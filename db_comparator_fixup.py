@@ -913,9 +913,6 @@ def compare_constraints_for_table(
 
     src_names = set(src_cons.keys())
     tgt_names = set(tgt_cons.keys())
-
-    missing = src_names - tgt_names
-    extra = tgt_names - src_names
     detail_mismatch: List[str] = []
 
     common = src_names & tgt_names
@@ -930,6 +927,74 @@ def compare_constraints_for_table(
             detail_mismatch.append(
                 f"{name}: 列顺序/集合不一致 (src={s['columns']}, tgt={t['columns']})"
             )
+
+    def bucket_constraints(cons_dict: Dict[str, Dict]) -> Dict[str, List[Tuple[Tuple[str, ...], str]]]:
+        buckets: Dict[str, List[Tuple[Tuple[str, ...], str]]] = {'P': [], 'U': [], 'R': []}
+        for name, info in cons_dict.items():
+            ctype = info.get("type")
+            if ctype not in buckets:
+                continue
+            cols = tuple(info.get("columns") or [])
+            buckets[ctype].append((cols, name))
+        return buckets
+
+    def match_by_columns(
+        src_list: List[Tuple[Tuple[str, ...], str]],
+        tgt_list: List[Tuple[Tuple[str, ...], str]]
+    ) -> Tuple[Set[str], Set[str]]:
+        tgt_used = [False] * len(tgt_list)
+        missing_names: Set[str] = set()
+        for cols, name in src_list:
+            found_idx = None
+            for idx, (t_cols, _) in enumerate(tgt_list):
+                if not tgt_used[idx] and t_cols == cols:
+                    found_idx = idx
+                    tgt_used[idx] = True
+                    break
+            if found_idx is None:
+                missing_names.add(name)
+        extra_names: Set[str] = {
+            tgt_list[idx][1]
+            for idx, used in enumerate(tgt_used)
+            if not used
+        }
+        return missing_names, extra_names
+
+    grouped_src = bucket_constraints(src_cons)
+    grouped_tgt = bucket_constraints(tgt_cons)
+
+    missing: Set[str] = set()
+    extra: Set[str] = set()
+
+    # PK: 仅检查是否存在，同时确保列集合一致
+    src_pk = grouped_src.get('P', [])
+    tgt_pk = grouped_tgt.get('P', [])
+    if src_pk and not tgt_pk:
+        missing.update(name for _, name in src_pk)
+    elif tgt_pk and not src_pk:
+        extra.update(name for _, name in tgt_pk)
+    elif src_pk and tgt_pk:
+        src_pk_cols = src_pk[0][0]
+        tgt_pk_cols = tgt_pk[0][0]
+        if src_pk_cols != tgt_pk_cols:
+            detail_mismatch.append(
+                f"PRIMARY KEY 列不一致 (src={list(src_pk_cols)}, tgt={list(tgt_pk_cols)})"
+            )
+
+    # UK / FK: 只按列集合匹配，忽略名称
+    uk_missing, uk_extra = match_by_columns(grouped_src.get('U', []), grouped_tgt.get('U', []))
+    fk_missing, fk_extra = match_by_columns(grouped_src.get('R', []), grouped_tgt.get('R', []))
+
+    # 与源/目标重名的项视为“存在但定义不同”，不计入缺失/多余
+    uk_missing -= tgt_names
+    fk_missing -= tgt_names
+    uk_extra -= src_names
+    fk_extra -= src_names
+
+    missing.update(uk_missing)
+    missing.update(fk_missing)
+    extra.update(uk_extra)
+    extra.update(fk_extra)
 
     all_good = (not missing) and (not extra) and (not detail_mismatch)
     if all_good:
@@ -1572,6 +1637,14 @@ def print_final_report(
     missing_count = len(tv_results['missing'])
     mismatched_count = len(tv_results['mismatched'])
     extraneous_count = len(tv_results['extraneous'])
+    idx_ok_cnt = len(extra_results.get("index_ok", []))
+    idx_mis_cnt = len(extra_results.get("index_mismatched", []))
+    cons_ok_cnt = len(extra_results.get("constraint_ok", []))
+    cons_mis_cnt = len(extra_results.get("constraint_mismatched", []))
+    seq_ok_cnt = len(extra_results.get("sequence_ok", []))
+    seq_mis_cnt = len(extra_results.get("sequence_mismatched", []))
+    trg_ok_cnt = len(extra_results.get("trigger_ok", []))
+    trg_mis_cnt = len(extra_results.get("trigger_mismatched", []))
 
     print("\n\n" + f"{Color.BOLD}{'='*80}{Color.ENDC}")
     print(f"           {Color.BOLD}数据库对象迁移校验报告 (V0.1){Color.ENDC}")
@@ -1583,6 +1656,13 @@ def print_final_report(
     print(f"  - {Color.RED}缺失:{Color.ENDC}       {missing_count}")
     print(f"  - {Color.YELLOW}不匹配 (仅 TABLE 列):{Color.ENDC}   {mismatched_count}")
     print(f"  - {Color.YELLOW}无效规则:{Color.ENDC} {extraneous_count}")
+    print("-" * 80)
+
+    print(f"\n{Color.BOLD}[ 综合概要 - 扩展对象 (INDEX/CONSTRAINT/SEQUENCE/TRIGGER) ]{Color.ENDC}")
+    print(f"  - 索引:      {Color.GREEN}一致{Color.ENDC} {idx_ok_cnt} / {Color.YELLOW}差异{Color.ENDC} {idx_mis_cnt}")
+    print(f"  - 约束:      {Color.GREEN}一致{Color.ENDC} {cons_ok_cnt} / {Color.YELLOW}差异{Color.ENDC} {cons_mis_cnt}")
+    print(f"  - 序列映射:  {Color.GREEN}一致{Color.ENDC} {seq_ok_cnt} / {Color.YELLOW}差异{Color.ENDC} {seq_mis_cnt}")
+    print(f"  - 触发器:    {Color.GREEN}一致{Color.ENDC} {trg_ok_cnt} / {Color.YELLOW}差异{Color.ENDC} {trg_mis_cnt}")
     print("-" * 80)
 
     print(f"\n{Color.BOLD}--- 1. [缺失的主对象] (在 OceanBase 中未找到) --- (共 {missing_count} 个){Color.ENDC}")
@@ -1624,8 +1704,6 @@ def print_final_report(
         print("    (无)")
 
     # 索引
-    idx_ok_cnt = len(extra_results.get("index_ok", []))
-    idx_mis_cnt = len(extra_results.get("index_mismatched", []))
     print(f"\n{Color.BOLD}--- 5. [索引一致性检查] ---{Color.ENDC}")
     print(f"  - {Color.GREEN}索引完全一致的表:{Color.ENDC} {idx_ok_cnt}")
     print(f"  - {Color.YELLOW}索引存在差异的表:{Color.ENDC} {idx_mis_cnt}")
@@ -1642,8 +1720,6 @@ def print_final_report(
         print("    (无差异或未执行索引检查)")
 
     # 约束
-    cons_ok_cnt = len(extra_results.get("constraint_ok", []))
-    cons_mis_cnt = len(extra_results.get("constraint_mismatched", []))
     print(f"\n{Color.BOLD}--- 6. [约束 (PK/UK/FK) 一致性检查] ---{Color.ENDC}")
     print(f"  - {Color.GREEN}约束完全一致的表:{Color.ENDC} {cons_ok_cnt}")
     print(f"  - {Color.YELLOW}约束存在差异的表:{Color.ENDC} {cons_mis_cnt}")
@@ -1660,8 +1736,6 @@ def print_final_report(
         print("    (无差异或未执行约束检查)")
 
     # 序列
-    seq_ok_cnt = len(extra_results.get("sequence_ok", []))
-    seq_mis_cnt = len(extra_results.get("sequence_mismatched", []))
     print(f"\n{Color.BOLD}--- 7. [序列 (SEQUENCE) 一致性检查] ---{Color.ENDC}")
     print(f"  - {Color.GREEN}序列集合完全一致的 schema 映射:{Color.ENDC} {seq_ok_cnt}")
     print(f"  - {Color.YELLOW}序列集合存在差异的 schema 映射:{Color.ENDC} {seq_mis_cnt}")
@@ -1676,8 +1750,6 @@ def print_final_report(
         print("    (无差异或未执行序列检查)")
 
     # 触发器
-    trg_ok_cnt = len(extra_results.get("trigger_ok", []))
-    trg_mis_cnt = len(extra_results.get("trigger_mismatched", []))
     print(f"\n{Color.BOLD}--- 8. [触发器 (TRIGGER) 一致性检查] ---{Color.ENDC}")
     print(f"  - {Color.GREEN}触发器完全一致的表:{Color.ENDC} {trg_ok_cnt}")
     print(f"  - {Color.YELLOW}触发器存在差异的表:{Color.ENDC} {trg_mis_cnt}")
