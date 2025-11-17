@@ -1,5 +1,0 @@
--- 修补缺失的约束 SYS_C009017 (表: OB_DATA.EMPLOYEES, 源表: ORA_DATA.EMPLOYEES)
--- 本文件由校验工具自动生成，请在 OceanBase 执行前仔细审核。
-
-ALTER TABLE "OB_DATA"."EMPLOYEES" ADD PRIMARY KEY ("ID")
-  USING INDEX  ENABLE;

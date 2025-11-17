@@ -1,4 +1,0 @@
--- 修补缺失的 INDEX IDX_DEPT_NAME (表: OB_DATA.DEPARTMENTS)
--- 本文件由校验工具自动生成，请在 OceanBase 执行前仔细审核。
-
-CREATE INDEX "OB_DATA"."IDX_DEPT_NAME" ON "OB_DATA"."DEPARTMENTS" ("DEPT_NAME");

@@ -1,4 +1,0 @@
--- 修补缺失的 INDEX SYS_C009017 (表: OB_DATA.EMPLOYEES)
--- 本文件由校验工具自动生成，请在 OceanBase 执行前仔细审核。
-
-CREATE UNIQUE INDEX "OB_DATA"."SYS_C009017" ON "OB_DATA"."EMPLOYEES" ("ID");

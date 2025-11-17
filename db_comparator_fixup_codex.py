@@ -9,11 +9,11 @@
    - TABLE, VIEW
    - INDEX, CONSTRAINT (PK/UK/FK)
    - SEQUENCE, TRIGGER
-   - PROCEDURE, FUNCTION, PACKAGE, SYNONYM
+   - PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, SYNONYM
 
 2. 对比规则：
    - TABLE：只对比“列名集合”，忽略以 OMS_ 开头的列，不对比数据类型/长度。
-   - VIEW / SEQUENCE / TRIGGER / PROCEDURE / FUNCTION / PACKAGE / SYNONYM：
+   - VIEW / SEQUENCE / TRIGGER / PROCEDURE / FUNCTION / PACKAGE / PACKAGE BODY / SYNONYM：
        只对比“是否存在”。
    - INDEX / CONSTRAINT：
        对比“是否存在”及“构成”（索引列集合、有无/列顺序；约束类型和约束列集合）。
@@ -32,7 +32,8 @@
 
 4. 修补脚本生成：
    - 缺失对象：
-       TABLE / VIEW / PROCEDURE / FUNCTION / PACKAGE / SYNONYM / INDEX / CONSTRAINT / SEQUENCE / TRIGGER
+       TABLE / VIEW / PROCEDURE / FUNCTION / PACKAGE / PACKAGE BODY / SYNONYM /
+       INDEX / CONSTRAINT / SEQUENCE / TRIGGER
        → 生成对应的 CREATE 语句脚本。
    - TABLE 列不匹配：
        → 生成 ALTER TABLE ADD 列的脚本；
@@ -214,7 +215,7 @@ def load_remap_rules(file_path: str) -> RemapRules:
 def get_source_objects(ora_cfg: OraConfig, schemas_list: List[str]) -> SourceObjectMap:
     """
     从 Oracle 源端获取所有需要对比的“主对象”：
-      TABLE, VIEW, PROCEDURE, FUNCTION, PACKAGE, SYNONYM
+      TABLE, VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, SYNONYM
     """
     log.info(f"正在连接 Oracle 源端: {ora_cfg['dsn']}...")
 
@@ -226,7 +227,7 @@ def get_source_objects(ora_cfg: OraConfig, schemas_list: List[str]) -> SourceObj
         WHERE OWNER IN ({placeholders})
           AND OBJECT_TYPE IN (
               'TABLE','VIEW',
-              'PROCEDURE','FUNCTION','PACKAGE','SYNONYM'
+              'PROCEDURE','FUNCTION','PACKAGE','PACKAGE BODY','SYNONYM'
           )
     """
 
@@ -249,7 +250,10 @@ def get_source_objects(ora_cfg: OraConfig, schemas_list: List[str]) -> SourceObj
         log.error(f"严重错误: 连接或查询 Oracle 失败: {e}")
         sys.exit(1)
 
-    log.info(f"从 Oracle 成功获取 {len(source_objects)} 个主对象 (TABLE/VIEW/PROC/FUNC/PACKAGE/SYNONYM)。")
+    log.info(
+        "从 Oracle 成功获取 %d 个主对象 (TABLE/VIEW/PROC/FUNC/PACKAGE/PACKAGE BODY/SYNONYM)。",
+        len(source_objects)
+    )
     return source_objects
 
 
@@ -275,7 +279,7 @@ def validate_remap_rules(remap_rules: RemapRules, source_objects: SourceObjectMa
 def generate_master_list(source_objects: SourceObjectMap, remap_rules: RemapRules) -> MasterCheckList:
     """
     生成“最终校验清单”并检测 "多对一" 映射。
-    包含主对象类型：TABLE / VIEW / PROCEDURE / FUNCTION / PACKAGE / SYNONYM
+    包含主对象类型：TABLE / VIEW / PROCEDURE / FUNCTION / PACKAGE / PACKAGE BODY / SYNONYM
     """
     log.info("正在生成主校验清单 (应用 Remap 规则)...")
     master_list: MasterCheckList = []
@@ -375,7 +379,7 @@ def dump_ob_metadata(ob_cfg: ObConfig, target_schemas: Set[str]) -> ObMetadata:
         WHERE OWNER IN ({owners_in})
           AND OBJECT_TYPE IN (
               'TABLE','VIEW',
-              'PROCEDURE','FUNCTION','PACKAGE','SYNONYM',
+              'PROCEDURE','FUNCTION','PACKAGE','PACKAGE BODY','SYNONYM',
               'SEQUENCE','TRIGGER','INDEX'
           )
     """
@@ -830,7 +834,7 @@ def check_primary_objects(
     """
     核心主对象校验：
       - TABLE: 存在性 + 列名集合 (忽略 OMS_ 列)
-      - VIEW / PROCEDURE / FUNCTION / PACKAGE / SYNONYM: 只校验存在性
+      - VIEW / PROCEDURE / FUNCTION / PACKAGE / PACKAGE BODY / SYNONYM: 只校验存在性
     """
     results: ReportResults = {
         "missing": [],
@@ -843,7 +847,7 @@ def check_primary_objects(
         log.info("主校验清单为空，没有需要校验的对象。")
         return results
 
-    log.info("--- 开始执行主对象批量验证 (TABLE/VIEW/PROC/FUNC/PACKAGE/SYNONYM) ---")
+    log.info("--- 开始执行主对象批量验证 (TABLE/VIEW/PROC/FUNC/PACKAGE/PACKAGE BODY/SYNONYM) ---")
 
     total = len(master_list)
     for i, (src_name, tgt_name, obj_type) in enumerate(master_list):
@@ -929,7 +933,7 @@ def check_primary_objects(
                     length_mismatches
                 ))
 
-        elif obj_type_u in ('VIEW', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'SYNONYM'):
+        elif obj_type_u in ('VIEW', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'SYNONYM'):
             ob_set = ob_meta.objects_by_type.get(obj_type_u, set())
             if full_tgt in ob_set:
                 results['ok'].append((obj_type_u, full_tgt))
@@ -983,10 +987,12 @@ def compare_indexes_for_table(
     src_idx = oracle_meta.indexes.get(src_key)
     if src_idx is None:
         return False, IndexMismatch(
-            table=f"{tgt_schema}.{tgt_table} (Oracle 索引信息缺失)",
+            table=f"{tgt_schema}.{tgt_table}",
             missing_indexes=set(),
             extra_indexes=set(),
-            detail_mismatch=[]
+            detail_mismatch=[
+                "无法比较：源端 Oracle 未提供该表的索引元数据 (ALL_INDEXES/ALL_IND_COLUMNS dump 为空)。"
+            ]
         )
 
     tgt_key = (tgt_schema.upper(), tgt_table.upper())
@@ -1036,10 +1042,12 @@ def compare_constraints_for_table(
     src_cons = oracle_meta.constraints.get(src_key)
     if src_cons is None:
         return False, ConstraintMismatch(
-            table=f"{tgt_schema}.{tgt_table} (Oracle 约束信息缺失)",
+            table=f"{tgt_schema}.{tgt_table}",
             missing_constraints=set(),
             extra_constraints=set(),
-            detail_mismatch=[]
+            detail_mismatch=[
+                "无法比较：源端 Oracle 未提供该表的约束元数据 (ALL_CONSTRAINTS/ALL_CONS_COLUMNS dump 为空)。"
+            ]
         )
 
     tgt_key = (tgt_schema.upper(), tgt_table.upper())
@@ -1156,7 +1164,7 @@ def compare_sequences_for_schema(
             tgt_schema=tgt_schema,
             missing_sequences=set(),
             extra_sequences=set(),
-            note="Oracle 序列信息缺失"
+            note=f"无法比较：源 schema {src_schema} 的序列元数据缺失 (ALL_SEQUENCES dump 为空)。"
         )
 
     tgt_seqs = ob_meta.sequences.get(tgt_schema.upper(), set())
@@ -1188,10 +1196,12 @@ def compare_triggers_for_table(
     src_trg = oracle_meta.triggers.get(src_key)
     if src_trg is None:
         return False, TriggerMismatch(
-            table=f"{tgt_schema}.{tgt_table} (Oracle 触发器信息缺失)",
+            table=f"{tgt_schema}.{tgt_table}",
             missing_triggers=set(),
             extra_triggers=set(),
-            detail_mismatch=[]
+            detail_mismatch=[
+                "无法比较：源端 Oracle 未提供该表的触发器元数据 (ALL_TRIGGERS dump 为空)。"
+            ]
         )
 
     tgt_key = (tgt_schema.upper(), tgt_table.upper())
@@ -1347,11 +1357,17 @@ def setup_metadata_session(ora_conn):
         log.warning(f"[DDL] 设置 DBMS_METADATA transform 失败: {e}")
 
 
+DDL_OBJ_TYPE_MAPPING = {
+    'PACKAGE BODY': 'PACKAGE_BODY'
+}
+
+
 def oracle_get_ddl(ora_conn, obj_type: str, owner: str, name: str) -> Optional[str]:
     sql = "SELECT DBMS_METADATA.GET_DDL(:1, :2, :3) FROM DUAL"
+    obj_type_norm = DDL_OBJ_TYPE_MAPPING.get(obj_type.upper(), obj_type.upper())
     try:
         with ora_conn.cursor() as cursor:
-            cursor.execute(sql, [obj_type.upper(), name.upper(), owner.upper()])
+            cursor.execute(sql, [obj_type_norm, name.upper(), owner.upper()])
             row = cursor.fetchone()
             if not row or row[0] is None:
                 return None
@@ -1528,7 +1544,7 @@ def generate_fixup_scripts(
       5. INDEX
       6. CONSTRAINT
       7. TRIGGER
-      8. PROCEDURE / FUNCTION / PACKAGE / SYNONYM
+      8. PROCEDURE / FUNCTION / PACKAGE / PACKAGE BODY / SYNONYM
     """
     if not master_list:
         log.info("[FIXUP] master_list 为空，未生成修补脚本。")
@@ -1545,8 +1561,13 @@ def generate_fixup_scripts(
     }
     schema_map = build_schema_mapping(master_list)
     obj_type_to_dir = {
-        'TABLE': 'table', 'VIEW': 'view', 'PROCEDURE': 'procedure',
-        'FUNCTION': 'function', 'PACKAGE': 'package', 'SYNONYM': 'synonym',
+        'TABLE': 'table',
+        'VIEW': 'view',
+        'PROCEDURE': 'procedure',
+        'FUNCTION': 'function',
+        'PACKAGE': 'package',
+        'PACKAGE BODY': 'package_body',
+        'SYNONYM': 'synonym',
     }
 
     try:
@@ -1668,7 +1689,8 @@ def generate_fixup_scripts(
             log.info("[FIXUP] (8/8) 正在生成其余代码对象脚本...")
             for (obj_type, tgt_name, src_name) in missing_main_objects:
                 obj_type_u = obj_type.upper()
-                if obj_type_u not in ('PROCEDURE', 'FUNCTION', 'PACKAGE', 'SYNONYM'): continue
+                if obj_type_u not in ('PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'SYNONYM'):
+                    continue
                 src_schema, src_obj = src_name.split('.')
                 tgt_schema, tgt_obj = tgt_name.split('.')
                 ddl = oracle_get_ddl(ora_conn, obj_type_u, src_schema, src_obj)
@@ -1857,14 +1879,18 @@ def print_final_report(
     # --- 提示 ---
     fixup_panel = Panel.fit(
         "[bold]Fixup 脚本生成目录[/bold]\n\n"
-        "fix_up/table       : 缺失 TABLE 的 CREATE 脚本\n"
-        "fix_up/view        : 缺失 VIEW 的 CREATE 脚本\n"
-        "fix_up/procedure   : 缺失 PROCEDURE 的 CREATE 脚本\n"
-        "fix_up/index       : 缺失 INDEX 的 CREATE 脚本\n"
-        "fix_up/constraint  : 缺失约束的 CREATE 脚本\n"
-        "fix_up/sequence    : 缺失 SEQUENCE 的 CREATE 脚本\n"
-        "fix_up/trigger     : 缺失 TRIGGER 的 CREATE 脚本\n"
-        "fix_up/table_alter : 列不匹配 TABLE 的 ALTER 修补脚本\n\n"
+        "fix_up/table         : 缺失 TABLE 的 CREATE 脚本\n"
+        "fix_up/view          : 缺失 VIEW 的 CREATE 脚本\n"
+        "fix_up/procedure     : 缺失 PROCEDURE 的 CREATE 脚本\n"
+        "fix_up/function      : 缺失 FUNCTION 的 CREATE 脚本\n"
+        "fix_up/package       : 缺失 PACKAGE 的 CREATE 脚本\n"
+        "fix_up/package_body  : 缺失 PACKAGE BODY 的 CREATE 脚本\n"
+        "fix_up/synonym       : 缺失 SYNONYM 的 CREATE 脚本\n"
+        "fix_up/index         : 缺失 INDEX 的 CREATE 脚本\n"
+        "fix_up/constraint    : 缺失约束的 CREATE 脚本\n"
+        "fix_up/sequence      : 缺失 SEQUENCE 的 CREATE 脚本\n"
+        "fix_up/trigger       : 缺失 TRIGGER 的 CREATE 脚本\n"
+        "fix_up/table_alter   : 列不匹配 TABLE 的 ALTER 修补脚本\n\n"
         "[bold]请在 OceanBase 执行前逐一人工审核上述脚本。[/bold]",
         title="[info]提示",
         border_style="info"
@@ -1885,7 +1911,7 @@ def main():
     # 2) 加载 Remap 规则
     remap_rules = load_remap_rules(settings['remap_file'])
 
-    # 3) 加载源端主对象 (TABLE/VIEW/PROC/FUNC/PACKAGE/SYNONYM)
+    # 3) 加载源端主对象 (TABLE/VIEW/PROC/FUNC/PACKAGE/PACKAGE BODY/SYNONYM)
     source_objects = get_source_objects(ora_cfg, settings['source_schemas_list'])
 
     # 4) 验证 Remap 规则
