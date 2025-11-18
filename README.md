@@ -21,7 +21,8 @@ This repository contains a complete toolkit for validating Oracle→OceanBase mi
 1. Python 3.7+ on Linux.
 2. Oracle client connectivity (for the `oracledb` driver) and network access to both Oracle and OceanBase.
 3. The OceanBase tenant must be running in Oracle compatibility mode with `obclient` installed.
-4. Install dependencies:
+4. Oracle Instant Client extracted locally. Configure `LD_LIBRARY_PATH` to include the client directory, e.g. `export LD_LIBRARY_PATH="/home/minorli/instantclient_19_28:${LD_LIBRARY_PATH}"`.
+5. Install dependencies:
 
 ```bash
 python3 -m venv venv
@@ -35,7 +36,7 @@ pip install -r requirements.txt
 1. **Edit `db.ini`**
    - `[ORACLE_SOURCE]`: Oracle username/password/DSN.
    - `[OCEANBASE_TARGET]`: `obclient` path, host, port, `-u` string, password.
-   - `[SETTINGS]`: `source_schemas` (comma-separated, supports line breaks), `remap_file`, optional `cli_timeout`, and `fixup_dir`.
+   - `[SETTINGS]`: `source_schemas`, `remap_file`, optional `cli_timeout`, `fixup_dir`, `oracle_client_lib_dir` (path to Instant Client), and `report_dir` (optional).
 2. **Adjust remap rules**
    - Update `remap_rules.txt` (or point `remap_file` to another file) so every migrated object that changed schema or name is explicitly mapped.
 3. **(Optional) Test Scenarios**
@@ -46,6 +47,8 @@ pip install -r requirements.txt
 ```bash
 python3 db_comparator_fixup_release.py
 ```
+
+> 运行前请确认 `oracle_client_lib_dir` 指向有效的 Instant Client 路径，并在 shell 中设置 `LD_LIBRARY_PATH` 指向同一路径，否则厚模式连接会报告 `libnnz19.so` 等缺失。
 
 What it does:
 1. Connects to Oracle and collects all TABLE/VIEW/PROCEDURE/FUNCTION/PACKAGE/PACKAGE BODY/SYNONYM metadata for the configured schemas.

@@ -48,8 +48,11 @@ import configparser
 import subprocess
 import sys
 import logging
+import math
 import re
+import os
 from collections import defaultdict, OrderedDict
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Set, List, Tuple, Optional, NamedTuple
 
@@ -60,8 +63,6 @@ except ImportError:
     print("错误: 未找到 'oracledb' 库。", file=sys.stderr)
     print("请先安装: pip install oracledb", file=sys.stderr)
     sys.exit(1)
-
-
 
 # --- 日志配置 ---
 logging.basicConfig(
@@ -164,6 +165,10 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('fixup_dir', 'fix_up')
         # obclient 超时时间 (秒)
         settings.setdefault('obclient_timeout', '60')
+        # 报告输出目录
+        settings.setdefault('report_dir', 'reports')
+        # Oracle Instant Client 目录 (Thick Mode)
+        settings.setdefault('oracle_client_lib_dir', '')
 
         global OBC_TIMEOUT
         try:
@@ -211,6 +216,34 @@ def load_remap_rules(file_path: str) -> RemapRules:
 
     log.info(f"加载了 {len(rules)} 条 Remap 规则。")
     return rules
+
+
+def init_oracle_client_from_settings(settings: Dict) -> None:
+    """根据配置初始化 Oracle Thick Mode 并提示环境变量设置。"""
+    client_dir = settings.get('oracle_client_lib_dir', '').strip()
+    if not client_dir:
+        log.error("严重错误: 未在 [SETTINGS] 中配置 oracle_client_lib_dir。")
+        log.error("请在 db.ini 中添加例如: oracle_client_lib_dir = /home/user/instantclient_19_28")
+        sys.exit(1)
+
+    client_path = Path(client_dir).expanduser()
+    if not client_path.exists():
+        log.error(f"严重错误: 指定的 Oracle Instant Client 目录不存在: {client_path}")
+        sys.exit(1)
+
+    ld_path = os.environ.get('LD_LIBRARY_PATH') or '<未设置>'
+    log.info(f"准备使用 Oracle Instant Client 目录: {client_path}")
+    log.info("如遇 libnnz19.so 等库缺失，请先执行:")
+    log.info(f"  export LD_LIBRARY_PATH=\"{client_path}:${{LD_LIBRARY_PATH}}\"")
+    log.info(f"当前 LD_LIBRARY_PATH: {ld_path}")
+
+    try:
+        oracledb.init_oracle_client(lib_dir=str(client_path))
+    except Exception as exc:
+        log.error("严重错误: Oracle Thick Mode 初始化失败。")
+        log.error("请确认 instant client 路径和 LD_LIBRARY_PATH 设置正确。")
+        log.error(f"错误详情: {exc}")
+        sys.exit(1)
 
 
 def get_source_objects(ora_cfg: OraConfig, schemas_list: List[str]) -> SourceObjectMap:
@@ -660,6 +693,14 @@ def dump_oracle_metadata(
     triggers: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     sequences: Dict[str, Set[str]] = {}
 
+    def _safe_upper(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            return value.upper()
+        except AttributeError:
+            return str(value).upper()
+
     try:
         with oracledb.connect(
             user=ora_cfg['user'],
@@ -680,7 +721,11 @@ def dump_oracle_metadata(
                 with ora_conn.cursor() as cursor:
                     cursor.execute(sql, owners)
                     for row in cursor:
-                        owner, table, col = row[0].upper(), row[1].upper(), row[2].upper()
+                        owner = _safe_upper(row[0])
+                        table = _safe_upper(row[1])
+                        col = _safe_upper(row[2])
+                        if not owner or not table or not col:
+                            continue
                         key = (owner, table)
                         if key not in table_pairs:
                             continue
@@ -704,11 +749,16 @@ def dump_oracle_metadata(
                 with ora_conn.cursor() as cursor:
                     cursor.execute(sql_idx, owners)
                     for row in cursor:
-                        owner, table = row[0].upper(), row[1].upper()
+                        owner = _safe_upper(row[0])
+                        table = _safe_upper(row[1])
+                        if not owner or not table:
+                            continue
                         key = (owner, table)
                         if key not in table_pairs:
                             continue
-                        idx_name = row[2].upper()
+                        idx_name = _safe_upper(row[2])
+                        if not idx_name:
+                            continue
                         indexes.setdefault(key, {})[idx_name] = {
                             "uniqueness": (row[3] or "").upper(),
                             "columns": []
@@ -723,12 +773,17 @@ def dump_oracle_metadata(
                 with ora_conn.cursor() as cursor:
                     cursor.execute(sql_idx_cols, owners)
                     for row in cursor:
-                        owner, table = row[0].upper(), row[1].upper()
+                        owner = _safe_upper(row[0])
+                        table = _safe_upper(row[1])
+                        if not owner or not table:
+                            continue
                         key = (owner, table)
                         if key not in table_pairs:
                             continue
-                        idx_name = row[2].upper()
-                        col_name = row[3].upper()
+                        idx_name = _safe_upper(row[2])
+                        col_name = _safe_upper(row[3])
+                        if not idx_name or not col_name:
+                            continue
                         indexes.setdefault(key, {}).setdefault(
                             idx_name, {"uniqueness": "UNKNOWN", "columns": []}
                         )["columns"].append(col_name)
@@ -744,11 +799,16 @@ def dump_oracle_metadata(
                 with ora_conn.cursor() as cursor:
                     cursor.execute(sql_cons, owners)
                     for row in cursor:
-                        owner, table = row[0].upper(), row[1].upper()
+                        owner = _safe_upper(row[0])
+                        table = _safe_upper(row[1])
+                        if not owner or not table:
+                            continue
                         key = (owner, table)
                         if key not in table_pairs:
                             continue
-                        name = row[2].upper()
+                        name = _safe_upper(row[2])
+                        if not name:
+                            continue
                         constraints.setdefault(key, {})[name] = {
                             "type": (row[3] or "").upper(),
                             "columns": []
@@ -763,12 +823,17 @@ def dump_oracle_metadata(
                 with ora_conn.cursor() as cursor:
                     cursor.execute(sql_cons_cols, owners)
                     for row in cursor:
-                        owner, table = row[0].upper(), row[1].upper()
+                        owner = _safe_upper(row[0])
+                        table = _safe_upper(row[1])
+                        if not owner or not table:
+                            continue
                         key = (owner, table)
                         if key not in table_pairs:
                             continue
-                        cons_name = row[2].upper()
-                        col_name = row[3].upper()
+                        cons_name = _safe_upper(row[2])
+                        col_name = _safe_upper(row[3])
+                        if not cons_name or not col_name:
+                            continue
                         constraints.setdefault(key, {}).setdefault(
                             cons_name, {"type": "UNKNOWN", "columns": []}
                         )["columns"].append(col_name)
@@ -782,11 +847,16 @@ def dump_oracle_metadata(
                 with ora_conn.cursor() as cursor:
                     cursor.execute(sql_trg, owners)
                     for row in cursor:
-                        owner, table = row[0].upper(), row[1].upper()
+                        owner = _safe_upper(row[0])
+                        table = _safe_upper(row[1])
+                        if not owner or not table:
+                            continue
                         key = (owner, table)
                         if key not in table_pairs:
                             continue
-                        trg_name = row[2].upper()
+                        trg_name = _safe_upper(row[2])
+                        if not trg_name:
+                            continue
                         triggers.setdefault(key, {})[trg_name] = {
                             "event": row[3],
                             "status": row[4]
@@ -802,8 +872,10 @@ def dump_oracle_metadata(
                 with ora_conn.cursor() as cursor:
                     cursor.execute(sql_seq, seq_owners)
                     for row in cursor:
-                        owner = row[0].upper()
-                        seq_name = row[1].upper()
+                        owner = _safe_upper(row[0])
+                        seq_name = _safe_upper(row[1])
+                        if not owner or not seq_name:
+                            continue
                         sequences.setdefault(owner, set()).add(seq_name)
 
     except oracledb.Error as e:
@@ -877,7 +949,7 @@ def check_primary_objects(
                 results['missing'].append(('TABLE', full_tgt, src_name))
                 continue
 
-            # 2) 列级别详细对比 (包括 VARCHAR/VARCHAR2 长度 * 1.5)
+            # 2) 列级别详细对比 (VARCHAR/VARCHAR2 需 >= 源端长度 * 1.5 向上取整)
             src_cols_details = oracle_meta.table_columns.get((src_schema_u, src_obj_u))
             tgt_cols_details = ob_meta.tab_columns.get((tgt_schema_u, tgt_obj_u), {})
 
@@ -914,14 +986,19 @@ def check_primary_objects(
 
                 if src_dtype in ('VARCHAR2', 'VARCHAR'):
                     src_len = src_info.get("char_length") or src_info.get("data_length")
-                    tgt_len = tgt_info.get("char_length")
+                    tgt_len = tgt_info.get("char_length") or tgt_info.get("data_length")
 
-                    if src_len is not None and tgt_len is not None:
-                        expected_tgt_len = int(src_len * 1.5)
-                        if tgt_len != expected_tgt_len:
-                            length_mismatches.append(
-                                (col_name, src_len, tgt_len, expected_tgt_len)
-                            )
+                    try:
+                        src_len_int = int(src_len)
+                        tgt_len_int = int(tgt_len)
+                    except (TypeError, ValueError):
+                        continue
+
+                    expected_tgt_len = int(math.ceil(src_len_int * 1.5))
+                    if tgt_len_int < expected_tgt_len:
+                        length_mismatches.append(
+                            (col_name, src_len_int, tgt_len_int, expected_tgt_len)
+                        )
 
             if not missing_in_tgt and not extra_in_tgt and not length_mismatches:
                 results['ok'].append(('TABLE', full_tgt))
@@ -1532,7 +1609,7 @@ def generate_alter_for_table_columns(
     # 长度不匹配：MODIFY
     if length_mismatches:
         lines.append("")
-        lines.append("-- 列长度不匹配 (目标端长度不等于源端 * 1.5)，将通过 ALTER TABLE MODIFY 修正：")
+        lines.append("-- 列长度不匹配 (目标端长度小于 ceil(源端长度 * 1.5))，将通过 ALTER TABLE MODIFY 修正：")
         for col_name, src_len, tgt_len, expected_len in length_mismatches:
             info = col_details.get(col_name)
             if not info:
@@ -1870,7 +1947,8 @@ except ImportError:
 def print_final_report(
     tv_results: ReportResults,
     total_checked: int,
-    extra_results: Optional[ExtraCheckResults] = None
+    extra_results: Optional[ExtraCheckResults] = None,
+    report_file: Optional[Path] = None
 ):
     custom_theme = Theme({
         "ok": "green",
@@ -1880,7 +1958,7 @@ def print_final_report(
         "header": "bold magenta",
         "title": "bold white on blue"
     })
-    console = Console(theme=custom_theme)
+    console = Console(theme=custom_theme, record=report_file is not None)
 
     if extra_results is None:
         extra_results = {
@@ -2095,6 +2173,16 @@ def print_final_report(
     console.print(fixup_panel)
     console.print(Panel.fit("[bold]报告结束[/bold]", style="title"))
 
+    if report_file:
+        report_path = Path(report_file)
+        try:
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_text = console.export_text(clear=False)
+            report_path.write_text(report_text, encoding='utf-8')
+            console.print(f"[info]报告已保存: {report_path}")
+        except OSError as exc:
+            console.print(f"[missing]报告写入失败: {exc}")
+
 
 # ====================== 主函数 ======================
 
@@ -2104,6 +2192,9 @@ def main():
 
     # 1) 加载配置
     ora_cfg, ob_cfg, settings = load_config(CONFIG_FILE)
+
+    # 初始化 Oracle Instant Client (Thick Mode)
+    init_oracle_client_from_settings(settings)
 
     # 2) 加载 Remap 规则
     remap_rules = load_remap_rules(settings['remap_file'])
@@ -2116,6 +2207,13 @@ def main():
 
     # 5) 生成主校验清单
     master_list = generate_master_list(source_objects, remap_rules)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_dir_setting = settings.get('report_dir', 'reports').strip() or 'reports'
+    report_dir = Path(report_dir_setting)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / f"report_{timestamp}.txt"
+    log.info(f"本次报告将输出到: {report_path}")
 
     if not master_list:
         log.info("主校验清单为空，程序结束。")
@@ -2135,7 +2233,7 @@ def main():
             "trigger_ok": [],
             "trigger_mismatched": [],
         }
-        print_final_report(tv_results, 0, extra_results)
+        print_final_report(tv_results, 0, extra_results, report_path)
         return
 
     # 6) 计算目标端 schema 集合并一次性 dump OB 元数据
@@ -2163,10 +2261,14 @@ def main():
     extra_results = check_extra_objects(settings, master_list, ob_meta, oracle_meta)
 
     # 9) 生成修补脚本
-    generate_fixup_scripts(ora_cfg, settings, tv_results, extra_results, master_list, oracle_meta, remap_rules)
+    if settings.get('generate_fixup', 'true').strip().lower() in ('true', '1', 'yes'):
+        log.info('已开启修补脚本生成，开始写入 fix_up 目录...')
+        generate_fixup_scripts(ora_cfg, settings, tv_results, extra_results, master_list, oracle_meta, remap_rules)
+    else:
+        log.info('已根据配置跳过修补脚本生成，仅打印对比报告。')
 
     # 10) 输出最终报告
-    print_final_report(tv_results, len(master_list), extra_results)
+    print_final_report(tv_results, len(master_list), extra_results, report_path)
 
 
 if __name__ == "__main__":
