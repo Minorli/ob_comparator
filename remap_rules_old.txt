@@ -1,9 +1,0 @@
-# 这是一个 remap 规则的示例文件
-# 源端 SCHEMA_A.TABLE_MAIN 将被映射到 OB_SCHEMA.TABLE_MAIN
-HXDB.TABLE_MAIN = HXDB_NEW.TABLE_MAIN
-HR.TABLE_CHILD = HXDB_NEW.TABLE_CHILD
-
-# 视图也可以被 remap
-HXDB.V_SALES_SUMMARY = HXDB_NEW.V_SALES_SUMMARY
-
-# 理论上没有remap的表，维持不变，这里不考虑目标端比源端多的表，因为没人敢删
