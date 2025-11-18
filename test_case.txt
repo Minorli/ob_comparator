@@ -199,7 +199,7 @@ ORA_HR.TRG_EMP_BI          = OB_STAGE.TRG_EMP_BI
 ======================================================================
 1) 在 Oracle 端插入足够数据，放大 Dump 负载。
 2) 在 OB 端仅部分建对象，并保持 VARCHAR2 长度未乘 1.5。
-3) 运行 db_comparator_fixup_codex.py：
+3) 运行 db_comparator_fixup_release.py：
    - 表列差异会提示缺列/多列/VARCHAR 长度不足。
    - 索引/约束/序列/触发器缺失会分别列出。
    - 新增的 PACKAGE BODY 与 Remap 逻辑会同时校验。

@@ -1,6 +1,6 @@
 # Spiderweb Remap Validation Scenario
 
-This case fabricates a dense, multi-schema migration so that `db_comparator_fixup_codex.py` is forced to exercise every code path: tables, views, synonym remaps, sequences, triggers, procedures, functions, packages (spec + body), indexes, constraints, and the VARCHAR/VARCHAR2 1.5× length rule.  The Oracle source side contains five schemas (`ORA_SALES`, `ORA_REF`, `ORA_LOG`, `ORA_UTIL`, `ORA_SEC`), while the OceanBase side spreads the objects across six different schemas plus one schema that keeps its original name.  Most objects jump to new schemas, some stay in place, and several targets intentionally omit or misconfigure metadata so the comparator must flag missing, extra, and mismatched objects.
+This case fabricates a dense, multi-schema migration so that `db_comparator_fixup_release.py` is forced to exercise every code path: tables, views, synonym remaps, sequences, triggers, procedures, functions, packages (spec + body), indexes, constraints, and the VARCHAR/VARCHAR2 1.5× length rule.  The Oracle source side contains five schemas (`ORA_SALES`, `ORA_REF`, `ORA_LOG`, `ORA_UTIL`, `ORA_SEC`), while the OceanBase side spreads the objects across six different schemas plus one schema that keeps its original name.  Most objects jump to new schemas, some stay in place, and several targets intentionally omit or misconfigure metadata so the comparator must flag missing, extra, and mismatched objects.
 
 ## Contents
 
@@ -46,7 +46,7 @@ The remap file routes individual objects, not just schemas, so tables, packages,
 
 4. **Run the comparator.**  
    ```
-   python3 db_comparator_fixup_codex.py
+   python3 db_comparator_fixup_release.py
    ```
    Use the credentials for the Oracle PDB and the OB tenant where you executed the scripts.
 
