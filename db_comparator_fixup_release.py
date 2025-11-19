@@ -139,6 +139,57 @@ class OracleMetadata(NamedTuple):
     sequences: Dict[str, Set[str]]                         # OWNER -> {SEQUENCE_NAME}
 
 
+class DependencyRecord(NamedTuple):
+    owner: str
+    name: str
+    object_type: str
+    referenced_owner: str
+    referenced_name: str
+    referenced_type: str
+
+
+class DependencyIssue(NamedTuple):
+    dependent: str
+    dependent_type: str
+    referenced: str
+    referenced_type: str
+    reason: str
+
+
+DependencyReport = Dict[str, List[DependencyIssue]]
+
+
+PRIMARY_OBJECT_TYPES: Tuple[str, ...] = (
+    'TABLE',
+    'VIEW',
+    'MATERIALIZED VIEW',
+    'PROCEDURE',
+    'FUNCTION',
+    'PACKAGE',
+    'PACKAGE BODY',
+    'SYNONYM',
+    'JOB',
+    'SCHEDULE',
+    'TYPE',
+    'TYPE BODY'
+)
+
+# 主对象中除 TABLE 外均做存在性验证
+PRIMARY_EXISTENCE_ONLY_TYPES: Tuple[str, ...] = tuple(
+    obj for obj in PRIMARY_OBJECT_TYPES if obj != 'TABLE'
+)
+
+# 额外纳入 remap/依赖但不做列级主检查的对象
+DEPENDENCY_EXTRA_OBJECT_TYPES: Tuple[str, ...] = (
+    'TRIGGER',
+    'SEQUENCE',
+    'INDEX'
+)
+
+ALL_TRACKED_OBJECT_TYPES: Tuple[str, ...] = tuple(
+    sorted(set(PRIMARY_OBJECT_TYPES) | set(DEPENDENCY_EXTRA_OBJECT_TYPES))
+)
+
 # ====================== 通用配置和基础函数 ======================
 
 def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
@@ -248,20 +299,21 @@ def init_oracle_client_from_settings(settings: Dict) -> None:
 
 def get_source_objects(ora_cfg: OraConfig, schemas_list: List[str]) -> SourceObjectMap:
     """
-    从 Oracle 源端获取所有需要对比的“主对象”：
-      TABLE, VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, SYNONYM
+    从 Oracle 源端获取所有需要纳入 remap/依赖分析的对象：
+      TABLE / VIEW / MATERIALIZED VIEW / PROCEDURE / FUNCTION / PACKAGE / PACKAGE BODY /
+      SYNONYM / JOB / SCHEDULE / TYPE / TYPE BODY / TRIGGER / SEQUENCE / INDEX
     """
     log.info(f"正在连接 Oracle 源端: {ora_cfg['dsn']}...")
 
     placeholders = ','.join([f":{i+1}" for i in range(len(schemas_list))])
+    object_types_clause = ",".join(f"'{obj}'" for obj in ALL_TRACKED_OBJECT_TYPES)
 
     sql = f"""
         SELECT OWNER, OBJECT_NAME, OBJECT_TYPE
         FROM ALL_OBJECTS
         WHERE OWNER IN ({placeholders})
           AND OBJECT_TYPE IN (
-              'TABLE','VIEW',
-              'PROCEDURE','FUNCTION','PACKAGE','PACKAGE BODY','SYNONYM'
+              {object_types_clause}
           )
     """
 
@@ -285,7 +337,7 @@ def get_source_objects(ora_cfg: OraConfig, schemas_list: List[str]) -> SourceObj
         sys.exit(1)
 
     log.info(
-        "从 Oracle 成功获取 %d 个主对象 (TABLE/VIEW/PROC/FUNC/PACKAGE/PACKAGE BODY/SYNONYM)。",
+        "从 Oracle 成功获取 %d 个受管对象 (包含主对象与扩展对象)。",
         len(source_objects)
     )
     return source_objects
@@ -313,7 +365,7 @@ def validate_remap_rules(remap_rules: RemapRules, source_objects: SourceObjectMa
 def generate_master_list(source_objects: SourceObjectMap, remap_rules: RemapRules) -> MasterCheckList:
     """
     生成“最终校验清单”并检测 "多对一" 映射。
-    包含主对象类型：TABLE / VIEW / PROCEDURE / FUNCTION / PACKAGE / PACKAGE BODY / SYNONYM
+    仅保留 PRIMARY_OBJECT_TYPES 中的主对象，用于主校验。
     """
     log.info("正在生成主校验清单 (应用 Remap 规则)...")
     master_list: MasterCheckList = []
@@ -321,6 +373,10 @@ def generate_master_list(source_objects: SourceObjectMap, remap_rules: RemapRule
     target_tracker: Dict[str, str] = {}
 
     for src_name, obj_type in source_objects.items():
+        obj_type_u = obj_type.upper()
+        if obj_type_u not in PRIMARY_OBJECT_TYPES:
+            continue
+
         if src_name in remap_rules:
             tgt_name = remap_rules[src_name]
         else:
@@ -343,6 +399,17 @@ def generate_master_list(source_objects: SourceObjectMap, remap_rules: RemapRule
 
     log.info(f"主校验清单生成完毕，共 {len(master_list)} 个待校验项。")
     return master_list
+
+
+def build_full_object_mapping(source_objects: SourceObjectMap, remap_rules: RemapRules) -> Dict[str, Tuple[str, str]]:
+    """
+    为所有受管对象建立映射 (源 -> 目标)。返回 {src_full_name: (tgt_full_name, object_type)}
+    """
+    mapping: Dict[str, Tuple[str, str]] = {}
+    for src_name, obj_type in source_objects.items():
+        tgt_name = remap_rules.get(src_name, src_name)
+        mapping[src_name] = (tgt_name, obj_type)
+    return mapping
 
 
 # ====================== obclient + 一次性元数据转储 ======================
@@ -407,14 +474,14 @@ def dump_ob_metadata(ob_cfg: ObConfig, target_schemas: Set[str]) -> ObMetadata:
 
     # --- 1. ALL_OBJECTS ---
     objects_by_type: Dict[str, Set[str]] = {}
+    object_types_clause = ",".join(f"'{obj}'" for obj in ALL_TRACKED_OBJECT_TYPES)
+
     sql = f"""
         SELECT OWNER, OBJECT_NAME, OBJECT_TYPE
         FROM ALL_OBJECTS
         WHERE OWNER IN ({owners_in})
           AND OBJECT_TYPE IN (
-              'TABLE','VIEW',
-              'PROCEDURE','FUNCTION','PACKAGE','PACKAGE BODY','SYNONYM',
-              'SEQUENCE','TRIGGER','INDEX'
+              {object_types_clause}
           )
     """
     ok, out, err = obclient_run_sql(ob_cfg, sql)
@@ -896,6 +963,205 @@ def dump_oracle_metadata(
     )
 
 
+def load_oracle_dependencies(
+    ora_cfg: OraConfig,
+    schemas_list: List[str]
+) -> List[DependencyRecord]:
+    """
+    从 Oracle 批量读取源 schema 内部的依赖关系。
+    """
+    if not schemas_list:
+        return []
+
+    owners_clause = ','.join([f":{i+1}" for i in range(len(schemas_list))])
+    types_clause = ",".join(f"'{t}'" for t in ALL_TRACKED_OBJECT_TYPES)
+
+    sql = f"""
+        SELECT OWNER, NAME, TYPE, REFERENCED_OWNER, REFERENCED_NAME, REFERENCED_TYPE
+        FROM ALL_DEPENDENCIES
+        WHERE OWNER IN ({owners_clause})
+          AND REFERENCED_OWNER IN ({owners_clause})
+          AND TYPE IN ({types_clause})
+          AND REFERENCED_TYPE IN ({types_clause})
+    """
+
+    records: List[DependencyRecord] = []
+    try:
+        with oracledb.connect(
+            user=ora_cfg['user'],
+            password=ora_cfg['password'],
+            dsn=ora_cfg['dsn']
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(sql, schemas_list)
+                for row in cursor:
+                    owner = (row[0] or '').strip().upper()
+                    name = (row[1] or '').strip().upper()
+                    obj_type = (row[2] or '').strip().upper()
+                    ref_owner = (row[3] or '').strip().upper()
+                    ref_name = (row[4] or '').strip().upper()
+                    ref_type = (row[5] or '').strip().upper()
+                    if not owner or not name or not ref_owner or not ref_name:
+                        continue
+                    records.append(DependencyRecord(
+                        owner=owner,
+                        name=name,
+                        object_type=obj_type,
+                        referenced_owner=ref_owner,
+                        referenced_name=ref_name,
+                        referenced_type=ref_type
+                    ))
+    except oracledb.Error as exc:
+        log.error(f"严重错误: 加载 Oracle 依赖信息失败: {exc}")
+        sys.exit(1)
+
+    log.info("Oracle 依赖信息加载完成，共 %d 条记录。", len(records))
+    return records
+
+
+def load_ob_dependencies(ob_cfg: ObConfig, target_schemas: Set[str]) -> Set[Tuple[str, str, str, str]]:
+    """
+    通过 obclient 读取 OceanBase 侧的依赖信息。
+    返回集合 { (OWNER.OBJ, TYPE, REF_OWNER.OBJ, REF_TYPE) }
+    """
+    if not target_schemas:
+        return set()
+
+    owners_in = ",".join(f"'{s}'" for s in sorted(target_schemas))
+    types_clause = ",".join(f"'{t}'" for t in ALL_TRACKED_OBJECT_TYPES)
+
+    sql = f"""
+        SELECT OWNER, NAME, TYPE, REFERENCED_OWNER, REFERENCED_NAME, REFERENCED_TYPE
+        FROM ALL_DEPENDENCIES
+        WHERE OWNER IN ({owners_in})
+          AND REFERENCED_OWNER IN ({owners_in})
+          AND TYPE IN ({types_clause})
+          AND REFERENCED_TYPE IN ({types_clause})
+    """
+    ok, out, err = obclient_run_sql(ob_cfg, sql)
+    if not ok:
+        log.error("无法从 OB 读取 ALL_DEPENDENCIES，程序退出。")
+        sys.exit(1)
+
+    result: Set[Tuple[str, str, str, str]] = set()
+    if out:
+        for line in out.splitlines():
+            parts = line.split('\t')
+            if len(parts) < 6:
+                continue
+            owner = parts[0].strip().upper()
+            name = parts[1].strip().upper()
+            obj_type = parts[2].strip().upper()
+            ref_owner = parts[3].strip().upper()
+            ref_name = parts[4].strip().upper()
+            ref_type = parts[5].strip().upper()
+            if not owner or not name or not ref_owner or not ref_name:
+                continue
+            result.add((
+                f"{owner}.{name}",
+                obj_type,
+                f"{ref_owner}.{ref_name}",
+                ref_type
+            ))
+
+    log.info("OceanBase 依赖信息加载完成，共 %d 条记录。", len(result))
+    return result
+
+
+def build_expected_dependency_pairs(
+    dependencies: List[DependencyRecord],
+    full_mapping: Dict[str, Tuple[str, str]]
+) -> Tuple[Set[Tuple[str, str, str, str]], List[DependencyIssue]]:
+    """
+    将源端依赖映射到目标端 (schema/object 名已替换)。
+    返回 (期望依赖集合, 被跳过的依赖列表)。
+    """
+    expected: Set[Tuple[str, str, str, str]] = set()
+    skipped: List[DependencyIssue] = []
+
+    for dep in dependencies:
+        dep_key = f"{dep.owner}.{dep.name}"
+        ref_key = f"{dep.referenced_owner}.{dep.referenced_name}"
+        dep_map = full_mapping.get(dep_key)
+        ref_map = full_mapping.get(ref_key)
+
+        if dep_map is None:
+            skipped.append(DependencyIssue(
+                dependent=dep_key,
+                dependent_type=dep.object_type,
+                referenced=ref_key,
+                referenced_type=dep.referenced_type,
+                reason="源对象未纳入受管范围，无法 remap。"
+            ))
+            continue
+        if ref_map is None:
+            skipped.append(DependencyIssue(
+                dependent=dep_key,
+                dependent_type=dep.object_type,
+                referenced=ref_key,
+                referenced_type=dep.referenced_type,
+                reason="被依赖对象未纳入受管范围，无法 remap。"
+            ))
+            continue
+
+        expected.add((
+            dep_map[0].upper(),
+            dep.object_type.upper(),
+            ref_map[0].upper(),
+            dep.referenced_type.upper()
+        ))
+
+    return expected, skipped
+
+
+def check_dependencies_against_ob(
+    expected_pairs: Set[Tuple[str, str, str, str]],
+    actual_pairs: Set[Tuple[str, str, str, str]],
+    skipped: List[DependencyIssue],
+    ob_meta: ObMetadata
+) -> DependencyReport:
+    """
+    对比目标端依赖关系，返回缺失/多余/跳过的依赖项。
+    """
+    report: DependencyReport = {
+        "missing": [],
+        "unexpected": [],
+        "skipped": skipped
+    }
+
+    def object_exists(full_name: str, obj_type: str) -> bool:
+        return full_name in ob_meta.objects_by_type.get(obj_type.upper(), set())
+
+    missing_pairs = expected_pairs - actual_pairs
+    extra_pairs = actual_pairs - expected_pairs
+
+    for dep_name, dep_type, ref_name, ref_type in sorted(missing_pairs):
+        if not object_exists(dep_name, dep_type):
+            reason = "OceanBase 中缺少依赖方对象。"
+        elif not object_exists(ref_name, ref_type):
+            reason = "OceanBase 中缺少被依赖对象。"
+        else:
+            reason = "OceanBase 中未建立 remap 后的引用关系。"
+        report["missing"].append(DependencyIssue(
+            dependent=dep_name,
+            dependent_type=dep_type,
+            referenced=ref_name,
+            referenced_type=ref_type,
+            reason=reason
+        ))
+
+    for dep_name, dep_type, ref_name, ref_type in sorted(extra_pairs):
+        report["unexpected"].append(DependencyIssue(
+            dependent=dep_name,
+            dependent_type=dep_type,
+            referenced=ref_name,
+            referenced_type=ref_type,
+            reason="OceanBase 存在未在 Oracle 源端出现的依赖关系，需人工确认。"
+        ))
+
+    return report
+
+
 # ====================== TABLE / VIEW / 其他主对象校验 ======================
 
 def check_primary_objects(
@@ -1011,7 +1277,7 @@ def check_primary_objects(
                     length_mismatches
                 ))
 
-        elif obj_type_u in ('VIEW', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'SYNONYM'):
+        elif obj_type_u in PRIMARY_EXISTENCE_ONLY_TYPES:
             ob_set = ob_meta.objects_by_type.get(obj_type_u, set())
             if full_tgt in ob_set:
                 results['ok'].append((obj_type_u, full_tgt))
@@ -1419,7 +1685,9 @@ def setup_metadata_session(ora_conn):
 
 
 DDL_OBJ_TYPE_MAPPING = {
-    'PACKAGE BODY': 'PACKAGE_BODY'
+    'PACKAGE BODY': 'PACKAGE_BODY',
+    'MATERIALIZED VIEW': 'MATERIALIZED_VIEW',
+    'TYPE BODY': 'TYPE_BODY'
 }
 
 
@@ -1645,18 +1913,18 @@ def generate_fixup_scripts(
     extra_results: ExtraCheckResults,
     master_list: MasterCheckList,
     oracle_meta: OracleMetadata,
-    remap_rules: RemapRules
+    full_object_mapping: Dict[str, Tuple[str, str]]
 ):
     """
     基于校验结果生成 fix_up DDL 脚本，并按依赖顺序排列：
       1. SEQUENCE
       2. TABLE (CREATE)
       3. TABLE (ALTER - for column diffs)
-      4. VIEW
+      4. VIEW / MATERIALIZED VIEW
       5. INDEX
       6. CONSTRAINT
       7. TRIGGER
-      8. PROCEDURE / FUNCTION / PACKAGE / PACKAGE BODY / SYNONYM
+      8. PROCEDURE / FUNCTION / PACKAGE / PACKAGE BODY / SYNONYM / JOB / SCHEDULE / TYPE / TYPE BODY
     """
     base_dir = Path(settings.get('fixup_dir', 'fix_up'))
 
@@ -1674,48 +1942,36 @@ def generate_fixup_scripts(
         if obj_type.upper() == 'TABLE'
     }
     object_replacements: List[Tuple[Tuple[str, str], Tuple[str, str]]] = []
-    table_replacements: List[Tuple[Tuple[str, str], Tuple[str, str]]] = []
-    for src_name, tgt_name, obj_type in master_list:
+    replacement_set: Set[Tuple[str, str, str, str]] = set()
+    for src_name, (tgt_name, obj_type) in full_object_mapping.items():
         try:
             src_schema, src_object = src_name.split('.')
             tgt_schema, tgt_object = tgt_name.split('.')
         except ValueError:
             continue
-        object_replacements.append(
-            ((src_schema.upper(), src_object.upper()), (tgt_schema.upper(), tgt_object.upper()))
-        )
-        if obj_type.upper() == 'TABLE':
-            table_replacements.append(
-                ((src_schema.upper(), src_object.upper()), (tgt_schema.upper(), tgt_object.upper()))
-            )
-    remap_replacements: List[Tuple[Tuple[str, str], Tuple[str, str]]] = []
-    for src, tgt in remap_rules.items():
-        try:
-            src_schema, src_obj = src.split('.')
-            tgt_schema, tgt_obj = tgt.split('.')
-        except ValueError:
+        key = (src_schema.upper(), src_object.upper(), tgt_schema.upper(), tgt_object.upper())
+        if key in replacement_set:
             continue
-        remap_replacements.append(
-            ((src_schema.upper(), src_obj.upper()), (tgt_schema.upper(), tgt_obj.upper()))
+        object_replacements.append(
+            ((key[0], key[1]), (key[2], key[3]))
         )
+        replacement_set.add(key)
+
     all_replacements = list(object_replacements)
-    replacement_set = {
-        (pair[0][0], pair[0][1], pair[1][0], pair[1][1]) for pair in object_replacements
-    }
-    for pair in remap_replacements:
-        key = (pair[0][0], pair[0][1], pair[1][0], pair[1][1])
-        if key not in replacement_set:
-            all_replacements.append(pair)
-            replacement_set.add(key)
-    schema_map = build_schema_mapping(master_list)
+
     obj_type_to_dir = {
         'TABLE': 'table',
         'VIEW': 'view',
+        'MATERIALIZED VIEW': 'materialized_view',
         'PROCEDURE': 'procedure',
         'FUNCTION': 'function',
         'PACKAGE': 'package',
         'PACKAGE BODY': 'package_body',
         'SYNONYM': 'synonym',
+        'JOB': 'job',
+        'SCHEDULE': 'schedule',
+        'TYPE': 'type',
+        'TYPE BODY': 'type_body',
     }
 
     try:
@@ -1777,13 +2033,15 @@ def generate_fixup_scripts(
                     header = f"基于列差异的 ALTER TABLE 修补脚本: {tgt_schema}.{tgt_table} (源: {src_schema}.{src_table})"
                     write_fixup_file(base_dir, 'table_alter', filename, alter_sql, header)
 
-            # 顺序 4: VIEW 缺失
-            log.info("[FIXUP] (4/8) 正在生成缺失的 VIEW CREATE 脚本...")
+            # 顺序 4: VIEW / MATERIALIZED VIEW 缺失
+            log.info("[FIXUP] (4/8) 正在生成缺失的 VIEW / MATERIALIZED VIEW 脚本...")
             for (obj_type, tgt_name, src_name) in missing_main_objects:
-                if obj_type.upper() != 'VIEW': continue
+                obj_type_u = obj_type.upper()
+                if obj_type_u not in ('VIEW', 'MATERIALIZED VIEW'):
+                    continue
                 src_schema, src_obj = src_name.split('.')
                 tgt_schema, tgt_obj = tgt_name.split('.')
-                ddl = oracle_get_ddl(ora_conn, 'VIEW', src_schema, src_obj)
+                ddl = oracle_get_ddl(ora_conn, obj_type_u, src_schema, src_obj)
                 if ddl:
                     ddl_adj = adjust_ddl_for_object(
                         ddl, src_schema, src_obj, tgt_schema, tgt_obj,
@@ -1791,8 +2049,9 @@ def generate_fixup_scripts(
                     )
                     ddl_adj = normalize_ddl_for_ob(ddl_adj)
                     filename = f"{tgt_schema}.{tgt_obj}.sql"
-                    header = f"修补缺失的 VIEW {tgt_schema}.{tgt_obj} (源: {src_schema}.{src_obj})"
-                    write_fixup_file(base_dir, 'view', filename, ddl_adj, header)
+                    header = f"修补缺失的 {obj_type_u} {tgt_schema}.{tgt_obj} (源: {src_schema}.{src_obj})"
+                    subdir = obj_type_to_dir[obj_type_u]
+                    write_fixup_file(base_dir, subdir, filename, ddl_adj, header)
 
             # 顺序 5: INDEX 缺失
             log.info("[FIXUP] (5/8) 正在生成 INDEX 脚本...")
@@ -1908,7 +2167,10 @@ def generate_fixup_scripts(
             log.info("[FIXUP] (8/8) 正在生成其余代码对象脚本...")
             for (obj_type, tgt_name, src_name) in missing_main_objects:
                 obj_type_u = obj_type.upper()
-                if obj_type_u not in ('PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'SYNONYM'):
+                if obj_type_u not in (
+                    'PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY',
+                    'SYNONYM', 'JOB', 'SCHEDULE', 'TYPE', 'TYPE BODY'
+                ):
                     continue
                 src_schema, src_obj = src_name.split('.')
                 tgt_schema, tgt_obj = tgt_name.split('.')
@@ -1948,6 +2210,7 @@ def print_final_report(
     tv_results: ReportResults,
     total_checked: int,
     extra_results: Optional[ExtraCheckResults] = None,
+    dependency_report: Optional[DependencyReport] = None,
     report_file: Optional[Path] = None
 ):
     custom_theme = Theme({
@@ -1966,6 +2229,12 @@ def print_final_report(
             "constraint_mismatched": [], "sequence_ok": [], "sequence_mismatched": [],
             "trigger_ok": [], "trigger_mismatched": [],
         }
+    if dependency_report is None:
+        dependency_report = {
+            "missing": [],
+            "unexpected": [],
+            "skipped": []
+        }
 
     log.info("所有校验已完成。正在生成最终报告...")
 
@@ -1981,6 +2250,9 @@ def print_final_report(
     seq_mis_cnt = len(extra_results.get("sequence_mismatched", []))
     trg_ok_cnt = len(extra_results.get("trigger_ok", []))
     trg_mis_cnt = len(extra_results.get("trigger_mismatched", []))
+    dep_missing_cnt = len(dependency_report.get("missing", []))
+    dep_unexpected_cnt = len(dependency_report.get("unexpected", []))
+    dep_skipped_cnt = len(dependency_report.get("skipped", []))
 
     console.print(Panel.fit("[bold]数据库对象迁移校验报告 (V0.2 - Rich)[/bold]", style="title"))
 
@@ -2015,6 +2287,14 @@ def print_final_report(
     ext_text.append(f"一致 {trg_ok_cnt} / ", style="ok")
     ext_text.append(f"差异 {trg_mis_cnt}", style="mismatch")
     summary_table.add_row("[bold]扩展对象 (INDEX/SEQ/etc.)[/bold]", ext_text)
+    dep_text = Text()
+    dep_text.append("缺失依赖: ", style="missing")
+    dep_text.append(f"{dep_missing_cnt}  ")
+    dep_text.append("额外依赖: ", style="mismatch")
+    dep_text.append(f"{dep_unexpected_cnt}  ")
+    dep_text.append("跳过: ", style="info")
+    dep_text.append(f"{dep_skipped_cnt}")
+    summary_table.add_row("[bold]依赖关系[/bold]", dep_text)
     console.print(summary_table)
 
     TYPE_COL_WIDTH = 16
@@ -2143,6 +2423,30 @@ def print_final_report(
         )
     )
 
+    dep_total = dep_missing_cnt + dep_unexpected_cnt + dep_skipped_cnt
+    if dep_total:
+        dep_table = Table(title=f"[header]9. 依赖关系校验 (共 {dep_total} 项)", expand=True)
+        dep_table.add_column("类别", style="info", width=12)
+        dep_table.add_column("依赖对象", style="info", width=OBJECT_COL_WIDTH)
+        dep_table.add_column("类型", style="info", width=TYPE_COL_WIDTH)
+        dep_table.add_column("被依赖对象", style="info", width=OBJECT_COL_WIDTH)
+        dep_table.add_column("说明", width=DETAIL_COL_WIDTH)
+
+        def render_dep_rows(label: str, entries: List[DependencyIssue], style: str) -> None:
+            for issue in entries:
+                dep_table.add_row(
+                    f"[{style}]{label}[/{style}]",
+                    issue.dependent,
+                    issue.dependent_type,
+                    issue.referenced,
+                    issue.reason
+                )
+
+        render_dep_rows("缺失", dependency_report.get("missing", []), "missing")
+        render_dep_rows("额外", dependency_report.get("unexpected", []), "mismatch")
+        render_dep_rows("跳过", dependency_report.get("skipped", []), "info")
+        console.print(dep_table)
+
     # --- 4. 无效 Remap 规则 ---
     if tv_results['extraneous']:
         table = Table(title=f"[header]4. 无效的 Remap 规则 (共 {extraneous_count} 个)", expand=True)
@@ -2156,11 +2460,16 @@ def print_final_report(
         "[bold]Fixup 脚本生成目录[/bold]\n\n"
         "fix_up/table         : 缺失 TABLE 的 CREATE 脚本\n"
         "fix_up/view          : 缺失 VIEW 的 CREATE 脚本\n"
+        "fix_up/materialized_view : 缺失 MATERIALIZED VIEW 的 CREATE 脚本\n"
         "fix_up/procedure     : 缺失 PROCEDURE 的 CREATE 脚本\n"
         "fix_up/function      : 缺失 FUNCTION 的 CREATE 脚本\n"
         "fix_up/package       : 缺失 PACKAGE 的 CREATE 脚本\n"
         "fix_up/package_body  : 缺失 PACKAGE BODY 的 CREATE 脚本\n"
         "fix_up/synonym       : 缺失 SYNONYM 的 CREATE 脚本\n"
+        "fix_up/job           : 缺失 JOB 的 CREATE 脚本\n"
+        "fix_up/schedule      : 缺失 SCHEDULE 的 CREATE 脚本\n"
+        "fix_up/type          : 缺失 TYPE 的 CREATE 脚本\n"
+        "fix_up/type_body     : 缺失 TYPE BODY 的 CREATE 脚本\n"
         "fix_up/index         : 缺失 INDEX 的 CREATE 脚本\n"
         "fix_up/constraint    : 缺失约束的 CREATE 脚本\n"
         "fix_up/sequence      : 缺失 SEQUENCE 的 CREATE 脚本\n"
@@ -2207,6 +2516,19 @@ def main():
 
     # 5) 生成主校验清单
     master_list = generate_master_list(source_objects, remap_rules)
+    full_object_mapping = build_full_object_mapping(source_objects, remap_rules)
+    oracle_dependencies = load_oracle_dependencies(ora_cfg, settings['source_schemas_list'])
+    expected_dependency_pairs, skipped_dependency_pairs = build_expected_dependency_pairs(
+        oracle_dependencies,
+        full_object_mapping
+    )
+    target_schemas: Set[str] = set()
+    for tgt_name, _ in full_object_mapping.values():
+        try:
+            schema, _ = tgt_name.split('.')
+            target_schemas.add(schema.upper())
+        except ValueError:
+            continue
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_dir_setting = settings.get('report_dir', 'reports').strip() or 'reports'
@@ -2214,6 +2536,12 @@ def main():
     report_dir.mkdir(parents=True, exist_ok=True)
     report_path = report_dir / f"report_{timestamp}.txt"
     log.info(f"本次报告将输出到: {report_path}")
+
+    dependency_report: DependencyReport = {
+        "missing": [],
+        "unexpected": [],
+        "skipped": skipped_dependency_pairs
+    }
 
     if not master_list:
         log.info("主校验清单为空，程序结束。")
@@ -2233,19 +2561,13 @@ def main():
             "trigger_ok": [],
             "trigger_mismatched": [],
         }
-        print_final_report(tv_results, 0, extra_results, report_path)
+        print_final_report(tv_results, 0, extra_results, dependency_report, report_path)
         return
 
     # 6) 计算目标端 schema 集合并一次性 dump OB 元数据
-    target_schemas: Set[str] = set()
-    for _, tgt_name, _ in master_list:
-        try:
-            schema, _ = tgt_name.split('.')
-            target_schemas.add(schema.upper())
-        except ValueError:
-            continue
-
     ob_meta = dump_ob_metadata(ob_cfg, target_schemas)
+
+    ob_dependencies = load_ob_dependencies(ob_cfg, target_schemas)
 
     # 7) 主对象校验
     oracle_meta = dump_oracle_metadata(ora_cfg, master_list, settings)
@@ -2260,15 +2582,30 @@ def main():
     # 8) 扩展对象校验 (索引/约束/序列/触发器)
     extra_results = check_extra_objects(settings, master_list, ob_meta, oracle_meta)
 
+    dependency_report = check_dependencies_against_ob(
+        expected_dependency_pairs,
+        ob_dependencies,
+        skipped_dependency_pairs,
+        ob_meta
+    )
+
     # 9) 生成修补脚本
     if settings.get('generate_fixup', 'true').strip().lower() in ('true', '1', 'yes'):
         log.info('已开启修补脚本生成，开始写入 fix_up 目录...')
-        generate_fixup_scripts(ora_cfg, settings, tv_results, extra_results, master_list, oracle_meta, remap_rules)
+        generate_fixup_scripts(
+            ora_cfg,
+            settings,
+            tv_results,
+            extra_results,
+            master_list,
+            oracle_meta,
+            full_object_mapping
+        )
     else:
         log.info('已根据配置跳过修补脚本生成，仅打印对比报告。')
 
     # 10) 输出最终报告
-    print_final_report(tv_results, len(master_list), extra_results, report_path)
+    print_final_report(tv_results, len(master_list), extra_results, dependency_report, report_path)
 
 
 if __name__ == "__main__":
