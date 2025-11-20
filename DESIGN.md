@@ -1,92 +1,131 @@
 # 数据库对象对比工具设计文档
 
-本文档阐述了数据库对象对比脚本的设计思路、核心架构和工作流程。
+本文档描述最新版 OceanBase Comparator Toolkit 的设计思路。新版本在原有“Oracle vs OceanBase” 元数据对比基础上，加入了依赖分析、授权推导、dbcat DDL 提取、Rich 报告与全量 fix-up 管道。
 
 ## 1. 核心目标
 
-这个工具用于自动对比 Oracle 和 OceanBase 数据库之间的对象，找出差异，并生成 SQL “修补”脚本，帮助用户快速同步目标数据库的结构。
+1. **准确识别差异**：覆盖 TABLE/VIEW/MATERIALIZED VIEW/PLSQL 对象/TYPE/JOB/SCHEDULE 等主对象，并扩展校验 INDEX/CONSTRAINT/SEQUENCE/TRIGGER。
+2. **自动化修补**：对缺失对象、列差异、授权缺口生成结构化 SQL，支持自动执行。
+3. **可追踪的报告**：通过 Rich 报表与文本快照输出，记录所有差异、依赖状态、无效 Remap 等，使迁移过程可审计。
+4. **高性能 & 低负载**：仍坚持“一次转储、本地对比”，避免循环访问数据库。
 
-主要解决以下几个痛点：
-- **对象缺失**：目标库缺少源库的表、视图、索引等。
-- **对象不一致**：
-    - 表的列不匹配（多列或少列）。
-    - 列定义不匹配（如 `VARCHAR` 长度）。
-    - 索引、约束的结构不一致。
-- **手动对比效率低、易出错**：对于有成百上千个对象的复杂数据库，手动排查几乎不可能完成。
+## 2. 总体架构
 
-## 2. 核心设计：一次转储，本地对比
+```
+db.ini + remap_rules.txt
+        │
+        ▼
+Oracle Thick Mode (ALL_OBJECTS / ALL_DEPENDENCIES / DBMS_METADATA)
+        │
+        │        obclient (ALL_OBJECTS / ALL_TAB_COLUMNS / … / ALL_DEPENDENCIES)
+        ▼                           │
+   源对象映射 + 依赖映射 + 目标元数据集
+        │
+        ├── 主对象 / 扩展对象对比
+        ├── 依赖核对 & GRANT 计算
+        ├── dbcat DDL 提取 + fix-up 生成
+        └── Rich 报告 + 文本快照 + fix_up 目录
+```
 
-为了提升性能并减少对目标库的压力，脚本采用了 **“一次转储，本地对比”** 的架构。
+关键阶段：
 
-如果采用在循环中反复查询源和目标库的传统做法，每次只查一个对象，会产生大量网络请求，性能很差。
+1. **配置验证**：校验 `source_schemas`、Remap、Instant Client 路径等，一旦发现致命问题立即退出。
+2. **元数据缓存**：Oracle 侧使用 Thick Mode + 批量查询；OceanBase 侧使用 obclient 执行预设 SQL，所有数据一次性加载到内存。
+3. **差异分析**：依赖 `master_list`（源→目标）完成表/列校验；索引/约束/触发器使用 Oracle/OB 双缓存进行集合比对；序列按 schema 级别比较。
+4. **依赖 & 授权**：`ALL_DEPENDENCIES` 映射后生成期望依赖集合，与目标库实际依赖比较并给出原因，同时计算跨 schema 所需的 `GRANT`。
+5. **修补脚本**：构建 dbcat 请求（含 schema→对象类型的任务集合），复用 `history/dbcat_output` 缓存，对 DDL 做 schema remap、语法清理、授权插入，并按对象类型输出到 `fix_up/`。
+6. **报告与执行**：Rich 控制台输出+落地文件；`final_fix.py` 负责在 OceanBase 上顺序执行 SQL 并回写结果。
 
-脚本的实际工作流程是：
-1.  **连接源端 Oracle**：拿到所有要检查的对象的完整列表。
-2.  **一次性转储目标端元数据**：通过 `obclient` 工具，执行几个预设的 SQL，把目标库 OceanBase 的所有相关元数据（如 `ALL_OBJECTS`, `ALL_TAB_COLUMNS` 等）一次性 dump 到本地。
-3.  **在本地内存中对比**：将 dump 下来的元数据加载到 Python 的数据结构里。之后所有的对比，包括对象是否存在、列名是否匹配、索引/约束结构是否一致等，都在本地内存中完成，不再和目标数据库交互。
+## 3. 配置与 Remap 驱动
 
-这个设计的优势很明显：
-- **高性能**：把成千上万次远程查询优化为几次批量拉取，大大加快了校验速度。
-- **低负载**：显著降低了对目标 OceanBase 数据库的查询压力。
-- **逻辑清晰**：数据获取和数据分析两个阶段分开，代码结构更清晰。
+- `db.ini` 完全驱动运行参数：除了连接信息外，还包含 `fixup_dir`、`report_dir`、`generate_fixup`、`obclient_timeout`、`cli_timeout`（dbcat）、`dbcat_*` 等。  
+- `remap_rules.txt` 控制源/目标对象映射，支持 `PACKAGE BODY` 特殊写法及注释。加载时会验证：
+  - 源对象是否存在；
+  - 是否出现“多对一”目标对象（直接报错）。
+- 程序会构建两种映射：
+  - `master_list`: 仅包含主对象（TABLE/VIEW/PLSQL/TYPE等）用于主校验；
+  - `full_object_mapping`: 包含所有受管对象（含 TRIGGER/SEQUENCE/INDEX），供依赖分析与脚本生成共享。
 
-## 3. 配置文件驱动
+## 4. 元数据采集
 
-为了灵活和复用，工具的行为完全由外部配置文件驱动。
+### Oracle
 
--   **`db.ini`**: 主配置文件。
-    -   `[ORACLE_SOURCE]`: 源端 Oracle 的连接信息。
-    -   `[OCEANBASE_TARGET]`: 目标端 OceanBase 的连接信息和 `obclient` 路径。
-    -   `[SETTINGS]`: 核心校验参数，如：
-        -   `source_schemas`: 要扫描的源端 schema 列表。
-        -   `remap_file`: 对象名重映射规则文件的路径。
-        -   `obclient_timeout`: `obclient` 执行超时时间，增强程序健壮性。
+- 通过 `oracledb` Thick Mode 连接，确保能使用 `DBMS_METADATA` 与 `ALL_*` 视图。
+- 读取内容：
+  - `ALL_OBJECTS`：源对象全集；
+  - `ALL_TAB_COLUMNS`、`ALL_INDEXES/ALL_IND_COLUMNS`、`ALL_CONSTRAINTS/ALL_CONS_COLUMNS`、`ALL_TRIGGERS`、`ALL_SEQUENCES`；
+  - `ALL_DEPENDENCIES`；
+  - DDL 提取阶段调用 dbcat（内部仍读取 Oracle 数据字典）以便批量生成标准化 DDL。
+- 把读取结果缓存到 `OracleMetadata`（按 schema+对象名称索引）。
 
--   **`remap_rules.txt`**: 对象重映射规则。
-    -   解决了不同环境中对象命名可能不一致的问题。
-    -   例如，源端的 `PROD.ORDERS` 在目标端可能叫 `MIG_PROD.ORDERS`，只需在文件中写一行 `PROD.ORDERS=MIG_PROD.ORDERS` 即可。
-    -   工具会根据这个规则生成最终的校验清单。
+### OceanBase
 
-## 4. 详细工作流程
+- 使用一次性 obclient 调用（带 `-ss` + `timeout`）拉取相同的 `ALL_*` 视图。
+- 结果存放在 `ObMetadata` 中，结构与 Oracle 侧对应，便于纯 Python 内存对比。
 
-程序按以下步骤执行：
+该“批量转储”架构保证比较阶段再无网络往返，提高性能和可重复性。
 
-1.  **加载配置**：读取 `db.ini` 和 `remap_rules.txt`。
-2.  **获取源对象**：连接 Oracle，查询 `ALL_OBJECTS`，拿到指定 schema 下所有要对比的对象列表。
-3.  **验证规则**：检查 `remap_rules.txt` 里写的源对象在 Oracle 中是否存在，对无效规则给出警告。
-4.  **生成主校验清单**：应用重映射规则，生成一个“源-目标”的完整映射清单。同时，检测并阻止“多对一”的非法映射。
-5.  **转储 OceanBase 元数据**：根据校验清单确定要查哪些目标 schema，然后调用 `obclient` 把元数据 dump 下来，解析到内存中。
-6.  **转储 Oracle 元数据**：为了避免后续生成脚本时反复查 Oracle，这里会预先批量加载所有需要的 Oracle 元数据（列定义、索引等）到内存。
-7.  **执行对比**：
-    -   **主对象对比**：遍历清单，检查目标对象是否存在。对表，额外对比列名。
-    -   **扩展对象对比**：对已存在的表，进一步对比索引、约束和触发器。同时，按 schema 对比序列。
-8.  **生成修补脚本**：
-    -   根据对比结果，调用 Oracle 的 `DBMS_METADATA.GET_DDL` 获取源对象的标准 DDL。
-    -   对 DDL 进行规范化和重映射处理（比如替换 schema 名）。
-    -   对表的列差异，直接生成 `ALTER TABLE` 语句。
-    -   所有生成的 `.sql` 脚本分类存放在 `fix_up/` 目录下，等待人工审核。
-9.  **输出报告**：用 `rich` 库在控制台打印一份格式化、带高亮的详细报告，清晰展示对比结果，并指明修补脚本的存放位置。
+## 5. 对比策略
 
-## 5. 对象对比逻辑
+1. **主对象**  
+   - TABLE：检查存在性、列名集合（过滤 `OMS_*` 内部列）、`VARCHAR/VARCHAR2` 列长度是否满足 `ceil(1.5 * 源长度)`。
+   - VIEW/MVIEW/类型/PLSQL/SYNONYM/JOB/SCHEDULE 等：验证存在性即可。
+2. **扩展对象**  
+   - INDEX：按列序列+唯一性匹配；多余或缺少的索引列集合会在报告中详细列出。
+   - CONSTRAINT：区分 PK/UK/FK，比较列组合和定义。
+   - TRIGGER：考虑 remap 后的触发器名称，检查目标端是否缺失或多余。
+   - SEQUENCE：按源 schema → 目标 schema 映射逐个确认。
+3. **数量汇总**  
+   - 在报告中附带 Oracle vs OceanBase 的对象数量对比，快速观察整体迁移完成度。
 
--   **TABLE**:
-    -   检查是否存在。
-    -   对比列名集合（忽略 `OMS_` 开头的内部列）。
-    -   检查 `VARCHAR`/`VARCHAR2` 列的长度（默认目标端长度应为源端 * 1.5）。
--   **VIEW, PROCEDURE, FUNCTION, PACKAGE, SYNONYM**:
-    -   只检查是否存在。
--   **INDEX**:
-    -   检查是否存在。
-    -   对比结构：索引的列、列顺序、是否唯一。
--   **CONSTRAINT (PK/UK/FK)**:
-    -   检查是否存在。
-    -   对比结构：约束类型和涉及的列。
--   **SEQUENCE, TRIGGER**:
-    -   只检查是否存在。
+所有差异会被写入 `tv_results`/`extra_results`，供后续报告和修补模块复用。
 
-## 6. 健壮性设计
+## 6. 依赖分析与授权
 
--   **超时机制**：所有 `obclient` 调用都设置了超时，防止因网络或数据库问题卡死。
--   **配置验证**：在程序早期严格校验配置文件，尽早发现错误。
--   **清晰的错误提示**：在连接失败、文件找不到、配置错误时，给出明确的错误信息并退出。
--   **依赖检查**：启动时检查 `oracledb` 和 `rich` 等关键库是否存在，引导用户安装。
+- 使用 `ALL_DEPENDENCIES` 构建 `{依赖对象 -> 被依赖对象}` 的全集，对应的对象类型限定在 `ALL_TRACKED_OBJECT_TYPES`。
+- 应用 `full_object_mapping` 后得到目标端“期望依赖集合”，再与 OceanBase 实际依赖差集：
+  - **缺失依赖**：指出是依赖对象缺失、被依赖对象缺失还是单纯未编译。
+  - **额外依赖**：提示目标端存在额外耦合，需人工判断。
+  - **跳过项**：源/目标缺少 remap 信息时记录原因但不报错。
+- 基于期望依赖自动推导跨 schema 所需权限：例如 PROC 调用其他 schema 的 TABLE/SYNONYM → 输出 `GRANT SELECT ...`，PLSQL 调用包/类型 → `GRANT EXECUTE ...`。这些脚本写入 `fix_up/grants/` 并在报告中展示。
+
+## 7. 修补脚本生成
+
+### dbcat 集成
+
+- 根据差异收集“需要 DDL 的对象集合”，以 schema 为维度构造 dbcat 命令：
+  - 可复用 `history/dbcat_output/<schema>/...` 缓存，未命中的对象再触发 dbcat。
+  - 运行 dbcat 需要 `JAVA_HOME` 与 `dbcat_from/dbcat_to` profile，超时时间由 `cli_timeout` 控制。
+- DDL 后处理：
+  - `adjust_ddl_for_object`：根据 Remap 替换 schema/name，支持额外引用对象的重写。
+  - `cleanup_dbcat_wrappers`：移除 `DELIMITER/$$` 包裹。
+  - `normalize_ddl_for_ob`：剔除 OceanBase 不支持的 `USING INDEX (...) ENABLE` 等片段。
+  - `enforce_schema_for_ddl`：必要时插入 `ALTER SESSION SET CURRENT_SCHEMA`。
+
+### 输出顺序与目录
+
+生成顺序遵循依赖关系：SEQUENCE → TABLE（CREATE + ALTER）→ 代码对象 → INDEX → CONSTRAINT → TRIGGER → GRANT → 其他对象。所有文件位于 `fix_up/<object_type>/`，并带有头部注释（源/目标信息、审核提示）。  
+
+表列差异专门写入 `fix_up/table_alter/`，对缺失列生成 `ADD COLUMN`，对长度不足生成 `MODIFY`，多余列仅以注释形式提示 `DROP`。  
+
+若某些对象类型 dbcat 暂不支持，生成阶段会给出 warning，提示需要手动处理。
+
+## 8. 报告与执行
+
+- **Rich 控制台报告**：包含综合概要、表级差异、索引/约束/序列/触发器明细、依赖缺口、授权脚本、无效 remap 等；每个章节都带计数和色彩区分。
+- **文本快照 (`reports/report_<timestamp>.txt`)**：通过 `Console(record=True)` 同步导出，方便归档或发给其他团队。
+- **fix_up 指南**：报告结尾展示各子目录含义，提醒人工审核。
+- **`final_fix.py` 执行器**：
+  - 读取 `fix_up/` 第一层子目录下的 SQL。
+  - 通过 obclient 顺序执行，成功后移动到 `fix_up/done/<subdir>/`，失败则保留原地并打印错误。
+  - 输出明细表与累计结果，便于反复执行。
+
+## 9. 健壮性设计
+
+- **超时控制**：所有 obclient 调用使用 `obclient_timeout`；dbcat 调用使用 `cli_timeout`；超时会记录 SQL 并立即退出。
+- **配置前置校验**：缺失 Instant Client / dbcat / JAVA_HOME / Remap 异常会直接报错，避免运行到一半失败。
+- **错误提示**：对每一步都提供结构化日志，方便定位：例如 Remap 无效、Oracle 元数据为空、dbcat 缺文件等。
+- **缓存与重用**：dbcat 输出保存在 `history/dbcat_output`，避免重复扫描；`generate_fixup=false` 时跳过 fix-up 阶段以加快巡检。
+- **并行友好**：所有输出目录（`fix_up/`, `reports/`, `history/dbcat_output/`）都显式创建且清理旧结果，确保自动化流水线能够多次运行。
+
+综上，该工具以配置驱动、一次转储、本地对比为核心；辅以依赖图与 dbcat 脚本生成，形成“发现问题 → 生成方案 → 执行验证”的闭环，满足大规模 Oracle → OceanBase 迁移过程的验证与修复需求。
