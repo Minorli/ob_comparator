@@ -39,10 +39,10 @@
    - TABLE 列不匹配：
        → 生成 ALTER TABLE ADD 列的脚本；
        → 对“多余列”生成注释掉的 DROP COLUMN 建议语句。
-   - 所有脚本写入 fix_up 目录下相应子目录，需人工审核后在 OceanBase 执行。
+   - 所有脚本写入 fixup_scripts 目录下相应子目录，需人工审核后在 OceanBase 执行。
 
 5. 健壮性：
-   - 所有 obclient 调用增加 timeout（从 db.ini 的 [SETTINGS] -> obclient_timeout 读取，默认 60 秒）。
+   - 所有 obclient 调用增加 timeout（从 config.ini 的 [SETTINGS] -> obclient_timeout 读取，默认 60 秒）。
 """
 
 import configparser
@@ -88,55 +88,7 @@ ObjectCountSummary = Dict[str, Dict[str, int]]
 # --- 全局 obclient timeout（秒），由配置初始化 ---
 OBC_TIMEOUT: int = 60
 
-
-# --- 扩展检查结果结构 ---
-class IndexMismatch(NamedTuple):
-    table: str
-    missing_indexes: Set[str]
-    extra_indexes: Set[str]
-    detail_mismatch: List[str]
-
-
-class ConstraintMismatch(NamedTuple):
-    table: str
-    missing_constraints: Set[str]
-    extra_constraints: Set[str]
-    detail_mismatch: List[str]
-
-
-class SequenceMismatch(NamedTuple):
-    src_schema: str
-    tgt_schema: str
-    missing_sequences: Set[str]
-    extra_sequences: Set[str]
-    note: Optional[str] = None
-
-
-class TriggerMismatch(NamedTuple):
-    table: str
-    missing_triggers: Set[str]
-    extra_triggers: Set[str]
-    detail_mismatch: List[str]
-
-
-ExtraCheckResults = Dict[str, List]
-
-
-def normalize_column_sequence(columns: Optional[List[str]]) -> Tuple[str, ...]:
-    if not columns:
-        return tuple()
-    seen: Set[str] = set()
-    normalized: List[str] = []
-    for col in columns:
-        col_u = (col or '').upper()
-        if not col_u:
-            continue
-        if col_u in seen:
-            continue
-        seen.add(col_u)
-        normalized.append(col_u)
-    return tuple(normalized)
-
+# --- 模型定义 ---
 class ObMetadata(NamedTuple):
     """
     一次性从 OceanBase dump 出来的元数据，用于本地对比。
@@ -188,6 +140,7 @@ class ColumnLengthIssue(NamedTuple):
     issue: str         # 'short' | 'oversize'
 
 
+# --- 对象类型常量 ---
 PRIMARY_OBJECT_TYPES: Tuple[str, ...] = (
     'TABLE',
     'VIEW',
@@ -239,8 +192,62 @@ OBJECT_COUNT_TYPES: Tuple[str, ...] = (
     'PROCEDURE',
     'FUNCTION',
     'PACKAGE',
-    'PACKAGE BODY'
+    'PACKAGE BODY',
+    'TYPE',
+    'TYPE BODY',
+    'MATERIALIZED VIEW',
+    'JOB',
+    'SCHEDULE'
 )
+
+
+# --- 扩展检查结果结构 ---
+class IndexMismatch(NamedTuple):
+    table: str
+    missing_indexes: Set[str]
+    extra_indexes: Set[str]
+    detail_mismatch: List[str]
+
+
+class ConstraintMismatch(NamedTuple):
+    table: str
+    missing_constraints: Set[str]
+    extra_constraints: Set[str]
+    detail_mismatch: List[str]
+
+
+class SequenceMismatch(NamedTuple):
+    src_schema: str
+    tgt_schema: str
+    missing_sequences: Set[str]
+    extra_sequences: Set[str]
+    note: Optional[str] = None
+
+
+class TriggerMismatch(NamedTuple):
+    table: str
+    missing_triggers: Set[str]
+    extra_triggers: Set[str]
+    detail_mismatch: List[str]
+
+
+ExtraCheckResults = Dict[str, List]
+
+
+def normalize_column_sequence(columns: Optional[List[str]]) -> Tuple[str, ...]:
+    if not columns:
+        return tuple()
+    seen: Set[str] = set()
+    normalized: List[str] = []
+    for col in columns:
+        col_u = (col or '').upper()
+        if not col_u:
+            continue
+        if col_u in seen:
+            continue
+        seen.add(col_u)
+        normalized.append(col_u)
+    return tuple(normalized)
 
 GRANT_PRIVILEGE_BY_TYPE: Dict[str, str] = {
     'TABLE': 'SELECT',
@@ -300,7 +307,7 @@ DBCAT_OUTPUT_DIR_HINTS: Dict[str, Tuple[str, ...]] = {
 # ====================== 通用配置和基础函数 ======================
 
 def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
-    """读取 db.ini 配置文件"""
+    """读取 config.ini 配置文件"""
     log.info(f"正在加载配置文件: {config_file}")
     config = configparser.ConfigParser()
     if not config.read(config_file):
@@ -319,19 +326,19 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             sys.exit(1)
         settings['source_schemas_list'] = schemas_list
 
-        # fix_up 目录
-        settings.setdefault('fixup_dir', 'fix_up')
+        # fixup 脚本目录
+        settings.setdefault('fixup_dir', 'fixup_scripts')
         # obclient 超时时间 (秒)
         settings.setdefault('obclient_timeout', '60')
         # 报告输出目录
-        settings.setdefault('report_dir', 'reports')
+        settings.setdefault('report_dir', 'main_reports')
         # Oracle Instant Client 目录 (Thick Mode)
         settings.setdefault('oracle_client_lib_dir', '')
         # dbcat 相关配置
         settings.setdefault('dbcat_bin', '')
         settings.setdefault('dbcat_from', '')
         settings.setdefault('dbcat_to', '')
-        settings.setdefault('dbcat_output_dir', 'history/dbcat_output')
+        settings.setdefault('dbcat_output_dir', 'dbcat_output')
         settings.setdefault('java_home', os.environ.get('JAVA_HOME', ''))
 
         global OBC_TIMEOUT
@@ -387,7 +394,7 @@ def init_oracle_client_from_settings(settings: Dict) -> None:
     client_dir = settings.get('oracle_client_lib_dir', '').strip()
     if not client_dir:
         log.error("严重错误: 未在 [SETTINGS] 中配置 oracle_client_lib_dir。")
-        log.error("请在 db.ini 中添加例如: oracle_client_lib_dir = /home/user/instantclient_19_28")
+        log.error("请在 config.ini 中添加例如: oracle_client_lib_dir = /home/user/instantclient_19_28")
         sys.exit(1)
 
     client_path = Path(client_dir).expanduser()
@@ -520,7 +527,7 @@ def validate_remap_rules(remap_rules: RemapRules, source_objects: SourceObjectMa
 
     if extraneous_keys:
         log.warning(f"  [规则警告] 在 remap_rules.txt 中发现了 {len(extraneous_keys)} 个无效的源对象。")
-        log.warning("  (这些对象在源端 Oracle (db.ini 中配置的 schema) 中未找到)")
+        log.warning("  (这些对象在源端 Oracle (config.ini 中配置的 schema) 中未找到)")
         for key in extraneous_keys:
             log.warning(f"    - 无效条目: {key}")
     else:
@@ -648,6 +655,32 @@ def find_source_by_target(
     return None
 
 
+def build_schema_mapping(master_list: MasterCheckList) -> Dict[str, str]:
+    """
+    基于 master_list 中 TABLE 映射，推导 schema 映射：
+      如果同一 src_schema 只映射到唯一一个 tgt_schema，则使用该映射；
+      否则 (映射到多个目标 schema)，退回 src_schema 本身 (1:1)。
+    """
+    mapping_tmp: Dict[str, Set[str]] = {}
+    for src_name, tgt_name, obj_type in master_list:
+        if obj_type.upper() != 'TABLE':
+            continue
+        try:
+            src_schema, _ = src_name.split('.')
+            tgt_schema, _ = tgt_name.split('.')
+        except ValueError:
+            continue
+        mapping_tmp.setdefault(src_schema.upper(), set()).add(tgt_schema.upper())
+
+    final_mapping: Dict[str, str] = {}
+    for src_schema, tgt_set in mapping_tmp.items():
+        if len(tgt_set) == 1:
+            final_mapping[src_schema] = next(iter(tgt_set))
+        else:
+            final_mapping[src_schema] = src_schema
+    return final_mapping
+
+
 def compute_object_counts(
     source_objects: SourceObjectMap,
     ob_meta: ObMetadata,
@@ -678,6 +711,8 @@ def compute_object_counts(
         "oracle": oracle_counts,
         "oceanbase": ob_counts
     }
+
+
 
 
 # ====================== obclient + 一次性元数据转储 ======================
@@ -715,7 +750,7 @@ def obclient_run_sql(ob_cfg: ObConfig, sql_query: str) -> Tuple[bool, str, str]:
         return False, "", "TimeoutExpired"
     except FileNotFoundError:
         log.error(f"严重错误: 未找到 obclient 可执行文件: {ob_cfg['executable']}")
-        log.error("请检查 db.ini 中的 [OCEANBASE_TARGET] -> executable 路径。")
+        log.error("请检查 config.ini 中的 [OCEANBASE_TARGET] -> executable 路径。")
         sys.exit(1)
     except Exception as e:
         log.error(f"严重错误: 执行 subprocess 时发生未知错误: {e}")
@@ -1702,32 +1737,6 @@ def check_primary_objects(
 
 # ====================== 扩展：索引 / 约束 / 序列 / 触发器 ======================
 
-def build_schema_mapping(master_list: MasterCheckList) -> Dict[str, str]:
-    """
-    基于 master_list 中 TABLE 映射，推导 schema 映射：
-      如果同一 src_schema 只映射到唯一一个 tgt_schema，则使用该映射；
-      否则 (映射到多个目标 schema)，退回 src_schema 本身 (1:1)。
-    """
-    mapping_tmp: Dict[str, Set[str]] = {}
-    for src_name, tgt_name, obj_type in master_list:
-        if obj_type.upper() != 'TABLE':
-            continue
-        try:
-            src_schema, _ = src_name.split('.')
-            tgt_schema, _ = tgt_name.split('.')
-        except ValueError:
-            continue
-        mapping_tmp.setdefault(src_schema.upper(), set()).add(tgt_schema.upper())
-
-    final_mapping: Dict[str, str] = {}
-    for src_schema, tgt_set in mapping_tmp.items():
-        if len(tgt_set) == 1:
-            final_mapping[src_schema] = next(iter(tgt_set))
-        else:
-            final_mapping[src_schema] = src_schema
-    return final_mapping
-
-
 def compare_indexes_for_table(
     oracle_meta: OracleMetadata,
     ob_meta: ObMetadata,
@@ -2155,10 +2164,130 @@ def parse_oracle_dsn(dsn: str) -> Tuple[str, str, Optional[str]]:
         sys.exit(1)
 
 
+def collect_oracle_env_info(ora_cfg: OraConfig) -> Dict[str, str]:
+    """采集 Oracle 端基本信息（版本/容器/服务名/地址/用户）。"""
+    info: Dict[str, str] = {}
+    info["user"] = ora_cfg.get("user", "")
+    info["dsn"] = ora_cfg.get("dsn", "")
+    try:
+        host, port, service = parse_oracle_dsn(ora_cfg.get("dsn", ""))
+        info["host"] = host
+        info["port"] = port
+        info["service_name"] = service
+    except Exception:
+        pass
+
+    try:
+        with oracledb.connect(
+            user=ora_cfg["user"],
+            password=ora_cfg["password"],
+            dsn=ora_cfg["dsn"]
+        ) as conn:
+            info["version"] = getattr(conn, "version", "") or info.get("version", "")
+            with conn.cursor() as cursor:
+                try:
+                    cursor.execute("SELECT sys_context('userenv','con_name') FROM dual")
+                    row = cursor.fetchone()
+                    if row and row[0]:
+                        info["container"] = str(row[0])
+                except Exception:
+                    pass
+                try:
+                    cursor.execute("SELECT cdb FROM v$database")
+                    row = cursor.fetchone()
+                    if row and row[0] is not None:
+                        info["cdb_mode"] = "CDB" if str(row[0]).strip().upper() == "YES" else "Non-CDB"
+                except Exception:
+                    pass
+                try:
+                    cursor.execute("SELECT sys_context('userenv','service_name') FROM dual")
+                    row = cursor.fetchone()
+                    if row and row[0]:
+                        info["service_name"] = str(row[0])
+                except Exception:
+                    pass
+    except Exception as exc:
+        log.warning("Oracle 基本信息获取失败（将使用配置值作为兜底）：%s", exc)
+
+    return info
+
+
+def parse_ob_status_output(output: str) -> Dict[str, str]:
+    """解析 obclient status 输出中的关键信息。"""
+    info: Dict[str, str] = {}
+    for line in (output or "").splitlines():
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        key = key.strip().lower()
+        val = val.strip()
+        if not val:
+            continue
+        if key.startswith("server version"):
+            info["version"] = val
+        elif key == "current database":
+            info["current_database"] = val
+        elif key == "connection id":
+            info["connection_id"] = val
+        elif key == "ssl":
+            info["ssl"] = val
+    return info
+
+
+def collect_ob_env_info(ob_cfg: ObConfig) -> Dict[str, str]:
+    """采集 OceanBase 端基本信息（版本/连接/用户）。"""
+    configured_user = ob_cfg.get("user_string", "")
+    info: Dict[str, str] = {
+        "host": ob_cfg.get("host", ""),
+        "port": ob_cfg.get("port", ""),
+        "configured_user": configured_user,
+        "current_user": configured_user
+    }
+
+    status_cmd = [
+        ob_cfg["executable"],
+        "-h", ob_cfg["host"],
+        "-P", ob_cfg["port"],
+        "-u", ob_cfg["user_string"],
+        "-p" + ob_cfg["password"],
+        "-e", "status"
+    ]
+    try:
+        result = subprocess.run(
+            status_cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=OBC_TIMEOUT
+        )
+        if result.returncode == 0:
+            info.update(parse_ob_status_output(result.stdout))
+        else:
+            log.warning("obclient status 调用失败(%s): %s", result.returncode, result.stderr.strip())
+    except Exception as exc:
+        log.warning("获取 obclient status 信息失败（将尝试 SQL 查询）：%s", exc)
+
+    if "version" not in info or not info["version"].strip():
+        ok, stdout, _ = obclient_run_sql(ob_cfg, "SELECT version()")
+        if ok and stdout.strip():
+            info["version"] = stdout.strip().splitlines()[0]
+
+    version_raw = info.get("version", "")
+    if version_raw:
+        matches = list(re.finditer(r'\([^()]*\)', version_raw))
+        if len(matches) > 1:
+            second = matches[1]
+            version_raw = version_raw[:second.start()] + version_raw[second.end():]
+        info["version"] = " ".join(version_raw.split())
+
+    return info
+
+
 def resolve_dbcat_cli(settings: Dict) -> Path:
     bin_path = settings.get('dbcat_bin', '').strip()
     if not bin_path:
-        log.error("严重错误: 未配置 dbcat_bin，请在 db.ini 的 [SETTINGS] 中指定 dbcat 目录。")
+        log.error("严重错误: 未配置 dbcat_bin，请在 config.ini 的 [SETTINGS] 中指定 dbcat 目录。")
         sys.exit(1)
     cli_path = Path(bin_path)
     if cli_path.is_dir():
@@ -2258,7 +2387,7 @@ def fetch_dbcat_schema_objects(
     if not schema_requests:
         return results
 
-    base_output = Path(settings.get('dbcat_output_dir', 'history/dbcat_output'))
+    base_output = Path(settings.get('dbcat_output_dir', 'dbcat_output'))
     ensure_dir(base_output)
     load_cached_dbcat_results(base_output, schema_requests, results)
 
@@ -2269,7 +2398,7 @@ def fetch_dbcat_schema_objects(
     dbcat_cli = resolve_dbcat_cli(settings)
     java_home = settings.get('java_home') or os.environ.get('JAVA_HOME')
     if not java_home:
-        log.error("严重错误: 需要 JAVA_HOME 才能运行 dbcat，请在环境或 db.ini 中配置。")
+        log.error("严重错误: 需要 JAVA_HOME 才能运行 dbcat，请在环境或 config.ini 中配置。")
         sys.exit(1)
 
     for schema in list(schema_requests.keys()):
@@ -2747,7 +2876,7 @@ def generate_fixup_scripts(
     ob_meta: Optional[ObMetadata] = None
 ):
     """
-    基于校验结果生成 fix_up DDL 脚本，并按依赖顺序排列：
+    基于校验结果生成 fixup_scripts DDL 脚本，并按依赖顺序排列：
       1. SEQUENCE
       2. TABLE (CREATE)
       3. TABLE (ALTER - for column diffs)
@@ -2758,7 +2887,7 @@ def generate_fixup_scripts(
       8. 依赖重编译 (ALTER ... COMPILE)
       9. 依赖授权 (跨 schema)
     """
-    base_dir = Path(settings.get('fixup_dir', 'fix_up'))
+    base_dir = Path(settings.get('fixup_dir', 'fixup_scripts'))
 
     if not master_list:
         log.info("[FIXUP] master_list 为空，未生成修补脚本。")
@@ -3265,7 +3394,8 @@ def print_final_report(
     dependency_report: Optional[DependencyReport] = None,
     required_grants: Optional[Dict[str, Set[Tuple[str, str]]]] = None,
     report_file: Optional[Path] = None,
-    object_counts_summary: Optional[ObjectCountSummary] = None
+    object_counts_summary: Optional[ObjectCountSummary] = None,
+    endpoint_info: Optional[Dict[str, Dict[str, str]]] = None
 ):
     custom_theme = Theme({
         "ok": "green",
@@ -3319,6 +3449,49 @@ def print_final_report(
     TYPE_COL_WIDTH = 16
     OBJECT_COL_WIDTH = 42
     DETAIL_COL_WIDTH = 90
+
+    def format_endpoint_block(info: Dict[str, str], is_oracle: bool) -> str:
+        lines: List[str] = []
+        if not info:
+            return "无可用信息"
+        if info.get("version"):
+            lines.append(f"版本: {info['version']}")
+        if is_oracle:
+            if info.get("cdb_mode"):
+                lines.append(f"CDB/PDB: {info['cdb_mode']}")
+            if info.get("container"):
+                lines.append(f"容器: {info['container']}")
+            if info.get("service_name"):
+                lines.append(f"服务名: {info['service_name']}")
+        else:
+            if info.get("current_database"):
+                lines.append(f"当前库: {info['current_database']}")
+            if info.get("connection_id"):
+                lines.append(f"连接 ID: {info['connection_id']}")
+            if info.get("ssl"):
+                lines.append(f"SSL: {info['ssl']}")
+        host = info.get("host")
+        port = info.get("port")
+        if host or port:
+            lines.append(f"地址: {host or ''}:{port or ''}")
+        user_label = "连接用户" if is_oracle else "当前用户"
+        lines.append(f"{user_label}: {info.get('current_user') or info.get('user') or info.get('configured_user', '')}")
+        if is_oracle and info.get("dsn"):
+            lines.append(f"DSN: {info['dsn']}")
+        return "\n".join([line for line in lines if line.strip()]) or "无可用信息"
+
+    if endpoint_info:
+        src_info = endpoint_info.get("oracle", {})
+        tgt_info = endpoint_info.get("oceanbase", {})
+        env_table = Table(title="[header]源/目标环境", width=section_width)
+        env_table.add_column("源 (Oracle)", width=section_width // 2)
+        env_table.add_column("目标 (OceanBase)", width=section_width // 2)
+        env_table.add_row(
+            format_endpoint_block(src_info, True),
+            format_endpoint_block(tgt_info, False)
+        )
+        console.print(env_table)
+        console.print("")
 
     # --- 综合概要 ---
     summary_table = Table(
@@ -3591,25 +3764,25 @@ def print_final_report(
     # --- 提示 ---
     fixup_panel = Panel.fit(
         "[bold]Fixup 脚本生成目录[/bold]\n\n"
-        "fix_up/table         : 缺失 TABLE 的 CREATE 脚本\n"
-        "fix_up/view          : 缺失 VIEW 的 CREATE 脚本\n"
-        "fix_up/materialized_view : 缺失 MATERIALIZED VIEW 的 CREATE 脚本\n"
-        "fix_up/procedure     : 缺失 PROCEDURE 的 CREATE 脚本\n"
-        "fix_up/function      : 缺失 FUNCTION 的 CREATE 脚本\n"
-        "fix_up/package       : 缺失 PACKAGE 的 CREATE 脚本\n"
-        "fix_up/package_body  : 缺失 PACKAGE BODY 的 CREATE 脚本\n"
-        "fix_up/synonym       : 缺失 SYNONYM 的 CREATE 脚本\n"
-        "fix_up/job           : 缺失 JOB 的 CREATE 脚本\n"
-        "fix_up/schedule      : 缺失 SCHEDULE 的 CREATE 脚本\n"
-        "fix_up/type          : 缺失 TYPE 的 CREATE 脚本\n"
-        "fix_up/type_body     : 缺失 TYPE BODY 的 CREATE 脚本\n"
-        "fix_up/index         : 缺失 INDEX 的 CREATE 脚本\n"
-        "fix_up/constraint    : 缺失约束的 CREATE 脚本\n"
-        "fix_up/sequence      : 缺失 SEQUENCE 的 CREATE 脚本\n"
-        "fix_up/trigger       : 缺失 TRIGGER 的 CREATE 脚本\n"
-        "fix_up/compile       : 依赖重编译脚本 (ALTER ... COMPILE)\n"
-        "fix_up/grants        : 依赖对象所需的授权脚本\n"
-        "fix_up/table_alter   : 列不匹配 TABLE 的 ALTER 修补脚本\n\n"
+        "fixup_scripts/table         : 缺失 TABLE 的 CREATE 脚本\n"
+        "fixup_scripts/view          : 缺失 VIEW 的 CREATE 脚本\n"
+        "fixup_scripts/materialized_view : 缺失 MATERIALIZED VIEW 的 CREATE 脚本\n"
+        "fixup_scripts/procedure     : 缺失 PROCEDURE 的 CREATE 脚本\n"
+        "fixup_scripts/function      : 缺失 FUNCTION 的 CREATE 脚本\n"
+        "fixup_scripts/package       : 缺失 PACKAGE 的 CREATE 脚本\n"
+        "fixup_scripts/package_body  : 缺失 PACKAGE BODY 的 CREATE 脚本\n"
+        "fixup_scripts/synonym       : 缺失 SYNONYM 的 CREATE 脚本\n"
+        "fixup_scripts/job           : 缺失 JOB 的 CREATE 脚本\n"
+        "fixup_scripts/schedule      : 缺失 SCHEDULE 的 CREATE 脚本\n"
+        "fixup_scripts/type          : 缺失 TYPE 的 CREATE 脚本\n"
+        "fixup_scripts/type_body     : 缺失 TYPE BODY 的 CREATE 脚本\n"
+        "fixup_scripts/index         : 缺失 INDEX 的 CREATE 脚本\n"
+        "fixup_scripts/constraint    : 缺失约束的 CREATE 脚本\n"
+        "fixup_scripts/sequence      : 缺失 SEQUENCE 的 CREATE 脚本\n"
+        "fixup_scripts/trigger       : 缺失 TRIGGER 的 CREATE 脚本\n"
+        "fixup_scripts/compile       : 依赖重编译脚本 (ALTER ... COMPILE)\n"
+        "fixup_scripts/grants        : 依赖对象所需的授权脚本\n"
+        "fixup_scripts/table_alter   : 列不匹配 TABLE 的 ALTER 修补脚本\n\n"
         "[bold]请在 OceanBase 执行前逐一人工审核上述脚本。[/bold]",
         title="[info]提示",
         border_style="info"
@@ -3632,13 +3805,20 @@ def print_final_report(
 
 def main():
     """主执行函数"""
-    CONFIG_FILE = 'db.ini'
+    CONFIG_FILE = 'config.ini'
 
     # 1) 加载配置
     ora_cfg, ob_cfg, settings = load_config(CONFIG_FILE)
 
     # 初始化 Oracle Instant Client (Thick Mode)
     init_oracle_client_from_settings(settings)
+
+    oracle_env_info = collect_oracle_env_info(ora_cfg)
+    ob_env_info = collect_ob_env_info(ob_cfg)
+    endpoint_info = {
+        "oracle": oracle_env_info,
+        "oceanbase": ob_env_info
+    }
 
     # 2) 加载 Remap 规则
     remap_rules = load_remap_rules(settings['remap_file'])
@@ -3667,7 +3847,7 @@ def main():
                 continue
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_dir_setting = settings.get('report_dir', 'reports').strip() or 'reports'
+    report_dir_setting = settings.get('report_dir', 'main_reports').strip() or 'main_reports'
     report_dir = Path(report_dir_setting)
     report_dir.mkdir(parents=True, exist_ok=True)
     report_path = report_dir / f"report_{timestamp}.txt"
@@ -3707,7 +3887,8 @@ def main():
             dependency_report,
             required_grants,
             report_path,
-            object_counts_summary
+            object_counts_summary,
+            endpoint_info
         )
         return
 
@@ -3740,7 +3921,8 @@ def main():
 
     # 9) 生成修补脚本
     if settings.get('generate_fixup', 'true').strip().lower() in ('true', '1', 'yes'):
-        log.info('已开启修补脚本生成，开始写入 fix_up 目录...')
+        fixup_dir_label = settings.get('fixup_dir', 'fixup_scripts') or 'fixup_scripts'
+        log.info('已开启修补脚本生成，开始写入 %s 目录...', fixup_dir_label)
         generate_fixup_scripts(
             ora_cfg,
             settings,
@@ -3764,7 +3946,8 @@ def main():
         dependency_report,
         required_grants,
         report_path,
-        object_counts_summary
+        object_counts_summary,
+        endpoint_info
     )
 
 

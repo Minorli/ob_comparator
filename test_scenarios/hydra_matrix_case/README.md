@@ -1,6 +1,6 @@
 # Hydra Matrix Scenario (Complex Remap Coverage)
 
-This edition of Hydra Matrix builds **eleven** fully functional Oracle schemas and remaps their objects across **fourteen** OceanBase schemas to exercise every feature in `db_comparator_fixup_release.py`.  The Oracle script creates every referenced table, sequence, trigger, PL/SQL unit, object type, materialized view, synonym, and view, so it runs cleanly on a brand-new database.  The OceanBase script intentionally recreates only part of the landscape—dropping columns, shortening VARCHAR lengths, omitting sequences/triggers/packages/types, and sprinkling extra artifacts—so each comparator report bucket (missing/mismatched/extraneous/dependency/grant) gets coverage.
+This edition of Hydra Matrix builds **eleven** fully functional Oracle schemas and remaps their objects across **fourteen** OceanBase schemas to exercise every feature in `schema_diff_reconciler.py`.  The Oracle script creates every referenced table, sequence, trigger, PL/SQL unit, object type, materialized view, synonym, and view, so it runs cleanly on a brand-new database.  The OceanBase script intentionally recreates only part of the landscape—dropping columns, shortening VARCHAR lengths, omitting sequences/triggers/packages/types, and sprinkling extra artifacts—so each comparator report bucket (missing/mismatched/extraneous/dependency/grant) gets coverage.
 
 ## Layout
 
@@ -54,7 +54,7 @@ test_scenarios/hydra_matrix_case/
    source_schemas = ORA_REF,ORA_TXN,ORA_DIGITAL,ORA_BILL,ORA_SEC,ORA_UTIL,ORA_AUDIT,ORA_PLAN,ORA_MDM,ORA_RPT,ORA_ML
    remap_file = test_scenarios/hydra_matrix_case/remap_rules_hydra.txt
    ```
-   Execute `python3 db_comparator_fixup_release.py` and inspect the console output, report file, and generated `fix_up/` scripts.
+   Execute `python3 schema_diff_reconciler.py` and inspect the console output, report file, and generated `fixup_scripts/` scripts.
 
 ## Coverage Highlights
 
@@ -63,6 +63,6 @@ test_scenarios/hydra_matrix_case/
 - **OMS 列过滤示例**: `OB_STAGE.CHANNEL_DIM` 注入 6 个以 `OMS_` 开头的列，其中 4 个为内置(`OMS_OBJECT_NUMBER/OMS_RELATIVE_FNO/OMS_BLOCK_NUMBER/OMS_ROW_NUMBER`)会被忽略，另外 2 个 (`OMS_EXTRA_FLAG/OMS_AUDIT_NOTE`) 会被报告为目标端多余列。
 - **Extra objects**: Noise tables and sequences on the OB side validate “unexpected object” reporting.
 - **Dependencies and grants**: Cross-schema FKs and program-unit calls span almost every schema.  The comparator must map dependencies through the remap rules and emit `GRANT SELECT/EXECUTE` scripts for dozens of cases.
-- **Fix-up generation**: Missing sequences, triggers, package bodies, types, and synonyms produce fix-up scripts that leverage dbcat DDL, while column mismatches route to `fix_up/table_alter`.
+- **Fix-up generation**: Missing sequences, triggers, package bodies, types, and synonyms produce fix-up scripts that leverage dbcat DDL, while column mismatches route to `fixup_scripts/table_alter`.
 
 Use this Hydra Matrix case whenever you need a deterministic regression suite that exercises complex remap networks, dependency analysis, grant generation, and fix-up output in one run.

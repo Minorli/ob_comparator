@@ -12,7 +12,7 @@
 ## 2. 总体架构
 
 ```
-db.ini + remap_rules.txt
+config.ini + remap_rules.txt
         │
         ▼
 Oracle Thick Mode (ALL_OBJECTS / ALL_DEPENDENCIES / DBMS_METADATA)
@@ -24,7 +24,7 @@ Oracle Thick Mode (ALL_OBJECTS / ALL_DEPENDENCIES / DBMS_METADATA)
         ├── 主对象 / 扩展对象对比
         ├── 依赖核对 & GRANT 计算
         ├── dbcat DDL 提取 + fix-up 生成
-        └── Rich 报告 + 文本快照 + fix_up 目录
+        └── Rich 报告 + 文本快照 + fixup_scripts 目录
 ```
 
 关键阶段：
@@ -33,12 +33,12 @@ Oracle Thick Mode (ALL_OBJECTS / ALL_DEPENDENCIES / DBMS_METADATA)
 2. **元数据缓存**：Oracle 侧使用 Thick Mode + 批量查询；OceanBase 侧使用 obclient 执行预设 SQL，所有数据一次性加载到内存。
 3. **差异分析**：依赖 `master_list`（源→目标）完成表/列校验；索引/约束/触发器使用 Oracle/OB 双缓存进行集合比对；序列按 schema 级别比较。
 4. **依赖 & 授权**：`ALL_DEPENDENCIES` 映射后生成期望依赖集合，与目标库实际依赖比较并给出原因，同时计算跨 schema 所需的 `GRANT`。
-5. **修补脚本**：构建 dbcat 请求（含 schema→对象类型的任务集合），复用 `history/dbcat_output` 缓存，对 DDL 做 schema remap、语法清理、授权插入，并按对象类型输出到 `fix_up/`。
-6. **报告与执行**：Rich 控制台输出+落地文件；`final_fix.py` 负责在 OceanBase 上顺序执行 SQL 并回写结果。
+5. **修补脚本**：构建 dbcat 请求（含 schema→对象类型的任务集合），复用 `dbcat_output` 缓存，对 DDL 做 schema remap、语法清理、授权插入，并按对象类型输出到 `fixup_scripts/`。
+6. **报告与执行**：Rich 控制台输出+落地文件；`run_fixup.py` 负责在 OceanBase 上顺序执行 SQL 并回写结果。
 
 ## 3. 配置与 Remap 驱动
 
-- `db.ini` 完全驱动运行参数：除了连接信息外，还包含 `fixup_dir`、`report_dir`、`generate_fixup`、`obclient_timeout`、`cli_timeout`（dbcat）、`dbcat_*` 等。  
+- `config.ini` 完全驱动运行参数：除了连接信息外，还包含 `fixup_dir`、`report_dir`、`generate_fixup`、`obclient_timeout`、`cli_timeout`（dbcat）、`dbcat_*` 等。  
 - `remap_rules.txt` 控制源/目标对象映射，支持 `PACKAGE BODY` 特殊写法及注释。加载时会验证：
   - 源对象是否存在；
   - 是否出现“多对一”目标对象（直接报错）。
@@ -87,14 +87,14 @@ Oracle Thick Mode (ALL_OBJECTS / ALL_DEPENDENCIES / DBMS_METADATA)
   - **缺失依赖**：指出是依赖对象缺失、被依赖对象缺失还是单纯未编译。
   - **额外依赖**：提示目标端存在额外耦合，需人工判断。
   - **跳过项**：源/目标缺少 remap 信息时记录原因但不报错。
-- 基于期望依赖自动推导跨 schema 所需权限：例如 PROC 调用其他 schema 的 TABLE/SYNONYM → 输出 `GRANT SELECT ...`，PLSQL 调用包/类型 → `GRANT EXECUTE ...`。这些脚本写入 `fix_up/grants/` 并在报告中展示。
+- 基于期望依赖自动推导跨 schema 所需权限：例如 PROC 调用其他 schema 的 TABLE/SYNONYM → 输出 `GRANT SELECT ...`，PLSQL 调用包/类型 → `GRANT EXECUTE ...`。这些脚本写入 `fixup_scripts/grants/` 并在报告中展示。
 
 ## 7. 修补脚本生成
 
 ### dbcat 集成
 
 - 根据差异收集“需要 DDL 的对象集合”，以 schema 为维度构造 dbcat 命令：
-  - 可复用 `history/dbcat_output/<schema>/...` 缓存，未命中的对象再触发 dbcat。
+  - 可复用 `dbcat_output/<schema>/...` 缓存，未命中的对象再触发 dbcat。
   - 运行 dbcat 需要 `JAVA_HOME` 与 `dbcat_from/dbcat_to` profile，超时时间由 `cli_timeout` 控制。
 - DDL 后处理：
   - `adjust_ddl_for_object`：根据 Remap 替换 schema/name，支持额外引用对象的重写。
@@ -104,20 +104,20 @@ Oracle Thick Mode (ALL_OBJECTS / ALL_DEPENDENCIES / DBMS_METADATA)
 
 ### 输出顺序与目录
 
-生成顺序遵循依赖关系：SEQUENCE → TABLE（CREATE + ALTER）→ 代码对象 → INDEX → CONSTRAINT → TRIGGER → GRANT → 其他对象。所有文件位于 `fix_up/<object_type>/`，并带有头部注释（源/目标信息、审核提示）。  
+生成顺序遵循依赖关系：SEQUENCE → TABLE（CREATE + ALTER）→ 代码对象 → INDEX → CONSTRAINT → TRIGGER → GRANT → 其他对象。所有文件位于 `fixup_scripts/<object_type>/`，并带有头部注释（源/目标信息、审核提示）。  
 
-表列差异专门写入 `fix_up/table_alter/`，对缺失列生成 `ADD COLUMN`，对长度不足生成 `MODIFY`，多余列仅以注释形式提示 `DROP`。  
+表列差异专门写入 `fixup_scripts/table_alter/`，对缺失列生成 `ADD COLUMN`，对长度不足生成 `MODIFY`，多余列仅以注释形式提示 `DROP`。  
 
 若某些对象类型 dbcat 暂不支持，生成阶段会给出 warning，提示需要手动处理。
 
 ## 8. 报告与执行
 
 - **Rich 控制台报告**：包含综合概要、表级差异、索引/约束/序列/触发器明细、依赖缺口、授权脚本、无效 remap 等；每个章节都带计数和色彩区分。
-- **文本快照 (`reports/report_<timestamp>.txt`)**：通过 `Console(record=True)` 同步导出，方便归档或发给其他团队。
-- **fix_up 指南**：报告结尾展示各子目录含义，提醒人工审核。
-- **`final_fix.py` 执行器**：
-  - 读取 `fix_up/` 第一层子目录下的 SQL。
-  - 通过 obclient 顺序执行，成功后移动到 `fix_up/done/<subdir>/`，失败则保留原地并打印错误。
+- **文本快照 (`main_reports/report_<timestamp>.txt`)**：通过 `Console(record=True)` 同步导出，方便归档或发给其他团队，并在开头展示源/目标数据库的版本与连接概览。
+- **fixup_scripts 指南**：报告结尾展示各子目录含义，提醒人工审核。
+- **`run_fixup.py` 执行器**：
+  - 读取 `fixup_scripts/` 第一层子目录下的 SQL。
+  - 通过 obclient 顺序执行，成功后移动到 `fixup_scripts/done/<subdir>/`，失败则保留原地并打印错误。
   - 输出明细表与累计结果，便于反复执行。
 
 ## 9. 健壮性设计
@@ -125,7 +125,7 @@ Oracle Thick Mode (ALL_OBJECTS / ALL_DEPENDENCIES / DBMS_METADATA)
 - **超时控制**：所有 obclient 调用使用 `obclient_timeout`；dbcat 调用使用 `cli_timeout`；超时会记录 SQL 并立即退出。
 - **配置前置校验**：缺失 Instant Client / dbcat / JAVA_HOME / Remap 异常会直接报错，避免运行到一半失败。
 - **错误提示**：对每一步都提供结构化日志，方便定位：例如 Remap 无效、Oracle 元数据为空、dbcat 缺文件等。
-- **缓存与重用**：dbcat 输出保存在 `history/dbcat_output`，避免重复扫描；`generate_fixup=false` 时跳过 fix-up 阶段以加快巡检。
-- **并行友好**：所有输出目录（`fix_up/`, `reports/`, `history/dbcat_output/`）都显式创建且清理旧结果，确保自动化流水线能够多次运行。
+- **缓存与重用**：dbcat 输出保存在 `dbcat_output`，避免重复扫描；`generate_fixup=false` 时跳过 fix-up 阶段以加快巡检。
+- **并行友好**：所有输出目录（`fixup_scripts/`, `main_reports/`, `dbcat_output/`）都显式创建且清理旧结果，确保自动化流水线能够多次运行。
 
 综上，该工具以配置驱动、一次转储、本地对比为核心；辅以依赖图与 dbcat 脚本生成，形成“发现问题 → 生成方案 → 执行验证”的闭环，满足大规模 Oracle → OceanBase 迁移过程的验证与修复需求。

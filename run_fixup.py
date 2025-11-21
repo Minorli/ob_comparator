@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Apply all fix-up SQL scripts under fix_up/* to OceanBase by invoking obclient.
+Apply all fix-up SQL scripts under fixup_scripts/* to OceanBase by invoking obclient.
 
 Usage:
-    python3 final_fix.py [optional path to db.ini]
+    python3 run_fixup.py [optional path to config.ini]
 
 Behavior:
-    * Reads OceanBase connection info from db.ini (same format used by the comparator).
-    * Discovers every *.sql file under the configured fix_up directory (recursively through first-level subfolders).
+    * Reads OceanBase connection info from config.ini (same format used by the comparator).
+    * Discovers every *.sql file under the configured fixup directory (recursively through first-level subfolders).
     * Executes each file sequentially via obclient. On failure, prints the error and continues.
     * Prints a final summary showing total scripts, successes, failures, and failed file names.
 """
@@ -21,9 +21,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-CONFIG_DEFAULT_PATH = "db.ini"
-DEFAULT_FIXUP_DIR = "fix_up"
+CONFIG_DEFAULT_PATH = "config.ini"
+DEFAULT_FIXUP_DIR = "fixup_scripts"
 DONE_DIR_NAME = "done"
+DEFAULT_OBCLIENT_TIMEOUT = 60
 
 
 class ConfigError(Exception):
@@ -32,7 +33,7 @@ class ConfigError(Exception):
 
 def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path]:
     """
-    Load OceanBase connection info and fix_up directory from db.ini.
+    Load OceanBase connection info and fixup directory from config.ini.
 
     Returns:
         (ob_cfg, fixup_dir, repo_root)
@@ -44,7 +45,7 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path]:
     parser.read(config_path, encoding="utf-8")
 
     if "OCEANBASE_TARGET" not in parser:
-        raise ConfigError("db.ini 缺少 [OCEANBASE_TARGET] 配置段。")
+        raise ConfigError("配置文件缺少 [OCEANBASE_TARGET] 配置段。")
 
     ob_section = parser["OCEANBASE_TARGET"]
     required_keys = ["executable", "host", "port", "user_string", "password"]
@@ -54,6 +55,13 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path]:
 
     ob_cfg = {key: ob_section[key].strip() for key in required_keys}
     ob_cfg["port"] = str(int(ob_cfg["port"]))  # 规范化端口
+
+    try:
+        obclient_timeout = parser.getint("SETTINGS", "obclient_timeout", fallback=DEFAULT_OBCLIENT_TIMEOUT)
+        obclient_timeout = obclient_timeout if obclient_timeout > 0 else DEFAULT_OBCLIENT_TIMEOUT
+    except Exception:
+        obclient_timeout = DEFAULT_OBCLIENT_TIMEOUT
+    ob_cfg["timeout"] = obclient_timeout
 
     repo_root = config_path.parent.resolve()
     fixup_dir = parser.get("SETTINGS", "fixup_dir", fallback=DEFAULT_FIXUP_DIR).strip()
@@ -84,7 +92,7 @@ def build_obclient_command(ob_cfg: Dict[str, str]) -> List[str]:
 
 def collect_sql_files(fixup_dir: Path, done_dir_name: str = DONE_DIR_NAME) -> List[Path]:
     """
-    Collect *.sql files under fix_up with dependency-aware ordering:
+    Collect *.sql files under the fixup directory with dependency-aware ordering:
       1) sequence → table → table_alter → constraint → index
       2) view / materialized_view
       3) remaining code objects (synonym/procedure/function/package/type/trigger/etc.)
@@ -130,14 +138,15 @@ def collect_sql_files(fixup_dir: Path, done_dir_name: str = DONE_DIR_NAME) -> Li
     return sql_files
 
 
-def run_sql(obclient_cmd: List[str], sql_text: str) -> subprocess.CompletedProcess:
-    """Execute SQL text by piping it to obclient."""
+def run_sql(obclient_cmd: List[str], sql_text: str, timeout: int) -> subprocess.CompletedProcess:
+    """Execute SQL text by piping it to obclient, bounded by timeout seconds."""
     return subprocess.run(
         obclient_cmd,
         input=sql_text,
         capture_output=True,
         text=True,
         check=False,
+        timeout=timeout,
     )
 
 
@@ -169,6 +178,7 @@ def main() -> None:
         return
 
     obclient_cmd = build_obclient_command(ob_cfg)
+    ob_timeout = int(ob_cfg.get("timeout", DEFAULT_OBCLIENT_TIMEOUT))
     total_scripts = len(sql_files)
     width = len(str(total_scripts)) or 1
     results: List[ScriptResult] = []
@@ -197,25 +207,31 @@ def main() -> None:
             print(f"{label} {relative_path} -> 跳过 (文件为空)")
             continue
 
-        result = run_sql(obclient_cmd, sql_text)
-        if result.returncode == 0:
-            move_note = ""
-            try:
-                target_dir = done_dir / sql_path.parent.name
-                target_dir.mkdir(parents=True, exist_ok=True)
-                target_path = target_dir / sql_path.name
-                shutil.move(str(sql_path), target_path)
-                move_note = f"(已移至 {target_path.relative_to(repo_root)})"
-            except Exception as exc:
-                move_note = f"(移动到 done 目录失败: {exc})"
-            results.append(ScriptResult(relative_path, "SUCCESS", move_note.strip()))
-            print(f"{label} {relative_path} -> 成功 {move_note}")
-        else:
-            stderr = (result.stderr or "").strip()
-            results.append(ScriptResult(relative_path, "FAILED", stderr))
+        try:
+            result = run_sql(obclient_cmd, sql_text, timeout=ob_timeout)
+            if result.returncode == 0:
+                move_note = ""
+                try:
+                    target_dir = done_dir / sql_path.parent.name
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    target_path = target_dir / sql_path.name
+                    shutil.move(str(sql_path), target_path)
+                    move_note = f"(已移至 {target_path.relative_to(repo_root)})"
+                except Exception as exc:
+                    move_note = f"(移动到 done 目录失败: {exc})"
+                results.append(ScriptResult(relative_path, "SUCCESS", move_note.strip()))
+                print(f"{label} {relative_path} -> 成功 {move_note}")
+            else:
+                stderr = (result.stderr or "").strip()
+                results.append(ScriptResult(relative_path, "FAILED", stderr))
+                print(f"{label} {relative_path} -> 失败")
+                if stderr:
+                    print(f"    {stderr}")
+        except subprocess.TimeoutExpired:
+            msg = f"执行超时 (> {ob_timeout} 秒)"
+            results.append(ScriptResult(relative_path, "FAILED", msg))
             print(f"{label} {relative_path} -> 失败")
-            if stderr:
-                print(f"    {stderr}")
+            print(f"    {msg}")
 
     executed = sum(1 for r in results if r.status != "SKIPPED")
     success = sum(1 for r in results if r.status == "SUCCESS")
@@ -258,6 +274,9 @@ def main() -> None:
         print(border)
 
     print("=================================================")
+
+    exit_code = 0 if failed == 0 else 1
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
