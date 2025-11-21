@@ -83,6 +83,7 @@ SourceObjectMap = Dict[str, Set[str]]  # {'OWNER.OBJ': {'TYPE1', 'TYPE2'}}
 FullObjectMapping = Dict[str, Dict[str, str]]  # {'OWNER.OBJ': {'TYPE': 'TGT_OWNER.OBJ'}}
 MasterCheckList = List[Tuple[str, str, str]]  # [(src_name, tgt_name, type)]
 ReportResults = Dict[str, List]
+# object_counts_summary keys: oracle/oceanbase/missing/extra -> {OBJECT_TYPE: count}
 ObjectCountSummary = Dict[str, Dict[str, int]]
 
 # --- 全局 obclient timeout（秒），由配置初始化 ---
@@ -197,7 +198,9 @@ OBJECT_COUNT_TYPES: Tuple[str, ...] = (
     'TYPE BODY',
     'MATERIALIZED VIEW',
     'JOB',
-    'SCHEDULE'
+    'SCHEDULE',
+    'INDEX',
+    'CONSTRAINT'
 )
 
 
@@ -682,35 +685,95 @@ def build_schema_mapping(master_list: MasterCheckList) -> Dict[str, str]:
 
 
 def compute_object_counts(
-    source_objects: SourceObjectMap,
+    full_object_mapping: FullObjectMapping,
     ob_meta: ObMetadata,
+    oracle_meta: OracleMetadata,
     monitored_types: Tuple[str, ...] = OBJECT_COUNT_TYPES
 ) -> ObjectCountSummary:
-    oracle_counts: Dict[str, int] = {t.upper(): 0 for t in monitored_types}
-    for obj_types in source_objects.values():
-        for obj_type in obj_types:
+    """
+    基于“期望对象集合”统计各类型的：源端数量、目标端命中数量、缺失数量、额外数量。
+    目标端数量仅统计“期望对象”的命中数，避免“缺 1 张表 + 额外 1 张表”被误判为数量一致。
+    """
+    expected_by_type: Dict[str, Set[str]] = {t.upper(): set() for t in monitored_types}
+    for _src, type_map in full_object_mapping.items():
+        for obj_type, tgt_name in type_map.items():
             obj_type_u = obj_type.upper()
-            if obj_type_u in oracle_counts:
-                oracle_counts[obj_type_u] += 1
+            if obj_type_u not in expected_by_type:
+                continue
+            expected_by_type[obj_type_u].add(tgt_name.upper())
 
-    ob_counts: Dict[str, int] = {
-        t: len(ob_meta.objects_by_type.get(t.upper(), set()))
-        for t in oracle_counts.keys()
+    actual_by_type: Dict[str, Set[str]] = {
+        t.upper(): {name.upper() for name in ob_meta.objects_by_type.get(t.upper(), set())}
+        for t in monitored_types if t != 'CONSTRAINT'
     }
 
-    mismatches = [t for t in oracle_counts if oracle_counts[t] != ob_counts[t]]
-    if mismatches:
+    summary: ObjectCountSummary = {
+        "oracle": {},
+        "oceanbase": {},
+        "missing": {},
+        "extra": {}
+    }
+
+    issue_types: List[str] = []
+    for obj_type in monitored_types:
+        obj_type_u = obj_type.upper()
+        
+        if obj_type_u == 'CONSTRAINT':
+            # Constraints are not in ALL_OBJECTS, so they need special handling
+            expected_set = {
+                cons_name
+                for cons_map in oracle_meta.constraints.values()
+                for cons_name in cons_map
+            }
+            actual_set = {
+                cons_name
+                for cons_map in ob_meta.constraints.values()
+                for cons_name in cons_map
+            }
+        else:
+            expected_set = expected_by_type.get(obj_type_u, set())
+            actual_set = actual_by_type.get(obj_type_u, set())
+
+        # For constraints and indexes, names can be system-generated. A simple name comparison is not enough.
+        # This count is a rough estimation. The detailed mismatch is more important.
+        # Here we count based on what's found in meta, not remapped names, for simplicity.
+        if obj_type_u in ('CONSTRAINT', 'INDEX'):
+            if obj_type_u == 'CONSTRAINT':
+                src_count = sum(len(v) for v in oracle_meta.constraints.values())
+                tgt_count = sum(len(v) for v in ob_meta.constraints.values())
+            else: # INDEX
+                src_count = sum(len(v) for v in oracle_meta.indexes.values())
+                tgt_count = sum(len(v) for v in ob_meta.indexes.values())
+            
+            summary["oracle"][obj_type_u] = src_count
+            summary["oceanbase"][obj_type_u] = tgt_count
+            summary["missing"][obj_type_u] = max(0, src_count - tgt_count)
+            summary["extra"][obj_type_u] = max(0, tgt_count - src_count)
+            if src_count != tgt_count:
+                issue_types.append(obj_type_u)
+            continue
+
+        matched = expected_set & actual_set
+        missing_set = expected_set - actual_set
+        extra_set = actual_set - expected_set
+
+        summary["oracle"][obj_type_u] = len(expected_set)
+        summary["oceanbase"][obj_type_u] = len(matched)
+        summary["missing"][obj_type_u] = len(missing_set)
+        summary["extra"][obj_type_u] = len(extra_set)
+
+        if missing_set or extra_set:
+            issue_types.append(obj_type_u)
+
+    if issue_types:
         log.warning(
-            "检查汇总: 以下对象类型数量在 Oracle 与 OceanBase 中不一致，将在报告中重点标注: %s",
-            ", ".join(mismatches)
+            "检查汇总: 基于 remap 后的期望集合，以下类型存在缺失或多余对象: %s",
+            ", ".join(issue_types)
         )
     else:
-        log.info("检查汇总: 所有关注对象类型数量在 Oracle 与 OceanBase 中一致。")
+        log.info("检查汇总: 所有关注对象类型的数量与期望一致（不计入额外对象）。")
 
-    return {
-        "oracle": oracle_counts,
-        "oceanbase": ob_counts
-    }
+    return summary
 
 
 
@@ -2563,13 +2626,62 @@ def adjust_ddl_for_object(
         text = pattern_unquoted.sub(f'{tgt_s_u}.{tgt_n_u}', text)
         return text
 
+    def replace_unqualified_identifier(text: str, src_n: str, tgt_s: str, tgt_n: str) -> str:
+        """
+        当源对象在自身 schema 内被 remap 到其他 schema 时，源 DDL 中的无前缀引用
+        会错误地落到当前 schema。这里将裸名替换为目标 schema.对象名。
+        """
+        if not src_n or not tgt_s or not tgt_n:
+            return text
+        src_n_u = src_n.upper()
+        tgt_s_u = tgt_s.upper()
+        tgt_n_u = tgt_n.upper()
+        tgt_full = f"{tgt_s_u}.{tgt_n_u}"
+
+        pattern = re.compile(rf'\b{re.escape(src_n_u)}\b', re.IGNORECASE)
+
+        def _repl(match: re.Match) -> str:
+            start = match.start()
+            # 向前查找首个非空白字符，若为 '.' 则视为已限定 schema，不替换
+            idx = start - 1
+            while idx >= 0 and text[idx].isspace():
+                idx -= 1
+            # 若存在引号包裹标识符，点号会出现在引号之前，需要跳过收尾引号再检查
+            if idx >= 0 and text[idx] == '"':
+                idx -= 1
+                while idx >= 0 and text[idx].isspace():
+                    idx -= 1
+            if idx >= 0 and text[idx] == '.':
+                return match.group(0)
+            return tgt_full
+
+        return pattern.sub(_repl, text)
+
     result = replace_identifier(ddl, src_schema, src_name, tgt_schema, tgt_name)
 
     if extra_identifiers:
+        # 先替换显式 schema.对象，再处理裸名 remap
         for (src_pair, tgt_pair) in extra_identifiers:
             result = replace_identifier(
                 result,
                 src_pair[0],
+                src_pair[1],
+                tgt_pair[0],
+                tgt_pair[1]
+            )
+        # 针对与当前源 schema 相同的对象，补充无前缀引用的 remap (schema 发生变化或对象名变化)
+        src_schema_u = src_schema.upper()
+        for (src_pair, tgt_pair) in extra_identifiers:
+            if src_pair[0].upper() != src_schema_u:
+                continue
+            # If the dependent object is the main object being processed, skip unqualified replacement.
+            # Its name is already handled by the initial `replace_identifier` call.
+            if src_pair[1].upper() == src_name.upper(): # This check prevents the main object's name from being double-qualified.
+                continue
+            if (src_pair[0].upper(), src_pair[1].upper()) == (tgt_pair[0].upper(), tgt_pair[1].upper()):
+                continue
+            result = replace_unqualified_identifier(
+                result,
                 src_pair[1],
                 tgt_pair[0],
                 tgt_pair[1]
@@ -2620,6 +2732,7 @@ USING_INDEX_PATTERN_SIMPLE = re.compile(
     r'USING\s+INDEX\s+(ENABLE|DISABLE)',
     re.IGNORECASE
 )
+MV_REFRESH_ON_DEMAND_PATTERN = re.compile(r'\s+ON\s+DEMAND', re.IGNORECASE)
 
 
 def normalize_ddl_for_ob(ddl: str) -> str:
@@ -2630,6 +2743,7 @@ def normalize_ddl_for_ob(ddl: str) -> str:
     """
     ddl = USING_INDEX_PATTERN_WITH_OPTIONS.sub(lambda m: m.group(1), ddl)
     ddl = USING_INDEX_PATTERN_SIMPLE.sub(lambda m: m.group(1), ddl)
+    ddl = MV_REFRESH_ON_DEMAND_PATTERN.sub('', ddl)
     return ddl
 
 
@@ -2727,19 +2841,33 @@ def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 
-def write_fixup_file(base_dir: Path, subdir: str, filename: str, content: str, header_comment: str):
+def write_fixup_file(
+    base_dir: Path,
+    subdir: str,
+    filename: str,
+    content: str,
+    header_comment: str,
+    grants_to_add: Optional[List[str]] = None
+):
     target_dir = base_dir / subdir
     ensure_dir(target_dir)
     file_path = target_dir / filename
     with open(file_path, 'w', encoding='utf-8') as f:
         f.write(f"-- {header_comment}\n")
         f.write("-- 本文件由校验工具自动生成，请在 OceanBase 执行前仔细审核。\n\n")
+        
         body = content.strip()
         f.write(body)
         f.write('\n')
         tail = body.rstrip()
         if tail and not tail.endswith((';', '/')):
             f.write(';\n')
+
+        if grants_to_add:
+            f.write('\n-- 自动追加相关授权语句\n')
+            for grant_stmt in sorted(grants_to_add):
+                f.write(f"{grant_stmt}\n")
+
     log.info(f"[FIXUP] 生成修补脚本: {file_path}")
 
 
@@ -3159,10 +3287,20 @@ def generate_fixup_scripts(
         ddl_adj = normalize_ddl_for_ob(ddl_adj)
         ddl_adj = strip_constraint_enable(ddl_adj)
         ddl_adj = enforce_schema_for_ddl(ddl_adj, tgt_schema, obj_type)
+        
+        # --- Find and prepare grants for this object ---
+        grants_for_this_object = []
+        full_target_object_name = f"{tgt_schema}.{tgt_obj}".upper()
+        for grantee, entries in grants_map.items():
+            for priv, obj_granted_on in entries:
+                if obj_granted_on.upper() == full_target_object_name:
+                    grant_stmt = f"GRANT {priv} ON {full_target_object_name} TO {grantee};"
+                    grants_for_this_object.append(grant_stmt)
+
         subdir = obj_type_to_dir.get(obj_type, obj_type.lower())
         filename = f"{tgt_schema}.{tgt_obj}.sql"
         header = f"修补缺失的 {obj_type} {tgt_schema}.{tgt_obj} (源: {src_schema}.{src_obj})"
-        write_fixup_file(base_dir, subdir, filename, ddl_adj, header)
+        write_fixup_file(base_dir, subdir, filename, ddl_adj, header, grants_to_add=grants_for_this_object)
 
     log.info("[FIXUP] (5/9) 正在生成 INDEX 脚本...")
     for item, src_schema, src_table, tgt_schema, tgt_table in index_tasks:
@@ -3186,9 +3324,9 @@ def generate_fixup_scripts(
                 ddl_adj = adjust_ddl_for_object(
                     stmt,
                     src_schema,
-                    idx_name_u,
+                    src_table,
                     tgt_schema,
-                    idx_name_u,
+                    tgt_table,
                     extra_identifiers=all_replacements
                 )
                 ddl_adj = normalize_ddl_for_ob(ddl_adj)
@@ -3246,9 +3384,9 @@ def generate_fixup_scripts(
                 ddl_adj = adjust_ddl_for_object(
                     stmt,
                     src_schema,
-                    cons_name_u,
+                    src_table,
                     tgt_schema,
-                    cons_name_u,
+                    tgt_table,
                     extra_identifiers=all_replacements
                 )
                 ddl_adj = normalize_ddl_for_ob(ddl_adj)
@@ -3338,27 +3476,33 @@ def generate_fixup_scripts(
         log.info("[FIXUP] (8/9) 无需生成依赖重编译脚本。")
 
     if grants_map:
-        log.info("[FIXUP] (9/9) 生成依赖授权脚本...")
+        log.info("[FIXUP] (9/9) 正在生成依赖授权脚本...")
+        grants_by_owner: Dict[str, Set[str]] = defaultdict(set)
         for grantee, entries in sorted(grants_map.items()):
             if not entries:
                 continue
-            statements = sorted({
-                f"GRANT {priv} ON {obj} TO {grantee};"
-                for priv, obj in entries
-            })
-            if not statements:
-                continue
-            content = "\n".join(statements)
-            has_ref = any(s.startswith("GRANT REFERENCES") for s in statements)
-            ref_note = "；包含 REFERENCES 用于跨 schema 外键" if has_ref else ""
-            header = f"授予 {grantee} 访问 remap 依赖目标的权限{ref_note}"
-            write_fixup_file(
-                base_dir,
-                'grants',
-                f"{grantee}_grants.sql",
-                content,
-                header
-            )
+            for priv, obj in entries:
+                if not obj or '.' not in obj:
+                    continue
+                owner, _ = obj.split('.', 1)
+                stmt = f"GRANT {priv.upper()} ON {obj.upper()} TO {grantee.upper()};"
+                grants_by_owner[owner.upper()].add(stmt)
+
+        if grants_by_owner:
+            for owner, stmts in sorted(grants_by_owner.items()):
+                if not stmts:
+                    continue
+                content = prepend_set_schema("\n".join(sorted(stmts)), owner)
+                header = f"{owner} 授予跨 schema 依赖对象所需权限"
+                write_fixup_file(
+                    base_dir,
+                    'grants',
+                    f"{owner}.grants.sql",
+                    content,
+                    header
+                )
+        else:
+            log.info("[FIXUP] (9/9) 无需生成依赖授权脚本。")
     else:
         log.info("[FIXUP] (9/9) 无需生成依赖授权脚本。")
 
@@ -3598,22 +3742,25 @@ def print_final_report(
     if object_counts_summary:
         count_table = Table(title="[header]0. 检查汇总", **count_table_kwargs)
         count_table.add_column("对象类型", style="info", width=TYPE_COL_WIDTH)
-        count_table.add_column("Oracle 数量", justify="right", width=12)
-        count_table.add_column("OceanBase 数量", justify="right", width=14)
-        count_table.add_column("差异", justify="right", width=8)
+        count_table.add_column("Oracle (应校验)", justify="right", width=18)
+        count_table.add_column("OceanBase (命中)", justify="right", width=18)
+        count_table.add_column("缺失", justify="right", width=8)
+        count_table.add_column("多余", justify="right", width=8)
         oracle_counts = object_counts_summary.get("oracle", {})
         ob_counts = object_counts_summary.get("oceanbase", {})
+        missing_counts = object_counts_summary.get("missing", {})
+        extra_counts = object_counts_summary.get("extra", {})
         for obj_type in OBJECT_COUNT_TYPES:
             ora_val = oracle_counts.get(obj_type, 0)
             ob_val = ob_counts.get(obj_type, 0)
-            diff = ob_val - ora_val
-            diff_text = "0" if diff == 0 else f"{diff:+d}"
-            diff_style = "ok" if diff == 0 else "missing"
+            miss_val = missing_counts.get(obj_type, 0)
+            extra_val = extra_counts.get(obj_type, 0)
             count_table.add_row(
                 obj_type,
                 str(ora_val),
                 str(ob_val),
-                f"[{diff_style}]{diff_text}[/{diff_style}]"
+                f"[missing]{miss_val}[/missing]" if miss_val else "0",
+                f"[mismatch]{extra_val}[/mismatch]" if extra_val else "0"
             )
         console.print(count_table)
 
@@ -3894,19 +4041,12 @@ def main():
 
     # 6) 计算目标端 schema 集合并一次性 dump OB 元数据
     ob_meta = dump_ob_metadata(ob_cfg, target_schemas)
-    object_counts_summary = compute_object_counts(source_objects, ob_meta, OBJECT_COUNT_TYPES)
-
     ob_dependencies = load_ob_dependencies(ob_cfg, target_schemas)
 
     # 7) 主对象校验
     oracle_meta = dump_oracle_metadata(ora_cfg, master_list, settings)
-
-    tv_results = check_primary_objects(
-        master_list,
-        extraneous_rules,
-        ob_meta,
-        oracle_meta
-    )
+    object_counts_summary = compute_object_counts(full_object_mapping, ob_meta, oracle_meta, OBJECT_COUNT_TYPES)
+    tv_results = check_primary_objects(master_list, extraneous_rules, ob_meta, oracle_meta)
 
     # 8) 扩展对象校验 (索引/约束/序列/触发器)
     extra_results = check_extra_objects(settings, master_list, ob_meta, oracle_meta, full_object_mapping)
