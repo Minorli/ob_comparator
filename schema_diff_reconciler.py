@@ -181,6 +181,21 @@ IGNORED_OMS_COLUMNS: Tuple[str, ...] = (
     "OMS_ROW_NUMBER",
 )
 
+
+def is_ignored_oms_column(col_name: Optional[str], col_meta: Optional[Dict] = None) -> bool:
+    """
+    OceanBase 在表上自动补充少量固定的 OMS_* 隐藏列。
+    仅当列名匹配已知 4 个系统列且列本身被标记为隐藏时才忽略。
+    """
+    if not col_name:
+        return False
+    col_u = col_name.strip('"').upper()
+    hidden_flag = False
+    if col_meta:
+        hidden_flag = bool(col_meta.get("hidden"))
+    return hidden_flag and col_u in IGNORED_OMS_COLUMNS
+
+
 VARCHAR_LEN_MIN_MULTIPLIER = 1.5  # 目标端 VARCHAR/2 长度需 >= ceil(src * 1.5)
 VARCHAR_LEN_OVERSIZE_MULTIPLIER = 2.5  # 超过该倍数认为“过大”，需要提示
 
@@ -885,13 +900,22 @@ def dump_ob_metadata(ob_cfg: ObConfig, target_schemas: Set[str]) -> ObMetadata:
                 objects_by_type.setdefault('TYPE BODY', set()).add(full)
 
     # --- 2. ALL_TAB_COLUMNS ---
+    def _load_ob_tab_columns(include_hidden: bool) -> Tuple[bool, str, str]:
+        hidden_col = ", NVL(TO_CHAR(HIDDEN_COLUMN),'NO') AS HIDDEN_COLUMN" if include_hidden else ""
+        sql_cols = f"""
+            SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHAR_LENGTH, NULLABLE, DATA_DEFAULT{hidden_col}
+            FROM ALL_TAB_COLUMNS
+            WHERE OWNER IN ({owners_in})
+        """
+        return obclient_run_sql(ob_cfg, sql_cols)
+
     tab_columns: Dict[Tuple[str, str], Dict[str, Dict]] = {}
-    sql = f"""
-        SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHAR_LENGTH, NULLABLE, DATA_DEFAULT
-        FROM ALL_TAB_COLUMNS
-        WHERE OWNER IN ({owners_in})
-    """
-    ok, out, err = obclient_run_sql(ob_cfg, sql)
+    hidden_supported = True
+    ok, out, err = _load_ob_tab_columns(include_hidden=True)
+    if not ok:
+        log.warning("读取 ALL_TAB_COLUMNS 包含 HIDDEN_COLUMN 失败，回退到不带隐藏标记: %s", err)
+        hidden_supported = False
+        ok, out, err = _load_ob_tab_columns(include_hidden=False)
     if not ok:
         log.error("无法从 OB 读取 ALL_TAB_COLUMNS，程序退出。")
         sys.exit(1)
@@ -899,23 +923,24 @@ def dump_ob_metadata(ob_cfg: ObConfig, target_schemas: Set[str]) -> ObMetadata:
     if out:
         for line in out.splitlines():
             parts = line.split('\t')
-            if len(parts) < 7:
+            expect_len = 8 if hidden_supported else 7
+            if len(parts) < expect_len:
                 continue
-            owner, table, col, dtype, char_len, nullable, default = (
-                parts[0].strip().upper(),
-                parts[1].strip().upper(),
-                parts[2].strip().upper(),
-                parts[3].strip().upper(),
-                parts[4].strip(),
-                parts[5].strip(),
-                parts[6].strip()
-            )
+            owner = parts[0].strip().upper()
+            table = parts[1].strip().upper()
+            col = parts[2].strip().upper()
+            dtype = parts[3].strip().upper()
+            char_len = parts[4].strip()
+            nullable = parts[5].strip()
+            default = parts[6].strip()
+            hidden_val = parts[7].strip().upper() if hidden_supported else "NO"
             key = (owner, table)
             tab_columns.setdefault(key, {})[col] = {
                 "data_type": dtype,
                 "char_length": int(char_len) if char_len.isdigit() else None,
                 "nullable": nullable,
-                "data_default": default
+                "data_default": default,
+                "hidden": hidden_val == 'YES'
             }
 
     # --- 3. ALL_INDEXES ---
@@ -1164,34 +1189,70 @@ def dump_oracle_metadata(
                 owners_clause = _make_in_clause(owners)
 
                 # 列定义
-                sql = f"""
-                    SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
-                           DATA_LENGTH, DATA_PRECISION, DATA_SCALE,
-                           NULLABLE, DATA_DEFAULT, CHAR_USED, CHAR_LENGTH
-                    FROM ALL_TAB_COLUMNS
-                    WHERE OWNER IN ({owners_clause})
-                """
-                with ora_conn.cursor() as cursor:
-                    cursor.execute(sql, owners)
-                    for row in cursor:
-                        owner = _safe_upper(row[0])
-                        table = _safe_upper(row[1])
-                        col = _safe_upper(row[2])
-                        if not owner or not table or not col:
-                            continue
-                        key = (owner, table)
-                        if key not in table_pairs:
-                            continue
-                        table_columns.setdefault(key, {})[col] = {
-                            "data_type": row[3],
-                            "data_length": row[4],
-                            "data_precision": row[5],
-                            "data_scale": row[6],
-                            "nullable": row[7],
-                            "data_default": row[8],
-                            "char_used": row[9],
-                            "char_length": row[10],
-                        }
+                def _load_ora_tab_columns(include_hidden: bool):
+                    hidden_col = ", NVL(TO_CHAR(HIDDEN_COLUMN),'NO') AS HIDDEN_COLUMN" if include_hidden else ""
+                    sql = f"""
+                        SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
+                               DATA_LENGTH, DATA_PRECISION, DATA_SCALE,
+                               NULLABLE, DATA_DEFAULT, CHAR_USED, CHAR_LENGTH{hidden_col}
+                        FROM ALL_TAB_COLUMNS
+                        WHERE OWNER IN ({owners_clause})
+                    """
+                    return sql
+
+                sql = _load_ora_tab_columns(include_hidden=True)
+                try_hidden = True
+                try:
+                    with ora_conn.cursor() as cursor:
+                        cursor.execute(sql, owners)
+                        for row in cursor:
+                            owner = _safe_upper(row[0])
+                            table = _safe_upper(row[1])
+                            col = _safe_upper(row[2])
+                            if not owner or not table or not col:
+                                continue
+                            key = (owner, table)
+                            if key not in table_pairs:
+                                continue
+                            table_columns.setdefault(key, {})[col] = {
+                                "data_type": row[3],
+                                "data_length": row[4],
+                                "data_precision": row[5],
+                                "data_scale": row[6],
+                                "nullable": row[7],
+                                "data_default": row[8],
+                                "char_used": row[9],
+                                "char_length": row[10],
+                                "hidden": (row[11] if len(row) > 11 else "NO") == "YES"
+                            }
+                except oracledb.Error as e:
+                    log.warning("读取 Oracle ALL_TAB_COLUMNS 含 HIDDEN_COLUMN 失败，回退：%s", e)
+                    try_hidden = False
+
+                if not try_hidden:
+                    sql = _load_ora_tab_columns(include_hidden=False)
+                    with ora_conn.cursor() as cursor:
+                        cursor.execute(sql, owners)
+                        for row in cursor:
+                            owner = _safe_upper(row[0])
+                            table = _safe_upper(row[1])
+                            col = _safe_upper(row[2])
+                            if not owner or not table or not col:
+                                continue
+                            key = (owner, table)
+                            if key not in table_pairs:
+                                continue
+                            table_columns.setdefault(key, {})[col] = {
+                                "data_type": row[3],
+                                "data_length": row[4],
+                                "data_precision": row[5],
+                                "data_scale": row[6],
+                                "nullable": row[7],
+                                "data_default": row[8],
+                                "char_used": row[9],
+                                "char_length": row[10],
+                                "hidden": False
+                            }
 
                 # 索引
                 sql_idx = f"""
@@ -1727,10 +1788,14 @@ def check_primary_objects(
                 ))
                 continue
 
-            ignored_oms = set(IGNORED_OMS_COLUMNS)
-            src_col_names = {col for col in src_cols_details.keys() if col.upper() not in ignored_oms}
-            tgt_col_names_raw = set(tgt_cols_details.keys())
-            tgt_col_names = {col for col in tgt_col_names_raw if col.upper() not in ignored_oms}
+            src_col_names = {
+                col for col, meta in src_cols_details.items()
+                if not is_ignored_oms_column(col, meta)
+            }
+            tgt_col_names = {
+                col for col, meta in tgt_cols_details.items()
+                if not is_ignored_oms_column(col, meta)
+            }
 
             missing_in_tgt = src_col_names - tgt_col_names
             extra_in_tgt = tgt_col_names - src_col_names

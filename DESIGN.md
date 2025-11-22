@@ -33,7 +33,7 @@ Oracle Thick Mode (ALL_OBJECTS / ALL_DEPENDENCIES / DBMS_METADATA)
 2. **元数据缓存**：Oracle 侧使用 Thick Mode + 批量查询；OceanBase 侧使用 obclient 执行预设 SQL，所有数据一次性加载到内存。
 3. **差异分析**：依赖 `master_list`（源→目标）完成表/列校验；索引/约束/触发器使用 Oracle/OB 双缓存进行集合比对；序列按 schema 级别比较。
 4. **依赖 & 授权**：`ALL_DEPENDENCIES` 映射后生成期望依赖集合，与目标库实际依赖比较并给出原因，同时计算跨 schema 所需的 `GRANT`。
-5. **修补脚本**：构建 dbcat 请求（含 schema→对象类型的任务集合），复用 `dbcat_output` 缓存，对 DDL 做 schema remap、语法清理、授权插入，并按对象类型输出到 `fixup_scripts/`。
+5. **修补脚本**：构建 dbcat 请求（含 schema→对象类型的任务集合），复用 `dbcat_output` 缓存，对 DDL 做 schema remap、语法清理、授权插入，并按对象类型输出到 `fixup_scripts/`（含依赖重编译/授权脚本）。
 6. **报告与执行**：Rich 控制台输出+落地文件；`run_fixup.py` 负责在 OceanBase 上顺序执行 SQL 并回写结果。
 
 ## 3. 配置与 Remap 驱动
@@ -51,6 +51,7 @@ Oracle Thick Mode (ALL_OBJECTS / ALL_DEPENDENCIES / DBMS_METADATA)
 ### Oracle
 
 - 通过 `oracledb` Thick Mode 连接，确保能使用 `DBMS_METADATA` 与 `ALL_*` 视图。
+- 运行账号需具备跨 schema 查询 `ALL_*` 的权限（如 SYS/SYSDBA 或 `SELECT_CATALOG_ROLE`/`SELECT ANY DICTIONARY`），否则只能看到自身对象。
 - 读取内容：
   - `ALL_OBJECTS`：源对象全集；
   - `ALL_TAB_COLUMNS`、`ALL_INDEXES/ALL_IND_COLUMNS`、`ALL_CONSTRAINTS/ALL_CONS_COLUMNS`、`ALL_TRIGGERS`、`ALL_SEQUENCES`；
@@ -68,7 +69,7 @@ Oracle Thick Mode (ALL_OBJECTS / ALL_DEPENDENCIES / DBMS_METADATA)
 ## 5. 对比策略
 
 1. **主对象**  
-   - TABLE：检查存在性、列名集合（过滤 `OMS_*` 内部列）、`VARCHAR/VARCHAR2` 列长度是否满足 `ceil(1.5 * 源长度)`。
+   - TABLE：检查存在性、列名集合（过滤 `OMS_*` 内部列）、`VARCHAR/VARCHAR2` 列长度是否落在 `[ceil(1.5 * 源长度), ceil(2.5 * 源长度)]` 区间；不足则生成 ALTER，过大则给出 WARNING。
    - VIEW/MVIEW/类型/PLSQL/SYNONYM/JOB/SCHEDULE 等：验证存在性即可。
 2. **扩展对象**  
    - INDEX：按列序列+唯一性匹配；多余或缺少的索引列集合会在报告中详细列出。
@@ -87,6 +88,7 @@ Oracle Thick Mode (ALL_OBJECTS / ALL_DEPENDENCIES / DBMS_METADATA)
   - **缺失依赖**：指出是依赖对象缺失、被依赖对象缺失还是单纯未编译。
   - **额外依赖**：提示目标端存在额外耦合，需人工判断。
   - **跳过项**：源/目标缺少 remap 信息时记录原因但不报错。
+- 对于缺失依赖但目标对象已存在的情况，会生成 `ALTER ... COMPILE` 脚本以尝试重编译。
 - 基于期望依赖自动推导跨 schema 所需权限：例如 PROC 调用其他 schema 的 TABLE/SYNONYM → 输出 `GRANT SELECT ...`，PLSQL 调用包/类型 → `GRANT EXECUTE ...`。这些脚本写入 `fixup_scripts/grants/` 并在报告中展示。
 
 ## 7. 修补脚本生成
@@ -104,9 +106,11 @@ Oracle Thick Mode (ALL_OBJECTS / ALL_DEPENDENCIES / DBMS_METADATA)
 
 ### 输出顺序与目录
 
-生成顺序遵循依赖关系：SEQUENCE → TABLE（CREATE + ALTER）→ 代码对象 → INDEX → CONSTRAINT → TRIGGER → GRANT → 其他对象。所有文件位于 `fixup_scripts/<object_type>/`，并带有头部注释（源/目标信息、审核提示）。  
+生成顺序遵循依赖关系：SEQUENCE → TABLE（CREATE + ALTER）→ 代码对象 → INDEX → CONSTRAINT → TRIGGER → 依赖重编译（COMPILE）→ GRANT → 其他对象。所有文件位于 `fixup_scripts/<object_type>/`，并带有头部注释（源/目标信息、审核提示）。  
 
-表列差异专门写入 `fixup_scripts/table_alter/`，对缺失列生成 `ADD COLUMN`，对长度不足生成 `MODIFY`，多余列仅以注释形式提示 `DROP`。  
+表列差异专门写入 `fixup_scripts/table_alter/`，对缺失列生成 `ADD COLUMN`，对长度不足生成 `MODIFY`，长度过大的列以 WARNING 形式提示人工评估；多余列仅以注释形式提示 `DROP`。  
+
+缺失依赖时生成的 `ALTER ... COMPILE` 脚本集中在 `fixup_scripts/compile/`，便于在 GRANT 前后分批执行。  
 
 若某些对象类型 dbcat 暂不支持，生成阶段会给出 warning，提示需要手动处理。
 

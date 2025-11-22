@@ -6,9 +6,9 @@ This toolkit automates end-to-end validation for Oracle → OceanBase migrations
 
 - 一次转储本地对比：Oracle 使用 Thick Mode + `DBMS_METADATA`，OceanBase 通过几次 `obclient` 调用批量拉取 `ALL_*` 视图，避免循环调库。
 - 覆盖的对象类型包括 `TABLE/VIEW/MATERIALIZED VIEW/PROCEDURE/FUNCTION/PACKAGE/PACKAGE BODY/SYNONYM/JOB/SCHEDULE/TYPE/TYPE BODY`，并扩展检查 `INDEX/CONSTRAINT/SEQUENCE/TRIGGER`。
-- 表校验除了存在性外，还会校验列名集合与 `VARCHAR/VARCHAR2` 长度（目标端需 ≥ `ceil(1.5 * 源端长度)`），并生成 `ALTER TABLE` 修补建议。
-- 自动收集 `ALL_DEPENDENCIES` 并映射到目标 schema，输出缺失/多余依赖和所需 `GRANT` 脚本。
-- 基于 dbcat 导出的 DDL + 本地修补器生成结构化的 `fixup_scripts/` 目录，含 SEQUENCE/TABLE/代码对象/INDEX/CONSTRAINT/TRIGGER/GRANT/TABLE_ALTER 等脚本。
+- 表校验除了存在性外，还会校验列名集合与 `VARCHAR/VARCHAR2` 长度（目标端需在 `[ceil(1.5*x), ceil(2.5*x)]` 区间），并生成 `ALTER TABLE` 修补建议。
+- 自动收集 `ALL_DEPENDENCIES` 并映射到目标 schema，输出缺失/多余依赖、依赖重编译脚本和所需 `GRANT`。
+- 基于 dbcat 导出的 DDL + 本地修补器生成结构化的 `fixup_scripts/` 目录，含 SEQUENCE/TABLE/代码对象/INDEX/CONSTRAINT/TRIGGER/COMPILE/GRANT/TABLE_ALTER 等脚本。
 - `run_fixup.py` 可按顺序执行这些脚本，并把成功的文件移动到 `fixup_scripts/done/...` 目录，方便二次运行。
 
 ## Repository Layout
@@ -35,6 +35,7 @@ This toolkit automates end-to-end validation for Oracle → OceanBase migrations
 2. Oracle Instant Client 19c+，并设置 `LD_LIBRARY_PATH` 指向解压目录（`oracle_client_lib_dir` 也需配置）。
 3. `obclient` 客户端以及访问 Oracle/OceanBase 的网络。
 4. `dbcat` CLI（例如 `dbcat-2.5.0-SNAPSHOT`），以及可用的 `JAVA_HOME`。dbcat 用于批量导出源端 DDL，是修补脚本生成的核心。
+5. 运行账号需能查询目标 schema 的 `ALL_*` 视图（推荐 SYS/SYSDBA 或拥有 `SELECT_CATALOG_ROLE`/`SELECT ANY DICTIONARY`；OceanBase 侧建议用 SYS/root 级账号），否则只会看到自身 schema 的对象。
 
 ### Python environment
 
@@ -100,7 +101,8 @@ python3 schema_diff_reconciler.py
    2. 缺失的 TABLE（CREATE）与 `table_alter/` 中的列修补
    3. VIEW/MVIEW/PLSQL/SYNONYM/JOB/SCHEDULE/TYPE/TYPE BODY
    4. INDEX / CONSTRAINT / TRIGGER
-   5. `grants/`：依赖所需授权  
+   5. 依赖重编译（`compile/` 中的 `ALTER ... COMPILE`）
+   6. `grants/`：依赖所需授权  
    生成前会清空旧的 `fixup_scripts/` 内容，并尽量复用 `dbcat_output` 缓存。
 7. **报告输出**：使用 `rich` 打印彩色摘要（对象数量、缺失/不匹配列表、依赖状态、GRANT 建议、无效 remap 等），同时写入 `main_reports/report_<timestamp>.txt`。
 
@@ -119,7 +121,8 @@ python3 schema_diff_reconciler.py
 - **`fixup_scripts/`**（当 `generate_fixup=true`）  
   - `table/`, `view/`, `materialized_view/`, `procedure/`, `function/`, `package/`, `package_body/`, `synonym/`, `job/`, `schedule/`, `type/`, `type_body/`：缺失对象的 CREATE DDL。
   - `sequence/`, `trigger/`, `index/`, `constraint/`：针对相应差异的脚本。
-  - `table_alter/`: 针对列缺失/长度不足生成的 `ALTER TABLE` 脚本（多余列仅给出注释版 DROP 建议）。
+  - `table_alter/`: 针对列缺失/长度不足生成的 `ALTER TABLE` 脚本（多余列仅给出注释版 DROP 建议；长度过大的列会以 WARNING 提示人工收敛）。
+  - `compile/`: 针对缺失依赖的对象生成 `ALTER ... COMPILE` 重编译脚本。
   - `grants/`: `GRANT <priv> ON <schema.object> TO <schema>`，确保跨 schema 依赖可编译。
   - `done/`: 由 `run_fixup.py` 创建，用于存放已执行成功的脚本副本。
 
