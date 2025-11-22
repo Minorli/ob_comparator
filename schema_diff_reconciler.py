@@ -1,8 +1,22 @@
+# Copyright 2025 Minorli                                                                                                                                                    
+#                                                                                                                                                                           
+# Licensed under the Apache License, Version 2.0 (the "License");                                                                                                           
+# you may not use this file except in compliance with the License.                                                                                                          
+# You may obtain a copy of the License at                                                                                                                                   
+#                                                                                                                                                                           
+#     http://www.apache.org/licenses/LICENSE-2.0                                                                                                                            
+#                                                                                                                                                                           
+# Unless required by applicable law or agreed to in writing, software                                                                                                       
+# distributed under the License is distributed on an "AS IS" BASIS,                                                                                                         
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.                                                                                                  
+# See the License for the specific language governing permissions and                                                                                                       
+# limitations under the License.#!/usr/bin/env python3
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
-数据库对象对比工具 (V0.1 - Dump-Once, Compare-Locally + 扩展对象 + ALTER 修补)
+数据库对象对比工具 (V0.5 - Dump-Once, Compare-Locally + 扩展对象 + ALTER 修补)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -19,7 +33,7 @@
    - INDEX / CONSTRAINT：
        对比“是否存在”及“构成”（索引列集合、有无/列顺序；约束类型和约束列集合）。
 
-3. 性能架构 (V0.1 核心)：
+3. 性能架构 (V0.5 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          ALL_OBJECTS
