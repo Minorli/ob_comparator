@@ -205,20 +205,34 @@ IGNORED_OMS_COLUMNS: Tuple[str, ...] = (
 
 def is_ignored_oms_column(col_name: Optional[str], col_meta: Optional[Dict] = None) -> bool:
     """
-    OceanBase 在表上自动补充少量固定的 OMS_* 隐藏列。
-    仅当列名匹配已知 4 个系统列且列本身被标记为隐藏时才忽略。
+    OceanBase 端迁移工具可能添加 OMS_* 列（VISIBLE/INVISIBLE 均可）。
+    只要列名命中已知 OMS_* 集合就忽略，不再依赖 hidden 标记。
     """
     if not col_name:
         return False
     col_u = col_name.strip('"').upper()
-    hidden_flag = False
-    if col_meta:
-        hidden_flag = bool(col_meta.get("hidden"))
-    return hidden_flag and col_u in IGNORED_OMS_COLUMNS
+    return col_u in IGNORED_OMS_COLUMNS
 
 
 VARCHAR_LEN_MIN_MULTIPLIER = 1.5  # 目标端 VARCHAR/2 长度需 >= ceil(src * 1.5)
 VARCHAR_LEN_OVERSIZE_MULTIPLIER = 2.5  # 超过该倍数认为“过大”，需要提示
+
+def is_oms_index(name: str, columns: List[str]) -> bool:
+    """识别迁移工具自动生成的 OMS_* 唯一索引，忽略之。"""
+    name_u = (name or "").strip('"').upper()
+    cols_u = [c.strip('"').upper() for c in (columns or []) if c]
+    if not cols_u:
+        return False
+    # 必须包含 4 个核心 OMS 列
+    if not all(col in cols_u for col in IGNORED_OMS_COLUMNS):
+        return False
+    # 名称包含 OMS_ROWID 或以 OMS_ROWID 结尾，或列前缀即 OMS 集合
+    if name_u.endswith("OMS_ROWID") or "OMS_ROWID" in name_u:
+        return True
+    prefix = cols_u[:4]
+    if set(prefix) == set(IGNORED_OMS_COLUMNS):
+        return True
+    return False
 
 OBJECT_COUNT_TYPES: Tuple[str, ...] = (
     'TABLE',
@@ -982,23 +996,15 @@ def dump_ob_metadata(
                     objects_by_type.setdefault('TYPE BODY', set()).add(full)
 
     # --- 2. ALL_TAB_COLUMNS ---
-    def _load_ob_tab_columns(include_hidden: bool) -> Tuple[bool, str, str]:
-        hidden_col = ", NVL(TO_CHAR(HIDDEN_COLUMN),'NO') AS HIDDEN_COLUMN" if include_hidden else ""
-        sql_cols = f"""
-            SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHAR_LENGTH, NULLABLE, DATA_DEFAULT{hidden_col}
-            FROM ALL_TAB_COLUMNS
-            WHERE OWNER IN ({owners_in})
-        """
-        return obclient_run_sql(ob_cfg, sql_cols)
+    sql_cols = f"""
+        SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHAR_LENGTH, NULLABLE, DATA_DEFAULT
+        FROM ALL_TAB_COLUMNS
+        WHERE OWNER IN ({owners_in})
+    """
 
     tab_columns: Dict[Tuple[str, str], Dict[str, Dict]] = {}
-    hidden_supported = True
     if include_tab_columns:
-        ok, out, err = _load_ob_tab_columns(include_hidden=True)
-        if not ok:
-            log.warning("读取 ALL_TAB_COLUMNS 包含 HIDDEN_COLUMN 失败，回退到不带隐藏标记: %s", err)
-            hidden_supported = False
-            ok, out, err = _load_ob_tab_columns(include_hidden=False)
+        ok, out, err = obclient_run_sql(ob_cfg, sql_cols)
         if not ok:
             log.error("无法从 OB 读取 ALL_TAB_COLUMNS，程序退出。")
             sys.exit(1)
@@ -1006,8 +1012,7 @@ def dump_ob_metadata(
         if out:
             for line in out.splitlines():
                 parts = line.split('\t')
-                expect_len = 8 if hidden_supported else 7
-                if len(parts) < expect_len:
+                if len(parts) < 7:
                     continue
                 owner = parts[0].strip().upper()
                 table = parts[1].strip().upper()
@@ -1016,14 +1021,13 @@ def dump_ob_metadata(
                 char_len = parts[4].strip()
                 nullable = parts[5].strip()
                 default = parts[6].strip()
-                hidden_val = parts[7].strip().upper() if hidden_supported else "NO"
                 key = (owner, table)
                 tab_columns.setdefault(key, {})[col] = {
                     "data_type": dtype,
                     "char_length": int(char_len) if char_len.isdigit() else None,
                     "nullable": nullable,
                     "data_default": default,
-                    "hidden": hidden_val == 'YES'
+                    "hidden": False
                 }
 
     # --- 3. ALL_INDEXES ---
@@ -1085,6 +1089,19 @@ def dump_ob_metadata(
                 if idx_name not in indexes[key]:
                     indexes[key][idx_name] = {"uniqueness": "UNKNOWN", "columns": []}
                 indexes[key][idx_name]["columns"].append(col_name)
+
+        # 过滤 OMS_* 自动索引
+        for key in list(indexes.keys()):
+            pruned = {}
+            for idx_name, info in indexes[key].items():
+                cols = info.get("columns") or []
+                if is_oms_index(idx_name, cols):
+                    continue
+                pruned[idx_name] = info
+            if pruned:
+                indexes[key] = pruned
+            else:
+                del indexes[key]
 
     # --- 5. ALL_CONSTRAINTS (P/U/R) ---
     constraints: Dict[Tuple[str, str], Dict[str, Dict]] = {}
