@@ -68,12 +68,35 @@ pip install -r requirements.txt
   - `fixup_dir`：修补脚本输出目录（默认 `fixup_scripts`）。
   - `report_dir`：报告输出目录（默认 `main_reports`）。
   - `generate_fixup`：`true/false`，允许只跑对比不生成脚本。
+  - `check_primary_types`：限制本次主对象校验的类型，逗号分隔（如 `TABLE,VIEW`，留空为全量）。
+  - `check_extra_types`：限制扩展校验的模块，默认 `index,constraint,sequence,trigger`，可按需删减。
+  - `check_dependencies`：`true/false`，关闭后跳过依赖校验与授权建议。
   - `obclient_timeout`：每次 `obclient` 调用的超时（秒，默认 60）。
   - `cli_timeout`：shell 工具（如 dbcat）超时，默认 600 秒。
   - `dbcat_bin`：dbcat 根目录或 `bin/dbcat` 可执行文件路径。
-  - `dbcat_from` / `dbcat_to`：dbcat 的源/目标 profile（例如 `oracle19c` → `oboracle420`）。
-  - `dbcat_output_dir`：dbcat 输出根目录，默认 `dbcat_output`，支持缓存复用。
-  - `java_home`：可选。如果留空则回退到环境变量 `JAVA_HOME`。
+- `dbcat_from` / `dbcat_to`：dbcat 的源/目标 profile（例如 `oracle19c` → `oboracle420`）。
+- `dbcat_output_dir`：dbcat 输出根目录，默认 `dbcat_output`，支持缓存复用。
+- `java_home`：可选。如果留空则回退到环境变量 `JAVA_HOME`。
+
+常用配置组合示例（可按需写入 `config.ini`）：
+
+- 仅校验表（列名 + VARCHAR 长度区间），不生成修补脚本、跳过依赖：
+  - `check_primary_types=TABLE`
+  - `check_extra_types=`（留空表示跳过索引/约束/序列/触发器）
+  - `check_dependencies=false`
+  - `generate_fixup=false`
+
+- 校验表 + 索引/约束/序列/触发器（默认值）：
+  - `check_primary_types=TABLE`
+  - `check_extra_types=index,constraint,sequence,trigger`
+  - `check_dependencies=true`
+
+- 全量检查（所有受管类型 + 依赖）：
+  - `check_primary_types=` 留空或填全（如 `TABLE,VIEW,...`）
+  - `check_extra_types=` 留空或默认值
+  - `check_dependencies=true`
+
+运行时控制台会打印“本次启用的主对象类型/扩展校验模块/是否跳过依赖”，便于确认范围。
 
 ### Remap rules
 

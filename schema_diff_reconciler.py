@@ -187,6 +187,13 @@ ALL_TRACKED_OBJECT_TYPES: Tuple[str, ...] = tuple(
     sorted(set(PRIMARY_OBJECT_TYPES) | set(DEPENDENCY_EXTRA_OBJECT_TYPES))
 )
 
+EXTRA_OBJECT_CHECK_TYPES: Tuple[str, ...] = (
+    'INDEX',
+    'CONSTRAINT',
+    'SEQUENCE',
+    'TRIGGER'
+)
+
 # OceanBase 目标端自动生成且需在列对比中忽略的 OMS 列
 IGNORED_OMS_COLUMNS: Tuple[str, ...] = (
     "OMS_OBJECT_NUMBER",
@@ -231,6 +238,27 @@ OBJECT_COUNT_TYPES: Tuple[str, ...] = (
     'INDEX',
     'CONSTRAINT'
 )
+
+
+def parse_bool_flag(value: Optional[str], default: bool = True) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+
+
+def parse_type_list(
+    raw_value: str,
+    allowed: Set[str],
+    label: str,
+    default_all: bool = True
+) -> Set[str]:
+    if not raw_value or not raw_value.strip():
+        return set(allowed) if default_all else set()
+    parsed = {item.strip().upper() for item in raw_value.split(',') if item.strip()}
+    unknown = parsed - allowed
+    if unknown:
+        log.warning("配置 %s 包含未知类型 %s，将被忽略。", label, sorted(unknown))
+    return parsed & allowed
 
 
 # --- 扩展检查结果结构 ---
@@ -372,6 +400,27 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('dbcat_to', '')
         settings.setdefault('dbcat_output_dir', 'dbcat_output')
         settings.setdefault('java_home', os.environ.get('JAVA_HOME', ''))
+        # 检查范围开关
+        settings.setdefault('check_primary_types', '')
+        settings.setdefault('check_extra_types', '')
+        settings.setdefault('check_dependencies', 'true')
+
+        enabled_primary_types = parse_type_list(
+            settings.get('check_primary_types', ''),
+            set(PRIMARY_OBJECT_TYPES),
+            'check_primary_types'
+        )
+        enabled_extra_types = parse_type_list(
+            settings.get('check_extra_types', ''),
+            set(EXTRA_OBJECT_CHECK_TYPES),
+            'check_extra_types'
+        )
+        settings['enabled_primary_types'] = enabled_primary_types
+        settings['enabled_extra_types'] = enabled_extra_types
+        settings['enable_dependencies_check'] = parse_bool_flag(
+            settings.get('check_dependencies', 'true'),
+            True
+        )
 
         global OBC_TIMEOUT
         try:
@@ -593,7 +642,11 @@ def resolve_remap_target(
     return None
 
 
-def generate_master_list(source_objects: SourceObjectMap, remap_rules: RemapRules) -> MasterCheckList:
+def generate_master_list(
+    source_objects: SourceObjectMap,
+    remap_rules: RemapRules,
+    enabled_primary_types: Optional[Set[str]] = None
+) -> MasterCheckList:
     """
     生成“最终校验清单”并检测 "多对一" 映射。
     仅保留 PRIMARY_OBJECT_TYPES 中的主对象，用于主校验。
@@ -603,11 +656,13 @@ def generate_master_list(source_objects: SourceObjectMap, remap_rules: RemapRule
 
     target_tracker: Dict[Tuple[str, str], str] = {}
 
+    allowed_primary = enabled_primary_types or set(PRIMARY_OBJECT_TYPES)
+
     for src_name, obj_types in source_objects.items():
         src_name_u = src_name.upper()
         for obj_type in sorted(obj_types):
             obj_type_u = obj_type.upper()
-            if obj_type_u not in PRIMARY_OBJECT_TYPES:
+            if obj_type_u not in allowed_primary:
                 continue
 
             tgt_name = resolve_remap_target(src_name_u, obj_type_u, remap_rules) or src_name_u
@@ -849,7 +904,16 @@ def obclient_run_sql(ob_cfg: ObConfig, sql_query: str) -> Tuple[bool, str, str]:
         return False, "", str(e)
 
 
-def dump_ob_metadata(ob_cfg: ObConfig, target_schemas: Set[str]) -> ObMetadata:
+def dump_ob_metadata(
+    ob_cfg: ObConfig,
+    target_schemas: Set[str],
+    tracked_object_types: Optional[Set[str]] = None,
+    include_tab_columns: bool = True,
+    include_indexes: bool = True,
+    include_constraints: bool = True,
+    include_triggers: bool = True,
+    include_sequences: bool = True
+) -> ObMetadata:
     """
     一次性从 OceanBase dump 所有需要的元数据，返回 ObMetadata。
     如果任何关键视图查询失败，则视为致命错误并退出。
@@ -869,7 +933,10 @@ def dump_ob_metadata(ob_cfg: ObConfig, target_schemas: Set[str]) -> ObMetadata:
 
     # --- 1. ALL_OBJECTS ---
     objects_by_type: Dict[str, Set[str]] = {}
-    object_types_clause = ",".join(f"'{obj}'" for obj in ALL_TRACKED_OBJECT_TYPES)
+    object_types_filter = tracked_object_types or set(ALL_TRACKED_OBJECT_TYPES)
+    if not object_types_filter:
+        object_types_filter = {'TABLE'}
+    object_types_clause = ",".join(f"'{obj}'" for obj in sorted(object_types_filter))
 
     sql = f"""
         SELECT OWNER, OBJECT_NAME, OBJECT_TYPE
@@ -894,24 +961,25 @@ def dump_ob_metadata(ob_cfg: ObConfig, target_schemas: Set[str]) -> ObMetadata:
             objects_by_type.setdefault(obj_type, set()).add(full)
 
     # 补充 ALL_TYPES (部分 OB 环境中 TYPE/TYPE BODY 不出现在 ALL_OBJECTS)
-    sql_types = f"""
-        SELECT OWNER, TYPE_NAME, TYPECODE
-        FROM ALL_TYPES
-        WHERE OWNER IN ({owners_in})
-    """
-    ok, out, err = obclient_run_sql(ob_cfg, sql_types)
-    if not ok:
-        log.warning("读取 ALL_TYPES 失败，TYPE / TYPE BODY 检查可能不完整: %s", err)
-    elif out:
-        for line in out.splitlines():
-            parts = line.split('\t')
-            if len(parts) < 3:
-                continue
-            owner, name, typecode = parts[0].strip().upper(), parts[1].strip().upper(), parts[2].strip().upper()
-            full = f"{owner}.{name}"
-            objects_by_type.setdefault('TYPE', set()).add(full)
-            if typecode == 'OBJECT':
-                objects_by_type.setdefault('TYPE BODY', set()).add(full)
+    if 'TYPE' in object_types_filter or 'TYPE BODY' in object_types_filter:
+        sql_types = f"""
+            SELECT OWNER, TYPE_NAME, TYPECODE
+            FROM ALL_TYPES
+            WHERE OWNER IN ({owners_in})
+        """
+        ok, out, err = obclient_run_sql(ob_cfg, sql_types)
+        if not ok:
+            log.warning("读取 ALL_TYPES 失败，TYPE / TYPE BODY 检查可能不完整: %s", err)
+        elif out:
+            for line in out.splitlines():
+                parts = line.split('\t')
+                if len(parts) < 3:
+                    continue
+                owner, name, typecode = parts[0].strip().upper(), parts[1].strip().upper(), parts[2].strip().upper()
+                full = f"{owner}.{name}"
+                objects_by_type.setdefault('TYPE', set()).add(full)
+                if typecode == 'OBJECT':
+                    objects_by_type.setdefault('TYPE BODY', set()).add(full)
 
     # --- 2. ALL_TAB_COLUMNS ---
     def _load_ob_tab_columns(include_hidden: bool) -> Tuple[bool, str, str]:
@@ -925,209 +993,214 @@ def dump_ob_metadata(ob_cfg: ObConfig, target_schemas: Set[str]) -> ObMetadata:
 
     tab_columns: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     hidden_supported = True
-    ok, out, err = _load_ob_tab_columns(include_hidden=True)
-    if not ok:
-        log.warning("读取 ALL_TAB_COLUMNS 包含 HIDDEN_COLUMN 失败，回退到不带隐藏标记: %s", err)
-        hidden_supported = False
-        ok, out, err = _load_ob_tab_columns(include_hidden=False)
-    if not ok:
-        log.error("无法从 OB 读取 ALL_TAB_COLUMNS，程序退出。")
-        sys.exit(1)
+    if include_tab_columns:
+        ok, out, err = _load_ob_tab_columns(include_hidden=True)
+        if not ok:
+            log.warning("读取 ALL_TAB_COLUMNS 包含 HIDDEN_COLUMN 失败，回退到不带隐藏标记: %s", err)
+            hidden_supported = False
+            ok, out, err = _load_ob_tab_columns(include_hidden=False)
+        if not ok:
+            log.error("无法从 OB 读取 ALL_TAB_COLUMNS，程序退出。")
+            sys.exit(1)
 
-    if out:
-        for line in out.splitlines():
-            parts = line.split('\t')
-            expect_len = 8 if hidden_supported else 7
-            if len(parts) < expect_len:
-                continue
-            owner = parts[0].strip().upper()
-            table = parts[1].strip().upper()
-            col = parts[2].strip().upper()
-            dtype = parts[3].strip().upper()
-            char_len = parts[4].strip()
-            nullable = parts[5].strip()
-            default = parts[6].strip()
-            hidden_val = parts[7].strip().upper() if hidden_supported else "NO"
-            key = (owner, table)
-            tab_columns.setdefault(key, {})[col] = {
-                "data_type": dtype,
-                "char_length": int(char_len) if char_len.isdigit() else None,
-                "nullable": nullable,
-                "data_default": default,
-                "hidden": hidden_val == 'YES'
-            }
+        if out:
+            for line in out.splitlines():
+                parts = line.split('\t')
+                expect_len = 8 if hidden_supported else 7
+                if len(parts) < expect_len:
+                    continue
+                owner = parts[0].strip().upper()
+                table = parts[1].strip().upper()
+                col = parts[2].strip().upper()
+                dtype = parts[3].strip().upper()
+                char_len = parts[4].strip()
+                nullable = parts[5].strip()
+                default = parts[6].strip()
+                hidden_val = parts[7].strip().upper() if hidden_supported else "NO"
+                key = (owner, table)
+                tab_columns.setdefault(key, {})[col] = {
+                    "data_type": dtype,
+                    "char_length": int(char_len) if char_len.isdigit() else None,
+                    "nullable": nullable,
+                    "data_default": default,
+                    "hidden": hidden_val == 'YES'
+                }
 
     # --- 3. ALL_INDEXES ---
     indexes: Dict[Tuple[str, str], Dict[str, Dict]] = {}
-    sql = f"""
-        SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, UNIQUENESS
-        FROM ALL_INDEXES
-        WHERE TABLE_OWNER IN ({owners_in})
-    """
-    ok, out, err = obclient_run_sql(ob_cfg, sql)
-    if not ok:
-        log.error("无法从 OB 读取 ALL_INDEXES，程序退出。")
-        sys.exit(1)
+    if include_indexes:
+        sql = f"""
+            SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, UNIQUENESS
+            FROM ALL_INDEXES
+            WHERE TABLE_OWNER IN ({owners_in})
+        """
+        ok, out, err = obclient_run_sql(ob_cfg, sql)
+        if not ok:
+            log.error("无法从 OB 读取 ALL_INDEXES，程序退出。")
+            sys.exit(1)
 
-    if out:
-        for line in out.splitlines():
-            parts = line.split('\t')
-            if len(parts) < 4:
-                continue
-            t_owner, t_name, idx_name, uniq = (
-                parts[0].strip().upper(),
-                parts[1].strip().upper(),
-                parts[2].strip().upper(),
-                parts[3].strip().upper()
-            )
-            key = (t_owner, t_name)
-            indexes.setdefault(key, {})[idx_name] = {
-                "uniqueness": uniq,
-                "columns": []
-            }
+        if out:
+            for line in out.splitlines():
+                parts = line.split('\t')
+                if len(parts) < 4:
+                    continue
+                t_owner, t_name, idx_name, uniq = (
+                    parts[0].strip().upper(),
+                    parts[1].strip().upper(),
+                    parts[2].strip().upper(),
+                    parts[3].strip().upper()
+                )
+                key = (t_owner, t_name)
+                indexes.setdefault(key, {})[idx_name] = {
+                    "uniqueness": uniq,
+                    "columns": []
+                }
 
-    # --- 4. ALL_IND_COLUMNS ---
-    sql = f"""
-        SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_NAME, COLUMN_POSITION
-        FROM ALL_IND_COLUMNS
-        WHERE TABLE_OWNER IN ({owners_in})
-        ORDER BY TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_POSITION
-    """
-    ok, out, err = obclient_run_sql(ob_cfg, sql)
-    if not ok:
-        log.error("无法从 OB 读取 ALL_IND_COLUMNS，程序退出。")
-        sys.exit(1)
+        # --- 4. ALL_IND_COLUMNS ---
+        sql = f"""
+            SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_NAME, COLUMN_POSITION
+            FROM ALL_IND_COLUMNS
+            WHERE TABLE_OWNER IN ({owners_in})
+            ORDER BY TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_POSITION
+        """
+        ok, out, err = obclient_run_sql(ob_cfg, sql)
+        if not ok:
+            log.error("无法从 OB 读取 ALL_IND_COLUMNS，程序退出。")
+            sys.exit(1)
 
-    if out:
-        for line in out.splitlines():
-            parts = line.split('\t')
-            if len(parts) < 5:
-                continue
-            t_owner, t_name, idx_name, col_name = (
-                parts[0].strip().upper(),
-                parts[1].strip().upper(),
-                parts[2].strip().upper(),
-                parts[3].strip().upper()
-            )
-            key = (t_owner, t_name)
-            if key not in indexes:
-                indexes[key] = {}
-            if idx_name not in indexes[key]:
-                indexes[key][idx_name] = {"uniqueness": "UNKNOWN", "columns": []}
-            indexes[key][idx_name]["columns"].append(col_name)
+        if out:
+            for line in out.splitlines():
+                parts = line.split('\t')
+                if len(parts) < 5:
+                    continue
+                t_owner, t_name, idx_name, col_name = (
+                    parts[0].strip().upper(),
+                    parts[1].strip().upper(),
+                    parts[2].strip().upper(),
+                    parts[3].strip().upper()
+                )
+                key = (t_owner, t_name)
+                if key not in indexes:
+                    indexes[key] = {}
+                if idx_name not in indexes[key]:
+                    indexes[key][idx_name] = {"uniqueness": "UNKNOWN", "columns": []}
+                indexes[key][idx_name]["columns"].append(col_name)
 
     # --- 5. ALL_CONSTRAINTS (P/U/R) ---
     constraints: Dict[Tuple[str, str], Dict[str, Dict]] = {}
-    sql = f"""
-        SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE
-        FROM ALL_CONSTRAINTS
-        WHERE OWNER IN ({owners_in})
-          AND CONSTRAINT_TYPE IN ('P','U','R')
-          AND STATUS = 'ENABLED'
-    """
-    ok, out, err = obclient_run_sql(ob_cfg, sql)
-    if not ok:
-        log.error("无法从 OB 读取 ALL_CONSTRAINTS，程序退出。")
-        sys.exit(1)
+    if include_constraints:
+        sql = f"""
+            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE
+            FROM ALL_CONSTRAINTS
+            WHERE OWNER IN ({owners_in})
+              AND CONSTRAINT_TYPE IN ('P','U','R')
+              AND STATUS = 'ENABLED'
+        """
+        ok, out, err = obclient_run_sql(ob_cfg, sql)
+        if not ok:
+            log.error("无法从 OB 读取 ALL_CONSTRAINTS，程序退出。")
+            sys.exit(1)
 
-    if out:
-        for line in out.splitlines():
-            parts = line.split('\t')
-            if len(parts) < 4:
-                continue
-            owner, table, cons_name, ctype = (
-                parts[0].strip().upper(),
-                parts[1].strip().upper(),
-                parts[2].strip().upper(),
-                parts[3].strip().upper()
-            )
-            key = (owner, table)
-            constraints.setdefault(key, {})[cons_name] = {
-                "type": ctype,
-                "columns": []
-            }
+        if out:
+            for line in out.splitlines():
+                parts = line.split('\t')
+                if len(parts) < 4:
+                    continue
+                owner, table, cons_name, ctype = (
+                    parts[0].strip().upper(),
+                    parts[1].strip().upper(),
+                    parts[2].strip().upper(),
+                    parts[3].strip().upper()
+                )
+                key = (owner, table)
+                constraints.setdefault(key, {})[cons_name] = {
+                    "type": ctype,
+                    "columns": []
+                }
 
-    # --- 6. ALL_CONS_COLUMNS ---
-    sql = f"""
-        SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME, POSITION
-        FROM ALL_CONS_COLUMNS
-        WHERE OWNER IN ({owners_in})
-        ORDER BY OWNER, TABLE_NAME, CONSTRAINT_NAME, POSITION
-    """
-    ok, out, err = obclient_run_sql(ob_cfg, sql)
-    if not ok:
-        log.error("无法从 OB 读取 ALL_CONS_COLUMNS，程序退出。")
-        sys.exit(1)
+        # --- 6. ALL_CONS_COLUMNS ---
+        sql = f"""
+            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME, POSITION
+            FROM ALL_CONS_COLUMNS
+            WHERE OWNER IN ({owners_in})
+            ORDER BY OWNER, TABLE_NAME, CONSTRAINT_NAME, POSITION
+        """
+        ok, out, err = obclient_run_sql(ob_cfg, sql)
+        if not ok:
+            log.error("无法从 OB 读取 ALL_CONS_COLUMNS，程序退出。")
+            sys.exit(1)
 
-    if out:
-        for line in out.splitlines():
-            parts = line.split('\t')
-            if len(parts) < 5:
-                continue
-            owner, table, cons_name, col_name = (
-                parts[0].strip().upper(),
-                parts[1].strip().upper(),
-                parts[2].strip().upper(),
-                parts[3].strip().upper()
-            )
-            key = (owner, table)
-            if key not in constraints:
-                constraints[key] = {}
-            if cons_name not in constraints[key]:
-                constraints[key][cons_name] = {"type": "UNKNOWN", "columns": []}
-            constraints[key][cons_name]["columns"].append(col_name)
+        if out:
+            for line in out.splitlines():
+                parts = line.split('\t')
+                if len(parts) < 5:
+                    continue
+                owner, table, cons_name, col_name = (
+                    parts[0].strip().upper(),
+                    parts[1].strip().upper(),
+                    parts[2].strip().upper(),
+                    parts[3].strip().upper()
+                )
+                key = (owner, table)
+                if key not in constraints:
+                    constraints[key] = {}
+                if cons_name not in constraints[key]:
+                    constraints[key][cons_name] = {"type": "UNKNOWN", "columns": []}
+                constraints[key][cons_name]["columns"].append(col_name)
 
     # --- 7. ALL_TRIGGERS ---
     triggers: Dict[Tuple[str, str], Dict[str, Dict]] = {}
-    sql = f"""
-        SELECT TABLE_OWNER, TABLE_NAME, TRIGGER_NAME, TRIGGERING_EVENT, STATUS
-        FROM ALL_TRIGGERS
-        WHERE TABLE_OWNER IN ({owners_in})
-    """
-    ok, out, err = obclient_run_sql(ob_cfg, sql)
-    if not ok:
-        log.error("无法从 OB 读取 ALL_TRIGGERS，程序退出。")
-        sys.exit(1)
+    if include_triggers:
+        sql = f"""
+            SELECT TABLE_OWNER, TABLE_NAME, TRIGGER_NAME, TRIGGERING_EVENT, STATUS
+            FROM ALL_TRIGGERS
+            WHERE TABLE_OWNER IN ({owners_in})
+        """
+        ok, out, err = obclient_run_sql(ob_cfg, sql)
+        if not ok:
+            log.error("无法从 OB 读取 ALL_TRIGGERS，程序退出。")
+            sys.exit(1)
 
-    if out:
-        for line in out.splitlines():
-            parts = line.split('\t')
-            if len(parts) < 5:
-                continue
-            t_owner, t_name, trg_name, ev, status = (
-                parts[0].strip().upper(),
-                parts[1].strip().upper(),
-                parts[2].strip().upper(),
-                parts[3].strip(),
-                parts[4].strip()
-            )
-            key = (t_owner, t_name)
-            triggers.setdefault(key, {})[trg_name] = {
-                "event": ev,
-                "status": status
-            }
+        if out:
+            for line in out.splitlines():
+                parts = line.split('\t')
+                if len(parts) < 5:
+                    continue
+                t_owner, t_name, trg_name, ev, status = (
+                    parts[0].strip().upper(),
+                    parts[1].strip().upper(),
+                    parts[2].strip().upper(),
+                    parts[3].strip(),
+                    parts[4].strip()
+                )
+                key = (t_owner, t_name)
+                triggers.setdefault(key, {})[trg_name] = {
+                    "event": ev,
+                    "status": status
+                }
 
     # --- 8. ALL_SEQUENCES ---
     sequences: Dict[str, Set[str]] = {}
-    sql = f"""
-        SELECT SEQUENCE_OWNER, SEQUENCE_NAME
-        FROM ALL_SEQUENCES
-        WHERE SEQUENCE_OWNER IN ({owners_in})
-    """
-    ok, out, err = obclient_run_sql(ob_cfg, sql)
-    if not ok:
-        log.error("无法从 OB 读取 ALL_SEQUENCES，程序退出。")
-        sys.exit(1)
+    if include_sequences:
+        sql = f"""
+            SELECT SEQUENCE_OWNER, SEQUENCE_NAME
+            FROM ALL_SEQUENCES
+            WHERE SEQUENCE_OWNER IN ({owners_in})
+        """
+        ok, out, err = obclient_run_sql(ob_cfg, sql)
+        if not ok:
+            log.error("无法从 OB 读取 ALL_SEQUENCES，程序退出。")
+            sys.exit(1)
 
-    if out:
-        for line in out.splitlines():
-            parts = line.split('\t')
-            if len(parts) < 2:
-                continue
-            owner, seq_name = parts[0].strip().upper(), parts[1].strip().upper()
-            sequences.setdefault(owner, set()).add(seq_name)
+        if out:
+            for line in out.splitlines():
+                parts = line.split('\t')
+                if len(parts) < 2:
+                    continue
+                owner, seq_name = parts[0].strip().upper(), parts[1].strip().upper()
+                sequences.setdefault(owner, set()).add(seq_name)
 
-    log.info("OceanBase 元数据转储完成 (ALL_OBJECTS/COLUMNS/INDEXES/CONSTRAINTS/TRIGGERS/SEQUENCES)。")
+    log.info("OceanBase 元数据转储完成 (根据开关加载 ALL_OBJECTS/列/索引/约束/触发器/序列)。")
     return ObMetadata(
         objects_by_type=objects_by_type,
         tab_columns=tab_columns,
@@ -1143,7 +1216,11 @@ def dump_ob_metadata(ob_cfg: ObConfig, target_schemas: Set[str]) -> ObMetadata:
 def dump_oracle_metadata(
     ora_cfg: OraConfig,
     master_list: MasterCheckList,
-    settings: Dict
+    settings: Dict,
+    include_indexes: bool = True,
+    include_constraints: bool = True,
+    include_triggers: bool = True,
+    include_sequences: bool = True
 ) -> OracleMetadata:
     """
     预先加载 Oracle 端所需的所有元数据，避免在校验/修补阶段频繁查询。
@@ -1269,150 +1346,153 @@ def dump_oracle_metadata(
                             }
 
                 # 索引
-                sql_idx = f"""
-                    SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, UNIQUENESS
-                    FROM ALL_INDEXES
-                    WHERE TABLE_OWNER IN ({owners_clause})
-                """
-                with ora_conn.cursor() as cursor:
-                    cursor.execute(sql_idx, owners)
-                    for row in cursor:
-                        owner = _safe_upper(row[0])
-                        table = _safe_upper(row[1])
-                        if not owner or not table:
-                            continue
-                        key = (owner, table)
-                        if key not in table_pairs:
-                            continue
-                        idx_name = _safe_upper(row[2])
-                        if not idx_name:
-                            continue
-                        indexes.setdefault(key, {})[idx_name] = {
-                            "uniqueness": (row[3] or "").upper(),
-                            "columns": []
-                        }
+                if include_indexes:
+                    sql_idx = f"""
+                        SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, UNIQUENESS
+                        FROM ALL_INDEXES
+                        WHERE TABLE_OWNER IN ({owners_clause})
+                    """
+                    with ora_conn.cursor() as cursor:
+                        cursor.execute(sql_idx, owners)
+                        for row in cursor:
+                            owner = _safe_upper(row[0])
+                            table = _safe_upper(row[1])
+                            if not owner or not table:
+                                continue
+                            key = (owner, table)
+                            if key not in table_pairs:
+                                continue
+                            idx_name = _safe_upper(row[2])
+                            if not idx_name:
+                                continue
+                            indexes.setdefault(key, {})[idx_name] = {
+                                "uniqueness": (row[3] or "").upper(),
+                                "columns": []
+                            }
 
-                sql_idx_cols = f"""
-                    SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_NAME
-                    FROM ALL_IND_COLUMNS
-                    WHERE TABLE_OWNER IN ({owners_clause})
-                    ORDER BY TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_POSITION
-                """
-                with ora_conn.cursor() as cursor:
-                    cursor.execute(sql_idx_cols, owners)
-                    for row in cursor:
-                        owner = _safe_upper(row[0])
-                        table = _safe_upper(row[1])
-                        if not owner or not table:
-                            continue
-                        key = (owner, table)
-                        if key not in table_pairs:
-                            continue
-                        idx_name = _safe_upper(row[2])
-                        col_name = _safe_upper(row[3])
-                        if not idx_name or not col_name:
-                            continue
-                        indexes.setdefault(key, {}).setdefault(
-                            idx_name, {"uniqueness": "UNKNOWN", "columns": []}
-                        )["columns"].append(col_name)
+                    sql_idx_cols = f"""
+                        SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_NAME
+                        FROM ALL_IND_COLUMNS
+                        WHERE TABLE_OWNER IN ({owners_clause})
+                        ORDER BY TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_POSITION
+                    """
+                    with ora_conn.cursor() as cursor:
+                        cursor.execute(sql_idx_cols, owners)
+                        for row in cursor:
+                            owner = _safe_upper(row[0])
+                            table = _safe_upper(row[1])
+                            if not owner or not table:
+                                continue
+                            key = (owner, table)
+                            if key not in table_pairs:
+                                continue
+                            idx_name = _safe_upper(row[2])
+                            col_name = _safe_upper(row[3])
+                            if not idx_name or not col_name:
+                                continue
+                            indexes.setdefault(key, {}).setdefault(
+                                idx_name, {"uniqueness": "UNKNOWN", "columns": []}
+                            )["columns"].append(col_name)
 
                 # 约束
-                sql_cons = f"""
-                    SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME
-                    FROM ALL_CONSTRAINTS
-                    WHERE OWNER IN ({owners_clause})
-                      AND CONSTRAINT_TYPE IN ('P','U','R')
-                      AND STATUS = 'ENABLED'
-                """
-                with ora_conn.cursor() as cursor:
-                    cursor.execute(sql_cons, owners)
-                    for row in cursor:
-                        owner = _safe_upper(row[0])
-                        table = _safe_upper(row[1])
-                        if not owner or not table:
-                            continue
-                        key = (owner, table)
-                        if key not in table_pairs:
-                            continue
-                        name = _safe_upper(row[2])
-                        if not name:
-                            continue
-                        constraints.setdefault(key, {})[name] = {
-                            "type": (row[3] or "").upper(),
-                            "columns": [],
-                            "r_owner": _safe_upper(row[4]) if row[4] else None,
-                            "r_constraint": _safe_upper(row[5]) if row[5] else None,
-                        }
+                if include_constraints:
+                    sql_cons = f"""
+                        SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME
+                        FROM ALL_CONSTRAINTS
+                        WHERE OWNER IN ({owners_clause})
+                          AND CONSTRAINT_TYPE IN ('P','U','R')
+                          AND STATUS = 'ENABLED'
+                    """
+                    with ora_conn.cursor() as cursor:
+                        cursor.execute(sql_cons, owners)
+                        for row in cursor:
+                            owner = _safe_upper(row[0])
+                            table = _safe_upper(row[1])
+                            if not owner or not table:
+                                continue
+                            key = (owner, table)
+                            if key not in table_pairs:
+                                continue
+                            name = _safe_upper(row[2])
+                            if not name:
+                                continue
+                            constraints.setdefault(key, {})[name] = {
+                                "type": (row[3] or "").upper(),
+                                "columns": [],
+                                "r_owner": _safe_upper(row[4]) if row[4] else None,
+                                "r_constraint": _safe_upper(row[5]) if row[5] else None,
+                            }
 
-                sql_cons_cols = f"""
-                    SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME
-                    FROM ALL_CONS_COLUMNS
-                    WHERE OWNER IN ({owners_clause})
-                    ORDER BY OWNER, TABLE_NAME, CONSTRAINT_NAME, POSITION
-                """
-                with ora_conn.cursor() as cursor:
-                    cursor.execute(sql_cons_cols, owners)
-                    for row in cursor:
-                        owner = _safe_upper(row[0])
-                        table = _safe_upper(row[1])
-                        if not owner or not table:
-                            continue
-                        key = (owner, table)
-                        if key not in table_pairs:
-                            continue
-                        cons_name = _safe_upper(row[2])
-                        col_name = _safe_upper(row[3])
-                        if not cons_name or not col_name:
-                            continue
-                        constraints.setdefault(key, {}).setdefault(
-                            cons_name, {"type": "UNKNOWN", "columns": []}
-                        )["columns"].append(col_name)
+                    sql_cons_cols = f"""
+                        SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME
+                        FROM ALL_CONS_COLUMNS
+                        WHERE OWNER IN ({owners_clause})
+                        ORDER BY OWNER, TABLE_NAME, CONSTRAINT_NAME, POSITION
+                    """
+                    with ora_conn.cursor() as cursor:
+                        cursor.execute(sql_cons_cols, owners)
+                        for row in cursor:
+                            owner = _safe_upper(row[0])
+                            table = _safe_upper(row[1])
+                            if not owner or not table:
+                                continue
+                            key = (owner, table)
+                            if key not in table_pairs:
+                                continue
+                            cons_name = _safe_upper(row[2])
+                            col_name = _safe_upper(row[3])
+                            if not cons_name or not col_name:
+                                continue
+                            constraints.setdefault(key, {}).setdefault(
+                                cons_name, {"type": "UNKNOWN", "columns": []}
+                            )["columns"].append(col_name)
 
-                # 为外键补齐被引用表信息 (基于约束引用)
-                cons_table_lookup: Dict[Tuple[str, str], Tuple[str, str]] = {}
-                for (owner, table), cons_map in constraints.items():
-                    for cons_name, info in cons_map.items():
-                        ctype = (info.get("type") or "").upper()
-                        if ctype in ('P', 'U'):
-                            cons_table_lookup[(owner, cons_name)] = (owner, table)
-                for (owner, _), cons_map in constraints.items():
-                    for cons_name, info in cons_map.items():
-                        ctype = (info.get("type") or "").upper()
-                        if ctype != 'R':
-                            continue
-                        r_owner = (info.get("r_owner") or "").upper()
-                        r_cons = (info.get("r_constraint") or "").upper()
-                        if not r_owner or not r_cons:
-                            continue
-                        ref_table = cons_table_lookup.get((r_owner, r_cons))
-                        if ref_table:
-                            info["ref_table_owner"], info["ref_table_name"] = ref_table
+                    # 为外键补齐被引用表信息 (基于约束引用)
+                    cons_table_lookup: Dict[Tuple[str, str], Tuple[str, str]] = {}
+                    for (owner, table), cons_map in constraints.items():
+                        for cons_name, info in cons_map.items():
+                            ctype = (info.get("type") or "").upper()
+                            if ctype in ('P', 'U'):
+                                cons_table_lookup[(owner, cons_name)] = (owner, table)
+                    for (owner, _), cons_map in constraints.items():
+                        for cons_name, info in cons_map.items():
+                            ctype = (info.get("type") or "").upper()
+                            if ctype != 'R':
+                                continue
+                            r_owner = (info.get("r_owner") or "").upper()
+                            r_cons = (info.get("r_constraint") or "").upper()
+                            if not r_owner or not r_cons:
+                                continue
+                            ref_table = cons_table_lookup.get((r_owner, r_cons))
+                            if ref_table:
+                                info["ref_table_owner"], info["ref_table_name"] = ref_table
 
                 # 触发器
-                sql_trg = f"""
-                    SELECT TABLE_OWNER, TABLE_NAME, TRIGGER_NAME, TRIGGERING_EVENT, STATUS
-                    FROM ALL_TRIGGERS
-                    WHERE TABLE_OWNER IN ({owners_clause})
-                """
-                with ora_conn.cursor() as cursor:
-                    cursor.execute(sql_trg, owners)
-                    for row in cursor:
-                        owner = _safe_upper(row[0])
-                        table = _safe_upper(row[1])
-                        if not owner or not table:
-                            continue
-                        key = (owner, table)
-                        if key not in table_pairs:
-                            continue
-                        trg_name = _safe_upper(row[2])
-                        if not trg_name:
-                            continue
-                        triggers.setdefault(key, {})[trg_name] = {
-                            "event": row[3],
-                            "status": row[4]
-                        }
+                if include_triggers:
+                    sql_trg = f"""
+                        SELECT TABLE_OWNER, TABLE_NAME, TRIGGER_NAME, TRIGGERING_EVENT, STATUS
+                        FROM ALL_TRIGGERS
+                        WHERE TABLE_OWNER IN ({owners_clause})
+                    """
+                    with ora_conn.cursor() as cursor:
+                        cursor.execute(sql_trg, owners)
+                        for row in cursor:
+                            owner = _safe_upper(row[0])
+                            table = _safe_upper(row[1])
+                            if not owner or not table:
+                                continue
+                            key = (owner, table)
+                            if key not in table_pairs:
+                                continue
+                            trg_name = _safe_upper(row[2])
+                            if not trg_name:
+                                continue
+                            triggers.setdefault(key, {})[trg_name] = {
+                                "event": row[3],
+                                "status": row[4]
+                            }
 
-            if seq_owners:
+            if seq_owners and include_sequences:
                 seq_clause = _make_in_clause(seq_owners)
                 sql_seq = f"""
                     SELECT SEQUENCE_OWNER, SEQUENCE_NAME
@@ -1738,7 +1818,8 @@ def check_primary_objects(
     master_list: MasterCheckList,
     extraneous_rules: List[str],
     ob_meta: ObMetadata,
-    oracle_meta: OracleMetadata
+    oracle_meta: OracleMetadata,
+    enabled_primary_types: Optional[Set[str]] = None
 ) -> ReportResults:
     """
     核心主对象校验：
@@ -1758,6 +1839,8 @@ def check_primary_objects(
         return results
 
     log.info("--- 开始执行主对象批量验证 (TABLE/VIEW/PROC/FUNC/PACKAGE/PACKAGE BODY/SYNONYM) ---")
+
+    allowed_types = enabled_primary_types or set(PRIMARY_OBJECT_TYPES)
 
     total = len(master_list)
     expected_targets: Dict[str, Set[str]] = defaultdict(set)
@@ -1780,6 +1863,9 @@ def check_primary_objects(
         tgt_obj_u = tgt_obj.upper()
         full_tgt = f"{tgt_schema_u}.{tgt_obj_u}"
         expected_targets[obj_type_u].add(full_tgt)
+
+        if obj_type_u not in allowed_types:
+            continue
 
         if obj_type_u == 'TABLE':
             # 1) OB 是否存在 TABLE
@@ -1867,7 +1953,7 @@ def check_primary_objects(
             continue
 
     # 记录目标端多出的对象（任何受管类型）
-    for obj_type in sorted(PRIMARY_OBJECT_TYPES):
+    for obj_type in sorted(allowed_types):
         actual = ob_meta.objects_by_type.get(obj_type, set())
         expected = expected_targets.get(obj_type, set())
         extras = sorted(actual - expected)
@@ -2173,7 +2259,8 @@ def check_extra_objects(
     master_list: MasterCheckList,
     ob_meta: ObMetadata,
     oracle_meta: OracleMetadata,
-    full_object_mapping: FullObjectMapping
+    full_object_mapping: FullObjectMapping,
+    enabled_extra_types: Optional[Set[str]] = None
 ) -> ExtraCheckResults:
     """
     基于 master_list (TABLE 映射) 检查：
@@ -2194,7 +2281,13 @@ def check_extra_objects(
         "trigger_mismatched": [],
     }
 
+    enabled_types = {t.upper() for t in (enabled_extra_types or set(EXTRA_OBJECT_CHECK_TYPES))}
+
     if not master_list:
+        return extra_results
+
+    if not enabled_types:
+        log.info("已根据配置跳过扩展对象校验 (索引/约束/序列/触发器)。")
         return extra_results
 
     log.info("--- 开始执行扩展对象校验 (索引/约束/序列/触发器) ---")
@@ -2218,78 +2311,82 @@ def check_extra_objects(
             continue
 
         # 索引
-        ok_idx, idx_mis = compare_indexes_for_table(
-            oracle_meta, ob_meta,
-            src_schema, src_table,
-            tgt_schema, tgt_table
-        )
-        if ok_idx:
-            extra_results["index_ok"].append(tgt_name)
-        elif idx_mis:
-            extra_results["index_mismatched"].append(idx_mis)
+        if 'INDEX' in enabled_types:
+            ok_idx, idx_mis = compare_indexes_for_table(
+                oracle_meta, ob_meta,
+                src_schema, src_table,
+                tgt_schema, tgt_table
+            )
+            if ok_idx:
+                extra_results["index_ok"].append(tgt_name)
+            elif idx_mis:
+                extra_results["index_mismatched"].append(idx_mis)
 
         # 约束
-        ok_cons, cons_mis = compare_constraints_for_table(
-            oracle_meta, ob_meta,
-            src_schema, src_table,
-            tgt_schema, tgt_table
-        )
-        if ok_cons:
-            extra_results["constraint_ok"].append(tgt_name)
-        elif cons_mis:
-            extra_results["constraint_mismatched"].append(cons_mis)
+        if 'CONSTRAINT' in enabled_types:
+            ok_cons, cons_mis = compare_constraints_for_table(
+                oracle_meta, ob_meta,
+                src_schema, src_table,
+                tgt_schema, tgt_table
+            )
+            if ok_cons:
+                extra_results["constraint_ok"].append(tgt_name)
+            elif cons_mis:
+                extra_results["constraint_mismatched"].append(cons_mis)
 
         # 触发器
-        ok_trg, trg_mis = compare_triggers_for_table(
-            oracle_meta, ob_meta,
-            src_schema, src_table,
-            tgt_schema, tgt_table,
-            full_object_mapping
-        )
-        if ok_trg:
-            extra_results["trigger_ok"].append(tgt_name)
-        elif trg_mis:
-            extra_results["trigger_mismatched"].append(trg_mis)
+        if 'TRIGGER' in enabled_types:
+            ok_trg, trg_mis = compare_triggers_for_table(
+                oracle_meta, ob_meta,
+                src_schema, src_table,
+                tgt_schema, tgt_table,
+                full_object_mapping
+            )
+            if ok_trg:
+                extra_results["trigger_ok"].append(tgt_name)
+            elif trg_mis:
+                extra_results["trigger_mismatched"].append(trg_mis)
 
     # 2) 序列校验（考虑 remap 后的目标 schema）
     sequence_groups: Dict[Tuple[str, str], List[Tuple[str, str]]] = defaultdict(list)
-    for src_schema, seq_names in oracle_meta.sequences.items():
-        src_schema_u = src_schema.upper()
-        for seq_name in seq_names:
-            seq_name_u = seq_name.upper()
-            src_full = f"{src_schema_u}.{seq_name_u}"
-            mapped = get_mapped_target(full_object_mapping, src_full, 'SEQUENCE')
-            tgt_full = mapped or src_full
-            if '.' not in tgt_full:
-                tgt_schema_u = src_schema_u
-                tgt_name_u = seq_name_u
+    if 'SEQUENCE' in enabled_types:
+        for src_schema, seq_names in oracle_meta.sequences.items():
+            src_schema_u = src_schema.upper()
+            for seq_name in seq_names:
+                seq_name_u = seq_name.upper()
+                src_full = f"{src_schema_u}.{seq_name_u}"
+                mapped = get_mapped_target(full_object_mapping, src_full, 'SEQUENCE')
+                tgt_full = mapped or src_full
+                if '.' not in tgt_full:
+                    tgt_schema_u = src_schema_u
+                    tgt_name_u = seq_name_u
+                else:
+                    tgt_schema_u, tgt_name_u = tgt_full.split('.', 1)
+                    tgt_schema_u = tgt_schema_u.upper()
+                    tgt_name_u = tgt_name_u.upper()
+                sequence_groups[(src_schema_u, tgt_schema_u)].append((seq_name_u, tgt_name_u))
+
+        for (src_schema_u, tgt_schema_u), entries in sequence_groups.items():
+            expected_tgt_names = {tgt_name for _, tgt_name in entries}
+            actual_tgt_names = {name.upper() for name in ob_meta.sequences.get(tgt_schema_u, set())}
+
+            missing_src = {
+                src_name for src_name, tgt_name in entries
+                if tgt_name not in actual_tgt_names
+            }
+            extra_tgt = actual_tgt_names - expected_tgt_names
+
+            mapping_label = f"{src_schema_u}->{tgt_schema_u}"
+            if not missing_src and not extra_tgt:
+                extra_results["sequence_ok"].append(mapping_label)
             else:
-                tgt_schema_u, tgt_name_u = tgt_full.split('.', 1)
-                tgt_schema_u = tgt_schema_u.upper()
-                tgt_name_u = tgt_name_u.upper()
-            sequence_groups[(src_schema_u, tgt_schema_u)].append((seq_name_u, tgt_name_u))
-
-    for (src_schema_u, tgt_schema_u), entries in sequence_groups.items():
-        expected_tgt_names = {tgt_name for _, tgt_name in entries}
-        actual_tgt_names = {name.upper() for name in ob_meta.sequences.get(tgt_schema_u, set())}
-
-        missing_src = {
-            src_name for src_name, tgt_name in entries
-            if tgt_name not in actual_tgt_names
-        }
-        extra_tgt = actual_tgt_names - expected_tgt_names
-
-        mapping_label = f"{src_schema_u}->{tgt_schema_u}"
-        if not missing_src and not extra_tgt:
-            extra_results["sequence_ok"].append(mapping_label)
-        else:
-            extra_results["sequence_mismatched"].append(SequenceMismatch(
-                src_schema=src_schema_u,
-                tgt_schema=tgt_schema_u,
-                missing_sequences=missing_src,
-                extra_sequences=extra_tgt,
-                note=None
-            ))
+                extra_results["sequence_mismatched"].append(SequenceMismatch(
+                    src_schema=src_schema_u,
+                    tgt_schema=tgt_schema_u,
+                    missing_sequences=missing_src,
+                    extra_sequences=extra_tgt,
+                    note=None
+                ))
 
     return extra_results
 
@@ -4036,6 +4133,21 @@ def main():
     # 1) 加载配置
     ora_cfg, ob_cfg, settings = load_config(CONFIG_FILE)
 
+    enabled_primary_types: Set[str] = set(settings.get('enabled_primary_types') or set(PRIMARY_OBJECT_TYPES))
+    enabled_extra_types: Set[str] = set(settings.get('enabled_extra_types') or set(EXTRA_OBJECT_CHECK_TYPES))
+    enable_dependencies_check: bool = bool(settings.get('enable_dependencies_check', True))
+
+    log.info(
+        "本次启用的主对象类型: %s",
+        ", ".join(sorted(enabled_primary_types))
+    )
+    log.info(
+        "本次启用的扩展校验: %s",
+        ", ".join(sorted(enabled_extra_types)) if enabled_extra_types else "<无>"
+    )
+    if not enable_dependencies_check:
+        log.info("已根据配置跳过依赖关系校验与 GRANT 计算。")
+
     # 初始化 Oracle Instant Client (Thick Mode)
     init_oracle_client_from_settings(settings)
 
@@ -4056,13 +4168,17 @@ def main():
     extraneous_rules = validate_remap_rules(remap_rules, source_objects)
 
     # 5) 生成主校验清单
-    master_list = generate_master_list(source_objects, remap_rules)
+    master_list = generate_master_list(source_objects, remap_rules, enabled_primary_types)
     full_object_mapping = build_full_object_mapping(source_objects, remap_rules)
-    oracle_dependencies = load_oracle_dependencies(ora_cfg, settings['source_schemas_list'])
-    expected_dependency_pairs, skipped_dependency_pairs = build_expected_dependency_pairs(
-        oracle_dependencies,
-        full_object_mapping
-    )
+    oracle_dependencies: List[DependencyRecord] = []
+    expected_dependency_pairs: Set[Tuple[str, str, str, str]] = set()
+    skipped_dependency_pairs: List[DependencyIssue] = []
+    if enable_dependencies_check:
+        oracle_dependencies = load_oracle_dependencies(ora_cfg, settings['source_schemas_list'])
+        expected_dependency_pairs, skipped_dependency_pairs = build_expected_dependency_pairs(
+            oracle_dependencies,
+            full_object_mapping
+        )
     target_schemas: Set[str] = set()
     for type_map in full_object_mapping.values():
         for tgt_name in type_map.values():
@@ -4119,24 +4235,70 @@ def main():
         return
 
     # 6) 计算目标端 schema 集合并一次性 dump OB 元数据
-    ob_meta = dump_ob_metadata(ob_cfg, target_schemas)
-    ob_dependencies = load_ob_dependencies(ob_cfg, target_schemas)
+    tracked_types = set(enabled_primary_types) | (set(enabled_extra_types) & set(ALL_TRACKED_OBJECT_TYPES))
+    if enable_dependencies_check:
+        tracked_types = set(ALL_TRACKED_OBJECT_TYPES)
+    if not tracked_types:
+        tracked_types = {'TABLE'}
+
+    ob_meta = dump_ob_metadata(
+        ob_cfg,
+        target_schemas,
+        tracked_object_types=tracked_types,
+        include_tab_columns='TABLE' in enabled_primary_types,
+        include_indexes='INDEX' in enabled_extra_types,
+        include_constraints='CONSTRAINT' in enabled_extra_types,
+        include_triggers='TRIGGER' in enabled_extra_types,
+        include_sequences='SEQUENCE' in enabled_extra_types
+    )
+    ob_dependencies: Set[Tuple[str, str, str, str]] = set()
+    if enable_dependencies_check:
+        ob_dependencies = load_ob_dependencies(ob_cfg, target_schemas)
 
     # 7) 主对象校验
-    oracle_meta = dump_oracle_metadata(ora_cfg, master_list, settings)
-    object_counts_summary = compute_object_counts(full_object_mapping, ob_meta, oracle_meta, OBJECT_COUNT_TYPES)
-    tv_results = check_primary_objects(master_list, extraneous_rules, ob_meta, oracle_meta)
+    oracle_meta = dump_oracle_metadata(
+        ora_cfg,
+        master_list,
+        settings,
+        include_indexes='INDEX' in enabled_extra_types,
+        include_constraints='CONSTRAINT' in enabled_extra_types,
+        include_triggers='TRIGGER' in enabled_extra_types,
+        include_sequences='SEQUENCE' in enabled_extra_types
+    )
+
+    monitored_types: Tuple[str, ...] = tuple(
+        t for t in OBJECT_COUNT_TYPES
+        if (t.upper() in enabled_primary_types) or (t.upper() in enabled_extra_types)
+    ) or ('TABLE',)
+
+    object_counts_summary = compute_object_counts(full_object_mapping, ob_meta, oracle_meta, monitored_types)
+    tv_results = check_primary_objects(master_list, extraneous_rules, ob_meta, oracle_meta, enabled_primary_types)
 
     # 8) 扩展对象校验 (索引/约束/序列/触发器)
-    extra_results = check_extra_objects(settings, master_list, ob_meta, oracle_meta, full_object_mapping)
-
-    dependency_report = check_dependencies_against_ob(
-        expected_dependency_pairs,
-        ob_dependencies,
-        skipped_dependency_pairs,
-        ob_meta
+    extra_results = check_extra_objects(
+        settings,
+        master_list,
+        ob_meta,
+        oracle_meta,
+        full_object_mapping,
+        enabled_extra_types
     )
-    required_grants = compute_required_grants(expected_dependency_pairs)
+
+    if enable_dependencies_check:
+        dependency_report = check_dependencies_against_ob(
+            expected_dependency_pairs,
+            ob_dependencies,
+            skipped_dependency_pairs,
+            ob_meta
+        )
+        required_grants = compute_required_grants(expected_dependency_pairs)
+    else:
+        dependency_report = {
+            "missing": [],
+            "unexpected": [],
+            "skipped": []
+        }
+        required_grants = {}
 
     # 9) 生成修补脚本
     if settings.get('generate_fixup', 'true').strip().lower() in ('true', '1', 'yes'):
