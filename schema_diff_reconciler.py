@@ -3097,30 +3097,118 @@ def write_fixup_file(
     log.info(f"[FIXUP] 生成修补脚本: {file_path}")
 
 
-def format_oracle_column_type(info: Dict) -> str:
-    dt = (info.get("data_type") or "").upper()
+def format_oracle_column_type(
+    info: Dict,
+    *,
+    override_length: Optional[int] = None,
+    prefer_ob_varchar: bool = False
+) -> str:
+    """
+    Render an Oracle column definition using available metadata without dropping
+    precision/scale/length/semantics.
+    """
+    raw_dt = (info.get("data_type") or "").strip()
+    dt = raw_dt.upper()
     prec = info.get("data_precision")
     scale = info.get("data_scale")
-    length = info.get("data_length")
-    char_len = info.get("char_length")
+    data_length = info.get("data_length")
+    char_length = info.get("char_length")
+    char_used = (info.get("char_used") or "").strip().upper()
 
-    if dt in ("NUMBER", "FLOAT"):
+    def apply_varchar_pref(type_literal: str) -> str:
+        if prefer_ob_varchar and type_literal.startswith("VARCHAR2"):
+            return "VARCHAR" + type_literal[len("VARCHAR2"):]
+        return type_literal
+
+    # If data_type already carries explicit precision/length (e.g., TIMESTAMP(6)), respect it.
+    if '(' in dt and override_length is None:
+        return apply_varchar_pref(dt)
+
+    # Character semantics helper (only for CHAR/VARCHAR2)
+    def _char_suffix(base_type: str) -> str:
+        if base_type not in ("CHAR", "VARCHAR2"):
+            return ""
+        if char_used == "C":
+            return " CHAR"
+        if char_used == "B":
+            return " BYTE"
+        return ""
+
+    # Choose effective length with optional override
+    def _pick_length(default_len: Optional[int]) -> Optional[int]:
+        return override_length if override_length is not None else default_len
+
+    # NUMBER-like
+    if dt in ("NUMBER", "DECIMAL", "NUMERIC"):
         if prec is not None:
             if scale is not None:
                 return f"{dt}({int(prec)},{int(scale)})"
-            else:
-                return f"{dt}({int(prec)})"
-        else:
-            return dt
+            return f"{dt}({int(prec)})"
+        if scale is not None:
+            return f"{dt}({int(scale)})"
+        return dt
 
-    if dt in ("CHAR", "NCHAR", "VARCHAR2", "NVARCHAR2"):
-        ln = char_len or length
+    # FLOAT
+    if dt == "FLOAT":
+        if prec is not None:
+            return f"{dt}({int(prec)})"
+        return dt
+
+    # TIMESTAMP family
+    if dt.startswith("TIMESTAMP"):
+        if "WITH LOCAL TIME ZONE" in dt:
+            suffix = " WITH LOCAL TIME ZONE"
+        elif "WITH TIME ZONE" in dt:
+            suffix = " WITH TIME ZONE"
+        else:
+            suffix = ""
+        base = "TIMESTAMP"
+        if scale is not None:
+            return f"{base}({int(scale)}){suffix}"
+        return f"{base}{suffix}"
+
+    # INTERVAL family
+    if dt.startswith("INTERVAL YEAR"):
+        if prec is not None or scale is not None:
+            year_prec = int(prec) if prec is not None else 2
+            return f"INTERVAL YEAR({year_prec}) TO MONTH"
+        return "INTERVAL YEAR TO MONTH"
+    if dt.startswith("INTERVAL DAY"):
+        if prec is not None or scale is not None:
+            day_prec = int(prec) if prec is not None else 2
+            frac_prec = int(scale) if scale is not None else 6
+            return f"INTERVAL DAY({day_prec}) TO SECOND({frac_prec})"
+        return "INTERVAL DAY TO SECOND"
+
+    # Character types
+    if dt in ("CHAR", "VARCHAR2"):
+        ln = _pick_length(char_length if char_used == "C" else (char_length or data_length))
+        if ln is not None:
+            return apply_varchar_pref(f"{dt}({int(ln)}){_char_suffix(dt)}")
+        return apply_varchar_pref(dt)
+
+    # National character types (length is character-based; no CHAR/BYTE suffix)
+    if dt in ("NCHAR", "NVARCHAR2"):
+        ln = _pick_length(char_length or data_length)
         if ln is not None:
             return f"{dt}({int(ln)})"
-        else:
-            return dt
+        return dt
 
-    return dt
+    # Binary/ROWID with length
+    if dt in ("RAW", "VARBINARY"):
+        ln = _pick_length(data_length)
+        if ln is not None:
+            return f"{dt}({int(ln)})"
+        return dt
+
+    if dt == "UROWID":
+        ln = _pick_length(data_length)
+        if ln is not None:
+            return f"{dt}({int(ln)})"
+        return dt
+
+    # Fallback
+    return apply_varchar_pref(dt)
 
 
 def generate_alter_for_table_columns(
@@ -3187,10 +3275,12 @@ def generate_alter_for_table_columns(
                 continue
 
             if issue_type == 'short':
-                # 在 OB 中，VARCHAR2 等同于 VARCHAR
-                modified_type = format_oracle_column_type(info) \
-                    .replace("VARCHAR2", "VARCHAR") \
-                    .replace(f"({src_len})", f"({limit_len})")
+                # 在 OB 中，VARCHAR2 等同于 VARCHAR；放大到校验下限
+                modified_type = format_oracle_column_type(
+                    info,
+                    override_length=limit_len,
+                    prefer_ob_varchar=True
+                )
 
                 lines.append(
                     f"ALTER TABLE {tgt_schema_u}.{tgt_table_u} "
@@ -3853,7 +3943,10 @@ def print_final_report(
         if host or port:
             lines.append(f"地址: {host or ''}:{port or ''}")
         user_label = "连接用户" if is_oracle else "当前用户"
-        lines.append(f"{user_label}: {info.get('current_user') or info.get('user') or info.get('configured_user', '')}")
+        user_value = info.get("current_user") or info.get("user") or info.get("configured_user", "")
+        if is_oracle and user_value:
+            user_value = str(user_value).upper()
+        lines.append(f"{user_label}: {user_value}")
         if is_oracle and info.get("dsn"):
             lines.append(f"DSN: {info['dsn']}")
         return "\n".join([line for line in lines if line.strip()]) or "无可用信息"
