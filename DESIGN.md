@@ -133,3 +133,12 @@ Oracle Thick Mode (ALL_OBJECTS / ALL_DEPENDENCIES / DBMS_METADATA)
 - **并行友好**：所有输出目录（`fixup_scripts/`, `main_reports/`, `dbcat_output/`）都显式创建且清理旧结果，确保自动化流水线能够多次运行。
 
 综上，该工具以配置驱动、一次转储、本地对比为核心；辅以依赖图与 dbcat 脚本生成，形成“发现问题 → 生成方案 → 执行验证”的闭环，满足大规模 Oracle → OceanBase 迁移过程的验证与修复需求。
+
+## 10. 配套工具与资产
+
+- `run_fixup.py`：在 OceanBase 上顺序执行 `fixup_scripts/` 第一层子目录的 SQL，支持 `--only-dirs/--only-types/--glob` 过滤，并将成功文件搬运到 `fixup_scripts/done/` 便于幂等重跑。  
+- `init_test.py`：读取 `config.ini`，对 `test_scenarios/gorgon_knot_case` 的 Oracle/OB SQL 进行分号与 `/` 划分后逐条执行，快速搭建冒烟环境。  
+- `test_scenarios/*`：三套场景覆盖不同特性：`labyrinth_case`（默认配置、列长度/依赖/GRANT）、`hydra_matrix_case`（多 schema 网格与复杂 remap）、`gorgon_knot_case`（多对一/一对多映射与名称冲突）。每套都附带 remap 与 README。  
+- `dbcat_output/`：缓存最近的 dbcat 提取结果（当前为 Labyrinth 表/MV），在下次生成时可复用以减少对源库的扫描。  
+- `fixup_scripts/` 与 `main_reports/`：仓库中留存的一次 Labyrinth 演练输出，展示脚本/报告格式；实际使用时可删除后由新一轮对比生成。  
+- `history/`：V8–V12 的迭代版本，展示从基础列对比到 ALTER 级修补的演进，可用于排查回归或参考旧逻辑。

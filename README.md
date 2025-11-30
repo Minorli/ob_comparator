@@ -24,14 +24,16 @@
 | Path | Description |
 | --- | --- |
 | `schema_diff_reconciler.py` | 主脚本，负责加载配置、Remap、元数据转储、差异对比、依赖分析、报告生成与 fix-up 输出。 |
-| `run_fixup.py` | 在 OceanBase 上批量执行 `fixup_scripts/` 子目录中的 SQL，打印成功/失败摘要。 |
+| `run_fixup.py` | 在 OceanBase 上批量执行 `fixup_scripts/` 子目录中的 SQL，支持按目录/类型/glob 过滤，并把成功项移到 `fixup_scripts/done/`。 |
+| `init_test.py` | 使用 `config.ini` 中的连接，初始化 `test_scenarios/gorgon_knot_case`（Oracle 或 OceanBase 任一侧）。 |
 | `config.ini` | 样例配置（Oracle/OceanBase 连接、Instant Client、dbcat、输出目录等）。 |
-| `remap_rules.txt` | 对象级 remap 文件。`remap_rules_old.txt` 保留历史示例。 |
-| `fixup_scripts/` | 最近一次校验生成的修补脚本（含 `grants/`, `table_alter/`, 以及各对象类型子目录）。 |
-| `dbcat_output/` | dbcat 导出的 DDL 缓存（避免重复导出）。 |
-| `main_reports/` | `rich` 渲染的文本报告，文件名格式 `report_<timestamp>.txt`。 |
-| `history/` | 旧版本脚本留档。 |
-| `test_scenarios/` | `hydra_matrix_case` 样例（包含 DDL、Remap、场景说明）。 |
+| `remap_rules.txt` | 默认 Remap（指向 `labyrinth_case`），其他场景的 Remap 位于各自目录。 |
+| `README_CROSS_PLATFORM.md` | 离线/跨平台 wheelhouse 打包与交付指南。 |
+| `fixup_scripts/` | 最近一次校验生成的修补脚本（当前为 Labyrinth 案例输出，含 `grants/`, `table_alter/`, `materialized_view/` 等）。 |
+| `dbcat_output/` | dbcat 导出的 DDL 缓存（当前包含 Labyrinth 案例的 TABLE/MVIEW DDL）。 |
+| `main_reports/` | `rich` 渲染的文本报告，文件名格式 `report_<timestamp>.txt`（当前存有一次演练快照）。 |
+| `history/` | 旧版本脚本留档（V8–V12 演进版，供排查/回溯）。 |
+| `test_scenarios/` | 三个全量样例：`labyrinth_case`、`hydra_matrix_case`、`gorgon_knot_case`（均含 Oracle/OB DDL 与 Remap）。 |
 | `requirements.txt` | Python 依赖（`oracledb`, `rich`）。 |
 | `DESIGN.md` | 设计/架构说明。 |
 
@@ -181,11 +183,14 @@ python3 run_fixup.py [optional/path/to/config.ini]
 
 如需按场景分批执行，可在 `fixup_scripts/` 中保留多个子目录或手动挑选脚本。
 
-## Sample scenarios & history
+## Sample scenarios & helpers
 
-- `test_scenarios/hydra_matrix_case`：多 schema、多 remap 的组合案例，模拟企业级项目。
-- `history/db_comparator_*.py`：旧版本脚本留档，可参考排查差异。
-（当前仓库仅包含 Hydra 场景，Spiderweb 场景未随仓库提供。）
+- `test_scenarios/labyrinth_case`：默认配置所指向的 Lab_*→OB_* 场景，涵盖列缺失/长度不足、依赖与 GRANT 建议，生成的报告与修补脚本已留存于 `main_reports/`、`fixup_scripts/` 供参考。  
+- `test_scenarios/hydra_matrix_case`：十一源 schema、十四目标 schema 的大网格，专门验证复杂 remap、依赖与授权推导（详见该目录下的 README）。  
+- `test_scenarios/gorgon_knot_case`：多对一/一对多混合映射与名称碰撞场景；可配合 `init_test.py --target oracle|oceanbase` 一键在两端初始化。  
+- `init_test.py`：解析 `config.ini` 并调用对应的 Oracle/obclient 逐条执行 Gorgon 脚本，便于本地冒烟或环境校准。  
+- `history/db_comparator_*.py`：V8–V12 历史版本，展示从基础校验到 ALTER 级修补的演进。  
+- 当前 `fixup_scripts/` 与 `main_reports/` 中的内容来自最近一次 Labyrinth 演练，仅作样例，可随时删除并由新一轮校验重新生成。
 
 ---
 

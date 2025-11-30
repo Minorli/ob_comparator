@@ -131,7 +131,12 @@ python run_fixup.py           # 同样可传 config.ini 路径
 - **离线安装失败**：确认 `pip install --no-index --find-links=./wheelhouse` 使用的 Python 版本正确；轮子平台标签是否覆盖目标机；必要时在目标架构重新生成 wheelhouse。  
 - **依赖不足**：oracledb Thick Mode 还依赖 `libaio` 等系统库，请在目标机提前安装（依据操作系统包管理器）。
 
-## 7. 小结
+## 7. 附带资料与可选内容
+- **必须携带**：`schema_diff_reconciler.py`、`run_fixup.py`、`requirements.txt`、不含敏感信息的 `config.ini` 模板、Remap 文件、`wheelhouse/`、dbcat 目录、Instant Client。  
+- **推荐附带**：`test_scenarios/` 与 `init_test.py`（便于离线冒烟）、`README.md`/`README_CROSS_PLATFORM.md`/`DESIGN.md`、`dbcat_output/`（可选缓存，避免目标机重复抽取）。  
+- **可清理后再打包**：旧的 `fixup_scripts/` 与 `main_reports/`（避免混淆生成物）、`history/`（纯参考）。敏感账号信息请务必在打包前去除或脱敏。
+
+## 8. 小结
 - 不修改源码，只通过 wheelhouse + venv 迁移。  
 - 构建机与目标机的 Python/架构要匹配；必要时在目标架构生成 wheelhouse。  
 - 运行前先设置 `JAVA_HOME`/`LD_LIBRARY_PATH` 等外部依赖，再激活 venv 并执行脚本。  
