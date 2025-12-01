@@ -1,6 +1,7 @@
 # 数据库对象对比工具 - 跨平台打包与执行指南 (Wheelhouse 版)
 
 > 适用场景：需要把当前目录下的 Python 程序（保持源码不改）打包到另一台机器运行，目标 Python 可能是 3.6/3.7.8，且目标机可能无法联网。本文只使用 wheelhouse+venv，不用 PyInstaller。
+> 适用版本：V0.6（保持“一次转储，本地对比”，命令行可传入自定义的 config.ini）。
 
 ## 0. 环境与外部依赖清单（目标机必须具备）
 - **Python 解释器**：与打包时的版本和架构匹配（建议提前在目标机装好 3.6.x 或 3.7.x，对应 cp36/cp37）。  
@@ -112,7 +113,7 @@ source setup_env.sh           # 设置 JAVA_HOME / LD_LIBRARY_PATH / PATH
 source .venv/bin/activate     # 进入对应 Python 版本的 venv
 
 # 运行对比
-python schema_diff_reconciler.py   # 如需指定配置: python schema_diff_reconciler.py /path/to/config.ini
+python schema_diff_reconciler.py [config.ini]   # 不传时默认读取当前目录的 config.ini
 
 # 查看输出
 ls main_reports

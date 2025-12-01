@@ -1,39 +1,37 @@
-# Copyright 2025 Minorli                                                                                                                                                    
-#                                                                                                                                                                           
-# Licensed under the Apache License, Version 2.0 (the "License");                                                                                                           
-# you may not use this file except in compliance with the License.                                                                                                          
-# You may obtain a copy of the License at                                                                                                                                   
-#                                                                                                                                                                           
-#     http://www.apache.org/licenses/LICENSE-2.0                                                                                                                            
-#                                                                                                                                                                           
-# Unless required by applicable law or agreed to in writing, software                                                                                                       
-# distributed under the License is distributed on an "AS IS" BASIS,                                                                                                         
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.                                                                                                  
-# See the License for the specific language governing permissions and                                                                                                       
-# limitations under the License.#!/usr/bin/env python3
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Copyright 2025 Minorli
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """
-数据库对象对比工具 (V0.5 - Dump-Once, Compare-Locally + 扩展对象 + ALTER 修补)
+数据库对象对比工具 (V0.6 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
-   - TABLE, VIEW
+   - TABLE, VIEW, MATERIALIZED VIEW
+   - PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, SYNONYM
+   - JOB, SCHEDULE, TYPE, TYPE BODY
    - INDEX, CONSTRAINT (PK/UK/FK)
    - SEQUENCE, TRIGGER
-   - PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, SYNONYM
 
 2. 对比规则：
-   - TABLE：只对比“列名集合”，忽略 OceanBase 目标端自动生成的 4 个 OMS 列
-     (OMS_OBJECT_NUMBER/OMS_RELATIVE_FNO/OMS_BLOCK_NUMBER/OMS_ROW_NUMBER)，不对比数据类型/长度。
-   - VIEW / SEQUENCE / TRIGGER / PROCEDURE / FUNCTION / PACKAGE / PACKAGE BODY / SYNONYM：
-       只对比“是否存在”。
-   - INDEX / CONSTRAINT：
-       对比“是否存在”及“构成”（索引列集合、有无/列顺序；约束类型和约束列集合）。
+   - TABLE：校验列名集合（忽略 OMS_* 列），并检查 VARCHAR/VARCHAR2 长度是否落在 [ceil(src*1.5), ceil(src*2.5)] 区间。
+   - VIEW/MVIEW/PLSQL/SYNONYM/JOB/SCHEDULE/TYPE：对比是否存在。
+   - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
+   - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.5 核心)：
+3. 性能架构 (V0.6 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          ALL_OBJECTS
@@ -51,14 +49,17 @@
        INDEX / CONSTRAINT / SEQUENCE / TRIGGER
        → 生成对应的 CREATE 语句脚本。
    - TABLE 列不匹配：
-       → 生成 ALTER TABLE ADD 列的脚本；
+       → 生成 ALTER TABLE ADD/MODIFY（长度不足）脚本；
        → 对“多余列”生成注释掉的 DROP COLUMN 建议语句。
+   - 依赖缺失 → 生成 ALTER ... COMPILE；跨 schema 调用 → 自动推导 GRANT。
    - 所有脚本写入 fixup_scripts 目录下相应子目录，需人工审核后在 OceanBase 执行。
 
 5. 健壮性：
    - 所有 obclient 调用增加 timeout（从 config.ini 的 [SETTINGS] -> obclient_timeout 读取，默认 60 秒）。
+   - Instant Client / dbcat / JAVA_HOME / Remap 前置校验，发现致命问题立即终止。
 """
 
+import argparse
 import configparser
 import subprocess
 import sys
@@ -3910,7 +3911,7 @@ def print_final_report(
     grant_stmt_cnt = sum(len(entries) for entries in required_grants.values())
     source_missing_schema_cnt = len(schema_summary.get("source_missing", []))
 
-    console.print(Panel.fit("[bold]数据库对象迁移校验报告 (V0.5 - Rich)[/bold]", style="title"))
+    console.print(Panel.fit("[bold]数据库对象迁移校验报告 (V0.6 - Rich)[/bold]", style="title"))
 
     section_width = 140
     count_table_kwargs: Dict[str, object] = {"width": section_width, "expand": False}
@@ -4296,12 +4297,27 @@ def print_final_report(
 
 # ====================== 主函数 ======================
 
+def parse_cli_args() -> argparse.Namespace:
+    """解析命令行参数，允许自定义 config.ini 路径。"""
+    parser = argparse.ArgumentParser(
+        description="Compare Oracle vs OceanBase schemas and emit reports/fix-up scripts (v0.6)."
+    )
+    parser.add_argument(
+        "config",
+        nargs="?",
+        default="config.ini",
+        help="config.ini path (default: ./config.ini)",
+    )
+    return parser.parse_args()
+
+
 def main():
     """主执行函数"""
-    CONFIG_FILE = 'config.ini'
+    args = parse_cli_args()
+    config_file = args.config
 
     # 1) 加载配置
-    ora_cfg, ob_cfg, settings = load_config(CONFIG_FILE)
+    ora_cfg, ob_cfg, settings = load_config(config_file)
 
     enabled_primary_types: Set[str] = set(settings.get('enabled_primary_types') or set(PRIMARY_OBJECT_TYPES))
     enabled_extra_types: Set[str] = set(settings.get('enabled_extra_types') or set(EXTRA_OBJECT_CHECK_TYPES))

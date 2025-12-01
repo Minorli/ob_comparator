@@ -6,3 +6,4 @@ dbcat_output
 venv
 test_scenarios
 history
+__pycache__

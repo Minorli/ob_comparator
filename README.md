@@ -1,13 +1,14 @@
 # OceanBase Comparator Toolkit
 
 🚀 **极简必看用法**  
+> 当前版本：V0.6（Dump-Once, Compare-Locally + 依赖 / ALTER 修补）
 
 本程序只有一个 python 程序而没有拆分成无数个模块的原因是，方便程序迭代后，"只传一次到服务器上"，因为你知道向客户的环境传一个打包文件和传一个文本文件难度是不是一样的（文本你可以打开，邮件粘贴到终端里）。
 
 1. 先在目标机准备好 Python 3.7（3.6 也可）、Oracle Instant Client、obclient、JDK+dbcat，设置好 `LD_LIBRARY_PATH` / `JAVA_HOME`。  
 2. `python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt`  
 3. 配置 `config.ini`（路径用绝对路径，`generate_fixup` 默认开启会生成修补脚本）。  
-4. `python schema_diff_reconciler.py` → 输出 `main_reports/` 和 `fixup_scripts/`。  
+4. `python schema_diff_reconciler.py [config.ini]`（不传则默认读取当前目录的 `config.ini`）→ 输出 `main_reports/` 和 `fixup_scripts/`。  
 5. 审核后执行 `python run_fixup.py` 自动跑脚本，可多次重试。
 
 ## Highlights
@@ -116,8 +117,9 @@ pip install -r requirements.txt
 
 ```bash
 export LD_LIBRARY_PATH="/path/to/instantclient:${LD_LIBRARY_PATH}"
-python3 schema_diff_reconciler.py
+python3 schema_diff_reconciler.py [path/to/config.ini]
 ```
+`config.ini` 路径可省略（默认读取工作目录下的同名文件），便于在多套环境之间切换。
 
 运行过程概览：
 
