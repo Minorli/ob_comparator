@@ -32,6 +32,7 @@ import fnmatch
 import shutil
 import subprocess
 import sys
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -218,7 +219,35 @@ class ScriptResult:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Apply fix-up SQL scripts to OceanBase.")
+    desc = textwrap.dedent(
+        """\
+        批量执行 fixup_scripts/* 下的 SQL（依优先级：序列→表→表列→约束→索引→视图/MVIEW→其余代码对象→GRANT）。
+        - 读取与比较器相同的 config.ini，使用 obclient 执行。
+        - 每个成功的脚本会移动到 fixup_scripts/done/<子目录>/ 便于幂等重跑。
+        - 支持子目录/类型/文件名过滤，保持 obclient 超时与提示。
+        """
+    )
+    epilog = textwrap.dedent(
+        """\
+        类型映射 (--only-types):
+          TABLE/TABLE_ALTER/SEQUENCE/INDEX/CONSTRAINT/VIEW/MATERIALIZED_VIEW/SYNONYM/PROCEDURE/
+          FUNCTION/PACKAGE/PACKAGE_BODY/TYPE/TYPE_BODY/TRIGGER/JOB/SCHEDULE/GRANTS
+        子目录优先级:
+          sequence -> table -> table_alter -> constraint -> index -> view -> materialized_view
+          -> synonym -> procedure -> function -> package -> package_body -> type -> type_body
+          -> trigger -> job -> schedule -> grants -> 其他子目录按字典序
+        示例:
+          python run_fixup.py                                  # 默认 config.ini, 全量执行
+          python run_fixup.py my.ini --only-dirs table,index   # 仅执行表和索引脚本
+          python run_fixup.py --only-types TABLE,VIEW          # 按对象类型过滤
+          python run_fixup.py --glob \"*202501*.sql\"            # 按文件名/相对路径 glob 过滤
+        """
+    )
+    parser = argparse.ArgumentParser(
+        description=desc,
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "config",
         nargs="?",

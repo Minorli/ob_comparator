@@ -61,6 +61,7 @@
 
 import argparse
 import configparser
+import textwrap
 import subprocess
 import sys
 import logging
@@ -4298,9 +4299,41 @@ def print_final_report(
 # ====================== 主函数 ======================
 
 def parse_cli_args() -> argparse.Namespace:
-    """解析命令行参数，允许自定义 config.ini 路径。"""
+    """解析命令行参数，允许自定义 config.ini 路径并展示功能说明。"""
+    desc = textwrap.dedent(
+        """\
+        OceanBase Comparator Toolkit v0.6
+        - 一次转储，本地对比：Oracle Thick Mode + 少量 obclient 调用，全部比对在内存完成。
+        - 覆盖对象：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。
+        - 校验规则：表列名集合 + VARCHAR/VARCHAR2 长度窗口 [ceil(1.5x), ceil(2.5x)]；其余对象校验存在性/列组合。
+        - 依赖&授权：加载 ALL_DEPENDENCIES，映射后对比，缺失则生成 ALTER ... COMPILE；推导跨 schema GRANT。
+        - Fix-up 输出：缺失对象 CREATE、表列 ALTER ADD/MODIFY、依赖 COMPILE、GRANT，按类型落地到 fixup_scripts/*。
+        """
+    )
+    epilog = textwrap.dedent(
+        """\
+        配置提示 (config.ini):
+          [ORACLE_SOURCE] user/password/dsn (Thick Mode)
+          [OCEANBASE_TARGET] executable/host/port/user_string/password (obclient)
+          [SETTINGS] source_schemas, remap_file, oracle_client_lib_dir, dbcat_*，输出目录等
+          可选开关：
+            check_primary_types     限制主对象类型（默认全量）
+            check_extra_types       限制扩展对象 (index,constraint,sequence,trigger)
+            check_dependencies      true/false 控制依赖&授权推导
+            generate_fixup          true/false 控制是否生成脚本
+
+        用法示例:
+          python schema_diff_reconciler.py                   # 使用当前目录 config.ini
+          python schema_diff_reconciler.py /path/to/conf.ini # 指定配置
+        输出:
+          main_reports/report_<ts>.txt  Rich 报告文本
+          fixup_scripts/                按类型分类的修补脚本
+        """
+    )
     parser = argparse.ArgumentParser(
-        description="Compare Oracle vs OceanBase schemas and emit reports/fix-up scripts (v0.6)."
+        description=desc,
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "config",
