@@ -1,0 +1,8 @@
+.gemini
+.gitignore
+main_reports
+fixup_scripts
+dbcat_output
+venv
+test_scenarios
+history
