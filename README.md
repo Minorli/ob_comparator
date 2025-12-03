@@ -1,7 +1,7 @@
 # OceanBase Comparator Toolkit
 
 🚀 **极简必看用法**  
-> 当前版本：V0.6（Dump-Once, Compare-Locally + 依赖 / ALTER 修补）
+> 当前版本：V0.7（Dump-Once, Compare-Locally + 依赖 / ALTER 修补）
 
 本程序只有一个 python 程序而没有拆分成无数个模块的原因是，方便程序迭代后，"只传一次到服务器上"，因为你知道向客户的环境传一个打包文件和传一个文本文件难度是不是一样的（文本你可以打开，邮件粘贴到终端里）。
 
@@ -14,10 +14,11 @@
 
 ## Highlights
 
-- 一次转储本地对比：Oracle 使用 Thick Mode + `DBMS_METADATA`，OceanBase 通过几次 `obclient` 调用批量拉取 `ALL_*` 视图，避免循环调库。
+- 一次转储本地对比：Oracle 使用 Thick Mode + `DBMS_METADATA`，OceanBase 通过几次 `obclient` 调用批量拉取 `DBA_*` 视图，避免循环调库。
 - 覆盖的对象类型包括 `TABLE/VIEW/MATERIALIZED VIEW/PROCEDURE/FUNCTION/PACKAGE/PACKAGE BODY/SYNONYM/JOB/SCHEDULE/TYPE/TYPE BODY`，并扩展检查 `INDEX/CONSTRAINT/SEQUENCE/TRIGGER`。
 - 表校验除了存在性外，还会校验列名集合与 `VARCHAR/VARCHAR2` 长度（目标端需在 `[ceil(1.5*x), ceil(2.5*x)]` 区间），并生成 `ALTER TABLE` 修补建议。
-- 自动收集 `ALL_DEPENDENCIES` 并映射到目标 schema，输出缺失/多余依赖、依赖重编译脚本和所需 `GRANT`。
+- 自动收集 `DBA_DEPENDENCIES` 并映射到目标 schema，输出缺失/多余依赖、依赖重编译脚本和所需 `GRANT`。
+- 启动时会提示需要 DBA/SELECT ANY DICTIONARY/SELECT_CATALOG_ROLE 等权限以查询 `DBA_*` 视图，否则元数据不完整。
 - 基于 dbcat 导出的 DDL + 本地修补器生成结构化的 `fixup_scripts/` 目录，含 SEQUENCE/TABLE/代码对象/INDEX/CONSTRAINT/TRIGGER/COMPILE/GRANT/TABLE_ALTER 等脚本。
 - `run_fixup.py` 可按顺序执行这些脚本，并把成功的文件移动到 `fixup_scripts/done/...` 目录，方便二次运行。
 
@@ -47,7 +48,7 @@
 2. Oracle Instant Client 19c+，并设置 `LD_LIBRARY_PATH` 指向解压目录（`oracle_client_lib_dir` 也需配置）。
 3. `obclient` 客户端以及访问 Oracle/OceanBase 的网络。
 4. `dbcat` CLI（例如 `dbcat-2.5.0-SNAPSHOT`），以及可用的 `JAVA_HOME`。dbcat 用于批量导出源端 DDL，是修补脚本生成的核心。
-5. 运行账号需能查询目标 schema 的 `ALL_*` 视图（推荐 SYS/SYSDBA 或拥有 `SELECT_CATALOG_ROLE`/`SELECT ANY DICTIONARY`；OceanBase 侧建议用 SYS/root 级账号），否则只会看到自身 schema 的对象。
+5. 运行账号需能查询目标 schema 的 `DBA_*` 视图（推荐 SYS/SYSDBA 或拥有 `SELECT_CATALOG_ROLE`/`SELECT ANY DICTIONARY`；OceanBase 侧建议用 SYS/root 级账号），否则只会看到自身 schema 的对象；程序启动会给出显式提醒。
 
 ### Python environment
 
@@ -127,13 +128,13 @@ python3 schema_diff_reconciler.py --wizard [path/to/config.ini]
 运行过程概览：
 
 1. **配置与 Remap 校验**：加载 `config.ini`、`remap_rules.txt`，确认所有源对象存在。
-2. **Oracle Thick Mode 初始化**：`oracledb` 以 Thick Mode 连接，批量读取 `ALL_OBJECTS/ALL_*`、`ALL_DEPENDENCIES`，并缓存表/索引/约束/触发器/序列元数据。
+2. **Oracle Thick Mode 初始化**：`oracledb` 以 Thick Mode 连接，批量读取 `DBA_OBJECTS/DBA_*`、`DBA_DEPENDENCIES`，并缓存表/索引/约束/触发器/序列元数据。
 3. **构建主校验清单**：生成源→目标映射，记录依赖、统计对象数量。
-4. **OceanBase 元数据转储**：通过少量 `obclient` 调用一次性拉取 `ALL_OBJECTS/COLUMNS/INDEXES/CONSTRAINTS/CONS_COLUMNS/TRIGGERS/SEQUENCES/DEPENDENCIES`。
+4. **OceanBase 元数据转储**：通过少量 `obclient` 调用一次性拉取 `DBA_OBJECTS/DBA_TAB_COLUMNS/DBA_INDEXES/DBA_CONSTRAINTS/DBA_CONS_COLUMNS/DBA_TRIGGERS/DBA_SEQUENCES/DBA_DEPENDENCIES`。
 5. **对比阶段**  
    - 主对象：逐个校验存在性与表列/长度差异（忽略 `OMS_*` 列）。  
-   - 扩展对象：对每个表比对索引/约束/触发器；按 schema 比对序列。  
-   - 依赖：把 Oracle 依赖映射到目标 schema，核对 OceanBase 的 `ALL_DEPENDENCIES`，得出缺失/额外/跳过项，并计算跨 schema 所需的 `GRANT`。
+   - 扩展对象：对每个表比对索引/约束/触发器（目标端额外约束名含 `_OMS_ROWID` 会忽略；源端元数据缺失时仍会把目标端现存索引/约束列出来）；按 schema 比对序列（源端缺数据时也会提示目标端已有序列）。  
+   - 依赖：把 Oracle 依赖映射到目标 schema，核对 OceanBase 的 `DBA_DEPENDENCIES`，得出缺失/额外/跳过项，并计算跨 schema 所需的 `GRANT`。
 6. **修补脚本（可选）**：若 `generate_fixup=true`，按以下顺序生成脚本：
    1. 缺失的 SEQUENCE（dbcat DDL）
    2. 缺失的 TABLE（CREATE）与 `table_alter/` 中的列修补

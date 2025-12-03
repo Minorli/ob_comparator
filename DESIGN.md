@@ -1,7 +1,7 @@
 # 数据库对象对比工具设计文档
 
 本文档描述最新版 OceanBase Comparator Toolkit 的设计思路。新版本在原有“Oracle vs OceanBase” 元数据对比基础上，加入了依赖分析、授权推导、dbcat DDL 提取、Rich 报告与全量 fix-up 管道。
-> 当前版本：V0.6（Dump-Once, Compare-Locally + 依赖分析 + ALTER 级修补；支持交互式配置向导与运行前自检）
+> 当前版本：V0.7（Dump-Once, Compare-Locally + 依赖分析 + ALTER 级修补；支持交互式配置向导与运行前自检）
 
 ## 1. 核心目标
 
@@ -16,9 +16,9 @@
 config.ini + remap_rules.txt
         │
         ▼
-Oracle Thick Mode (ALL_OBJECTS / ALL_DEPENDENCIES / DBMS_METADATA)
+Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
         │
-        │        obclient (ALL_OBJECTS / ALL_TAB_COLUMNS / … / ALL_DEPENDENCIES)
+        │        obclient (DBA_OBJECTS / DBA_TAB_COLUMNS / … / DBA_DEPENDENCIES)
         ▼                           │
    源对象映射 + 依赖映射 + 目标元数据集
         │
@@ -33,7 +33,7 @@ Oracle Thick Mode (ALL_OBJECTS / ALL_DEPENDENCIES / DBMS_METADATA)
 1. **配置验证**：校验 `source_schemas`、Remap、Instant Client 路径等，一旦发现致命问题立即退出。
 2. **元数据缓存**：Oracle 侧使用 Thick Mode + 批量查询；OceanBase 侧使用 obclient 执行预设 SQL，所有数据一次性加载到内存。
 3. **差异分析**：依赖 `master_list`（源→目标）完成表/列校验；索引/约束/触发器使用 Oracle/OB 双缓存进行集合比对；序列按 schema 级别比较。
-4. **依赖 & 授权**：`ALL_DEPENDENCIES` 映射后生成期望依赖集合，与目标库实际依赖比较并给出原因，同时计算跨 schema 所需的 `GRANT`。
+4. **依赖 & 授权**：`DBA_DEPENDENCIES` 映射后生成期望依赖集合，与目标库实际依赖比较并给出原因，同时计算跨 schema 所需的 `GRANT`。
 5. **修补脚本**：构建 dbcat 请求（含 schema→对象类型的任务集合），复用 `dbcat_output` 缓存，对 DDL 做 schema remap、语法清理、授权插入，并按对象类型输出到 `fixup_scripts/`（含依赖重编译/授权脚本）。
 6. **报告与执行**：Rich 控制台输出+落地文件；`run_fixup.py` 负责在 OceanBase 上顺序执行 SQL 并回写结果。
 
@@ -51,18 +51,19 @@ Oracle Thick Mode (ALL_OBJECTS / ALL_DEPENDENCIES / DBMS_METADATA)
 
 ### Oracle
 
-- 通过 `oracledb` Thick Mode 连接，确保能使用 `DBMS_METADATA` 与 `ALL_*` 视图。
-- 运行账号需具备跨 schema 查询 `ALL_*` 的权限（如 SYS/SYSDBA 或 `SELECT_CATALOG_ROLE`/`SELECT ANY DICTIONARY`），否则只能看到自身对象。
+- 通过 `oracledb` Thick Mode 连接，确保能使用 `DBMS_METADATA` 与 `DBA_*` 视图。
+- 运行账号需具备跨 schema 查询 `DBA_*` 的权限（如 SYS/SYSDBA 或 `SELECT_CATALOG_ROLE`/`SELECT ANY DICTIONARY`），否则只能看到自身对象。
+- 程序启动后会显式提醒需要上述权限，避免因权限不足导致元数据缺失。
 - 读取内容：
-  - `ALL_OBJECTS`：源对象全集；
-  - `ALL_TAB_COLUMNS`、`ALL_INDEXES/ALL_IND_COLUMNS`、`ALL_CONSTRAINTS/ALL_CONS_COLUMNS`、`ALL_TRIGGERS`、`ALL_SEQUENCES`；
-  - `ALL_DEPENDENCIES`；
+  - `DBA_OBJECTS`：源对象全集；
+  - `DBA_TAB_COLUMNS`、`DBA_INDEXES/DBA_IND_COLUMNS`、`DBA_CONSTRAINTS/DBA_CONS_COLUMNS`、`DBA_TRIGGERS`、`DBA_SEQUENCES`；
+  - `DBA_DEPENDENCIES`；
   - DDL 提取阶段调用 dbcat（内部仍读取 Oracle 数据字典）以便批量生成标准化 DDL。
 - 把读取结果缓存到 `OracleMetadata`（按 schema+对象名称索引）。
 
 ### OceanBase
 
-- 使用一次性 obclient 调用（带 `-ss` + `timeout`）拉取相同的 `ALL_*` 视图。
+- 使用一次性 obclient 调用（带 `-ss` + `timeout`）拉取相同的 `DBA_*` 视图。
 - 结果存放在 `ObMetadata` 中，结构与 Oracle 侧对应，便于纯 Python 内存对比。
 
 该“批量转储”架构保证比较阶段再无网络往返，提高性能和可重复性。
@@ -73,10 +74,10 @@ Oracle Thick Mode (ALL_OBJECTS / ALL_DEPENDENCIES / DBMS_METADATA)
    - TABLE：检查存在性、列名集合（过滤 `OMS_*` 内部列）、`VARCHAR/VARCHAR2` 列长度是否落在 `[ceil(1.5 * 源长度), ceil(2.5 * 源长度)]` 区间；不足则生成 ALTER，过大则给出 WARNING。
    - VIEW/MVIEW/类型/PLSQL/SYNONYM/JOB/SCHEDULE 等：验证存在性即可。
 2. **扩展对象**  
-   - INDEX：按列序列+唯一性匹配；多余或缺少的索引列集合会在报告中详细列出。
-   - CONSTRAINT：区分 PK/UK/FK，比较列组合和定义。
+   - INDEX：按列序列+唯一性匹配；多余或缺少的索引列集合会在报告中详细列出；若源端缺失元数据，也会打印目标端现存索引列表。
+   - CONSTRAINT：区分 PK/UK/FK，比较列组合和定义；目标端名称包含 `_OMS_ROWID` 的约束会被忽略；源端元数据缺失时同样输出目标端现存约束列表。
    - TRIGGER：考虑 remap 后的触发器名称，检查目标端是否缺失或多余。
-   - SEQUENCE：按源 schema → 目标 schema 映射逐个确认。
+   - SEQUENCE：按源 schema → 目标 schema 映射逐个确认；源端元数据缺失时会提示并列出目标端已有序列。
 3. **数量汇总**  
    - 在报告中附带 Oracle vs OceanBase 的对象数量对比，快速观察整体迁移完成度。
 
@@ -84,7 +85,7 @@ Oracle Thick Mode (ALL_OBJECTS / ALL_DEPENDENCIES / DBMS_METADATA)
 
 ## 6. 依赖分析与授权
 
-- 使用 `ALL_DEPENDENCIES` 构建 `{依赖对象 -> 被依赖对象}` 的全集，对应的对象类型限定在 `ALL_TRACKED_OBJECT_TYPES`。
+- 使用 `DBA_DEPENDENCIES` 构建 `{依赖对象 -> 被依赖对象}` 的全集，对应的对象类型限定在 `ALL_TRACKED_OBJECT_TYPES`。
 - 应用 `full_object_mapping` 后得到目标端“期望依赖集合”，再与 OceanBase 实际依赖差集：
   - **缺失依赖**：指出是依赖对象缺失、被依赖对象缺失还是单纯未编译。
   - **额外依赖**：提示目标端存在额外耦合，需人工判断。

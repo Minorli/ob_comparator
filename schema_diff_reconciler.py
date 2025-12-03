@@ -15,7 +15,7 @@
 # limitations under the License.
 
 """
-数据库对象对比工具 (V0.6 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补)
+数据库对象对比工具 (V0.7 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -31,15 +31,15 @@
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.6 核心)：
+3. 性能架构 (V0.7 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
-         ALL_OBJECTS
-         ALL_TAB_COLUMNS
-         ALL_INDEXES / ALL_IND_COLUMNS
-         ALL_CONSTRAINTS / ALL_CONS_COLUMNS
-         ALL_TRIGGERS
-         ALL_SEQUENCES
+         DBA_OBJECTS
+         DBA_TAB_COLUMNS
+         DBA_INDEXES / DBA_IND_COLUMNS
+         DBA_CONSTRAINTS / DBA_CONS_COLUMNS
+         DBA_TRIGGERS
+         DBA_SEQUENCES
        后续所有对比均在 Python 内存数据结构中完成。
    - 避免 V12 中在循环中大量调用 obclient 的性能黑洞。
 
@@ -83,6 +83,20 @@ except ImportError:
     print("错误: 未找到 'oracledb' 库。", file=sys.stderr)
     print("请先安装: pip install oracledb", file=sys.stderr)
     sys.exit(1)
+
+# Rich 渲染写入文件时需要的简化字符映射，便于 vi/less 查看
+BOX_ASCII_TRANS = str.maketrans({
+    "┏": "+", "┓": "+", "┗": "+", "┛": "+", "┣": "+", "┫": "+", "┳": "+", "┻": "+", "╋": "+",
+    "━": "-", "┃": "|", "─": "-", "│": "|",
+    "┌": "+", "┐": "+", "└": "+", "┘": "+", "├": "+", "┤": "+", "┴": "+", "┬": "+", "┼": "+",
+    "═": "-", "║": "|", "╔": "+", "╗": "+", "╚": "+", "╝": "+", "╠": "+", "╣": "+", "╦": "+", "╩": "+", "╬": "+",
+})
+
+# 简易 ANSI 转义去除（不依赖 rich 的 strip_ansi，兼容低版本 wheel）
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKF]")
+
+def strip_ansi_text(text: str) -> str:
+    return ANSI_RE.sub("", text)
 
 # --- 日志配置 ---
 logging.basicConfig(
@@ -442,6 +456,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
 
         log.info(f"成功加载配置，将扫描 {len(schemas_list)} 个源 schema。")
         log.info(f"obclient 超时时间: {OBC_TIMEOUT} 秒")
+        log.warning(
+            "注意：程序将从 DBA_* 视图读取 Oracle/OceanBase 元数据，请确保运行账号具备 DBA/SELECT ANY DICTIONARY/SELECT_CATALOG_ROLE 等等价权限，否则结果将不完整。"
+        )
         return ora_cfg, ob_cfg, settings
     except KeyError as e:
         log.error(f"严重错误: 配置文件中缺少必要的部分: {e}")
@@ -802,7 +819,7 @@ def get_source_objects(ora_cfg: OraConfig, schemas_list: List[str]) -> SourceObj
 
     sql = f"""
         SELECT OWNER, OBJECT_NAME, OBJECT_TYPE
-        FROM ALL_OBJECTS
+        FROM DBA_OBJECTS
         WHERE OWNER IN ({placeholders})
           AND OBJECT_TYPE IN (
               {object_types_clause}
@@ -833,7 +850,7 @@ def get_source_objects(ora_cfg: OraConfig, schemas_list: List[str]) -> SourceObj
             # 精确认定物化视图集合，避免误删真实表
             with connection.cursor() as cursor:
                 cursor.execute(
-                    f"SELECT OWNER, MVIEW_NAME FROM ALL_MVIEWS WHERE OWNER IN ({placeholders})",
+                    f"SELECT OWNER, MVIEW_NAME FROM DBA_MVIEWS WHERE OWNER IN ({placeholders})",
                     schemas_list
                 )
                 for row in cursor:
@@ -843,7 +860,7 @@ def get_source_objects(ora_cfg: OraConfig, schemas_list: List[str]) -> SourceObj
                         mview_pairs.add((owner, name))
             with connection.cursor() as cursor:
                 cursor.execute(
-                    f"SELECT OWNER, TABLE_NAME FROM ALL_TABLES WHERE OWNER IN ({placeholders})",
+                    f"SELECT OWNER, TABLE_NAME FROM DBA_TABLES WHERE OWNER IN ({placeholders})",
                     schemas_list
                 )
                 for row in cursor:
@@ -855,9 +872,9 @@ def get_source_objects(ora_cfg: OraConfig, schemas_list: List[str]) -> SourceObj
         log.error(f"严重错误: 连接或查询 Oracle 失败: {e}")
         sys.exit(1)
 
-    # Materialized View 在 ALL_OBJECTS 中通常会同时作为 TABLE 出现，去重以避免误将 MV 当成 TABLE 校验/抽取。
+    # Materialized View 在 DBA_OBJECTS 中通常会同时作为 TABLE 出现，去重以避免误将 MV 当成 TABLE 校验/抽取。
     mview_dedup = 0
-    pure_tables = table_pairs - mview_pairs  # ALL_TABLES 也包含 MVIEW，这里只保留真实 TABLE
+    pure_tables = table_pairs - mview_pairs  # DBA_TABLES 也包含 MVIEW，这里只保留真实 TABLE
     for full_name, types in source_objects.items():
         if 'MATERIALIZED VIEW' in types and 'TABLE' in types:
             try:
@@ -865,7 +882,7 @@ def get_source_objects(ora_cfg: OraConfig, schemas_list: List[str]) -> SourceObj
             except ValueError:
                 continue
             key = (owner.upper(), name.upper())
-            # 只有确定该对象存在于 ALL_MVIEWS 且不在“纯表”列表时，才移除 TABLE 标记
+            # 只有确定该对象存在于 DBA_MVIEWS 且不在“纯表”列表时，才移除 TABLE 标记
             if key in mview_pairs and key not in pure_tables:
                 types.discard('TABLE')
                 mview_dedup += 1
@@ -1117,7 +1134,7 @@ def compute_object_counts(
         obj_type_u = obj_type.upper()
         
         if obj_type_u == 'CONSTRAINT':
-            # Constraints are not in ALL_OBJECTS, so they need special handling
+            # Constraints are not in DBA_OBJECTS, so they need special handling
             expected_set = {
                 cons_name
                 for cons_map in oracle_meta.constraints.values()
@@ -1245,7 +1262,7 @@ def dump_ob_metadata(
 
     owners_in = ",".join(f"'{s}'" for s in sorted(target_schemas))
 
-    # --- 1. ALL_OBJECTS ---
+    # --- 1. DBA_OBJECTS ---
     objects_by_type: Dict[str, Set[str]] = {}
     object_types_filter = tracked_object_types or set(ALL_TRACKED_OBJECT_TYPES)
     if not object_types_filter:
@@ -1254,7 +1271,7 @@ def dump_ob_metadata(
 
     sql = f"""
         SELECT OWNER, OBJECT_NAME, OBJECT_TYPE
-        FROM ALL_OBJECTS
+        FROM DBA_OBJECTS
         WHERE OWNER IN ({owners_in})
           AND OBJECT_TYPE IN (
               {object_types_clause}
@@ -1262,7 +1279,7 @@ def dump_ob_metadata(
     """
     ok, out, err = obclient_run_sql(ob_cfg, sql)
     if not ok:
-        log.error("无法从 OB 读取 ALL_OBJECTS，程序退出。")
+        log.error("无法从 OB 读取 DBA_OBJECTS，程序退出。")
         sys.exit(1)
 
     if out:
@@ -1274,16 +1291,16 @@ def dump_ob_metadata(
             full = f"{owner}.{name}"
             objects_by_type.setdefault(obj_type, set()).add(full)
 
-    # 补充 ALL_TYPES (部分 OB 环境中 TYPE/TYPE BODY 不出现在 ALL_OBJECTS)
+    # 补充 DBA_TYPES (部分 OB 环境中 TYPE/TYPE BODY 不出现在 DBA_OBJECTS)
     if 'TYPE' in object_types_filter or 'TYPE BODY' in object_types_filter:
         sql_types = f"""
             SELECT OWNER, TYPE_NAME, TYPECODE
-            FROM ALL_TYPES
+            FROM DBA_TYPES
             WHERE OWNER IN ({owners_in})
         """
         ok, out, err = obclient_run_sql(ob_cfg, sql_types)
         if not ok:
-            log.warning("读取 ALL_TYPES 失败，TYPE / TYPE BODY 检查可能不完整: %s", err)
+            log.warning("读取 DBA_TYPES 失败，TYPE / TYPE BODY 检查可能不完整: %s", err)
         elif out:
             for line in out.splitlines():
                 parts = line.split('\t')
@@ -1295,10 +1312,10 @@ def dump_ob_metadata(
                 if typecode == 'OBJECT':
                     objects_by_type.setdefault('TYPE BODY', set()).add(full)
 
-    # --- 2. ALL_TAB_COLUMNS ---
+    # --- 2. DBA_TAB_COLUMNS ---
     sql_cols = f"""
         SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHAR_LENGTH, NULLABLE, DATA_DEFAULT
-        FROM ALL_TAB_COLUMNS
+        FROM DBA_TAB_COLUMNS
         WHERE OWNER IN ({owners_in})
     """
 
@@ -1306,7 +1323,7 @@ def dump_ob_metadata(
     if include_tab_columns:
         ok, out, err = obclient_run_sql(ob_cfg, sql_cols)
         if not ok:
-            log.error("无法从 OB 读取 ALL_TAB_COLUMNS，程序退出。")
+            log.error("无法从 OB 读取 DBA_TAB_COLUMNS，程序退出。")
             sys.exit(1)
 
         if out:
@@ -1330,17 +1347,17 @@ def dump_ob_metadata(
                     "hidden": False
                 }
 
-    # --- 3. ALL_INDEXES ---
+    # --- 3. DBA_INDEXES ---
     indexes: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     if include_indexes:
         sql = f"""
             SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, UNIQUENESS
-            FROM ALL_INDEXES
+            FROM DBA_INDEXES
             WHERE TABLE_OWNER IN ({owners_in})
         """
         ok, out, err = obclient_run_sql(ob_cfg, sql)
         if not ok:
-            log.error("无法从 OB 读取 ALL_INDEXES，程序退出。")
+            log.error("无法从 OB 读取 DBA_INDEXES，程序退出。")
             sys.exit(1)
 
         if out:
@@ -1360,16 +1377,16 @@ def dump_ob_metadata(
                     "columns": []
                 }
 
-        # --- 4. ALL_IND_COLUMNS ---
+        # --- 4. DBA_IND_COLUMNS ---
         sql = f"""
             SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_NAME, COLUMN_POSITION
-            FROM ALL_IND_COLUMNS
+            FROM DBA_IND_COLUMNS
             WHERE TABLE_OWNER IN ({owners_in})
             ORDER BY TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_POSITION
         """
         ok, out, err = obclient_run_sql(ob_cfg, sql)
         if not ok:
-            log.error("无法从 OB 读取 ALL_IND_COLUMNS，程序退出。")
+            log.error("无法从 OB 读取 DBA_IND_COLUMNS，程序退出。")
             sys.exit(1)
 
         if out:
@@ -1403,19 +1420,19 @@ def dump_ob_metadata(
             else:
                 del indexes[key]
 
-    # --- 5. ALL_CONSTRAINTS (P/U/R) ---
+    # --- 5. DBA_CONSTRAINTS (P/U/R) ---
     constraints: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     if include_constraints:
         sql = f"""
             SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE
-            FROM ALL_CONSTRAINTS
+            FROM DBA_CONSTRAINTS
             WHERE OWNER IN ({owners_in})
               AND CONSTRAINT_TYPE IN ('P','U','R')
               AND STATUS = 'ENABLED'
         """
         ok, out, err = obclient_run_sql(ob_cfg, sql)
         if not ok:
-            log.error("无法从 OB 读取 ALL_CONSTRAINTS，程序退出。")
+            log.error("无法从 OB 读取 DBA_CONSTRAINTS，程序退出。")
             sys.exit(1)
 
         if out:
@@ -1435,16 +1452,16 @@ def dump_ob_metadata(
                     "columns": []
                 }
 
-        # --- 6. ALL_CONS_COLUMNS ---
+        # --- 6. DBA_CONS_COLUMNS ---
         sql = f"""
             SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME, POSITION
-            FROM ALL_CONS_COLUMNS
+            FROM DBA_CONS_COLUMNS
             WHERE OWNER IN ({owners_in})
             ORDER BY OWNER, TABLE_NAME, CONSTRAINT_NAME, POSITION
         """
         ok, out, err = obclient_run_sql(ob_cfg, sql)
         if not ok:
-            log.error("无法从 OB 读取 ALL_CONS_COLUMNS，程序退出。")
+            log.error("无法从 OB 读取 DBA_CONS_COLUMNS，程序退出。")
             sys.exit(1)
 
         if out:
@@ -1465,17 +1482,17 @@ def dump_ob_metadata(
                     constraints[key][cons_name] = {"type": "UNKNOWN", "columns": []}
                 constraints[key][cons_name]["columns"].append(col_name)
 
-    # --- 7. ALL_TRIGGERS ---
+    # --- 7. DBA_TRIGGERS ---
     triggers: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     if include_triggers:
         sql = f"""
             SELECT TABLE_OWNER, TABLE_NAME, TRIGGER_NAME, TRIGGERING_EVENT, STATUS
-            FROM ALL_TRIGGERS
+            FROM DBA_TRIGGERS
             WHERE TABLE_OWNER IN ({owners_in})
         """
         ok, out, err = obclient_run_sql(ob_cfg, sql)
         if not ok:
-            log.error("无法从 OB 读取 ALL_TRIGGERS，程序退出。")
+            log.error("无法从 OB 读取 DBA_TRIGGERS，程序退出。")
             sys.exit(1)
 
         if out:
@@ -1496,17 +1513,17 @@ def dump_ob_metadata(
                     "status": status
                 }
 
-    # --- 8. ALL_SEQUENCES ---
+    # --- 8. DBA_SEQUENCES ---
     sequences: Dict[str, Set[str]] = {}
     if include_sequences:
         sql = f"""
             SELECT SEQUENCE_OWNER, SEQUENCE_NAME
-            FROM ALL_SEQUENCES
+            FROM DBA_SEQUENCES
             WHERE SEQUENCE_OWNER IN ({owners_in})
         """
         ok, out, err = obclient_run_sql(ob_cfg, sql)
         if not ok:
-            log.error("无法从 OB 读取 ALL_SEQUENCES，程序退出。")
+            log.error("无法从 OB 读取 DBA_SEQUENCES，程序退出。")
             sys.exit(1)
 
         if out:
@@ -1517,7 +1534,7 @@ def dump_ob_metadata(
                 owner, seq_name = parts[0].strip().upper(), parts[1].strip().upper()
                 sequences.setdefault(owner, set()).add(seq_name)
 
-    log.info("OceanBase 元数据转储完成 (根据开关加载 ALL_OBJECTS/列/索引/约束/触发器/序列)。")
+    log.info("OceanBase 元数据转储完成 (根据开关加载 DBA_OBJECTS/列/索引/约束/触发器/序列)。")
     return ObMetadata(
         objects_by_type=objects_by_type,
         tab_columns=tab_columns,
@@ -1572,7 +1589,7 @@ def dump_oracle_metadata(
     def _make_in_clause(values: List[str]) -> str:
         return ",".join(f":{i+1}" for i in range(len(values)))
 
-    log.info("正在批量加载 Oracle 元数据 (ALL_TAB_COLUMNS/INDEXES/CONSTRAINTS/TRIGGERS/SEQUENCES)...")
+    log.info("正在批量加载 Oracle 元数据 (DBA_TAB_COLUMNS/DBA_INDEXES/DBA_CONSTRAINTS/DBA_TRIGGERS/DBA_SEQUENCES)...")
     table_columns: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     indexes: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     constraints: Dict[Tuple[str, str], Dict[str, Dict]] = {}
@@ -1602,9 +1619,9 @@ def dump_oracle_metadata(
                     with ora_conn.cursor() as cursor:
                         cursor.execute("""
                             SELECT COUNT(*)
-                            FROM ALL_TAB_COLUMNS
+                            FROM DBA_TAB_COLUMNS
                             WHERE OWNER = 'SYS'
-                              AND TABLE_NAME = 'ALL_TAB_COLUMNS'
+                              AND TABLE_NAME = 'DBA_TAB_COLUMNS'
                               AND COLUMN_NAME = 'HIDDEN_COLUMN'
                         """)
                         count_row = cursor.fetchone()
@@ -1620,7 +1637,7 @@ def dump_oracle_metadata(
                         SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
                                DATA_LENGTH, DATA_PRECISION, DATA_SCALE,
                                NULLABLE, DATA_DEFAULT, CHAR_USED, CHAR_LENGTH{hidden_col}
-                        FROM ALL_TAB_COLUMNS
+                        FROM DBA_TAB_COLUMNS
                         WHERE OWNER IN ({owners_clause})
                     """
                     return sql
@@ -1654,7 +1671,7 @@ def dump_oracle_metadata(
                             table_columns.setdefault(key, {})[col] = _parse_tab_column_row(row, support_hidden_col)
                 except oracledb.Error as e:
                     if support_hidden_col:
-                        log.info("读取 ALL_TAB_COLUMNS(含 hidden) 失败，尝试不含 hidden：%s", e)
+                        log.info("读取 DBA_TAB_COLUMNS(含 hidden) 失败，尝试不含 hidden：%s", e)
                         support_hidden_col = False
                         sql = _load_ora_tab_columns(include_hidden=False)
                         with ora_conn.cursor() as cursor:
@@ -1676,7 +1693,7 @@ def dump_oracle_metadata(
                 if include_indexes:
                     sql_idx = f"""
                         SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, UNIQUENESS
-                        FROM ALL_INDEXES
+                        FROM DBA_INDEXES
                         WHERE TABLE_OWNER IN ({owners_clause})
                     """
                     with ora_conn.cursor() as cursor:
@@ -1699,7 +1716,7 @@ def dump_oracle_metadata(
 
                     sql_idx_cols = f"""
                         SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_NAME
-                        FROM ALL_IND_COLUMNS
+                        FROM DBA_IND_COLUMNS
                         WHERE TABLE_OWNER IN ({owners_clause})
                         ORDER BY TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_POSITION
                     """
@@ -1725,7 +1742,7 @@ def dump_oracle_metadata(
                 if include_constraints:
                     sql_cons = f"""
                         SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME
-                        FROM ALL_CONSTRAINTS
+                        FROM DBA_CONSTRAINTS
                         WHERE OWNER IN ({owners_clause})
                           AND CONSTRAINT_TYPE IN ('P','U','R')
                           AND STATUS = 'ENABLED'
@@ -1752,7 +1769,7 @@ def dump_oracle_metadata(
 
                     sql_cons_cols = f"""
                         SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME
-                        FROM ALL_CONS_COLUMNS
+                        FROM DBA_CONS_COLUMNS
                         WHERE OWNER IN ({owners_clause})
                         ORDER BY OWNER, TABLE_NAME, CONSTRAINT_NAME, POSITION
                     """
@@ -1798,7 +1815,7 @@ def dump_oracle_metadata(
                 if include_triggers:
                     sql_trg = f"""
                         SELECT TABLE_OWNER, TABLE_NAME, TRIGGER_NAME, TRIGGERING_EVENT, STATUS
-                        FROM ALL_TRIGGERS
+                        FROM DBA_TRIGGERS
                         WHERE TABLE_OWNER IN ({owners_clause})
                     """
                     with ora_conn.cursor() as cursor:
@@ -1823,7 +1840,7 @@ def dump_oracle_metadata(
                 seq_clause = _make_in_clause(seq_owners)
                 sql_seq = f"""
                     SELECT SEQUENCE_OWNER, SEQUENCE_NAME
-                    FROM ALL_SEQUENCES
+                    FROM DBA_SEQUENCES
                     WHERE SEQUENCE_OWNER IN ({seq_clause})
                 """
                 with ora_conn.cursor() as cursor:
@@ -1868,7 +1885,7 @@ def load_oracle_dependencies(
 
     sql = f"""
         SELECT OWNER, NAME, TYPE, REFERENCED_OWNER, REFERENCED_NAME, REFERENCED_TYPE
-        FROM ALL_DEPENDENCIES
+        FROM DBA_DEPENDENCIES
         WHERE OWNER IN ({owners_clause})
           AND REFERENCED_OWNER IN ({owners_clause})
           AND TYPE IN ({types_clause})
@@ -1922,7 +1939,7 @@ def load_ob_dependencies(ob_cfg: ObConfig, target_schemas: Set[str]) -> Set[Tupl
 
     sql = f"""
         SELECT OWNER, NAME, TYPE, REFERENCED_OWNER, REFERENCED_NAME, REFERENCED_TYPE
-        FROM ALL_DEPENDENCIES
+        FROM DBA_DEPENDENCIES
         WHERE OWNER IN ({owners_in})
           AND REFERENCED_OWNER IN ({owners_in})
           AND TYPE IN ({types_clause})
@@ -1930,7 +1947,7 @@ def load_ob_dependencies(ob_cfg: ObConfig, target_schemas: Set[str]) -> Set[Tupl
     """
     ok, out, err = obclient_run_sql(ob_cfg, sql)
     if not ok:
-        log.error("无法从 OB 读取 ALL_DEPENDENCIES，程序退出。")
+        log.error("无法从 OB 读取 DBA_DEPENDENCIES，程序退出。")
         sys.exit(1)
 
     result: Set[Tuple[str, str, str, str]] = set()
@@ -2307,18 +2324,23 @@ def compare_indexes_for_table(
 ) -> Tuple[bool, Optional[IndexMismatch]]:
     src_key = (src_schema.upper(), src_table.upper())
     src_idx = oracle_meta.indexes.get(src_key)
+    tgt_key = (tgt_schema.upper(), tgt_table.upper())
+    tgt_idx = ob_meta.indexes.get(tgt_key, {})
+
     if src_idx is None:
+        extra_indexes = set(tgt_idx.keys())
+        detail = (
+            "无法比较：源端 Oracle 未提供该表的索引元数据 (DBA_INDEXES/DBA_IND_COLUMNS dump 为空)。"
+        )
+        if extra_indexes:
+            detail += f" 目标端当前索引：{', '.join(sorted(extra_indexes))}。"
         return False, IndexMismatch(
             table=f"{tgt_schema}.{tgt_table}",
             missing_indexes=set(),
-            extra_indexes=set(),
-            detail_mismatch=[
-                "无法比较：源端 Oracle 未提供该表的索引元数据 (ALL_INDEXES/ALL_IND_COLUMNS dump 为空)。"
-            ]
+            extra_indexes=extra_indexes,
+            detail_mismatch=[detail]
         )
 
-    tgt_key = (tgt_schema.upper(), tgt_table.upper())
-    tgt_idx = ob_meta.indexes.get(tgt_key, {})
     tgt_constraints = ob_meta.constraints.get(tgt_key, {})
     constraint_index_cols: Set[Tuple[str, ...]] = {
         normalize_column_sequence(cons.get("columns"))
@@ -2400,18 +2422,22 @@ def compare_constraints_for_table(
 ) -> Tuple[bool, Optional[ConstraintMismatch]]:
     src_key = (src_schema.upper(), src_table.upper())
     src_cons = oracle_meta.constraints.get(src_key)
+    tgt_key = (tgt_schema.upper(), tgt_table.upper())
+    tgt_cons = ob_meta.constraints.get(tgt_key, {})
+
     if src_cons is None:
+        extra_cons = {name for name in tgt_cons.keys() if "_OMS_ROWID" not in (name or "")}
+        detail = (
+            "无法比较：源端 Oracle 未提供该表的约束元数据 (DBA_CONSTRAINTS/DBA_CONS_COLUMNS dump 为空)。"
+        )
+        if extra_cons:
+            detail += f" 目标端当前约束：{', '.join(sorted(extra_cons))}。"
         return False, ConstraintMismatch(
             table=f"{tgt_schema}.{tgt_table}",
             missing_constraints=set(),
-            extra_constraints=set(),
-            detail_mismatch=[
-                "无法比较：源端 Oracle 未提供该表的约束元数据 (ALL_CONSTRAINTS/ALL_CONS_COLUMNS dump 为空)。"
-            ]
+            extra_constraints=extra_cons,
+            detail_mismatch=[detail]
         )
-
-    tgt_key = (tgt_schema.upper(), tgt_table.upper())
-    tgt_cons = ob_meta.constraints.get(tgt_key, {})
 
     detail_mismatch: List[str] = []
     missing: Set[str] = set()
@@ -2457,6 +2483,9 @@ def compare_constraints_for_table(
                 extra_cols = tgt_list[idx][0]
                 if extra_cols in source_all_cols:
                     continue
+                # 跳过迁移工具生成的 OMS_ROWID 辅助约束
+                if "_OMS_ROWID" in (extra_name or ""):
+                    continue
                 extra.add(extra_name)
                 detail_mismatch.append(
                     f"{label}: 目标端存在额外约束 {extra_name} (列 {list(extra_cols)})。"
@@ -2487,12 +2516,18 @@ def compare_sequences_for_schema(
     src_seqs = oracle_meta.sequences.get(src_schema.upper())
     if src_seqs is None:
         log.warning(f"[序列检查] 未找到 {src_schema} 的 Oracle 序列元数据。")
+        tgt_seqs_snapshot = ob_meta.sequences.get(tgt_schema.upper(), set())
+        note = (
+            f"Oracle 用户已成功查询，但在 schema {src_schema} 的 DBA_SEQUENCES 未返回任何记录，请检查该 schema 是否确实存在序列。"
+        )
+        if tgt_seqs_snapshot:
+            note += f" 目标端现有序列：{', '.join(sorted(tgt_seqs_snapshot))}。"
         return False, SequenceMismatch(
             src_schema=src_schema,
             tgt_schema=tgt_schema,
             missing_sequences=set(),
-            extra_sequences=set(),
-            note=f"Oracle 用户已成功查询，但在 schema {src_schema} 的 ALL_SEQUENCES 未返回任何记录，请检查该 schema 是否确实存在序列。"
+            extra_sequences=tgt_seqs_snapshot,
+            note=note
         )
 
     tgt_seqs = ob_meta.sequences.get(tgt_schema.upper(), set())
@@ -4192,7 +4227,7 @@ def print_final_report(
     grant_stmt_cnt = sum(len(entries) for entries in required_grants.values())
     source_missing_schema_cnt = len(schema_summary.get("source_missing", []))
 
-    console.print(Panel.fit("[bold]数据库对象迁移校验报告 (V0.6 - Rich)[/bold]", style="title"))
+    console.print(Panel.fit("[bold]数据库对象迁移校验报告 (V0.7 - Rich)[/bold]", style="title"))
 
     section_width = 140
     count_table_kwargs: Dict[str, object] = {"width": section_width, "expand": False}
@@ -4570,8 +4605,10 @@ def print_final_report(
         try:
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report_text = console.export_text(clear=False)
-            report_path.write_text(report_text, encoding='utf-8')
-            console.print(f"[info]报告已保存: {report_path}")
+            # 生成便于 vi/less 查看且无颜色/框线的纯文本报告
+            plain_text = strip_ansi_text(report_text).translate(BOX_ASCII_TRANS)
+            report_path.write_text(plain_text, encoding='utf-8')
+            console.print(f"[info]报告已保存(纯文本): {report_path}")
         except OSError as exc:
             console.print(f"[missing]报告写入失败: {exc}")
 
@@ -4582,11 +4619,11 @@ def parse_cli_args() -> argparse.Namespace:
     """解析命令行参数，允许自定义 config.ini 路径并展示功能说明。"""
     desc = textwrap.dedent(
         """\
-        OceanBase Comparator Toolkit v0.6
+        OceanBase Comparator Toolkit v0.7
         - 一次转储，本地对比：Oracle Thick Mode + 少量 obclient 调用，全部比对在内存完成。
         - 覆盖对象：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。
         - 校验规则：表列名集合 + VARCHAR/VARCHAR2 长度窗口 [ceil(1.5x), ceil(2.5x)]；其余对象校验存在性/列组合。
-        - 依赖&授权：加载 ALL_DEPENDENCIES，映射后对比，缺失则生成 ALTER ... COMPILE；推导跨 schema GRANT。
+        - 依赖&授权：加载 DBA_DEPENDENCIES，映射后对比，缺失则生成 ALTER ... COMPILE；推导跨 schema GRANT。
         - Fix-up 输出：缺失对象 CREATE、表列 ALTER ADD/MODIFY、依赖 COMPILE、GRANT，按类型落地到 fixup_scripts/*。
         """
     )
