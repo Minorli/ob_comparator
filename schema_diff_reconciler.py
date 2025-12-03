@@ -4429,14 +4429,27 @@ def print_final_report(
 
     # --- 1. 缺失的主对象 ---
     if tv_results['missing']:
-        table = Table(title=f"[header]1. 缺失的主对象 (共 {missing_count} 个)", width=section_width)
+        table = Table(title=f"[header]1. 缺失的主对象 (共 {missing_count} 个) — 按目标 schema 分组[/header]", width=section_width)
+        SCHEMA_COL_WIDTH = 18
+        table.add_column("目标 Schema", style="info", width=SCHEMA_COL_WIDTH)
         table.add_column("类型", style="info", width=TYPE_COL_WIDTH)
         table.add_column("源对象 = 目标对象(应存在)", style="info")
+
+        grouped_missing: Dict[str, List[Tuple[str, str, str]]] = defaultdict(list)
         for obj_type, tgt_name, src_name in tv_results['missing']:
-            table.add_row(
-                f"[{obj_type}]",
-                f"{src_name} = {tgt_name}"
-            )
+            tgt_schema = tgt_name.split('.')[0] if '.' in tgt_name else tgt_name
+            grouped_missing[tgt_schema.upper()].append((obj_type, tgt_name, src_name))
+
+        grouped_items = sorted(grouped_missing.items())
+        for tgt_schema, items in grouped_items:
+            sorted_items = sorted(items, key=lambda x: (x[0], x[1], x[2]))
+            for idx, (obj_type, tgt_name, src_name) in enumerate(sorted_items):
+                table.add_row(
+                    tgt_schema if idx == 0 else "",
+                    f"[{obj_type}]",
+                    f"{src_name} = {tgt_name}",
+                    end_section=(idx == len(sorted_items) - 1)
+                )
         console.print(table)
 
     if tv_results.get('extra_targets'):
