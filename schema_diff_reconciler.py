@@ -4433,6 +4433,46 @@ except ImportError:
     print("请先安装: pip install rich", file=sys.stderr)
     sys.exit(1)
 
+
+def export_missing_table_view_mappings(
+    tv_results: ReportResults,
+    report_dir: Path
+) -> Optional[Path]:
+    """
+    将缺失的 TABLE/VIEW 映射按目标 schema 输出为文本，便于迁移工具直接消费。
+    """
+    if not report_dir:
+        return None
+
+    grouped: Dict[str, List[str]] = defaultdict(list)
+    for obj_type, tgt_name, src_name in tv_results.get("missing", []):
+        if obj_type.upper() not in ("TABLE", "VIEW"):
+            continue
+        if "." not in tgt_name or "." not in src_name:
+            continue
+        tgt_schema = tgt_name.split(".")[0].upper()
+        grouped[tgt_schema].append(f"{src_name}={tgt_name}")
+
+    if not grouped:
+        return None
+
+    output_dir = Path(report_dir) / "tables_views_miss"
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.warning("无法创建缺失 TABLE/VIEW 映射目录 %s: %s", output_dir, exc)
+        return None
+
+    for tgt_schema, mappings in sorted(grouped.items()):
+        file_path = output_dir / f"{tgt_schema}.txt"
+        lines = sorted(set(mappings))
+        try:
+            file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError as exc:
+            log.warning("写入缺失映射文件失败 %s: %s", file_path, exc)
+    return output_dir
+
+
 def print_final_report(
     tv_results: ReportResults,
     total_checked: int,
@@ -4722,7 +4762,7 @@ def print_final_report(
         SCHEMA_COL_WIDTH = 18
         table.add_column("目标 Schema", style="info", width=SCHEMA_COL_WIDTH)
         table.add_column("类型", style="info", width=TYPE_COL_WIDTH)
-        table.add_column("源对象 = 目标对象(应存在)", style="info")
+        table.add_column("源对象=目标对象(应存在)", style="info")
 
         grouped_missing: Dict[str, List[Tuple[str, str, str]]] = defaultdict(list)
         for obj_type, tgt_name, src_name in tv_results['missing']:
@@ -4736,7 +4776,7 @@ def print_final_report(
                 table.add_row(
                     tgt_schema if idx == 0 else "",
                     f"[{obj_type}]",
-                    f"{src_name} = {tgt_name}",
+                    f"{src_name}={tgt_name}",
                     end_section=(idx == len(sorted_items) - 1)
                 )
         console.print(table)
@@ -4932,6 +4972,7 @@ def print_final_report(
 
     if report_file:
         report_path = Path(report_file)
+        export_dir = export_missing_table_view_mappings(tv_results, report_path.parent)
         try:
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report_text = console.export_text(clear=False)
@@ -4939,6 +4980,8 @@ def print_final_report(
             plain_text = strip_ansi_text(report_text).translate(BOX_ASCII_TRANS)
             report_path.write_text(plain_text, encoding='utf-8')
             console.print(f"[info]报告已保存(纯文本): {report_path}")
+            if export_dir:
+                log.info("缺失 TABLE/VIEW 映射已输出到: %s", export_dir)
         except OSError as exc:
             console.print(f"[missing]报告写入失败: {exc}")
 
