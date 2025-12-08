@@ -70,8 +70,10 @@ import math
 import re
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import uuid
 import shutil
+import time
 from collections import defaultdict, OrderedDict
 from datetime import datetime
 from pathlib import Path
@@ -482,6 +484,8 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('check_comments', 'true')
         settings.setdefault('infer_schema_mapping', 'true')
         settings.setdefault('dbcat_chunk_size', '150')
+        settings.setdefault('fixup_workers', '')
+        settings.setdefault('progress_log_interval', '10')
 
         enabled_primary_types = parse_type_list(
             settings.get('check_primary_types', ''),
@@ -515,6 +519,14 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             set(ALL_TRACKED_OBJECT_TYPES),
             'fixup_types'
         )
+        try:
+            cpu_default = max(1, os.cpu_count() or 1)
+            settings['fixup_workers'] = int(settings.get('fixup_workers') or min(12, cpu_default))
+            if settings['fixup_workers'] <= 0:
+                settings['fixup_workers'] = min(12, cpu_default)
+        except (TypeError, ValueError):
+            cpu_default = max(1, os.cpu_count() or 1)
+            settings['fixup_workers'] = min(12, cpu_default)
         try:
             settings['dbcat_chunk_size'] = int(settings.get('dbcat_chunk_size', '150'))
         except ValueError:
@@ -3965,10 +3977,18 @@ def format_oracle_column_type(
     char_length = info.get("char_length")
     char_used = (info.get("char_used") or "").strip().upper()
 
+    def strip_byte_suffix(type_literal: str, base_type: str) -> str:
+        if base_type not in ("VARCHAR2", "VARCHAR"):
+            return type_literal
+        return re.sub(r'\s+BYTE\b', '', type_literal, flags=re.IGNORECASE)
+
     def apply_varchar_pref(type_literal: str) -> str:
-        if prefer_ob_varchar and type_literal.startswith("VARCHAR2"):
-            return "VARCHAR" + type_literal[len("VARCHAR2"):]
-        return type_literal
+        literal = type_literal
+        if prefer_ob_varchar and literal.startswith("VARCHAR2"):
+            literal = "VARCHAR" + literal[len("VARCHAR2"):]
+        literal = strip_byte_suffix(literal, "VARCHAR2")
+        literal = strip_byte_suffix(literal, "VARCHAR")
+        return literal
 
     # If data_type already carries explicit precision/length (e.g., TIMESTAMP(6)), respect it.
     if '(' in dt and override_length is None:
@@ -3981,7 +4001,7 @@ def format_oracle_column_type(
         if char_used == "C":
             return " CHAR"
         if char_used == "B":
-            return " BYTE"
+            return "" if base_type == "VARCHAR2" else " BYTE"
         return ""
 
     # Choose effective length with optional override
@@ -4177,10 +4197,16 @@ def generate_fixup_scripts(
       4. VIEW / MATERIALIZED VIEW 等代码对象
       5. INDEX
       6. CONSTRAINT
-      7. TRIGGER
-      8. 依赖重编译 (ALTER ... COMPILE)
-      9. 依赖授权 (跨 schema)
+    7. TRIGGER
+    8. 依赖重编译 (ALTER ... COMPILE)
+    9. 依赖授权 (跨 schema)
     """
+    try:
+        progress_log_interval = float(settings.get('progress_log_interval', 10))
+    except (TypeError, ValueError):
+        progress_log_interval = 10.0
+    progress_log_interval = max(1.0, progress_log_interval)
+
     base_dir = Path(settings.get('fixup_dir', 'fixup_scripts'))
 
     if not master_list:
@@ -4256,6 +4282,26 @@ def generate_fixup_scripts(
         if fixup_schema_filter and schema_u not in fixup_schema_filter:
             return False
         return True
+
+    def build_progress_tracker(total: int, label: str) -> Callable[[Optional[str]], None]:
+        state = {"done": 0, "last": time.time()}
+        state_lock = threading.Lock()
+        if total:
+            log.info("%s 总计 %d 个。", label, total)
+
+        def _tick(extra: Optional[str] = None) -> None:
+            if total <= 0:
+                return
+            with state_lock:
+                state["done"] += 1
+                now = time.time()
+                should_log = state["done"] == total or (now - state["last"]) >= progress_log_interval
+                if should_log:
+                    state["last"] = now
+                    suffix = f" [{extra}]" if extra else ""
+                    log.info("%s 进度 %d/%d%s", label, state["done"], total, suffix)
+
+        return _tick
 
     grants_map: Dict[str, Set[Tuple[str, str]]] = required_grants if required_grants is not None else {}
 
@@ -4369,6 +4415,33 @@ def generate_fixup_scripts(
                 queue_request(src_schema, 'TRIGGER', trg_name_u)
                 trigger_tasks.append((src_schema, trg_name_u, tgt_schema_final, tgt_obj))
 
+    other_missing_summary: Dict[str, int] = defaultdict(int)
+    for ot, _, _, _, _ in other_missing_objects:
+        other_missing_summary[ot] += 1
+    index_total = sum(len(item.missing_indexes) for item, _, _, _, _ in index_tasks)
+    constraint_total = sum(len(item.missing_constraints) for item, _, _, _, _ in constraint_tasks)
+    total_missing_scripts = (
+        len(sequence_tasks)
+        + len(missing_tables)
+        + len(other_missing_objects)
+        + index_total
+        + constraint_total
+        + len(trigger_tasks)
+    )
+    other_summary = ", ".join(f"{k}={v}" for k, v in sorted(other_missing_summary.items())) or "无"
+    log.info(
+        "[FIXUP] 待生成缺失对象/脚本总计 %d 个: TABLE=%d, 其他=%d (%s), INDEX=%d, CONSTRAINT=%d, SEQUENCE=%d, TRIGGER=%d",
+        total_missing_scripts,
+        len(missing_tables),
+        len(other_missing_objects),
+        other_summary,
+        index_total,
+        constraint_total,
+        len(sequence_tasks),
+        len(trigger_tasks)
+    )
+    log.info("[FIXUP] 进度日志间隔 %.0f 秒，可通过 progress_log_interval 配置。", progress_log_interval)
+
     dbcat_data = fetch_dbcat_schema_objects(ora_cfg, settings, schema_requests)
 
     def get_dbcat_ddl(schema: str, obj_type: str, obj_name: str) -> Optional[str]:
@@ -4412,113 +4485,130 @@ def generate_fixup_scripts(
         for table_name, ddl in type_map.get('TABLE', {}).items():
             table_ddl_cache[(schema, table_name)] = ddl
 
-    worker_count = max(1, int(((os.cpu_count() or 1) * 0.2)))
-
-    worker_count = 1
-    log.info("[FIXUP] 已禁用并发 (worker=1)")
+    worker_count = max(1, int(settings.get('fixup_workers', 1)))
+    if worker_count == 1:
+        log.info("[FIXUP] 并发未启用 (worker=1)，可通过 fixup_workers 配置提高到 8 或 12。")
+    else:
+        log.info("[FIXUP] 启用并发生成 (worker=%d)，可通过 fixup_workers 配置调整。", worker_count)
 
     def run_tasks(tasks: List[Callable[[], None]], label: str) -> None:
         if not tasks:
             return
-        for task in tasks:
-            try:
-                task()
-            except Exception as exc:
-                log.error("[FIXUP] 任务 %s 失败: %s", label, exc)
+        if worker_count <= 1:
+            for task in tasks:
+                try:
+                    task()
+                except Exception as exc:
+                    log.error("[FIXUP] 任务 %s 失败: %s", label, exc)
+            return
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(task) for task in tasks]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as exc:
+                    log.error("[FIXUP] 任务 %s 失败: %s", label, exc)
 
     log.info("[FIXUP] (1/9) 正在生成 SEQUENCE 脚本...")
+    seq_progress = build_progress_tracker(len(sequence_tasks), "[FIXUP] (1/9) SEQUENCE")
     seq_jobs: List[Callable[[], None]] = []
     for src_schema, seq_name, tgt_schema, tgt_name in sequence_tasks:
         def _job(ss=src_schema, sn=seq_name, ts=tgt_schema, tn=tgt_name):
-            ddl = get_dbcat_ddl(ss, 'SEQUENCE', sn)
-            ddl_source_label = "DBCAT" if ddl else ""
-            if not ddl:
-                ddl = get_fallback_ddl(ss, 'SEQUENCE', sn)
+            try:
+                ddl = get_dbcat_ddl(ss, 'SEQUENCE', sn)
+                ddl_source_label = "DBCAT" if ddl else ""
+                if not ddl:
+                    ddl = get_fallback_ddl(ss, 'SEQUENCE', sn)
+                    if ddl:
+                        log.info("[FIXUP] 使用 DBMS_METADATA 兜底导出 SEQUENCE %s.%s。", ss, sn)
+                        mark_source('SEQUENCE', 'fallback')
+                        ddl_source_label = "METADATA"
+                if not ddl:
+                    log.warning("[FIXUP] 未找到 SEQUENCE %s.%s 的 dbcat DDL。", ss, sn)
+                    mark_source('SEQUENCE', 'missing')
+                    return
                 if ddl:
-                    log.info("[FIXUP] 使用 DBMS_METADATA 兜底导出 SEQUENCE %s.%s。", ss, sn)
-                    mark_source('SEQUENCE', 'fallback')
-                    ddl_source_label = "METADATA"
-            if not ddl:
-                log.warning("[FIXUP] 未找到 SEQUENCE %s.%s 的 dbcat DDL。", ss, sn)
-                mark_source('SEQUENCE', 'missing')
-                return
-            if ddl:
-                mark_source('SEQUENCE', 'dbcat')
-            ddl_source_label = ddl_source_label or "DBCAT"
-            ddl_adj = adjust_ddl_for_object(
-                ddl,
-                ss,
-                sn,
-                ts,
-                tn,
-                extra_identifiers=all_replacements,
-                obj_type='SEQUENCE'
-            )
-            ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
-            ddl_adj = prepend_set_schema(ddl_adj, ts)
-            ddl_adj = normalize_ddl_for_ob(ddl_adj)
-            ddl_adj = strip_constraint_enable(ddl_adj)
-            filename = f"{ts}.{tn}.sql"
-            header = f"修补缺失的 SEQUENCE {ts}.{tn} (源: {ss}.{sn})"
-            log.info("[FIXUP]%s 写入 SEQUENCE 脚本: %s", source_tag(ddl_source_label), filename)
-            write_fixup_file(base_dir, 'sequence', filename, ddl_adj, header)
+                    mark_source('SEQUENCE', 'dbcat')
+                ddl_source_label = ddl_source_label or "DBCAT"
+                ddl_adj = adjust_ddl_for_object(
+                    ddl,
+                    ss,
+                    sn,
+                    ts,
+                    tn,
+                    extra_identifiers=all_replacements,
+                    obj_type='SEQUENCE'
+                )
+                ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
+                ddl_adj = prepend_set_schema(ddl_adj, ts)
+                ddl_adj = normalize_ddl_for_ob(ddl_adj)
+                ddl_adj = strip_constraint_enable(ddl_adj)
+                filename = f"{ts}.{tn}.sql"
+                header = f"修补缺失的 SEQUENCE {ts}.{tn} (源: {ss}.{sn})"
+                log.info("[FIXUP]%s 写入 SEQUENCE 脚本: %s", source_tag(ddl_source_label), filename)
+                write_fixup_file(base_dir, 'sequence', filename, ddl_adj, header)
+            finally:
+                seq_progress()
         seq_jobs.append(_job)
     run_tasks(seq_jobs, "SEQUENCE")
 
     log.info("[FIXUP] (2/9) 正在生成缺失的 TABLE CREATE 脚本...")
     table_jobs: List[Callable[[], None]] = []
     table_total = len(missing_tables)
+    table_progress_tick = build_progress_tracker(table_total, "[FIXUP] (2/9) TABLE")
     table_counts: Dict[str, int] = defaultdict(int)
     table_progress = {"done": 0}
     table_lock = threading.Lock()
-    log_step = max(1, table_total // 10) if table_total else 1
 
     def _record_table_progress(source_label: str) -> None:
         with table_lock:
             table_counts[source_label] += 1
             table_progress["done"] += 1
-            done = table_progress["done"]
-            if done == table_total or (done % log_step == 0):
-                stats = ", ".join(f"{k}={v}" for k, v in sorted(table_counts.items()))
-                log.info("[FIXUP] (2/9) 进度 %d/%d [%s]", done, table_total, stats or "no scripts")
+            stats = ", ".join(f"{k}={v}" for k, v in sorted(table_counts.items()))
+        table_progress_tick(stats or "no scripts")
 
     for src_schema, src_table, tgt_schema, tgt_table in missing_tables:
         def _job(ss=src_schema, st=src_table, ts=tgt_schema, tt=tgt_table):
-            ddl = get_dbcat_ddl(ss, 'TABLE', st)
-            ddl_source_label = "DBCAT" if ddl else ""
-            if not ddl:
-                ddl = get_fallback_ddl(ss, 'TABLE', st)
+            progress_label = "unknown"
+            try:
+                ddl = get_dbcat_ddl(ss, 'TABLE', st)
+                ddl_source_label = "DBCAT" if ddl else ""
+                if not ddl:
+                    ddl = get_fallback_ddl(ss, 'TABLE', st)
+                    if ddl:
+                        log.info("[FIXUP] 使用 DBMS_METADATA 兜底导出 TABLE %s.%s。", ss, st)
+                        mark_source('TABLE', 'fallback')
+                        ddl_source_label = "METADATA"
+                if not ddl:
+                    log.warning("[FIXUP] 未找到 TABLE %s.%s 的 dbcat DDL。", ss, st)
+                    mark_source('TABLE', 'missing')
+                    progress_label = "missing"
+                    return
                 if ddl:
-                    log.info("[FIXUP] 使用 DBMS_METADATA 兜底导出 TABLE %s.%s。", ss, st)
-                    mark_source('TABLE', 'fallback')
-                    ddl_source_label = "METADATA"
-            if not ddl:
-                log.warning("[FIXUP] 未找到 TABLE %s.%s 的 dbcat DDL。", ss, st)
-                mark_source('TABLE', 'missing')
-                _record_table_progress("missing")
-                return
-            if ddl:
-                mark_source('TABLE', 'dbcat')
-            ddl_source_label = ddl_source_label or "DBCAT"
-            ddl_adj = adjust_ddl_for_object(
-                ddl,
-                ss,
-                st,
-                ts,
-                tt,
-                extra_identifiers=all_replacements,
-                obj_type='TABLE'
-            )
-            ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
-            ddl_adj = prepend_set_schema(ddl_adj, ts)
-            ddl_adj = normalize_ddl_for_ob(ddl_adj)
-            ddl_adj = strip_constraint_enable(ddl_adj)
-            ddl_adj = strip_enable_novalidate(ddl_adj)
-            filename = f"{ts}.{tt}.sql"
-            header = f"修补缺失的 TABLE {ts}.{tt} (源: {ss}.{st})"
-            log.info("[FIXUP]%s 写入 TABLE 脚本: %s", source_tag(ddl_source_label), filename)
-            write_fixup_file(base_dir, 'table', filename, ddl_adj, header)
-            _record_table_progress(ddl_source_label.lower())
+                    mark_source('TABLE', 'dbcat')
+                ddl_source_label = ddl_source_label or "DBCAT"
+                ddl_adj = adjust_ddl_for_object(
+                    ddl,
+                    ss,
+                    st,
+                    ts,
+                    tt,
+                    extra_identifiers=all_replacements,
+                    obj_type='TABLE'
+                )
+                ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
+                ddl_adj = prepend_set_schema(ddl_adj, ts)
+                ddl_adj = normalize_ddl_for_ob(ddl_adj)
+                ddl_adj = strip_constraint_enable(ddl_adj)
+                ddl_adj = strip_enable_novalidate(ddl_adj)
+                filename = f"{ts}.{tt}.sql"
+                header = f"修补缺失的 TABLE {ts}.{tt} (源: {ss}.{st})"
+                log.info("[FIXUP]%s 写入 TABLE 脚本: %s", source_tag(ddl_source_label), filename)
+                write_fixup_file(base_dir, 'table', filename, ddl_adj, header)
+                progress_label = ddl_source_label.lower()
+            finally:
+                _record_table_progress(progress_label)
         table_jobs.append(_job)
     run_tasks(table_jobs, "TABLE")
 
@@ -4548,57 +4638,62 @@ def generate_fixup_scripts(
             write_fixup_file(base_dir, 'table_alter', filename, alter_sql, header)
 
     log.info("[FIXUP] (4/9) 正在生成 VIEW / MATERIALIZED VIEW / 其他对象脚本...")
+    other_progress = build_progress_tracker(len(other_missing_objects), "[FIXUP] (4/9) 其他对象")
     other_jobs: List[Callable[[], None]] = []
     for (obj_type, src_schema, src_obj, tgt_schema, tgt_obj) in other_missing_objects:
         def _job(ot=obj_type, ss=src_schema, so=src_obj, ts=tgt_schema, to=tgt_obj):
-            ddl = get_dbcat_ddl(ss, ot, so)
-            ddl_source_label = "DBCAT" if ddl else ""
-            if not ddl:
-                ddl = get_fallback_ddl(ss, ot, so)
+            try:
+                ddl = get_dbcat_ddl(ss, ot, so)
+                ddl_source_label = "DBCAT" if ddl else ""
+                if not ddl:
+                    ddl = get_fallback_ddl(ss, ot, so)
+                    if ddl:
+                        log.info("[DDL] 使用 DBMS_METADATA 兜底导出 %s %s.%s。", ot, ss, so)
+                        mark_source(ot, 'fallback')
+                        ddl_source_label = "METADATA"
+                if not ddl:
+                    log.warning("[FIXUP] 未找到 %s %s.%s 的 dbcat DDL。", ot, ss, so)
+                    mark_source(ot, 'missing')
+                    return
                 if ddl:
-                    log.info("[DDL] 使用 DBMS_METADATA 兜底导出 %s %s.%s。", ot, ss, so)
-                    mark_source(ot, 'fallback')
-                    ddl_source_label = "METADATA"
-            if not ddl:
-                log.warning("[FIXUP] 未找到 %s %s.%s 的 dbcat DDL。", ot, ss, so)
-                mark_source(ot, 'missing')
-                return
-            if ddl:
-                mark_source(ot, 'dbcat')
-            ddl_source_label = ddl_source_label or "DBCAT"
-            ddl_adj = adjust_ddl_for_object(
-                ddl,
-                ss,
-                so,
-                ts,
-                to,
-                extra_identifiers=all_replacements,
-                obj_type=ot
-            )
-            ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
-            ddl_adj = prepend_set_schema(ddl_adj, ts)
-            ddl_adj = normalize_ddl_for_ob(ddl_adj)
-            ddl_adj = strip_constraint_enable(ddl_adj)
-            ddl_adj = enforce_schema_for_ddl(ddl_adj, ts, ot)
-            
-            # --- Find and prepare grants for this object ---
-            grants_for_this_object = []
-            full_target_object_name = f"{ts}.{to}".upper()
-            for grantee, entries in grants_map.items():
-                for priv, obj_granted_on in entries:
-                    if obj_granted_on.upper() == full_target_object_name:
-                        grant_stmt = f"GRANT {priv} ON {full_target_object_name} TO {grantee};"
-                        grants_for_this_object.append(grant_stmt)
+                    mark_source(ot, 'dbcat')
+                ddl_source_label = ddl_source_label or "DBCAT"
+                ddl_adj = adjust_ddl_for_object(
+                    ddl,
+                    ss,
+                    so,
+                    ts,
+                    to,
+                    extra_identifiers=all_replacements,
+                    obj_type=ot
+                )
+                ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
+                ddl_adj = prepend_set_schema(ddl_adj, ts)
+                ddl_adj = normalize_ddl_for_ob(ddl_adj)
+                ddl_adj = strip_constraint_enable(ddl_adj)
+                ddl_adj = enforce_schema_for_ddl(ddl_adj, ts, ot)
+                
+                # --- Find and prepare grants for this object ---
+                grants_for_this_object = []
+                full_target_object_name = f"{ts}.{to}".upper()
+                for grantee, entries in grants_map.items():
+                    for priv, obj_granted_on in entries:
+                        if obj_granted_on.upper() == full_target_object_name:
+                            grant_stmt = f"GRANT {priv} ON {full_target_object_name} TO {grantee};"
+                            grants_for_this_object.append(grant_stmt)
 
-            subdir = obj_type_to_dir.get(ot, ot.lower())
-            filename = f"{ts}.{to}.sql"
-            header = f"修补缺失的 {ot} {ts}.{to} (源: {ss}.{so})"
-            log.info("[FIXUP]%s 写入 %s 脚本: %s", source_tag(ddl_source_label), ot, filename)
-            write_fixup_file(base_dir, subdir, filename, ddl_adj, header, grants_to_add=grants_for_this_object)
+                subdir = obj_type_to_dir.get(ot, ot.lower())
+                filename = f"{ts}.{to}.sql"
+                header = f"修补缺失的 {ot} {ts}.{to} (源: {ss}.{so})"
+                log.info("[FIXUP]%s 写入 %s 脚本: %s", source_tag(ddl_source_label), ot, filename)
+                write_fixup_file(base_dir, subdir, filename, ddl_adj, header, grants_to_add=grants_for_this_object)
+            finally:
+                other_progress()
         other_jobs.append(_job)
     run_tasks(other_jobs, "OTHER_OBJECTS")
 
     log.info("[FIXUP] (5/9) 正在生成 INDEX 脚本...")
+    index_progress = build_progress_tracker(index_total, "[FIXUP] (5/9) INDEX")
     index_jobs: List[Callable[[], None]] = []
     for item, src_schema, src_table, tgt_schema, tgt_table in index_tasks:
         def _job(it=item, ss=src_schema, st=src_table, ts=tgt_schema, tt=tgt_table):
@@ -4606,6 +4701,8 @@ def generate_fixup_scripts(
             if not table_ddl:
                 log.warning("[FIXUP] 未找到 TABLE %s.%s 的 dbcat DDL，无法生成索引。", ss, st)
                 mark_source('INDEX', 'missing')
+                for _ in it.missing_indexes:
+                    index_progress()
                 return
 
             def index_predicate(stmt_upper: str) -> bool:
@@ -4614,32 +4711,36 @@ def generate_fixup_scripts(
             extracted = extract_statements_for_names(table_ddl, it.missing_indexes, index_predicate)
             for idx_name in sorted(it.missing_indexes):
                 idx_name_u = idx_name.upper()
-                statements = extracted.get(idx_name_u) or []
-                if not statements:
-                    log.warning("[FIXUP] 未在 TABLE %s.%s 的 DDL 中找到索引 %s。", ss, st, idx_name_u)
-                    continue
-                ddl_lines: List[str] = []
-                for stmt in statements:
-                    ddl_adj = adjust_ddl_for_object(
-                        stmt,
-                        ss,
-                        st,
-                        ts,
-                        tt,
-                        extra_identifiers=all_replacements,
-                        obj_type='INDEX'
-                    )
-                    ddl_adj = normalize_ddl_for_ob(ddl_adj)
-                    ddl_lines.append(ddl_adj if ddl_adj.endswith(';') else ddl_adj + ';')
-                content = prepend_set_schema("\n".join(ddl_lines), ts)
-                filename = f"{ts}.{idx_name_u}.sql"
-                header = f"修补缺失的 INDEX {idx_name_u} (表: {ts}.{tt})"
-                log.info("[FIXUP]%s 写入 INDEX 脚本: %s", source_tag("DBCAT"), filename)
-                write_fixup_file(base_dir, 'index', filename, content, header)
+                try:
+                    statements = extracted.get(idx_name_u) or []
+                    if not statements:
+                        log.warning("[FIXUP] 未在 TABLE %s.%s 的 DDL 中找到索引 %s。", ss, st, idx_name_u)
+                        continue
+                    ddl_lines: List[str] = []
+                    for stmt in statements:
+                        ddl_adj = adjust_ddl_for_object(
+                            stmt,
+                            ss,
+                            st,
+                            ts,
+                            tt,
+                            extra_identifiers=all_replacements,
+                            obj_type='INDEX'
+                        )
+                        ddl_adj = normalize_ddl_for_ob(ddl_adj)
+                        ddl_lines.append(ddl_adj if ddl_adj.endswith(';') else ddl_adj + ';')
+                    content = prepend_set_schema("\n".join(ddl_lines), ts)
+                    filename = f"{ts}.{idx_name_u}.sql"
+                    header = f"修补缺失的 INDEX {idx_name_u} (表: {ts}.{tt})"
+                    log.info("[FIXUP]%s 写入 INDEX 脚本: %s", source_tag("DBCAT"), filename)
+                    write_fixup_file(base_dir, 'index', filename, content, header)
+                finally:
+                    index_progress()
         index_jobs.append(_job)
     run_tasks(index_jobs, "INDEX")
 
     log.info("[FIXUP] (6/9) 正在生成 CONSTRAINT 脚本...")
+    constraint_progress = build_progress_tracker(constraint_total, "[FIXUP] (6/9) CONSTRAINT")
     constraint_jobs: List[Callable[[], None]] = []
     for item, src_schema, src_table, tgt_schema, tgt_table in constraint_tasks:
         def _job(it=item, ss=src_schema, st=src_table, ts=tgt_schema, tt=tgt_table):
@@ -4647,6 +4748,8 @@ def generate_fixup_scripts(
             if not table_ddl:
                 log.warning("[FIXUP] 未找到 TABLE %s.%s 的 dbcat DDL，无法生成约束。", ss, st)
                 mark_source('CONSTRAINT', 'missing')
+                for _ in it.missing_constraints:
+                    constraint_progress()
                 return
 
             def constraint_predicate(stmt_upper: str) -> bool:
@@ -4655,94 +4758,101 @@ def generate_fixup_scripts(
             extracted = extract_statements_for_names(table_ddl, it.missing_constraints, constraint_predicate)
             for cons_name in sorted(it.missing_constraints):
                 cons_name_u = cons_name.upper()
-                statements = extracted.get(cons_name_u) or []
-                cons_meta = oracle_meta.constraints.get((ss.upper(), st.upper()), {}).get(cons_name_u)
-                ctype = (cons_meta or {}).get("type", "").upper()
-                cols = cons_meta.get("columns") if cons_meta else []
-                # 针对跨 schema 的外键，准备 REFERENCES 授权
-                if cons_meta and ctype == 'R':
-                    ref_owner = cons_meta.get("ref_table_owner") or cons_meta.get("r_owner")
-                    ref_table = cons_meta.get("ref_table_name")
-                    if ref_owner and ref_table and ref_owner.upper() != ts.upper():
-                        ref_src_full = f"{ref_owner}.{ref_table}"
-                        ref_tgt_full = get_mapped_target(full_object_mapping, ref_src_full, 'TABLE') or ref_src_full
-                        grants_map.setdefault(ts.upper(), set()).add(('REFERENCES', ref_tgt_full.upper()))
-                # Fallback: PK/UK 可能内联在 CREATE TABLE 中，尝试用元数据重建
-                if not statements:
-                    cols_join = ", ".join(c for c in cols if c)
-                    if cols_join and ctype in ('P', 'U'):
-                        add_clause = "PRIMARY KEY" if ctype == 'P' else "UNIQUE"
-                        stmt = (
-                            f"ALTER TABLE {ts}.{tt} "
-                            f"ADD CONSTRAINT {cons_name_u} {add_clause} ({cols_join})"
+                try:
+                    statements = extracted.get(cons_name_u) or []
+                    cons_meta = oracle_meta.constraints.get((ss.upper(), st.upper()), {}).get(cons_name_u)
+                    ctype = (cons_meta or {}).get("type", "").upper()
+                    cols = cons_meta.get("columns") if cons_meta else []
+                    # 针对跨 schema 的外键，准备 REFERENCES 授权
+                    if cons_meta and ctype == 'R':
+                        ref_owner = cons_meta.get("ref_table_owner") or cons_meta.get("r_owner")
+                        ref_table = cons_meta.get("ref_table_name")
+                        if ref_owner and ref_table and ref_owner.upper() != ts.upper():
+                            ref_src_full = f"{ref_owner}.{ref_table}"
+                            ref_tgt_full = get_mapped_target(full_object_mapping, ref_src_full, 'TABLE') or ref_src_full
+                            grants_map.setdefault(ts.upper(), set()).add(('REFERENCES', ref_tgt_full.upper()))
+                    # Fallback: PK/UK 可能内联在 CREATE TABLE 中，尝试用元数据重建
+                    if not statements:
+                        cols_join = ", ".join(c for c in cols if c)
+                        if cols_join and ctype in ('P', 'U'):
+                            add_clause = "PRIMARY KEY" if ctype == 'P' else "UNIQUE"
+                            stmt = (
+                                f"ALTER TABLE {ts}.{tt} "
+                                f"ADD CONSTRAINT {cons_name_u} {add_clause} ({cols_join})"
+                            )
+                            statements = [stmt]
+                        elif cons_meta:
+                            log.warning(
+                                "[FIXUP] 约束 %s 类型为 %s，无内联 DDL 可用，无法自动重建。",
+                                cons_name_u, ctype or "UNKNOWN"
+                            )
+                    if not statements:
+                        log.warning("[FIXUP] 未在 TABLE %s.%s 的 DDL 中找到约束 %s。", ss, st, cons_name_u)
+                        continue
+                    ddl_lines: List[str] = []
+                    for stmt in statements:
+                        ddl_adj = adjust_ddl_for_object(
+                            stmt,
+                            ss,
+                            st,
+                            ts,
+                            tt,
+                            extra_identifiers=all_replacements
                         )
-                        statements = [stmt]
-                    elif cons_meta:
-                        log.warning(
-                            "[FIXUP] 约束 %s 类型为 %s，无内联 DDL 可用，无法自动重建。",
-                            cons_name_u, ctype or "UNKNOWN"
-                        )
-                if not statements:
-                    log.warning("[FIXUP] 未在 TABLE %s.%s 的 DDL 中找到约束 %s。", ss, st, cons_name_u)
-                    continue
-                ddl_lines: List[str] = []
-                for stmt in statements:
-                    ddl_adj = adjust_ddl_for_object(
-                        stmt,
-                        ss,
-                        st,
-                        ts,
-                        tt,
-                        extra_identifiers=all_replacements
-                    )
-                    ddl_adj = normalize_ddl_for_ob(ddl_adj)
-                    ddl_adj = strip_constraint_enable(ddl_adj)
-                    ddl_adj = strip_enable_novalidate(ddl_adj)
-                    ddl_lines.append(ddl_adj if ddl_adj.endswith(';') else ddl_adj + ';')
-                content = prepend_set_schema("\n".join(ddl_lines), ts)
-                filename = f"{ts}.{cons_name_u}.sql"
-                header = f"修补缺失的约束 {cons_name_u} (表: {ts}.{tt})"
-                log.info("[FIXUP]%s 写入 CONSTRAINT 脚本: %s", source_tag("DBCAT"), filename)
-                write_fixup_file(base_dir, 'constraint', filename, content, header)
+                        ddl_adj = normalize_ddl_for_ob(ddl_adj)
+                        ddl_adj = strip_constraint_enable(ddl_adj)
+                        ddl_adj = strip_enable_novalidate(ddl_adj)
+                        ddl_lines.append(ddl_adj if ddl_adj.endswith(';') else ddl_adj + ';')
+                    content = prepend_set_schema("\n".join(ddl_lines), ts)
+                    filename = f"{ts}.{cons_name_u}.sql"
+                    header = f"修补缺失的约束 {cons_name_u} (表: {ts}.{tt})"
+                    log.info("[FIXUP]%s 写入 CONSTRAINT 脚本: %s", source_tag("DBCAT"), filename)
+                    write_fixup_file(base_dir, 'constraint', filename, content, header)
+                finally:
+                    constraint_progress()
         constraint_jobs.append(_job)
     run_tasks(constraint_jobs, "CONSTRAINT")
 
     log.info("[FIXUP] (7/9) 正在生成 TRIGGER 脚本...")
+    trigger_progress = build_progress_tracker(len(trigger_tasks), "[FIXUP] (7/9) TRIGGER")
     trigger_jobs: List[Callable[[], None]] = []
     for src_schema, trg_name, tgt_schema, tgt_obj in trigger_tasks:
         def _job(ss=src_schema, tn=trg_name, ts=tgt_schema, to=tgt_obj):
-            ddl = get_dbcat_ddl(ss, 'TRIGGER', tn)
-            ddl_source_label = "DBCAT" if ddl else ""
-            if not ddl:
-                ddl = get_fallback_ddl(ss, 'TRIGGER', tn)
+            try:
+                ddl = get_dbcat_ddl(ss, 'TRIGGER', tn)
+                ddl_source_label = "DBCAT" if ddl else ""
+                if not ddl:
+                    ddl = get_fallback_ddl(ss, 'TRIGGER', tn)
+                    if ddl:
+                        log.info("[FIXUP] 使用 DBMS_METADATA 兜底导出 TRIGGER %s.%s。", ss, tn)
+                        mark_source('TRIGGER', 'fallback')
+                        ddl_source_label = "METADATA"
+                if not ddl:
+                    log.warning("[FIXUP] 未找到 TRIGGER %s.%s 的 dbcat DDL。", ss, tn)
+                    mark_source('TRIGGER', 'missing')
+                    return
                 if ddl:
-                    log.info("[FIXUP] 使用 DBMS_METADATA 兜底导出 TRIGGER %s.%s。", ss, tn)
-                    mark_source('TRIGGER', 'fallback')
-                    ddl_source_label = "METADATA"
-            if not ddl:
-                log.warning("[FIXUP] 未找到 TRIGGER %s.%s 的 dbcat DDL。", ss, tn)
-                mark_source('TRIGGER', 'missing')
-                return
-            if ddl:
-                mark_source('TRIGGER', 'dbcat')
-            ddl_source_label = ddl_source_label or "DBCAT"
-            ddl_adj = adjust_ddl_for_object(
-                ddl,
-                ss,
-                tn,
-                ts,
-                to,
-                extra_identifiers=all_replacements,
-                obj_type='TRIGGER'
-            )
-            ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
-            ddl_adj = prepend_set_schema(ddl_adj, ts)
-            ddl_adj = strip_constraint_enable(ddl_adj)
-            ddl_adj = enforce_schema_for_ddl(ddl_adj, ts, 'TRIGGER')
-            filename = f"{ts}.{to}.sql"
-            header = f"修补缺失的触发器 {to} (源: {ss}.{tn})"
-            log.info("[FIXUP]%s 写入 TRIGGER 脚本: %s", source_tag(ddl_source_label), filename)
-            write_fixup_file(base_dir, 'trigger', filename, ddl_adj, header)
+                    mark_source('TRIGGER', 'dbcat')
+                ddl_source_label = ddl_source_label or "DBCAT"
+                ddl_adj = adjust_ddl_for_object(
+                    ddl,
+                    ss,
+                    tn,
+                    ts,
+                    to,
+                    extra_identifiers=all_replacements,
+                    obj_type='TRIGGER'
+                )
+                ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
+                ddl_adj = prepend_set_schema(ddl_adj, ts)
+                ddl_adj = strip_constraint_enable(ddl_adj)
+                ddl_adj = enforce_schema_for_ddl(ddl_adj, ts, 'TRIGGER')
+                filename = f"{ts}.{to}.sql"
+                header = f"修补缺失的触发器 {to} (源: {ss}.{tn})"
+                log.info("[FIXUP]%s 写入 TRIGGER 脚本: %s", source_tag(ddl_source_label), filename)
+                write_fixup_file(base_dir, 'trigger', filename, ddl_adj, header)
+            finally:
+                trigger_progress()
         trigger_jobs.append(_job)
     run_tasks(trigger_jobs, "TRIGGER")
 
