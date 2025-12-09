@@ -32,15 +32,19 @@
 | `run_fixup.py` | 在 OceanBase 上批量执行 `fixup_scripts/` 子目录中的 SQL，支持按目录/类型/glob 过滤，并把成功项移到 `fixup_scripts/done/`。 |
 | `init_test.py` | 使用 `config.ini` 中的连接，初始化 `test_scenarios/gorgon_knot_case`（Oracle 或 OceanBase 任一侧）。 |
 | `config.ini` | 样例配置（Oracle/OceanBase 连接、Instant Client、dbcat、输出目录等）。 |
-| `remap_rules.txt` | 默认 Remap（指向 `labyrinth_case`），其他场景的 Remap 位于各自目录。 |
+| `remap_rules.txt` | 默认 Remap（指向 `gorgon_knot_case`），其他场景的 Remap 位于各自目录。 |
+| `README.md` | 本文档，使用说明和配置指南。 |
 | `README_CROSS_PLATFORM.md` | 离线/跨平台 wheelhouse 打包与交付指南。 |
-| `fixup_scripts/` | 最近一次校验生成的修补脚本（当前为 Labyrinth 案例输出，含 `grants/`, `table_alter/`, `materialized_view/` 等）。 |
-| `dbcat_output/` | dbcat 导出的 DDL 缓存（当前包含 Labyrinth 案例的 TABLE/MVIEW DDL）。 |
-| `main_reports/` | `rich` 渲染的文本报告，文件名格式 `report_<timestamp>.txt`（当前存有一次演练快照）。 |
+| `REMAP_INFERENCE_GUIDE.md` | Remap推导能力详细说明（多对一、一对一、一对多场景）。 |
+| `DESIGN.md` | 设计/架构说明。 |
+| `CHANGELOG.md` | 版本变更记录。 |
+| `AUDIT_REPORT.md` | 程序一致性审核报告。 |
+| `fixup_scripts/` | 最近一次校验生成的修补脚本（含 `grants/`, `table_alter/`, `materialized_view/` 等）。 |
+| `dbcat_output/` | dbcat 导出的 DDL 缓存（支持复用）。 |
+| `main_reports/` | `rich` 渲染的文本报告，文件名格式 `report_<timestamp>.txt`。 |
 | `history/` | 旧版本脚本留档（V8–V12 演进版，供排查/回溯）。 |
 | `test_scenarios/` | 三个全量样例：`labyrinth_case`、`hydra_matrix_case`、`gorgon_knot_case`（均含 Oracle/OB DDL 与 Remap）。 |
 | `requirements.txt` | Python 依赖（`oracledb`, `rich`）。 |
-| `DESIGN.md` | 设计/架构说明。 |
 
 ## Requirements
 
@@ -82,7 +86,11 @@ pip install -r requirements.txt
   - `check_extra_types`：限制扩展校验的模块，默认 `index,constraint,sequence,trigger`，可按需删减。
   - `check_dependencies`：`true/false`，关闭后跳过依赖校验与授权建议。
   - `check_comments`：`true/false`，控制是否比对表/列注释。
-  - `infer_schema_mapping`：`true/false`，是否根据 remap 后的 TABLE 映射自动推导 schema 映射（默认 `true`，仅作用于非 TABLE 对象，如 VIEW/SYNONYM/TRIGGER/SEQ/MVIEW/TYPE 等；TABLE 仍按显式规则 1:1，推导来源仅限表的唯一映射）。
+  - `infer_schema_mapping`：`true/false`，是否自动推导非TABLE对象的目标schema（默认 `true`）。
+    - **多对一映射**（如 HERO_A + HERO_B → OLYMPIAN_A）：基于TABLE映射推导schema映射
+    - **一对一映射**（如 GOD_A → PRIMORDIAL）：基于TABLE映射推导schema映射
+    - **一对多映射**（如 MONSTER_A → TITAN_A + TITAN_B）：基于依赖分析智能推导（分析对象引用的表，选择出现次数最多的目标schema）
+    - 详细说明请参考 `REMAP_INFERENCE_GUIDE.md`
   - `dbcat_chunk_size`：单次传给 dbcat 的对象数，默认 `150`，可调大以减少批次数。
   - `obclient_timeout`：每次 `obclient` 调用的超时（秒，默认 60）。
   - `cli_timeout`：shell 工具（如 dbcat）超时，默认 600 秒。

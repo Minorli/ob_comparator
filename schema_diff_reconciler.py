@@ -15,6 +15,7 @@
 # limitations under the License.
 
 """
+
 数据库对象对比工具 (V0.8 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
@@ -68,6 +69,9 @@ import sys
 import logging
 import math
 import re
+
+__version__ = "0.8.1"
+__author__ = "OceanBase Migration Team"
 import os
 import threading
 import json
@@ -1184,20 +1188,97 @@ def derive_schema_mapping_from_rules(remap_rules: RemapRules) -> Dict[str, str]:
     return schema_mapping
 
 
+def infer_target_schema_from_dependencies(
+    src_name: str,
+    obj_type: str,
+    remap_rules: RemapRules,
+    source_dependencies: Optional[Set[Tuple[str, str, str, str]]] = None
+) -> Optional[str]:
+    """
+    基于对象的依赖关系推导目标schema（用于一对多场景）。
+    
+    逻辑：
+    1. 查找该对象依赖的所有表
+    2. 统计这些表被remap到哪些目标schema
+    3. 选择出现次数最多的目标schema
+    
+    Args:
+        src_name: 源对象全名（如 MONSTER_A.VW_LAIR_RICHNESS）
+        obj_type: 对象类型
+        remap_rules: remap规则
+        source_dependencies: 源端依赖关系集合 {(dep_owner, dep_name, dep_type, ref_owner, ref_name, ref_type)}
+    
+    Returns:
+        推导的目标schema，如果无法推导则返回None
+    """
+    if not source_dependencies or '.' not in src_name:
+        return None
+    
+    src_name_u = src_name.upper()
+    src_schema, src_obj = src_name_u.split('.', 1)
+    
+    # 查找该对象依赖的所有表
+    referenced_tables: List[str] = []
+    for dep_owner, dep_name, dep_type, ref_owner, ref_name, ref_type in source_dependencies:
+        dep_full = f"{dep_owner}.{dep_name}".upper()
+        ref_full = f"{ref_owner}.{ref_name}".upper()
+        ref_type_u = (ref_type or "").upper()
+        
+        # 如果当前对象依赖某个表
+        if dep_full == src_name_u and ref_type_u == 'TABLE':
+            referenced_tables.append(ref_full)
+    
+    if not referenced_tables:
+        return None
+    
+    # 统计这些表被remap到哪些目标schema
+    target_schema_counts: Dict[str, int] = {}
+    for table_full in referenced_tables:
+        table_target = remap_rules.get(table_full)
+        if table_target and '.' in table_target:
+            tgt_schema = table_target.split('.', 1)[0].upper()
+            target_schema_counts[tgt_schema] = target_schema_counts.get(tgt_schema, 0) + 1
+    
+    if not target_schema_counts:
+        return None
+    
+    # 选择出现次数最多的目标schema
+    max_count = max(target_schema_counts.values())
+    candidate_schemas = [s for s, c in target_schema_counts.items() if c == max_count]
+    
+    if len(candidate_schemas) == 1:
+        inferred_schema = candidate_schemas[0]
+        log.info(
+            "[推导] %s (%s) 引用 %d 个表，其中 %d 个在 %s -> 推导目标: %s.%s",
+            src_name, obj_type, len(referenced_tables), max_count, inferred_schema, inferred_schema, src_obj
+        )
+        return f"{inferred_schema}.{src_obj}"
+    else:
+        # 多个schema的引用次数相同，无法推导
+        log.debug(
+            "[推导] %s (%s) 引用的表分散在多个schema，无法推导: %s",
+            src_name, obj_type, candidate_schemas
+        )
+        return None
+
+
 def resolve_remap_target(
     src_name: str,
     obj_type: str,
     remap_rules: RemapRules,
     schema_mapping: Optional[Dict[str, str]] = None,
-    object_parent_map: Optional[ObjectParentMap] = None
+    object_parent_map: Optional[ObjectParentMap] = None,
+    source_dependencies: Optional[Set[Tuple[str, str, str, str]]] = None
 ) -> Optional[str]:
     """
     解析对象的 remap 目标：
     1. 优先查找 remap_rules 中的显式规则
-    2. 对于依附对象（TRIGGER 等），使用父表的 remap 目标 schema
-    3. 对于其他非 TABLE 对象，尝试使用 schema_mapping（一对一映射）
+    2. 对于依附对象（TRIGGER/INDEX/CONSTRAINT/SEQUENCE），使用父表的 remap 目标 schema
+    3. 对于独立对象，尝试基于依赖分析推导（一对多场景）
+    4. 对于其他非 TABLE 对象，尝试使用 schema_mapping（多对一、一对一场景）
     
-    object_parent_map: 依附对象到父表的映射，用于 one-to-many schema 拆分场景
+    object_parent_map: 依附对象到父表的映射
+    source_dependencies: 源端依赖关系，用于智能推导
     """
     obj_type_u = obj_type.upper()
     candidate_keys: List[str] = [src_name]
@@ -1210,20 +1291,27 @@ def resolve_remap_target(
                 return strip_body_suffix(tgt)
             return tgt
 
-    # 对于依附对象（如 TRIGGER），使用父表的 remap 目标 schema
+    # 对于依附对象（TRIGGER/INDEX/CONSTRAINT/SEQUENCE），使用父表的 remap 目标 schema
     if '.' in src_name and object_parent_map:
         parent_table = object_parent_map.get(src_name.upper())
         if parent_table:
-            # 查找父表的 remap 目标
             parent_target = remap_rules.get(parent_table.upper())
             if parent_target:
-                # 使用父表目标的 schema
                 tgt_schema = parent_target.split('.', 1)[0].upper()
                 src_obj = src_name.split('.', 1)[1]
                 return f"{tgt_schema}.{src_obj}"
 
-    # 对于非 TABLE 对象，尝试基于 schema 映射推导（一对一映射）
+    # 对于独立对象（VIEW/PROCEDURE/FUNCTION/PACKAGE），尝试基于依赖分析推导
     if '.' in src_name and obj_type_u != 'TABLE':
+        # 先尝试依赖分析推导（适用于一对多场景）
+        if source_dependencies:
+            inferred = infer_target_schema_from_dependencies(
+                src_name, obj_type, remap_rules, source_dependencies
+            )
+            if inferred:
+                return inferred
+        
+        # 回退到schema映射推导（适用于多对一、一对一场景）
         src_schema, src_obj = src_name.split('.', 1)
         src_schema_u = src_schema.upper()
         
@@ -1241,7 +1329,8 @@ def generate_master_list(
     enabled_primary_types: Optional[Set[str]] = None,
     schema_mapping: Optional[Dict[str, str]] = None,
     precomputed_mapping: Optional[FullObjectMapping] = None,
-    object_parent_map: Optional[ObjectParentMap] = None
+    object_parent_map: Optional[ObjectParentMap] = None,
+    source_dependencies: Optional[Set[Tuple[str, str, str, str]]] = None
 ) -> MasterCheckList:
     """
     生成“最终校验清单”并检测 "多对一" 映射。
@@ -1265,7 +1354,7 @@ def generate_master_list(
                 tgt_name = precomputed_mapping[src_name_u].get(obj_type_u, src_name_u)
             else:
                 tgt_name = resolve_remap_target(
-                    src_name_u, obj_type_u, remap_rules, schema_mapping, object_parent_map
+                    src_name_u, obj_type_u, remap_rules, schema_mapping, object_parent_map, source_dependencies
                 ) or src_name_u
             tgt_name_u = tgt_name.upper()
 
@@ -1292,13 +1381,15 @@ def build_full_object_mapping(
     source_objects: SourceObjectMap,
     remap_rules: RemapRules,
     schema_mapping: Optional[Dict[str, str]] = None,
-    object_parent_map: Optional[ObjectParentMap] = None
+    object_parent_map: Optional[ObjectParentMap] = None,
+    source_dependencies: Optional[Set[Tuple[str, str, str, str]]] = None
 ) -> FullObjectMapping:
     """
     为所有受管对象建立映射 (源 -> 目标)。
     返回 {'SRC.OBJ': {'TYPE': 'TGT.OBJ'}}
     
     object_parent_map: 依附对象到父表的映射，用于 one-to-many schema 拆分场景
+    source_dependencies: 源端依赖关系，用于智能推导目标schema
     """
     mapping: FullObjectMapping = {}
     target_tracker: Dict[Tuple[str, str], str] = {}
@@ -1307,7 +1398,7 @@ def build_full_object_mapping(
         for obj_type in obj_types:
             obj_type_u = obj_type.upper()
             tgt_name = resolve_remap_target(
-                src_name_u, obj_type_u, remap_rules, schema_mapping, object_parent_map
+                src_name_u, obj_type_u, remap_rules, schema_mapping, object_parent_map, source_dependencies
             ) or src_name_u
             tgt_name_u = tgt_name.upper()
             key = (tgt_name_u, obj_type_u)
@@ -1397,11 +1488,29 @@ def build_schema_mapping(master_list: MasterCheckList) -> Dict[str, str]:
         mapping_tmp.setdefault(src_schema.upper(), set()).add(tgt_schema.upper())
 
     final_mapping: Dict[str, str] = {}
+    one_to_many_schemas: List[Tuple[str, Set[str]]] = []
+    
     for src_schema, tgt_set in mapping_tmp.items():
         if len(tgt_set) == 1:
             final_mapping[src_schema] = next(iter(tgt_set))
         else:
+            # 一对多映射：源schema的表分散到多个目标schema
             final_mapping[src_schema] = src_schema
+            one_to_many_schemas.append((src_schema, tgt_set))
+    
+    # 警告：一对多场景下，非TABLE对象（VIEW/PROCEDURE/FUNCTION/PACKAGE）无法自动推导
+    if one_to_many_schemas:
+        log.warning("=" * 80)
+        log.warning("检测到一对多 schema 映射场景（源schema的表分散到多个目标schema）：")
+        for src_schema, tgt_set in one_to_many_schemas:
+            log.warning("  %s -> %s", src_schema, sorted(tgt_set))
+        log.warning("")
+        log.warning("注意：在一对多场景下，独立对象（VIEW/PROCEDURE/FUNCTION/PACKAGE等）")
+        log.warning("无法自动推导目标schema，必须在 remap_rules.txt 中显式指定。")
+        log.warning("依附对象（TRIGGER/INDEX/CONSTRAINT/SEQUENCE）会自动跟随父表的schema。")
+        log.warning("=" * 80)
+    
+    return final_mapping
     return final_mapping
 
 
@@ -3250,6 +3359,7 @@ def check_extra_objects(
 
     # 2) 序列校验（考虑 remap 后的目标 schema）
     sequence_groups: Dict[Tuple[str, str], List[Tuple[str, str]]] = defaultdict(list)
+    tgt_schema_all_expected: Dict[str, Set[str]] = defaultdict(set)
     if 'SEQUENCE' in enabled_types:
         for src_schema, seq_names in oracle_meta.sequences.items():
             src_schema_u = src_schema.upper()
@@ -3266,16 +3376,18 @@ def check_extra_objects(
                     tgt_schema_u = tgt_schema_u.upper()
                     tgt_name_u = tgt_name_u.upper()
                 sequence_groups[(src_schema_u, tgt_schema_u)].append((seq_name_u, tgt_name_u))
+                tgt_schema_all_expected[tgt_schema_u].add(tgt_name_u)
 
         for (src_schema_u, tgt_schema_u), entries in sequence_groups.items():
             expected_tgt_names = {tgt_name for _, tgt_name in entries}
             actual_tgt_names = {name.upper() for name in ob_meta.sequences.get(tgt_schema_u, set())}
+            all_expected_for_tgt = tgt_schema_all_expected[tgt_schema_u]
 
             missing_src = {
                 src_name for src_name, tgt_name in entries
                 if tgt_name not in actual_tgt_names
             }
-            extra_tgt = actual_tgt_names - expected_tgt_names
+            extra_tgt = actual_tgt_names - all_expected_for_tgt
 
             mapping_label = f"{src_schema_u}->{tgt_schema_u}"
             if not missing_src and not extra_tgt:
@@ -3729,20 +3841,25 @@ def load_from_flat_cache(
     base_output: Path,
     schema_requests: Dict[str, Dict[str, Set[str]]],
     accumulator: Dict[str, Dict[str, Dict[str, str]]],
-    source_meta: Optional[Dict[Tuple[str, str, str], Tuple[str, float]]] = None
+    source_meta: Optional[Dict[Tuple[str, str, str], Tuple[str, float]]] = None,
+    parallel_workers: int = 1
 ) -> int:
     """
-    从扁平化缓存目录加载 DDL。使用 JSON 索引快速判断对象是否存在。
-    返回加载的对象数量。
+    从扁平化缓存目录加载 DDL。
+    parallel_workers: 并行读取线程数，默认1（顺序读取），建议4-8用于慢速磁盘
     """
     flat_cache = base_output / FLAT_CACHE_DIR_NAME
     if not flat_cache.exists():
         return 0
     
-    # 加载索引用于快速判断
+    index_start = time.time()
     cache_index = load_flat_cache_index(base_output)
+    index_elapsed = time.time() - index_start
+    if index_elapsed > 1.0:
+        log.warning("[性能] 加载缓存索引耗时 %.2fs，磁盘IO可能较慢", index_elapsed)
     
-    loaded_count = 0
+    # 收集所有需要加载的文件
+    load_tasks: List[Tuple[str, str, str, Path]] = []
     for schema in list(schema_requests.keys()):
         schema_u = schema.upper()
         type_map = schema_requests.get(schema) or {}
@@ -3751,35 +3868,87 @@ def load_from_flat_cache(
         for obj_type in list(type_map.keys()):
             obj_type_u = obj_type.upper()
             names = type_map[obj_type]
-            satisfied: Set[str] = set()
-            
-            # 从索引获取该类型的已缓存对象列表
             cached_names = set(schema_index.get(obj_type_u, []))
             
-            for name in list(names):
+            for name in names:
                 name_u = name.upper()
-                # 索引中不存在则跳过文件检查
                 if cached_names and name_u not in cached_names:
                     continue
-                
                 file_path = get_flat_cache_path(base_output, schema, obj_type, name)
                 if file_path.exists():
-                    try:
-                        start_time = time.time()
-                        ddl_text = file_path.read_text('utf-8')
-                        elapsed = time.time() - start_time
-                        accumulator.setdefault(schema_u, {}).setdefault(obj_type_u, {})[name_u] = ddl_text
-                        if source_meta is not None:
-                            source_meta[(schema_u, obj_type_u, name_u)] = ("flat_cache", elapsed)
-                        satisfied.add(name)
+                    load_tasks.append((schema, obj_type, name, file_path))
+    
+    if not load_tasks:
+        return 0
+    
+    loaded_count = 0
+    total_read_time = 0.0
+    slow_files = []
+    results_lock = threading.Lock()
+    
+    def _load_file(task: Tuple[str, str, str, Path]) -> Optional[Tuple]:
+        schema, obj_type, name, file_path = task
+        try:
+            start = time.time()
+            ddl_text = file_path.read_text('utf-8')
+            elapsed = time.time() - start
+            return (schema, obj_type, name, ddl_text, elapsed)
+        except OSError as e:
+            log.debug("[缓存] 读取失败 %s: %s", file_path, e)
+            return None
+    
+    # 并行或顺序加载
+    if parallel_workers > 1 and len(load_tasks) > 20:
+        log.info("[缓存] 并行加载 %d 个文件 (workers=%d)...", len(load_tasks), parallel_workers)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+            for result in executor.map(_load_file, load_tasks):
+                if result:
+                    schema, obj_type, name, ddl_text, elapsed = result
+                    with results_lock:
+                        accumulator.setdefault(schema.upper(), {}).setdefault(obj_type.upper(), {})[name.upper()] = ddl_text
+                        if source_meta:
+                            source_meta[(schema.upper(), obj_type.upper(), name.upper())] = ("flat_cache", elapsed)
+                        total_read_time += elapsed
+                        if elapsed > 0.5:
+                            slow_files.append((f"{schema}.{name}", elapsed))
                         loaded_count += 1
-                    except OSError:
-                        continue
-            names -= satisfied
-            if not names:
-                type_map.pop(obj_type, None)
-        if not type_map:
-            schema_requests.pop(schema, None)
+    else:
+        for task in load_tasks:
+            result = _load_file(task)
+            if result:
+                schema, obj_type, name, ddl_text, elapsed = result
+                accumulator.setdefault(schema.upper(), {}).setdefault(obj_type.upper(), {})[name.upper()] = ddl_text
+                if source_meta:
+                    source_meta[(schema.upper(), obj_type.upper(), name.upper())] = ("flat_cache", elapsed)
+                total_read_time += elapsed
+                if elapsed > 0.5:
+                    slow_files.append((f"{schema}.{name}", elapsed))
+                loaded_count += 1
+    
+    # 更新schema_requests
+    for schema, obj_type, name, _ in load_tasks:
+        type_map = schema_requests.get(schema, {})
+        if obj_type in type_map:
+            type_map[obj_type].discard(name)
+            if not type_map[obj_type]:
+                del type_map[obj_type]
+        if not type_map and schema in schema_requests:
+            del schema_requests[schema]
+    
+    # 性能诊断
+    if loaded_count > 0:
+        avg_time = total_read_time / loaded_count
+        if avg_time > 0.1:
+            log.warning(
+                "[性能警告] 缓存加载平均 %.3fs/文件 (%.2fs/%d文件) - 磁盘IO慢",
+                avg_time, total_read_time, loaded_count
+            )
+            log.warning("[建议] 1) 使用本地SSD  2) 设置cache_parallel_workers=4-8  3) 或禁用缓存")
+        if slow_files:
+            log.warning("[性能] %d个文件>0.5s，前5个：", len(slow_files))
+            for obj_name, elapsed in slow_files[:5]:
+                log.warning("  %s: %.2fs", obj_name, elapsed)
     
     return loaded_count
 
@@ -3969,9 +4138,12 @@ def fetch_dbcat_schema_objects(
     base_output = Path(settings.get('dbcat_output_dir', 'dbcat_output'))
     ensure_dir(base_output)
     
+    # 获取并行加载配置
+    cache_parallel_workers = int(settings.get('cache_parallel_workers', 1))
+    
     # 1) 优先从扁平缓存加载
     before_req = sum(len(names) for type_map in schema_requests.values() for names in type_map.values())
-    flat_loaded = load_from_flat_cache(base_output, schema_requests, results, source_meta)
+    flat_loaded = load_from_flat_cache(base_output, schema_requests, results, source_meta, cache_parallel_workers)
     if flat_loaded:
         log.info("[dbcat] 从扁平缓存加载 %d 个对象 DDL。", flat_loaded)
     
@@ -4087,9 +4259,11 @@ def fetch_dbcat_schema_objects(
                 if proc.returncode != 0:
                     return f"[dbcat] 转换 schema={schema} 失败: {proc.stderr or proc.stdout}"
                 log.info("[dbcat] 导出 schema=%s option=%s 完成，用时 %.2fs。", schema, option, elapsed)
+                # 将批次总耗时平均分配给每个对象
+                avg_elapsed = elapsed / len(chunk_names) if chunk_names else elapsed
                 for obj_name in chunk_names:
                     key = (schema.upper(), obj_type.upper(), obj_name.upper())
-                    chunk_time_map[key] = elapsed
+                    chunk_time_map[key] = avg_elapsed
                 return None
             except subprocess.TimeoutExpired:
                 return f"[dbcat] 转换 schema={schema} 超时 ({cli_timeout}s)"
@@ -4392,6 +4566,23 @@ def adjust_ddl_for_object(
         return pattern.sub(_repl, text)
 
     result = replace_identifier(ddl, src_schema, src_name, tgt_schema, tgt_name)
+    
+    # 处理主对象的裸名引用（如 END package_name）
+    if mapping_changed and src_name_u != tgt_name_u:
+        pattern = re.compile(rf'\b{re.escape(src_name_u)}\b', re.IGNORECASE)
+        def _repl_main(match: re.Match) -> str:
+            start = match.start()
+            idx = start - 1
+            while idx >= 0 and result[idx].isspace():
+                idx -= 1
+            if idx >= 0 and result[idx] == '"':
+                idx -= 1
+                while idx >= 0 and result[idx].isspace():
+                    idx -= 1
+            if idx >= 0 and result[idx] == '.':
+                return match.group(0)
+            return tgt_name_u
+        result = pattern.sub(_repl_main, result)
 
     if extra_identifiers:
         # 先替换显式 schema.对象，再处理裸名 remap
@@ -4408,9 +4599,7 @@ def adjust_ddl_for_object(
         for (src_pair, tgt_pair) in extra_identifiers:
             if src_pair[0].upper() != src_schema_u:
                 continue
-            # If the dependent object is the main object being processed, skip unqualified replacement.
-            # Its name is already handled by the initial `replace_identifier` call.
-            if src_pair[1].upper() == src_name.upper(): # This check prevents the main object's name from being double-qualified.
+            if src_pair[1].upper() == src_name.upper():
                 continue
             if (src_pair[0].upper(), src_pair[1].upper()) == (tgt_pair[0].upper(), tgt_pair[1].upper()):
                 continue
@@ -5076,7 +5265,11 @@ def generate_fixup_scripts(
             meta = ddl_source_meta.get(key)
             if meta:
                 source_label = "DBCAT_CACHE" if meta[0] == "cache" else "DBCAT_RUN"
-                elapsed_hint = meta[1]
+                # 对于缓存，使用实际读取耗时；对于dbcat_run，使用记录的平均耗时
+                if meta[0] == "cache":
+                    elapsed_hint = time.time() - start_time
+                else:
+                    elapsed_hint = meta[1]
         else:
             ddl = get_fallback_ddl(schema, obj_type, obj_name)
             if ddl:
@@ -5085,10 +5278,13 @@ def generate_fixup_scripts(
                 source_label = "MISSING"
 
         elapsed = elapsed_hint if elapsed_hint is not None else (time.time() - start_time)
-        log.info(
-            "[DDL_FETCH] %s.%s (%s) 来源=%s 耗时=%.3fs",
-            schema, obj_name, obj_type, source_label, elapsed
-        )
+        
+        # 只在非缓存或耗时较长时输出详细日志
+        if source_label != "DBCAT_CACHE" or elapsed > 0.1:
+            log.info(
+                "[DDL_FETCH] %s.%s (%s) 来源=%s 耗时=%.3fs",
+                schema, obj_name, obj_type, source_label, elapsed
+            )
         return ddl, source_label, elapsed
 
     def build_progress_tracker(total: int, label: str) -> Callable[[Optional[str]], None]:
@@ -6562,6 +6758,7 @@ def main():
     ora_cfg, ob_cfg, settings = load_config(str(config_path))
     validate_runtime_paths(settings, ob_cfg)
 
+    log.info("OceanBase Comparator Toolkit v%s", __version__)
     enabled_primary_types: Set[str] = set(settings.get('enabled_primary_types') or set(PRIMARY_OBJECT_TYPES))
     enabled_extra_types: Set[str] = set(settings.get('enabled_extra_types') or set(EXTRA_OBJECT_CHECK_TYPES))
     enable_dependencies_check: bool = bool(settings.get('enable_dependencies_check', True))
@@ -6602,13 +6799,26 @@ def main():
     
     # 4.1) 获取依附对象（如 TRIGGER）的父表映射，用于 one-to-many schema 拆分场景
     object_parent_map = get_object_parent_tables(ora_cfg, settings['source_schemas_list'])
+    
+    # 4.2) 加载源端依赖关系（用于智能推导一对多场景的目标schema）
+    oracle_dependencies: List[DependencyRecord] = []
+    source_dependencies_set: Optional[Set[Tuple[str, str, str, str]]] = None
+    if enable_dependencies_check:
+        oracle_dependencies = load_oracle_dependencies(ora_cfg, settings['source_schemas_list'])
+        # 转换为简化格式：(dep_owner, dep_name, dep_type, ref_owner, ref_name, ref_type)
+        source_dependencies_set = {
+            (dep.owner.upper(), dep.name.upper(), dep.object_type.upper(), 
+             dep.referenced_owner.upper(), dep.referenced_name.upper(), dep.referenced_type.upper())
+            for dep in oracle_dependencies
+        }
 
     # 5) 先不推导 schema，生成基础映射/清单，用于推导 TABLE 唯一映射
     base_full_mapping = build_full_object_mapping(
         source_objects,
         remap_rules,
         None,
-        object_parent_map
+        object_parent_map,
+        source_dependencies_set
     )
     base_master_list = generate_master_list(
         source_objects,
@@ -6616,17 +6826,19 @@ def main():
         enabled_primary_types,
         None,
         base_full_mapping,
-        object_parent_map
+        object_parent_map,
+        source_dependencies_set
     )
     if settings.get("enable_schema_mapping_infer"):
         schema_mapping_from_tables = build_schema_mapping(base_master_list)
 
-    # 6) 基于 TABLE 推导的 schema 映射（仅作用于非 TABLE 对象）重建映射与校验清单
+    # 6) 基于 TABLE 推导的 schema 映射（仅作用于非 TABLE 对象）+ 依赖分析，重建映射与校验清单
     full_object_mapping = build_full_object_mapping(
         source_objects,
         remap_rules,
         schema_mapping_from_tables,
-        object_parent_map
+        object_parent_map,
+        source_dependencies_set
     )
     master_list = generate_master_list(
         source_objects,
@@ -6634,13 +6846,12 @@ def main():
         enabled_primary_types,
         schema_mapping_from_tables,
         full_object_mapping,
-        object_parent_map
+        object_parent_map,
+        source_dependencies_set
     )
-    oracle_dependencies: List[DependencyRecord] = []
     expected_dependency_pairs: Set[Tuple[str, str, str, str]] = set()
     skipped_dependency_pairs: List[DependencyIssue] = []
     if enable_dependencies_check:
-        oracle_dependencies = load_oracle_dependencies(ora_cfg, settings['source_schemas_list'])
         expected_dependency_pairs, skipped_dependency_pairs = build_expected_dependency_pairs(
             oracle_dependencies,
             full_object_mapping
