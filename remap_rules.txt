@@ -117,3 +117,4 @@ GOD_A.VW_DOMAIN_POWER         = PRIMORDIAL.VW_DOMAIN_POWER
 GOD_A.VW_MORTAL_TOUCH         = PRIMORDIAL.VW_MORTAL_TOUCH
 
 # MONSTER_B is intentionally not mapped. All its objects are expected to be reported as "Source Only".
+GOD_A.T_OMEN BODY             = PRIMORDIAL.T_PORTENT BODY
