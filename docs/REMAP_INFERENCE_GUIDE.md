@@ -56,21 +56,27 @@ MONSTER_A.CURSES       -> TITAN_B.CURSES
 
 **推导能力**：
 - ✅ TABLE：需要显式 remap
-- ❌ VIEW/PROCEDURE/FUNCTION/PACKAGE：**无法自动推导**，必须显式指定
+- ⚡ VIEW/PROCEDURE/FUNCTION/PACKAGE：**智能推导**（基于依赖分析）
+  - 程序会分析对象引用的表，统计这些表被 remap 到哪些目标 schema
+  - 选择出现次数最多的目标 schema 作为推导结果
+  - 如果依赖推导失败（如未引用任何表、或引用的表分散在多个 schema），则需要显式指定
 - ✅ TRIGGER/INDEX/CONSTRAINT/SEQUENCE：**自动推导**（跟随父表）
 
-**原因**：
+**推导逻辑**：
 - MONSTER_A 的表分散到 TITAN_A 和 TITAN_B 两个 schema
-- 程序无法判断 `MONSTER_A.VW_LAIR_RICHNESS` 应该放在 TITAN_A 还是 TITAN_B
-- 但 `MONSTER_A.TRG_LAIR_BI` 可以自动跟随父表 `LAIR` 到 TITAN_A
+- `MONSTER_A.VW_LAIR_RICHNESS` 如果主要引用 TITAN_A 的表，会自动推导到 TITAN_A
+- `MONSTER_A.TRG_LAIR_BI` 会自动跟随父表 `LAIR` 到 TITAN_A
 
-**解决方案**：
-在 `remap_rules.txt` 中显式指定独立对象的 remap：
+**何时需要显式指定**：
+只有在以下情况下才需要在 `remap_rules.txt` 中显式指定：
+1. 对象未引用任何表（无法通过依赖分析推导）
+2. 对象引用的表分散在多个目标 schema，且引用次数相同（无法判断优先级）
+
+示例：
 ```
+# 仅在依赖推导失败时才需要显式指定
 MONSTER_A.VW_LAIR_RICHNESS    = TITAN_B.VW_LAIR_RICHNESS
-MONSTER_A.VW_DANGER_MATRIX    = TITAN_B.VW_DANGER_MATRIX
 MONSTER_A.SP_SUMMON_MINION    = TITAN_B.SP_SUMMON_MINION
-MONSTER_A.PKG_MONSTER_OPS     = TITAN_B.PKG_MONSTER_OPS
 ```
 
 ## 对象类型分类
@@ -126,20 +132,28 @@ MONSTER_A.PKG_MONSTER_OPS     = TITAN_B.PKG_MONSTER_OPS
 
 运行程序后，检查以下内容：
 
-1. **查看警告日志**：
+1. **查看提示日志**：
    ```
    检测到一对多 schema 映射场景（源schema的表分散到多个目标schema）：
      MONSTER_A -> ['TITAN_A', 'TITAN_B']
    
-   注意：在一对多场景下，独立对象（VIEW/PROCEDURE/FUNCTION/PACKAGE等）
-   无法自动推导目标schema，必须在 remap_rules.txt 中显式指定。
+   推导策略：
+     1. 独立对象（VIEW/PROCEDURE/FUNCTION/PACKAGE等）：
+        - 优先通过依赖分析推导（分析对象引用的表，选择出现最多的目标schema）
+        - 如果依赖推导失败，需要在 remap_rules.txt 中显式指定
+     2. 依附对象（TRIGGER/INDEX/CONSTRAINT/SEQUENCE）：
+        - 自动跟随父表的 schema，无需显式指定
    ```
 
-2. **检查报告中的缺失对象**：
-   - 如果 VIEW/PROCEDURE 等对象被报告为"缺失"
-   - 可能是因为一对多场景下未显式指定 remap
+2. **检查推导日志**：
+   - 查找 `[推导]` 标签的日志，了解哪些对象成功推导
+   - 查找 `[推导失败]` 标签的日志，了解哪些对象需要显式指定
 
-3. **检查生成的 fixup 脚本**：
+3. **检查报告中的缺失对象**：
+   - 如果 VIEW/PROCEDURE 等对象被报告为"缺失"
+   - 可能是因为依赖推导失败，需要显式指定 remap
+
+4. **检查生成的 fixup 脚本**：
    - 查看 DDL 中的 schema 和表引用是否正确
    - 特别注意跨 schema 引用的表名
 
@@ -187,19 +201,21 @@ infer_schema_mapping = true   # 默认值，推荐保持开启
 程序会在日志中输出推导的 schema 映射：
 
 ```
-[INFO] Schema 映射推导结果（基于 TABLE）：
+[INFO] Schema映射推导完成，共 4 个源schema:
   HERO_A -> OLYMPIAN_A
   HERO_B -> OLYMPIAN_A
   GOD_A -> PRIMORDIAL
-  MONSTER_A -> MONSTER_A (一对多，无法推导)
+  MONSTER_A -> MONSTER_A (1:1或一对多场景)
 ```
+
+注：一对多场景下，独立对象会尝试通过依赖分析推导目标 schema。
 
 ## 故障排查
 
 ### 问题：VIEW/PROCEDURE 被报告为缺失
 
 **可能原因**：
-1. 一对多场景下未显式指定 remap
+1. 一对多场景下依赖推导失败（对象未引用表，或引用的表分散在多个 schema）
 2. `infer_schema_mapping` 被设置为 `false`
 
 **解决方案**：

@@ -258,11 +258,16 @@ def is_oms_index(name: str, columns: List[str]) -> bool:
     cols_u = [c.strip('"').upper() for c in (columns or []) if c]
     if not cols_u:
         return False
-    # 只忽略“恰好由标准 4 列”构成的索引，避免误滤掉附带额外列的索引
-    if set(cols_u) != set(IGNORED_OMS_COLUMNS) or len(cols_u) != len(IGNORED_OMS_COLUMNS):
+    # 检查名称是否以 _OMS_ROWID 结尾
+    if not name_u.endswith("_OMS_ROWID"):
         return False
-    # 名称包含/结尾 OMS_ROWID 时视为标准 OMS 索引
-    return name_u.endswith("OMS_ROWID") or "OMS_ROWID" in name_u
+    
+    # 检查列集合是否包含所有标准 OMS 列
+    cols_set = set(cols_u)
+    oms_cols_set = set(IGNORED_OMS_COLUMNS)
+    
+    # 如果包含所有4个OMS列，则认为是OMS索引（允许有额外列）
+    return oms_cols_set.issubset(cols_set)
 
 OBJECT_COUNT_TYPES: Tuple[str, ...] = (
     'TABLE',
@@ -502,6 +507,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('dbcat_chunk_size', '150')
         settings.setdefault('fixup_workers', '')
         settings.setdefault('progress_log_interval', '10')
+        settings.setdefault('report_width', '160')  # 报告宽度，避免nohup时被截断为80
 
         enabled_primary_types = parse_type_list(
             settings.get('check_primary_types', ''),
@@ -1427,6 +1433,28 @@ def get_mapped_target(
     return type_map.get(obj_type_u)
 
 
+def find_mapped_target_any_type(
+    full_object_mapping: FullObjectMapping,
+    src_full_name: str,
+    preferred_types: Optional[Tuple[str, ...]] = None
+) -> Optional[str]:
+    """
+    在不知道对象类型的情况下，根据可选的类型优先级查找映射的目标名。
+    先按 preferred_types 顺序查找，找不到再回退到该源对象的任意映射值。
+    """
+    preferred_types = preferred_types or ()
+    src_key = src_full_name.upper()
+    for obj_type in preferred_types:
+        mapped = get_mapped_target(full_object_mapping, src_key, obj_type)
+        if mapped:
+            return mapped
+    type_map = full_object_mapping.get(src_key)
+    if not type_map:
+        return None
+    # 回退取任意一个映射值即可（dict 保持插入顺序）
+    return next(iter(type_map.values()), None)
+
+
 def ensure_mapping_entry(
     full_object_mapping: FullObjectMapping,
     src_full_name: str,
@@ -1481,8 +1509,8 @@ def build_schema_mapping(master_list: MasterCheckList) -> Dict[str, str]:
         if obj_type.upper() != 'TABLE':
             continue
         try:
-            src_schema, _ = src_name.split('.')
-            tgt_schema, _ = tgt_name.split('.')
+            src_schema, _ = src_name.split('.', 1)
+            tgt_schema, _ = tgt_name.split('.', 1)
         except ValueError:
             continue
         mapping_tmp.setdefault(src_schema.upper(), set()).add(tgt_schema.upper())
@@ -1498,17 +1526,29 @@ def build_schema_mapping(master_list: MasterCheckList) -> Dict[str, str]:
             final_mapping[src_schema] = src_schema
             one_to_many_schemas.append((src_schema, tgt_set))
     
-    # 警告：一对多场景下，非TABLE对象（VIEW/PROCEDURE/FUNCTION/PACKAGE）无法自动推导
+    # 输出schema映射摘要
+    if final_mapping:
+        log.info("Schema映射推导完成，共 %d 个源schema:", len(final_mapping))
+        for src_s, tgt_s in sorted(final_mapping.items()):
+            if src_s == tgt_s:
+                log.info("  %s -> %s (1:1或一对多场景)", src_s, tgt_s)
+            else:
+                log.info("  %s -> %s", src_s, tgt_s)
+    
+    # 提示：一对多场景下的推导策略
     if one_to_many_schemas:
-        log.warning("=" * 80)
-        log.warning("检测到一对多 schema 映射场景（源schema的表分散到多个目标schema）：")
+        log.info("=" * 80)
+        log.info("检测到一对多 schema 映射场景（源schema的表分散到多个目标schema）：")
         for src_schema, tgt_set in one_to_many_schemas:
-            log.warning("  %s -> %s", src_schema, sorted(tgt_set))
-        log.warning("")
-        log.warning("注意：在一对多场景下，独立对象（VIEW/PROCEDURE/FUNCTION/PACKAGE等）")
-        log.warning("无法自动推导目标schema，必须在 remap_rules.txt 中显式指定。")
-        log.warning("依附对象（TRIGGER/INDEX/CONSTRAINT/SEQUENCE）会自动跟随父表的schema。")
-        log.warning("=" * 80)
+            log.info("  %s -> %s", src_schema, sorted(tgt_set))
+        log.info("")
+        log.info("推导策略：")
+        log.info("  1. 独立对象（VIEW/PROCEDURE/FUNCTION/PACKAGE等）：")
+        log.info("     - 优先通过依赖分析推导（分析对象引用的表，选择出现最多的目标schema）")
+        log.info("     - 如果依赖推导失败，需要在 remap_rules.txt 中显式指定")
+        log.info("  2. 依附对象（TRIGGER/INDEX/CONSTRAINT/SEQUENCE）：")
+        log.info("     - 自动跟随父表的 schema，无需显式指定")
+        log.info("=" * 80)
     
     return final_mapping
     return final_mapping
@@ -1526,7 +1566,7 @@ def compute_schema_coverage(
       说明：目标端可能是“超集”，因此不检查“额外 schema”或“目标缺失 schema”。
     """
     cfg_src_set = {s.upper() for s in configured_source_schemas}
-    src_seen = {name.split('.')[0].upper() for name in source_objects.keys() if '.' in name}
+    src_seen = {name.split('.', 1)[0].upper() for name in source_objects.keys() if '.' in name}
     source_missing = sorted(cfg_src_set - src_seen)
 
     return {
@@ -2891,16 +2931,27 @@ def check_primary_objects(
                     except (TypeError, ValueError):
                         continue
 
-                    expected_min_len = int(math.ceil(src_len_int * VARCHAR_LEN_MIN_MULTIPLIER))
-                    oversize_cap_len = int(math.ceil(src_len_int * VARCHAR_LEN_OVERSIZE_MULTIPLIER))
-                    if tgt_len_int < expected_min_len:
-                        length_mismatches.append(
-                            ColumnLengthIssue(col_name, src_len_int, tgt_len_int, expected_min_len, 'short')
-                        )
-                    elif tgt_len_int > oversize_cap_len:
-                        length_mismatches.append(
-                            ColumnLengthIssue(col_name, src_len_int, tgt_len_int, oversize_cap_len, 'oversize')
-                        )
+                    # 区分BYTE和CHAR语义：CHAR_USED='C'表示CHAR语义，其他为BYTE语义
+                    src_char_used = (src_info.get("char_used") or "").strip().upper()
+                    
+                    if src_char_used == 'C':
+                        # CHAR语义：要求长度完全一致
+                        if tgt_len_int != src_len_int:
+                            length_mismatches.append(
+                                ColumnLengthIssue(col_name, src_len_int, tgt_len_int, src_len_int, 'char_mismatch')
+                            )
+                    else:
+                        # BYTE语义：需要放大1.5倍
+                        expected_min_len = int(math.ceil(src_len_int * VARCHAR_LEN_MIN_MULTIPLIER))
+                        oversize_cap_len = int(math.ceil(src_len_int * VARCHAR_LEN_OVERSIZE_MULTIPLIER))
+                        if tgt_len_int < expected_min_len:
+                            length_mismatches.append(
+                                ColumnLengthIssue(col_name, src_len_int, tgt_len_int, expected_min_len, 'short')
+                            )
+                        elif tgt_len_int > oversize_cap_len:
+                            length_mismatches.append(
+                                ColumnLengthIssue(col_name, src_len_int, tgt_len_int, oversize_cap_len, 'oversize')
+                            )
 
             if not missing_in_tgt and not extra_in_tgt and not length_mismatches:
                 results['ok'].append(('TABLE', full_tgt))
@@ -2951,10 +3002,8 @@ def compare_indexes_for_table(
     tgt_idx = ob_meta.indexes.get(tgt_key, {})
 
     # 源端元数据为 None 时，视为源端该表无索引（或元数据加载为空），继续比较并标记目标端 extra
-    src_idx_info_note: Optional[str] = None
     if src_idx is None:
         src_idx = {}
-        src_idx_info_note = "注：源端 Oracle 该表无索引元数据 (DBA_INDEXES/DBA_IND_COLUMNS dump 为空或确实无索引)。"
 
     tgt_constraints = ob_meta.constraints.get(tgt_key, {})
     constraint_index_cols: Set[Tuple[str, ...]] = {
@@ -2985,14 +3034,54 @@ def compare_indexes_for_table(
     missing_cols = set(src_map.keys()) - set(tgt_map.keys())
     extra_cols = set(tgt_map.keys()) - set(src_map.keys())
 
+    # 处理同名索引但SYS_NC列名不同的情况
+    def normalize_sys_nc_columns(cols: Tuple[str, ...]) -> Tuple[str, ...]:
+        """将SYS_NC开头的列名标准化为通用形式"""
+        normalized = []
+        for col in cols:
+            if col.startswith('SYS_NC') and '$' in col:
+                normalized.append('SYS_NC$')  # 标准化为通用形式
+            else:
+                normalized.append(col)
+        return tuple(normalized)
+
+    def has_same_named_index(src_cols: Tuple[str, ...], tgt_cols: Tuple[str, ...]) -> bool:
+        """检查是否存在同名索引"""
+        src_names = src_map.get(src_cols, {}).get("names", set())
+        tgt_names = tgt_map.get(tgt_cols, {}).get("names", set())
+        return bool(src_names & tgt_names)  # 有交集说明存在同名索引
+
+    def is_sys_nc_only_diff(src_cols: Tuple[str, ...], tgt_cols: Tuple[str, ...]) -> bool:
+        """检查是否仅SYS_NC列名不同"""
+        return normalize_sys_nc_columns(src_cols) == normalize_sys_nc_columns(tgt_cols)
+
+    # 找出因SYS_NC列名不同而被误判的同名索引
+    sys_nc_matched_pairs = []
+    for src_cols in list(missing_cols):
+        for tgt_cols in list(extra_cols):
+            if (has_same_named_index(src_cols, tgt_cols) and 
+                is_sys_nc_only_diff(src_cols, tgt_cols)):
+                sys_nc_matched_pairs.append((src_cols, tgt_cols))
+                missing_cols.discard(src_cols)
+                extra_cols.discard(tgt_cols)
+                break
+
     detail_mismatch: List[str] = []
-    if src_idx_info_note:
-        detail_mismatch.append(src_idx_info_note)
 
     for cols in set(src_map.keys()) & set(tgt_map.keys()):
         src_uniq = src_map[cols]["uniq"]
         tgt_uniq = tgt_map[cols]["uniq"]
         if src_uniq != tgt_uniq:
+            # 检查是否是源端NONUNIQUE变成目标端UNIQUE的情况
+            src_has_nonunique = "NONUNIQUE" in src_uniq
+            tgt_has_unique = "UNIQUE" in tgt_uniq
+            
+            # 如果源端是NONUNIQUE，目标端是UNIQUE，且该列集有约束支撑，则认为是正常的
+            if src_has_nonunique and tgt_has_unique and cols in constraint_index_cols:
+                log.debug("索引列 %s: 源端NONUNIQUE变目标端UNIQUE，有约束支撑，视为正常迁移", list(cols))
+                continue
+            
+            # 其他唯一性不一致情况仍然报告
             detail_mismatch.append(
                 f"索引列 {list(cols)} 唯一性不一致 (源 {sorted(src_uniq)}, 目标 {sorted(tgt_uniq)})。"
             )
@@ -3043,14 +3132,10 @@ def compare_constraints_for_table(
     tgt_cons = ob_meta.constraints.get(tgt_key, {})
 
     # 源端元数据为 None 时，视为源端该表无约束（或元数据加载为空），继续比较并标记目标端 extra
-    src_cons_info_note: Optional[str] = None
     if src_cons is None:
         src_cons = {}
-        src_cons_info_note = "注：源端 Oracle 该表无约束元数据 (DBA_CONSTRAINTS/DBA_CONS_COLUMNS dump 为空或确实无约束)。"
 
     detail_mismatch: List[str] = []
-    if src_cons_info_note:
-        detail_mismatch.append(src_cons_info_note)
     missing: Set[str] = set()
     extra: Set[str] = set()
 
@@ -3463,6 +3548,7 @@ def check_comments(
         src_col_cmts = oracle_meta.column_comments.get(src_key, {})
         tgt_col_cmts = ob_meta.column_comments.get(tgt_key, {})
 
+        # 过滤OMS列后计算缺失和额外的列注释
         missing_cols = {
             col for col in src_col_cmts.keys()
             if col not in tgt_col_cmts and not is_ignored_oms_column(col)
@@ -3471,6 +3557,13 @@ def check_comments(
             col for col in tgt_col_cmts.keys()
             if col not in src_col_cmts and not is_ignored_oms_column(col)
         }
+
+        # 额外验证：确保OMS列被完全过滤
+        oms_filtered_extra = {col for col in extra_cols if not is_ignored_oms_column(col)}
+        if len(oms_filtered_extra) != len(extra_cols):
+            log.debug("表 %s.%s: 从额外列注释中过滤了 %d 个OMS列", 
+                     tgt_key[0], tgt_key[1], len(extra_cols) - len(oms_filtered_extra))
+            extra_cols = oms_filtered_extra
 
         column_diffs: List[Tuple[str, str, str]] = []
         for col in (src_col_cmts.keys() & tgt_col_cmts.keys()):
@@ -3612,7 +3705,7 @@ def collect_ob_env_info(ob_cfg: ObConfig) -> Dict[str, str]:
         log.warning("获取 obclient status 信息失败（将尝试 SQL 查询）：%s", exc)
 
     if "version" not in info or not info["version"].strip():
-        ok, stdout, _ = obclient_run_sql(ob_cfg, "SELECT version()")
+        ok, stdout, _ = obclient_run_sql(ob_cfg, "SELECT OB_VERSION() FROM DUAL")
         if ok and stdout.strip():
             info["version"] = stdout.strip().splitlines()[0]
 
@@ -3966,7 +4059,21 @@ def save_to_flat_cache(
     file_path = get_flat_cache_path(base_output, schema, obj_type, obj_name)
     try:
         file_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # 验证：检查DDL是否包含异常字符
+        if '\x00' in ddl_content:
+            log.warning("[dbcat] DDL包含NULL字符，已清理: %s.%s", schema, obj_name)
+            ddl_content = ddl_content.replace('\x00', '')
+        
         file_path.write_text(ddl_content, encoding='utf-8')
+        
+        # 验证：读回并比较
+        readback = file_path.read_text(encoding='utf-8')
+        if readback != ddl_content:
+            log.error("[dbcat] 缓存验证失败: %s.%s (写入%d字节，读回%d字节)",
+                     schema, obj_name, len(ddl_content), len(readback))
+            return False
+        
         return True
     except OSError as exc:
         log.warning("[dbcat] 保存到扁平缓存失败 %s: %s", file_path, exc)
@@ -4399,6 +4506,232 @@ CREATE_OBJECT_PATTERNS = {
 }
 
 
+def get_oceanbase_version(ob_cfg: ObConfig) -> Optional[str]:
+    """获取OceanBase版本号"""
+    sql = "SELECT OB_VERSION() FROM DUAL"
+    ok, out, err = obclient_run_sql(ob_cfg, sql)
+    if not ok or not out:
+        log.warning("无法获取OceanBase版本信息: %s", err)
+        return None
+    
+    # 解析版本号，OB_VERSION()直接返回版本号如 "4.2.5.7"
+    for line in out.splitlines():
+        line = line.strip()
+        if line and line != 'OB_VERSION()':  # 跳过列标题
+            # 检查是否是版本号格式 (数字.数字.数字.数字)
+            if '.' in line and line.replace('.', '').replace('-', '').isdigit():
+                return line.split('-')[0]  # 去掉可能的后缀
+    return None
+
+
+def compare_version(version1: str, version2: str) -> int:
+    """比较版本号，返回 -1(v1<v2), 0(v1==v2), 1(v1>v2)"""
+    try:
+        v1_parts = [int(x) for x in version1.split('.')]
+        v2_parts = [int(x) for x in version2.split('.')]
+        
+        # 补齐长度
+        max_len = max(len(v1_parts), len(v2_parts))
+        v1_parts.extend([0] * (max_len - len(v1_parts)))
+        v2_parts.extend([0] * (max_len - len(v2_parts)))
+        
+        for i in range(max_len):
+            if v1_parts[i] < v2_parts[i]:
+                return -1
+            elif v1_parts[i] > v2_parts[i]:
+                return 1
+        return 0
+    except (ValueError, AttributeError):
+        return 0
+
+
+def clean_view_ddl_for_oceanbase(ddl: str, ob_version: Optional[str] = None) -> str:
+    """
+    清理Oracle VIEW DDL，使其兼容OceanBase
+    
+    Args:
+        ddl: Oracle VIEW的DDL语句
+        ob_version: OceanBase版本号
+    
+    Returns:
+        清理后的DDL
+    """
+    if not ddl:
+        return ddl
+    
+    # 需要移除的关键字模式
+    patterns_to_remove = [
+        # EDITIONABLE 在所有版本都需要移除
+        r'\s+EDITIONABLE\s+',
+        r'\s+NONEDITIONABLE\s+',
+        # FORCE 关键字
+        r'\bFORCE\s+',
+        # BEQUEATH 子句
+        r'\s+BEQUEATH\s+(?:CURRENT_USER|DEFINER)',
+        # SHARING 子句 (Oracle 12c+)
+        r'\s+SHARING\s*=\s*(?:METADATA|DATA|EXTENDED\s+DATA|NONE)',
+        # DEFAULT COLLATION 子句
+        r'\s+DEFAULT\s+COLLATION\s+\w+',
+        # CONTAINER 子句
+        r'\s+CONTAINER_MAP\s*',
+        r'\s+CONTAINERS_DEFAULT\s*',
+    ]
+    
+    # 版本相关的清理
+    if ob_version:
+        # 如果版本 < 4.2.5.7，需要移除 WITH CHECK OPTION
+        if compare_version(ob_version, "4.2.5.7") < 0:
+            patterns_to_remove.append(r'\s+WITH\s+CHECK\s+OPTION')
+    else:
+        # 版本未知时，保守起见移除 WITH CHECK OPTION
+        patterns_to_remove.append(r'\s+WITH\s+CHECK\s+OPTION')
+    
+    cleaned_ddl = ddl
+    for pattern in patterns_to_remove:
+        cleaned_ddl = re.sub(pattern, ' ', cleaned_ddl, flags=re.IGNORECASE)
+    
+    # 清理多余的空格
+    cleaned_ddl = re.sub(r'\s+', ' ', cleaned_ddl)
+    cleaned_ddl = cleaned_ddl.strip()
+    
+    return cleaned_ddl
+
+
+def extract_view_dependencies(ddl: str) -> Set[str]:
+    """
+    从VIEW DDL中提取依赖的对象名（表、视图等）
+    
+    Args:
+        ddl: VIEW的DDL语句
+    
+    Returns:
+        依赖对象的集合，格式为 SCHEMA.OBJECT_NAME
+    """
+    dependencies = set()
+    if not ddl:
+        return dependencies
+    
+    # 提取 SELECT 语句部分
+    select_match = re.search(r'\bAS\s+(SELECT\b.*)', ddl, re.IGNORECASE | re.DOTALL)
+    if not select_match:
+        return dependencies
+    
+    select_sql = select_match.group(1)
+    
+    # 简单的表名提取模式（可能需要根据实际情况调整）
+    # 匹配 FROM/JOIN 后的表名
+    table_patterns = [
+        r'\bFROM\s+([A-Z_][A-Z0-9_]*(?:\.[A-Z_][A-Z0-9_]*)?)',
+        r'\bJOIN\s+([A-Z_][A-Z0-9_]*(?:\.[A-Z_][A-Z0-9_]*)?)',
+        r'\bINTO\s+([A-Z_][A-Z0-9_]*(?:\.[A-Z_][A-Z0-9_]*)?)',
+    ]
+    
+    for pattern in table_patterns:
+        matches = re.findall(pattern, select_sql, re.IGNORECASE)
+        for match in matches:
+            # 清理引号和别名
+            table_name = match.strip().strip('"').upper()
+            if '.' not in table_name:
+                # 如果没有schema前缀，暂时跳过（需要上下文推断）
+                continue
+            dependencies.add(table_name)
+    
+    return dependencies
+
+
+def remap_view_dependencies(
+    ddl: str, 
+    view_schema: str,
+    remap_rules: RemapRules,
+    full_object_mapping: FullObjectMapping
+) -> str:
+    """
+    根据remap规则重写VIEW DDL中的依赖对象引用
+    
+    Args:
+        ddl: 原始DDL
+        view_schema: 视图所在的schema
+        remap_rules: remap规则
+        full_object_mapping: 完整的对象映射
+    
+    Returns:
+        重写后的DDL
+    """
+    if not ddl:
+        return ddl
+    
+    # 提取依赖对象
+    dependencies = extract_view_dependencies(ddl)
+    
+    # 构建替换映射
+    replacements = {}
+    for dep in dependencies:
+        # 查找该依赖对象的目标映射
+        tgt_name = find_mapped_target_any_type(
+            full_object_mapping,
+            dep,
+            preferred_types=("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM")
+        )
+        if tgt_name:
+            replacements[dep] = tgt_name
+
+    # 执行替换
+    result_ddl = ddl
+    for src_ref, tgt_ref in replacements.items():
+        # 使用词边界确保精确匹配
+        pattern = r'\b' + re.escape(src_ref) + r'\b'
+        result_ddl = re.sub(pattern, tgt_ref, result_ddl, flags=re.IGNORECASE)
+    
+    return result_ddl
+
+
+def oracle_get_views_ddl_batch(
+    ora_cfg: OraConfig,
+    view_objects: List[Tuple[str, str]]  # [(schema, view_name), ...]
+) -> Dict[Tuple[str, str], str]:
+    """
+    批量获取VIEW的DDL，使用DBMS_METADATA
+    
+    Args:
+        ora_cfg: Oracle连接配置
+        view_objects: 视图对象列表 [(schema, view_name), ...]
+    
+    Returns:
+        {(schema, view_name): ddl_text}
+    """
+    if not view_objects:
+        return {}
+    
+    log.info("[VIEW] 正在批量获取 %d 个VIEW的DDL (使用DBMS_METADATA)...", len(view_objects))
+    
+    results = {}
+    
+    try:
+        with oracledb.connect(
+            user=ora_cfg['user'],
+            password=ora_cfg['password'],
+            dsn=ora_cfg['dsn']
+        ) as connection:
+            setup_metadata_session(connection)
+            
+            for schema, view_name in view_objects:
+                try:
+                    ddl = oracle_get_ddl(connection, 'VIEW', schema, view_name)
+                    if ddl:
+                        results[(schema, view_name)] = ddl
+                        log.debug("[VIEW] 成功获取 %s.%s 的DDL", schema, view_name)
+                    else:
+                        log.warning("[VIEW] 未能获取 %s.%s 的DDL", schema, view_name)
+                except Exception as exc:
+                    log.warning("[VIEW] 获取 %s.%s DDL失败: %s", schema, view_name, exc)
+                    
+    except Exception as exc:
+        log.error("[VIEW] 批量获取VIEW DDL时连接失败: %s", exc)
+    
+    log.info("[VIEW] 成功获取 %d/%d 个VIEW的DDL", len(results), len(view_objects))
+    return results
+
+
 def oracle_get_ddl(ora_conn, obj_type: str, owner: str, name: str) -> Optional[str]:
     sql = "SELECT DBMS_METADATA.GET_DDL(:1, :2, :3) FROM DUAL"
     obj_type_norm = DDL_OBJ_TYPE_MAPPING.get(obj_type.upper(), obj_type.upper())
@@ -4585,30 +4918,37 @@ def adjust_ddl_for_object(
         result = pattern.sub(_repl_main, result)
 
     if extra_identifiers:
-        # 先替换显式 schema.对象，再处理裸名 remap
+        # 构建快速查找字典：{(src_schema, src_obj): (tgt_schema, tgt_obj)}
+        replacement_dict: Dict[Tuple[str, str], Tuple[str, str]] = {}
         for (src_pair, tgt_pair) in extra_identifiers:
-            result = replace_identifier(
-                result,
-                src_pair[0],
-                src_pair[1],
-                tgt_pair[0],
-                tgt_pair[1]
-            )
-        # 针对与当前源 schema 相同的对象，补充无前缀引用的 remap (schema 发生变化或对象名变化)
+            key = (src_pair[0].upper(), src_pair[1].upper())
+            replacement_dict[key] = (tgt_pair[0].upper(), tgt_pair[1].upper())
+        
+        # 只对字典中存在的对象执行替换（避免循环所有规则）
+        # 使用原有的 replace_identifier 逻辑，但只处理实际需要替换的
+        for (src_s, src_o), (tgt_s, tgt_o) in replacement_dict.items():
+            # 检查DDL中是否包含这个对象引用（快速预检）
+            src_s_u = src_s.upper()
+            src_o_u = src_o.upper()
+            if src_s_u not in result.upper() or src_o_u not in result.upper():
+                continue
+            
+            # 执行精确替换
+            result = replace_identifier(result, src_s, src_o, tgt_s, tgt_o)
+        
+        # 处理裸名引用（无schema前缀）
         src_schema_u = src_schema.upper()
-        for (src_pair, tgt_pair) in extra_identifiers:
-            if src_pair[0].upper() != src_schema_u:
+        for (src_s, src_o), (tgt_s, tgt_o) in replacement_dict.items():
+            if src_s.upper() != src_schema_u:
                 continue
-            if src_pair[1].upper() == src_name.upper():
+            if src_o.upper() == src_name.upper():
                 continue
-            if (src_pair[0].upper(), src_pair[1].upper()) == (tgt_pair[0].upper(), tgt_pair[1].upper()):
+            if (src_s.upper(), src_o.upper()) == (tgt_s.upper(), tgt_o.upper()):
                 continue
-            result = replace_unqualified_identifier(
-                result,
-                src_pair[1],
-                tgt_pair[0],
-                tgt_pair[1]
-            )
+            # 快速预检
+            if src_o.upper() not in result.upper():
+                continue
+            result = replace_unqualified_identifier(result, src_o, tgt_s, tgt_o)
 
     def qualify_main_object_creation(text: str) -> str:
         """在 remap 后为主对象的 CREATE 语句补全 schema 前缀。"""
@@ -4694,6 +5034,444 @@ USING_INDEX_PATTERN_SIMPLE = re.compile(
     re.IGNORECASE
 )
 MV_REFRESH_ON_DEMAND_PATTERN = re.compile(r'\s+ON\s+DEMAND', re.IGNORECASE)
+
+
+def clean_plsql_ending(ddl: str) -> str:
+    """
+    清理PL/SQL对象结尾的语法问题
+    
+    问题：Oracle允许 END XXXX; 后跟单独的 ; 和 /，但OceanBase要求只能是 /
+    修复：移除 END 语句后多余的分号，保留最后的 /
+    """
+    if not ddl:
+        return ddl
+    
+    lines = ddl.split('\n')
+    cleaned_lines = []
+    i = 0
+    
+    while i < len(lines):
+        line = lines[i].strip()
+        
+        # 检查是否是 END 语句
+        if re.match(r'^\s*END\s+\w+\s*;\s*$', line, re.IGNORECASE):
+            cleaned_lines.append(lines[i])  # 保留原始格式的 END 语句
+            i += 1
+            
+            # 跳过后续的单独分号行
+            while i < len(lines):
+                next_line = lines[i].strip()
+                if next_line == ';':
+                    i += 1  # 跳过单独的分号
+                elif next_line == '/':
+                    cleaned_lines.append(lines[i])  # 保留斜杠
+                    i += 1
+                    break
+                elif next_line == '':
+                    cleaned_lines.append(lines[i])  # 保留空行
+                    i += 1
+                else:
+                    # 遇到其他内容，停止处理
+                    break
+        else:
+            cleaned_lines.append(lines[i])
+            i += 1
+    
+    return '\n'.join(cleaned_lines)
+
+
+def clean_extra_semicolons(ddl: str) -> str:
+    """
+    清理多余的分号
+    
+    问题：某些语句可能有连续的分号 ;;
+    修复：将连续分号替换为单个分号
+    """
+    if not ddl:
+        return ddl
+    
+    # 替换连续的分号为单个分号
+    cleaned = re.sub(r';+', ';', ddl)
+    return cleaned
+
+
+def clean_extra_dots(ddl: str) -> str:
+    """
+    清理多余的点号
+    
+    问题：对象名可能有多余的点，如 SCHEMA..TABLE
+    修复：将连续点号替换为单个点号
+    """
+    if not ddl:
+        return ddl
+    
+    # 替换连续的点号为单个点号
+    cleaned = re.sub(r'\.+', '.', ddl)
+    return cleaned
+
+
+def clean_trailing_whitespace(ddl: str) -> str:
+    """
+    清理行尾空白字符
+    """
+    if not ddl:
+        return ddl
+    
+    lines = ddl.split('\n')
+    cleaned_lines = [line.rstrip() for line in lines]
+    return '\n'.join(cleaned_lines)
+
+
+def clean_empty_lines(ddl: str) -> str:
+    """
+    清理多余的空行（保留适当的空行）
+    """
+    if not ddl:
+        return ddl
+    
+    # 将连续的多个空行替换为最多2个空行
+    cleaned = re.sub(r'\n\s*\n\s*\n+', '\n\n\n', ddl)
+    return cleaned
+
+
+def extract_trigger_table_references(ddl: str) -> Set[str]:
+    """
+    从触发器DDL中提取引用的表名
+    
+    Args:
+        ddl: 触发器的DDL语句
+    
+    Returns:
+        引用表名的集合，格式为 SCHEMA.TABLE_NAME
+    """
+    if not ddl:
+        return set()
+    
+    table_refs = set()
+    
+    # 提取 ON 子句中的表名（触发器定义的表）
+    on_pattern = r'\bON\s+([A-Z_][A-Z0-9_]*(?:\.[A-Z_][A-Z0-9_]*)?)'
+    matches = re.findall(on_pattern, ddl, re.IGNORECASE)
+    for match in matches:
+        table_name = match.strip().strip('"').upper()
+        if '.' in table_name:
+            table_refs.add(table_name)
+    
+    # 提取触发器体中的表引用（INSERT INTO, UPDATE, DELETE FROM等）
+    body_patterns = [
+        r'\bINSERT\s+INTO\s+([A-Z_][A-Z0-9_]*(?:\.[A-Z_][A-Z0-9_]*)?)',
+        r'\bUPDATE\s+([A-Z_][A-Z0-9_]*(?:\.[A-Z_][A-Z0-9_]*)?)',
+        r'\bDELETE\s+FROM\s+([A-Z_][A-Z0-9_]*(?:\.[A-Z_][A-Z0-9_]*)?)',
+        r'\bFROM\s+([A-Z_][A-Z0-9_]*(?:\.[A-Z_][A-Z0-9_]*)?)',
+        r'\bJOIN\s+([A-Z_][A-Z0-9_]*(?:\.[A-Z_][A-Z0-9_]*)?)',
+    ]
+    
+    for pattern in body_patterns:
+        matches = re.findall(pattern, ddl, re.IGNORECASE)
+        for match in matches:
+            table_name = match.strip().strip('"').upper()
+            if '.' in table_name and not table_name.startswith(':'):  # 排除绑定变量
+                table_refs.add(table_name)
+    
+    return table_refs
+
+
+def remap_trigger_table_references(
+    ddl: str,
+    full_object_mapping: FullObjectMapping
+) -> str:
+    """
+    根据remap规则重写触发器DDL中的表引用
+    
+    Args:
+        ddl: 原始触发器DDL
+        full_object_mapping: 完整的对象映射
+    
+    Returns:
+        重写后的DDL
+    """
+    if not ddl:
+        return ddl
+    
+    # 提取表引用
+    table_refs = extract_trigger_table_references(ddl)
+    
+    # 构建替换映射
+    replacements = {}
+    for table_ref in table_refs:
+        # 查找该表的目标映射
+        tgt_name = find_mapped_target_any_type(
+            full_object_mapping,
+            table_ref,
+            preferred_types=("TABLE",)
+        )
+        if tgt_name:
+            replacements[table_ref] = tgt_name
+
+    # 执行替换
+    result_ddl = ddl
+    for src_ref, tgt_ref in replacements.items():
+        # 使用词边界确保精确匹配，避免部分匹配
+        pattern = r'\b' + re.escape(src_ref) + r'\b'
+        result_ddl = re.sub(pattern, tgt_ref, result_ddl, flags=re.IGNORECASE)
+        log.debug("[TRIGGER] 重映射表引用: %s -> %s", src_ref, tgt_ref)
+    
+    return result_ddl
+
+
+def remap_plsql_object_references(
+    ddl: str,
+    obj_type: str,
+    full_object_mapping: FullObjectMapping
+) -> str:
+    """
+    重映射PL/SQL对象（PROCEDURE、FUNCTION、PACKAGE等）中的对象引用
+    
+    Args:
+        ddl: 原始DDL
+        obj_type: 对象类型
+        full_object_mapping: 完整的对象映射
+    
+    Returns:
+        重写后的DDL
+    """
+    if not ddl:
+        return ddl
+    
+    obj_type_upper = obj_type.upper()
+    
+    # 触发器需要特殊处理表引用
+    if obj_type_upper == 'TRIGGER':
+        return remap_trigger_table_references(ddl, full_object_mapping)
+    
+    # 其他PL/SQL对象的通用处理
+    # 提取可能的对象引用（简化版本，可以根据需要扩展）
+    object_refs = set()
+    
+    # 查找 SCHEMA.OBJECT 格式的引用
+    ref_pattern = r'\b([A-Z_][A-Z0-9_]*\.[A-Z_][A-Z0-9_]*)\b'
+    matches = re.findall(ref_pattern, ddl, re.IGNORECASE)
+    for match in matches:
+        ref_name = match.strip().strip('"').upper()
+        if '.' in ref_name:
+            object_refs.add(ref_name)
+    
+    # 构建替换映射 - O(1) 查找，按类型优先级决策，避免全表扫描
+    replacements = {}
+    preferred_types = (
+        "TABLE", "VIEW", "MATERIALIZED VIEW", "SEQUENCE",
+        "SYNONYM", "PACKAGE", "PACKAGE BODY", "FUNCTION",
+        "PROCEDURE", "TYPE", "TYPE BODY", "TRIGGER"
+    )
+    for obj_ref in object_refs:
+        tgt_name = find_mapped_target_any_type(
+            full_object_mapping,
+            obj_ref,
+            preferred_types=preferred_types
+        )
+        if tgt_name:
+            replacements[obj_ref] = tgt_name
+
+    # 执行替换
+    result_ddl = ddl
+    for src_ref, tgt_ref in replacements.items():
+        pattern = r'\b' + re.escape(src_ref) + r'\b'
+        result_ddl = re.sub(pattern, tgt_ref, result_ddl, flags=re.IGNORECASE)
+        log.debug("[%s] 重映射对象引用: %s -> %s", obj_type_upper, src_ref, tgt_ref)
+    
+    return result_ddl
+
+
+def clean_oracle_hints(ddl: str) -> str:
+    """移除Oracle特有的Hint语法"""
+    if not ddl:
+        return ddl
+    return re.sub(r'/\*\+[^*]*\*/', '', ddl, flags=re.DOTALL)
+
+
+def clean_storage_clauses(ddl: str) -> str:
+    """移除Oracle特有的存储子句"""
+    if not ddl:
+        return ddl
+    
+    # 移除STORAGE子句
+    cleaned = re.sub(r'\s+STORAGE\s*\([^)]+\)', '', ddl, flags=re.IGNORECASE)
+    
+    # 移除TABLESPACE子句（OceanBase可能不完全兼容）
+    cleaned = re.sub(r'\s+TABLESPACE\s+\w+', '', cleaned, flags=re.IGNORECASE)
+    
+    return cleaned
+
+
+def clean_pragma_statements(ddl: str) -> str:
+    """移除OceanBase不支持的PRAGMA语句"""
+    if not ddl:
+        return ddl
+    
+    # 移除PRAGMA AUTONOMOUS_TRANSACTION
+    cleaned = re.sub(r'\s*PRAGMA\s+AUTONOMOUS_TRANSACTION\s*;', '', ddl, flags=re.IGNORECASE)
+    
+    # 移除其他可能的PRAGMA语句
+    cleaned = re.sub(r'\s*PRAGMA\s+\w+[^;]*;', '', cleaned, flags=re.IGNORECASE)
+    
+    return cleaned
+
+
+def clean_oracle_specific_syntax(ddl: str) -> str:
+    """清理Oracle特有语法"""
+    if not ddl:
+        return ddl
+    
+    # 移除BFILE数据类型引用
+    cleaned = re.sub(r'\bBFILE\b', 'BLOB', ddl, flags=re.IGNORECASE)
+    
+    # 移除XMLTYPE特殊语法
+    cleaned = re.sub(r'\s+XMLTYPE\s+COLUMN\s+\w+\s+XMLSCHEMA[^;]*', '', cleaned, flags=re.IGNORECASE)
+    
+    return cleaned
+
+
+def clean_sequence_unsupported_options(ddl: str) -> str:
+    """移除 OceanBase 不支持的 SEQUENCE 选项"""
+    if not ddl:
+        return ddl
+    cleaned = ddl
+    # 删除 NOKEEP / NOSCALE / GLOBAL 选项，保留其余内容
+    for token in ("NOKEEP", "NOSCALE", "GLOBAL"):
+        cleaned = re.sub(rf"\s*\b{token}\b", " ", cleaned, flags=re.IGNORECASE)
+    # 收敛多余空格
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r" \n", "\n", cleaned)
+    return cleaned
+
+
+# DDL清理规则配置（更新为包含生产环境规则）
+DDL_CLEANUP_RULES = {
+    # PL/SQL对象需要特殊的结尾处理和PRAGMA清理
+    'PLSQL_OBJECTS': {
+        'types': ['PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'TYPE', 'TYPE BODY', 'TRIGGER'],
+        'rules': [
+            clean_plsql_ending,
+            clean_pragma_statements,
+            clean_oracle_hints,
+            clean_oracle_specific_syntax,
+            clean_extra_semicolons,
+            clean_extra_dots,
+            clean_trailing_whitespace,
+            clean_empty_lines,
+        ]
+    },
+    
+    # 表对象需要存储子句清理
+    'TABLE_OBJECTS': {
+        'types': ['TABLE'],
+        'rules': [
+            clean_storage_clauses,
+            clean_oracle_hints,
+            clean_oracle_specific_syntax,
+            clean_extra_semicolons,
+            clean_extra_dots,
+            clean_trailing_whitespace,
+            clean_empty_lines,
+        ]
+    },
+    
+    # SEQUENCE 对象需要移除 OceanBase 不支持的选项
+    'SEQUENCE_OBJECTS': {
+        'types': ['SEQUENCE'],
+        'rules': [
+            clean_sequence_unsupported_options,
+            clean_oracle_hints,
+            clean_oracle_specific_syntax,
+            clean_extra_semicolons,
+            clean_extra_dots,
+            clean_trailing_whitespace,
+            clean_empty_lines,
+        ]
+    },
+    
+    # 其他对象的通用清理
+    'GENERAL_OBJECTS': {
+        'types': ['VIEW', 'MATERIALIZED VIEW', 'SYNONYM'],
+        'rules': [
+            clean_oracle_hints,
+            clean_oracle_specific_syntax,
+            clean_extra_semicolons,
+            clean_extra_dots,
+            clean_trailing_whitespace,
+            clean_empty_lines,
+        ]
+    }
+}
+
+
+def apply_ddl_cleanup_rules(ddl: str, obj_type: str) -> str:
+    """
+    根据对象类型应用相应的DDL清理规则
+    
+    Args:
+        ddl: 原始DDL
+        obj_type: 对象类型
+    
+    Returns:
+        清理后的DDL
+    """
+    if not ddl:
+        return ddl
+    
+    obj_type_upper = obj_type.upper()
+    
+    # 确定使用哪套规则
+    rules_to_apply = []
+    
+    for rule_set_name, rule_set in DDL_CLEANUP_RULES.items():
+        if obj_type_upper in rule_set['types']:
+            rules_to_apply = rule_set['rules']
+            break
+    
+    # 如果没有匹配的规则，使用通用规则
+    if not rules_to_apply:
+        rules_to_apply = DDL_CLEANUP_RULES['GENERAL_OBJECTS']['rules']
+    
+    # 依次应用所有规则
+    cleaned_ddl = ddl
+    for rule_func in rules_to_apply:
+        try:
+            cleaned_ddl = rule_func(cleaned_ddl)
+        except Exception as exc:
+            log.warning("DDL清理规则 %s 执行失败: %s", rule_func.__name__, exc)
+    
+    return cleaned_ddl
+
+
+def add_custom_cleanup_rule(rule_name: str, obj_types: List[str], rule_func: Callable[[str], str]):
+    """
+    动态添加自定义清理规则
+    
+    Args:
+        rule_name: 规则名称
+        obj_types: 适用的对象类型列表
+        rule_func: 清理函数，接受DDL字符串，返回清理后的DDL
+    
+    Example:
+        def my_custom_rule(ddl: str) -> str:
+            return ddl.replace("OLD_SYNTAX", "NEW_SYNTAX")
+        
+        add_custom_cleanup_rule("my_rule", ["PROCEDURE", "FUNCTION"], my_custom_rule)
+    """
+    # 创建新的规则集或更新现有规则集
+    rule_set_name = f"CUSTOM_{rule_name.upper()}"
+    
+    if rule_set_name not in DDL_CLEANUP_RULES:
+        DDL_CLEANUP_RULES[rule_set_name] = {
+            'types': [t.upper() for t in obj_types],
+            'rules': []
+        }
+    
+    # 添加规则函数
+    DDL_CLEANUP_RULES[rule_set_name]['rules'].append(rule_func)
+    
+    log.info("已添加自定义DDL清理规则: %s，适用于对象类型: %s", rule_name, obj_types)
 
 
 def normalize_ddl_for_ob(ddl: str) -> str:
@@ -4867,14 +5645,13 @@ def format_oracle_column_type(
     if '(' in dt and override_length is None:
         return apply_varchar_pref(dt)
 
-    # Character semantics helper (only for CHAR/VARCHAR2)
+    # Length semantics suffix for VARCHAR/VARCHAR2 (CHAR vs BYTE)
     def _char_suffix(base_type: str) -> str:
-        if base_type not in ("CHAR", "VARCHAR2"):
+        if base_type not in ("VARCHAR", "VARCHAR2"):
             return ""
         if char_used == "C":
             return " CHAR"
-        if char_used == "B":
-            return "" if base_type == "VARCHAR2" else " BYTE"
+        # BYTE 语义不需要显式指定（OceanBase 默认就是 BYTE）
         return ""
 
     # Choose effective length with optional override
@@ -4923,12 +5700,20 @@ def format_oracle_column_type(
             return f"INTERVAL DAY({day_prec}) TO SECOND({frac_prec})"
         return "INTERVAL DAY TO SECOND"
 
-    # Character types
-    if dt in ("CHAR", "VARCHAR2"):
+    # VARCHAR/VARCHAR2 with length semantics (CHAR vs BYTE)
+    if dt in ("VARCHAR", "VARCHAR2"):
         ln = _pick_length(char_length if char_used == "C" else (char_length or data_length))
         if ln is not None:
             return apply_varchar_pref(f"{dt}({int(ln)}){_char_suffix(dt)}")
         return apply_varchar_pref(dt)
+    
+    # CHAR type (separate from VARCHAR length semantics)
+    if dt == "CHAR":
+        ln = _pick_length(char_length if char_used == "C" else (char_length or data_length))
+        if ln is not None:
+            suffix = " CHAR" if char_used == "C" else ""
+            return f"{dt}({int(ln)}){suffix}"
+        return dt
 
     # National character types (length is character-based; no CHAR/BYTE suffix)
     if dt in ("NCHAR", "NVARCHAR2"):
@@ -4975,6 +5760,12 @@ def inflate_table_varchar_lengths(
         dtype = (info.get("data_type") or "").strip().upper()
         if dtype not in ("VARCHAR2", "VARCHAR"):
             continue
+        
+        # 只对BYTE语义的列进行放大，CHAR语义保持原样
+        char_used = (info.get("char_used") or "").strip().upper()
+        if char_used == 'C':
+            continue
+        
         src_len = info.get("char_length") or info.get("data_length")
         try:
             src_len_int = int(src_len)
@@ -5075,11 +5866,14 @@ def generate_alter_for_table_columns(
                 f"ADD ({col_u} {col_type}{default_clause}{nullable_clause});"
             )
 
-    # 为新增列生成注释语句
+    # 为新增列生成注释语句（过滤OMS列）
     col_comments = oracle_meta.column_comments.get((src_schema.upper(), src_table.upper()), {})
     added_col_comments: List[str] = []
     for col in sorted(missing_cols):
         col_u = col.upper()
+        # 跳过OMS列的注释
+        if is_ignored_oms_column(col_u):
+            continue
         comment = col_comments.get(col_u)
         if comment:
             # 转义单引号
@@ -5095,25 +5889,36 @@ def generate_alter_for_table_columns(
     # 长度不匹配：MODIFY
     if length_mismatches:
         lines.append("")
-        lines.append("-- 列长度不匹配 (目标端长度需在 [ceil(src*1.5), ceil(src*2.5)] 区间)：")
+        lines.append("-- 列长度不匹配：")
         for issue in length_mismatches:
             col_name, src_len, tgt_len, limit_len, issue_type = issue
             info = col_details.get(col_name)
             if not info:
                 continue
 
-            if issue_type == 'short':
-                # 在 OB 中，VARCHAR2 等同于 VARCHAR；放大到校验下限
+            if issue_type == 'char_mismatch':
+                # CHAR语义：要求长度完全一致
+                modified_type = format_oracle_column_type(
+                    info,
+                    override_length=src_len,
+                    prefer_ob_varchar=True
+                )
+                lines.append(
+                    f"ALTER TABLE {tgt_schema_u}.{tgt_table_u} "
+                    f"MODIFY ({col_name.upper()} {modified_type}); "
+                    f"-- CHAR语义，源长度: {src_len}, 目标长度: {tgt_len}, 要求一致"
+                )
+            elif issue_type == 'short':
+                # BYTE语义：放大到校验下限
                 modified_type = format_oracle_column_type(
                     info,
                     override_length=limit_len,
                     prefer_ob_varchar=True
                 )
-
                 lines.append(
                     f"ALTER TABLE {tgt_schema_u}.{tgt_table_u} "
                     f"MODIFY ({col_name.upper()} {modified_type}); "
-                    f"-- 源长度: {src_len}, 目标长度: {tgt_len}, 期望下限: {limit_len}"
+                    f"-- BYTE语义，源长度: {src_len}, 目标长度: {tgt_len}, 期望下限: {limit_len}"
                 )
             else:
                 lines.append(
@@ -5137,12 +5942,14 @@ def generate_alter_for_table_columns(
 
 def generate_fixup_scripts(
     ora_cfg: OraConfig,
+    ob_cfg: ObConfig,
     settings: Dict,
     tv_results: ReportResults,
     extra_results: ExtraCheckResults,
     master_list: MasterCheckList,
     oracle_meta: OracleMetadata,
     full_object_mapping: FullObjectMapping,
+    remap_rules: RemapRules,
     required_grants: Optional[Dict[str, Set[Tuple[str, str]]]] = None,
     dependency_report: Optional[DependencyReport] = None,
     ob_meta: Optional[ObMetadata] = None,
@@ -5191,8 +5998,8 @@ def generate_fixup_scripts(
     for src_name, type_map in full_object_mapping.items():
         for tgt_name in type_map.values():
             try:
-                src_schema, src_object = src_name.split('.')
-                tgt_schema, tgt_object = tgt_name.split('.')
+                src_schema, src_object = src_name.split('.', 1)
+                tgt_schema, tgt_object = tgt_name.split('.', 1)
             except ValueError:
                 continue
             key = (src_schema.upper(), src_object.upper(), tgt_schema.upper(), tgt_object.upper())
@@ -5202,6 +6009,20 @@ def generate_fixup_scripts(
             replacement_set.add(key)
 
     all_replacements = list(object_replacements)
+    
+    def get_relevant_replacements(src_schema: str) -> List[Tuple[Tuple[str, str], Tuple[str, str]]]:
+        """
+        只返回与指定源schema相关的replacements，大幅减少DDL处理时的正则替换次数。
+        相关规则包括：
+        1. 源schema匹配的规则
+        2. 目标schema匹配的规则（处理跨schema引用）
+        """
+        src_schema_u = src_schema.upper()
+        relevant = []
+        for (src_s, src_o), (tgt_s, tgt_o) in all_replacements:
+            if src_s.upper() == src_schema_u or tgt_s.upper() == src_schema_u:
+                relevant.append(((src_s, src_o), (tgt_s, tgt_o)))
+        return relevant
 
     obj_type_to_dir = {
         'TABLE': 'table',
@@ -5258,7 +6079,7 @@ def generate_fixup_scripts(
             .get(obj_type.upper(), {})
             .get(obj_name.upper())
         )
-        source_label = "DBCAT_UNKNOWN"
+        source_label = "MISSING"
         elapsed_hint = None
 
         if ddl:
@@ -5270,6 +6091,10 @@ def generate_fixup_scripts(
                     elapsed_hint = time.time() - start_time
                 else:
                     elapsed_hint = meta[1]
+            else:
+                # DDL存在但无元数据，可能是缓存部分加载
+                source_label = "DBCAT"
+                elapsed_hint = time.time() - start_time
         else:
             ddl = get_fallback_ddl(schema, obj_type, obj_name)
             if ddl:
@@ -5370,8 +6195,8 @@ def generate_fixup_scripts(
         obj_type_u = obj_type.upper()
         if '.' not in src_name or '.' not in tgt_name:
             continue
-        src_schema, src_obj = src_name.split('.')
-        tgt_schema, tgt_obj = tgt_name.split('.')
+        src_schema, src_obj = src_name.split('.', 1)
+        tgt_schema, tgt_obj = tgt_name.split('.', 1)
         if not allow_fixup(obj_type_u, tgt_schema):
             continue
         queue_request(src_schema, obj_type_u, src_obj)
@@ -5435,8 +6260,8 @@ def generate_fixup_scripts(
         src_name = table_map.get(table_str)
         if not src_name or '.' not in src_name:
             continue
-        src_schema, _ = src_name.split('.')
-        tgt_schema, _ = table_str.split('.')
+        src_schema, _ = src_name.split('.', 1)
+        tgt_schema, _ = table_str.split('.', 1)
         # 优先使用缺失映射对（源->目标），确保 dbcat 按源名导出
         if item.missing_mappings:
             for src_full, tgt_full in item.missing_mappings:
@@ -5490,14 +6315,24 @@ def generate_fixup_scripts(
     )
     log.info("[FIXUP] 进度日志间隔 %.0f 秒，可通过 progress_log_interval 配置。", progress_log_interval)
 
+    # 分离VIEW对象和其他对象（需要在使用前定义）
+    view_missing_objects: List[Tuple[str, str, str, str]] = []
+    non_view_missing_objects: List[Tuple[str, str, str, str, str]] = []
+    
+    for (obj_type, src_schema, src_obj, tgt_schema, tgt_obj) in other_missing_objects:
+        if obj_type.upper() == 'VIEW':
+            view_missing_objects.append((src_schema, src_obj, tgt_schema, tgt_obj))
+        else:
+            non_view_missing_objects.append((obj_type, src_schema, src_obj, tgt_schema, tgt_obj))
+
     dbcat_data, ddl_source_meta = fetch_dbcat_schema_objects(ora_cfg, settings, schema_requests)
 
     # 预取所有可能需要 fallback 的 DDL（dbcat 未命中的对象）
     fallback_ddl_cache: Dict[Tuple[str, str, str], str] = {}
     
-    # 收集需要 fallback 的对象
+    # 收集需要 fallback 的对象（排除VIEW，因为VIEW有专门处理）
     fallback_needed: List[Tuple[str, str, str]] = []
-    for obj_type, src_schema, src_obj, tgt_schema, tgt_obj in other_missing_objects:
+    for obj_type, src_schema, src_obj, tgt_schema, tgt_obj in non_view_missing_objects:
         # 检查 dbcat_data 中是否有
         if not dbcat_data.get(src_schema.upper(), {}).get(obj_type.upper(), {}).get(src_obj.upper()):
             fallback_needed.append((src_schema, obj_type, src_obj))
@@ -5608,7 +6443,11 @@ def generate_fixup_scripts(
     for src_schema, seq_name, tgt_schema, tgt_name in sequence_tasks:
         def _job(ss=src_schema, sn=seq_name, ts=tgt_schema, tn=tgt_name):
             try:
-                ddl, ddl_source_label, _elapsed = fetch_ddl_with_timing(ss, 'SEQUENCE', sn)
+                fetch_result = fetch_ddl_with_timing(ss, 'SEQUENCE', sn)
+                if len(fetch_result) != 3:
+                    log.error("[FIXUP] SEQUENCE fetch_ddl_with_timing 返回了 %d 个值，期望 3 个: %s", len(fetch_result), fetch_result)
+                    return
+                ddl, ddl_source_label, _elapsed = fetch_result
                 if not ddl:
                     log.warning("[FIXUP] 未找到 SEQUENCE %s.%s 的 dbcat DDL。", ss, sn)
                     mark_source('SEQUENCE', 'missing')
@@ -5625,12 +6464,13 @@ def generate_fixup_scripts(
                     sn,
                     ts,
                     tn,
-                    extra_identifiers=all_replacements,
+                    extra_identifiers=get_relevant_replacements(ss),
                     obj_type='SEQUENCE'
                 )
                 ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
                 ddl_adj = prepend_set_schema(ddl_adj, ts)
                 ddl_adj = normalize_ddl_for_ob(ddl_adj)
+                ddl_adj = apply_ddl_cleanup_rules(ddl_adj, 'SEQUENCE')
                 ddl_adj = strip_constraint_enable(ddl_adj)
                 filename = f"{ts}.{tn}.sql"
                 header = f"修补缺失的 SEQUENCE {ts}.{tn} (源: {ss}.{sn})"
@@ -5660,7 +6500,11 @@ def generate_fixup_scripts(
         def _job(ss=src_schema, st=src_table, ts=tgt_schema, tt=tgt_table):
             progress_label = "unknown"
             try:
-                ddl, ddl_source_label, _elapsed = fetch_ddl_with_timing(ss, 'TABLE', st)
+                fetch_result = fetch_ddl_with_timing(ss, 'TABLE', st)
+                if len(fetch_result) != 3:
+                    log.error("[FIXUP] TABLE fetch_ddl_with_timing 返回了 %d 个值，期望 3 个: %s", len(fetch_result), fetch_result)
+                    return
+                ddl, ddl_source_label, _elapsed = fetch_result
                 if not ddl:
                     log.warning("[FIXUP] 未找到 TABLE %s.%s 的 dbcat DDL。", ss, st)
                     mark_source('TABLE', 'missing')
@@ -5678,13 +6522,14 @@ def generate_fixup_scripts(
                     st,
                     ts,
                     tt,
-                    extra_identifiers=all_replacements,
+                    extra_identifiers=get_relevant_replacements(ss),
                     obj_type='TABLE'
                 )
                 ddl_adj = inflate_table_varchar_lengths(ddl_adj, ss, st, oracle_meta)
                 ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
                 ddl_adj = prepend_set_schema(ddl_adj, ts)
                 ddl_adj = normalize_ddl_for_ob(ddl_adj)
+                ddl_adj = apply_ddl_cleanup_rules(ddl_adj, 'TABLE')
                 ddl_adj = strip_constraint_enable(ddl_adj)
                 ddl_adj = strip_enable_novalidate(ddl_adj)
                 filename = f"{ts}.{tt}.sql"
@@ -5722,13 +6567,87 @@ def generate_fixup_scripts(
             header = f"基于列差异的 ALTER TABLE 修补脚本: {tgt_schema}.{tgt_table} (源: {src_schema}.{src_table})"
             write_fixup_file(base_dir, 'table_alter', filename, alter_sql, header)
 
+    # 获取OceanBase版本
+    ob_version = get_oceanbase_version(ob_cfg)
+    if ob_version:
+        log.info("[VIEW] 检测到OceanBase版本: %s", ob_version)
+    else:
+        log.warning("[VIEW] 无法获取OceanBase版本，将使用保守的DDL清理策略")
+
+    # 批量获取VIEW的DDL
+    view_ddl_cache: Dict[Tuple[str, str], str] = {}
+    if view_missing_objects:
+        view_objects_for_ddl = [(src_schema, src_obj) for src_schema, src_obj, _, _ in view_missing_objects]
+        view_ddl_cache = oracle_get_views_ddl_batch(ora_cfg, view_objects_for_ddl)
+
     log.info("[FIXUP] (4/9) 正在生成 VIEW / MATERIALIZED VIEW / 其他对象脚本...")
-    other_progress = build_progress_tracker(len(other_missing_objects), "[FIXUP] (4/9) 其他对象")
+    
+    # 处理VIEW对象
+    if view_missing_objects:
+        log.info("[FIXUP] (4a/9) 正在生成 %d 个VIEW脚本...", len(view_missing_objects))
+        for src_schema, src_obj, tgt_schema, tgt_obj in view_missing_objects:
+            try:
+                # 获取原始DDL
+                ddl_key = (src_schema, src_obj)
+                raw_ddl = view_ddl_cache.get(ddl_key)
+                if not raw_ddl:
+                    log.warning("[FIXUP] 未找到 VIEW %s.%s 的DDL", src_schema, src_obj)
+                    continue
+                
+                # 清理DDL使其兼容OceanBase
+                cleaned_ddl = clean_view_ddl_for_oceanbase(raw_ddl, ob_version)
+                
+                # 重写依赖对象引用
+                remapped_ddl = remap_view_dependencies(
+                    cleaned_ddl, 
+                    tgt_schema, 
+                    remap_rules, 
+                    full_object_mapping
+                )
+                
+                # 调整schema和对象名
+                final_ddl = adjust_ddl_for_object(
+                    remapped_ddl,
+                    src_schema,
+                    src_obj,
+                    tgt_schema,
+                    tgt_obj,
+                    extra_identifiers=get_relevant_replacements(src_schema),
+                    obj_type='VIEW'
+                )
+                
+                # 最终清理
+                final_ddl = cleanup_dbcat_wrappers(final_ddl)
+                final_ddl = prepend_set_schema(final_ddl, tgt_schema)
+                final_ddl = normalize_ddl_for_ob(final_ddl)
+                final_ddl = apply_ddl_cleanup_rules(final_ddl, 'VIEW')
+                final_ddl = strip_constraint_enable(final_ddl)
+                final_ddl = enforce_schema_for_ddl(final_ddl, tgt_schema, 'VIEW')
+                
+                # 确保DDL以分号结尾
+                if not final_ddl.rstrip().endswith(';'):
+                    final_ddl = final_ddl.rstrip() + ';'
+                
+                # 写入文件
+                filename = f"{tgt_schema}.{tgt_obj}.sql"
+                header = f"修补缺失的 VIEW {tgt_obj} (源: {src_schema}.{src_obj})"
+                log.info("[FIXUP][DBMS_METADATA] 写入 VIEW 脚本: %s", filename)
+                write_fixup_file(base_dir, 'view', filename, final_ddl, header)
+                
+            except Exception as exc:
+                log.error("[FIXUP] 处理 VIEW %s.%s 时出错: %s", src_schema, src_obj, exc)
+
+    # 处理非VIEW对象
+    other_progress = build_progress_tracker(len(non_view_missing_objects), "[FIXUP] (4b/9) 其他对象")
     other_jobs: List[Callable[[], None]] = []
-    for (obj_type, src_schema, src_obj, tgt_schema, tgt_obj) in other_missing_objects:
+    for (obj_type, src_schema, src_obj, tgt_schema, tgt_obj) in non_view_missing_objects:
         def _job(ot=obj_type, ss=src_schema, so=src_obj, ts=tgt_schema, to=tgt_obj):
             try:
-                ddl, ddl_source_label, _elapsed = fetch_ddl_with_timing(ss, ot, so)
+                fetch_result = fetch_ddl_with_timing(ss, ot, so)
+                if len(fetch_result) != 3:
+                    log.error("[FIXUP] fetch_ddl_with_timing 返回了 %d 个值，期望 3 个: %s", len(fetch_result), fetch_result)
+                    return
+                ddl, ddl_source_label, _elapsed = fetch_result
                 if not ddl:
                     log.warning("[FIXUP] 未找到 %s %s.%s 的 dbcat DDL。", ot, ss, so)
                     mark_source(ot, 'missing')
@@ -5745,12 +6664,16 @@ def generate_fixup_scripts(
                     so,
                     ts,
                     to,
-                    extra_identifiers=all_replacements,
+                    extra_identifiers=get_relevant_replacements(ss),
                     obj_type=ot
                 )
+                # 重映射PL/SQL对象中的对象引用
+                if ot.upper() in ['PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'TYPE', 'TYPE BODY']:
+                    ddl_adj = remap_plsql_object_references(ddl_adj, ot, full_object_mapping)
                 ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
                 ddl_adj = prepend_set_schema(ddl_adj, ts)
                 ddl_adj = normalize_ddl_for_ob(ddl_adj)
+                ddl_adj = apply_ddl_cleanup_rules(ddl_adj, ot)
                 ddl_adj = strip_constraint_enable(ddl_adj)
                 ddl_adj = enforce_schema_for_ddl(ddl_adj, ts, ot)
                 
@@ -5812,7 +6735,7 @@ def generate_fixup_scripts(
                             st,
                             ts,
                             tt,
-                            extra_identifiers=all_replacements,
+                            extra_identifiers=get_relevant_replacements(ss),
                             obj_type='INDEX'
                         )
                         ddl_adj = normalize_ddl_for_ob(ddl_adj)
@@ -5899,8 +6822,8 @@ def generate_fixup_scripts(
                         log.warning("[FIXUP] 未在 TABLE %s.%s 的 DDL 中找到约束 %s。", ss, st, cons_name_u)
                         continue
                     ddl_lines: List[str] = []
-                    # 合并 all_replacements 和 FK 引用表的映射
-                    constraint_replacements = all_replacements + fk_ref_replacements
+                    # 合并相关的 replacements 和 FK 引用表的映射
+                    constraint_replacements = get_relevant_replacements(ss) + fk_ref_replacements
                     for stmt in statements:
                         ddl_adj = adjust_ddl_for_object(
                             stmt,
@@ -5930,7 +6853,11 @@ def generate_fixup_scripts(
     for src_schema, trg_name, tgt_schema, tgt_obj in trigger_tasks:
         def _job(ss=src_schema, tn=trg_name, ts=tgt_schema, to=tgt_obj):
             try:
-                ddl, ddl_source_label, _elapsed = fetch_ddl_with_timing(ss, 'TRIGGER', tn)
+                fetch_result = fetch_ddl_with_timing(ss, 'TRIGGER', tn)
+                if len(fetch_result) != 3:
+                    log.error("[FIXUP] TRIGGER fetch_ddl_with_timing 返回了 %d 个值，期望 3 个: %s", len(fetch_result), fetch_result)
+                    return
+                ddl, ddl_source_label, _elapsed = fetch_result
                 if not ddl:
                     log.warning("[FIXUP] 未找到 TRIGGER %s.%s 的 dbcat DDL。", ss, tn)
                     mark_source('TRIGGER', 'missing')
@@ -5947,11 +6874,14 @@ def generate_fixup_scripts(
                     tn,
                     ts,
                     to,
-                    extra_identifiers=all_replacements,
+                    extra_identifiers=get_relevant_replacements(ss),
                     obj_type='TRIGGER'
                 )
+                # 重映射触发器中的表引用
+                ddl_adj = remap_plsql_object_references(ddl_adj, 'TRIGGER', full_object_mapping)
                 ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
                 ddl_adj = prepend_set_schema(ddl_adj, ts)
+                ddl_adj = apply_ddl_cleanup_rules(ddl_adj, 'TRIGGER')
                 ddl_adj = strip_constraint_enable(ddl_adj)
                 ddl_adj = enforce_schema_for_ddl(ddl_adj, ts, 'TRIGGER')
                 filename = f"{ts}.{to}.sql"
@@ -6161,7 +7091,8 @@ def print_final_report(
     report_file: Optional[Path] = None,
     object_counts_summary: Optional[ObjectCountSummary] = None,
     endpoint_info: Optional[Dict[str, Dict[str, str]]] = None,
-    schema_summary: Optional[Dict[str, List[str]]] = None
+    schema_summary: Optional[Dict[str, List[str]]] = None,
+    settings: Optional[Dict] = None
 ):
     custom_theme = Theme({
         "ok": "green",
@@ -6171,7 +7102,15 @@ def print_final_report(
         "header": "bold magenta",
         "title": "bold white on blue"
     })
-    console = Console(theme=custom_theme, record=report_file is not None)
+    # 从配置读取报告宽度，避免在nohup等非交互式环境下被截断为80
+    if settings:
+        try:
+            report_width = int(settings.get('report_width', 160))
+        except (TypeError, ValueError):
+            report_width = 160
+    else:
+        report_width = 160
+    console = Console(theme=custom_theme, record=report_file is not None, width=report_width)
 
     if extra_results is None:
         extra_results = {
@@ -6444,7 +7383,7 @@ def print_final_report(
 
         grouped_missing: Dict[str, List[Tuple[str, str, str]]] = defaultdict(list)
         for obj_type, tgt_name, src_name in tv_results['missing']:
-            tgt_schema = tgt_name.split('.')[0] if '.' in tgt_name else tgt_name
+            tgt_schema = tgt_name.split('.', 1)[0] if '.' in tgt_name else tgt_name
             grouped_missing[tgt_schema.upper()].append((obj_type, tgt_name, src_name))
 
         grouped_items = sorted(grouped_missing.items())
@@ -6486,13 +7425,17 @@ def print_final_report(
                     details.append("* 长度不匹配 (VARCHAR/2):\n", style="mismatch")
                     for issue in length_mismatches:
                         col, src_len, tgt_len, limit_len, issue_type = issue
-                        if issue_type == 'short':
+                        if issue_type == 'char_mismatch':
                             details.append(
-                                f"    - {col}: 源={src_len}, 目标={tgt_len}, 期望下限={limit_len}\n"
+                                f"    - {col}: 源={src_len} CHAR, 目标={tgt_len}, 要求一致\n"
+                            )
+                        elif issue_type == 'short':
+                            details.append(
+                                f"    - {col}: 源={src_len} BYTE, 目标={tgt_len}, 期望下限={limit_len}\n"
                             )
                         else:
                             details.append(
-                                f"    - {col}: 源={src_len}, 目标={tgt_len}, 上限允许={limit_len}\n"
+                                f"    - {col}: 源={src_len} BYTE, 目标={tgt_len}, 上限允许={limit_len}\n"
                             )
             table.add_row(tgt_name, details)
         console.print(table)
@@ -6860,7 +7803,7 @@ def main():
     for type_map in full_object_mapping.values():
         for tgt_name in type_map.values():
             try:
-                schema, _ = tgt_name.split('.')
+                schema, _ = tgt_name.split('.', 1)
                 target_schemas.add(schema.upper())
             except ValueError:
                 continue
@@ -6917,7 +7860,8 @@ def main():
             report_path,
             object_counts_summary,
             endpoint_info,
-            schema_summary
+            schema_summary,
+            settings
         )
         return
 
@@ -7016,12 +7960,14 @@ def main():
         log.info('已开启修补脚本生成，开始写入 %s 目录...', fixup_dir_label)
         generate_fixup_scripts(
             ora_cfg,
+            ob_cfg,
             settings,
             tv_results,
             extra_results,
             master_list,
             oracle_meta,
             full_object_mapping,
+            remap_rules,
             required_grants,
             dependency_report,
             ob_meta,
@@ -7041,7 +7987,8 @@ def main():
         report_path,
         object_counts_summary,
         endpoint_info,
-        schema_summary
+        schema_summary,
+        settings
     )
 
 

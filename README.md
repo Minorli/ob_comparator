@@ -16,7 +16,10 @@
 
 - 一次转储本地对比：Oracle 使用 Thick Mode + `DBMS_METADATA`，OceanBase 通过几次 `obclient` 调用批量拉取 `DBA_*` 视图，避免循环调库。
 - 覆盖的对象类型包括 `TABLE/VIEW/MATERIALIZED VIEW/PROCEDURE/FUNCTION/PACKAGE/PACKAGE BODY/SYNONYM/JOB/SCHEDULE/TYPE/TYPE BODY`，并扩展检查 `INDEX/CONSTRAINT/SEQUENCE/TRIGGER`。
-- 表校验除了存在性外，还会校验列名集合与 `VARCHAR/VARCHAR2` 长度（目标端需在 `[ceil(1.5*x), ceil(2.5*x)]` 区间），并生成 `ALTER TABLE` 修补建议。
+- 表校验除了存在性外，还会校验列名集合与 `VARCHAR/VARCHAR2` 长度：
+  - **BYTE语义**（如 `VARCHAR2(100) BYTE`）：目标端需在 `[ceil(1.5*x), ceil(2.5*x)]` 区间
+  - **CHAR语义**（如 `VARCHAR2(100) CHAR`）：目标端需与源端长度完全一致
+  - 自动生成相应的 `ALTER TABLE` 修补建议
 - 新增表/列注释一致性检查（DBA_TAB_COMMENTS / DBA_COL_COMMENTS），支持通过 `check_comments` 开关关闭，批量查询仅覆盖待校验的表，避免全库扫描。
 - Remap 规则检查：源端不存在的 Remap 条目会被识别并另存到同目录的 `*_invalid.txt` 便于复查，原始 `remap_rules.txt` 不会被修改。
 - 自动收集 `DBA_DEPENDENCIES` 并映射到目标 schema，输出缺失/多余依赖、依赖重编译脚本和所需 `GRANT`。
@@ -34,11 +37,11 @@
 | `config.ini` | 样例配置（Oracle/OceanBase 连接、Instant Client、dbcat、输出目录等）。 |
 | `remap_rules.txt` | 默认 Remap（指向 `gorgon_knot_case`），其他场景的 Remap 位于各自目录。 |
 | `README.md` | 本文档，使用说明和配置指南。 |
-| `README_CROSS_PLATFORM.md` | 离线/跨平台 wheelhouse 打包与交付指南。 |
-| `REMAP_INFERENCE_GUIDE.md` | Remap推导能力详细说明（多对一、一对一、一对多场景）。 |
-| `DESIGN.md` | 设计/架构说明。 |
-| `CHANGELOG.md` | 版本变更记录。 |
-| `AUDIT_REPORT.md` | 程序一致性审核报告。 |
+| `docs/README_CROSS_PLATFORM.md` | 离线/跨平台 wheelhouse 打包与交付指南。 |
+| `docs/REMAP_INFERENCE_GUIDE.md` | Remap推导能力详细说明（多对一、一对一、一对多场景）。 |
+| `docs/DESIGN.md` | 设计/架构说明。 |
+| `docs/CHANGELOG.md` | 版本变更记录。 |
+| `docs/AUDIT_REPORT.md` | 程序一致性审核报告。 |
 | `fixup_scripts/` | 最近一次校验生成的修补脚本（含 `grants/`, `table_alter/`, `materialized_view/` 等）。 |
 | `dbcat_output/` | dbcat 导出的 DDL 缓存（支持复用）。 |
 | `main_reports/` | `rich` 渲染的文本报告，文件名格式 `report_<timestamp>.txt`。 |
@@ -82,15 +85,21 @@ pip install -r requirements.txt
   - `fixup_dir`：修补脚本输出目录（默认 `fixup_scripts`）。
   - `report_dir`：报告输出目录（默认 `main_reports`）。
   - `generate_fixup`：`true/false`，允许只跑对比不生成脚本。
+  - `fixup_schemas`：限定生成修补脚本的目标 schema 列表（逗号分隔，留空为全部）。
+  - `fixup_types`：限定生成修补脚本的对象类型（逗号分隔，留空为全部，如 `TABLE,VIEW,TRIGGER`）。
+  - `fixup_workers`：并发生成修补脚本的线程数（默认为 CPU 核心数，最多12）。
+  - `progress_log_interval`：进度日志输出间隔（秒，默认10）。
+  - `report_width`：报告宽度（默认160，避免 nohup 时被截断为80列）。
   - `check_primary_types`：限制本次主对象校验的类型，逗号分隔（如 `TABLE,VIEW`，留空为全量）。
   - `check_extra_types`：限制扩展校验的模块，默认 `index,constraint,sequence,trigger`，可按需删减。
   - `check_dependencies`：`true/false`，关闭后跳过依赖校验与授权建议。
+  - `print_dependency_chains`：`true/false`，是否输出依赖链路详细信息（默认 `true`）。
   - `check_comments`：`true/false`，控制是否比对表/列注释。
   - `infer_schema_mapping`：`true/false`，是否自动推导非TABLE对象的目标schema（默认 `true`）。
     - **多对一映射**（如 HERO_A + HERO_B → OLYMPIAN_A）：基于TABLE映射推导schema映射
     - **一对一映射**（如 GOD_A → PRIMORDIAL）：基于TABLE映射推导schema映射
     - **一对多映射**（如 MONSTER_A → TITAN_A + TITAN_B）：基于依赖分析智能推导（分析对象引用的表，选择出现次数最多的目标schema）
-    - 详细说明请参考 `REMAP_INFERENCE_GUIDE.md`
+    - 详细说明请参考 `docs/REMAP_INFERENCE_GUIDE.md`
   - `dbcat_chunk_size`：单次传给 dbcat 的对象数，默认 `150`，可调大以减少批次数。
   - `obclient_timeout`：每次 `obclient` 调用的超时（秒，默认 60）。
   - `cli_timeout`：shell 工具（如 dbcat）超时，默认 600 秒。
@@ -215,4 +224,4 @@ python3 run_fixup.py [optional/path/to/config.ini]
 
 ---
 
-欢迎根据自身需求扩展 remap 规则、接入 CI、或把工具集成到更大的迁移流水线中。若需了解内部实现和设计动机，请继续阅读 `DESIGN.md`。祝迁移顺利!
+欢迎根据自身需求扩展 remap 规则、接入 CI、或把工具集成到更大的迁移流水线中。若需了解内部实现和设计动机，请继续阅读 `docs/DESIGN.md`。祝迁移顺利!
