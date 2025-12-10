@@ -7,3 +7,4 @@ venv
 test_scenarios
 history
 __pycache__
+docs
