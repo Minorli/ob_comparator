@@ -2707,105 +2707,63 @@ def build_expected_dependency_pairs(
     return expected, skipped
 
 
-def to_raw_dependency_pairs(
-    dependencies: List[DependencyRecord]
-) -> Set[Tuple[str, str, str, str]]:
-    """
-    将 DependencyRecord 列表转换为 (dep_full, dep_type, ref_full, ref_type) 集合（源端视角）。
-    """
-    raw_pairs: Set[Tuple[str, str, str, str]] = set()
-    for dep in dependencies:
-        dep_key = f"{dep.owner}.{dep.name}".upper()
-        ref_key = f"{dep.referenced_owner}.{dep.referenced_name}".upper()
-        raw_pairs.add((dep_key, dep.object_type.upper(), ref_key, dep.referenced_type.upper()))
-    return raw_pairs
-
-
 def export_dependency_chains(
     expected_pairs: Set[Tuple[str, str, str, str]],
-    output_path: Path,
-    source_pairs: Optional[Set[Tuple[str, str, str, str]]] = None
+    output_path: Path
 ) -> Optional[Path]:
     """
-    输出依赖链，支持：
-      - 源端（Oracle）依赖链
-      - 目标端（Remap 后）依赖链
-    依赖链会“下探”直到终点（无进一步依赖或 TABLE/MVIEW），并打印每条路径。
+    将 remap 后的依赖关系按“依赖在前”的拓扑顺序输出到文件，便于审计和排查。
+    若存在环会记录警告，并将环内节点依旧输出（按 DFS 顺序）。
     """
-    if not expected_pairs and not source_pairs:
+    if not expected_pairs:
         return None
 
-    def _build_chains(pairs: Set[Tuple[str, str, str, str]], label: str) -> Tuple[List[str], List[str]]:
-        if not pairs:
-            return [], []
-        graph: Dict[str, Set[str]] = defaultdict(set)  # dependent -> {referenced}
-        type_map: Dict[str, str] = {}
-        reverse_refs: Dict[str, Set[str]] = defaultdict(set)
+    graph: Dict[str, Set[str]] = defaultdict(set)  # dependent -> {referenced}
+    type_map: Dict[str, str] = {}
 
-        for dep_name, dep_type, ref_name, ref_type in pairs:
-            dep = dep_name.upper()
-            ref = ref_name.upper()
-            graph[dep].add(ref)
-            reverse_refs[ref].add(dep)
-            type_map.setdefault(dep, dep_type.upper())
-            type_map.setdefault(ref, ref_type.upper())
+    for dep_name, dep_type, ref_name, ref_type in expected_pairs:
+        dep = dep_name.upper()
+        ref = ref_name.upper()
+        graph[dep].add(ref)
+        type_map.setdefault(dep, dep_type.upper())
+        type_map.setdefault(ref, ref_type.upper())
 
-        # 选择根节点（未被其他对象引用的节点）；若无根，则全部节点皆为起点
-        roots = [n for n in type_map.keys() if n not in reverse_refs]
-        if not roots:
-            roots = sorted(type_map.keys())
+    order: List[str] = []
+    visiting: Set[str] = set()
+    visited: Set[str] = set()
+    cycles: List[str] = []
 
-        chains: List[str] = []
-        cycles: List[str] = []
+    def dfs(node: str, stack: List[str]) -> None:
+        if node in visited:
+            return
+        if node in visiting:
+            cycles.append(" -> ".join(stack + [node]))
+            return
+        visiting.add(node)
+        for ref in sorted(graph.get(node, set())):
+            dfs(ref, stack + [node])
+        visiting.remove(node)
+        visited.add(node)
+        order.append(node)
 
-        def dfs(node: str, path: List[Tuple[str, str]], seen: Set[str]) -> None:
-            node_u = node.upper()
-            obj_type = type_map.get(node_u, "UNKNOWN")
-            if node_u in seen:
-                cycle_path = " -> ".join([f"{n}({t})" for n, t in path] + [f"{node_u}(CYCLE)"])
-                cycles.append(cycle_path)
-                return
-            path_next = path + [(node_u, obj_type)]
-            refs = sorted(graph.get(node_u, set()))
-            # 终点条件：无引用或到达 TABLE/MATERIALIZED VIEW
-            if not refs or obj_type in ("TABLE", "MATERIALIZED VIEW"):
-                chains.append(" -> ".join(f"{n}({t})" for n, t in path_next))
-                return
-            for ref in refs:
-                dfs(ref, path_next, seen | {node_u})
-
-        for root in sorted(roots):
-            dfs(root, [], set())
-
-        return chains, cycles
-
-    target_chains, target_cycles = _build_chains(expected_pairs, "TARGET")
-    source_chains, source_cycles = _build_chains(source_pairs or set(), "SOURCE") if source_pairs else ([], [])
+    for node in sorted(type_map.keys()):
+        dfs(node, [])
 
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open('w', encoding='utf-8') as f:
-            f.write("# 依赖链下探（终点为 TABLE/MVIEW 或无进一步依赖）\n")
-            f.write(f"# 目标端依赖数: {len(expected_pairs)}, 源端依赖数: {len(source_pairs or [])}\n\n")
-
-            if source_chains:
-                f.write("[SOURCE - ORACLE] 依赖链:\n")
-                for idx, line in enumerate(source_chains, 1):
-                    f.write(f"{idx:05d}. {line}\n")
-                if source_cycles:
-                    f.write("\n[SOURCE] 检测到依赖环:\n")
-                    for cyc in source_cycles:
-                        f.write(f"- {cyc}\n")
-                f.write("\n")
-
-            f.write("[TARGET - REMAPPED] 依赖链:\n")
-            for idx, line in enumerate(target_chains, 1):
-                f.write(f"{idx:05d}. {line}\n")
-            if target_cycles:
-                f.write("\n[TARGET] 检测到依赖环:\n")
-                for cyc in target_cycles:
-                    f.write(f"- {cyc}\n")
+            f.write("# 依赖链拓扑序（依赖对象在前，引用者在后）\n")
+            f.write(f"# 对象数: {len(type_map)}, 依赖边数: {len(expected_pairs)}\n")
+            if cycles:
+                f.write(f"# 检测到依赖环 {len(cycles)} 条，以下输出为 DFS 顺序，需人工确认：\n")
+                for cyc in cycles:
+                    f.write(f"#   cycle: {cyc}\n")
             f.write("\n")
+            for idx, name in enumerate(order, 1):
+                obj_type = type_map.get(name, "UNKNOWN")
+                deps = sorted(graph.get(name, set()))
+                dep_str = ", ".join(deps) if deps else "<无直接依赖>"
+                f.write(f"{idx:05d}. {name} ({obj_type})\n    depends on: {dep_str}\n\n")
     except OSError as exc:
         log.warning("写入依赖链文件失败: %s", exc)
         return None
@@ -6939,50 +6897,6 @@ def generate_fixup_scripts(
                             statements = [stmt]
                             mark_source('CONSTRAINT', 'fallback')
                             source_label = "META"
-                        elif cons_meta and ctype == 'R':
-                            # 尝试基于元数据重建外键
-                            ref_owner = cons_meta.get("ref_table_owner") or cons_meta.get("r_owner")
-                            ref_table = cons_meta.get("ref_table_name")
-                            ref_cons = cons_meta.get("r_constraint")
-                            ref_cols: List[str] = []
-                            if ref_owner and ref_table:
-                                ref_owner_u = ref_owner.upper()
-                                ref_table_u = ref_table.upper()
-                                ref_key = (ref_owner_u, ref_table_u)
-                                # 优先使用引用的约束列，否则取该表的 PK/UK
-                                if ref_cons:
-                                    ref_cons_u = ref_cons.upper()
-                                    ref_info = constraints.get(ref_key, {}).get(ref_cons_u, {})
-                                    ref_cols = ref_info.get("columns") or []
-                                if not ref_cols:
-                                    ref_tbl_cons = constraints.get(ref_key, {})
-                                    for cand in ref_tbl_cons.values():
-                                        ctype_cand = (cand.get("type") or "").upper()
-                                        if ctype_cand in ("P", "U"):
-                                            ref_cols = cand.get("columns") or []
-                                            if ref_cols:
-                                                break
-                            if cols and ref_owner and ref_table and ref_cols:
-                                ref_tgt_full = get_mapped_target(
-                                    full_object_mapping,
-                                    f"{ref_owner}.{ref_table}",
-                                    'TABLE'
-                                ) or f"{ref_owner}.{ref_table}"
-                                if '.' in ref_tgt_full:
-                                    ref_tgt_schema, ref_tgt_table = ref_tgt_full.split('.', 1)
-                                else:
-                                    ref_tgt_schema, ref_tgt_table = ref_owner.upper(), ref_table.upper()
-                                stmt = (
-                                    f"ALTER TABLE {ts}.{tt} "
-                                    f"ADD CONSTRAINT {cons_name_u} FOREIGN KEY ({', '.join(cols)}) "
-                                    f"REFERENCES {ref_tgt_schema}.{ref_tgt_table} ({', '.join(ref_cols)})"
-                                )
-                                statements = [stmt]
-                                mark_source('CONSTRAINT', 'fallback')
-                                source_label = "META"
-                                # 跨 schema FK 需要 grant
-                                if ref_tgt_schema != ts.upper():
-                                    grants_map.setdefault(ts.upper(), set()).add(('REFERENCES', f"{ref_tgt_schema}.{ref_tgt_table}"))
                         elif cons_meta:
                             log.warning(
                                 "[FIXUP] 约束 %s 类型为 %s，无内联 DDL 可用，无法自动重建。",
@@ -8114,12 +8028,7 @@ def main():
         required_grants = compute_required_grants(expected_dependency_pairs)
         if settings.get("print_dependency_chains", True):
             dep_chain_path = report_dir / f"dependency_chains_{timestamp}.txt"
-            source_dep_pairs = to_raw_dependency_pairs(oracle_dependencies) if oracle_dependencies else set()
-            dependency_chain_file = export_dependency_chains(
-                expected_dependency_pairs,
-                dep_chain_path,
-                source_pairs=source_dep_pairs
-            )
+            dependency_chain_file = export_dependency_chains(expected_dependency_pairs, dep_chain_path)
             if dependency_chain_file:
                 log.info("依赖链路已输出: %s", dependency_chain_file)
             else:
