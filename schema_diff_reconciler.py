@@ -45,7 +45,7 @@
        后续所有对比均在 Python 内存数据结构中完成。
    - 避免 V12 中在循环中大量调用 obclient 的性能黑洞。
 
-4. 修补脚本生成：
+4. 目标端订正 SQL 生成：
    - 缺失对象：
        TABLE / VIEW / PROCEDURE / FUNCTION / PACKAGE / PACKAGE BODY / SYNONYM /
        INDEX / CONSTRAINT / SEQUENCE / TRIGGER
@@ -174,6 +174,14 @@ class DependencyIssue(NamedTuple):
     referenced: str
     referenced_type: str
     reason: str
+
+
+class SynonymMeta(NamedTuple):
+    owner: str
+    name: str
+    table_owner: str
+    table_name: str
+    db_link: Optional[str]
 
 
 DependencyReport = Dict[str, List[DependencyIssue]]
@@ -540,7 +548,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings['fixup_schema_list'] = [
             s.strip().upper() for s in settings.get('fixup_schemas', '').split(',') if s.strip()
         ]
-        # 注意：fixup 类型默认值需要包含 CONSTRAINT，否则约束修补脚本不会生成
+        # 注意：fixup 类型默认值需要包含 CONSTRAINT，否则约束订正 SQL 不会生成
         settings['fixup_type_set'] = parse_type_list(
             settings.get('fixup_types', ''),
             set(ALL_TRACKED_OBJECT_TYPES) | set(EXTRA_OBJECT_CHECK_TYPES),
@@ -600,7 +608,7 @@ def validate_runtime_paths(settings: Dict, ob_cfg: ObConfig) -> None:
     if generate_fixup_enabled:
         dbcat_bin = settings.get('dbcat_bin', '').strip()
         if not dbcat_bin:
-            warnings.append("generate_fixup 已开启，但未配置 dbcat_bin；如需生成修补脚本，请在 [SETTINGS] 中填写 dbcat 目录或 bin/dbcat 路径。")
+            warnings.append("generate_fixup 已开启，但未配置 dbcat_bin；如需生成订正 SQL，请在 [SETTINGS] 中填写 dbcat 目录或 bin/dbcat 路径。")
         else:
             dbcat_path = Path(dbcat_bin).expanduser()
             if not dbcat_path.exists():
@@ -759,7 +767,7 @@ def run_config_wizard(config_path: Path) -> None:
     _prompt_field(
         "SETTINGS",
         "generate_fixup",
-        "是否生成修补脚本 (true/false)",
+        "是否生成目标端订正 SQL (true/false)",
         default=cfg.get("SETTINGS", "generate_fixup", fallback="true"),
         transform=_bool_transform,
     )
@@ -806,19 +814,19 @@ def run_config_wizard(config_path: Path) -> None:
     _prompt_field(
         "SETTINGS",
         "fixup_dir",
-        "修补脚本输出目录",
+        "订正 SQL 输出目录",
         default=cfg.get("SETTINGS", "fixup_dir", fallback="fixup_scripts"),
     )
     _prompt_field(
         "SETTINGS",
         "fixup_schemas",
-        "限定生成修补脚本的目标 schema 列表 (逗号分隔，留空为全部)",
+        "限定生成订正 SQL 的目标 schema 列表 (逗号分隔，留空为全部)",
         default=cfg.get("SETTINGS", "fixup_schemas", fallback=""),
     )
     _prompt_field(
         "SETTINGS",
         "fixup_types",
-        "限定生成修补脚本的对象类型 (留空为全部，如 TABLE,VIEW,TRIGGER)",
+        "限定生成订正 SQL 的对象类型 (留空为全部，如 TABLE,VIEW,TRIGGER)",
         default=cfg.get("SETTINGS", "fixup_types", fallback=""),
     )
     _prompt_field(
@@ -1154,6 +1162,68 @@ def get_object_parent_tables(ora_cfg: OraConfig, schemas_list: List[str]) -> Obj
         log.warning(f"获取依附对象父表映射失败: {e}")
     
     return parent_map
+
+
+def load_synonym_metadata(
+    ora_cfg: OraConfig,
+    schemas_list: List[str],
+    allowed_target_schemas: Optional[List[str]] = None
+) -> Dict[Tuple[str, str], SynonymMeta]:
+    """
+    快速读取同义词定义，避免逐个 DBMS_METADATA 调用。
+    返回 {(OWNER, SYNONYM_NAME): SynonymMeta}
+    allowed_target_schemas: 当 owner=PUBLIC 时，仅保留指向这些 schema 的同义词，过滤掉系统自带的 PUBLIC 同义词。
+    """
+    if not schemas_list:
+        return {}
+
+    allowed_targets = {s.upper() for s in (allowed_target_schemas or [])}
+    placeholders = ','.join([f":{i+1}" for i in range(len(schemas_list))])
+    sql = f"""
+        SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME, DB_LINK
+        FROM DBA_SYNONYMS
+        WHERE OWNER IN ({placeholders})
+    """
+
+    result: Dict[Tuple[str, str], SynonymMeta] = {}
+    skipped_public = 0
+    try:
+        with oracledb.connect(
+            user=ora_cfg['user'],
+            password=ora_cfg['password'],
+            dsn=ora_cfg['dsn']
+        ) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(sql, schemas_list)
+                for row in cursor:
+                    owner = (row[0] or '').strip().upper()
+                    name = (row[1] or '').strip().upper()
+                    table_owner = (row[2] or '').strip().upper()
+                    table_name = (row[3] or '').strip().upper()
+                    db_link = (row[4] or '').strip().upper() if row[4] else None
+                    if not owner or not name or not table_name:
+                        continue
+                    if owner == 'PUBLIC' and allowed_targets and table_owner and table_owner.upper() not in allowed_targets:
+                        skipped_public += 1
+                        continue
+                    key = (owner, name)
+                    result[key] = SynonymMeta(
+                        owner=owner,
+                        name=name,
+                        table_owner=table_owner,
+                        table_name=table_name,
+                        db_link=db_link
+                    )
+    except oracledb.Error as exc:
+        log.warning("读取同义词元数据失败，将回退 DBMS_METADATA：%s", exc)
+
+    log.info(
+        "已缓存 %d 个同义词元数据（OWNER IN %s，跳过 PUBLIC 系统同义词 %d 个）。",
+        len(result),
+        ",".join(schemas_list),
+        skipped_public
+    )
+    return result
 
 
 def validate_remap_rules(
@@ -2034,11 +2104,12 @@ def dump_ob_metadata(
                     parts[3].strip().upper()
                 )
                 key = (t_owner, t_name)
-                if key not in indexes:
-                    indexes[key] = {}
-                if idx_name not in indexes[key]:
-                    indexes[key][idx_name] = {"uniqueness": "UNKNOWN", "columns": []}
-                indexes[key][idx_name]["columns"].append(col_name)
+                # 只有在 DBA_INDEXES 已有记录时才补充列，避免虚构 UNKNOWN 索引
+                idx_info = indexes.get(key, {}).get(idx_name)
+                if idx_info is None:
+                    log.debug("索引 %s.%s.%s 未出现在 DBA_INDEXES，跳过列信息。", t_owner, t_name, idx_name)
+                    continue
+                idx_info["columns"].append(col_name)
 
         # 过滤 OMS_* 自动索引
         for key in list(indexes.keys()):
@@ -4814,6 +4885,51 @@ def remap_view_dependencies(
     return result_ddl
 
 
+def remap_synonym_target(
+    ddl: str,
+    remap_rules: RemapRules,
+    full_object_mapping: FullObjectMapping
+) -> str:
+    """
+    将 SYNONYM 的 FOR 子句指向 remap 后的目标对象（支持跨 schema，如 PUBLIC 同义词）。
+    """
+    if not ddl:
+        return ddl
+
+    pattern = re.compile(
+        r'\bFOR\s+("?[A-Z0-9_\$#]+"?(?:\s*\.\s*"?[A-Z0-9_\$#]+"?)?)',
+        re.IGNORECASE
+    )
+
+    def _format_target(target: str, quoted_like_src: bool) -> str:
+        parts = target.upper().split('.', 1)
+        if len(parts) != 2:
+            return target.upper()
+        if quoted_like_src:
+            return '.'.join(f'"{p}"' for p in parts)
+        return target.upper()
+
+    def _repl(match: re.Match) -> str:
+        raw_target = match.group(1)
+        normalized = raw_target.replace('"', '').replace(' ', '').upper()
+        if '.' not in normalized:
+            return match.group(0)
+
+        mapped = find_mapped_target_any_type(
+            full_object_mapping,
+            normalized,
+            preferred_types=("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM")
+        ) or remap_rules.get(normalized)
+
+        if not mapped or '.' not in mapped:
+            return match.group(0)
+
+        new_target = _format_target(mapped, '"' in raw_target)
+        return f"FOR {new_target}"
+
+    return pattern.sub(_repl, ddl, count=1)
+
+
 def oracle_get_views_ddl_batch(
     ora_cfg: OraConfig,
     view_objects: List[Tuple[str, str]]  # [(schema, view_name), ...]
@@ -4999,7 +5115,7 @@ def adjust_ddl_for_object(
     def replace_unqualified_identifier(text: str, src_n: str, tgt_s: str, tgt_n: str) -> str:
         """
         当源对象在自身 schema 内被 remap 到其他 schema 时，源 DDL 中的无前缀引用
-        会错误地落到当前 schema。这里将裸名替换为目标 schema.对象名。
+        会错误地落到当前 schema。这里尽量只在“疑似对象引用”的上下文中替换，避免误伤列名/变量。
         """
         if not src_n or not tgt_s or not tgt_n:
             return text
@@ -5008,24 +5124,114 @@ def adjust_ddl_for_object(
         tgt_n_u = tgt_n.upper()
         tgt_full = f"{tgt_s_u}.{tgt_n_u}"
 
-        pattern = re.compile(rf'\b{re.escape(src_n_u)}\b', re.IGNORECASE)
+        name_pattern = re.compile(rf'\b{re.escape(src_n_u)}\b', re.IGNORECASE)
+        token_pattern = re.compile(r'[A-Z_][A-Z0-9_\$#]*', re.IGNORECASE)
+        stop_tokens = {
+            'SELECT', 'WHERE', 'GROUP', 'HAVING', 'ORDER', 'CONNECT', 'START',
+            'WITH', 'UNION', 'INTERSECT', 'MINUS', 'EXCEPT',
+            'WHEN', 'THEN', 'ELSE', 'BEGIN', 'DECLARE', 'IS', 'AS', 'LOOP', 'END',
+            'FETCH', 'CLOSE', 'OPEN', 'VALUES', 'SET', 'RETURN', 'CASE', 'OVER',
+            'PARTITION', 'CHECK', 'CONSTRAINT', 'PRIMARY', 'FOREIGN', 'UNIQUE',
+            'DEFAULT'
+        }
+
+        def _has_insert_or_merge(tokens: List[str]) -> bool:
+            """向前寻找 INSERT/MERGE（在遇到 stop token 前）。"""
+            for tok in reversed(tokens):
+                if tok in stop_tokens:
+                    return False
+                if tok in ('INSERT', 'MERGE'):
+                    return True
+            return False
+
+        def _nearest_context(tokens: List[str]) -> Optional[str]:
+            """
+            从后往前查找最近的上下文关键词（FROM/JOIN/UPDATE/DELETE/TRUNCATE/TABLE/INTO/USING/ON）。
+            遇到 stop token 则终止。
+            """
+            for tok in reversed(tokens):
+                if tok in stop_tokens:
+                    return None
+                if tok in ('FROM', 'JOIN', 'UPDATE', 'DELETE', 'TRUNCATE', 'TABLE'):
+                    return tok
+                if tok == 'INTO':
+                    return tok
+                if tok == 'USING':
+                    return 'USING'
+                if tok == 'ON':
+                    return 'ON'
+                if tok == 'REFERENCES':
+                    return 'REFERENCES'
+            return None
+
+        def _looks_like_namespace(after: str) -> bool:
+            """
+            判断是否是 pkg.func / seq.NEXTVAL 这类“名称后跟点”的调用。
+            允许 NEXTVAL/CURRVAL，或后续紧跟 ( / . 认为是包/类型访问。
+            """
+            m = re.match(r'\s*\.\s*([A-Z_][A-Z0-9_\$#]*)', after, re.IGNORECASE)
+            if not m:
+                return False
+            next_token = m.group(1).upper()
+            if next_token in ('NEXTVAL', 'CURRVAL'):
+                return True
+            rest = after[m.end():].lstrip()
+            return rest.startswith('(') or rest.startswith('.')
+
+        def _ddl_on_context(prefix: str) -> bool:
+            """
+            判断是否位于 DDL 中的 ON 子句（如 CREATE INDEX ... ON / TRIGGER ... ON）。
+            仅在 ON 紧跟对象名场景下允许替换，避免 JOIN ... ON 条件被误替换。
+            """
+            prefix_upper = prefix.upper().rstrip()
+            if not prefix_upper.endswith(' ON'):
+                return False
+            return bool(
+                re.search(r'\bINDEX\b', prefix_upper)
+                or re.search(r'\bTRIGGER\b', prefix_upper)
+                or re.search(r'\bMATERIALIZED\s+VIEW\s+LOG\b', prefix_upper)
+            )
 
         def _repl(match: re.Match) -> str:
-            start = match.start()
-            # 向前查找首个非空白字符，若为 '.' 则视为已限定 schema，不替换
+            start, end = match.span()
+            # 向前查首个非空白字符，若为 '.' 则已限定 schema
             idx = start - 1
             while idx >= 0 and text[idx].isspace():
                 idx -= 1
-            # 若存在引号包裹标识符，点号会出现在引号之前，需要跳过收尾引号再检查
             if idx >= 0 and text[idx] == '"':
                 idx -= 1
                 while idx >= 0 and text[idx].isspace():
                     idx -= 1
             if idx >= 0 and text[idx] == '.':
                 return match.group(0)
+
+            after = text[end:]
+            if _looks_like_namespace(after):
+                return tgt_full
+
+            tokens_before = [t.upper() for t in token_pattern.findall(text[:start])]
+            context = _nearest_context(tokens_before)
+            if not context:
+                prefix = text[max(0, start - 160):start]
+                if _ddl_on_context(prefix):
+                    return tgt_full
+                return match.group(0)
+            if context == 'INTO' and not _has_insert_or_merge(tokens_before):
+                return match.group(0)
+            if context == 'USING' and not _has_insert_or_merge(tokens_before):
+                return match.group(0)
+            if context == 'ON':
+                prefix = text[max(0, start - 160):start]
+                if not _ddl_on_context(prefix):
+                    return match.group(0)
+            if context == 'REFERENCES':
+                prefix = text[max(0, start - 80):start].upper().rstrip()
+                if not prefix.endswith('REFERENCES'):
+                    return match.group(0)
+                return tgt_full
             return tgt_full
 
-        return pattern.sub(_repl, text)
+        return name_pattern.sub(_repl, text)
 
     result = replace_identifier(ddl, src_schema, src_name, tgt_schema, tgt_name)
     
@@ -5115,6 +5321,9 @@ def adjust_ddl_for_object(
         return text
 
     if mapping_changed:
+        # PUBLIC SYNONYM 不应在对象名上补 schema 前缀，只需要改名
+        if obj_type and obj_type.upper() == 'SYNONYM' and tgt_schema_u == 'PUBLIC':
+            return result
         result = qualify_main_object_creation(result)
 
     return result
@@ -5460,6 +5669,14 @@ def clean_oracle_specific_syntax(ddl: str) -> str:
     return cleaned
 
 
+def clean_editionable_flags(ddl: str) -> str:
+    """移除 EDITIONABLE / NONEDITIONABLE 关键字（OceanBase 不需要）。"""
+    if not ddl:
+        return ddl
+    cleaned = re.sub(r'\b(?:NON)?EDITIONABLE\b', ' ', ddl, flags=re.IGNORECASE)
+    return re.sub(r'[ \t]+', ' ', cleaned)
+
+
 def clean_sequence_unsupported_options(ddl: str) -> str:
     """移除 OceanBase 不支持的 SEQUENCE 选项"""
     if not ddl:
@@ -5474,6 +5691,29 @@ def clean_sequence_unsupported_options(ddl: str) -> str:
     return cleaned
 
 
+def clean_semicolon_before_slash(ddl: str) -> str:
+    """
+    移除单独一行的分号，其后紧跟 / 的情况（常见于 PL/SQL 导出）。
+    """
+    if not ddl:
+        return ddl
+    lines = ddl.splitlines()
+    cleaned: List[str] = []
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if stripped == ';':
+            j = i + 1
+            while j < len(lines) and lines[j].strip() == '':
+                j += 1
+            if j < len(lines) and lines[j].strip() == '/':
+                i += 1
+                continue
+        cleaned.append(lines[i])
+        i += 1
+    return "\n".join(cleaned)
+
+
 # DDL清理规则配置（更新为包含生产环境规则）
 DDL_CLEANUP_RULES = {
     # PL/SQL对象需要特殊的结尾处理和PRAGMA清理
@@ -5481,6 +5721,7 @@ DDL_CLEANUP_RULES = {
         'types': ['PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'TYPE', 'TYPE BODY', 'TRIGGER'],
         'rules': [
             clean_plsql_ending,
+            clean_semicolon_before_slash,
             clean_pragma_statements,
             clean_oracle_hints,
             clean_oracle_specific_syntax,
@@ -5523,6 +5764,7 @@ DDL_CLEANUP_RULES = {
     'GENERAL_OBJECTS': {
         'types': ['VIEW', 'MATERIALIZED VIEW', 'SYNONYM'],
         'rules': [
+            clean_editionable_flags,
             clean_oracle_hints,
             clean_oracle_specific_syntax,
             clean_extra_semicolons,
@@ -5736,7 +5978,7 @@ def write_fixup_file(
             for grant_stmt in sorted(grants_to_add):
                 f.write(f"{grant_stmt}\n")
 
-    log.info(f"[FIXUP] 生成修补脚本: {file_path}")
+    log.info(f"[FIXUP] 生成目标端订正 SQL: {file_path}")
 
 
 def format_oracle_column_type(
@@ -6082,7 +6324,8 @@ def generate_fixup_scripts(
     required_grants: Optional[Dict[str, Set[Tuple[str, str]]]] = None,
     dependency_report: Optional[DependencyReport] = None,
     ob_meta: Optional[ObMetadata] = None,
-    expected_dependency_pairs: Optional[Set[Tuple[str, str, str, str]]] = None
+    expected_dependency_pairs: Optional[Set[Tuple[str, str, str, str]]] = None,
+    synonym_metadata: Optional[Dict[Tuple[str, str], SynonymMeta]] = None
 ):
     """
     基于校验结果生成 fixup_scripts DDL 脚本，并按依赖顺序排列：
@@ -6101,11 +6344,12 @@ def generate_fixup_scripts(
     except (TypeError, ValueError):
         progress_log_interval = 10.0
     progress_log_interval = max(1.0, progress_log_interval)
+    synonym_meta_map = synonym_metadata or {}
 
     base_dir = Path(settings.get('fixup_dir', 'fixup_scripts'))
 
     if not master_list:
-        log.info("[FIXUP] master_list 为空，未生成修补脚本。")
+        log.info("[FIXUP] master_list 为空，未生成目标端订正 SQL。")
         return
 
     ensure_dir(base_dir)
@@ -6114,7 +6358,7 @@ def generate_fixup_scripts(
             child.unlink()
         elif child.is_dir():
             shutil.rmtree(child, ignore_errors=True)
-    log.info(f"[FIXUP] 修补脚本将生成到目录: {base_dir.resolve()}")
+    log.info(f"[FIXUP] 目标端订正 SQL 将生成到目录: {base_dir.resolve()}")
 
     table_map: Dict[str, str] = {
         tgt_name: src_name
@@ -6138,20 +6382,20 @@ def generate_fixup_scripts(
             replacement_set.add(key)
 
     all_replacements = list(object_replacements)
-    
+    # 预构建按schema索引的替换表，加速 lookup
+    replacements_by_schema: Dict[str, List[Tuple[Tuple[str, str], Tuple[str, str]]]] = defaultdict(list)
+    for (src_s, src_o), (tgt_s, tgt_o) in all_replacements:
+        for sch in (src_s.upper(), tgt_s.upper()):
+            replacements_by_schema[sch].append(((src_s, src_o), (tgt_s, tgt_o)))
+
     def get_relevant_replacements(src_schema: str) -> List[Tuple[Tuple[str, str], Tuple[str, str]]]:
         """
-        只返回与指定源schema相关的replacements，大幅减少DDL处理时的正则替换次数。
+        返回与指定源schema相关的replacements（已按schema预索引，加速匹配）。
         相关规则包括：
         1. 源schema匹配的规则
         2. 目标schema匹配的规则（处理跨schema引用）
         """
-        src_schema_u = src_schema.upper()
-        relevant = []
-        for (src_s, src_o), (tgt_s, tgt_o) in all_replacements:
-            if src_s.upper() == src_schema_u or tgt_s.upper() == src_schema_u:
-                relevant.append(((src_s, src_o), (tgt_s, tgt_o)))
-        return relevant
+        return replacements_by_schema.get(src_schema.upper(), [])
 
     obj_type_to_dir = {
         'TABLE': 'table',
@@ -6201,6 +6445,28 @@ def generate_fixup_scripts(
         """
         key = (schema.upper(), obj_type.upper(), obj_name.upper())
         start_time = time.time()
+
+        # 快速路径：同义词使用缓存元数据直接生成，避免逐个 DBMS_METADATA
+        if obj_type.upper() == 'SYNONYM':
+            syn_meta = synonym_meta_map.get((schema.upper(), obj_name.upper()))
+            if syn_meta and syn_meta.table_name:
+                target = syn_meta.table_owner
+                if target:
+                    target = f"{target}.{syn_meta.table_name}"
+                else:
+                    target = syn_meta.table_name
+                if syn_meta.db_link:
+                    target = f"{target}@{syn_meta.db_link}"
+                if syn_meta.owner == 'PUBLIC':
+                    ddl = f"CREATE OR REPLACE PUBLIC SYNONYM {syn_meta.name} FOR {target};"
+                else:
+                    ddl = f"CREATE OR REPLACE SYNONYM {syn_meta.owner}.{syn_meta.name} FOR {target};"
+                elapsed = time.time() - start_time
+                log.info(
+                    "[DDL_FETCH] %s.%s (%s) 来源=META_SYN 耗时=%.3fs",
+                    schema, obj_name, obj_type, elapsed
+                )
+                return ddl, "META_SYN", elapsed
 
         ddl = (
             dbcat_data
@@ -6309,13 +6575,19 @@ def generate_fixup_scripts(
 
     schema_requests: Dict[str, Dict[str, Set[str]]] = defaultdict(lambda: defaultdict(set))
     unsupported_types: Set[str] = set()
+    public_synonym_fallback: Set[Tuple[str, str]] = set()
 
     def queue_request(schema: str, obj_type: str, obj_name: str) -> None:
         obj_type_u = obj_type.upper()
+        schema_u = schema.upper()
+        obj_name_u = obj_name.upper()
+        if schema_u == 'PUBLIC' and obj_type_u == 'SYNONYM':
+            public_synonym_fallback.add((schema_u, obj_name_u))
+            return
         if obj_type_u not in DBCAT_OPTION_MAP:
             unsupported_types.add(obj_type_u)
             return
-        schema_requests[schema.upper()][obj_type_u].add(obj_name.upper())
+        schema_requests[schema_u][obj_type_u].add(obj_name_u)
 
     missing_tables: List[Tuple[str, str, str, str]] = []
     other_missing_objects: List[Tuple[str, str, str, str, str]] = []
@@ -6381,7 +6653,7 @@ def generate_fixup_scripts(
         queue_request(src_schema, 'TABLE', src_table)
         constraint_tasks.append((item, src_schema, src_table, tgt_schema.upper(), tgt_table.upper()))
 
-    trigger_tasks: List[Tuple[str, str, str, str]] = []
+    trigger_tasks: List[Tuple[str, str, str, str, str, str]] = []
     for item in extra_results.get('trigger_mismatched', []):
         table_str = item.table.split()[0]
         if '.' not in table_str:
@@ -6389,8 +6661,8 @@ def generate_fixup_scripts(
         src_name = table_map.get(table_str)
         if not src_name or '.' not in src_name:
             continue
-        src_schema, _ = src_name.split('.', 1)
-        tgt_schema, _ = table_str.split('.', 1)
+        src_schema, src_table = src_name.split('.', 1)
+        tgt_schema, tgt_table = table_str.split('.', 1)
         # 优先使用缺失映射对（源->目标），确保 dbcat 按源名导出
         if item.missing_mappings:
             for src_full, tgt_full in item.missing_mappings:
@@ -6401,7 +6673,7 @@ def generate_fixup_scripts(
                 if not allow_fixup('TRIGGER', tgt_schema_final):
                     continue
                 queue_request(src_schema_u, 'TRIGGER', src_trg)
-                trigger_tasks.append((src_schema_u, src_trg, tgt_schema_final, tgt_obj))
+                trigger_tasks.append((src_schema_u, src_trg, tgt_schema_final, tgt_obj, src_table, tgt_table))
         else:
             for trg_name in sorted(item.missing_triggers):
                 trg_name_u = trg_name.upper()
@@ -6415,7 +6687,7 @@ def generate_fixup_scripts(
                 if not allow_fixup('TRIGGER', tgt_schema_final):
                     continue
                 queue_request(src_schema, 'TRIGGER', trg_name_u)
-                trigger_tasks.append((src_schema, trg_name_u, tgt_schema_final, tgt_obj))
+                trigger_tasks.append((src_schema, trg_name_u, tgt_schema_final, tgt_obj, src_table, tgt_table))
 
     other_missing_summary: Dict[str, int] = defaultdict(int)
     for ot, _, _, _, _ in other_missing_objects:
@@ -6443,6 +6715,8 @@ def generate_fixup_scripts(
         len(trigger_tasks)
     )
     log.info("[FIXUP] 进度日志间隔 %.0f 秒，可通过 progress_log_interval 配置。", progress_log_interval)
+    if public_synonym_fallback:
+        log.info("[FIXUP] 检测到 %d 个 PUBLIC 同义词，将跳过 dbcat，改用 DBMS_METADATA 导出并清理 EDITIONABLE 关键字。", len(public_synonym_fallback))
 
     # 分离VIEW对象和其他对象（需要在使用前定义）
     view_missing_objects: List[Tuple[str, str, str, str]] = []
@@ -6472,7 +6746,7 @@ def generate_fixup_scripts(
             fallback_needed.append((src_schema, 'SEQUENCE', src_seq))
     
     # 触发器任务
-    for src_schema, trg_name, tgt_schema, tgt_obj in trigger_tasks:
+    for src_schema, trg_name, tgt_schema, tgt_obj, _src_table, _tgt_table in trigger_tasks:
         if not dbcat_data.get(src_schema.upper(), {}).get('TRIGGER', {}).get(trg_name.upper()):
             fallback_needed.append((src_schema, 'TRIGGER', trg_name))
     
@@ -6517,6 +6791,12 @@ def generate_fixup_scripts(
                     return None
                 log.warning("[DDL] DBMS_METADATA 获取 %s.%s (%s) 失败: %s", schema, obj_name, obj_type, exc)
                 return None
+
+    def _is_dbcat_unsupported_table(ddl: str) -> bool:
+        """判断 dbcat 抓取的 TABLE DDL 是否包含 unsupported 提示。"""
+        if not ddl:
+            return False
+        return "UNSUPPORTED" in ddl.upper()
 
     table_ddl_cache: Dict[Tuple[str, str], str] = {}
     for schema, type_map in dbcat_data.items():
@@ -6639,6 +6919,16 @@ def generate_fixup_scripts(
                     mark_source('TABLE', 'missing')
                     progress_label = "missing"
                     return
+                # 如果 dbcat 返回 unsupported，尝试 DBMS_METADATA 兜底，直接暴露给用户
+                if _is_dbcat_unsupported_table(ddl):
+                    fallback_ddl = get_fallback_ddl(ss, 'TABLE', st)
+                    if fallback_ddl:
+                        ddl = fallback_ddl
+                        ddl_source_label = "DBMS_METADATA"
+                        mark_source('TABLE', 'fallback')
+                        log.info("[FIXUP] TABLE %s.%s 的 dbcat DDL 为 unsupported，已使用 DBMS_METADATA 兜底。", ss, st)
+                    else:
+                        log.warning("[FIXUP] TABLE %s.%s 的 dbcat DDL 为 unsupported，DBMS_METADATA 兜底失败，仍输出原始 DDL 供人工处理。", ss, st)
                 if ddl_source_label.startswith("DBCAT"):
                     mark_source('TABLE', 'dbcat')
                 elif ddl_source_label == "DBMS_METADATA":
@@ -6693,7 +6983,7 @@ def generate_fixup_scripts(
         if alter_sql:
             alter_sql = prepend_set_schema(alter_sql, tgt_schema)
             filename = f"{tgt_schema}.{tgt_table}.alter_columns.sql"
-            header = f"基于列差异的 ALTER TABLE 修补脚本: {tgt_schema}.{tgt_table} (源: {src_schema}.{src_table})"
+            header = f"基于列差异的 ALTER TABLE 订正 SQL: {tgt_schema}.{tgt_table} (源: {src_schema}.{src_table})"
             write_fixup_file(base_dir, 'table_alter', filename, alter_sql, header)
 
     # 获取OceanBase版本
@@ -6796,6 +7086,12 @@ def generate_fixup_scripts(
                     extra_identifiers=get_relevant_replacements(ss),
                     obj_type=ot
                 )
+                if ot.upper() == 'SYNONYM':
+                    ddl_adj = remap_synonym_target(
+                        ddl_adj,
+                        remap_rules,
+                        full_object_mapping
+                    )
                 # 重映射PL/SQL对象中的对象引用
                 if ot.upper() in ['PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'TYPE', 'TYPE BODY']:
                     ddl_adj = remap_plsql_object_references(ddl_adj, ot, full_object_mapping)
@@ -6952,10 +7248,10 @@ def generate_fixup_scripts(
                                 # 优先使用引用的约束列，否则取该表的 PK/UK
                                 if ref_cons:
                                     ref_cons_u = ref_cons.upper()
-                                    ref_info = constraints.get(ref_key, {}).get(ref_cons_u, {})
+                                    ref_info = oracle_meta.constraints.get(ref_key, {}).get(ref_cons_u, {})
                                     ref_cols = ref_info.get("columns") or []
                                 if not ref_cols:
-                                    ref_tbl_cons = constraints.get(ref_key, {})
+                                    ref_tbl_cons = oracle_meta.constraints.get(ref_key, {})
                                     for cand in ref_tbl_cons.values():
                                         ctype_cand = (cand.get("type") or "").upper()
                                         if ctype_cand in ("P", "U"):
@@ -7023,8 +7319,8 @@ def generate_fixup_scripts(
     log.info("[FIXUP] (7/9) 正在生成 TRIGGER 脚本...")
     trigger_progress = build_progress_tracker(len(trigger_tasks), "[FIXUP] (7/9) TRIGGER")
     trigger_jobs: List[Callable[[], None]] = []
-    for src_schema, trg_name, tgt_schema, tgt_obj in trigger_tasks:
-        def _job(ss=src_schema, tn=trg_name, ts=tgt_schema, to=tgt_obj):
+    for src_schema, trg_name, tgt_schema, tgt_obj, src_table, tgt_table in trigger_tasks:
+        def _job(ss=src_schema, tn=trg_name, ts=tgt_schema, to=tgt_obj, st=src_table, tt=tgt_table):
             try:
                 fetch_result = fetch_ddl_with_timing(ss, 'TRIGGER', tn)
                 if len(fetch_result) != 3:
@@ -7041,13 +7337,16 @@ def generate_fixup_scripts(
                     mark_source('TRIGGER', 'fallback')
                 else:
                     mark_source('TRIGGER', 'missing')
+                extra_ids = get_relevant_replacements(ss)
+                if st and tt:
+                    extra_ids = extra_ids + [((ss.upper(), st.upper()), (ts.upper(), tt.upper()))]
                 ddl_adj = adjust_ddl_for_object(
                     ddl,
                     ss,
                     tn,
                     ts,
                     to,
-                    extra_identifiers=get_relevant_replacements(ss),
+                    extra_identifiers=extra_ids,
                     obj_type='TRIGGER'
                 )
                 # 重映射触发器中的表引用
@@ -7829,8 +8128,8 @@ def parse_cli_args() -> argparse.Namespace:
           可选开关：
             check_primary_types     限制主对象类型（默认全量）
             check_extra_types       限制扩展对象 (index,constraint,sequence,trigger)
-            fixup_schemas           仅对指定目标 schema 生成修补脚本（逗号分隔，留空为全部）
-            fixup_types             仅生成指定对象类型的修补脚本（留空为全部，例如 TABLE,TRIGGER）
+            fixup_schemas           仅对指定目标 schema 生成订正 SQL（逗号分隔，留空为全部）
+            fixup_types             仅生成指定对象类型的订正 SQL（留空为全部，例如 TABLE,TRIGGER）
             check_dependencies      true/false 控制依赖&授权推导
             generate_fixup          true/false 控制是否生成脚本
 
@@ -7839,7 +8138,7 @@ def parse_cli_args() -> argparse.Namespace:
           python schema_diff_reconciler.py /path/to/conf.ini # 指定配置
         输出:
           main_reports/report_<ts>.txt  Rich 报告文本
-          fixup_scripts/                按类型分类的修补脚本
+          fixup_scripts/                按类型分类的订正 SQL
         """
     )
     parser = argparse.ArgumentParser(
@@ -7927,6 +8226,12 @@ def main():
              dep.referenced_owner.upper(), dep.referenced_name.upper(), dep.referenced_type.upper())
             for dep in oracle_dependencies
         }
+    # 4.3) 缓存同义词元数据，供 PUBLIC 等大规模同义词快速生成 DDL
+    synonym_meta = load_synonym_metadata(
+        ora_cfg,
+        settings['source_schemas_list'],
+        allowed_target_schemas=settings['source_schemas_list']
+    )
 
     # 5) 先不推导 schema，生成基础映射/清单，用于推导 TABLE 唯一映射
     base_full_mapping = build_full_object_mapping(
@@ -8132,7 +8437,7 @@ def main():
         }
         required_grants = {}
 
-    # 9) 生成修补脚本
+    # 9) 生成目标端订正 SQL
     if settings.get('generate_fixup', 'true').strip().lower() in ('true', '1', 'yes'):
         fixup_dir_label = settings.get('fixup_dir', 'fixup_scripts') or 'fixup_scripts'
         log.info('已开启修补脚本生成，开始写入 %s 目录...', fixup_dir_label)
@@ -8149,7 +8454,8 @@ def main():
             required_grants,
             dependency_report,
             ob_meta,
-            expected_dependency_pairs
+            expected_dependency_pairs,
+            synonym_meta
         )
     else:
         log.info('已根据配置跳过修补脚本生成，仅打印对比报告。')
