@@ -1,7 +1,7 @@
 # OceanBase Comparator Toolkit
 
 🚀 **极简必看用法**  
-> 当前版本：V0.8（Dump-Once, Compare-Locally + 依赖 / ALTER 修补 + 注释校验）
+> 当前版本：V0.8.8（Dump-Once, Compare-Locally + 依赖 / ALTER 修补 + 注释校验）
 
 本程序只有一个 python 程序而没有拆分成无数个模块的原因是，方便程序迭代后，"只传一次到服务器上"，因为你知道向客户的环境传一个打包文件和传一个文本文件难度是不是一样的（文本你可以打开，邮件粘贴到终端里）。
 
