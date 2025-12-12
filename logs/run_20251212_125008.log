@@ -1,0 +1,12 @@
+2025-12-12 12:50:08,700 [INFO] - 本次运行日志将输出到: /home/minorli/comparator/logs/run_20251212_125008.log
+2025-12-12 12:50:08,700 [INFO] - OceanBase Comparator Toolkit v0.8.8
+2025-12-12 12:50:08,700 [INFO] - 本次启用的主对象类型: FUNCTION, JOB, MATERIALIZED VIEW, PACKAGE, PACKAGE BODY, PROCEDURE, SCHEDULE, SYNONYM, TABLE, TYPE, TYPE BODY, VIEW
+2025-12-12 12:50:08,700 [INFO] - 本次启用的扩展校验: CONSTRAINT, INDEX, SEQUENCE, TRIGGER
+2025-12-12 12:50:08,700 [INFO] - 准备使用 Oracle Instant Client 目录: /home/minorli/orabase/instantclient_19_29
+2025-12-12 12:50:08,700 [INFO] - 如遇 libnnz19.so 等库缺失，请先执行:
+2025-12-12 12:50:08,700 [INFO] -   export LD_LIBRARY_PATH="/home/minorli/orabase/instantclient_19_29:${LD_LIBRARY_PATH}"
+2025-12-12 12:50:08,700 [INFO] - 当前 LD_LIBRARY_PATH: <未设置>
+2025-12-12 12:50:08,702 [ERROR] - 严重错误: Oracle Thick Mode 初始化失败。
+2025-12-12 12:50:08,702 [ERROR] - 请确认 instant client 路径和 LD_LIBRARY_PATH 设置正确。
+2025-12-12 12:50:08,702 [ERROR] - 错误详情: DPI-1047: Cannot locate a 64-bit Oracle Client library: "libnnz19.so: cannot open shared object file: No such file or directory". See https://python-oracledb.readthedocs.io/en/latest/user_guide/initialization.html for help
+Help: https://python-oracledb.readthedocs.io/en/latest/user_guide/troubleshooting.html#dpi-1047

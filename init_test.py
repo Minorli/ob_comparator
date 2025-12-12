@@ -10,8 +10,16 @@ import oracledb
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.ini"
-ORACLE_SQL = ROOT / "test_scenarios" / "gorgon_knot_case" / "oracle_setup.sql"
-OCEANBASE_SQL = ROOT / "test_scenarios" / "gorgon_knot_case" / "oceanbase_setup.sql"
+DEFAULT_SCENARIO = "gorgon_knot_case"
+
+
+def scenario_paths(name: str):
+    scenario_dir = ROOT / "test_scenarios" / name
+    oracle_sql = scenario_dir / "oracle_setup.sql"
+    oceanbase_sql = scenario_dir / "oceanbase_setup.sql"
+    if not oracle_sql.exists() or not oceanbase_sql.exists():
+        raise FileNotFoundError(f"Scenario '{name}' not found or missing setup sql under {scenario_dir}")
+    return oracle_sql, oceanbase_sql
 
 
 def load_config():
@@ -97,7 +105,7 @@ def preview(stmt: str, width: int = 90) -> str:
     return single_line if len(single_line) <= width else single_line[: width - 3] + "..."
 
 
-def init_oracle(cfg):
+def init_oracle(cfg, oracle_sql: Path):
     user = cfg.get("ORACLE_SOURCE", "user", fallback=None)
     password = cfg.get("ORACLE_SOURCE", "password", fallback=None)
     dsn = cfg.get("ORACLE_SOURCE", "dsn", fallback=None)
@@ -107,10 +115,14 @@ def init_oracle(cfg):
         raise ValueError("Missing ORACLE_SOURCE credentials in config.ini")
 
     if lib_dir:
-        oracledb.init_oracle_client(lib_dir=lib_dir)
+        try:
+            oracledb.init_oracle_client(lib_dir=str(lib_dir).strip())
+        except Exception as exc:  # pragma: no cover - environment dependent
+            # Thick mode is optional for test initialization; fall back to thin mode.
+            print(f"[WARN] Oracle thick mode init failed, falling back to thin mode: {exc}")
 
-    statements = parse_sql_script(ORACLE_SQL)
-    print(f"[INFO] Parsed {len(statements)} statements from {ORACLE_SQL.name}")
+    statements = parse_sql_script(oracle_sql)
+    print(f"[INFO] Parsed {len(statements)} statements from {oracle_sql.name}")
 
     with oracledb.connect(user=user, password=password, dsn=dsn, mode=oracledb.DEFAULT_AUTH) as conn:
         cur = conn.cursor()
@@ -125,7 +137,7 @@ def init_oracle(cfg):
     print("[INFO] Oracle setup completed.")
 
 
-def init_oceanbase(cfg):
+def init_oceanbase(cfg, oceanbase_sql: Path):
     exe = cfg.get("OCEANBASE_TARGET", "executable", fallback=None)
     host = cfg.get("OCEANBASE_TARGET", "host", fallback=None)
     port = cfg.get("OCEANBASE_TARGET", "port", fallback=None)
@@ -135,8 +147,8 @@ def init_oceanbase(cfg):
     if not all([exe, host, port, user_string, password]):
         raise ValueError("Missing OCEANBASE_TARGET config entries in config.ini")
 
-    statements = parse_sql_script(OCEANBASE_SQL)
-    print(f"[INFO] Parsed {len(statements)} statements from {OCEANBASE_SQL.name}")
+    statements = parse_sql_script(oceanbase_sql)
+    print(f"[INFO] Parsed {len(statements)} statements from {oceanbase_sql.name}")
 
     base_cmd = [
         exe,
@@ -155,9 +167,16 @@ def init_oceanbase(cfg):
         result = subprocess.run(cmd, text=True, capture_output=True)
         if result.returncode != 0:
             combined = (result.stdout or "") + (result.stderr or "")
+            upper_combined = combined.upper()
             print(combined)
-            if "ORA-01031" in combined.upper():
+            if "ORA-01031" in upper_combined:
                 print(f"[WARN] Step {idx} failed due to insufficient privileges; continuing.")
+                continue
+            if "ORA-01920" in upper_combined:
+                print(f"[WARN] Step {idx} failed because user already exists; continuing.")
+                continue
+            if "ORA-00955" in upper_combined:
+                print(f"[WARN] Step {idx} failed because object already exists; continuing.")
                 continue
             raise RuntimeError(f"OceanBase step {idx} failed with code {result.returncode}")
     print("[INFO] OceanBase setup completed.")
@@ -189,16 +208,23 @@ def main():
         "-t",
         help="Target to initialize: 1/oracle or 2/oceanbase. If omitted, you will be prompted.",
     )
+    parser.add_argument(
+        "--scenario",
+        "-s",
+        default=DEFAULT_SCENARIO,
+        help="Scenario folder name under test_scenarios/ (default: gorgon_knot_case).",
+    )
     args = parser.parse_args()
 
     cfg = load_config()
+    oracle_sql, oceanbase_sql = scenario_paths(args.scenario)
     target = choose_target(args.target)
 
     print(f"[INFO] Starting initialization for: {target}")
     if target == "oracle":
-        init_oracle(cfg)
+        init_oracle(cfg, oracle_sql)
     else:
-        init_oceanbase(cfg)
+        init_oceanbase(cfg, oceanbase_sql)
 
 
 if __name__ == "__main__":

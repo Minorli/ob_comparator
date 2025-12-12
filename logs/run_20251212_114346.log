@@ -1,0 +1,246 @@
+2025-12-12 11:43:46,794 [INFO] - 本次运行日志将输出到: /home/minorli/comparator/logs/run_20251212_114346.log
+2025-12-12 11:43:46,794 [INFO] - OceanBase Comparator Toolkit v0.8.8
+2025-12-12 11:43:46,794 [INFO] - 本次启用的主对象类型: FUNCTION, JOB, MATERIALIZED VIEW, PACKAGE, PACKAGE BODY, PROCEDURE, SCHEDULE, SYNONYM, TABLE, TYPE, TYPE BODY, VIEW
+2025-12-12 11:43:46,794 [INFO] - 本次启用的扩展校验: CONSTRAINT, INDEX, SEQUENCE, TRIGGER
+2025-12-12 11:43:46,794 [INFO] - 准备使用 Oracle Instant Client 目录: /home/minorli/orabase/instantclient_19_29
+2025-12-12 11:43:46,794 [INFO] - 如遇 libnnz19.so 等库缺失，请先执行:
+2025-12-12 11:43:46,794 [INFO] -   export LD_LIBRARY_PATH="/home/minorli/orabase/instantclient_19_29:${LD_LIBRARY_PATH}"
+2025-12-12 11:43:46,794 [INFO] - 当前 LD_LIBRARY_PATH: /home/minorli/orabase/instantclient_19_29:
+2025-12-12 11:43:46,927 [INFO] - 正在加载 Remap 规则文件: remap_rules.txt
+2025-12-12 11:43:46,928 [INFO] - 加载了 6 条 Remap 规则。
+2025-12-12 11:43:46,929 [INFO] - 正在连接 Oracle 源端: 172.16.0.199:1521/ora19pdb1...
+2025-12-12 11:43:47,020 [INFO] - Oracle 连接成功。正在查询源对象列表...
+2025-12-12 11:43:47,239 [INFO] - 从 Oracle 成功获取 33 个受管对象 (包含主对象与扩展对象)。
+2025-12-12 11:43:47,239 [INFO] - 正在验证 Remap 规则...
+2025-12-12 11:43:47,240 [INFO] - Remap 规则验证通过，所有规则中的源对象均存在。
+2025-12-12 11:43:49,393 [INFO] - 已获取 31 个依附对象的父表映射（触发器/同义词/索引/约束）。
+2025-12-12 11:43:49,696 [INFO] - Oracle 依赖信息加载完成，共 27 条记录。
+2025-12-12 11:43:49,697 [INFO] - 正在预计算依赖图的递归 TABLE/MVIEW 引用缓存以加速 remap 推导...
+2025-12-12 11:43:49,698 [INFO] - 递归依赖表缓存完成，共 25 个节点。
+2025-12-12 11:43:49,834 [INFO] - 已缓存 0 个同义词元数据（OWNER IN ORA_APP,ORA_FIN,ORA_BI,ORA_UTIL，跳过 PUBLIC 系统同义词 0 个）。
+2025-12-12 11:43:49,837 [WARNING] - 检测到 PACKAGE/PACKAGE BODY 推导目标不一致 (ORA_APP.PKG_ORDER_API vs OB_SALES.PKG_ORDER_API)，已强制统一为 OB_SALES.PKG_ORDER_API。
+2025-12-12 11:43:49,838 [INFO] - 正在生成主校验清单 (应用 Remap 规则)...
+2025-12-12 11:43:49,838 [INFO] - 主校验清单生成完毕，共 17 个待校验项。
+2025-12-12 11:43:49,839 [INFO] - Schema映射推导完成，共 2 个源schema:
+2025-12-12 11:43:49,839 [INFO] -   ORA_APP -> ORA_APP (1:1或一对多场景)
+2025-12-12 11:43:49,839 [INFO] -   ORA_FIN -> OB_FIN
+2025-12-12 11:43:49,840 [INFO] - ================================================================================
+2025-12-12 11:43:49,840 [INFO] - 检测到一对多 schema 映射场景（源schema的表分散到多个目标schema）：
+2025-12-12 11:43:49,840 [INFO] -   ORA_APP -> ['OB_LOG', 'OB_SALES', 'ORA_APP']
+2025-12-12 11:43:49,840 [INFO] - 
+2025-12-12 11:43:49,841 [INFO] - 推导策略：
+2025-12-12 11:43:49,841 [INFO] -   1. 独立对象（VIEW/PROCEDURE/FUNCTION/PACKAGE等）：
+2025-12-12 11:43:49,841 [INFO] -      - 优先通过依赖分析推导（分析对象引用的表，选择出现最多的目标schema）
+2025-12-12 11:43:49,841 [INFO] -      - 如果依赖推导失败，需要在 remap_rules.txt 中显式指定
+2025-12-12 11:43:49,841 [INFO] -   2. 依附对象（TRIGGER/INDEX/CONSTRAINT/SEQUENCE）：
+2025-12-12 11:43:49,842 [INFO] -      - 自动跟随父表的 schema，无需显式指定
+2025-12-12 11:43:49,842 [INFO] - ================================================================================
+2025-12-12 11:43:49,843 [WARNING] - 检测到 PACKAGE/PACKAGE BODY 推导目标不一致 (ORA_APP.PKG_ORDER_API vs OB_SALES.PKG_ORDER_API)，已强制统一为 OB_SALES.PKG_ORDER_API。
+2025-12-12 11:43:49,845 [INFO] - 正在生成主校验清单 (应用 Remap 规则)...
+2025-12-12 11:43:49,845 [INFO] - 主校验清单生成完毕，共 17 个待校验项。
+2025-12-12 11:43:49,846 [INFO] - 本次报告将输出到: main_reports/report_20251212_114346.txt
+2025-12-12 11:43:49,848 [INFO] - 全量对象映射已输出: main_reports/object_mapping_20251212_114346.txt
+2025-12-12 11:43:50,305 [WARNING] - OB 端注释查询未返回任何记录，可能缺少权限，注释比对将跳过。
+2025-12-12 11:43:50,615 [INFO] - OceanBase 元数据转储完成 (根据开关加载 DBA_OBJECTS/列/索引/约束/触发器/序列/注释)。
+2025-12-12 11:43:50,657 [INFO] - OceanBase 依赖信息加载完成，共 0 条记录。
+2025-12-12 11:43:50,658 [INFO] - 正在批量加载 Oracle 元数据 (DBA_TAB_COLUMNS/DBA_INDEXES/DBA_CONSTRAINTS/DBA_TRIGGERS/DBA_SEQUENCES)...
+2025-12-12 11:43:51,981 [INFO] - Oracle 元数据加载完成：列=7, 索引表=7, 约束表=7, 触发器表=4, 序列schema=2, 注释表=7
+2025-12-12 11:43:51,984 [WARNING] - 检查汇总: 基于 remap 后的期望集合，以下类型存在缺失或多余对象: TABLE, VIEW, TRIGGER, SEQUENCE, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, INDEX, CONSTRAINT
+2025-12-12 11:43:51,985 [INFO] - --- 开始执行主对象批量验证 (TABLE/VIEW/PROC/FUNC/PACKAGE/PACKAGE BODY/SYNONYM) ---
+2025-12-12 11:43:51,985 [INFO] - --- 开始执行扩展对象校验 (索引/约束/序列/触发器) ---
+2025-12-12 11:43:51,987 [INFO] - 依赖链路已输出: main_reports/dependency_chains_20251212_114346.txt
+2025-12-12 11:43:51,987 [INFO] - 已开启修补脚本生成，开始写入 fixup_scripts 目录...
+2025-12-12 11:43:51,988 [INFO] - [FIXUP] 目标端订正 SQL 将生成到目录: /home/minorli/comparator/fixup_scripts
+2025-12-12 11:43:51,988 [INFO] - [FIXUP] 待生成缺失对象/脚本总计 46 个: TABLE=7, 其他=10 (FUNCTION=1, PACKAGE=1, PACKAGE BODY=1, PROCEDURE=2, VIEW=5), INDEX=8, CONSTRAINT=13, SEQUENCE=4, TRIGGER=4
+2025-12-12 11:43:51,989 [INFO] - [FIXUP] 进度日志间隔 10 秒，可通过 progress_log_interval 配置。
+2025-12-12 11:43:51,992 [INFO] - [dbcat] 缓存未命中，将调用 dbcat 导出 25 个对象。
+2025-12-12 11:43:51,993 [INFO] - [dbcat] 启用并行导出 (workers=4)，共 3 个 schema 待导出。
+2025-12-12 11:43:51,994 [INFO] - [dbcat] 导出 schema=ORA_APP option=--table 对象数=5...
+2025-12-12 11:43:51,995 [INFO] - [dbcat] 导出 schema=ORA_FIN option=--table 对象数=2...
+2025-12-12 11:43:51,995 [INFO] - [dbcat] 导出 schema=ORA_BI option=--view 对象数=3...
+2025-12-12 11:44:04,698 [INFO] - [dbcat] 导出 schema=ORA_BI option=--view 完成，用时 12.70s。
+2025-12-12 11:44:04,700 [INFO] - [dbcat] 已将 3 个对象 DDL 整理到扁平缓存 dbcat_output/cache/ORA_BI/
+2025-12-12 11:44:04,700 [INFO] - [dbcat] 已清理临时目录 dbcat_output/ORA_BI_20251212_114351_5c82d4
+2025-12-12 11:44:10,839 [INFO] - [dbcat] 导出 schema=ORA_FIN option=--table 完成，用时 18.84s。
+2025-12-12 11:44:10,839 [INFO] - [dbcat] 导出 schema=ORA_FIN option=--view 对象数=1...
+2025-12-12 11:44:18,431 [INFO] - [dbcat] 导出 schema=ORA_APP option=--table 完成，用时 26.44s。
+2025-12-12 11:44:18,431 [INFO] - [dbcat] 导出 schema=ORA_APP option=--view 对象数=1...
+2025-12-12 11:44:19,996 [INFO] - [dbcat] 导出 schema=ORA_FIN option=--view 完成，用时 9.16s。
+2025-12-12 11:44:19,996 [INFO] - [dbcat] 导出 schema=ORA_FIN option=--procedure 对象数=1...
+2025-12-12 11:44:26,430 [INFO] - [dbcat] 导出 schema=ORA_FIN option=--procedure 完成，用时 6.43s。
+2025-12-12 11:44:26,431 [INFO] - [dbcat] 导出 schema=ORA_FIN option=--sequence 对象数=2...
+2025-12-12 11:44:30,490 [INFO] - [dbcat] 导出 schema=ORA_APP option=--view 完成，用时 12.06s。
+2025-12-12 11:44:30,491 [INFO] - [dbcat] 导出 schema=ORA_APP option=--function 对象数=1...
+2025-12-12 11:44:32,542 [INFO] - [dbcat] 导出 schema=ORA_FIN option=--sequence 完成，用时 6.11s。
+2025-12-12 11:44:32,542 [INFO] - [dbcat] 导出 schema=ORA_FIN option=--trigger 对象数=2...
+2025-12-12 11:44:36,563 [INFO] - [dbcat] 导出 schema=ORA_APP option=--function 完成，用时 6.07s。
+2025-12-12 11:44:36,563 [INFO] - [dbcat] 导出 schema=ORA_APP option=--procedure 对象数=1...
+2025-12-12 11:44:38,743 [INFO] - [dbcat] 导出 schema=ORA_FIN option=--trigger 完成，用时 6.20s。
+2025-12-12 11:44:38,749 [INFO] - [dbcat] 已将 8 个对象 DDL 整理到扁平缓存 dbcat_output/cache/ORA_FIN/
+2025-12-12 11:44:38,751 [INFO] - [dbcat] 已清理临时目录 dbcat_output/ORA_FIN_20251212_114351_86e2ed
+2025-12-12 11:44:41,660 [INFO] - [dbcat] 导出 schema=ORA_APP option=--procedure 完成，用时 5.10s。
+2025-12-12 11:44:41,661 [INFO] - [dbcat] 导出 schema=ORA_APP option=--package 对象数=1...
+2025-12-12 11:44:45,879 [INFO] - [dbcat] 导出 schema=ORA_APP option=--package 完成，用时 4.22s。
+2025-12-12 11:44:45,879 [INFO] - [dbcat] 导出 schema=ORA_APP option=--package-body 对象数=1...
+2025-12-12 11:44:49,939 [INFO] - [dbcat] 导出 schema=ORA_APP option=--package-body 完成，用时 4.06s。
+2025-12-12 11:44:49,940 [INFO] - [dbcat] 导出 schema=ORA_APP option=--sequence 对象数=2...
+2025-12-12 11:44:53,580 [INFO] - [dbcat] 导出 schema=ORA_APP option=--sequence 完成，用时 3.64s。
+2025-12-12 11:44:53,581 [INFO] - [dbcat] 导出 schema=ORA_APP option=--trigger 对象数=2...
+2025-12-12 11:44:57,699 [INFO] - [dbcat] 导出 schema=ORA_APP option=--trigger 完成，用时 4.12s。
+2025-12-12 11:44:57,704 [INFO] - [dbcat] 已将 14 个对象 DDL 整理到扁平缓存 dbcat_output/cache/ORA_APP/
+2025-12-12 11:44:57,706 [INFO] - [dbcat] 已清理临时目录 dbcat_output/ORA_APP_20251212_114351_2facf1
+2025-12-12 11:44:57,706 [INFO] - [FIXUP] 启用并发生成 (worker=8)，可通过 fixup_workers 配置调整。
+2025-12-12 11:44:57,707 [INFO] - [FIXUP] (1/9) 正在生成 SEQUENCE 脚本...
+2025-12-12 11:44:57,707 [INFO] - [FIXUP] (1/9) SEQUENCE 总计 4 个。
+2025-12-12 11:44:57,707 [INFO] - [DDL_FETCH] ORA_APP.SEQ_ORDER (SEQUENCE) 来源=DBCAT_RUN 耗时=1.820s
+2025-12-12 11:44:57,709 [INFO] - [FIXUP][DBCAT_RUN] 写入 SEQUENCE 脚本: OB_SALES.SEQ_ORDER.sql
+2025-12-12 11:44:57,709 [INFO] - [DDL_FETCH] ORA_APP.SEQ_ORDER_LINE (SEQUENCE) 来源=DBCAT_RUN 耗时=1.820s
+2025-12-12 11:44:57,709 [INFO] - [DDL_FETCH] ORA_FIN.SEQ_PAYMENT (SEQUENCE) 来源=DBCAT_RUN 耗时=3.055s
+2025-12-12 11:44:57,710 [INFO] - [DDL_FETCH] ORA_FIN.SEQ_REFUND (SEQUENCE) 来源=DBCAT_RUN 耗时=3.055s
+2025-12-12 11:44:57,710 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/sequence/OB_SALES.SEQ_ORDER.sql
+2025-12-12 11:44:57,711 [INFO] - [FIXUP][DBCAT_RUN] 写入 SEQUENCE 脚本: OB_SALES.SEQ_ORDER_LINE.sql
+2025-12-12 11:44:57,712 [INFO] - [FIXUP][DBCAT_RUN] 写入 SEQUENCE 脚本: OB_FIN.SEQ_PAYMENT.sql
+2025-12-12 11:44:57,713 [INFO] - [FIXUP][DBCAT_RUN] 写入 SEQUENCE 脚本: OB_FIN.SEQ_REFUND.sql
+2025-12-12 11:44:57,714 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/sequence/OB_SALES.SEQ_ORDER_LINE.sql
+2025-12-12 11:44:57,714 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/sequence/OB_FIN.SEQ_PAYMENT.sql
+2025-12-12 11:44:57,714 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/sequence/OB_FIN.SEQ_REFUND.sql
+2025-12-12 11:44:57,714 [INFO] - [FIXUP] (1/9) SEQUENCE 进度 4/4
+2025-12-12 11:44:57,715 [INFO] - [FIXUP] (2/9) 正在生成缺失的 TABLE CREATE 脚本...
+2025-12-12 11:44:57,715 [INFO] - [FIXUP] (2/9) TABLE 总计 7 个。
+2025-12-12 11:44:57,715 [INFO] - [DDL_FETCH] ORA_APP.CUSTOMER (TABLE) 来源=DBCAT_RUN 耗时=5.287s
+2025-12-12 11:44:57,715 [INFO] - [DDL_FETCH] ORA_APP.PRODUCT (TABLE) 来源=DBCAT_RUN 耗时=5.287s
+2025-12-12 11:44:57,716 [INFO] - [DDL_FETCH] ORA_APP.ORDER_HDR (TABLE) 来源=DBCAT_RUN 耗时=5.287s
+2025-12-12 11:44:57,718 [INFO] - [FIXUP][DBCAT_RUN] 写入 TABLE 脚本: ORA_APP.CUSTOMER.sql
+2025-12-12 11:44:57,718 [INFO] - [DDL_FETCH] ORA_APP.ORDER_LINE (TABLE) 来源=DBCAT_RUN 耗时=5.287s
+2025-12-12 11:44:57,719 [INFO] - [FIXUP][DBCAT_RUN] 写入 TABLE 脚本: ORA_APP.PRODUCT.sql
+2025-12-12 11:44:57,722 [INFO] - [FIXUP][DBCAT_RUN] 写入 TABLE 脚本: OB_SALES.ORDER_HDR.sql
+2025-12-12 11:44:57,722 [INFO] - [DDL_FETCH] ORA_APP.SHIPMENT (TABLE) 来源=DBCAT_RUN 耗时=5.287s
+2025-12-12 11:44:57,724 [INFO] - [FIXUP][DBCAT_RUN] 写入 TABLE 脚本: OB_SALES.ORDER_LINE.sql
+2025-12-12 11:44:57,725 [INFO] - [DDL_FETCH] ORA_FIN.PAYMENT (TABLE) 来源=DBCAT_RUN 耗时=9.422s
+2025-12-12 11:44:57,727 [INFO] - [FIXUP][DBCAT_RUN] 写入 TABLE 脚本: OB_LOG.SHIPMENT.sql
+2025-12-12 11:44:57,728 [INFO] - [DDL_FETCH] ORA_FIN.REFUND (TABLE) 来源=DBCAT_RUN 耗时=9.422s
+2025-12-12 11:44:57,728 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/table/OB_SALES.ORDER_HDR.sql
+2025-12-12 11:44:57,728 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/table/ORA_APP.CUSTOMER.sql
+2025-12-12 11:44:57,729 [INFO] - [FIXUP][DBCAT_RUN] 写入 TABLE 脚本: OB_FIN.PAYMENT.sql
+2025-12-12 11:44:57,729 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/table/ORA_APP.PRODUCT.sql
+2025-12-12 11:44:57,732 [INFO] - [FIXUP][DBCAT_RUN] 写入 TABLE 脚本: OB_FIN.REFUND.sql
+2025-12-12 11:44:57,732 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/table/OB_SALES.ORDER_LINE.sql
+2025-12-12 11:44:57,732 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/table/OB_LOG.SHIPMENT.sql
+2025-12-12 11:44:57,734 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/table/OB_FIN.PAYMENT.sql
+2025-12-12 11:44:57,734 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/table/OB_FIN.REFUND.sql
+2025-12-12 11:44:57,734 [INFO] - [FIXUP] (2/9) TABLE 进度 7/7 [dbcat_run=7]
+2025-12-12 11:44:57,734 [INFO] - [FIXUP] (3/9) 正在生成 TABLE ALTER 脚本...
+2025-12-12 11:44:57,761 [INFO] - [VIEW] 检测到OceanBase版本: 4.2.5.7
+2025-12-12 11:44:57,762 [INFO] - [VIEW] 正在批量获取 5 个VIEW的DDL (使用DBMS_METADATA)...
+2025-12-12 11:45:01,031 [INFO] - [VIEW] 成功获取 5/5 个VIEW的DDL
+2025-12-12 11:45:01,032 [INFO] - [FIXUP] (4/9) 正在生成 VIEW / MATERIALIZED VIEW / 其他对象脚本...
+2025-12-12 11:45:01,032 [INFO] - [FIXUP] (4a/9) 正在生成 5 个VIEW脚本...
+2025-12-12 11:45:01,040 [INFO] - [FIXUP][DBMS_METADATA] 写入 VIEW 脚本: OB_SALES.VW_OPEN_ORDERS.sql
+2025-12-12 11:45:01,040 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/view/OB_SALES.VW_OPEN_ORDERS.sql
+2025-12-12 11:45:01,041 [INFO] - [FIXUP][DBMS_METADATA] 写入 VIEW 脚本: OB_FIN.VW_PAYMENTS.sql
+2025-12-12 11:45:01,041 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/view/OB_FIN.VW_PAYMENTS.sql
+2025-12-12 11:45:01,042 [INFO] - [FIXUP][DBMS_METADATA] 写入 VIEW 脚本: OB_ANALYTICS.VW_ORDER_SUMMARY.sql
+2025-12-12 11:45:01,043 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/view/OB_ANALYTICS.VW_ORDER_SUMMARY.sql
+2025-12-12 11:45:01,044 [INFO] - [FIXUP][DBMS_METADATA] 写入 VIEW 脚本: OB_LOG.VW_SHIPMENT_STATUS.sql
+2025-12-12 11:45:01,044 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/view/OB_LOG.VW_SHIPMENT_STATUS.sql
+2025-12-12 11:45:01,046 [INFO] - [FIXUP][DBMS_METADATA] 写入 VIEW 脚本: OB_FIN.VW_REVENUE.sql
+2025-12-12 11:45:01,046 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/view/OB_FIN.VW_REVENUE.sql
+2025-12-12 11:45:01,046 [INFO] - [FIXUP] (4b/9) 其他对象 总计 5 个。
+2025-12-12 11:45:01,046 [INFO] - [DDL_FETCH] ORA_APP.FN_ORDER_TOTAL (FUNCTION) 来源=DBCAT_RUN 耗时=6.071s
+2025-12-12 11:45:01,048 [INFO] - [FIXUP][DBCAT_RUN] 写入 FUNCTION 脚本: OB_SALES.FN_ORDER_TOTAL.sql
+2025-12-12 11:45:01,049 [INFO] - [DDL_FETCH] ORA_APP.SP_PLACE_ORDER (PROCEDURE) 来源=DBCAT_RUN 耗时=5.097s
+2025-12-12 11:45:01,049 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/function/OB_SALES.FN_ORDER_TOTAL.sql
+2025-12-12 11:45:01,051 [INFO] - [FIXUP][DBCAT_RUN] 写入 PROCEDURE 脚本: OB_SALES.SP_PLACE_ORDER.sql
+2025-12-12 11:45:01,051 [INFO] - [DDL_FETCH] ORA_APP.PKG_ORDER_API (PACKAGE) 来源=DBCAT_RUN 耗时=4.218s
+2025-12-12 11:45:01,051 [INFO] - [DDL_FETCH] ORA_APP.PKG_ORDER_API (PACKAGE BODY) 来源=DBCAT_RUN 耗时=4.060s
+2025-12-12 11:45:01,051 [INFO] - [DDL_FETCH] ORA_FIN.SP_POST_REFUND (PROCEDURE) 来源=DBCAT_RUN 耗时=6.434s
+2025-12-12 11:45:01,054 [INFO] - [FIXUP][DBCAT_RUN] 写入 PACKAGE 脚本: OB_SALES.PKG_ORDER_API.sql
+2025-12-12 11:45:01,056 [INFO] - [FIXUP][DBCAT_RUN] 写入 PACKAGE BODY 脚本: OB_SALES.PKG_ORDER_API.sql
+2025-12-12 11:45:01,058 [INFO] - [FIXUP][DBCAT_RUN] 写入 PROCEDURE 脚本: OB_FIN.SP_POST_REFUND.sql
+2025-12-12 11:45:01,058 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/procedure/OB_SALES.SP_PLACE_ORDER.sql
+2025-12-12 11:45:01,059 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/package/OB_SALES.PKG_ORDER_API.sql
+2025-12-12 11:45:01,059 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/package_body/OB_SALES.PKG_ORDER_API.sql
+2025-12-12 11:45:01,059 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/procedure/OB_FIN.SP_POST_REFUND.sql
+2025-12-12 11:45:01,060 [INFO] - [FIXUP] (4b/9) 其他对象 进度 5/5
+2025-12-12 11:45:01,060 [INFO] - [FIXUP] (5/9) 正在生成 INDEX 脚本...
+2025-12-12 11:45:01,060 [INFO] - [FIXUP] (5/9) INDEX 总计 8 个。
+2025-12-12 11:45:01,061 [INFO] - [FIXUP][META] 使用元数据重建索引 ORA_APP.SYS_C007688。
+2025-12-12 11:45:01,061 [INFO] - [FIXUP][META] 使用元数据重建索引 ORA_APP.SYS_C007691。
+2025-12-12 11:45:01,064 [INFO] - [FIXUP][DBCAT] 写入 INDEX 脚本: OB_SALES.IDX_ORDER_CUSTOMER.sql
+2025-12-12 11:45:01,064 [INFO] - [FIXUP][META] 写入 INDEX 脚本: ORA_APP.SYS_C007688.sql
+2025-12-12 11:45:01,064 [INFO] - [FIXUP][META] 写入 INDEX 脚本: ORA_APP.SYS_C007691.sql
+2025-12-12 11:45:01,065 [INFO] - [FIXUP][META] 使用元数据重建索引 OB_SALES.SYS_C007699。
+2025-12-12 11:45:01,066 [INFO] - [FIXUP][META] 写入 INDEX 脚本: OB_SALES.SYS_C007699.sql
+2025-12-12 11:45:01,067 [INFO] - [FIXUP][META] 使用元数据重建索引 OB_LOG.SYS_C007703。
+2025-12-12 11:45:01,069 [INFO] - [FIXUP][META] 写入 INDEX 脚本: OB_LOG.SYS_C007703.sql
+2025-12-12 11:45:01,069 [INFO] - [FIXUP][META] 使用元数据重建索引 OB_FIN.SYS_C007707。
+2025-12-12 11:45:01,070 [INFO] - [FIXUP][META] 写入 INDEX 脚本: OB_FIN.SYS_C007707.sql
+2025-12-12 11:45:01,070 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/index/OB_SALES.IDX_ORDER_CUSTOMER.sql
+2025-12-12 11:45:01,071 [INFO] - [FIXUP][META] 使用元数据重建索引 OB_FIN.SYS_C007711。
+2025-12-12 11:45:01,071 [INFO] - [FIXUP][META] 使用元数据重建索引 OB_SALES.SYS_C007693。
+2025-12-12 11:45:01,072 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/index/ORA_APP.SYS_C007691.sql
+2025-12-12 11:45:01,072 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/index/ORA_APP.SYS_C007688.sql
+2025-12-12 11:45:01,072 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/index/OB_LOG.SYS_C007703.sql
+2025-12-12 11:45:01,072 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/index/OB_FIN.SYS_C007707.sql
+2025-12-12 11:45:01,072 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/index/OB_SALES.SYS_C007699.sql
+2025-12-12 11:45:01,073 [INFO] - [FIXUP][META] 写入 INDEX 脚本: OB_FIN.SYS_C007711.sql
+2025-12-12 11:45:01,073 [INFO] - [FIXUP][META] 写入 INDEX 脚本: OB_SALES.SYS_C007693.sql
+2025-12-12 11:45:01,074 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/index/OB_SALES.SYS_C007693.sql
+2025-12-12 11:45:01,074 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/index/OB_FIN.SYS_C007711.sql
+2025-12-12 11:45:01,075 [INFO] - [FIXUP] (5/9) INDEX 进度 8/8
+2025-12-12 11:45:01,075 [INFO] - [FIXUP] (6/9) 正在生成 CONSTRAINT 脚本...
+2025-12-12 11:45:01,075 [INFO] - [FIXUP] (6/9) CONSTRAINT 总计 13 个。
+2025-12-12 11:45:01,076 [INFO] - [FIXUP][META] 写入 CONSTRAINT 脚本: ORA_APP.SYS_C007688.sql
+2025-12-12 11:45:01,077 [INFO] - [FIXUP][META] 写入 CONSTRAINT 脚本: ORA_APP.SYS_C007691.sql
+2025-12-12 11:45:01,079 [INFO] - [FIXUP][DBCAT] 写入 CONSTRAINT 脚本: OB_SALES.FK_ORDER_CUSTOMER.sql
+2025-12-12 11:45:01,080 [INFO] - [FIXUP] FK 约束 FK_LINE_ORDER 引用表 ORA_APP.ORDER_HDR -> OB_SALES.ORDER_HDR
+2025-12-12 11:45:01,082 [INFO] - [FIXUP] FK 约束 FK_SHIP_ORDER 引用表 ORA_APP.ORDER_HDR -> OB_SALES.ORDER_HDR
+2025-12-12 11:45:01,082 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/constraint/ORA_APP.SYS_C007688.sql
+2025-12-12 11:45:01,083 [INFO] - [FIXUP] FK 约束 FK_PAY_ORDER 引用表 ORA_APP.ORDER_HDR -> OB_SALES.ORDER_HDR
+2025-12-12 11:45:01,084 [INFO] - [FIXUP][DBCAT] 写入 CONSTRAINT 脚本: OB_SALES.FK_LINE_ORDER.sql
+2025-12-12 11:45:01,085 [INFO] - [FIXUP] FK 约束 FK_REF_PAY 引用表 ORA_FIN.PAYMENT -> OB_FIN.PAYMENT
+2025-12-12 11:45:01,085 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/constraint/OB_SALES.FK_ORDER_CUSTOMER.sql
+2025-12-12 11:45:01,085 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/constraint/ORA_APP.SYS_C007691.sql
+2025-12-12 11:45:01,085 [INFO] - [FIXUP][DBCAT] 写入 CONSTRAINT 脚本: OB_LOG.FK_SHIP_ORDER.sql
+2025-12-12 11:45:01,086 [INFO] - [FIXUP][DBCAT] 写入 CONSTRAINT 脚本: OB_FIN.FK_PAY_ORDER.sql
+2025-12-12 11:45:01,087 [INFO] - [FIXUP][DBCAT] 写入 CONSTRAINT 脚本: OB_FIN.FK_REF_PAY.sql
+2025-12-12 11:45:01,087 [INFO] - [FIXUP][META] 写入 CONSTRAINT 脚本: OB_SALES.SYS_C007693.sql
+2025-12-12 11:45:01,088 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/constraint/OB_LOG.FK_SHIP_ORDER.sql
+2025-12-12 11:45:01,087 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/constraint/OB_SALES.FK_LINE_ORDER.sql
+2025-12-12 11:45:01,088 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/constraint/OB_FIN.FK_PAY_ORDER.sql
+2025-12-12 11:45:01,089 [INFO] - [FIXUP][META] 写入 CONSTRAINT 脚本: OB_LOG.SYS_C007703.sql
+2025-12-12 11:45:01,089 [INFO] - [FIXUP][DBCAT] 写入 CONSTRAINT 脚本: OB_SALES.FK_LINE_PRODUCT.sql
+2025-12-12 11:45:01,090 [INFO] - [FIXUP][META] 写入 CONSTRAINT 脚本: OB_FIN.SYS_C007707.sql
+2025-12-12 11:45:01,090 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/constraint/OB_FIN.FK_REF_PAY.sql
+2025-12-12 11:45:01,090 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/constraint/OB_SALES.SYS_C007693.sql
+2025-12-12 11:45:01,091 [INFO] - [FIXUP][META] 写入 CONSTRAINT 脚本: OB_FIN.SYS_C007711.sql
+2025-12-12 11:45:01,091 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/constraint/OB_SALES.FK_LINE_PRODUCT.sql
+2025-12-12 11:45:01,091 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/constraint/OB_FIN.SYS_C007707.sql
+2025-12-12 11:45:01,091 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/constraint/OB_LOG.SYS_C007703.sql
+2025-12-12 11:45:01,092 [INFO] - [FIXUP][META] 写入 CONSTRAINT 脚本: OB_SALES.SYS_C007699.sql
+2025-12-12 11:45:01,092 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/constraint/OB_FIN.SYS_C007711.sql
+2025-12-12 11:45:01,093 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/constraint/OB_SALES.SYS_C007699.sql
+2025-12-12 11:45:01,093 [INFO] - [FIXUP] (6/9) CONSTRAINT 进度 13/13
+2025-12-12 11:45:01,094 [INFO] - [FIXUP] (7/9) 正在生成 TRIGGER 脚本...
+2025-12-12 11:45:01,094 [INFO] - [FIXUP] (7/9) TRIGGER 总计 4 个。
+2025-12-12 11:45:01,094 [INFO] - [DDL_FETCH] ORA_APP.TRG_ORDER_HDR_BI (TRIGGER) 来源=DBCAT_RUN 耗时=2.059s
+2025-12-12 11:45:01,094 [INFO] - [DDL_FETCH] ORA_APP.TRG_ORDER_LINE_BI (TRIGGER) 来源=DBCAT_RUN 耗时=2.059s
+2025-12-12 11:45:01,094 [INFO] - [DDL_FETCH] ORA_FIN.TRG_PAYMENT_BI (TRIGGER) 来源=DBCAT_RUN 耗时=3.100s
+2025-12-12 11:45:01,100 [INFO] - [FIXUP][DBCAT_RUN] 写入 TRIGGER 脚本: OB_SALES.TRG_ORDER_HDR_BI.sql
+2025-12-12 11:45:01,102 [INFO] - [DDL_FETCH] ORA_FIN.TRG_REFUND_BI (TRIGGER) 来源=DBCAT_RUN 耗时=3.100s
+2025-12-12 11:45:01,105 [INFO] - [FIXUP][DBCAT_RUN] 写入 TRIGGER 脚本: OB_SALES.TRG_ORDER_LINE_BI.sql
+2025-12-12 11:45:01,108 [INFO] - [FIXUP][DBCAT_RUN] 写入 TRIGGER 脚本: OB_FIN.TRG_PAYMENT_BI.sql
+2025-12-12 11:45:01,111 [INFO] - [FIXUP][DBCAT_RUN] 写入 TRIGGER 脚本: OB_FIN.TRG_REFUND_BI.sql
+2025-12-12 11:45:01,112 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/trigger/OB_SALES.TRG_ORDER_HDR_BI.sql
+2025-12-12 11:45:01,112 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/trigger/OB_FIN.TRG_PAYMENT_BI.sql
+2025-12-12 11:45:01,112 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/trigger/OB_SALES.TRG_ORDER_LINE_BI.sql
+2025-12-12 11:45:01,113 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/trigger/OB_FIN.TRG_REFUND_BI.sql
+2025-12-12 11:45:01,113 [INFO] - [FIXUP] (7/9) TRIGGER 进度 4/4
+2025-12-12 11:45:01,113 [INFO] - [FIXUP] (8/9) 正在生成依赖重编译脚本...
+2025-12-12 11:45:01,113 [INFO] - [FIXUP] (8/9) 无需生成依赖重编译脚本。
+2025-12-12 11:45:01,113 [INFO] - [FIXUP] (9/9) 正在生成依赖授权脚本...
+2025-12-12 11:45:01,114 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/grants/OB_SALES.grants.sql
+2025-12-12 11:45:01,114 [INFO] - [FIXUP] 生成目标端订正 SQL: fixup_scripts/grants/ORA_APP.grants.sql
+2025-12-12 11:45:01,114 [INFO] - [FIXUP] DDL 来源统计: CONSTRAINT: dbcat=6, fallback=7 | FUNCTION: dbcat=1 | INDEX: dbcat=1, fallback=7 | PACKAGE: dbcat=1 | PACKAGE BODY: dbcat=1 | PROCEDURE: dbcat=2 | SEQUENCE: dbcat=4 | TABLE: dbcat=7 | TRIGGER: dbcat=4
+2025-12-12 11:45:01,115 [INFO] - 所有校验已完成。正在生成最终报告...
+2025-12-12 11:45:01,185 [INFO] - 缺失 TABLE/VIEW 映射已输出到: main_reports/tables_views_miss
