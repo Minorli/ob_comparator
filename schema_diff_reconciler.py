@@ -333,6 +333,14 @@ def is_oms_index(name: str, columns: List[str]) -> bool:
     # 如果包含所有4个OMS列，则认为是OMS索引（允许有额外列）
     return oms_cols_set.issubset(cols_set)
 
+
+def is_ob_notnull_constraint(name: Optional[str]) -> bool:
+    """
+    识别 OceanBase Oracle 模式下自动生成的 *_OBNOTNULL_* CHECK 约束。
+    这些约束用于保证 PK 列非空，Oracle 侧不会显式出现，报告统计应忽略以避免误判“多余约束”。
+    """
+    return "OBNOTNULL" in (name or "").upper()
+
 OBJECT_COUNT_TYPES: Tuple[str, ...] = (
     'TABLE',
     'VIEW',
@@ -2143,8 +2151,17 @@ def compute_object_counts(
         # Here we count based on what's found in meta, not remapped names, for simplicity.
         if obj_type_u in ('CONSTRAINT', 'INDEX'):
             if obj_type_u == 'CONSTRAINT':
-                src_count = sum(len(v) for v in oracle_meta.constraints.values())
-                tgt_count = sum(len(v) for v in ob_meta.constraints.values())
+                def _count_pkukfk(cons_maps: Dict[Tuple[str, str], Dict[str, Dict]]) -> int:
+                    cnt = 0
+                    for cons_map in cons_maps.values():
+                        for info in cons_map.values():
+                            ctype = (info.get("type") or "").upper()
+                            if ctype in ('P', 'U', 'R'):
+                                cnt += 1
+                    return cnt
+
+                src_count = _count_pkukfk(oracle_meta.constraints)
+                tgt_count = _count_pkukfk(ob_meta.constraints)
             else: # INDEX
                 src_count = sum(len(v) for v in oracle_meta.indexes.values())
                 tgt_count = sum(len(v) for v in ob_meta.indexes.values())
@@ -2603,6 +2620,23 @@ def dump_ob_metadata(
                     ref_table = cons_table_lookup.get((r_owner_u, r_cons_u))
                     if ref_table:
                         info["ref_table_owner"], info["ref_table_name"] = ref_table
+
+        # 过滤 OceanBase 自动生成的 *_OBNOTNULL_* CHECK 约束
+        if constraints:
+            pruned_constraints: Dict[Tuple[str, str], Dict[str, Dict]] = {}
+            removed_cnt = 0
+            for key, cons_map in constraints.items():
+                kept: Dict[str, Dict] = {}
+                for cons_name, info in cons_map.items():
+                    if is_ob_notnull_constraint(cons_name):
+                        removed_cnt += 1
+                        continue
+                    kept[cons_name] = info
+                if kept:
+                    pruned_constraints[key] = kept
+            if removed_cnt:
+                log.info("[CONSTRAINT] 已忽略 %d 条 OceanBase 自动 OBNOTNULL 约束。", removed_cnt)
+            constraints = pruned_constraints
 
     # --- 7. DBA_TRIGGERS ---
     triggers: Dict[Tuple[str, str], Dict[str, Dict]] = {}
