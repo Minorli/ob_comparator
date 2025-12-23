@@ -2,22 +2,22 @@
 [ORACLE_SOURCE]
 # 源端 Oracle 数据库的连接信息
 # DSN 格式: "hostname:port/service_name"
-user     = oms_user
-password = welcome1
-dsn      = 172.16.0.199:1521/ora19pdb1
+user     = your_username
+password = your_password
+dsn      = hostname:1521/service_name
 
 [OCEANBASE_TARGET]
 # 目标端 OceanBase (obclient) 的命令行参数，确保路径/权限正确
 executable  = /usr/bin/obclient
-host        = 172.16.0.147
-port        = 2883
+host        = 127.0.0.1
+port        = 2881
 # 完整的 -u 参数，建议使用 SYS
-user_string = OMS_USER@ob4ora#observer147
-password    = PAssw0rd01##
+user_string = root@sys
+password    = your_password
 
 [SETTINGS]
 # 要扫描的所有源端 schema，用逗号分隔，可换行
-source_schemas          = ORA_APP,ORA_FIN,ORA_BI,ORA_UTIL 
+source_schemas          = ORA_APP,ORA_FIN,ORA_BI
 # Remap 规则文件路径（迁移时需要改变 schema 的对象映射）
 remap_file              = remap_rules.txt
 
@@ -56,11 +56,11 @@ print_dependency_chains = true
 check_comments          = true
 
 # Oracle Instant Client 目录 (必须包含 libclntsh.so)
-oracle_client_lib_dir   = /home/minorli/orabase/instantclient_19_29
+oracle_client_lib_dir   = /path/to/instantclient_19_29
 
 # dbcat 配置：需预先设置好 JAVA_HOME；from/to 影响转换逻辑
 dbcat_parallel_workers = 4
-dbcat_bin               = /home/minorli/dbcat-2.5.0-SNAPSHOT
+dbcat_bin               = /path/to/dbcat-2.5.0-SNAPSHOT
 dbcat_output_dir        = dbcat_output
 dbcat_from              = oracle19c
 dbcat_to                = oboracle422

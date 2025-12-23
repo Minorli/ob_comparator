@@ -5471,52 +5471,132 @@ def clean_view_ddl_for_oceanbase(ddl: str, ob_version: Optional[str] = None) -> 
     return cleaned_ddl
 
 
+class SqlMasker:
+    """
+    辅助类：用于对 SQL 中的字符串字面量和注释进行掩码处理。
+    防止正则替换时误伤字符串或注释内的内容。
+    """
+    def __init__(self, sql: str):
+        self.original_sql = sql
+        self.masked_sql = sql
+        self.literals: Dict[str, str] = {}
+        self.comments: Dict[str, str] = {}
+        self._mask()
+
+    def _mask(self):
+        # 1. Mask String Literals: 'text'
+        # 注意: Oracle 字符串内部的单引号转义为 ''
+        def mask_str(match):
+            key = f"###STR_{len(self.literals)}###"
+            self.literals[key] = match.group(0)
+            return key
+        
+        self.masked_sql = re.sub(r"'(?:''|[^'])*'", mask_str, self.masked_sql)
+
+        # 2. Mask Block Comments: /* ... */
+        def mask_block_cmt(match):
+            key = f"###CMT_BLK_{len(self.comments)}###"
+            self.comments[key] = match.group(0)
+            return key
+        
+        self.masked_sql = re.sub(r'/\*.*?\*/', mask_block_cmt, self.masked_sql, flags=re.DOTALL)
+
+        # 3. Mask Line Comments: -- ...
+        def mask_line_cmt(match):
+            key = f"###CMT_LN_{len(self.comments)}###"
+            self.comments[key] = match.group(0)
+            return key
+        
+        self.masked_sql = re.sub(r'--.*?$', mask_line_cmt, self.masked_sql, flags=re.MULTILINE)
+
+    def unmask(self, sql: str) -> str:
+        # 恢复掩码内容
+        for k, v in self.comments.items():
+            sql = sql.replace(k, v)
+        for k, v in self.literals.items():
+            sql = sql.replace(k, v)
+        return sql
+
+
 def extract_view_dependencies(ddl: str, default_schema: Optional[str] = None) -> Set[str]:
     """
     从 VIEW DDL 中提取依赖的对象名（表/视图/同义词等）。
-    使用轻量级正则 + 规则：
-    - 识别 FROM/JOIN/INTO/UPDATE/MERGE INTO 后的对象引用
-    - 对无 schema 前缀的引用，若提供 default_schema，则按 default_schema 兜底
-    返回集合元素格式为 SCHEMA.OBJECT_NAME（大写）。
+    改进版：
+    - 使用 SqlMasker 保护字符串和注释
+    - 支持提取 FROM/JOIN 后逗号分隔的多个表
     """
     dependencies: Set[str] = set()
     if not ddl:
         return dependencies
 
-    # 去除字符串字面量与注释，降低误匹配
-    def _strip_literals_and_comments(sql: str) -> str:
-        # 移除块注释与行注释
-        sql = re.sub(r'/\*.*?\*/', ' ', sql, flags=re.DOTALL)
-        sql = re.sub(r'--.*?$', ' ', sql, flags=re.MULTILINE)
-        # 将字符串替换为空白
-        sql = re.sub(r"'(?:''|[^'])*'", "''", sql)
-        return sql
+    masker = SqlMasker(ddl)
+    clean_sql = masker.masked_sql
 
-    ddl_clean = _strip_literals_and_comments(ddl)
-    select_match = re.search(r'\bAS\s+(SELECT\b.*)', ddl_clean, re.IGNORECASE | re.DOTALL)
-    if not select_match:
-        return dependencies
-    select_sql = select_match.group(1)
+    # 归一化空白
+    clean_sql = re.sub(r'\s+', ' ', clean_sql)
 
-    ref_pattern = re.compile(
-        r'\b(?:FROM|JOIN|INTO|UPDATE|MERGE\s+INTO)\s+'
-        r'("?[A-Z0-9_\$#]+"?(?:\s*\.\s*"?[A-Z0-9_\$#]+"?)?)',
-        re.IGNORECASE
-    )
+    # 关键词正则
+    start_keywords = r'(?:FROM|JOIN|UPDATE|INTO|MERGE\s+INTO)'
+    stopper_keywords = [
+        'WHERE', 'GROUP', 'HAVING', 'ORDER', 'UNION', 'INTERSECT', 'MINUS', 'EXCEPT',
+        'START', 'CONNECT', 'MODEL', 'WINDOW', 'FETCH', 'OFFSET', 'FOR',
+        'ON', 'USING', 'LEFT', 'RIGHT', 'FULL', 'INNER', 'CROSS', 'NATURAL',
+        'SELECT', 'SET', 'VALUES', 'RETURNING', 'AS'
+    ]
+    stopper_pattern = r'\b(?:' + '|'.join(stopper_keywords) + r')\b'
 
-    for match in ref_pattern.findall(select_sql):
-        raw = match.strip()
-        raw = re.split(r'[\s,)]', raw, maxsplit=1)[0]
-        normalized = raw.replace('"', '').replace(' ', '').upper()
-        # 去除 db link
-        if '@' in normalized:
-            normalized = normalized.split('@', 1)[0]
-        if normalized in ('DUAL',):
-            continue
-        if '.' in normalized:
-            dependencies.add(normalized)
-        elif default_schema:
-            dependencies.add(f"{default_schema.upper()}.{normalized}")
+    combined_pattern = re.compile(rf'\b{start_keywords}\b', re.IGNORECASE)
+    stopper_regex = re.compile(stopper_pattern + r'|' + rf'\b{start_keywords}\b', re.IGNORECASE)
+
+    current_pos = 0
+    while True:
+        match = combined_pattern.search(clean_sql, current_pos)
+        if not match:
+            break
+        
+        content_start = match.end()
+        stop_match = stopper_regex.search(clean_sql, content_start)
+        
+        if stop_match:
+            content_end = stop_match.start()
+            next_scan_pos = stop_match.start()
+        else:
+            content_end = len(clean_sql)
+            next_scan_pos = len(clean_sql)
+
+        segment = clean_sql[content_start:content_end]
+        
+        # 处理逗号分隔的表列表
+        parts = segment.split(',')
+        for part in parts:
+            part = part.strip()
+            # 简单过滤：忽略括号开头的子查询
+            if not part or part.startswith('('):
+                continue
+                
+            # 取第一个 token (忽略别名)
+            first_token = part.split()[0]
+            candidate = first_token.replace('"', '').upper()
+            
+            if '@' in candidate:
+                candidate = candidate.split('@')[0]
+            
+            if not candidate or candidate == 'DUAL':
+                continue
+            
+            # 简单的合法性检查
+            if not re.match(r'^[A-Z0-9_\$#\.]+$', candidate):
+                continue
+                
+            if '.' in candidate:
+                dependencies.add(candidate)
+            elif default_schema:
+                dependencies.add(f"{default_schema.upper()}.{candidate}")
+
+        current_pos = next_scan_pos
+        # 防止死循环
+        if current_pos <= match.start():
+            current_pos = match.end()
 
     return dependencies
 
@@ -5529,15 +5609,7 @@ def remap_view_dependencies(
 ) -> str:
     """
     根据remap规则重写VIEW DDL中的依赖对象引用
-    
-    Args:
-        ddl: 原始DDL
-        view_schema: 视图所在的schema
-        remap_rules: remap规则
-        full_object_mapping: 完整的对象映射
-    
-    Returns:
-        重写后的DDL
+    改进：使用 SqlMasker 确保只替换 SQL 代码，不替换注释/字符串
     """
     if not ddl:
         return ddl
@@ -5562,13 +5634,16 @@ def remap_view_dependencies(
         if '.' in dep_u:
             dep_schema, dep_obj = dep_u.split('.', 1)
             if dep_schema == view_schema_u:
-                # 无前缀引用也替换为全名，避免跨 schema 迁移后失效
+                # 无前缀引用也替换为全名(或目标名)，避免跨 schema 迁移后失效
                 replacements.setdefault(dep_obj, tgt_u)
 
     if not replacements:
         return ddl
 
-    result_ddl = ddl
+    # 使用 Masker 保护
+    masker = SqlMasker(ddl)
+    working_sql = masker.masked_sql
+
     for src_ref in sorted(replacements.keys(), key=len, reverse=True):
         tgt_ref = replacements[src_ref]
         if '.' in src_ref:
@@ -5582,9 +5657,9 @@ def remap_view_dependencies(
                 rf'(?<![A-Z0-9_\$#"\.]){re.escape(src_ref)}(?![A-Z0-9_\$#"])',
                 re.IGNORECASE
             )
-        result_ddl = pattern.sub(tgt_ref, result_ddl)
+        working_sql = pattern.sub(tgt_ref, working_sql)
 
-    return result_ddl
+    return masker.unmask(working_sql)
 
 
 def remap_synonym_target(
@@ -6288,64 +6363,94 @@ def remap_trigger_table_references(
 def remap_plsql_object_references(
     ddl: str,
     obj_type: str,
-    full_object_mapping: FullObjectMapping
+    full_object_mapping: FullObjectMapping,
+    source_schema: Optional[str] = None
 ) -> str:
     """
     重映射PL/SQL对象（PROCEDURE、FUNCTION、PACKAGE等）中的对象引用
-    
-    Args:
-        ddl: 原始DDL
-        obj_type: 对象类型
-        full_object_mapping: 完整的对象映射
-    
-    Returns:
-        重写后的DDL
+    改进：
+    - 支持 source_schema 以解析本地未限定引用
+    - 使用 SqlMasker 保护
     """
     if not ddl:
         return ddl
     
     obj_type_upper = obj_type.upper()
     
-    # 触发器需要特殊处理表引用
+    # 触发器需要特殊处理表引用 (保留原逻辑，但可增强)
     if obj_type_upper == 'TRIGGER':
         return remap_trigger_table_references(ddl, full_object_mapping)
     
-    # 其他PL/SQL对象的通用处理
-    # 提取可能的对象引用（简化版本，可以根据需要扩展）
-    object_refs = set()
+    masker = SqlMasker(ddl)
+    working_sql = masker.masked_sql
     
-    # 查找 SCHEMA.OBJECT 格式的引用
-    ref_pattern = r'\b([A-Z_][A-Z0-9_]*\.[A-Z_][A-Z0-9_]*)\b'
-    matches = re.findall(ref_pattern, ddl, re.IGNORECASE)
-    for match in matches:
-        ref_name = match.strip().strip('"').upper()
-        if '.' in ref_name:
-            object_refs.add(ref_name)
-    
-    # 构建替换映射 - O(1) 查找，按类型优先级决策，避免全表扫描
+    # 收集需要替换的引用
     replacements = {}
     preferred_types = (
         "TABLE", "VIEW", "MATERIALIZED VIEW", "SEQUENCE",
         "SYNONYM", "PACKAGE", "PACKAGE BODY", "FUNCTION",
         "PROCEDURE", "TYPE", "TYPE BODY", "TRIGGER"
     )
-    for obj_ref in object_refs:
-        tgt_name = find_mapped_target_any_type(
-            full_object_mapping,
-            obj_ref,
-            preferred_types=preferred_types
-        )
-        if tgt_name:
-            replacements[obj_ref] = tgt_name
+
+    # 1. 查找 SCHEMA.OBJECT 格式的引用
+    ref_pattern = r'\b([A-Z_][A-Z0-9_]*\.[A-Z_][A-Z0-9_]*)\b'
+    matches = re.findall(ref_pattern, working_sql, re.IGNORECASE)
+    for match in matches:
+        ref_name = match.strip().strip('"').upper()
+        if '.' in ref_name:
+            tgt_name = find_mapped_target_any_type(
+                full_object_mapping,
+                ref_name,
+                preferred_types=preferred_types
+            )
+            if tgt_name and tgt_name.upper() != ref_name:
+                replacements[ref_name] = tgt_name.upper()
+
+    # 2. 查找未限定引用 (如果提供了 source_schema)
+    if source_schema:
+        # 查找所有可能的标识符
+        ident_pattern = r'\b([A-Z_][A-Z0-9_\$#]*)\b'
+        candidates = set(re.findall(ident_pattern, working_sql, re.IGNORECASE))
+        
+        # 排除保留字 (简单列表)
+        reserved = {'BEGIN', 'END', 'IF', 'THEN', 'ELSE', 'LOOP', 'COMMIT', 'ROLLBACK', 'SELECT', 'FROM', 'WHERE', 'AND', 'OR'}
+        
+        for cand in candidates:
+            cand_u = cand.upper()
+            if cand_u in reserved:
+                continue
+                
+            # 假设它是 source_schema 下的对象
+            full_src = f"{source_schema.upper()}.{cand_u}"
+            tgt_name = find_mapped_target_any_type(
+                full_object_mapping,
+                full_src,
+                preferred_types=preferred_types
+            )
+            
+            if tgt_name:
+                # 仅当目标全名与当前不一致时替换
+                # 例如 TAB -> TGT.TAB
+                tgt_u = tgt_name.upper()
+                if tgt_u != cand_u:
+                     replacements[cand_u] = tgt_u
 
     # 执行替换
-    result_ddl = ddl
-    for src_ref, tgt_ref in replacements.items():
-        pattern = r'\b' + re.escape(src_ref) + r'\b'
-        result_ddl = re.sub(pattern, tgt_ref, result_ddl, flags=re.IGNORECASE)
-        log.debug("[%s] 重映射对象引用: %s -> %s", obj_type_upper, src_ref, tgt_ref)
+    if replacements:
+        for src_ref in sorted(replacements.keys(), key=len, reverse=True):
+            tgt_ref = replacements[src_ref]
+            
+            if '.' in src_ref:
+                pattern = r'\b' + re.escape(src_ref) + r'\b'
+                working_sql = re.sub(pattern, tgt_ref, working_sql, flags=re.IGNORECASE)
+            else:
+                 # 未限定引用，需确保不匹配已限定引用的尾部
+                 pattern = r'(?<![A-Z0-9_\$#"\.])\b' + re.escape(src_ref) + r'\b'
+                 working_sql = re.sub(pattern, tgt_ref, working_sql, flags=re.IGNORECASE)
+            
+            log.debug("[%s] 重映射对象引用: %s -> %s", obj_type_upper, src_ref, tgt_ref)
     
-    return result_ddl
+    return masker.unmask(working_sql)
 
 
 def clean_oracle_hints(ddl: str) -> str:
@@ -7941,7 +8046,7 @@ def generate_fixup_scripts(
                         ddl_adj = normalize_public_synonym_name(ddl_adj, to)
                 # 重映射PL/SQL对象中的对象引用
                 if ot.upper() in ['PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'TYPE', 'TYPE BODY']:
-                    ddl_adj = remap_plsql_object_references(ddl_adj, ot, full_object_mapping)
+                    ddl_adj = remap_plsql_object_references(ddl_adj, ot, full_object_mapping, source_schema=ss)
                 ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
                 ddl_adj = prepend_set_schema(ddl_adj, ts)
                 ddl_adj = normalize_ddl_for_ob(ddl_adj)
@@ -8197,7 +8302,7 @@ def generate_fixup_scripts(
                     obj_type='TRIGGER'
                 )
                 # 重映射触发器中的表引用
-                ddl_adj = remap_plsql_object_references(ddl_adj, 'TRIGGER', full_object_mapping)
+                ddl_adj = remap_plsql_object_references(ddl_adj, 'TRIGGER', full_object_mapping, source_schema=ss)
                 # 强化主对象与 ON 子句的 schema 替换（避免遗漏）
                 def _rewrite_trigger_name_and_on(text: str) -> str:
                     # 替换 CREATE TRIGGER 段的 schema 前缀
