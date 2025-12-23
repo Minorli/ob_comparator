@@ -968,5 +968,5 @@ python3 run_fixup_v2.py --help
 
 ---
 
-**作者：** OceanBase Migration Team  
+**作者：** Minor Li  
 **更新日期：** 2025-12-10

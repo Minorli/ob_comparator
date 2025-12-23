@@ -117,4 +117,4 @@ python3 run_fixup.py --smart-order --recompile
 - **Java**: JDK 8+ (用于 dbcat)
 
 ---
-© 2025 OceanBase Migration Team.
+© 2025 Minor Li.

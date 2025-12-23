@@ -71,7 +71,7 @@ import math
 import re
 
 __version__ = "0.9.0"
-__author__ = "OceanBase Migration Team"
+__author__ = "Minor Li"
 import os
 import threading
 import json
