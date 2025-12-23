@@ -2,6 +2,16 @@
 
 All notable changes to OceanBase Comparator Toolkit will be documented in this file.
 
+## [0.9.0] - 2025-12-23
+
+### Security & Reliability
+- **DDL 重写引擎重构**: 引入 `SqlMasker`，彻底解决正则替换时误伤字符串/注释的风险。
+- **视图依赖解析升级**: 新增 Token 级解析器，完美支持 `FROM A, B` 等复杂 SQL 语法的表依赖提取。
+- **PL/SQL 智能推导**: 增强 `remap_plsql_object_references`，支持本地未限定引用的自动 Schema 补全。
+
+### Documentation
+- **文档重构**: 整合分散的 markdown 文档为 `ADVANCED_USAGE.md`、`DEPLOYMENT.md`、`ARCHITECTURE.md`。
+
 ## [0.8.8] - 2025-12-11
 
 ### Changed

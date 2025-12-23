@@ -16,7 +16,7 @@
 
 """
 
-数据库对象对比工具 (V0.8.8 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
+数据库对象对比工具 (V0.9.0 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -33,7 +33,7 @@
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.8.8 核心)：
+3. 性能架构 (V0.9.0 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          DBA_OBJECTS
@@ -8629,7 +8629,7 @@ def print_final_report(
     grant_stmt_cnt = sum(len(entries) for entries in required_grants.values())
     source_missing_schema_cnt = len(schema_summary.get("source_missing", []))
 
-    console.print(Panel.fit("[bold]数据库对象迁移校验报告 (V0.8.8 - Rich)[/bold]", style="title"))
+    console.print(Panel.fit("[bold]数据库对象迁移校验报告 (V0.9.0 - Rich)[/bold]", style="title"))
 
     section_width = 140
     count_table_kwargs: Dict[str, object] = {"width": section_width, "expand": False}
@@ -9104,7 +9104,7 @@ def parse_cli_args() -> argparse.Namespace:
     """解析命令行参数，允许自定义 config.ini 路径并展示功能说明。"""
     desc = textwrap.dedent(
         """\
-        OceanBase Comparator Toolkit v0.8.8
+        OceanBase Comparator Toolkit v0.9.0
         - 一次转储，本地对比：Oracle Thick Mode + 少量 obclient 调用，全部比对在内存完成。
         - 覆盖对象：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。
         - 校验规则：表列名集合 + VARCHAR/VARCHAR2 长度窗口 [ceil(1.5x), ceil(2.5x)]；其余对象校验存在性/列组合。
