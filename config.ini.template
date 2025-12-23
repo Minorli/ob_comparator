@@ -10,9 +10,9 @@ dsn      = hostname:1521/service_name
 # 目标端 OceanBase (obclient) 的命令行参数，确保路径/权限正确
 executable  = /usr/bin/obclient
 host        = 127.0.0.1
-port        = 2881
+port        = 2883
 # 完整的 -u 参数，建议使用 SYS
-user_string = root@sys
+user_string = root@sys#cluster_name
 password    = your_password
 
 [SETTINGS]
