@@ -1327,7 +1327,7 @@ def validate_remap_rules(
     body_aliases = {
         f"{name} BODY"
         for name, obj_types in source_objects.items()
-        if any(obj_type.upper() == 'PACKAGE BODY' for obj_type in obj_types)
+        if any(obj_type.upper() in ('PACKAGE BODY', 'TYPE BODY') for obj_type in obj_types)
     }
     source_keys_with_alias = source_keys | body_aliases
 
@@ -1421,6 +1421,7 @@ def infer_dominant_schema_from_rules(
     src_schema_u = src_schema.upper()
     counts: Dict[str, int] = defaultdict(int)
     table_keys: Optional[Set[str]] = None
+    explicit_tables: Set[str] = set()
     if source_objects:
         table_keys = {
             name.upper()
@@ -1430,13 +1431,24 @@ def infer_dominant_schema_from_rules(
     for src_full, tgt_full in remap_rules.items():
         if '.' not in src_full or '.' not in tgt_full:
             continue
-        if table_keys is not None and src_full.upper() not in table_keys:
+        src_full_u = src_full.upper()
+        if table_keys is not None and src_full_u not in table_keys:
             continue
-        s_schema, _ = src_full.split('.', 1)
-        if s_schema.upper() != src_schema_u:
+        explicit_tables.add(src_full_u)
+        s_schema, _ = src_full_u.split('.', 1)
+        if s_schema != src_schema_u:
             continue
         t_schema, _ = tgt_full.split('.', 1)
         counts[t_schema.upper()] += 1
+    if table_keys is not None:
+        # Treat tables missing in remap_rules as 1:1 mappings to their source schema.
+        for src_full_u in table_keys:
+            if src_full_u in explicit_tables:
+                continue
+            s_schema, _ = src_full_u.split('.', 1)
+            if s_schema != src_schema_u:
+                continue
+            counts[s_schema] += 1
     if not counts:
         return None
     max_count = max(counts.values())
@@ -1444,6 +1456,157 @@ def infer_dominant_schema_from_rules(
     if len(candidates) == 1:
         return candidates[0]
     return None
+
+
+def infer_sequence_target_schema_from_dependents(
+    seq_full: str,
+    remap_rules: RemapRules,
+    source_objects: Optional[SourceObjectMap] = None,
+    schema_mapping: Optional[Dict[str, str]] = None,
+    object_parent_map: Optional[ObjectParentMap] = None,
+    dependency_graph: Optional[DependencyGraph] = None,
+    transitive_table_cache: Optional[TransitiveTableCache] = None,
+    source_dependencies: Optional[SourceDependencySet] = None,
+    _path: Optional[Set[Tuple[str, str]]] = None
+) -> Tuple[Optional[str], bool]:
+    """
+    基于引用该 SEQUENCE 的对象推导目标 schema。
+
+    返回 (schema, conflict):
+      - schema: 推导结果（仅 schema）
+      - conflict: 若引用对象 remap 到多个 schema，标记冲突，避免继续回退推导
+    """
+    if '.' not in seq_full or not source_dependencies:
+        return None, False
+
+    seq_full_u = seq_full.upper()
+    dependents: List[Tuple[str, str, str]] = []
+    for dep_owner, dep_name, dep_type, ref_owner, ref_name, ref_type in source_dependencies:
+        if (ref_type or "").upper() != 'SEQUENCE':
+            continue
+        ref_full = f"{ref_owner}.{ref_name}".upper()
+        if ref_full != seq_full_u:
+            continue
+        dep_full = f"{dep_owner}.{dep_name}".upper()
+        dep_type_u = (dep_type or "").upper()
+        if dep_full and dep_type_u:
+            dependents.append((dep_full, dep_type_u, dep_owner))
+
+    if not dependents:
+        return None, False
+
+    remapped_targets: Set[str] = set()
+    for dep_full, dep_type_u, dep_owner in dependents:
+        dep_target = resolve_remap_target(
+            dep_full,
+            dep_type_u,
+            remap_rules,
+            source_objects=source_objects,
+            schema_mapping=schema_mapping,
+            object_parent_map=object_parent_map,
+            dependency_graph=dependency_graph,
+            transitive_table_cache=transitive_table_cache,
+            source_dependencies=source_dependencies,
+            _path=_path
+        ) or dep_full
+        if '.' not in dep_target:
+            continue
+        tgt_schema = dep_target.split('.', 1)[0].upper()
+        if tgt_schema != dep_owner.upper():
+            remapped_targets.add(tgt_schema)
+
+    if remapped_targets:
+        if len(remapped_targets) == 1:
+            inferred_schema = next(iter(remapped_targets))
+            log.debug(
+                "[推导] SEQUENCE %s 被 remap 对象引用，推导目标 schema: %s",
+                seq_full_u, inferred_schema
+            )
+            return inferred_schema, False
+        log.warning(
+            "[推导] SEQUENCE %s 被多个 remap schema 引用 (%s)，无法自动推导，请显式配置 remap。",
+            seq_full_u, sorted(remapped_targets)
+        )
+        return None, True
+
+    return None, False
+
+
+def infer_target_schema_from_direct_dependencies(
+    src_name: str,
+    obj_type: str,
+    remap_rules: RemapRules,
+    source_objects: Optional[SourceObjectMap] = None,
+    schema_mapping: Optional[Dict[str, str]] = None,
+    object_parent_map: Optional[ObjectParentMap] = None,
+    dependency_graph: Optional[DependencyGraph] = None,
+    transitive_table_cache: Optional[TransitiveTableCache] = None,
+    source_dependencies: Optional[SourceDependencySet] = None,
+    *,
+    ignore_public_synonyms: bool = True,
+    _path: Optional[Set[Tuple[str, str]]] = None
+) -> Tuple[Optional[str], bool]:
+    """
+    基于对象的“直接引用”推导目标 schema（不限于 TABLE/MVIEW）。
+
+    Returns:
+        (schema, conflict)
+        - schema: 唯一目标 schema
+        - conflict: 若引用对象映射到多个 schema，标记冲突
+    """
+    if not source_dependencies or '.' not in src_name:
+        return None, False
+
+    src_name_u = src_name.upper()
+    obj_type_u = (obj_type or "").upper()
+    candidate_types = {obj_type_u}
+    if obj_type_u in ('PACKAGE BODY', 'TYPE BODY'):
+        candidate_types.add(obj_type_u.replace(' BODY', ''))
+
+    remapped_targets: Set[str] = set()
+    for dep_owner, dep_name, dep_type, ref_owner, ref_name, ref_type in source_dependencies:
+        dep_full = f"{dep_owner}.{dep_name}".upper()
+        dep_type_u = (dep_type or "").upper()
+        if dep_full != src_name_u or dep_type_u not in candidate_types:
+            continue
+        ref_owner_u = (ref_owner or "").upper()
+        ref_type_u = (ref_type or "").upper()
+        if ignore_public_synonyms and ref_type_u == 'SYNONYM' and ref_owner_u == 'PUBLIC':
+            continue
+        ref_full = f"{ref_owner}.{ref_name}".upper()
+        ref_target = resolve_remap_target(
+            ref_full,
+            ref_type_u,
+            remap_rules,
+            source_objects=source_objects,
+            schema_mapping=schema_mapping,
+            object_parent_map=object_parent_map,
+            dependency_graph=dependency_graph,
+            transitive_table_cache=transitive_table_cache,
+            source_dependencies=source_dependencies,
+            _path=_path
+        ) or ref_full
+        if '.' not in ref_target:
+            continue
+        tgt_schema = ref_target.split('.', 1)[0].upper()
+        if tgt_schema != ref_owner_u:
+            remapped_targets.add(tgt_schema)
+
+    if remapped_targets:
+        if len(remapped_targets) == 1:
+            inferred_schema = next(iter(remapped_targets))
+            log.debug(
+                "[推导] %s (%s) 直接引用对象映射到 %s -> 推导目标 schema: %s",
+                src_name_u, obj_type_u, inferred_schema, inferred_schema
+            )
+            return inferred_schema, False
+        log.warning(
+            "[推导] %s (%s) 直接引用对象映射到多个 schema (%s)，无法自动推导，请显式配置 remap。",
+            src_name_u, obj_type_u, sorted(remapped_targets)
+        )
+        return None, True
+
+    return None, False
 
 
 def build_dependency_graph(source_dependencies: Optional[SourceDependencySet]) -> DependencyGraph:
@@ -1657,7 +1820,8 @@ def resolve_remap_target(
     object_parent_map: Optional[ObjectParentMap] = None,
     dependency_graph: Optional[DependencyGraph] = None,
     transitive_table_cache: Optional[TransitiveTableCache] = None,
-    source_dependencies: Optional[SourceDependencySet] = None
+    source_dependencies: Optional[SourceDependencySet] = None,
+    _path: Optional[Set[Tuple[str, str]]] = None
 ) -> Optional[str]:
     """
     解析对象的 remap 目标：
@@ -1670,60 +1834,159 @@ def resolve_remap_target(
     source_dependencies: 源端依赖关系，用于智能推导
     """
     obj_type_u = obj_type.upper()
-    candidate_keys: List[str] = [src_name]
-    if obj_type_u == 'PACKAGE BODY':
-        candidate_keys.insert(0, f"{src_name} BODY")
-    for key in candidate_keys:
-        if key in remap_rules:
-            tgt = remap_rules[key].strip()
-            if obj_type_u == 'PACKAGE BODY':
-                return strip_body_suffix(tgt)
-            return tgt
+    src_name_u = src_name.upper()
+    path = _path if _path is not None else set()
+    node = (src_name_u, obj_type_u)
+    if node in path:
+        return None
+    path.add(node)
+    try:
+        candidate_keys: List[str] = [src_name]
+        if obj_type_u in ('PACKAGE BODY', 'TYPE BODY'):
+            candidate_keys.insert(0, f"{src_name} BODY")
+        for key in candidate_keys:
+            if key in remap_rules:
+                tgt = remap_rules[key].strip()
+                if obj_type_u in ('PACKAGE BODY', 'TYPE BODY'):
+                    return strip_body_suffix(tgt)
+                return tgt
 
-    # 对于依附对象（TRIGGER/INDEX/CONSTRAINT/SEQUENCE/SYNONYM），使用父表的 remap 目标 schema
-    if '.' in src_name and object_parent_map:
-        parent_table = object_parent_map.get(src_name.upper())
-        if parent_table:
-            parent_target = remap_rules.get(parent_table.upper())
-            if parent_target:
-                tgt_schema = parent_target.split('.', 1)[0].upper()
-                src_obj = src_name.split('.', 1)[1]
-                return f"{tgt_schema}.{src_obj}"
+        if obj_type_u == 'SYNONYM' and '.' in src_name:
+            src_schema, src_obj = src_name.split('.', 1)
+            if src_schema.upper() == 'PUBLIC':
+                return f"PUBLIC.{src_obj.upper()}"
 
-    # 针对 SEQUENCE / SYNONYM，在 remap_rules 仅包含 TABLE 映射时，使用该 schema 的主流目标 schema
-    if '.' in src_name and obj_type_u in ('SEQUENCE', 'SYNONYM'):
-        src_schema, src_obj = src_name.split('.', 1)
-        dominant_schema = infer_dominant_schema_from_rules(remap_rules, src_schema, source_objects)
-        if dominant_schema:
-            return f"{dominant_schema}.{src_obj}"
-
-    # 对于独立对象（VIEW/PROCEDURE/FUNCTION/PACKAGE等），尝试基于依赖分析递归推导
-    if '.' in src_name and obj_type_u != 'TABLE':
-        dep_graph = dependency_graph
-        if dep_graph is None and source_dependencies:
-            dep_graph = build_dependency_graph(source_dependencies)
-        if dep_graph:
-            inferred = infer_target_schema_from_dependencies(
+        if obj_type_u == 'SYNONYM' and '.' in src_name:
+            src_schema, src_obj = src_name.split('.', 1)
+            inferred_schema, _conflict = infer_target_schema_from_direct_dependencies(
                 src_name,
                 obj_type,
                 remap_rules,
-                dep_graph,
+                source_objects=source_objects,
+                schema_mapping=schema_mapping,
                 object_parent_map=object_parent_map,
-                transitive_table_cache=transitive_table_cache
+                dependency_graph=dependency_graph,
+                transitive_table_cache=transitive_table_cache,
+                source_dependencies=source_dependencies,
+                _path=path
             )
-            if inferred:
-                return inferred
-        
-        # 回退到schema映射推导（适用于多对一、一对一场景）
-        src_schema, src_obj = src_name.split('.', 1)
-        src_schema_u = src_schema.upper()
-        
-        if schema_mapping:
-            tgt_schema = schema_mapping.get(src_schema_u)
-            if tgt_schema:
-                return f"{tgt_schema}.{src_obj}"
-    
-    return None
+            if inferred_schema:
+                return f"{inferred_schema}.{src_obj}"
+
+        # 对于依附对象（TRIGGER/INDEX/CONSTRAINT/SEQUENCE/SYNONYM），使用父表的 remap 目标 schema
+        if '.' in src_name and object_parent_map:
+            parent_table = object_parent_map.get(src_name.upper())
+            if parent_table:
+                parent_target = remap_rules.get(parent_table.upper())
+                if not parent_target and schema_mapping and '.' in parent_table:
+                    parent_schema, parent_obj = parent_table.split('.', 1)
+                    mapped_schema = schema_mapping.get(parent_schema.upper())
+                    if mapped_schema:
+                        parent_target = f"{mapped_schema.upper()}.{parent_obj}"
+                if not parent_target and obj_type_u == 'SYNONYM' and source_objects:
+                    parent_types = {t.upper() for t in source_objects.get(parent_table.upper(), set())}
+                    preferred_types = (
+                        'TABLE', 'VIEW', 'MATERIALIZED VIEW', 'SEQUENCE',
+                        'SYNONYM', 'FUNCTION', 'PROCEDURE', 'PACKAGE',
+                        'TYPE', 'TRIGGER'
+                    )
+                    for parent_type in preferred_types:
+                        if parent_type not in parent_types:
+                            continue
+                        parent_target = resolve_remap_target(
+                            parent_table.upper(),
+                            parent_type,
+                            remap_rules,
+                            source_objects=source_objects,
+                            schema_mapping=schema_mapping,
+                            object_parent_map=object_parent_map,
+                            dependency_graph=dependency_graph,
+                            transitive_table_cache=transitive_table_cache,
+                            source_dependencies=source_dependencies,
+                            _path=path
+                        )
+                        if parent_target:
+                            break
+                if parent_target:
+                    tgt_schema = parent_target.split('.', 1)[0].upper()
+                    src_obj = src_name.split('.', 1)[1]
+                    return f"{tgt_schema}.{src_obj}"
+
+        # 对于 SEQUENCE，优先根据依赖对象的 remap 结果推导
+        if '.' in src_name and obj_type_u == 'SEQUENCE':
+            src_schema, src_obj = src_name.split('.', 1)
+            inferred_schema, conflict = infer_sequence_target_schema_from_dependents(
+                src_name,
+                remap_rules,
+                source_objects=source_objects,
+                schema_mapping=schema_mapping,
+                object_parent_map=object_parent_map,
+                dependency_graph=dependency_graph,
+                transitive_table_cache=transitive_table_cache,
+                source_dependencies=source_dependencies,
+                _path=path
+            )
+            if inferred_schema:
+                return f"{inferred_schema}.{src_obj}"
+            if conflict:
+                return None
+
+        # 已处理 SEQUENCE 的依赖推导，后续不再进行通用直接依赖推导
+
+        # 针对 SEQUENCE / SYNONYM，在 remap_rules 仅包含 TABLE 映射时，使用该 schema 的主流目标 schema
+        if '.' in src_name and obj_type_u in ('SEQUENCE', 'SYNONYM'):
+            src_schema, src_obj = src_name.split('.', 1)
+            dominant_schema = infer_dominant_schema_from_rules(remap_rules, src_schema, source_objects)
+            if dominant_schema:
+                return f"{dominant_schema}.{src_obj}"
+
+        # 对于独立对象，优先基于直接依赖对象的 remap 推导（不限于 TABLE/MVIEW）
+        if '.' in src_name and obj_type_u not in ('TABLE', 'SEQUENCE', 'SYNONYM'):
+            src_schema, src_obj = src_name.split('.', 1)
+            inferred_schema, _conflict = infer_target_schema_from_direct_dependencies(
+                src_name,
+                obj_type,
+                remap_rules,
+                source_objects=source_objects,
+                schema_mapping=schema_mapping,
+                object_parent_map=object_parent_map,
+                dependency_graph=dependency_graph,
+                transitive_table_cache=transitive_table_cache,
+                source_dependencies=source_dependencies,
+                _path=path
+            )
+            if inferred_schema:
+                return f"{inferred_schema}.{src_obj}"
+
+        # 对于独立对象（VIEW/PROCEDURE/FUNCTION/PACKAGE等），尝试基于依赖分析递归推导
+        if '.' in src_name and obj_type_u != 'TABLE':
+            dep_graph = dependency_graph
+            if dep_graph is None and source_dependencies:
+                dep_graph = build_dependency_graph(source_dependencies)
+            if dep_graph:
+                inferred = infer_target_schema_from_dependencies(
+                    src_name,
+                    obj_type,
+                    remap_rules,
+                    dep_graph,
+                    object_parent_map=object_parent_map,
+                    transitive_table_cache=transitive_table_cache
+                )
+                if inferred:
+                    return inferred
+            
+            # 回退到schema映射推导（适用于多对一、一对一场景）
+            src_schema, src_obj = src_name.split('.', 1)
+            src_schema_u = src_schema.upper()
+            
+            if schema_mapping:
+                tgt_schema = schema_mapping.get(src_schema_u)
+                if tgt_schema:
+                    return f"{tgt_schema}.{src_obj}"
+
+        return None
+    finally:
+        path.remove(node)
 
 
 def generate_master_list(
@@ -7968,9 +8231,9 @@ def generate_fixup_scripts(
                 
                 # 重写依赖对象引用
                 remapped_ddl = remap_view_dependencies(
-                    cleaned_ddl, 
-                    tgt_schema, 
-                    remap_rules, 
+                    cleaned_ddl,
+                    src_schema,
+                    remap_rules,
                     full_object_mapping
                 )
                 
