@@ -16,3 +16,5 @@ schema_diff_reconciler_v0.8.8.py
 test_schema_diff_reconciler.py
 logs
 config.ini
+openspec
+AGENTS.md
