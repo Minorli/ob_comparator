@@ -1,7 +1,7 @@
 # OceanBase Comparator Toolkit
 
 🚀 **极简必看用法**  
-> 当前版本：V0.9.0（Dump-Once, Compare-Locally + 安全 DDL 生成 + 依赖智能推导）
+> 当前版本：V0.9.2（Dump-Once, Compare-Locally + 安全 DDL 生成 + 依赖智能推导）
 
 本程序致力于以最轻量的方式实现 Oracle 到 OceanBase 的异构数据库对比与修复。采用“一次转储，本地对比”架构，彻底解决大规模对象比对时的性能瓶颈与 ORA-01555 问题。
 

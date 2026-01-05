@@ -16,7 +16,7 @@
 
 """
 
-数据库对象对比工具 (V0.9.0 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
+数据库对象对比工具 (V0.9.2 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -33,7 +33,7 @@
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.9.0 核心)：
+3. 性能架构 (V0.9.2 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          DBA_OBJECTS
@@ -70,7 +70,7 @@ import logging
 import math
 import re
 
-__version__ = "0.9.0"
+__version__ = "0.9.2"
 __author__ = "Minor Li"
 import os
 import threading
@@ -168,6 +168,7 @@ DependencyNode = Tuple[str, str]  # (OWNER.OBJECT, OBJECT_TYPE)
 DependencyGraph = Dict[DependencyNode, Set[DependencyNode]]
 # 递归推导时每个节点的“最终引用表”缓存
 TransitiveTableCache = Dict[DependencyNode, Set[str]]
+RemapConflictMap = Dict[Tuple[str, str], str]  # {(SRC_FULL, TYPE): reason}
 
 # --- 全局 obclient timeout（秒），由配置初始化 ---
 OBC_TIMEOUT: int = 60
@@ -254,9 +255,30 @@ PRIMARY_OBJECT_TYPES: Tuple[str, ...] = (
     'TYPE BODY'
 )
 
+PRINT_ONLY_PRIMARY_TYPES: Tuple[str, ...] = (
+    'MATERIALIZED VIEW',
+    'PACKAGE',
+    'PACKAGE BODY'
+)
+
+PRINT_ONLY_PRIMARY_REASONS: Dict[str, str] = {
+    'MATERIALIZED VIEW': "OB 暂不支持 MATERIALIZED VIEW，仅打印不校验",
+    'PACKAGE': "PACKAGE 默认仅打印不校验",
+    'PACKAGE BODY': "PACKAGE BODY 默认仅打印不校验"
+}
+
+# 这些类型不参与 schema 推导（除非显式 remap）
+NO_INFER_SCHEMA_TYPES: Set[str] = {
+    'VIEW',
+    'MATERIALIZED VIEW',
+    'TRIGGER',
+    'PACKAGE',
+    'PACKAGE BODY'
+}
+
 # 主对象中除 TABLE 外均做存在性验证
 PRIMARY_EXISTENCE_ONLY_TYPES: Tuple[str, ...] = tuple(
-    obj for obj in PRIMARY_OBJECT_TYPES if obj != 'TABLE'
+    obj for obj in PRIMARY_OBJECT_TYPES if obj != 'TABLE' and obj not in PRINT_ONLY_PRIMARY_TYPES
 )
 
 # 额外纳入 remap/依赖但不做列级主检查的对象
@@ -1047,16 +1069,26 @@ def init_oracle_client_from_settings(settings: Dict) -> None:
         sys.exit(1)
 
 
-def get_source_objects(ora_cfg: OraConfig, schemas_list: List[str]) -> SourceObjectMap:
+def get_source_objects(
+    ora_cfg: OraConfig,
+    schemas_list: List[str],
+    object_types: Optional[Set[str]] = None
+) -> SourceObjectMap:
     """
     从 Oracle 源端获取所有需要纳入 remap/依赖分析的对象：
       TABLE / VIEW / MATERIALIZED VIEW / PROCEDURE / FUNCTION / PACKAGE / PACKAGE BODY /
       SYNONYM / JOB / SCHEDULE / TYPE / TYPE BODY / TRIGGER / SEQUENCE / INDEX
+    object_types: 可选的类型过滤集合（只查询指定类型）
     """
     log.info(f"正在连接 Oracle 源端: {ora_cfg['dsn']}...")
 
     placeholders = ','.join([f":{i+1}" for i in range(len(schemas_list))])
-    object_types_clause = ",".join(f"'{obj}'" for obj in ALL_TRACKED_OBJECT_TYPES)
+    enabled_types = {t.upper() for t in (object_types or set(ALL_TRACKED_OBJECT_TYPES))}
+    enabled_types &= set(ALL_TRACKED_OBJECT_TYPES)
+    if not enabled_types:
+        log.warning("未启用任何可管理对象类型，源端对象列表为空。")
+        return {}
+    object_types_clause = ",".join(f"'{obj}'" for obj in sorted(enabled_types))
 
     sql = f"""
         SELECT OWNER, OBJECT_NAME, OBJECT_TYPE
@@ -1154,17 +1186,24 @@ def get_source_objects(ora_cfg: OraConfig, schemas_list: List[str]) -> SourceObj
 ObjectParentMap = Dict[str, str]  # {SCHEMA.OBJECT_NAME: SCHEMA.TABLE_NAME}
 
 
-def get_object_parent_tables(ora_cfg: OraConfig, schemas_list: List[str]) -> ObjectParentMap:
+def get_object_parent_tables(
+    ora_cfg: OraConfig,
+    schemas_list: List[str],
+    enabled_object_types: Optional[Set[str]] = None
+) -> ObjectParentMap:
     """
     获取依附对象（TRIGGER/SYNONYM/INDEX/CONSTRAINT 等）所属的父表。
-    返回 {SCHEMA.OBJECT_NAME: SCHEMA.TABLE_NAME} 映射，用于让依附对象跟随父表的 schema。
-    
-    用于 one-to-many schema 拆分场景：
-    - 如果表 MONSTER_A.DUNGEONS 被 remap 到 TITAN_A.DUNGEON_INFO
-    - 则触发器 MONSTER_A.TRG_DUNGEONS 也应该 remap 到 TITAN_A schema
+    返回 {SCHEMA.OBJECT_NAME: SCHEMA.TABLE_NAME} 映射：
+      - INDEX/CONSTRAINT/SEQUENCE 等依附对象跟随父表 schema
+      - TRIGGER 仅用于依赖推导（触发器自身 schema 不随父表 remap）
     """
     parent_map: ObjectParentMap = {}
     placeholders = ','.join([f":{i+1}" for i in range(len(schemas_list))])
+    enabled_types = {t.upper() for t in (enabled_object_types or set(ALL_TRACKED_OBJECT_TYPES))}
+    include_triggers = 'TRIGGER' in enabled_types
+    include_synonyms = 'SYNONYM' in enabled_types
+    include_indexes = 'INDEX' in enabled_types
+    include_constraints = 'CONSTRAINT' in enabled_types
     
     try:
         with oracledb.connect(
@@ -1173,78 +1212,82 @@ def get_object_parent_tables(ora_cfg: OraConfig, schemas_list: List[str]) -> Obj
             dsn=ora_cfg['dsn']
         ) as connection:
             # 获取触发器所属的表
-            with connection.cursor() as cursor:
-                cursor.execute(f"""
-                    SELECT OWNER, TRIGGER_NAME, TABLE_OWNER, TABLE_NAME
-                    FROM DBA_TRIGGERS
-                    WHERE OWNER IN ({placeholders})
-                      AND TABLE_NAME IS NOT NULL
-                      AND BASE_OBJECT_TYPE IN ('TABLE', 'VIEW')
-                """, schemas_list)
-                for row in cursor:
-                    owner = (row[0] or '').strip().upper()
-                    trigger_name = (row[1] or '').strip().upper()
-                    table_owner = (row[2] or '').strip().upper()
-                    table_name = (row[3] or '').strip().upper()
-                    if owner and trigger_name and table_owner and table_name:
-                        trigger_key = f"{owner}.{trigger_name}"
-                        table_key = f"{table_owner}.{table_name}"
-                        parent_map[trigger_key] = table_key
+            if include_triggers:
+                with connection.cursor() as cursor:
+                    cursor.execute(f"""
+                        SELECT OWNER, TRIGGER_NAME, TABLE_OWNER, TABLE_NAME
+                        FROM DBA_TRIGGERS
+                        WHERE OWNER IN ({placeholders})
+                          AND TABLE_NAME IS NOT NULL
+                          AND BASE_OBJECT_TYPE IN ('TABLE', 'VIEW')
+                    """, schemas_list)
+                    for row in cursor:
+                        owner = (row[0] or '').strip().upper()
+                        trigger_name = (row[1] or '').strip().upper()
+                        table_owner = (row[2] or '').strip().upper()
+                        table_name = (row[3] or '').strip().upper()
+                        if owner and trigger_name and table_owner and table_name:
+                            trigger_key = f"{owner}.{trigger_name}"
+                            table_key = f"{table_owner}.{table_name}"
+                            parent_map[trigger_key] = table_key
 
             # 获取同义词指向的表/视图，使同义词也能跟随父表 schema
-            with connection.cursor() as cursor:
-                cursor.execute(f"""
-                    SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME
-                    FROM DBA_SYNONYMS
-                    WHERE OWNER IN ({placeholders})
-                      AND TABLE_OWNER IS NOT NULL
-                      AND TABLE_NAME IS NOT NULL
-                """, schemas_list)
-                for row in cursor:
-                    owner = (row[0] or '').strip().upper()
-                    syn_name = (row[1] or '').strip().upper()
-                    table_owner = (row[2] or '').strip().upper()
-                    table_name = (row[3] or '').strip().upper()
-                    if owner and syn_name and table_owner and table_name:
-                        syn_key = f"{owner}.{syn_name}"
-                        table_key = f"{table_owner}.{table_name}"
-                        parent_map[syn_key] = table_key
+            if include_synonyms:
+                with connection.cursor() as cursor:
+                    cursor.execute(f"""
+                        SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME
+                        FROM DBA_SYNONYMS
+                        WHERE OWNER IN ({placeholders})
+                          AND TABLE_OWNER IS NOT NULL
+                          AND TABLE_NAME IS NOT NULL
+                    """, schemas_list)
+                    for row in cursor:
+                        owner = (row[0] or '').strip().upper()
+                        syn_name = (row[1] or '').strip().upper()
+                        table_owner = (row[2] or '').strip().upper()
+                        table_name = (row[3] or '').strip().upper()
+                        if owner and syn_name and table_owner and table_name:
+                            syn_key = f"{owner}.{syn_name}"
+                            table_key = f"{table_owner}.{table_name}"
+                            parent_map[syn_key] = table_key
 
             # 获取索引所属的表
-            with connection.cursor() as cursor:
-                cursor.execute(f"""
-                    SELECT OWNER, INDEX_NAME, TABLE_OWNER, TABLE_NAME
-                    FROM DBA_INDEXES
-                    WHERE OWNER IN ({placeholders})
-                      AND TABLE_OWNER IS NOT NULL
-                      AND TABLE_NAME IS NOT NULL
-                """, schemas_list)
-                for row in cursor:
-                    owner = (row[0] or '').strip().upper()
-                    index_name = (row[1] or '').strip().upper()
-                    table_owner = (row[2] or '').strip().upper()
-                    table_name = (row[3] or '').strip().upper()
-                    if owner and index_name and table_owner and table_name:
-                        index_key = f"{owner}.{index_name}"
-                        table_key = f"{table_owner}.{table_name}"
-                        parent_map[index_key] = table_key
+            if include_indexes:
+                with connection.cursor() as cursor:
+                    cursor.execute(f"""
+                        SELECT OWNER, INDEX_NAME, TABLE_OWNER, TABLE_NAME
+                        FROM DBA_INDEXES
+                        WHERE OWNER IN ({placeholders})
+                          AND TABLE_OWNER IS NOT NULL
+                          AND TABLE_NAME IS NOT NULL
+                    """, schemas_list)
+                    for row in cursor:
+                        owner = (row[0] or '').strip().upper()
+                        index_name = (row[1] or '').strip().upper()
+                        table_owner = (row[2] or '').strip().upper()
+                        table_name = (row[3] or '').strip().upper()
+                        if owner and index_name and table_owner and table_name:
+                            index_key = f"{owner}.{index_name}"
+                            table_key = f"{table_owner}.{table_name}"
+                            parent_map[index_key] = table_key
 
             # 获取约束所属的表
-            with connection.cursor() as cursor:
-                cursor.execute(f"""
-                    SELECT OWNER, CONSTRAINT_NAME, TABLE_NAME
-                    FROM DBA_CONSTRAINTS
-                    WHERE OWNER IN ({placeholders})
-                      AND TABLE_NAME IS NOT NULL
-                """, schemas_list)
-                for row in cursor:
-                    owner = (row[0] or '').strip().upper()
-                    cons_name = (row[1] or '').strip().upper()
-                    table_name = (row[2] or '').strip().upper()
-                    if owner and cons_name and table_name:
-                        cons_key = f"{owner}.{cons_name}"
-                        table_key = f"{owner}.{table_name}"
-                        parent_map[cons_key] = table_key
+            if include_constraints:
+                with connection.cursor() as cursor:
+                    cursor.execute(f"""
+                        SELECT OWNER, CONSTRAINT_NAME, TABLE_NAME
+                        FROM DBA_CONSTRAINTS
+                        WHERE OWNER IN ({placeholders})
+                          AND TABLE_NAME IS NOT NULL
+                    """, schemas_list)
+                    for row in cursor:
+                        owner = (row[0] or '').strip().upper()
+                        cons_name = (row[1] or '').strip().upper()
+                        table_name = (row[2] or '').strip().upper()
+                        if owner and cons_name and table_name:
+                            cons_key = f"{owner}.{cons_name}"
+                            table_key = f"{owner}.{table_name}"
+                            parent_map[cons_key] = table_key
 
             log.info("已获取 %d 个依附对象的父表映射（触发器/同义词/索引/约束）。", len(parent_map))
     except oracledb.Error as e:
@@ -1467,6 +1510,7 @@ def infer_sequence_target_schema_from_dependents(
     dependency_graph: Optional[DependencyGraph] = None,
     transitive_table_cache: Optional[TransitiveTableCache] = None,
     source_dependencies: Optional[SourceDependencySet] = None,
+    remap_conflicts: Optional[RemapConflictMap] = None,
     _path: Optional[Set[Tuple[str, str]]] = None
 ) -> Tuple[Optional[str], bool]:
     """
@@ -1497,18 +1541,42 @@ def infer_sequence_target_schema_from_dependents(
 
     remapped_targets: Set[str] = set()
     for dep_full, dep_type_u, dep_owner in dependents:
-        dep_target = resolve_remap_target(
-            dep_full,
-            dep_type_u,
-            remap_rules,
-            source_objects=source_objects,
-            schema_mapping=schema_mapping,
-            object_parent_map=object_parent_map,
-            dependency_graph=dependency_graph,
-            transitive_table_cache=transitive_table_cache,
-            source_dependencies=source_dependencies,
-            _path=_path
-        ) or dep_full
+        if dep_type_u == 'TRIGGER' and object_parent_map:
+            parent_table = object_parent_map.get(dep_full.upper())
+            if parent_table:
+                dep_target = resolve_remap_target(
+                    parent_table,
+                    'TABLE',
+                    remap_rules,
+                    source_objects=source_objects,
+                    schema_mapping=schema_mapping,
+                    object_parent_map=object_parent_map,
+                    dependency_graph=dependency_graph,
+                    transitive_table_cache=transitive_table_cache,
+                    source_dependencies=source_dependencies,
+                    remap_conflicts=remap_conflicts,
+                    _path=_path
+                ) or parent_table
+            else:
+                dep_target = dep_full
+        else:
+            dep_target = resolve_remap_target(
+                dep_full,
+                dep_type_u,
+                remap_rules,
+                source_objects=source_objects,
+                schema_mapping=schema_mapping,
+                object_parent_map=object_parent_map,
+                dependency_graph=dependency_graph,
+                transitive_table_cache=transitive_table_cache,
+                source_dependencies=source_dependencies,
+                remap_conflicts=remap_conflicts,
+                _path=_path
+            ) or dep_full
+        if dep_target is None:
+            if remap_conflicts and (dep_full.upper(), dep_type_u) in remap_conflicts:
+                return None, True
+            dep_target = dep_full
         if '.' not in dep_target:
             continue
         tgt_schema = dep_target.split('.', 1)[0].upper()
@@ -1542,6 +1610,7 @@ def infer_target_schema_from_direct_dependencies(
     dependency_graph: Optional[DependencyGraph] = None,
     transitive_table_cache: Optional[TransitiveTableCache] = None,
     source_dependencies: Optional[SourceDependencySet] = None,
+    remap_conflicts: Optional[RemapConflictMap] = None,
     *,
     ignore_public_synonyms: bool = True,
     _path: Optional[Set[Tuple[str, str]]] = None
@@ -1584,8 +1653,13 @@ def infer_target_schema_from_direct_dependencies(
             dependency_graph=dependency_graph,
             transitive_table_cache=transitive_table_cache,
             source_dependencies=source_dependencies,
+            remap_conflicts=remap_conflicts,
             _path=_path
-        ) or ref_full
+        )
+        if ref_target is None:
+            if remap_conflicts and (ref_full.upper(), ref_type_u) in remap_conflicts:
+                return None, True
+            ref_target = ref_full
         if '.' not in ref_target:
             continue
         tgt_schema = ref_target.split('.', 1)[0].upper()
@@ -1746,7 +1820,7 @@ def infer_target_schema_from_dependencies(
     dependency_graph: Optional[DependencyGraph] = None,
     object_parent_map: Optional[ObjectParentMap] = None,
     transitive_table_cache: Optional[TransitiveTableCache] = None
-) -> Optional[str]:
+) -> Tuple[Optional[str], bool]:
     """
     基于对象的依赖关系递归推导目标 schema（用于 one-to-many 场景）。
 
@@ -1756,10 +1830,12 @@ def infer_target_schema_from_dependencies(
     3. 统计目标 schema 出现次数，唯一最多者作为推导结果
 
     Returns:
-        推导出的目标全名 "TGT_SCHEMA.OBJ"；无法推导则返回 None
+        (target_full, conflict)
+        - target_full: 推导出的目标全名 "TGT_SCHEMA.OBJ"；无法推导则返回 None
+        - conflict: 是否发生多 schema 冲突
     """
     if '.' not in src_name or not dependency_graph:
-        return None
+        return None, False
 
     src_name_u = src_name.upper()
     src_schema, src_obj = src_name_u.split('.', 1)
@@ -1778,7 +1854,7 @@ def infer_target_schema_from_dependencies(
             object_parent_map=object_parent_map
         )
     if not referenced_tables:
-        return None
+        return None, False
 
     target_schema_counts: Dict[str, int] = defaultdict(int)
     for table_full in referenced_tables:
@@ -1791,7 +1867,7 @@ def infer_target_schema_from_dependencies(
         target_schema_counts[tgt_schema] += 1
 
     if not target_schema_counts:
-        return None
+        return None, False
 
     max_count = max(target_schema_counts.values())
     candidate_schemas = [s for s, c in target_schema_counts.items() if c == max_count]
@@ -1802,13 +1878,13 @@ def infer_target_schema_from_dependencies(
             "[推导] %s (%s) 递归引用 %d 个表/MVIEW，其中 %d 个在 %s -> 推导目标: %s.%s",
             src_name_u, obj_type, len(referenced_tables), max_count, inferred_schema, inferred_schema, src_obj
         )
-        return f"{inferred_schema}.{src_obj}"
+        return f"{inferred_schema}.{src_obj}", False
 
     log.debug(
         "[推导] %s (%s) 引用的表/MVIEW 分散在多个 schema，无法推导: %s",
         src_name_u, obj_type, candidate_schemas
     )
-    return None
+    return None, True
 
 
 def resolve_remap_target(
@@ -1821,12 +1897,13 @@ def resolve_remap_target(
     dependency_graph: Optional[DependencyGraph] = None,
     transitive_table_cache: Optional[TransitiveTableCache] = None,
     source_dependencies: Optional[SourceDependencySet] = None,
+    remap_conflicts: Optional[RemapConflictMap] = None,
     _path: Optional[Set[Tuple[str, str]]] = None
 ) -> Optional[str]:
     """
     解析对象的 remap 目标：
     1. 优先查找 remap_rules 中的显式规则
-    2. 对于依附对象（TRIGGER/INDEX/CONSTRAINT/SEQUENCE/SYNONYM），使用父表的 remap 目标 schema
+    2. 对于依附对象（INDEX/CONSTRAINT/SEQUENCE/SYNONYM），使用父表的 remap 目标 schema
     3. 对于独立对象，尝试基于依赖分析推导（一对多场景）
     4. 对于其他非 TABLE 对象，尝试使用 schema_mapping（多对一、一对一场景）
     
@@ -1840,6 +1917,13 @@ def resolve_remap_target(
     if node in path:
         return None
     path.add(node)
+    def _record_conflict(reason: str) -> None:
+        if remap_conflicts is None:
+            return
+        key = (src_name_u, obj_type_u)
+        if key not in remap_conflicts:
+            remap_conflicts[key] = reason
+
     try:
         candidate_keys: List[str] = [src_name]
         if obj_type_u in ('PACKAGE BODY', 'TYPE BODY'):
@@ -1851,6 +1935,9 @@ def resolve_remap_target(
                     return strip_body_suffix(tgt)
                 return tgt
 
+        if obj_type_u in NO_INFER_SCHEMA_TYPES:
+            return src_name_u
+
         if obj_type_u == 'SYNONYM' and '.' in src_name:
             src_schema, src_obj = src_name.split('.', 1)
             if src_schema.upper() == 'PUBLIC':
@@ -1858,7 +1945,7 @@ def resolve_remap_target(
 
         if obj_type_u == 'SYNONYM' and '.' in src_name:
             src_schema, src_obj = src_name.split('.', 1)
-            inferred_schema, _conflict = infer_target_schema_from_direct_dependencies(
+            inferred_schema, conflict = infer_target_schema_from_direct_dependencies(
                 src_name,
                 obj_type,
                 remap_rules,
@@ -1868,12 +1955,16 @@ def resolve_remap_target(
                 dependency_graph=dependency_graph,
                 transitive_table_cache=transitive_table_cache,
                 source_dependencies=source_dependencies,
+                remap_conflicts=remap_conflicts,
                 _path=path
             )
             if inferred_schema:
                 return f"{inferred_schema}.{src_obj}"
+            if conflict:
+                _record_conflict("同义词直接依赖映射到多个 schema，无法自动推导")
+                return None
 
-        # 对于依附对象（TRIGGER/INDEX/CONSTRAINT/SEQUENCE/SYNONYM），使用父表的 remap 目标 schema
+        # 对于依附对象（INDEX/CONSTRAINT/SEQUENCE/SYNONYM），使用父表的 remap 目标 schema
         if '.' in src_name and object_parent_map:
             parent_table = object_parent_map.get(src_name.upper())
             if parent_table:
@@ -1924,11 +2015,13 @@ def resolve_remap_target(
                 dependency_graph=dependency_graph,
                 transitive_table_cache=transitive_table_cache,
                 source_dependencies=source_dependencies,
+                remap_conflicts=remap_conflicts,
                 _path=path
             )
             if inferred_schema:
                 return f"{inferred_schema}.{src_obj}"
             if conflict:
+                _record_conflict("SEQUENCE 被多个 remap schema 引用，无法自动推导")
                 return None
 
         # 已处理 SEQUENCE 的依赖推导，后续不再进行通用直接依赖推导
@@ -1943,7 +2036,7 @@ def resolve_remap_target(
         # 对于独立对象，优先基于直接依赖对象的 remap 推导（不限于 TABLE/MVIEW）
         if '.' in src_name and obj_type_u not in ('TABLE', 'SEQUENCE', 'SYNONYM'):
             src_schema, src_obj = src_name.split('.', 1)
-            inferred_schema, _conflict = infer_target_schema_from_direct_dependencies(
+            inferred_schema, conflict = infer_target_schema_from_direct_dependencies(
                 src_name,
                 obj_type,
                 remap_rules,
@@ -1953,10 +2046,14 @@ def resolve_remap_target(
                 dependency_graph=dependency_graph,
                 transitive_table_cache=transitive_table_cache,
                 source_dependencies=source_dependencies,
+                remap_conflicts=remap_conflicts,
                 _path=path
             )
             if inferred_schema:
                 return f"{inferred_schema}.{src_obj}"
+            if conflict:
+                _record_conflict("直接依赖映射到多个 schema，无法自动推导")
+                return None
 
         # 对于独立对象（VIEW/PROCEDURE/FUNCTION/PACKAGE等），尝试基于依赖分析递归推导
         if '.' in src_name and obj_type_u != 'TABLE':
@@ -1964,7 +2061,7 @@ def resolve_remap_target(
             if dep_graph is None and source_dependencies:
                 dep_graph = build_dependency_graph(source_dependencies)
             if dep_graph:
-                inferred = infer_target_schema_from_dependencies(
+                inferred, conflict = infer_target_schema_from_dependencies(
                     src_name,
                     obj_type,
                     remap_rules,
@@ -1974,6 +2071,9 @@ def resolve_remap_target(
                 )
                 if inferred:
                     return inferred
+                if conflict:
+                    _record_conflict("递归依赖映射到多个 schema，无法自动推导")
+                    return None
             
             # 回退到schema映射推导（适用于多对一、一对一场景）
             src_schema, src_obj = src_name.split('.', 1)
@@ -1998,7 +2098,8 @@ def generate_master_list(
     object_parent_map: Optional[ObjectParentMap] = None,
     transitive_table_cache: Optional[TransitiveTableCache] = None,
     source_dependencies: Optional[SourceDependencySet] = None,
-    dependency_graph: Optional[DependencyGraph] = None
+    dependency_graph: Optional[DependencyGraph] = None,
+    remap_conflicts: Optional[RemapConflictMap] = None
 ) -> MasterCheckList:
     """
     生成“最终校验清单”并检测 "多对一" 映射。
@@ -2017,6 +2118,8 @@ def generate_master_list(
             obj_type_u = obj_type.upper()
             if obj_type_u not in allowed_primary:
                 continue
+            if remap_conflicts and (src_name_u, obj_type_u) in remap_conflicts:
+                continue
 
             if precomputed_mapping and src_name_u in precomputed_mapping:
                 tgt_name = precomputed_mapping[src_name_u].get(obj_type_u, src_name_u)
@@ -2030,8 +2133,12 @@ def generate_master_list(
                     object_parent_map=object_parent_map,
                     dependency_graph=dependency_graph,
                     transitive_table_cache=transitive_table_cache,
-                    source_dependencies=source_dependencies
-                ) or src_name_u
+                    source_dependencies=source_dependencies,
+                    remap_conflicts=remap_conflicts
+                )
+                if remap_conflicts and (src_name_u, obj_type_u) in remap_conflicts:
+                    continue
+                tgt_name = tgt_name or src_name_u
             tgt_name_u = tgt_name.upper()
 
             key = (tgt_name_u, obj_type_u)
@@ -2060,7 +2167,9 @@ def build_full_object_mapping(
     object_parent_map: Optional[ObjectParentMap] = None,
     transitive_table_cache: Optional[TransitiveTableCache] = None,
     source_dependencies: Optional[SourceDependencySet] = None,
-    dependency_graph: Optional[DependencyGraph] = None
+    dependency_graph: Optional[DependencyGraph] = None,
+    enabled_types: Optional[Set[str]] = None,
+    remap_conflicts: Optional[RemapConflictMap] = None
 ) -> FullObjectMapping:
     """
     为所有受管对象建立映射 (源 -> 目标)。
@@ -2068,6 +2177,7 @@ def build_full_object_mapping(
     
     object_parent_map: 依附对象到父表的映射，用于 one-to-many schema 拆分场景
     source_dependencies: 源端依赖关系，用于智能推导目标schema
+    enabled_types: 若提供，仅处理这些对象类型
     """
     def _enforce_paired_objects_same_target(
         src_full: str,
@@ -2112,6 +2222,9 @@ def build_full_object_mapping(
     mapping: FullObjectMapping = {}
     target_tracker: Dict[Tuple[str, str], str] = {}
 
+    enabled_types_u = {t.upper() for t in enabled_types} if enabled_types else None
+    conflict_map = remap_conflicts
+
     for src_name, obj_types in source_objects.items():
         src_name_u = src_name.upper()
         local_map: Dict[str, str] = {}
@@ -2119,6 +2232,8 @@ def build_full_object_mapping(
         # 先为该对象的所有类型计算目标
         for obj_type in sorted(obj_types):
             obj_type_u = obj_type.upper()
+            if enabled_types_u and obj_type_u not in enabled_types_u:
+                continue
             tgt_name = resolve_remap_target(
                 src_name_u,
                 obj_type_u,
@@ -2128,9 +2243,17 @@ def build_full_object_mapping(
                 object_parent_map=object_parent_map,
                 dependency_graph=dependency_graph,
                 transitive_table_cache=transitive_table_cache,
-                source_dependencies=source_dependencies
-            ) or src_name_u
+                source_dependencies=source_dependencies,
+                remap_conflicts=conflict_map
+            )
+            if tgt_name is None:
+                if conflict_map and (src_name_u, obj_type_u) in conflict_map:
+                    continue
+                tgt_name = src_name_u
             local_map[obj_type_u] = tgt_name.upper()
+
+        if not local_map:
+            continue
 
         # 强制配对对象统一目标
         _enforce_paired_objects_same_target(src_name_u, local_map)
@@ -2314,8 +2437,10 @@ def build_schema_mapping(master_list: MasterCheckList) -> Dict[str, str]:
         log.info("  1. 独立对象（VIEW/PROCEDURE/FUNCTION/PACKAGE等）：")
         log.info("     - 优先通过依赖分析推导（分析对象引用的表，选择出现最多的目标schema）")
         log.info("     - 如果依赖推导失败，需要在 remap_rules.txt 中显式指定")
-        log.info("  2. 依附对象（TRIGGER/INDEX/CONSTRAINT/SEQUENCE）：")
+        log.info("  2. 依附对象（INDEX/CONSTRAINT/SEQUENCE）：")
         log.info("     - 自动跟随父表的 schema，无需显式指定")
+        log.info("  3. TRIGGER：")
+        log.info("     - 默认保持源 schema，除非在 remap_rules.txt 中显式指定")
         log.info("=" * 80)
     
     return final_mapping
@@ -3344,7 +3469,8 @@ def dump_oracle_metadata(
 
 def load_oracle_dependencies(
     ora_cfg: OraConfig,
-    schemas_list: List[str]
+    schemas_list: List[str],
+    object_types: Optional[Set[str]] = None
 ) -> List[DependencyRecord]:
     """
     从 Oracle 批量读取源 schema 内部的依赖关系。
@@ -3353,7 +3479,12 @@ def load_oracle_dependencies(
         return []
 
     owners_clause = ','.join([f":{i+1}" for i in range(len(schemas_list))])
-    types_clause = ",".join(f"'{t}'" for t in ALL_TRACKED_OBJECT_TYPES)
+    enabled_types = {t.upper() for t in (object_types or set(ALL_TRACKED_OBJECT_TYPES))}
+    enabled_types &= set(ALL_TRACKED_OBJECT_TYPES)
+    if not enabled_types:
+        log.info("未启用依赖分析对象类型，跳过 Oracle 依赖读取。")
+        return []
+    types_clause = ",".join(f"'{t}'" for t in sorted(enabled_types))
 
     sql = f"""
         SELECT OWNER, NAME, TYPE, REFERENCED_OWNER, REFERENCED_NAME, REFERENCED_TYPE
@@ -3398,7 +3529,11 @@ def load_oracle_dependencies(
     return records
 
 
-def load_ob_dependencies(ob_cfg: ObConfig, target_schemas: Set[str]) -> Set[Tuple[str, str, str, str]]:
+def load_ob_dependencies(
+    ob_cfg: ObConfig,
+    target_schemas: Set[str],
+    object_types: Optional[Set[str]] = None
+) -> Set[Tuple[str, str, str, str]]:
     """
     通过 obclient 读取 OceanBase 侧的依赖信息。
     返回集合 { (OWNER.OBJ, TYPE, REF_OWNER.OBJ, REF_TYPE) }
@@ -3407,7 +3542,11 @@ def load_ob_dependencies(ob_cfg: ObConfig, target_schemas: Set[str]) -> Set[Tupl
         return set()
 
     owners_in = ",".join(f"'{s}'" for s in sorted(target_schemas))
-    types_clause = ",".join(f"'{t}'" for t in ALL_TRACKED_OBJECT_TYPES)
+    enabled_types = {t.upper() for t in (object_types or set(ALL_TRACKED_OBJECT_TYPES))}
+    enabled_types &= set(ALL_TRACKED_OBJECT_TYPES)
+    if not enabled_types:
+        return set()
+    types_clause = ",".join(f"'{t}'" for t in sorted(enabled_types))
 
     sql = f"""
         SELECT OWNER, NAME, TYPE, REFERENCED_OWNER, REFERENCED_NAME, REFERENCED_TYPE
@@ -3882,17 +4021,20 @@ def check_primary_objects(
     extraneous_rules: List[str],
     ob_meta: ObMetadata,
     oracle_meta: OracleMetadata,
-    enabled_primary_types: Optional[Set[str]] = None
+    enabled_primary_types: Optional[Set[str]] = None,
+    print_only_types: Optional[Set[str]] = None
 ) -> ReportResults:
     """
     核心主对象校验：
       - TABLE: 存在性 + 列名集合 (忽略 OMS_OBJECT_NUMBER/OMS_RELATIVE_FNO/OMS_BLOCK_NUMBER/OMS_ROW_NUMBER)
-      - VIEW / PROCEDURE / FUNCTION / PACKAGE / PACKAGE BODY / SYNONYM: 只校验存在性
+      - VIEW / PROCEDURE / FUNCTION / SYNONYM: 只校验存在性
+      - MATERIALIZED VIEW / PACKAGE / PACKAGE BODY: 默认仅打印不校验（若未被禁用）
     """
     results: ReportResults = {
         "missing": [],
         "mismatched": [],
         "ok": [],
+        "skipped": [],
         "extraneous": extraneous_rules,
         "extra_targets": []
     }
@@ -3904,6 +4046,7 @@ def check_primary_objects(
     log.info("--- 开始执行主对象批量验证 (TABLE/VIEW/PROC/FUNC/PACKAGE/PACKAGE BODY/SYNONYM) ---")
 
     allowed_types = enabled_primary_types or set(PRIMARY_OBJECT_TYPES)
+    print_only_types_u = {t.upper() for t in (print_only_types or set())}
 
     total = len(master_list)
     expected_targets: Dict[str, Set[str]] = defaultdict(set)
@@ -3925,10 +4068,15 @@ def check_primary_objects(
         tgt_schema_u = tgt_schema.upper()
         tgt_obj_u = tgt_obj.upper()
         full_tgt = f"{tgt_schema_u}.{tgt_obj_u}"
-        expected_targets[obj_type_u].add(full_tgt)
-
         if obj_type_u not in allowed_types:
             continue
+
+        if obj_type_u in print_only_types_u:
+            reason = PRINT_ONLY_PRIMARY_REASONS.get(obj_type_u, "仅打印不校验")
+            results['skipped'].append((obj_type_u, full_tgt, src_name, reason))
+            continue
+
+        expected_targets[obj_type_u].add(full_tgt)
 
         if obj_type_u == 'TABLE':
             # 1) OB 是否存在 TABLE
@@ -4032,7 +4180,7 @@ def check_primary_objects(
             continue
 
     # 记录目标端多出的对象（任何受管类型）
-    for obj_type in sorted(allowed_types):
+    for obj_type in sorted(allowed_types - print_only_types_u):
         actual = ob_meta.objects_by_type.get(obj_type, set())
         expected = expected_targets.get(obj_type, set())
         extras = sorted(actual - expected)
@@ -4399,7 +4547,10 @@ def compare_triggers_for_table(
         if not tgt_trg:
             return True, None
         # 源端没有触发器但目标端有，记录目标端额外的触发器
-        extra_triggers = set(tgt_trg.keys())
+        extra_triggers: Set[str] = set()
+        for name, info in tgt_trg.items():
+            owner_u = (info.get("owner") or tgt_schema).upper()
+            extra_triggers.add(f"{owner_u}.{name.upper()}")
         return False, TriggerMismatch(
             table=f"{tgt_schema}.{tgt_table}",
             missing_triggers=set(),
@@ -4409,16 +4560,23 @@ def compare_triggers_for_table(
         )
 
     src_names_raw = set(src_trg.keys())
-    tgt_names = set(tgt_trg.keys())
+    tgt_full_names: Set[str] = set()
+    tgt_info_map: Dict[str, Dict] = {}
+    for name, info in tgt_trg.items():
+        owner_u = (info.get("owner") or tgt_schema).upper()
+        name_u = name.upper()
+        full = f"{owner_u}.{name_u}"
+        tgt_full_names.add(full)
+        tgt_info_map[full] = info
 
-    src_names: Set[str] = set()
-    target_name_map: Dict[str, Tuple[str, str, str]] = {}
+    src_target_full: Set[str] = set()
+    target_name_map: Dict[str, Tuple[str, str, str, str]] = {}
     for name in src_names_raw:
         info = src_trg.get(name) or {}
         trg_owner = (info.get("owner") or src_schema).upper()
         name_u = name.upper()
-        full = f"{trg_owner}.{name_u}"
-        mapped = get_mapped_target(full_object_mapping, full, 'TRIGGER')
+        src_full = f"{trg_owner}.{name_u}"
+        mapped = get_mapped_target(full_object_mapping, src_full, 'TRIGGER')
         if mapped and '.' in mapped:
             tgt_owner, tgt_name = mapped.split('.', 1)
             tgt_owner_u = tgt_owner.upper()
@@ -4428,22 +4586,25 @@ def compare_triggers_for_table(
             tgt_name_u = name_u
             ensure_mapping_entry(
                 full_object_mapping,
-                full,
+                src_full,
                 'TRIGGER',
                 f"{tgt_owner_u}.{tgt_name_u}"
             )
-        src_names.add(tgt_name_u)
-        target_name_map[tgt_name_u] = (trg_owner, name_u, tgt_owner_u)
+        tgt_full = f"{tgt_owner_u}.{tgt_name_u}"
+        src_target_full.add(tgt_full)
+        target_name_map[tgt_full] = (trg_owner, name_u, tgt_owner_u, tgt_name_u)
 
-    missing = src_names - tgt_names
-    extra = tgt_names - src_names
+    missing = src_target_full - tgt_full_names
+    extra = tgt_full_names - src_target_full
     detail_mismatch: List[str] = []
     missing_mappings: List[Tuple[str, str]] = []
 
-    for tgt_name in sorted(missing):
-        src_owner, src_name, tgt_owner = target_name_map.get(
-            tgt_name,
-            (src_schema.upper(), tgt_name, tgt_schema.upper())
+    for tgt_full in sorted(missing):
+        tgt_parts = tgt_full.split('.', 1)
+        tgt_name_fallback = tgt_parts[1] if len(tgt_parts) > 1 else tgt_full
+        src_owner, src_name, tgt_owner, tgt_name = target_name_map.get(
+            tgt_full,
+            (src_schema.upper(), tgt_name_fallback, tgt_schema.upper(), tgt_name_fallback)
         )
         missing_mappings.append(
             (
@@ -4452,19 +4613,20 @@ def compare_triggers_for_table(
             )
         )
 
-    common = src_names & tgt_names
-    for name in common:
-        src_info = target_name_map.get(name)
-        src_info_name = src_info[1] if src_info else name
-        s = src_trg.get(src_info_name) or src_trg.get(name) or {}
-        t = tgt_trg[name]
-        if (s["event"] or "").strip() != (t.get("event") or "").strip():
+    common = src_target_full & tgt_full_names
+    for tgt_full in common:
+        src_info = target_name_map.get(tgt_full)
+        src_info_name = src_info[1] if src_info else tgt_full.split('.', 1)[1]
+        s = src_trg.get(src_info_name) or {}
+        t = tgt_info_map.get(tgt_full, {})
+        display_name = tgt_full
+        if (s.get("event") or "").strip() != (t.get("event") or "").strip():
             detail_mismatch.append(
-                f"{name}: 触发事件不一致 (src={s['event']}, tgt={t.get('event')})"
+                f"{display_name}: 触发事件不一致 (src={s.get('event')}, tgt={t.get('event')})"
             )
-        if (s["status"] or "").strip() != (t.get("status") or "").strip():
+        if (s.get("status") or "").strip() != (t.get("status") or "").strip():
             detail_mismatch.append(
-                f"{name}: 状态不一致 (src={s['status']}, tgt={t.get('status')})"
+                f"{display_name}: 状态不一致 (src={s.get('status')}, tgt={t.get('status')})"
             )
 
     all_good = (not missing) and (not extra) and (not detail_mismatch)
@@ -7866,7 +8028,7 @@ def generate_fixup_scripts(
         queue_request(src_schema, 'TABLE', src_table)
         constraint_tasks.append((item, src_schema, src_table, tgt_schema.upper(), tgt_table.upper()))
 
-    trigger_tasks: List[Tuple[str, str, str, str, str, str]] = []
+    trigger_tasks: List[Tuple[str, str, str, str, str, str, str]] = []
     for item in extra_results.get('trigger_mismatched', []):
         table_str = item.table.split()[0]
         if '.' not in table_str:
@@ -7886,7 +8048,7 @@ def generate_fixup_scripts(
                 if not allow_fixup('TRIGGER', tgt_schema_final):
                     continue
                 queue_request(src_schema_u, 'TRIGGER', src_trg)
-                trigger_tasks.append((src_schema_u, src_trg, tgt_schema_final, tgt_obj, src_table, tgt_table))
+                trigger_tasks.append((src_schema_u, src_trg, tgt_schema_final, tgt_obj, src_table, tgt_schema, tgt_table))
         else:
             for trg_name in sorted(item.missing_triggers):
                 trg_name_u = trg_name.upper()
@@ -7900,7 +8062,7 @@ def generate_fixup_scripts(
                 if not allow_fixup('TRIGGER', tgt_schema_final):
                     continue
                 queue_request(src_schema, 'TRIGGER', trg_name_u)
-                trigger_tasks.append((src_schema, trg_name_u, tgt_schema_final, tgt_obj, src_table, tgt_table))
+                trigger_tasks.append((src_schema, trg_name_u, tgt_schema_final, tgt_obj, src_table, tgt_schema, tgt_table))
 
     other_missing_summary: Dict[str, int] = defaultdict(int)
     for ot, _, _, _, _ in other_missing_objects:
@@ -7959,7 +8121,7 @@ def generate_fixup_scripts(
             fallback_needed.append((src_schema, 'SEQUENCE', src_seq))
     
     # 触发器任务
-    for src_schema, trg_name, tgt_schema, tgt_obj, _src_table, _tgt_table in trigger_tasks:
+    for src_schema, trg_name, tgt_schema, tgt_obj, _src_table, _tgt_schema, _tgt_table in trigger_tasks:
         if not dbcat_data.get(src_schema.upper(), {}).get('TRIGGER', {}).get(trg_name.upper()):
             fallback_needed.append((src_schema, 'TRIGGER', trg_name))
     
@@ -8534,8 +8696,16 @@ def generate_fixup_scripts(
     log.info("[FIXUP] (7/9) 正在生成 TRIGGER 脚本...")
     trigger_progress = build_progress_tracker(len(trigger_tasks), "[FIXUP] (7/9) TRIGGER")
     trigger_jobs: List[Callable[[], None]] = []
-    for src_schema, trg_name, tgt_schema, tgt_obj, src_table, tgt_table in trigger_tasks:
-        def _job(ss=src_schema, tn=trg_name, ts=tgt_schema, to=tgt_obj, st=src_table, tt=tgt_table):
+    for src_schema, trg_name, tgt_schema, tgt_obj, src_table, tgt_table_schema, tgt_table in trigger_tasks:
+        def _job(
+            ss=src_schema,
+            tn=trg_name,
+            ts=tgt_schema,
+            to=tgt_obj,
+            st=src_table,
+            tts=tgt_table_schema,
+            tt=tgt_table
+        ):
             try:
                 fetch_result = fetch_ddl_with_timing(ss, 'TRIGGER', tn)
                 if len(fetch_result) != 3:
@@ -8553,8 +8723,8 @@ def generate_fixup_scripts(
                 else:
                     mark_source('TRIGGER', 'missing')
                 extra_ids = get_relevant_replacements(ss)
-                if st and tt:
-                    extra_ids = extra_ids + [((ss.upper(), st.upper()), (ts.upper(), tt.upper()))]
+                if st and tt and tts:
+                    extra_ids = extra_ids + [((ss.upper(), st.upper()), (tts.upper(), tt.upper()))]
                 ddl_adj = adjust_ddl_for_object(
                     ddl,
                     ss,
@@ -8575,12 +8745,12 @@ def generate_fixup_scripts(
                     )
                     text = name_pattern.sub(rf'\1{ts}.{to}', text, count=1)
                     # 替换 ON 子句表名
-                    if st and tt:
+                    if st and tt and tts:
                         on_pattern = re.compile(
                             rf'(\bON\s+)("?\s*{re.escape(ss)}\s*"?\s*\.\s*)?"?{re.escape(st)}"?',
                             re.IGNORECASE
                         )
-                        text = on_pattern.sub(rf'\1{ts}.{tt}', text, count=1)
+                        text = on_pattern.sub(rf'\1{tts}.{tt}', text, count=1)
                     return text
                 ddl_adj = _rewrite_trigger_name_and_on(ddl_adj)
                 ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
@@ -8588,10 +8758,32 @@ def generate_fixup_scripts(
                 ddl_adj = apply_ddl_cleanup_rules(ddl_adj, 'TRIGGER')
                 ddl_adj = strip_constraint_enable(ddl_adj)
                 ddl_adj = enforce_schema_for_ddl(ddl_adj, ts, 'TRIGGER')
+                grants_for_trigger: Set[str] = set()
+                if tts and tt and ts and tts.upper() != ts.upper():
+                    table_full = f"{tts}.{tt}".upper()
+                    required_priv = GRANT_PRIVILEGE_BY_TYPE.get('TABLE', 'SELECT')
+                    grants_for_trigger.add(
+                        f"GRANT {required_priv} ON {table_full} TO {ts.upper()};"
+                    )
+                if grants_map and ts:
+                    for priv, obj_granted_on in grants_map.get(ts.upper(), set()):
+                        if not obj_granted_on or '.' not in obj_granted_on:
+                            continue
+                        if tts and tt and obj_granted_on.upper() == f"{tts}.{tt}".upper():
+                            grants_for_trigger.add(
+                                f"GRANT {priv} ON {obj_granted_on.upper()} TO {ts.upper()};"
+                            )
                 filename = f"{ts}.{to}.sql"
                 header = f"修补缺失的触发器 {to} (源: {ss}.{tn})"
                 log.info("[FIXUP]%s 写入 TRIGGER 脚本: %s", source_tag(ddl_source_label), filename)
-                write_fixup_file(base_dir, 'trigger', filename, ddl_adj, header)
+                write_fixup_file(
+                    base_dir,
+                    'trigger',
+                    filename,
+                    ddl_adj,
+                    header,
+                    grants_to_add=sorted(grants_for_trigger) if grants_for_trigger else None
+                )
             finally:
                 trigger_progress()
         trigger_jobs.append(_job)
@@ -8766,6 +8958,28 @@ def export_full_object_mapping(
         return None
 
 
+def export_remap_conflicts(
+    remap_conflicts: RemapConflictMap,
+    output_path: Path
+) -> Optional[Path]:
+    """
+    输出无法自动推导的对象列表，便于提醒显式 remap。
+    每行格式：SRC_FULL<TAB>OBJECT_TYPE<TAB>REASON
+    """
+    if not remap_conflicts:
+        return None
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        lines: List[str] = ["# 无法自动推导的对象，请在 remap_rules.txt 中显式配置"]
+        for (src_full, obj_type), reason in sorted(remap_conflicts.items()):
+            lines.append(f"{src_full}\t{obj_type}\t{reason}")
+        output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return output_path
+    except OSError as exc:
+        log.warning("写入 remap_conflicts 文件失败 %s: %s", output_path, exc)
+        return None
+
+
 def export_missing_table_view_mappings(
     tv_results: ReportResults,
     report_dir: Path
@@ -8873,6 +9087,9 @@ def print_final_report(
     ok_count = len(tv_results['ok'])
     missing_count = len(tv_results['missing'])
     mismatched_count = len(tv_results['mismatched'])
+    skipped_count = len(tv_results.get('skipped', []))
+    remap_conflicts = tv_results.get('remap_conflicts', [])
+    remap_conflict_cnt = len(remap_conflicts)
     extraneous_count = len(tv_results['extraneous'])
     idx_ok_cnt = len(extra_results.get("index_ok", []))
     idx_mis_cnt = len(extra_results.get("index_mismatched", []))
@@ -8892,7 +9109,7 @@ def print_final_report(
     grant_stmt_cnt = sum(len(entries) for entries in required_grants.values())
     source_missing_schema_cnt = len(schema_summary.get("source_missing", []))
 
-    console.print(Panel.fit("[bold]数据库对象迁移校验报告 (V0.9.0 - Rich)[/bold]", style="title"))
+    console.print(Panel.fit(f"[bold]数据库对象迁移校验报告 (V{__version__} - Rich)[/bold]", style="title"))
 
     section_width = 140
     count_table_kwargs: Dict[str, object] = {"width": section_width, "expand": False}
@@ -8973,8 +9190,15 @@ def print_final_report(
     primary_text.append(f"{mismatched_count}\n")
     primary_text.append("多余: ", style="mismatch")
     primary_text.append(f"{extra_target_cnt}\n")
+    if skipped_count:
+        primary_text.append("仅打印: ", style="info")
+        primary_text.append(f"{skipped_count}\n")
     primary_text.append("无效规则: ", style="mismatch")
     primary_text.append(f"{extraneous_count}")
+    if remap_conflict_cnt:
+        primary_text.append("\n")
+        primary_text.append("无法推导: ", style="mismatch")
+        primary_text.append(f"{remap_conflict_cnt}")
     summary_table.add_row("[bold]主对象 (TABLE/VIEW/etc.)[/bold]", primary_text)
 
     comment_text = Text()
@@ -9088,7 +9312,8 @@ def print_final_report(
         ob_counts = object_counts_summary.get("oceanbase", {})
         missing_counts = object_counts_summary.get("missing", {})
         extra_counts = object_counts_summary.get("extra", {})
-        for obj_type in OBJECT_COUNT_TYPES:
+        count_types = sorted(set(oracle_counts) | set(ob_counts) | set(missing_counts) | set(extra_counts))
+        for obj_type in count_types:
             ora_val = oracle_counts.get(obj_type, 0)
             ob_val = ob_counts.get(obj_type, 0)
             miss_val = missing_counts.get(obj_type, 0)
@@ -9134,6 +9359,33 @@ def print_final_report(
         table.add_column("目标对象(多余)", style="info")
         for obj_type, tgt_name in tv_results['extra_targets']:
             table.add_row(f"[{obj_type}]", tgt_name)
+        console.print(table)
+
+    if tv_results.get('skipped'):
+        skipped_items = tv_results['skipped']
+        table = Table(title=f"[header]1.c 仅打印未校验的主对象 (共 {len(skipped_items)} 个)", width=section_width)
+        table.add_column("类型", style="info", width=TYPE_COL_WIDTH)
+        table.add_column("对象 (源名[=目标名])", style="info", width=OBJECT_COL_WIDTH)
+        table.add_column("原因", style="info", width=DETAIL_COL_WIDTH)
+        for obj_type, tgt_name, src_name, reason in skipped_items:
+            table.add_row(
+                f"[{obj_type}]",
+                format_missing_mapping(src_name, tgt_name),
+                reason or ""
+            )
+        console.print(table)
+
+    if remap_conflicts:
+        table = Table(title=f"[header]1.d 无法自动推导的对象 (共 {remap_conflict_cnt} 个)", width=section_width)
+        table.add_column("类型", style="info", width=TYPE_COL_WIDTH)
+        table.add_column("对象 (源端)", style="info", width=OBJECT_COL_WIDTH)
+        table.add_column("原因", style="info", width=DETAIL_COL_WIDTH)
+        for obj_type, src_name, reason in remap_conflicts:
+            table.add_row(
+                f"[{obj_type}]",
+                src_name,
+                reason or ""
+            )
         console.print(table)
 
     # --- 2. 列不匹配的表 ---
@@ -9321,11 +9573,11 @@ def print_final_report(
         "[bold]Fixup 脚本生成目录[/bold]\n\n"
         "fixup_scripts/table         : 缺失 TABLE 的 CREATE 脚本\n"
         "fixup_scripts/view          : 缺失 VIEW 的 CREATE 脚本\n"
-        "fixup_scripts/materialized_view : 缺失 MATERIALIZED VIEW 的 CREATE 脚本\n"
+        "fixup_scripts/materialized_view : MATERIALIZED VIEW 默认仅打印不生成\n"
         "fixup_scripts/procedure     : 缺失 PROCEDURE 的 CREATE 脚本\n"
         "fixup_scripts/function      : 缺失 FUNCTION 的 CREATE 脚本\n"
-        "fixup_scripts/package       : 缺失 PACKAGE 的 CREATE 脚本\n"
-        "fixup_scripts/package_body  : 缺失 PACKAGE BODY 的 CREATE 脚本\n"
+        "fixup_scripts/package       : PACKAGE 默认仅打印不生成\n"
+        "fixup_scripts/package_body  : PACKAGE BODY 默认仅打印不生成\n"
         "fixup_scripts/synonym       : 缺失 SYNONYM 的 CREATE 脚本\n"
         "fixup_scripts/job           : 缺失 JOB 的 CREATE 脚本\n"
         "fixup_scripts/schedule      : 缺失 SCHEDULE 的 CREATE 脚本\n"
@@ -9366,8 +9618,8 @@ def print_final_report(
 def parse_cli_args() -> argparse.Namespace:
     """解析命令行参数，允许自定义 config.ini 路径并展示功能说明。"""
     desc = textwrap.dedent(
-        """\
-        OceanBase Comparator Toolkit v0.9.0
+        f"""\
+        OceanBase Comparator Toolkit v{__version__}
         - 一次转储，本地对比：Oracle Thick Mode + 少量 obclient 调用，全部比对在内存完成。
         - 覆盖对象：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。
         - 校验规则：表列名集合 + VARCHAR/VARCHAR2 长度窗口 [ceil(1.5x), ceil(2.5x)]；其余对象校验存在性/列组合。
@@ -9436,6 +9688,10 @@ def main():
     log.info("OceanBase Comparator Toolkit v%s", __version__)
     enabled_primary_types: Set[str] = set(settings.get('enabled_primary_types') or set(PRIMARY_OBJECT_TYPES))
     enabled_extra_types: Set[str] = set(settings.get('enabled_extra_types') or set(EXTRA_OBJECT_CHECK_TYPES))
+    print_only_primary_types = set(PRINT_ONLY_PRIMARY_TYPES)
+    print_only_types = enabled_primary_types & print_only_primary_types
+    checked_primary_types = enabled_primary_types - print_only_types
+    enabled_object_types = enabled_primary_types | enabled_extra_types
     enable_dependencies_check: bool = bool(settings.get('enable_dependencies_check', True))
     enable_comment_check: bool = bool(settings.get('enable_comment_check', True))
 
@@ -9443,6 +9699,11 @@ def main():
         "本次启用的主对象类型: %s",
         ", ".join(sorted(enabled_primary_types))
     )
+    if print_only_types:
+        log.info(
+            "以下主对象类型仅打印不校验: %s",
+            ", ".join(sorted(print_only_types))
+        )
     log.info(
         "本次启用的扩展校验: %s",
         ", ".join(sorted(enabled_extra_types)) if enabled_extra_types else "<无>"
@@ -9466,22 +9727,36 @@ def main():
     remap_rules = load_remap_rules(settings['remap_file'])
 
     # 3) 加载源端主对象 (TABLE/VIEW/PROC/FUNC/PACKAGE/PACKAGE BODY/SYNONYM)
-    source_objects = get_source_objects(ora_cfg, settings['source_schemas_list'])
+    source_objects = get_source_objects(
+        ora_cfg,
+        settings['source_schemas_list']
+    )
 
     # 4) 验证 Remap 规则
     extraneous_rules = validate_remap_rules(remap_rules, source_objects, settings.get("remap_file"))
     schema_mapping_from_tables: Optional[Dict[str, str]] = None
     
     # 4.1) 获取依附对象（如 TRIGGER）的父表映射，用于 one-to-many schema 拆分场景
-    object_parent_map = get_object_parent_tables(ora_cfg, settings['source_schemas_list'])
+    object_parent_map = get_object_parent_tables(
+        ora_cfg,
+        settings['source_schemas_list'],
+        enabled_object_types=enabled_object_types
+    )
     
     # 4.2) 加载源端依赖关系（用于智能推导一对多场景的目标schema）
     oracle_dependencies: List[DependencyRecord] = []
     source_dependencies_set: Optional[SourceDependencySet] = None
     # 依赖既用于缺失依赖校验，也用于 one-to-many remap 推导；即便关闭 check_dependencies 也可能需要推导
-    need_dependency_infer = enable_dependencies_check or bool(settings.get("enable_schema_mapping_infer", True))
+    infer_candidate_types = enabled_object_types - NO_INFER_SCHEMA_TYPES - {'TABLE', 'INDEX', 'CONSTRAINT'}
+    need_dependency_infer = enable_dependencies_check or (
+        bool(settings.get("enable_schema_mapping_infer", True)) and bool(infer_candidate_types)
+    )
     if need_dependency_infer:
-        oracle_dependencies = load_oracle_dependencies(ora_cfg, settings['source_schemas_list'])
+        oracle_dependencies = load_oracle_dependencies(
+            ora_cfg,
+            settings['source_schemas_list'],
+            object_types=enabled_object_types
+        )
         # 转换为简化格式：(dep_owner, dep_name, dep_type, ref_owner, ref_name, ref_type)
         source_dependencies_set = {
             (dep.owner.upper(), dep.name.upper(), dep.object_type.upper(),
@@ -9506,6 +9781,7 @@ def main():
     )
 
     # 5) 先不推导 schema，生成基础映射/清单，用于推导 TABLE 唯一映射
+    remap_conflicts: RemapConflictMap = {}
     base_full_mapping = build_full_object_mapping(
         source_objects,
         remap_rules,
@@ -9513,7 +9789,9 @@ def main():
         object_parent_map=object_parent_map,
         transitive_table_cache=transitive_table_cache,
         source_dependencies=source_dependencies_set,
-        dependency_graph=dependency_graph
+        dependency_graph=dependency_graph,
+        enabled_types=enabled_object_types,
+        remap_conflicts=remap_conflicts
     )
     base_master_list = generate_master_list(
         source_objects,
@@ -9524,7 +9802,8 @@ def main():
         object_parent_map=object_parent_map,
         transitive_table_cache=transitive_table_cache,
         source_dependencies=source_dependencies_set,
-        dependency_graph=dependency_graph
+        dependency_graph=dependency_graph,
+        remap_conflicts=remap_conflicts
     )
     if settings.get("enable_schema_mapping_infer"):
         schema_mapping_from_tables = build_schema_mapping(base_master_list)
@@ -9537,7 +9816,9 @@ def main():
         object_parent_map=object_parent_map,
         transitive_table_cache=transitive_table_cache,
         source_dependencies=source_dependencies_set,
-        dependency_graph=dependency_graph
+        dependency_graph=dependency_graph,
+        enabled_types=enabled_object_types,
+        remap_conflicts=remap_conflicts
     )
     master_list = generate_master_list(
         source_objects,
@@ -9548,7 +9829,8 @@ def main():
         object_parent_map=object_parent_map,
         transitive_table_cache=transitive_table_cache,
         source_dependencies=source_dependencies_set,
-        dependency_graph=dependency_graph
+        dependency_graph=dependency_graph,
+        remap_conflicts=remap_conflicts
     )
     expected_dependency_pairs: Set[Tuple[str, str, str, str]] = set()
     skipped_dependency_pairs: List[DependencyIssue] = []
@@ -9579,6 +9861,17 @@ def main():
     if mapping_written:
         log.info("全量对象映射已输出: %s", mapping_written)
 
+    remap_conflict_items: List[Tuple[str, str, str]] = []
+    if remap_conflicts:
+        remap_conflict_items = [
+            (obj_type, src_full, reason)
+            for (src_full, obj_type), reason in sorted(remap_conflicts.items())
+        ]
+        conflict_path = report_dir / f"remap_conflicts_{timestamp}.txt"
+        conflict_written = export_remap_conflicts(remap_conflicts, conflict_path)
+        if conflict_written:
+            log.info("无法自动推导的对象已输出: %s", conflict_written)
+
     dependency_report: DependencyReport = {
         "missing": [],
         "unexpected": [],
@@ -9595,6 +9888,8 @@ def main():
             "missing": [],
             "mismatched": [],
             "ok": [],
+            "skipped": [],
+            "remap_conflicts": remap_conflict_items,
             "extraneous": extraneous_rules,
             "extra_targets": []
         }
@@ -9629,9 +9924,7 @@ def main():
         return
 
     # 6) 计算目标端 schema 集合并一次性 dump OB 元数据
-    tracked_types = set(enabled_primary_types) | (set(enabled_extra_types) & set(ALL_TRACKED_OBJECT_TYPES))
-    if enable_dependencies_check:
-        tracked_types = set(ALL_TRACKED_OBJECT_TYPES)
+    tracked_types = set(checked_primary_types) | (set(enabled_extra_types) & set(ALL_TRACKED_OBJECT_TYPES))
     if not tracked_types:
         tracked_types = {'TABLE'}
 
@@ -9649,7 +9942,11 @@ def main():
     )
     ob_dependencies: Set[Tuple[str, str, str, str]] = set()
     if enable_dependencies_check:
-        ob_dependencies = load_ob_dependencies(ob_cfg, target_schemas)
+        ob_dependencies = load_ob_dependencies(
+            ob_cfg,
+            target_schemas,
+            object_types=enabled_object_types
+        )
 
     schema_summary = compute_schema_coverage(
         settings['source_schemas_list'],
@@ -9672,11 +9969,19 @@ def main():
 
     monitored_types: Tuple[str, ...] = tuple(
         t for t in OBJECT_COUNT_TYPES
-        if (t.upper() in enabled_primary_types) or (t.upper() in enabled_extra_types)
+        if (t.upper() in checked_primary_types) or (t.upper() in enabled_extra_types)
     ) or ('TABLE',)
 
     object_counts_summary = compute_object_counts(full_object_mapping, ob_meta, oracle_meta, monitored_types)
-    tv_results = check_primary_objects(master_list, extraneous_rules, ob_meta, oracle_meta, enabled_primary_types)
+    tv_results = check_primary_objects(
+        master_list,
+        extraneous_rules,
+        ob_meta,
+        oracle_meta,
+        enabled_primary_types,
+        print_only_types
+    )
+    tv_results["remap_conflicts"] = remap_conflict_items
     comment_results = check_comments(
         master_list,
         oracle_meta,
@@ -9748,9 +10053,13 @@ def main():
         log.info('已根据配置跳过修补脚本生成，仅打印对比报告。')
 
     # 10) 输出最终报告
+    total_checked = sum(
+        1 for _, _, obj_type in master_list
+        if obj_type.upper() in checked_primary_types
+    )
     print_final_report(
         tv_results,
-        len(master_list),
+        total_checked,
         extra_results,
         comment_results,
         dependency_report,

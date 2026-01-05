@@ -18,3 +18,4 @@ logs
 config.ini
 openspec
 AGENTS.md
+.venv

@@ -2,6 +2,16 @@
 
 All notable changes to OceanBase Comparator Toolkit will be documented in this file.
 
+## [Unreleased]
+
+## [0.9.2] - 2026-01-05
+
+### Changed
+- 触发器/视图默认保持源 schema（仅显式 remap 才改变），触发器脚本附带跨 schema 授权。
+- `check_primary_types`/`check_extra_types` 贯穿 remap 推导、依赖校验与元数据加载范围。
+- MATERIALIZED VIEW 与 PACKAGE/PACKAGE BODY 默认仅打印不校验，避免 OB 不支持/默认跳过。
+- 无法自动推导的对象会单独汇总并在报告中提示，避免误回退。
+
 ## [0.9.0] - 2025-12-23
 
 ### Security & Reliability
