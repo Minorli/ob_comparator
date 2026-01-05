@@ -1,120 +1,137 @@
 # OceanBase Comparator Toolkit
 
-🚀 **极简必看用法**  
-> 当前版本：V0.9.2（Dump-Once, Compare-Locally + 安全 DDL 生成 + 依赖智能推导）
+> 当前版本：V0.9.2  
+> 关键词：一次转储、本地对比、Remap 推导、精确修复脚本
 
-本程序致力于以最轻量的方式实现 Oracle 到 OceanBase 的异构数据库对比与修复。采用“一次转储，本地对比”架构，彻底解决大规模对象比对时的性能瓶颈与 ORA-01555 问题。
+这是一套面向 Oracle → OceanBase 的对象对比与修复工具。它把元数据一次性拉到本地内存进行比对，避免循环查库带来的性能与稳定性问题，并能生成可审计的修复脚本。
 
-1. **环境准备**：准备 Python 3.7+、Oracle Instant Client、obclient、JDK+dbcat。  
-2. **安装依赖**：
-   ```bash
-   python3 -m venv .venv && source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-3. **配置**：复制模板并修改配置。
-   ```bash
-   cp config.ini.template config.ini
-   # 编辑 config.ini 填入连接信息
-   ```
-4. **运行对比**：
-   ```bash
-   python3 schema_diff_reconciler.py
-   # 或使用向导模式
-   python3 schema_diff_reconciler.py --wizard
-   ```
-5. **执行修复**：
-   审核 `fixup_scripts/` 下生成的 SQL，确认无误后自动执行：
-   ```bash
-   python3 run_fixup.py
-   ```
+## 3 分钟上手（新手版）
 
-## ✨ 核心特性
+### 1) 准备环境
+- Python 3.7+
+- Oracle Instant Client（19c+）
+- obclient
+- JDK + dbcat
 
-- **🚀 高性能架构**：放弃传统的循环查库模式，采用全量元数据快照（Dump-Once）+ 本地内存比对（Compare-Locally），速度提升显著。
-- **🛡️ 安全 DDL 生成 (New)**：
-  - 内置 `SqlMasker` 引擎，在重写 SQL（Remap）时自动保护字符串字面量与注释，杜绝正则误伤。
-  - 智能解析视图依赖，完美支持 `FROM A, B` 等复杂语法。
-  - PL/SQL 本地引用自动补全（智能推导 Schema）。
-- **🧠 智能 Remap 推导**：
-  - 自动识别“多对一”、“一对一”映射。
-  - 针对“一对多”场景，基于依赖图（Dependency Graph）智能推导视图/存储过程的归属 Schema。
-- **🔧 全面对象支持**：
-  - 核心对象：TABLE, VIEW, MVIEW, PROCEDURE, FUNCTION, PACKAGE, TRIGGER, SEQUENCE, SYNONYM。
-  - 深度校验：INDEX（列/唯一性）、CONSTRAINT（PK/UK/FK）、列属性（长度自动放宽策略）。
-  - 注释比对：支持表级与列级注释一致性检查。
-- **📦 自动化修补**：
-  - 自动生成 CREATE/ALTER/GRANT/COMPILE 脚本。
-  - 结构化输出到 `fixup_scripts/`，按依赖顺序组织。
-
-## 📂 项目结构
-
-| 路径 | 说明 |
-| --- | --- |
-| `schema_diff_reconciler.py` | **主程序**。负责元数据提取、对比、依赖分析及修复脚本生成。 |
-| `run_fixup.py` | **执行器**。批量执行修复脚本，支持断点续传与结果归档。 |
-| `config.ini.template` | 配置模板。使用前复制为 `config.ini`。 |
-| `remap_rules.txt` | 对象映射规则定义文件。 |
-| `docs/ADVANCED_USAGE.md` | **进阶指南**。包含 Remap 推导原理与 `run_fixup` 高级用法。 |
-| `docs/DEPLOYMENT.md` | **部署指南**。离线环境/跨平台打包与交付说明。 |
-| `docs/ARCHITECTURE.md` | **架构文档**。设计理念与内部实现细节。 |
-| `docs/CHANGELOG.md` | 版本变更记录。 |
-| `fixup_scripts/` | 生成的修复脚本目录（按对象类型分类）。 |
-| `main_reports/` | 对比报告归档。 |
-| `dbcat_output/` | dbcat 导出的 DDL 缓存。 |
-
-## ⚙️ 配置说明 (`config.ini`)
-
-### 关键配置项
-
-- **`[ORACLE_SOURCE]` / `[OCEANBASE_TARGET]`**: 定义源端与目标端的连接信息。
-- **`source_schemas`**: 待比对的源端 Schema 列表。
-- **`remap_file`**: 映射规则文件路径（默认为 `remap_rules.txt`）。
-- **`check_primary_types`**: 指定检查的主对象类型（如 `TABLE,VIEW`），留空则全量检查。
-- **`generate_fixup`**: 是否生成修复脚本 (`true`/`false`)。
-- **`check_dependencies`**: 是否启用依赖分析与授权推导。
-- **`check_comments`**: 是否比对注释。
-
-### Remap 规则 (`remap_rules.txt`)
-
-格式为 `SOURCE.OBJECT = TARGET.OBJECT`。
-建议仅配置 **TABLE** 的映射，其他对象（索引、触发器、视图等）通常可由程序自动推导。详情请参阅 [进阶指南](docs/ADVANCED_USAGE.md)。
-
-## 🛠️ 常见操作
-
-### 1. 仅校验表结构
-```ini
-check_primary_types = TABLE
-check_extra_types = 
-check_dependencies = false
-generate_fixup = false
+### 2) 安装依赖
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-### 2. 全量对比与修复
+### 3) 生成并填写配置
+```bash
+cp config.ini.template config.ini
+```
+
+最小必填项示例（只列关键项）：
 ```ini
-check_primary_types = 
-check_extra_types = index,constraint,sequence,trigger
+[ORACLE_SOURCE]
+user = scott
+password = tiger
+dsn = 127.0.0.1:1521/orclpdb1
+
+[OCEANBASE_TARGET]
+executable = /usr/bin/obclient
+host = 127.0.0.1
+port = 2883
+user_string = root@sys#obcluster
+password = xxx
+
+[SETTINGS]
+source_schemas = SCOTT,HR
+remap_file = remap_rules.txt
+oracle_client_lib_dir = /opt/instantclient_19_28
+dbcat_bin = /opt/dbcat-2.5.0-SNAPSHOT
+dbcat_output_dir = dbcat_output
+java_home = /usr/lib/jvm/java-11
+```
+
+> 配置项很多？不用怕。完整说明请看 `readme_config.txt`，模板默认值见 `config.ini.template`。
+
+### 4) 运行对比
+```bash
+python3 schema_diff_reconciler.py
+# 缺项可用向导
+python3 schema_diff_reconciler.py --wizard
+```
+
+### 5) 审核并执行修复
+```bash
+# 先审核 fixup_scripts/ 下的 SQL
+python3 run_fixup.py --smart-order --recompile
+```
+
+## Remap 规则速记
+
+**显式规则优先级最高**，未写规则的对象遵循以下默认逻辑：
+
+- **TABLE 必须显式**：如果表被 remap，建议只写表的规则。
+- **VIEW / MATERIALIZED VIEW / TRIGGER**：默认保持原 schema，不会跟随父表 remap。
+- **INDEX / CONSTRAINT / SEQUENCE**：依附表，默认跟随父表的 remap 目标。
+- **PROCEDURE / FUNCTION / TYPE / SYNONYM**：允许通过依赖推导目标 schema（可关闭）。
+- **PACKAGE / PACKAGE BODY**：默认仅打印不校验。
+- **MATERIALIZED VIEW**：OB 不支持，仅打印不校验。
+
+如果推导失败或出现冲突，报告会输出 `remap_conflicts_*.txt`，需要在 `remap_rules.txt` 中显式补齐。
+
+**规则示例：**
+```
+# 表 remap
+SRC_A.ORDERS = OB_A.ORDERS
+SRC_A.CUSTOMERS = OB_A.CUSTOMERS
+
+# 需要强制改 schema 的视图/触发器，必须显式写
+SRC_A.VW_REPORT = OB_A.VW_REPORT
+SRC_A.TRG_ORDER = OB_A.TRG_ORDER
+```
+
+## 运行后会生成什么？
+
+- `main_reports/report_*.txt`：完整对比报告（建议先看这个）
+- `main_reports/remap_conflicts_*.txt`：无法自动推导的对象清单
+- `fixup_scripts/`：按对象类型生成的修复 SQL（执行前需审核）
+- `dbcat_output/`：DDL 缓存（下次复用）
+
+## 常见使用场景
+
+**只看表结构，不做修复：**
+```ini
+check_primary_types = TABLE
+generate_fixup = false
+check_dependencies = false
+```
+
+**全量比对 + 修复脚本：**
+```ini
+check_primary_types =
+check_extra_types = INDEX,CONSTRAINT,SEQUENCE,TRIGGER
 check_dependencies = true
 generate_fixup = true
 ```
 
-### 3. 应用修复脚本
-```bash
-# 执行所有脚本
-python3 run_fixup.py
+## 项目结构速览
 
-# 仅执行表结构变更
-python3 run_fixup.py --only-dirs table,table_alter
+| 路径 | 说明 |
+| --- | --- |
+| `schema_diff_reconciler.py` | 主程序：对比、推导、报告、fixup 生成 |
+| `run_fixup.py` | 修复脚本执行器（支持 smart-order 和 recompile） |
+| `config.ini.template` | 配置模板 |
+| `readme_config.txt` | 配置项完整说明 |
+| `remap_rules.txt` | Remap 规则 |
+| `main_reports/` | 报告输出 |
+| `fixup_scripts/` | 修复脚本输出 |
+| `docs/ADVANCED_USAGE.md` | Remap 推导和 run_fixup 高级说明 |
+| `docs/ARCHITECTURE.md` | 架构设计与内部实现 |
+| `docs/DEPLOYMENT.md` | 离线部署与跨平台打包 |
 
-# 启用智能排序与自动重编译（推荐）
-python3 run_fixup.py --smart-order --recompile
-```
+## 进一步阅读
 
-## 📋 要求
-
-- **OS**: Linux (推荐) / macOS
-- **Python**: 3.7+
-- **Client**: Oracle Instant Client 19c+, obclient
-- **Java**: JDK 8+ (用于 dbcat)
+1) `readme_config.txt`：配置项与默认值  
+2) `docs/ADVANCED_USAGE.md`：Remap 细节、冲突处理、执行策略  
+3) `docs/ARCHITECTURE.md`：核心流程与关键算法  
+4) `docs/DEPLOYMENT.md`：离线部署与跨平台运行  
 
 ---
 © 2025 Minor Li.

@@ -5,9 +5,9 @@
 
 ## 1. 核心目标
 
-1. **准确识别差异**：覆盖 TABLE/VIEW/MATERIALIZED VIEW/PLSQL 对象/TYPE/JOB/SCHEDULE 等主对象，并扩展校验 INDEX/CONSTRAINT/SEQUENCE/TRIGGER。
+1. **准确识别差异**：覆盖 TABLE/VIEW/PLSQL/TYPE/JOB/SCHEDULE 等主对象，并扩展校验 INDEX/CONSTRAINT/SEQUENCE/TRIGGER；MATERIALIZED VIEW 与 PACKAGE/PACKAGE BODY 默认仅打印不校验。
 2. **自动化修补**：对缺失对象、列差异、授权缺口生成结构化 SQL，支持自动执行。
-3. **可追踪的报告**：通过 Rich 报表与文本快照输出，记录所有差异、依赖状态、无效 Remap 等，使迁移过程可审计。
+3. **可追踪的报告**：通过 Rich 报表与文本快照输出，记录所有差异、依赖状态、Remap 冲突等，使迁移过程可审计。
 4. **高性能 & 低负载**：仍坚持“一次转储、本地对比”，避免循环访问数据库。
 
 ## 2. 总体架构
@@ -40,12 +40,15 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
 ## 3. 配置与 Remap 驱动
 
 - `config.ini` 完全驱动运行参数：除了连接信息外，还包含 `fixup_dir`、`report_dir`、`generate_fixup`、`obclient_timeout`、`cli_timeout`（dbcat）、`dbcat_*` 等。  
+- `check_primary_types` / `check_extra_types` 决定元数据加载、Remap 推导、对比与修复脚本生成的范围；未包含的类型不会参与本轮流程。  
 - `remap_rules.txt` 控制源/目标对象映射，支持 `PACKAGE BODY` 特殊写法及注释。加载时会验证：
   - 源对象是否存在；
   - 是否出现“多对一”目标对象（直接报错）。
 - 程序会构建两种映射：
   - `master_list`: 仅包含主对象（TABLE/VIEW/PLSQL/TYPE等）用于主校验；
   - `full_object_mapping`: 包含所有受管对象（含 TRIGGER/SEQUENCE/INDEX），供依赖分析与脚本生成共享。
+  - 无法自动推导的对象会记录到 `remap_conflicts` 并跳过映射，避免误回退到源 schema。
+  - VIEW/MATERIALIZED VIEW/TRIGGER/PACKAGE/PACKAGE BODY 默认不参与 schema 推导，仅显式 remap 时才改变归属。
 
 ## 4. 元数据采集
 
@@ -73,11 +76,12 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
 
 1. **主对象**  
    - TABLE：检查存在性、列名集合（过滤 `OMS_*` 内部列）、`VARCHAR/VARCHAR2` 列长度是否落在 `[ceil(1.5 * 源长度), ceil(2.5 * 源长度)]` 区间；不足则生成 ALTER，过大则给出 WARNING。
-   - VIEW/MVIEW/类型/PLSQL/SYNONYM/JOB/SCHEDULE 等：验证存在性即可。
+   - VIEW/类型/PLSQL/SYNONYM/JOB/SCHEDULE 等：验证存在性即可。
+   - MATERIALIZED VIEW / PACKAGE / PACKAGE BODY：默认仅打印不校验（OB 不支持或默认跳过）。
 2. **扩展对象**  
    - INDEX：按列序列+唯一性匹配；多余或缺少的索引列集合会在报告中详细列出；若源端缺失元数据，也会打印目标端现存索引列表。
    - CONSTRAINT：区分 PK/UK/FK，比较列组合和定义；目标端名称包含 `_OMS_ROWID` 的约束会被忽略；源端元数据缺失时同样输出目标端现存约束列表。
-   - TRIGGER：考虑 remap 后的触发器名称，检查目标端是否缺失或多余。
+   - TRIGGER：按 owner+name 比对缺失或多余；触发器默认保持原 schema（仅显式 remap 才改变）。
    - SEQUENCE：按源 schema → 目标 schema 映射逐个确认；源端元数据缺失时会提示并列出目标端已有序列。
 3. **数量汇总**  
    - 在报告中附带 Oracle vs OceanBase 的对象数量对比，快速观察整体迁移完成度。
@@ -93,6 +97,7 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
   - **跳过项**：源/目标缺少 remap 信息时记录原因但不报错。
 - 对于缺失依赖但目标对象已存在的情况，会生成 `ALTER ... COMPILE` 脚本以尝试重编译。
 - 基于期望依赖自动推导跨 schema 所需权限：例如 PROC 调用其他 schema 的 TABLE/SYNONYM → 输出 `GRANT SELECT ...`，PLSQL 调用包/类型 → `GRANT EXECUTE ...`。这些脚本写入 `fixup_scripts/grants/` 并在报告中展示。
+- 当触发器与目标表不在同一 schema 时，fixup 会在触发器脚本中附带必要的授权语句。
 
 ## 7. 修补脚本生成
 
@@ -119,8 +124,9 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
 
 ## 8. 报告与执行
 
-- **Rich 控制台报告**：包含综合概要、表级差异、索引/约束/序列/触发器明细、依赖缺口、授权脚本、无效 remap 等；每个章节都带计数和色彩区分。
+- **Rich 控制台报告**：包含综合概要、表级差异、索引/约束/序列/触发器明细、依赖缺口、授权脚本、Remap 冲突等；每个章节都带计数和色彩区分。
 - **文本快照 (`main_reports/report_<timestamp>.txt`)**：通过 `Console(record=True)` 同步导出，方便归档或发给其他团队，并在开头展示源/目标数据库的版本与连接概览。
+- **Remap 冲突清单 (`main_reports/remap_conflicts_<timestamp>.txt`)**：列出无法自动推导的对象，需显式 remap 后重跑。
 - **fixup_scripts 指南**：报告结尾展示各子目录含义，提醒人工审核。
 - **`run_fixup.py` 执行器**：
   - 读取 `fixup_scripts/` 第一层子目录下的 SQL。

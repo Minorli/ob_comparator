@@ -80,10 +80,12 @@
     TABLE, VIEW, MATERIALIZED VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY,
     SYNONYM, JOB, SCHEDULE, TYPE, TYPE BODY
   注意: MATERIALIZED VIEW / PACKAGE / PACKAGE BODY 默认仅打印不校验。
+  说明: 该范围会影响元数据加载、Remap 推导、对比与修复脚本生成。
 
 - check_extra_types: 限制额外对象检查。
   有效值:
     INDEX, CONSTRAINT, SEQUENCE, TRIGGER
+  说明: 该范围会影响依附对象的加载与推导范围。
 
 - check_dependencies: true/false/1/0/yes/no. 启用依赖检查和授权计算。
 

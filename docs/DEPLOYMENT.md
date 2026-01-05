@@ -1,7 +1,7 @@
 # 数据库对象对比工具 - 跨平台打包与执行指南 (Wheelhouse 版)
 
 > 适用场景：需要把当前目录下的 Python 程序（保持源码不改）打包到另一台机器运行，目标 Python 可能是 3.6/3.7.8，且目标机可能无法联网。本文只使用 wheelhouse+venv，不用 PyInstaller。
-> 适用版本：V0.9.2（保持“一次转储，本地对比”，命令行可传入自定义的 config.ini；新增表/列注释比对开关）。
+> 适用版本：V0.9.2（保持“一次转储，本地对比”，支持 Remap 冲突报告与智能排序执行）。
 
 ## 0. 环境与外部依赖清单（目标机必须具备）
 - **Python 解释器**：与打包时的版本和架构匹配（建议提前在目标机装好 3.6.x 或 3.7.x，对应 cp36/cp37）。  
@@ -119,9 +119,10 @@ python schema_diff_reconciler.py --wizard [config.ini]   # 缺项时启动交互
 # 查看输出
 ls main_reports
 ls fixup_scripts
+# 如需处理推导冲突，查看 main_reports/remap_conflicts_*.txt
 
 # 执行修补脚本（可多次重跑）
-python run_fixup.py           # 同样可传 config.ini 路径
+python run_fixup.py --smart-order --recompile  # 同样可传 config.ini 路径
 ```
 
 ## 6. 检查点与常见问题
@@ -135,7 +136,7 @@ python run_fixup.py           # 同样可传 config.ini 路径
 
 ## 7. 附带资料与可选内容
 - **必须携带**：`schema_diff_reconciler.py`、`run_fixup.py`、`requirements.txt`、不含敏感信息的 `config.ini` 模板、Remap 文件、`wheelhouse/`、dbcat 目录、Instant Client。  
-- **推荐附带**：`test_scenarios/` 与 `init_test.py`（便于离线冒烟）、`README.md`/`README_CROSS_PLATFORM.md`/`DESIGN.md`、`dbcat_output/`（可选缓存，避免目标机重复抽取）。  
+- **推荐附带**：`test_scenarios/` 与 `init_test.py`（便于离线冒烟）、`README.md`、`readme_config.txt`、`docs/`、`dbcat_output/`（可选缓存，避免目标机重复抽取）。  
 - **可清理后再打包**：旧的 `fixup_scripts/` 与 `main_reports/`（避免混淆生成物）、`history/`（纯参考）。敏感账号信息请务必在打包前去除或脱敏。
 
 ## 8. 小结

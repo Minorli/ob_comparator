@@ -23,7 +23,7 @@ Features:
   - Maintains backward compatibility with original run_fixup.py
   
 Usage:
-    python3 run_fixup_v2.py [config.ini] [options]
+    python3 run_fixup.py [config.ini] [options]
     
     --smart-order     : Enable dependency-aware execution (recommended)
     --recompile       : Enable automatic recompilation of INVALID objects

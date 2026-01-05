@@ -4,6 +4,9 @@ All notable changes to OceanBase Comparator Toolkit will be documented in this f
 
 ## [Unreleased]
 
+### Documentation
+- 全面更新 README 与文档细节（Remap 规则、冲突处理、run_fixup 高级用法、部署与配置说明）。
+
 ## [0.9.2] - 2026-01-05
 
 ### Changed
