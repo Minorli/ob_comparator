@@ -4,8 +4,18 @@ All notable changes to OceanBase Comparator Toolkit will be documented in this f
 
 ## [Unreleased]
 
-### Documentation
-- 全面更新 README 与文档细节（Remap 规则、冲突处理、run_fixup 高级用法、部署与配置说明）。
+### Changed
+- 黑名单表清单新增 LONG/LONG RAW 转换校验状态输出，区分已校验与缺失/类型不匹配。
+
+## [0.9.3] - 2026-01-06
+
+### Added
+- 支持读取 `OMS_USER.TMP_BLACK_TABLE`，输出黑名单缺失表清单 `main_reports/blacklist_tables.txt`（按 schema 分组、附原因）。
+- `tables_views_miss/` 输出自动排除黑名单表，确保规则可直接供 OMS 使用。
+
+### Changed
+- 检查汇总增加黑名单缺失 TABLE 单独统计，`TABLE` 缺失计数仅统计支持迁移的表。
+- 缺失列补齐时将 `LONG/LONG RAW` 自动映射为 `CLOB/BLOB`，避免错误修补。
 
 ## [0.9.2] - 2026-01-05
 

@@ -1,7 +1,7 @@
 # 数据库对象对比工具设计文档
 
 本文档描述最新版 OceanBase Comparator Toolkit 的设计思路。新版本在原有“Oracle vs OceanBase” 元数据对比基础上，加入了依赖分析、授权推导、dbcat DDL 提取、Rich 报告与全量 fix-up 管道。
-> 当前版本：V0.9.2（Dump-Once, Compare-Locally + 依赖分析 + ALTER 级修补 + 注释校验；支持交互式配置向导与运行前自检）
+> 当前版本：V0.9.3（Dump-Once, Compare-Locally + 依赖分析 + ALTER 级修补 + 注释校验；支持交互式配置向导与运行前自检）
 
 ## 1. 核心目标
 
@@ -62,6 +62,7 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
   - `DBA_TAB_COLUMNS`、`DBA_INDEXES/DBA_IND_COLUMNS`、`DBA_CONSTRAINTS/DBA_CONS_COLUMNS`、`DBA_TRIGGERS`、`DBA_SEQUENCES`；
   - `DBA_DEPENDENCIES`；
   - `DBA_TAB_COMMENTS` / `DBA_COL_COMMENTS`（按待校验表分批获取注释，默认开启，可通过 `check_comments` 关闭）。
+  - `OMS_USER.TMP_BLACK_TABLE`：黑名单表信息（用于过滤 OMS 缺失规则并输出原因清单）。
   - DDL 提取阶段调用 dbcat（内部仍读取 Oracle 数据字典）以便批量生成标准化 DDL。
 - 把读取结果缓存到 `OracleMetadata`（按 schema+对象名称索引）。
 
@@ -116,7 +117,7 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
 
 生成顺序遵循依赖关系：SEQUENCE → TABLE（CREATE + ALTER）→ 代码对象 → INDEX → CONSTRAINT → TRIGGER → 依赖重编译（COMPILE）→ GRANT → 其他对象。所有文件位于 `fixup_scripts/<object_type>/`，并带有头部注释（源/目标信息、审核提示）。  
 
-表列差异专门写入 `fixup_scripts/table_alter/`，对缺失列生成 `ADD COLUMN`，对长度不足生成 `MODIFY`，长度过大的列以 WARNING 形式提示人工评估；多余列仅以注释形式提示 `DROP`。  
+表列差异专门写入 `fixup_scripts/table_alter/`，对缺失列生成 `ADD COLUMN`（`LONG/LONG RAW` 自动映射为 `CLOB/BLOB`），对长度不足或 LONG 类型不一致生成 `MODIFY`，长度过大的列以 WARNING 形式提示人工评估；多余列仅以注释形式提示 `DROP`。  
 
 缺失依赖时生成的 `ALTER ... COMPILE` 脚本集中在 `fixup_scripts/compile/`，便于在 GRANT 前后分批执行。  
 
@@ -127,6 +128,8 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
 - **Rich 控制台报告**：包含综合概要、表级差异、索引/约束/序列/触发器明细、依赖缺口、授权脚本、Remap 冲突等；每个章节都带计数和色彩区分。
 - **文本快照 (`main_reports/report_<timestamp>.txt`)**：通过 `Console(record=True)` 同步导出，方便归档或发给其他团队，并在开头展示源/目标数据库的版本与连接概览。
 - **Remap 冲突清单 (`main_reports/remap_conflicts_<timestamp>.txt`)**：列出无法自动推导的对象，需显式 remap 后重跑。
+- **OMS 缺失规则 (`main_reports/tables_views_miss/`)**：仅输出支持迁移的 TABLE/VIEW 规则，可直接交给 OMS。
+- **黑名单清单 (`main_reports/blacklist_tables.txt`)**：列出黑名单表并标注原因与 LONG 转换校验状态（缺失表不会生成 OMS 规则）。
 - **fixup_scripts 指南**：报告结尾展示各子目录含义，提醒人工审核。
 - **`run_fixup.py` 执行器**：
   - 读取 `fixup_scripts/` 第一层子目录下的 SQL。

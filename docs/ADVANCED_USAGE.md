@@ -118,6 +118,13 @@ check_extra_types =
 infer_schema_mapping = false
 ```
 
+### 9. 黑名单表与 OMS 规则输出
+
+当源端存在 `OMS_USER.TMP_BLACK_TABLE` 时：
+- 缺失 TABLE 会先与黑名单匹配；黑名单表不会进入 `main_reports/tables_views_miss/`。
+- 被过滤的表会写入 `main_reports/blacklist_tables.txt`，按 schema 分组并注明 `BLACK_TYPE`/`DATA_TYPE`、原因与 LONG 转换校验状态。
+- `LONG/LONG RAW` 列在补列 DDL 中会自动映射为 `CLOB/BLOB`。
+
 ---
 
 ## 二、run_fixup.py 高级用法
@@ -210,4 +217,4 @@ A: 检查范围被限制为 TABLE，其他类型不会加载也不会推导。
 
 ---
 
-更新时间：2026-01-05
+更新时间：2026-01-06

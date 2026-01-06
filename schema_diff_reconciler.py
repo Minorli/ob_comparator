@@ -16,7 +16,7 @@
 
 """
 
-数据库对象对比工具 (V0.9.2 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
+数据库对象对比工具 (V0.9.3 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -33,7 +33,7 @@
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.9.2 核心)：
+3. 性能架构 (V0.9.3 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          DBA_OBJECTS
@@ -70,7 +70,7 @@ import logging
 import math
 import re
 
-__version__ = "0.9.2"
+__version__ = "0.9.3"
 __author__ = "Minor Li"
 import os
 import threading
@@ -169,6 +169,16 @@ DependencyGraph = Dict[DependencyNode, Set[DependencyNode]]
 # 递归推导时每个节点的“最终引用表”缓存
 TransitiveTableCache = Dict[DependencyNode, Set[str]]
 RemapConflictMap = Dict[Tuple[str, str], str]  # {(SRC_FULL, TYPE): reason}
+BlacklistEntry = Tuple[str, str]  # (BLACK_TYPE, DATA_TYPE)
+BlacklistTableMap = Dict[Tuple[str, str], Set[BlacklistEntry]]  # (OWNER, TABLE) -> {(BLACK_TYPE, DATA_TYPE)}
+class BlacklistReportRow(NamedTuple):
+    schema: str
+    table: str
+    black_type: str
+    data_type: str
+    reason: str
+    status: str
+    detail: str
 
 # --- 全局 obclient timeout（秒），由配置初始化 ---
 OBC_TIMEOUT: int = 60
@@ -201,6 +211,7 @@ class OracleMetadata(NamedTuple):
     table_comments: Dict[Tuple[str, str], Optional[str]]   # (OWNER, TABLE_NAME) -> COMMENT
     column_comments: Dict[Tuple[str, str], Dict[str, Optional[str]]]  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: COMMENT}
     comments_complete: bool                                # 注释元数据是否加载完成
+    blacklist_tables: BlacklistTableMap                    # (OWNER, TABLE) -> {(BLACK_TYPE, DATA_TYPE)}
 
 
 class DependencyRecord(NamedTuple):
@@ -239,6 +250,13 @@ class ColumnLengthIssue(NamedTuple):
     issue: str         # 'short' | 'oversize'
 
 
+class ColumnTypeIssue(NamedTuple):
+    column: str
+    src_type: str
+    tgt_type: str
+    expected_type: str
+
+
 # --- 对象类型常量 ---
 PRIMARY_OBJECT_TYPES: Tuple[str, ...] = (
     'TABLE',
@@ -274,6 +292,16 @@ NO_INFER_SCHEMA_TYPES: Set[str] = {
     'TRIGGER',
     'PACKAGE',
     'PACKAGE BODY'
+}
+
+BLACKLIST_REASON_BY_TYPE: Dict[str, str] = {
+    'SPE': "表字段存在不支持的类型，不支持创建，不需要生成DDL",
+    'TEMP_TABLE': "临时表，不支持创建，不需要生成DDL",
+    'TEMPORARY_TABLE': "源表是临时表，不需要生成DDL",
+    'DIY': "表中字段存在自定义类型，不支持创建，不需要生成DDL",
+    'LOB_OVERSIZE': "表中存在的LOB字段体积超过512 MiB，可以在目标端创建表，但是 OMS 不支持同步",
+    'LONG': "LONG/LONG RAW 需人工转换为 CLOB/BLOB",
+    'DBLINK': "源表可能是 IOT 表或者外部表，不需要生成DDL"
 }
 
 # 主对象中除 TABLE 外均做存在性验证
@@ -337,6 +365,39 @@ def is_ignored_source_column(col_name: Optional[str], col_meta: Optional[Dict] =
 
 VARCHAR_LEN_MIN_MULTIPLIER = 1.5  # 目标端 VARCHAR/2 长度需 >= ceil(src * 1.5)
 VARCHAR_LEN_OVERSIZE_MULTIPLIER = 2.5  # 超过该倍数认为“过大”，需要提示
+
+
+def normalize_black_type(value: Optional[str]) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().upper()
+
+
+def normalize_black_data_type(value: Optional[str]) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().upper()
+
+
+def blacklist_reason(black_type: Optional[str]) -> str:
+    black_type_u = normalize_black_type(black_type)
+    if not black_type_u:
+        return "未知黑名单类型"
+    return BLACKLIST_REASON_BY_TYPE.get(black_type_u, "未知黑名单类型")
+
+
+def is_long_type(data_type: Optional[str]) -> bool:
+    dt = (data_type or "").strip().upper()
+    return dt in ("LONG", "LONG RAW")
+
+
+def map_long_type_to_ob(data_type: Optional[str]) -> str:
+    dt = (data_type or "").strip().upper()
+    if dt == "LONG":
+        return "CLOB"
+    if dt == "LONG RAW":
+        return "BLOB"
+    return dt
 
 def is_oms_index(name: str, columns: List[str]) -> bool:
     """识别迁移工具自动生成的 OMS_* 唯一索引，忽略之。"""
@@ -2389,6 +2450,21 @@ def collect_table_pairs(master_list: MasterCheckList, use_target: bool = False) 
     return pairs
 
 
+def build_table_target_map(master_list: MasterCheckList) -> Dict[Tuple[str, str], Tuple[str, str]]:
+    """
+    基于 master_list 构造源表 -> 目标表映射。
+    """
+    mapping: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    for src_name, tgt_name, obj_type in master_list:
+        if obj_type.upper() != 'TABLE':
+            continue
+        src_key = parse_full_object_name(src_name)
+        tgt_key = parse_full_object_name(tgt_name)
+        if src_key and tgt_key:
+            mapping[src_key] = tgt_key
+    return mapping
+
+
 def build_schema_mapping(master_list: MasterCheckList) -> Dict[str, str]:
     """
     基于 master_list 中 TABLE 映射，推导 schema 映射：
@@ -3102,7 +3178,8 @@ def dump_oracle_metadata(
     include_constraints: bool = True,
     include_triggers: bool = True,
     include_sequences: bool = True,
-    include_comments: bool = True
+    include_comments: bool = True,
+    include_blacklist: bool = True
 ) -> OracleMetadata:
     """
     预先加载 Oracle 端所需的所有元数据，避免在校验/修补阶段频繁查询。
@@ -3123,7 +3200,8 @@ def dump_oracle_metadata(
             sequences={},
             table_comments={},
             column_comments={},
-            comments_complete=False
+            comments_complete=False,
+            blacklist_tables={}
         )
 
     def _make_in_clause(values: List[str]) -> str:
@@ -3138,6 +3216,7 @@ def dump_oracle_metadata(
     table_comments: Dict[Tuple[str, str], Optional[str]] = {}
     column_comments: Dict[Tuple[str, str], Dict[str, Optional[str]]] = {}
     comments_complete = False
+    blacklist_tables: BlacklistTableMap = {}
 
     def _safe_upper(value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -3430,6 +3509,53 @@ def dump_oracle_metadata(
                             log.warning("Oracle 端注释查询未返回任何记录，可能缺少权限，注释比对将跳过。")
                             comments_complete = False
 
+                if include_blacklist:
+                    blacklist_available = True
+                    sql_blacklist_count = f"""
+                        SELECT COUNT(*)
+                        FROM OMS_USER.TMP_BLACK_TABLE
+                        WHERE OWNER IN ({owners_clause})
+                    """
+                    try:
+                        with ora_conn.cursor() as cursor:
+                            cursor.execute(sql_blacklist_count, owners)
+                            row = cursor.fetchone()
+                            total_blacklist = int(row[0]) if row and row[0] is not None else 0
+                        if total_blacklist <= 0:
+                            log.warning("未检测到 OMS_USER.TMP_BLACK_TABLE 黑名单记录（当前 schema）。")
+                        else:
+                            log.info("检测到黑名单表记录 %d 条（当前 schema），将用于过滤缺失表规则。", total_blacklist)
+                    except oracledb.Error as e:
+                        blacklist_available = False
+                        err_msg = str(e)
+                        if any(code in err_msg for code in ("ORA-00942", "ORA-04043")):
+                            log.warning("未检测到 OMS_USER.TMP_BLACK_TABLE（黑名单过滤已跳过）。")
+                        else:
+                            log.warning("读取 OMS_USER.TMP_BLACK_TABLE 失败，将跳过黑名单过滤：%s", e)
+
+                    if blacklist_available:
+                        sql_blacklist = f"""
+                            SELECT OWNER, TABLE_NAME, DATA_TYPE, BLACK_TYPE
+                            FROM OMS_USER.TMP_BLACK_TABLE
+                            WHERE OWNER IN ({owners_clause})
+                        """
+                        try:
+                            with ora_conn.cursor() as cursor:
+                                cursor.execute(sql_blacklist, owners)
+                                for row in cursor:
+                                    owner = _safe_upper(row[0])
+                                    table = _safe_upper(row[1])
+                                    if not owner or not table:
+                                        continue
+                                    key = (owner, table)
+                                    if key not in table_pairs:
+                                        continue
+                                    data_type = normalize_black_data_type(row[2])
+                                    black_type = normalize_black_type(row[3]) or "UNKNOWN"
+                                    blacklist_tables.setdefault(key, set()).add((black_type, data_type))
+                        except oracledb.Error as e:
+                            log.warning("读取 OMS_USER.TMP_BLACK_TABLE 失败，将跳过黑名单过滤：%s", e)
+
             if seq_owners and include_sequences:
                 seq_clause = _make_in_clause(seq_owners)
                 sql_seq = f"""
@@ -3451,8 +3577,14 @@ def dump_oracle_metadata(
         sys.exit(1)
 
     log.info(
-        "Oracle 元数据加载完成：列=%d, 索引表=%d, 约束表=%d, 触发器表=%d, 序列schema=%d, 注释表=%d",
-        len(table_columns), len(indexes), len(constraints), len(triggers), len(sequences), len(table_comments)
+        "Oracle 元数据加载完成：列=%d, 索引表=%d, 约束表=%d, 触发器表=%d, 序列schema=%d, 注释表=%d, 黑名单表=%d",
+        len(table_columns),
+        len(indexes),
+        len(constraints),
+        len(triggers),
+        len(sequences),
+        len(table_comments),
+        len(blacklist_tables)
     )
 
     return OracleMetadata(
@@ -3463,7 +3595,8 @@ def dump_oracle_metadata(
         sequences=sequences,
         table_comments=table_comments,
         column_comments=column_comments,
-        comments_complete=comments_complete
+        comments_complete=comments_complete,
+        blacklist_tables=blacklist_tables
     )
 
 
@@ -4027,6 +4160,7 @@ def check_primary_objects(
     """
     核心主对象校验：
       - TABLE: 存在性 + 列名集合 (忽略 OMS_OBJECT_NUMBER/OMS_RELATIVE_FNO/OMS_BLOCK_NUMBER/OMS_ROW_NUMBER)
+      - LONG/LONG RAW 列要求目标端类型为 CLOB/BLOB
       - VIEW / PROCEDURE / FUNCTION / SYNONYM: 只校验存在性
       - MATERIALIZED VIEW / PACKAGE / PACKAGE BODY: 默认仅打印不校验（若未被禁用）
     """
@@ -4095,6 +4229,7 @@ def check_primary_objects(
                     f"{full_tgt} (源端列信息获取失败)",
                     set(),
                     set(),
+                    [],
                     []
                 ))
                 continue
@@ -4111,6 +4246,7 @@ def check_primary_objects(
             missing_in_tgt = src_col_names - tgt_col_names
             extra_in_tgt = tgt_col_names - src_col_names
             length_mismatches: List[ColumnLengthIssue] = []
+            type_mismatches: List[ColumnTypeIssue] = []
 
             # 显式提示被忽略名单外的 OMS_* 列属于“多余列”
             extra_oms = {c for c in extra_in_tgt if c.upper().startswith("OMS_")}
@@ -4124,6 +4260,20 @@ def check_primary_objects(
                 tgt_info = tgt_cols_details[col_name]
 
                 src_dtype = (src_info.get("data_type") or "").upper()
+                tgt_dtype = (tgt_info.get("data_type") or "").upper()
+
+                if is_long_type(src_dtype):
+                    expected_type = map_long_type_to_ob(src_dtype)
+                    if (tgt_dtype or "UNKNOWN") != expected_type:
+                        type_mismatches.append(
+                            ColumnTypeIssue(
+                                col_name,
+                                src_dtype or "UNKNOWN",
+                                tgt_dtype or "UNKNOWN",
+                                expected_type
+                            )
+                        )
+                    continue
 
                 if src_dtype in ('VARCHAR2', 'VARCHAR'):
                     src_len = src_info.get("char_length") or src_info.get("data_length")
@@ -4157,7 +4307,7 @@ def check_primary_objects(
                                 ColumnLengthIssue(col_name, src_len_int, tgt_len_int, oversize_cap_len, 'oversize')
                             )
 
-            if not missing_in_tgt and not extra_in_tgt and not length_mismatches:
+            if not missing_in_tgt and not extra_in_tgt and not length_mismatches and not type_mismatches:
                 results['ok'].append(('TABLE', full_tgt))
             else:
                 results['mismatched'].append((
@@ -4165,7 +4315,8 @@ def check_primary_objects(
                     full_tgt,
                     missing_in_tgt,
                     extra_in_tgt,
-                    length_mismatches
+                    length_mismatches,
+                    type_mismatches
                 ))
 
         elif obj_type_u in PRIMARY_EXISTENCE_ONLY_TYPES:
@@ -7371,6 +7522,9 @@ def format_oracle_column_type(
         literal = strip_byte_suffix(literal, "VARCHAR")
         return literal
 
+    if is_long_type(dt):
+        return map_long_type_to_ob(dt)
+
     # If data_type already carries explicit precision/length (e.g., TIMESTAMP(6)), respect it.
     if '(' in dt and override_length is None:
         return apply_varchar_pref(dt)
@@ -7537,15 +7691,17 @@ def generate_alter_for_table_columns(
     tgt_table: str,
     missing_cols: Set[str],
     extra_cols: Set[str],
-    length_mismatches: List[ColumnLengthIssue]
+    length_mismatches: List[ColumnLengthIssue],
+    type_mismatches: List[ColumnTypeIssue]
 ) -> Optional[str]:
     """
     为一个具体的表生成 ALTER TABLE 脚本：
       - 对 missing_cols 生成 ADD COLUMN
       - 对 extra_cols 生成注释掉的 DROP COLUMN 建议
       - 对 length_mismatches 生成 MODIFY COLUMN
+      - 对 type_mismatches (LONG/LONG RAW) 生成 MODIFY COLUMN
     """
-    if not missing_cols and not extra_cols and not length_mismatches:
+    if not missing_cols and not extra_cols and not length_mismatches and not type_mismatches:
         return None
 
     col_details = oracle_meta.table_columns.get((src_schema.upper(), src_table.upper()))
@@ -7655,6 +7811,21 @@ def generate_alter_for_table_columns(
                     f"-- WARNING: {col_name.upper()} 长度过大 (源={src_len}, 目标={tgt_len}, "
                     f"建议上限={limit_len})，请人工评估是否需要收敛。"
                 )
+
+    # 类型不匹配：MODIFY (LONG/LONG RAW -> CLOB/BLOB)
+    if type_mismatches:
+        lines.append("")
+        lines.append("-- 列类型不匹配 (LONG/LONG RAW)：")
+        for issue in type_mismatches:
+            col_name, src_type, tgt_type, expected_type = issue
+            info = col_details.get(col_name)
+            if not info:
+                continue
+            lines.append(
+                f"ALTER TABLE {tgt_schema_u}.{tgt_table_u} "
+                f"MODIFY ({col_name.upper()} {expected_type}); "
+                f"-- 源类型: {src_type}, 目标类型: {tgt_type}"
+            )
 
     # 多余列：DROP（注释掉，供人工评估）
     if extra_cols:
@@ -8337,7 +8508,7 @@ def generate_fixup_scripts(
     run_tasks(table_jobs, "TABLE")
 
     log.info("[FIXUP] (3/9) 正在生成 TABLE ALTER 脚本...")
-    for (obj_type, tgt_name, missing_cols, extra_cols, length_mismatches) in tv_results.get('mismatched', []):
+    for (obj_type, tgt_name, missing_cols, extra_cols, length_mismatches, type_mismatches) in tv_results.get('mismatched', []):
         if obj_type.upper() != 'TABLE' or "获取失败" in tgt_name:
             continue
         src_name = table_map.get(tgt_name)
@@ -8353,7 +8524,8 @@ def generate_fixup_scripts(
             tgt_table,
             missing_cols,
             extra_cols,
-            length_mismatches
+            length_mismatches,
+            type_mismatches
         )
         if alter_sql:
             alter_sql = prepend_set_schema(alter_sql, tgt_schema)
@@ -8933,6 +9105,17 @@ def format_missing_mapping(src_name: str, tgt_name: str) -> str:
     return f"{src_clean}={tgt_clean}"
 
 
+def parse_full_object_name(name: str) -> Optional[Tuple[str, str]]:
+    if not name or '.' not in name:
+        return None
+    parts = name.split('.', 1)
+    schema = parts[0].strip().strip('"').upper()
+    obj = parts[1].strip().strip('"').upper()
+    if not schema or not obj:
+        return None
+    return schema, obj
+
+
 def export_full_object_mapping(
     full_object_mapping: FullObjectMapping,
     output_path: Path
@@ -8982,10 +9165,12 @@ def export_remap_conflicts(
 
 def export_missing_table_view_mappings(
     tv_results: ReportResults,
-    report_dir: Path
+    report_dir: Path,
+    blacklisted_tables: Optional[Set[Tuple[str, str]]] = None
 ) -> Optional[Path]:
     """
     将缺失的 TABLE/VIEW 映射按目标 schema 输出为文本，便于迁移工具直接消费。
+    若提供 blacklisted_tables，则跳过黑名单 TABLE。
     """
     if not report_dir:
         return None
@@ -8998,6 +9183,10 @@ def export_missing_table_view_mappings(
     for obj_type, tgt_name, src_name in tv_results.get("missing", []):
         if obj_type.upper() not in ("TABLE", "VIEW"):
             continue
+        if obj_type.upper() == "TABLE" and blacklisted_tables:
+            src_key = parse_full_object_name(src_name)
+            if src_key and src_key in blacklisted_tables:
+                continue
         if "." not in tgt_name or "." not in src_name:
             continue
         tgt_schema = tgt_name.split(".")[0].upper()
@@ -9024,6 +9213,237 @@ def export_missing_table_view_mappings(
     return output_dir
 
 
+def evaluate_long_conversion_status(
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata,
+    src_schema: str,
+    src_table: str,
+    tgt_schema: str,
+    tgt_table: str
+) -> Tuple[str, str, bool]:
+    """
+    校验 LONG/LONG RAW 列在目标端是否已转换为 CLOB/BLOB。
+    返回 (status, detail, verified)。
+    """
+    tgt_full = f"{tgt_schema.upper()}.{tgt_table.upper()}"
+    src_key = (src_schema.upper(), src_table.upper())
+    tgt_key = (tgt_schema.upper(), tgt_table.upper())
+
+    if not ob_meta or not ob_meta.objects_by_type:
+        return "UNKNOWN", "目标端元数据缺失", False
+
+    tgt_tables = ob_meta.objects_by_type.get("TABLE")
+    if tgt_tables is None:
+        return "UNKNOWN", "目标端未加载 TABLE 元数据", False
+
+    if tgt_full not in tgt_tables:
+        return "MISSING_TABLE", "目标端表不存在", False
+
+    src_cols = oracle_meta.table_columns.get(src_key)
+    if src_cols is None:
+        return "UNKNOWN", "源端列元数据缺失", False
+
+    long_cols: Dict[str, str] = {}
+    for col, info in src_cols.items():
+        src_type = (info.get("data_type") or "").strip().upper()
+        if is_long_type(src_type):
+            long_cols[col.upper()] = src_type
+
+    if not long_cols:
+        return "NO_LONG_COLUMNS", "源端未发现 LONG/LONG RAW 列", False
+
+    if not ob_meta.tab_columns:
+        return "UNKNOWN", "目标端未加载列元数据", False
+
+    tgt_cols = ob_meta.tab_columns.get(tgt_key)
+    if not tgt_cols:
+        return "UNKNOWN", "目标端列元数据缺失", False
+
+    missing_cols: List[str] = []
+    mismatch_cols: List[str] = []
+    for col, src_type in long_cols.items():
+        tgt_info = tgt_cols.get(col)
+        if not tgt_info:
+            missing_cols.append(col)
+            continue
+        tgt_type = (tgt_info.get("data_type") or "").strip().upper() or "UNKNOWN"
+        expected = map_long_type_to_ob(src_type)
+        if tgt_type != expected:
+            mismatch_cols.append(f"{col}({tgt_type}->{expected})")
+
+    if missing_cols:
+        return "MISSING_COLUMN", f"缺失列: {sorted(missing_cols)}", False
+    if mismatch_cols:
+        return "TYPE_MISMATCH", f"类型不匹配: {sorted(mismatch_cols)}", False
+
+    return "VERIFIED", "已校验: LONG/LONG RAW 已转换为 CLOB/BLOB", True
+
+
+def build_blacklist_report_rows(
+    blacklist_tables: BlacklistTableMap,
+    table_target_map: Dict[Tuple[str, str], Tuple[str, str]],
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata
+) -> List[BlacklistReportRow]:
+    """
+    生成黑名单表报告行，LONG/LONG RAW 额外校验目标端转换情况。
+    """
+    rows: List[BlacklistReportRow] = []
+    for (schema, table), entries in blacklist_tables.items():
+        schema_u = schema.upper()
+        table_u = table.upper()
+        tgt_schema, tgt_table = table_target_map.get((schema_u, table_u), (schema_u, table_u))
+        mapped_full = f"{tgt_schema.upper()}.{tgt_table.upper()}"
+        src_full = f"{schema_u}.{table_u}"
+        mapping_hint = ""
+        if mapped_full != src_full:
+            mapping_hint = f"目标端: {mapped_full}; "
+
+        for black_type, data_type in sorted(entries):
+            black_type_u = normalize_black_type(black_type) or "UNKNOWN"
+            data_type_u = normalize_black_data_type(data_type) or "-"
+            reason = blacklist_reason(black_type_u)
+            status = "BLACKLISTED"
+            detail = "-"
+
+            if black_type_u == "LONG" or is_long_type(data_type_u):
+                status, detail, verified = evaluate_long_conversion_status(
+                    oracle_meta,
+                    ob_meta,
+                    schema_u,
+                    table_u,
+                    tgt_schema,
+                    tgt_table
+                )
+                detail = f"{mapping_hint}{detail}" if mapping_hint and detail != "-" else detail
+                if verified:
+                    reason = "已校验: LONG/LONG RAW 已转换为 CLOB/BLOB"
+
+            rows.append(
+                BlacklistReportRow(
+                    schema=schema_u,
+                    table=table_u,
+                    black_type=black_type_u,
+                    data_type=data_type_u,
+                    reason=reason,
+                    status=status,
+                    detail=detail
+                )
+            )
+    return rows
+
+
+def export_blacklist_tables(
+    rows: List[BlacklistReportRow],
+    report_dir: Path
+) -> Optional[Path]:
+    """
+    将黑名单表输出为文本，按 schema 分组并标注原因与 LONG 校验状态。
+    """
+    if not report_dir or not rows:
+        return None
+
+    output_path = Path(report_dir) / "blacklist_tables.txt"
+    grouped: Dict[str, List[BlacklistReportRow]] = defaultdict(list)
+    for row in rows:
+        grouped[row.schema.upper()].append(row)
+
+    lines: List[str] = [
+        "# 黑名单表清单（LONG/LONG RAW 将校验目标端转换情况）",
+        "# 说明: 黑名单缺失表不会生成 tables_views_miss 规则",
+        "# 字段说明: TABLE_FULL | BLACK_TYPE | DATA_TYPE | STATUS | DETAIL | REASON"
+    ]
+    for schema in sorted(grouped.keys()):
+        schema_rows = sorted(
+            grouped[schema],
+            key=lambda r: (r.table, r.black_type, r.data_type)
+        )
+        formatted_rows: List[Tuple[str, str, str, str, str, str]] = []
+        for row in schema_rows:
+            formatted_rows.append((
+                f"{schema}.{row.table}",
+                row.black_type,
+                row.data_type,
+                row.status,
+                row.detail,
+                row.reason
+            ))
+
+        table_count = len({r[0] for r in formatted_rows})
+        entry_count = len(formatted_rows)
+        lines.append(f"[{schema}] (tables={table_count}, entries={entry_count})")
+
+        table_w = max(len("TABLE_FULL"), max((len(r[0]) for r in formatted_rows), default=0))
+        type_w = max(len("BLACK_TYPE"), max((len(r[1]) for r in formatted_rows), default=0))
+        data_w = max(len("DATA_TYPE"), max((len(r[2]) for r in formatted_rows), default=0))
+        status_w = max(len("STATUS"), max((len(r[3]) for r in formatted_rows), default=0))
+        detail_w = max(len("DETAIL"), max((len(r[4]) for r in formatted_rows), default=0))
+
+        header = (
+            f"{'TABLE_FULL'.ljust(table_w)}  "
+            f"{'BLACK_TYPE'.ljust(type_w)}  "
+            f"{'DATA_TYPE'.ljust(data_w)}  "
+            f"{'STATUS'.ljust(status_w)}  "
+            f"{'DETAIL'.ljust(detail_w)}  "
+            f"REASON"
+        )
+        sep = (
+            f"{'-' * table_w}  "
+            f"{'-' * type_w}  "
+            f"{'-' * data_w}  "
+            f"{'-' * status_w}  "
+            f"{'-' * detail_w}  "
+            f"{'-' * 6}"
+        )
+        lines.append(header)
+        lines.append(sep)
+
+        for table_full, black_type, data_type, status, detail, reason in formatted_rows:
+            lines.append(
+                f"{table_full.ljust(table_w)}  "
+                f"{black_type.ljust(type_w)}  "
+                f"{data_type.ljust(data_w)}  "
+                f"{status.ljust(status_w)}  "
+                f"{detail.ljust(detail_w)}  "
+                f"{reason}"
+            )
+        lines.append("")
+
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        content = "\n".join(lines).rstrip() + "\n"
+        output_path.write_text(content, encoding="utf-8")
+        return output_path
+    except OSError as exc:
+        log.warning("写入黑名单表清单失败 %s: %s", output_path, exc)
+        return None
+
+
+def collect_blacklisted_missing_tables(
+    tv_results: ReportResults,
+    blacklist_tables: BlacklistTableMap
+) -> BlacklistTableMap:
+    """
+    从黑名单表中筛选出“当前缺失”的 TABLE，用于统计与输出。
+    """
+    if not tv_results or not blacklist_tables:
+        return {}
+
+    missing_tables: Set[Tuple[str, str]] = set()
+    for obj_type, _, src_name in tv_results.get("missing", []):
+        if obj_type.upper() != "TABLE":
+            continue
+        src_key = parse_full_object_name(src_name)
+        if src_key:
+            missing_tables.add(src_key)
+
+    return {
+        key: entries
+        for key, entries in blacklist_tables.items()
+        if key in missing_tables
+    }
+
+
 def print_final_report(
     tv_results: ReportResults,
     total_checked: int,
@@ -9035,7 +9455,9 @@ def print_final_report(
     object_counts_summary: Optional[ObjectCountSummary] = None,
     endpoint_info: Optional[Dict[str, Dict[str, str]]] = None,
     schema_summary: Optional[Dict[str, List[str]]] = None,
-    settings: Optional[Dict] = None
+    settings: Optional[Dict] = None,
+    blacklisted_missing_tables: Optional[BlacklistTableMap] = None,
+    blacklist_report_rows: Optional[List[BlacklistReportRow]] = None
 ):
     custom_theme = Theme({
         "ok": "green",
@@ -9180,6 +9602,7 @@ def print_final_report(
     schema_text.append(f"{source_missing_schema_cnt}")
     summary_table.add_row("[bold]Schema 覆盖[/bold]", schema_text)
 
+    blacklist_missing_cnt = len(blacklisted_missing_tables or {})
     primary_text = Text()
     primary_text.append(f"总计校验对象 (来自源库): {total_checked}\n")
     primary_text.append("一致: ", style="ok")
@@ -9308,10 +9731,17 @@ def print_final_report(
         count_table.add_column("OceanBase (命中)", justify="right", width=18)
         count_table.add_column("缺失", justify="right", width=8)
         count_table.add_column("多余", justify="right", width=8)
-        oracle_counts = object_counts_summary.get("oracle", {})
-        ob_counts = object_counts_summary.get("oceanbase", {})
-        missing_counts = object_counts_summary.get("missing", {})
-        extra_counts = object_counts_summary.get("extra", {})
+        oracle_counts = dict(object_counts_summary.get("oracle", {}))
+        ob_counts = dict(object_counts_summary.get("oceanbase", {}))
+        missing_counts = dict(object_counts_summary.get("missing", {}))
+        extra_counts = dict(object_counts_summary.get("extra", {}))
+        if blacklist_missing_cnt:
+            table_missing = missing_counts.get("TABLE", 0)
+            missing_counts["TABLE"] = max(0, table_missing - blacklist_missing_cnt)
+            oracle_counts["TABLE (BLACKLIST)"] = blacklist_missing_cnt
+            ob_counts["TABLE (BLACKLIST)"] = 0
+            missing_counts["TABLE (BLACKLIST)"] = blacklist_missing_cnt
+            extra_counts["TABLE (BLACKLIST)"] = 0
         count_types = sorted(set(oracle_counts) | set(ob_counts) | set(missing_counts) | set(extra_counts))
         for obj_type in count_types:
             ora_val = oracle_counts.get(obj_type, 0)
@@ -9393,7 +9823,7 @@ def print_final_report(
         table = Table(title=f"[header]2. 不匹配的表 (共 {mismatched_count} 个)", width=section_width)
         table.add_column("表名", style="info", width=OBJECT_COL_WIDTH)
         table.add_column("差异详情", width=DETAIL_COL_WIDTH)
-        for obj_type, tgt_name, missing, extra, length_mismatches in tv_results['mismatched']:
+        for obj_type, tgt_name, missing, extra, length_mismatches, type_mismatches in tv_results['mismatched']:
             details = Text()
             if "获取失败" in tgt_name:
                 details.append(f"源端列信息获取失败", style="missing")
@@ -9402,6 +9832,13 @@ def print_final_report(
                     details.append(f"- 缺失列: {sorted(list(missing))}\n", style="missing")
                 if extra:
                     details.append(f"+ 多余列: {sorted(list(extra))}\n", style="mismatch")
+                if type_mismatches:
+                    details.append("* 类型不匹配 (LONG/LONG RAW):\n", style="mismatch")
+                    for issue in type_mismatches:
+                        col, src_type, tgt_type, expected_type = issue
+                        details.append(
+                            f"    - {col}: 源={src_type}, 目标={tgt_type}, 期望={expected_type}\n"
+                        )
                 if length_mismatches:
                     details.append("* 长度不匹配 (VARCHAR/2):\n", style="mismatch")
                     for issue in length_mismatches:
@@ -9599,7 +10036,13 @@ def print_final_report(
 
     if report_file:
         report_path = Path(report_file)
-        export_dir = export_missing_table_view_mappings(tv_results, report_path.parent)
+        blacklisted_table_keys = set((blacklisted_missing_tables or {}).keys())
+        export_dir = export_missing_table_view_mappings(
+            tv_results,
+            report_path.parent,
+            blacklisted_tables=blacklisted_table_keys
+        )
+        blacklist_path = export_blacklist_tables(blacklist_report_rows or [], report_path.parent)
         try:
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report_text = console.export_text(clear=False)
@@ -9609,6 +10052,8 @@ def print_final_report(
             console.print(f"[info]报告已保存(纯文本): {report_path}")
             if export_dir:
                 log.info("缺失 TABLE/VIEW 映射已输出到: %s", export_dir)
+            if blacklist_path:
+                log.info("黑名单表清单已输出到: %s", blacklist_path)
         except OSError as exc:
             console.print(f"[missing]报告写入失败: {exc}")
 
@@ -9647,6 +10092,8 @@ def parse_cli_args() -> argparse.Namespace:
           python schema_diff_reconciler.py /path/to/conf.ini # 指定配置
         输出:
           main_reports/report_<ts>.txt  Rich 报告文本
+          main_reports/tables_views_miss/ 按 schema 输出缺失 TABLE/VIEW 规则 (OMS 使用)
+          main_reports/blacklist_tables.txt 黑名单表清单 (含 LONG 转换校验状态)
           fixup_scripts/                按类型分类的订正 SQL
         """
     )
@@ -9919,7 +10366,9 @@ def main():
             object_counts_summary,
             endpoint_info,
             schema_summary,
-            settings
+            settings,
+            blacklisted_missing_tables={},
+            blacklist_report_rows=[]
         )
         return
 
@@ -9967,6 +10416,14 @@ def main():
         include_comments=enable_comment_check
     )
 
+    table_target_map = build_table_target_map(master_list)
+    blacklist_report_rows = build_blacklist_report_rows(
+        oracle_meta.blacklist_tables,
+        table_target_map,
+        oracle_meta,
+        ob_meta
+    )
+
     monitored_types: Tuple[str, ...] = tuple(
         t for t in OBJECT_COUNT_TYPES
         if (t.upper() in checked_primary_types) or (t.upper() in enabled_extra_types)
@@ -9982,6 +10439,10 @@ def main():
         print_only_types
     )
     tv_results["remap_conflicts"] = remap_conflict_items
+    blacklisted_missing_tables = collect_blacklisted_missing_tables(
+        tv_results,
+        oracle_meta.blacklist_tables
+    )
     comment_results = check_comments(
         master_list,
         oracle_meta,
@@ -10068,7 +10529,9 @@ def main():
         object_counts_summary,
         endpoint_info,
         schema_summary,
-        settings
+        settings,
+        blacklisted_missing_tables,
+        blacklist_report_rows
     )
 
 
