@@ -7875,6 +7875,7 @@ def generate_fixup_scripts(
         progress_log_interval = 10.0
     progress_log_interval = max(1.0, progress_log_interval)
     synonym_meta_map = synonym_metadata or {}
+    allowed_synonym_targets = {s.upper() for s in settings.get('source_schemas_list', [])}
 
     base_dir = Path(settings.get('fixup_dir', 'fixup_scripts')).expanduser()
 
@@ -8144,10 +8145,21 @@ def generate_fixup_scripts(
             continue
         src_schema, src_obj = src_name.split('.', 1)
         tgt_schema, tgt_obj = tgt_name.split('.', 1)
-        if obj_type_u == 'SYNONYM' and src_schema.upper() == 'PUBLIC':
-            src_key = (src_schema.upper(), src_obj.upper())
-            src_full = f"{src_schema.upper()}.{src_obj.upper()}"
-            if src_key not in synonym_meta_map and src_full not in remap_rules:
+        if obj_type_u == 'SYNONYM':
+            src_schema_u = src_schema.upper()
+            src_obj_u = src_obj.upper()
+            src_key = (src_schema_u, src_obj_u)
+            src_full = f"{src_schema_u}.{src_obj_u}"
+            syn_meta = synonym_meta_map.get(src_key)
+            if syn_meta and allowed_synonym_targets and syn_meta.table_owner:
+                table_owner_u = syn_meta.table_owner.upper()
+                if table_owner_u not in allowed_synonym_targets and src_full not in remap_rules:
+                    log.info(
+                        "[FIXUP] 跳过同义词 %s.%s（table_owner=%s 不在 source_schemas 范围内）。",
+                        src_schema, src_obj, table_owner_u
+                    )
+                    continue
+            if src_schema_u == 'PUBLIC' and not syn_meta and src_full not in remap_rules:
                 log.info(
                     "[FIXUP] 跳过 PUBLIC 同义词 %s.%s（table_owner 不在 source_schemas 范围内）。",
                     src_schema, src_obj
