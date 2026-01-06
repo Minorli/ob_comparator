@@ -16,7 +16,7 @@
 
 """
 
-数据库对象对比工具 (V0.9.3 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
+数据库对象对比工具 (V0.9.4 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -33,7 +33,7 @@
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.9.3 核心)：
+3. 性能架构 (V0.9.4 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          DBA_OBJECTS
@@ -70,7 +70,7 @@ import logging
 import math
 import re
 
-__version__ = "0.9.3"
+__version__ = "0.9.4"
 __author__ = "Minor Li"
 import os
 import threading
@@ -8279,12 +8279,17 @@ def generate_fixup_scripts(
     # 预取所有可能需要 fallback 的 DDL（dbcat 未命中的对象）
     fallback_ddl_cache: Dict[Tuple[str, str, str], str] = {}
     
-    # 收集需要 fallback 的对象（排除VIEW，因为VIEW有专门处理）
+    # 收集需要 fallback 的对象（dbcat 缺失时由 DBMS_METADATA 兜底）
     fallback_needed: List[Tuple[str, str, str]] = []
     for obj_type, src_schema, src_obj, tgt_schema, tgt_obj in non_view_missing_objects:
         # 检查 dbcat_data 中是否有
         if not dbcat_data.get(src_schema.upper(), {}).get(obj_type.upper(), {}).get(src_obj.upper()):
             fallback_needed.append((src_schema, obj_type, src_obj))
+
+    # 视图任务（dbcat 缺失时允许 DBMS_METADATA 兜底）
+    for src_schema, src_obj, _, _ in view_missing_objects:
+        if not dbcat_data.get(src_schema.upper(), {}).get('VIEW', {}).get(src_obj.upper()):
+            fallback_needed.append((src_schema, 'VIEW', src_obj))
     
     # 序列任务
     for src_schema, src_seq, tgt_schema, tgt_seq in sequence_tasks:
@@ -8540,12 +8545,6 @@ def generate_fixup_scripts(
     else:
         log.warning("[VIEW] 无法获取OceanBase版本，将使用保守的DDL清理策略")
 
-    # 批量获取VIEW的DDL
-    view_ddl_cache: Dict[Tuple[str, str], str] = {}
-    if view_missing_objects:
-        view_objects_for_ddl = [(src_schema, src_obj) for src_schema, src_obj, _, _ in view_missing_objects]
-        view_ddl_cache = oracle_get_views_ddl_batch(ora_cfg, view_objects_for_ddl)
-
     log.info("[FIXUP] (4/9) 正在生成 VIEW / MATERIALIZED VIEW / 其他对象脚本...")
     
     # 处理VIEW对象
@@ -8553,12 +8552,21 @@ def generate_fixup_scripts(
         log.info("[FIXUP] (4a/9) 正在生成 %d 个VIEW脚本...", len(view_missing_objects))
         for src_schema, src_obj, tgt_schema, tgt_obj in view_missing_objects:
             try:
-                # 获取原始DDL
-                ddl_key = (src_schema, src_obj)
-                raw_ddl = view_ddl_cache.get(ddl_key)
-                if not raw_ddl:
-                    log.warning("[FIXUP] 未找到 VIEW %s.%s 的DDL", src_schema, src_obj)
+                fetch_result = fetch_ddl_with_timing(src_schema, 'VIEW', src_obj)
+                if len(fetch_result) != 3:
+                    log.error("[FIXUP] VIEW fetch_ddl_with_timing 返回了 %d 个值，期望 3 个: %s", len(fetch_result), fetch_result)
                     continue
+                raw_ddl, ddl_source_label, _elapsed = fetch_result
+                if not raw_ddl:
+                    log.warning("[FIXUP] 未找到 VIEW %s.%s 的 DDL。", src_schema, src_obj)
+                    mark_source('VIEW', 'missing')
+                    continue
+                if ddl_source_label.startswith("DBCAT"):
+                    mark_source('VIEW', 'dbcat')
+                elif ddl_source_label == "DBMS_METADATA":
+                    mark_source('VIEW', 'fallback')
+                else:
+                    mark_source('VIEW', 'missing')
                 
                 # 清理DDL使其兼容OceanBase
                 cleaned_ddl = clean_view_ddl_for_oceanbase(raw_ddl, ob_version)
@@ -8597,7 +8605,7 @@ def generate_fixup_scripts(
                 # 写入文件
                 filename = f"{tgt_schema}.{tgt_obj}.sql"
                 header = f"修补缺失的 VIEW {tgt_obj} (源: {src_schema}.{src_obj})"
-                log.info("[FIXUP][DBMS_METADATA] 写入 VIEW 脚本: %s", filename)
+                log.info("[FIXUP]%s 写入 VIEW 脚本: %s", source_tag(ddl_source_label), filename)
                 write_fixup_file(base_dir, 'view', filename, final_ddl, header)
                 
             except Exception as exc:

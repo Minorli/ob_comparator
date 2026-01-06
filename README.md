@@ -1,6 +1,6 @@
 # OceanBase Comparator Toolkit
 
-> 当前版本：V0.9.3  
+> 当前版本：V0.9.4  
 > 关键词：一次转储、本地对比、Remap 推导、精确修复脚本
 
 这是一套面向 Oracle → OceanBase 的对象对比与修复工具。它把元数据一次性拉到本地内存进行比对，避免循环查库带来的性能与稳定性问题，并能生成可审计的修复脚本。
@@ -93,7 +93,7 @@ SRC_A.TRG_ORDER = OB_A.TRG_ORDER
 - `main_reports/remap_conflicts_*.txt`：无法自动推导的对象清单
 - `main_reports/tables_views_miss/`：按目标 schema 输出缺失 TABLE/VIEW 规则（可直接给 OMS，用于支持的对象）
 - `main_reports/blacklist_tables.txt`：黑名单表清单（按 schema 分组，附原因与 LONG 转换校验状态）
-- `fixup_scripts/`：按对象类型生成的修复 SQL（执行前需审核）
+- `fixup_scripts/`：按对象类型生成的修复 SQL（执行前需审核，VIEW DDL 优先 dbcat，缺失时 DBMS_METADATA 兜底）
 - `dbcat_output/`：DDL 缓存（下次复用）
 
 > 如果源库存在 `OMS_USER.TMP_BLACK_TABLE`，则缺失表会先与黑名单比对：黑名单缺失表不会进入 `tables_views_miss/`，仅在 `blacklist_tables.txt` 中说明原因与状态。

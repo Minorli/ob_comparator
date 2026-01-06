@@ -4,7 +4,10 @@ All notable changes to OceanBase Comparator Toolkit will be documented in this f
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-01-07
+
 ### Changed
+- 缺失 VIEW 的 fixup DDL 优先使用 dbcat 导出，dbcat 未命中时才使用 DBMS_METADATA 兜底。
 - 黑名单表清单新增 LONG/LONG RAW 转换校验状态输出，区分已校验与缺失/类型不匹配。
 
 ## [0.9.3] - 2026-01-06
