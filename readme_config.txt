@@ -60,6 +60,9 @@
 
 - generate_fixup: 是否生成修复脚本 (true/false/1/0/yes/no)。
 
+- generate_grants: 是否生成授权脚本并附加到修复 DDL (true/false/1/0/yes/no)。
+  授权脚本输出到 fixup_scripts/grants/，包含对象权限与系统/角色权限。
+
 - fixup_workers: 修复生成并发数；留空或 0 则使用 min(12, CPU)。
 
 - progress_log_interval: 进度日志间隔（秒）(>=1)。
@@ -90,7 +93,7 @@
     INDEX, CONSTRAINT, SEQUENCE, TRIGGER
   说明: 该范围会影响依附对象的加载与推导范围。
 
-- check_dependencies: true/false/1/0/yes/no. 启用依赖检查和授权计算。
+- check_dependencies: true/false/1/0/yes/no. 启用依赖检查（授权生成由 generate_grants 控制）。
 
 - print_dependency_chains: true/false/1/0/yes/no. 打印依赖链（仅当 check_dependencies=true 时生效）。
 

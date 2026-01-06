@@ -23,7 +23,7 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
    源对象映射 + 依赖映射 + 目标元数据集
         │
         ├── 主对象 / 扩展对象对比
-        ├── 依赖核对 & GRANT 计算
+        ├── 依赖核对 & 授权生成
         ├── dbcat DDL 提取 + fix-up 生成
         └── Rich 报告 + 文本快照 + fixup_scripts 目录
 ```
@@ -33,7 +33,7 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
 1. **配置验证**：校验 `source_schemas`、Remap、Instant Client 路径等，一旦发现致命问题立即退出。
 2. **元数据缓存**：Oracle 侧使用 Thick Mode + 批量查询；OceanBase 侧使用 obclient 执行预设 SQL，所有数据一次性加载到内存。
 3. **差异分析**：依赖 `master_list`（源→目标）完成表/列校验；索引/约束/触发器使用 Oracle/OB 双缓存进行集合比对；序列按 schema 级别比较。
-4. **依赖 & 授权**：`DBA_DEPENDENCIES` 映射后生成期望依赖集合，与目标库实际依赖比较并给出原因，同时计算跨 schema 所需的 `GRANT`。
+4. **依赖 & 授权**：`DBA_DEPENDENCIES` 映射后生成期望依赖集合，与目标库实际依赖比较并给出原因；授权脚本基于 Oracle 权限元数据与依赖推导生成。
 5. **修补脚本**：构建 dbcat 请求（含 schema→对象类型的任务集合），复用 `dbcat_output` 缓存，对 DDL 做 schema remap、语法清理、授权插入，并按对象类型输出到 `fixup_scripts/`（含依赖重编译/授权脚本）。
 6. **报告与执行**：Rich 控制台输出+落地文件；`run_fixup.py` 负责在 OceanBase 上顺序执行 SQL 并回写结果。
 
@@ -62,6 +62,7 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
   - `DBA_TAB_COLUMNS`、`DBA_INDEXES/DBA_IND_COLUMNS`、`DBA_CONSTRAINTS/DBA_CONS_COLUMNS`、`DBA_TRIGGERS`、`DBA_SEQUENCES`；
   - `DBA_DEPENDENCIES`；
   - `DBA_TAB_COMMENTS` / `DBA_COL_COMMENTS`（按待校验表分批获取注释，默认开启，可通过 `check_comments` 关闭）。
+  - `DBA_TAB_PRIVS` / `DBA_SYS_PRIVS` / `DBA_ROLE_PRIVS`（授权脚本来源，仅 `generate_grants=true` 时加载）。
   - `OMS_USER.TMP_BLACK_TABLE`：黑名单表信息（用于过滤 OMS 缺失规则并输出原因清单）。
   - DDL 提取阶段调用 dbcat（内部仍读取 Oracle 数据字典）以便批量生成标准化 DDL。
 - 把读取结果缓存到 `OracleMetadata`（按 schema+对象名称索引）。
@@ -97,7 +98,7 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
   - **额外依赖**：提示目标端存在额外耦合，需人工判断。
   - **跳过项**：源/目标缺少 remap 信息时记录原因但不报错。
 - 对于缺失依赖但目标对象已存在的情况，会生成 `ALTER ... COMPILE` 脚本以尝试重编译。
-- 基于期望依赖自动推导跨 schema 所需权限：例如 PROC 调用其他 schema 的 TABLE/SYNONYM → 输出 `GRANT SELECT ...`，PLSQL 调用包/类型 → `GRANT EXECUTE ...`。这些脚本写入 `fixup_scripts/grants/` 并在报告中展示。
+- 授权脚本由 Oracle 权限元数据（`DBA_TAB_PRIVS`/`DBA_SYS_PRIVS`/`DBA_ROLE_PRIVS`）+ 依赖推导生成，应用 remap 后写入 `fixup_scripts/grants/`（仅 `generate_grants=true` 时生成，报告不展示授权明细）。
 - 当触发器与目标表不在同一 schema 时，fixup 会在触发器脚本中附带必要的授权语句。
 
 ## 7. 修补脚本生成
@@ -116,7 +117,7 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
 
 ### 输出顺序与目录
 
-生成顺序遵循依赖关系：SEQUENCE → TABLE（CREATE + ALTER）→ 代码对象 → INDEX → CONSTRAINT → TRIGGER → 依赖重编译（COMPILE）→ GRANT → 其他对象。所有文件位于 `fixup_scripts/<object_type>/`，并带有头部注释（源/目标信息、审核提示）。  
+生成顺序遵循依赖关系：SEQUENCE → TABLE（CREATE + ALTER）→ 代码对象 → INDEX → CONSTRAINT → TRIGGER → 依赖重编译（COMPILE）→ 授权脚本 → 其他对象。所有文件位于 `fixup_scripts/<object_type>/`，并带有头部注释（源/目标信息、审核提示）。  
 
 表列差异专门写入 `fixup_scripts/table_alter/`，对缺失列生成 `ADD COLUMN`（`LONG/LONG RAW` 自动映射为 `CLOB/BLOB`），对长度不足或 LONG 类型不一致生成 `MODIFY`，长度过大的列以 WARNING 形式提示人工评估；多余列仅以注释形式提示 `DROP`。  
 
@@ -126,7 +127,7 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
 
 ## 8. 报告与执行
 
-- **Rich 控制台报告**：包含综合概要、表级差异、索引/约束/序列/触发器明细、依赖缺口、授权脚本、Remap 冲突等；每个章节都带计数和色彩区分。
+- **Rich 控制台报告**：包含综合概要、表级差异、索引/约束/序列/触发器明细、依赖缺口、Remap 冲突等；授权脚本仅输出到 fixup 目录，不在报告中展示。
 - **文本快照 (`main_reports/report_<timestamp>.txt`)**：通过 `Console(record=True)` 同步导出，方便归档或发给其他团队，并在开头展示源/目标数据库的版本与连接概览。
 - **Remap 冲突清单 (`main_reports/remap_conflicts_<timestamp>.txt`)**：列出无法自动推导的对象，需显式 remap 后重跑。
 - **OMS 缺失规则 (`main_reports/tables_views_miss/`)**：仅输出支持迁移的 TABLE/VIEW 规则，可直接交给 OMS。

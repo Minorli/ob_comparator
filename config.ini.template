@@ -51,6 +51,9 @@ dbcat_chunk_size        = 150
 # 是否在对比后生成修复脚本（dbcat 抽取，DBMS_METADATA 兜底）
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 generate_fixup          = true
+# 是否生成授权脚本并附加到修补 DDL（依赖于源端权限/依赖推导）
+# 可选值：true/false/1/0/yes/no（大小写不敏感）
+generate_grants         = true
 # 仅生成指定目标 schema/对象类型的修补脚本（留空为全量）
 # fixup_schemas 示例：HERO_A,HERO_B
 # fixup_types 可选值：
@@ -75,7 +78,7 @@ trigger_list            =
 #   只检查扩展序列 -> check_extra_types=SEQUENCE
 check_primary_types     =
 check_extra_types       = index,constraint,sequence,trigger
-# 是否进行依赖关系校验与授权建议
+# 是否进行依赖关系校验
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 check_dependencies      = true
 # 是否输出依赖链路拓扑（依赖在前的顺序），用于审计/排查
