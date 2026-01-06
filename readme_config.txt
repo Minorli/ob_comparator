@@ -73,6 +73,9 @@
     TABLE, VIEW, MATERIALIZED VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY,
     SYNONYM, JOB, SCHEDULE, TYPE, TYPE BODY, SEQUENCE, TRIGGER, INDEX, CONSTRAINT
 
+- trigger_list: 可选触发器清单过滤文件（每行 SCHEMA.TRIGGER_NAME）。
+  配置后仅生成列表内触发器脚本，并输出 main_reports/trigger_miss.txt 记录无效/不存在/非缺失项。
+
 检查范围 (Check scope)
 
 - check_primary_types: 限制主要对象类型（留空表示全部）。

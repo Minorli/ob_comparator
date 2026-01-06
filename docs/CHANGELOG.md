@@ -4,6 +4,9 @@ All notable changes to OceanBase Comparator Toolkit will be documented in this f
 
 ## [Unreleased]
 
+### Added
+- 支持 trigger_list 过滤缺失触发器脚本，仅生成清单内的 TRIGGER，并输出 trigger_miss.txt 记录无效/不存在条目。
+
 ## [0.9.4] - 2026-01-07
 
 ### Changed

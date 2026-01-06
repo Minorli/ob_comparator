@@ -59,6 +59,8 @@ generate_fixup          = true
 # 示例：fixup_types=TABLE,TRIGGER
 fixup_schemas           = 
 fixup_types             = 
+# 可选：触发器清单过滤（每行 SCHEMA.TRIGGER_NAME），配置后仅生成列表内触发器脚本
+trigger_list            =
 
 # 可选：限制本次只检查的对象类型/模块，留空表示全量（大小写不敏感，逗号分隔）
 # check_primary_types 可选值：

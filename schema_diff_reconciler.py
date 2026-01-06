@@ -502,6 +502,12 @@ class TriggerMismatch(NamedTuple):
     missing_mappings: Optional[List[Tuple[str, str]]] = None
 
 
+class TriggerListReportRow(NamedTuple):
+    entry: str
+    status: str
+    detail: str
+
+
 class CommentMismatch(NamedTuple):
     table: str
     table_comment: Optional[Tuple[str, str]]  # (src, tgt) when different
@@ -674,6 +680,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         # fixup 定向生成选项
         settings.setdefault('fixup_schemas', '')
         settings.setdefault('fixup_types', '')
+        settings.setdefault('trigger_list', '')
         # 检查范围开关
         settings.setdefault('check_primary_types', '')
         settings.setdefault('check_extra_types', '')
@@ -774,6 +781,12 @@ def validate_runtime_paths(settings: Dict, ob_cfg: ObConfig) -> None:
     remap_file = settings.get('remap_file', '').strip()
     if remap_file and not Path(remap_file).expanduser().exists():
         warnings.append(f"Remap 文件不存在: {remap_file}（将按 1:1 继续，可确认路径是否正确）。")
+
+    trigger_list_path = settings.get('trigger_list', '').strip()
+    if trigger_list_path and not Path(trigger_list_path).expanduser().exists():
+        warnings.append(
+            f"trigger_list 文件不存在: {trigger_list_path}（将记录在报告中并跳过触发器脚本生成）。"
+        )
 
     # dbcat / JAVA_HOME 仅在生成 fixup 时提示
     generate_fixup_enabled = settings.get('generate_fixup', 'true').strip().lower() in ('true', '1', 'yes')
@@ -1003,6 +1016,12 @@ def run_config_wizard(config_path: Path) -> None:
     )
     _prompt_field(
         "SETTINGS",
+        "trigger_list",
+        "可选：触发器清单文件 (SCHEMA.TRIGGER_NAME，每行一条)",
+        default=cfg.get("SETTINGS", "trigger_list", fallback=""),
+    )
+    _prompt_field(
+        "SETTINGS",
         "report_dir",
         "报告输出目录",
         default=cfg.get("SETTINGS", "report_dir", fallback="main_reports"),
@@ -1102,6 +1121,228 @@ def load_remap_rules(file_path: str) -> RemapRules:
     return rules
 
 
+def parse_trigger_list_file(
+    file_path: str
+) -> Tuple[Set[str], List[Tuple[int, str, str]], List[Tuple[int, str]], int, Optional[str]]:
+    """
+    解析 trigger_list 文件，每行格式为 SCHEMA.TRIGGER_NAME。
+    返回 (entries, invalid_entries, duplicate_entries, total_lines, error).
+    """
+    entries: Set[str] = set()
+    invalid_entries: List[Tuple[int, str, str]] = []
+    duplicate_entries: List[Tuple[int, str]] = []
+    total_lines = 0
+    if not file_path:
+        return entries, invalid_entries, duplicate_entries, total_lines, None
+
+    path = Path(file_path).expanduser()
+    try:
+        with path.open("r", encoding="utf-8") as fp:
+            for line_no, raw in enumerate(fp, start=1):
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "#" in line:
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                total_lines += 1
+                if "." not in line:
+                    invalid_entries.append((line_no, raw.strip(), "缺少 schema 前缀 (SCHEMA.TRIGGER_NAME)"))
+                    continue
+                schema, name = line.split(".", 1)
+                schema = schema.strip().strip('"')
+                name = name.strip().strip('"')
+                if not schema or not name:
+                    invalid_entries.append((line_no, raw.strip(), "schema 或 trigger 名称为空"))
+                    continue
+                full_name = f"{schema.upper()}.{name.upper()}"
+                if full_name in entries:
+                    duplicate_entries.append((line_no, full_name))
+                    continue
+                entries.add(full_name)
+        return entries, invalid_entries, duplicate_entries, total_lines, None
+    except FileNotFoundError:
+        return set(), [], [], 0, f"文件不存在: {path}"
+    except OSError as exc:
+        return set(), [], [], 0, f"读取失败: {exc}"
+
+
+def build_trigger_full_set(
+    triggers: Dict[Tuple[str, str], Dict[str, Dict]]
+) -> Set[str]:
+    """将元数据中的触发器转换为 OWNER.TRIGGER_NAME 集合。"""
+    full_set: Set[str] = set()
+    for (owner, _), trg_map in triggers.items():
+        owner_u = (owner or "").upper()
+        for trg_name, info in (trg_map or {}).items():
+            trg_owner = (info.get("owner") or owner_u).upper()
+            name_u = (trg_name or "").upper()
+            if trg_owner and name_u:
+                full_set.add(f"{trg_owner}.{name_u}")
+    return full_set
+
+
+def collect_missing_trigger_mappings(
+    extra_results: ExtraCheckResults
+) -> Tuple[Dict[str, str], Set[str], int]:
+    """
+    从 trigger_mismatched 结果中提取缺失触发器映射。
+    返回 (src_to_tgt_map, missing_targets, total_missing).
+    """
+    src_to_tgt: Dict[str, str] = {}
+    missing_targets: Set[str] = set()
+    total_missing = 0
+    for item in extra_results.get("trigger_mismatched", []):
+        total_missing += len(item.missing_triggers)
+        for tgt_full in item.missing_triggers:
+            if tgt_full:
+                missing_targets.add(tgt_full.upper())
+        if item.missing_mappings:
+            for src_full, tgt_full in item.missing_mappings:
+                if not src_full or not tgt_full:
+                    continue
+                src_u = src_full.upper()
+                tgt_u = tgt_full.upper()
+                src_to_tgt[src_u] = tgt_u
+                missing_targets.add(tgt_u)
+    return src_to_tgt, missing_targets, total_missing
+
+
+def build_trigger_list_report(
+    trigger_list_path: str,
+    entries: Set[str],
+    invalid_entries: List[Tuple[int, str, str]],
+    duplicate_entries: List[Tuple[int, str]],
+    total_lines: int,
+    read_error: Optional[str],
+    extra_results: ExtraCheckResults,
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata,
+    full_object_mapping: FullObjectMapping,
+    trigger_check_enabled: bool
+) -> Tuple[List[TriggerListReportRow], Dict[str, object]]:
+    """
+    基于 trigger_list 与缺失触发器结果构造报告行与汇总信息。
+    """
+    summary: Dict[str, object] = {
+        "enabled": True,
+        "path": str(trigger_list_path),
+        "total_lines": total_lines,
+        "valid_entries": len(entries),
+        "invalid_entries": len(invalid_entries),
+        "duplicate_entries": len(duplicate_entries),
+        "selected_missing": 0,
+        "missing_not_listed": 0,
+        "not_found": 0,
+        "not_missing": 0,
+        "check_disabled": False,
+        "error": read_error or ""
+    }
+    rows: List[TriggerListReportRow] = []
+
+    if read_error:
+        rows.append(TriggerListReportRow(
+            entry=str(trigger_list_path),
+            status="ERROR",
+            detail=read_error
+        ))
+        return rows, summary
+
+    for line_no, raw, reason in invalid_entries:
+        rows.append(TriggerListReportRow(
+            entry=f"line {line_no}: {raw}",
+            status="INVALID",
+            detail=reason
+        ))
+    for line_no, entry in duplicate_entries:
+        rows.append(TriggerListReportRow(
+            entry=f"line {line_no}: {entry}",
+            status="DUPLICATE",
+            detail="重复条目"
+        ))
+
+    if not trigger_check_enabled:
+        summary["check_disabled"] = True
+        for entry in sorted(entries):
+            rows.append(TriggerListReportRow(
+                entry=entry,
+                status="CHECK_DISABLED",
+                detail="TRIGGER 未启用检查，无法判定缺失状态"
+            ))
+        return rows, summary
+
+    src_to_tgt, missing_targets, total_missing = collect_missing_trigger_mappings(extra_results)
+    missing_src_set = set(src_to_tgt.keys())
+    missing_by_tgt = {tgt: src for src, tgt in src_to_tgt.items()}
+    source_triggers = build_trigger_full_set(oracle_meta.triggers or {})
+    target_triggers = build_trigger_full_set(ob_meta.triggers or {})
+
+    selected_missing_targets: Set[str] = set()
+    not_found = 0
+    not_missing = 0
+
+    for entry in sorted(entries):
+        entry_u = entry.upper()
+        if entry_u in missing_src_set:
+            tgt_full = src_to_tgt.get(entry_u)
+            if tgt_full:
+                selected_missing_targets.add(tgt_full)
+            rows.append(TriggerListReportRow(
+                entry=entry_u,
+                status="SELECTED_MISSING",
+                detail=f"目标缺失: {tgt_full}" if tgt_full else "目标缺失"
+            ))
+            continue
+        if entry_u in missing_targets:
+            src_full = missing_by_tgt.get(entry_u)
+            selected_missing_targets.add(entry_u)
+            rows.append(TriggerListReportRow(
+                entry=entry_u,
+                status="SELECTED_MISSING",
+                detail=f"源触发器: {src_full}" if src_full else "目标缺失"
+            ))
+            continue
+        if entry_u not in source_triggers:
+            if entry_u in target_triggers:
+                not_missing += 1
+                rows.append(TriggerListReportRow(
+                    entry=entry_u,
+                    status="EXISTS_IN_TARGET",
+                    detail="目标端已存在"
+                ))
+            else:
+                not_found += 1
+                rows.append(TriggerListReportRow(
+                    entry=entry_u,
+                    status="NOT_FOUND_IN_SOURCE",
+                    detail="源端未找到触发器"
+                ))
+            continue
+
+        target_full = get_mapped_target(full_object_mapping, entry_u, 'TRIGGER') or entry_u
+        if target_full.upper() in target_triggers:
+            not_missing += 1
+            rows.append(TriggerListReportRow(
+                entry=entry_u,
+                status="EXISTS_IN_TARGET",
+                detail=f"目标端已存在: {target_full.upper()}"
+            ))
+        else:
+            not_missing += 1
+            rows.append(TriggerListReportRow(
+                entry=entry_u,
+                status="NOT_MISSING_OR_OUT_OF_SCOPE",
+                detail="未在缺失清单中或不在本次校验范围"
+            ))
+
+    summary["selected_missing"] = len(selected_missing_targets)
+    summary["missing_not_listed"] = max(0, total_missing - len(selected_missing_targets))
+    summary["not_found"] = not_found
+    summary["not_missing"] = not_missing
+    return rows, summary
+
+
 def init_oracle_client_from_settings(settings: Dict) -> None:
     """根据配置初始化 Oracle Thick Mode 并提示环境变量设置。"""
     client_dir = settings.get('oracle_client_lib_dir', '').strip()
@@ -1143,27 +1384,24 @@ def get_source_objects(
     """
     log.info(f"正在连接 Oracle 源端: {ora_cfg['dsn']}...")
 
-    placeholders = ','.join([f":{i+1}" for i in range(len(schemas_list))])
     enabled_types = {t.upper() for t in (object_types or set(ALL_TRACKED_OBJECT_TYPES))}
     enabled_types &= set(ALL_TRACKED_OBJECT_TYPES)
-    if not enabled_types:
+    include_synonyms = 'SYNONYM' in enabled_types
+    object_types_for_objects = set(enabled_types)
+    if include_synonyms:
+        object_types_for_objects.discard('SYNONYM')
+    if not object_types_for_objects and not include_synonyms:
         log.warning("未启用任何可管理对象类型，源端对象列表为空。")
         return {}
-    object_types_clause = ",".join(f"'{obj}'" for obj in sorted(enabled_types))
-
-    sql = f"""
-        SELECT OWNER, OBJECT_NAME, OBJECT_TYPE
-        FROM DBA_OBJECTS
-        WHERE OWNER IN ({placeholders})
-          AND OBJECT_TYPE IN (
-              {object_types_clause}
-          )
-    """
+    placeholders = ','.join([f":{i+1}" for i in range(len(schemas_list))])
+    object_types_clause = ",".join(f"'{obj}'" for obj in sorted(object_types_for_objects)) if object_types_for_objects else ""
 
     source_objects: SourceObjectMap = defaultdict(set)
     mview_pairs: Set[Tuple[str, str]] = set()
     table_pairs: Set[Tuple[str, str]] = set()
     skipped_iot = 0
+    added_synonyms = 0
+    added_public_synonyms = 0
 
     try:
         with oracledb.connect(
@@ -1172,19 +1410,56 @@ def get_source_objects(
             dsn=ora_cfg['dsn']
         ) as connection:
             log.info("Oracle 连接成功。正在查询源对象列表...")
-            with connection.cursor() as cursor:
-                cursor.execute(sql, schemas_list)
-                for row in cursor:
-                    owner = (row[0] or '').strip().upper()
-                    obj_name = (row[1] or '').strip().upper()
-                    obj_type = (row[2] or '').strip().upper()
-                    if not owner or not obj_name or not obj_type:
-                        continue
-                    if obj_name.startswith("SYS_IOT_OVER_"):
-                        skipped_iot += 1
-                        continue
-                    full_name = f"{owner}.{obj_name}"
-                    source_objects[full_name].add(obj_type)
+            if object_types_for_objects:
+                sql = f"""
+                    SELECT OWNER, OBJECT_NAME, OBJECT_TYPE
+                    FROM DBA_OBJECTS
+                    WHERE OWNER IN ({placeholders})
+                      AND OBJECT_TYPE IN (
+                          {object_types_clause}
+                      )
+                """
+                with connection.cursor() as cursor:
+                    cursor.execute(sql, schemas_list)
+                    for row in cursor:
+                        owner = (row[0] or '').strip().upper()
+                        obj_name = (row[1] or '').strip().upper()
+                        obj_type = (row[2] or '').strip().upper()
+                        if not owner or not obj_name or not obj_type:
+                            continue
+                        if obj_name.startswith("SYS_IOT_OVER_"):
+                            skipped_iot += 1
+                            continue
+                        full_name = f"{owner}.{obj_name}"
+                        source_objects[full_name].add(obj_type)
+            if include_synonyms:
+                synonym_owners = sorted(set(s.upper() for s in schemas_list) | {"PUBLIC"})
+                target_owners = sorted({s.upper() for s in schemas_list})
+                if target_owners:
+                    owner_ph = ','.join([f":{i+1}" for i in range(len(synonym_owners))])
+                    target_ph = ','.join([f":{i+1+len(synonym_owners)}" for i in range(len(target_owners))])
+                    sql = f"""
+                        SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME
+                        FROM DBA_SYNONYMS
+                        WHERE OWNER IN ({owner_ph})
+                          AND TABLE_OWNER IN ({target_ph})
+                          AND TABLE_NAME IS NOT NULL
+                    """
+                    with connection.cursor() as cursor:
+                        cursor.execute(sql, synonym_owners + target_owners)
+                        for row in cursor:
+                            owner = (row[0] or '').strip().upper()
+                            syn_name = (row[1] or '').strip().upper()
+                            table_owner = (row[2] or '').strip().upper()
+                            table_name = (row[3] or '').strip().upper()
+                            if not owner or not syn_name or not table_owner or not table_name:
+                                continue
+                            full_name = f"{owner}.{syn_name}"
+                            source_objects[full_name].add('SYNONYM')
+                            if owner == 'PUBLIC':
+                                added_public_synonyms += 1
+                            else:
+                                added_synonyms += 1
             # 精确认定物化视图集合，避免误删真实表
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -1238,6 +1513,12 @@ def get_source_objects(
         "从 Oracle 成功获取 %d 个受管对象 (包含主对象与扩展对象)。",
         total_objects
     )
+    if include_synonyms:
+        log.info(
+            "已纳入同义词 %d 个（含 PUBLIC %d 个），仅保留指向 source_schemas 的同义词。",
+            added_synonyms + added_public_synonyms,
+            added_public_synonyms
+        )
     if skipped_iot:
         log.info("已跳过 %d 个 SYS_IOT_OVER_* IOT 表，不参与对比或修补脚本生成。", skipped_iot)
     return dict(source_objects)
@@ -1371,7 +1652,8 @@ def load_synonym_metadata(
         return {}
 
     allowed_targets = {s.upper() for s in (allowed_target_schemas or [])}
-    placeholders = ','.join([f":{i+1}" for i in range(len(schemas_list))])
+    owners = sorted(set(s.upper() for s in schemas_list) | {"PUBLIC"})
+    placeholders = ','.join([f":{i+1}" for i in range(len(owners))])
     sql = f"""
         SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME, DB_LINK
         FROM DBA_SYNONYMS
@@ -1387,7 +1669,7 @@ def load_synonym_metadata(
             dsn=ora_cfg['dsn']
         ) as connection:
             with connection.cursor() as cursor:
-                cursor.execute(sql, schemas_list)
+                cursor.execute(sql, owners)
                 for row in cursor:
                     owner = (row[0] or '').strip().upper()
                     name = (row[1] or '').strip().upper()
@@ -1413,7 +1695,7 @@ def load_synonym_metadata(
     log.info(
         "已缓存 %d 个同义词元数据（OWNER IN %s，跳过 PUBLIC 系统同义词 %d 个）。",
         len(result),
-        ",".join(schemas_list),
+        ",".join(owners),
         skipped_public
     )
     return result
@@ -7855,7 +8137,9 @@ def generate_fixup_scripts(
     dependency_report: Optional[DependencyReport] = None,
     ob_meta: Optional[ObMetadata] = None,
     expected_dependency_pairs: Optional[Set[Tuple[str, str, str, str]]] = None,
-    synonym_metadata: Optional[Dict[Tuple[str, str], SynonymMeta]] = None
+    synonym_metadata: Optional[Dict[Tuple[str, str], SynonymMeta]] = None,
+    trigger_filter_entries: Optional[Set[str]] = None,
+    trigger_filter_enabled: bool = False
 ):
     """
     基于校验结果生成 fixup_scripts DDL 脚本，并按依赖顺序排列：
@@ -7868,6 +8152,8 @@ def generate_fixup_scripts(
     7. TRIGGER
     8. 依赖重编译 (ALTER ... COMPILE)
     9. 依赖授权 (跨 schema)
+
+    如果配置了 trigger_list，则仅生成清单中列出的触发器脚本。
     """
     try:
         progress_log_interval = float(settings.get('progress_log_interval', 10))
@@ -7875,6 +8161,11 @@ def generate_fixup_scripts(
         progress_log_interval = 10.0
     progress_log_interval = max(1.0, progress_log_interval)
     synonym_meta_map = synonym_metadata or {}
+    trigger_filter_set = {t.upper() for t in (trigger_filter_entries or set())}
+    if trigger_filter_enabled:
+        log.info("[FIXUP] 已启用 trigger_list 过滤，清单条目数=%d。", len(trigger_filter_set))
+        if not trigger_filter_set:
+            log.warning("[FIXUP] trigger_list 为空或读取失败，TRIGGER 脚本将全部跳过。")
     allowed_synonym_targets = {s.upper() for s in settings.get('source_schemas_list', [])}
 
     base_dir = Path(settings.get('fixup_dir', 'fixup_scripts')).expanduser()
@@ -8124,6 +8415,15 @@ def generate_fixup_scripts(
     unsupported_types: Set[str] = set()
     public_synonym_fallback: Set[Tuple[str, str]] = set()
 
+    def _trigger_allowed(src_full: Optional[str], tgt_full: Optional[str]) -> bool:
+        if not trigger_filter_enabled:
+            return True
+        if not trigger_filter_set:
+            return False
+        src_u = (src_full or "").upper()
+        tgt_u = (tgt_full or "").upper()
+        return (src_u in trigger_filter_set) or (tgt_u in trigger_filter_set)
+
     def queue_request(schema: str, obj_type: str, obj_name: str) -> None:
         obj_type_u = obj_type.upper()
         schema_u = schema.upper()
@@ -8237,6 +8537,8 @@ def generate_fixup_scripts(
                     continue
                 src_schema_u, src_trg = src_full.split('.', 1)
                 tgt_schema_final, tgt_obj = tgt_full.split('.', 1)
+                if not _trigger_allowed(src_full, tgt_full):
+                    continue
                 if not allow_fixup('TRIGGER', tgt_schema_final):
                     continue
                 queue_request(src_schema_u, 'TRIGGER', src_trg)
@@ -8251,6 +8553,9 @@ def generate_fixup_scripts(
                 else:
                     tgt_schema_final = tgt_schema.upper()
                     tgt_obj = trg_name_u
+                tgt_full = f"{tgt_schema_final}.{tgt_obj}"
+                if not _trigger_allowed(src_full, tgt_full):
+                    continue
                 if not allow_fixup('TRIGGER', tgt_schema_final):
                     continue
                 queue_request(src_schema, 'TRIGGER', trg_name_u)
@@ -9448,6 +9753,55 @@ def export_blacklist_tables(
         return None
 
 
+def export_trigger_miss_report(
+    rows: List[TriggerListReportRow],
+    summary: Dict[str, object],
+    report_dir: Path
+) -> Optional[Path]:
+    """
+    输出触发器清单筛选报告。
+    """
+    if not report_dir or not summary or not summary.get("enabled"):
+        return None
+
+    output_path = Path(report_dir) / "trigger_miss.txt"
+    lines: List[str] = [
+        "# 触发器清单筛选报告 (trigger_list)",
+        f"# trigger_list: {summary.get('path', '')}",
+        (
+            "# 汇总: total_lines={total_lines}, valid={valid_entries}, invalid={invalid_entries}, "
+            "duplicate={duplicate_entries}, selected_missing={selected_missing}, "
+            "missing_not_listed={missing_not_listed}, not_found={not_found}, not_missing={not_missing}"
+        ).format(**{k: summary.get(k, 0) for k in [
+            "total_lines", "valid_entries", "invalid_entries", "duplicate_entries",
+            "selected_missing", "missing_not_listed", "not_found", "not_missing"
+        ]})
+    ]
+    if summary.get("error"):
+        lines.append(f"# ERROR: {summary.get('error')}")
+    if summary.get("check_disabled"):
+        lines.append("# NOTE: TRIGGER 未启用检查，清单仅做格式校验。")
+    lines.append("# 字段说明: ENTRY | STATUS | DETAIL")
+
+    if rows:
+        entry_w = max(len("ENTRY"), max((len(r.entry) for r in rows), default=0))
+        status_w = max(len("STATUS"), max((len(r.status) for r in rows), default=0))
+        header = f"{'ENTRY'.ljust(entry_w)}  {'STATUS'.ljust(status_w)}  DETAIL"
+        lines.append(header)
+        lines.append("-" * len(header))
+        for row in rows:
+            lines.append(f"{row.entry.ljust(entry_w)}  {row.status.ljust(status_w)}  {row.detail}")
+
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        content = "\n".join(lines).rstrip() + "\n"
+        output_path.write_text(content, encoding="utf-8")
+        return output_path
+    except OSError as exc:
+        log.warning("写入 trigger_miss 报告失败 %s: %s", output_path, exc)
+        return None
+
+
 def collect_blacklisted_missing_tables(
     tv_results: ReportResults,
     blacklist_tables: BlacklistTableMap
@@ -9486,7 +9840,9 @@ def print_final_report(
     schema_summary: Optional[Dict[str, List[str]]] = None,
     settings: Optional[Dict] = None,
     blacklisted_missing_tables: Optional[BlacklistTableMap] = None,
-    blacklist_report_rows: Optional[List[BlacklistReportRow]] = None
+    blacklist_report_rows: Optional[List[BlacklistReportRow]] = None,
+    trigger_list_summary: Optional[Dict[str, object]] = None,
+    trigger_list_rows: Optional[List[TriggerListReportRow]] = None
 ):
     custom_theme = Theme({
         "ok": "green",
@@ -9678,6 +10034,36 @@ def print_final_report(
     ext_text.append(f"差异 {trg_mis_cnt}", style="mismatch")
     summary_table.add_row("[bold]扩展对象 (INDEX/SEQ/etc.)[/bold]", ext_text)
 
+    if trigger_list_summary and trigger_list_summary.get("enabled"):
+        filter_text = Text()
+        if trigger_list_summary.get("error"):
+            filter_text.append(
+                f"trigger_list 读取失败: {trigger_list_summary.get('error')}",
+                style="mismatch"
+            )
+        elif trigger_list_summary.get("check_disabled"):
+            filter_text.append("TRIGGER 未启用检查，清单仅做格式校验。", style="mismatch")
+        else:
+            filter_text.append("列表: ", style="info")
+            filter_text.append(str(trigger_list_summary.get("valid_entries", 0)))
+            filter_text.append("  命中缺失: ", style="info")
+            filter_text.append(str(trigger_list_summary.get("selected_missing", 0)), style="ok")
+            filter_text.append("  未列出缺失: ", style="info")
+            filter_text.append(str(trigger_list_summary.get("missing_not_listed", 0)), style="mismatch")
+            invalid_cnt = trigger_list_summary.get("invalid_entries", 0) or 0
+            not_found_cnt = trigger_list_summary.get("not_found", 0) or 0
+            not_missing_cnt = trigger_list_summary.get("not_missing", 0) or 0
+            if invalid_cnt:
+                filter_text.append("  无效: ", style="mismatch")
+                filter_text.append(str(invalid_cnt), style="mismatch")
+            if not_found_cnt:
+                filter_text.append("  未找到: ", style="mismatch")
+                filter_text.append(str(not_found_cnt), style="mismatch")
+            if not_missing_cnt:
+                filter_text.append("  非缺失: ", style="info")
+                filter_text.append(str(not_missing_cnt), style="info")
+        summary_table.add_row("[bold]触发器筛选[/bold]", filter_text)
+
     dep_text = Text()
     dep_text.append("缺失依赖: ", style="missing")
     dep_text.append(f"{dep_missing_cnt}  ")
@@ -9710,6 +10096,8 @@ def print_final_report(
             addition_counts["SEQUENCE"] += len(item.missing_sequences)
         for item in extra_results.get("trigger_mismatched", []):
             addition_counts["TRIGGER"] += len(item.missing_triggers)
+        if trigger_list_summary and trigger_list_summary.get("enabled"):
+            addition_counts["TRIGGER"] = int(trigger_list_summary.get("selected_missing", 0) or 0)
 
         def format_block(title: str, data: OrderedDict) -> str:
             lines = [f"[bold]{title}[/bold]"]
@@ -10072,6 +10460,13 @@ def print_final_report(
             blacklisted_tables=blacklisted_table_keys
         )
         blacklist_path = export_blacklist_tables(blacklist_report_rows or [], report_path.parent)
+        trigger_miss_path = None
+        if trigger_list_summary and trigger_list_summary.get("enabled"):
+            trigger_miss_path = export_trigger_miss_report(
+                trigger_list_rows or [],
+                trigger_list_summary,
+                report_path.parent
+            )
         try:
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report_text = console.export_text(clear=False)
@@ -10083,6 +10478,8 @@ def print_final_report(
                 log.info("缺失 TABLE/VIEW 映射已输出到: %s", export_dir)
             if blacklist_path:
                 log.info("黑名单表清单已输出到: %s", blacklist_path)
+            if trigger_miss_path:
+                log.info("触发器清单筛选报告已输出到: %s", trigger_miss_path)
         except OSError as exc:
             console.print(f"[missing]报告写入失败: {exc}")
 
@@ -10113,6 +10510,7 @@ def parse_cli_args() -> argparse.Namespace:
             check_extra_types       限制扩展对象 (index,constraint,sequence,trigger)
             fixup_schemas           仅对指定目标 schema 生成订正 SQL（逗号分隔，留空为全部）
             fixup_types             仅生成指定对象类型的订正 SQL（留空为全部，例如 TABLE,TRIGGER）
+            trigger_list            仅生成指定触发器清单 (每行 SCHEMA.TRIGGER_NAME)
             check_dependencies      true/false 控制依赖&授权推导
             generate_fixup          true/false 控制是否生成脚本
 
@@ -10123,6 +10521,7 @@ def parse_cli_args() -> argparse.Namespace:
           main_reports/report_<ts>.txt  Rich 报告文本
           main_reports/tables_views_miss/ 按 schema 输出缺失 TABLE/VIEW 规则 (OMS 使用)
           main_reports/blacklist_tables.txt 黑名单表清单 (含 LONG 转换校验状态)
+          main_reports/trigger_miss.txt  触发器清单筛选报告 (仅配置 trigger_list 时生成)
           fixup_scripts/                按类型分类的订正 SQL
         """
     )
@@ -10397,7 +10796,9 @@ def main():
             schema_summary,
             settings,
             blacklisted_missing_tables={},
-            blacklist_report_rows=[]
+            blacklist_report_rows=[],
+            trigger_list_summary=None,
+            trigger_list_rows=None
         )
         return
 
@@ -10489,6 +10890,40 @@ def main():
         enabled_extra_types
     )
 
+    trigger_list_summary: Optional[Dict[str, object]] = None
+    trigger_list_rows: Optional[List[TriggerListReportRow]] = None
+    trigger_filter_entries: Optional[Set[str]] = None
+    trigger_filter_enabled = False
+    trigger_list_path = settings.get("trigger_list", "").strip()
+    if trigger_list_path:
+        trigger_filter_enabled = True
+        entries, invalid_entries, duplicate_entries, total_lines, read_error = parse_trigger_list_file(trigger_list_path)
+        trigger_list_rows, trigger_list_summary = build_trigger_list_report(
+            trigger_list_path,
+            entries,
+            invalid_entries,
+            duplicate_entries,
+            total_lines,
+            read_error,
+            extra_results,
+            oracle_meta,
+            ob_meta,
+            full_object_mapping,
+            trigger_check_enabled='TRIGGER' in enabled_extra_types
+        )
+        trigger_filter_entries = entries
+        if trigger_list_summary.get("error"):
+            log.warning("trigger_list 读取失败，将跳过触发器筛选与生成: %s", trigger_list_summary.get("error"))
+        elif trigger_list_summary.get("check_disabled"):
+            log.warning("TRIGGER 未启用检查，trigger_list 将不会用于缺失触发器筛选。")
+        else:
+            log.info(
+                "trigger_list 生效: 列表=%d, 命中缺失=%d, 未列出缺失=%d。",
+                trigger_list_summary.get("valid_entries", 0),
+                trigger_list_summary.get("selected_missing", 0),
+                trigger_list_summary.get("missing_not_listed", 0)
+            )
+
     if enable_dependencies_check:
         dependency_report = check_dependencies_against_ob(
             expected_dependency_pairs,
@@ -10537,7 +10972,9 @@ def main():
             dependency_report,
             ob_meta,
             expected_dependency_pairs,
-            synonym_meta
+            synonym_meta,
+            trigger_filter_entries,
+            trigger_filter_enabled
         )
     else:
         log.info('已根据配置跳过修补脚本生成，仅打印对比报告。')
@@ -10560,7 +10997,9 @@ def main():
         schema_summary,
         settings,
         blacklisted_missing_tables,
-        blacklist_report_rows
+        blacklist_report_rows,
+        trigger_list_summary,
+        trigger_list_rows
     )
 
 
