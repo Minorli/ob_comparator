@@ -127,6 +127,7 @@ class FailureType:
     MISSING_OBJECT = "missing_object"        # Dependency object doesn't exist -> retryable
     PERMISSION_DENIED = "permission_denied"  # Insufficient privileges -> needs grants
     SYNTAX_ERROR = "syntax_error"            # SQL syntax error -> needs DDL fix
+    DATA_CONFLICT = "data_conflict"          # Unique/constraint violation -> needs data cleanup
     DUPLICATE_OBJECT = "duplicate_object"    # Object already exists -> can skip
     INVALID_IDENTIFIER = "invalid_identifier" # Column/table name error -> needs DDL fix
     NAME_IN_USE = "name_in_use"              # Name already used -> needs resolution
@@ -158,9 +159,9 @@ def classify_sql_error(stderr: str) -> str:
     if 'ORA-01031' in stderr_upper or 'INSUFFICIENT PRIVILEGES' in stderr_upper:
         return FailureType.PERMISSION_DENIED
     
-    # Duplicate object (can skip)
+    # Data conflict (unique constraint violation)
     if 'ORA-00001' in stderr_upper or 'UNIQUE CONSTRAINT' in stderr_upper:
-        return FailureType.DUPLICATE_OBJECT
+        return FailureType.DATA_CONFLICT
     
     # Invalid identifier (DDL needs fix)
     if 'ORA-00904' in stderr_upper:
@@ -247,6 +248,15 @@ def log_failure_analysis(failures_by_type: Dict[str, List['ScriptResult']]) -> N
         total_dup = dup_count + name_count
         log.info("✓ 对象已存在: %d 个 (可忽略)", total_dup)
         log.info("   说明: 这些对象已在目标库存在，无需重复创建")
+
+    # Data conflicts
+    if FailureType.DATA_CONFLICT in failures_by_type:
+        items = failures_by_type[FailureType.DATA_CONFLICT]
+        log.info("❌ 数据冲突/唯一约束违反: %d 个", len(items))
+        log.info("   建议: 清理重复数据后重试相关DDL")
+        if len(items) <= 3:
+            for item in items[:3]:
+                log.info("     - %s", item.path.name)
     
     # Unknown errors
     if FailureType.UNKNOWN in failures_by_type:
@@ -979,7 +989,6 @@ def run_iterative_fixup(
     ob_timeout = int(ob_cfg.get("timeout", DEFAULT_OBCLIENT_TIMEOUT))
     
     round_num = 0
-    last_success_count = 0
     cumulative_success = 0
     cumulative_failed = 0
     
@@ -1105,13 +1114,6 @@ def run_iterative_fixup(
         if round_success < min_progress:
             log.warning(f"本轮成功数 ({round_success}) 低于最小进展阈值 ({min_progress})，停止迭代。")
             break
-        
-        # Check for oscillation
-        if round_success == last_success_count and round_num > 1:
-            log.warning("检测到收敛停滞（成功数未增长），停止迭代。")
-            break
-        
-        last_success_count = round_success
         
         # Recompile after each round if enabled
         if args.recompile:

@@ -5681,12 +5681,38 @@ def compare_sequences_for_schema(
         tgt_seqs_snapshot = ob_meta.sequences.get(tgt_schema.upper(), set())
         
         # 改进：区分元数据加载失败 vs schema确实没有序列
-        # 检查该schema是否在objects中有记录（说明schema存在）
+        # 检查该schema是否在已加载的对象元数据中出现（说明schema存在）
+        schema_u = src_schema.upper()
         schema_has_objects = any(
-            obj_schema == src_schema.upper() 
-            for obj_schema in oracle_meta.objects.keys()
+            owner == schema_u
+            for owner, _ in oracle_meta.table_columns.keys()
         )
-        
+        if not schema_has_objects:
+            for owner, _ in oracle_meta.indexes.keys():
+                if owner == schema_u:
+                    schema_has_objects = True
+                    break
+        if not schema_has_objects:
+            for owner, _ in oracle_meta.constraints.keys():
+                if owner == schema_u:
+                    schema_has_objects = True
+                    break
+        if not schema_has_objects:
+            for owner, _ in oracle_meta.triggers.keys():
+                if owner == schema_u:
+                    schema_has_objects = True
+                    break
+        if not schema_has_objects:
+            for owner, _ in oracle_meta.table_comments.keys():
+                if owner == schema_u:
+                    schema_has_objects = True
+                    break
+        if not schema_has_objects:
+            for owner, _ in oracle_meta.column_comments.keys():
+                if owner == schema_u:
+                    schema_has_objects = True
+                    break
+
         if not schema_has_objects:
             # Schema不存在于元数据中，可能是配置错误或权限问题，跳过比较
             note = f"源端schema {src_schema} 未在Oracle元数据中找到，跳过序列比较。"
@@ -5745,17 +5771,10 @@ def compare_triggers_for_table(
     full_object_mapping: FullObjectMapping
 ) -> Tuple[bool, Optional[TriggerMismatch]]:
     src_key = (src_schema.upper(), src_table.upper())
-    src_trg = oracle_meta.triggers.get(src_key)
+    src_trg = oracle_meta.triggers.get(src_key) or {}
     tgt_key = (tgt_schema.upper(), tgt_table.upper())
     tgt_trg = ob_meta.triggers.get(tgt_key, {})
 
-    # 明确区分None（元数据未加载）和空字典（确实没有触发器）
-    if src_trg is None:
-        log.warning(f"[触发器检查] 源端表 {src_schema}.{src_table} 触发器元数据未加载（None）。")
-        # 元数据未加载时，无法准确比较，跳过触发器比较
-        # 避免误报目标端触发器为"额外"
-        return True, None
-    
     # 源端没有触发器（空字典或空集合）
     if not src_trg:
         # 如果目标端也没有触发器，则视为一致
