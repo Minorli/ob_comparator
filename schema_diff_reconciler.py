@@ -8144,6 +8144,15 @@ def generate_fixup_scripts(
             continue
         src_schema, src_obj = src_name.split('.', 1)
         tgt_schema, tgt_obj = tgt_name.split('.', 1)
+        if obj_type_u == 'SYNONYM' and src_schema.upper() == 'PUBLIC':
+            src_key = (src_schema.upper(), src_obj.upper())
+            src_full = f"{src_schema.upper()}.{src_obj.upper()}"
+            if src_key not in synonym_meta_map and src_full not in remap_rules:
+                log.info(
+                    "[FIXUP] 跳过 PUBLIC 同义词 %s.%s（table_owner 不在 source_schemas 范围内）。",
+                    src_schema, src_obj
+                )
+                continue
         if not allow_fixup(obj_type_u, tgt_schema):
             continue
         queue_request(src_schema, obj_type_u, src_obj)
