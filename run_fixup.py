@@ -120,6 +120,147 @@ def log_subsection(title: str, fill_char: str = "-") -> None:
 init_console_logging()
 log = logging.getLogger(__name__)
 
+
+# Error classification for intelligent retry
+class FailureType:
+    """Classification of SQL execution failures for retry logic."""
+    MISSING_OBJECT = "missing_object"        # Dependency object doesn't exist -> retryable
+    PERMISSION_DENIED = "permission_denied"  # Insufficient privileges -> needs grants
+    SYNTAX_ERROR = "syntax_error"            # SQL syntax error -> needs DDL fix
+    DUPLICATE_OBJECT = "duplicate_object"    # Object already exists -> can skip
+    INVALID_IDENTIFIER = "invalid_identifier" # Column/table name error -> needs DDL fix
+    NAME_IN_USE = "name_in_use"              # Name already used -> needs resolution
+    TIMEOUT = "timeout"                       # Execution timeout -> may retry
+    UNKNOWN = "unknown"                       # Unknown error -> investigate
+
+
+def classify_sql_error(stderr: str) -> str:
+    """
+    Classify OceanBase/Oracle error messages for retry logic.
+    
+    Args:
+        stderr: Error message from obclient
+        
+    Returns:
+        FailureType classification string
+    """
+    if not stderr:
+        return FailureType.UNKNOWN
+    
+    stderr_upper = stderr.upper()
+    
+    # Missing object errors (retryable - object may be created in later rounds)
+    if any(code in stderr_upper for code in ['ORA-00942', 'ORA-04043', 'ORA-06512']):
+        if 'TABLE OR VIEW DOES NOT EXIST' in stderr_upper or 'DOES NOT EXIST' in stderr_upper:
+            return FailureType.MISSING_OBJECT
+    
+    # Permission denied (needs grant scripts)
+    if 'ORA-01031' in stderr_upper or 'INSUFFICIENT PRIVILEGES' in stderr_upper:
+        return FailureType.PERMISSION_DENIED
+    
+    # Duplicate object (can skip)
+    if 'ORA-00001' in stderr_upper or 'UNIQUE CONSTRAINT' in stderr_upper:
+        return FailureType.DUPLICATE_OBJECT
+    
+    # Invalid identifier (DDL needs fix)
+    if 'ORA-00904' in stderr_upper:
+        return FailureType.INVALID_IDENTIFIER
+    
+    # Name already in use (object exists)
+    if 'ORA-00955' in stderr_upper or 'NAME IS ALREADY USED' in stderr_upper:
+        return FailureType.NAME_IN_USE
+    
+    # Syntax errors (DDL needs fix)
+    if any(code in stderr_upper for code in ['ORA-00900', 'ORA-00901', 'ORA-00902', 'ORA-00903']):
+        return FailureType.SYNTAX_ERROR
+    
+    return FailureType.UNKNOWN
+
+
+def analyze_failure_patterns(results: List['ScriptResult']) -> Dict[str, List['ScriptResult']]:
+    """
+    Analyze failure patterns and group by error type.
+    
+    Args:
+        results: List of ScriptResult objects
+        
+    Returns:
+        Dictionary mapping error types to list of failed results
+    """
+    failures_by_type = defaultdict(list)
+    
+    for result in results:
+        if result.status == "FAILED":
+            error_type = classify_sql_error(result.message)
+            failures_by_type[error_type].append(result)
+    
+    return dict(failures_by_type)
+
+
+def log_failure_analysis(failures_by_type: Dict[str, List['ScriptResult']]) -> None:
+    """
+    Log detailed failure analysis with actionable suggestions.
+    
+    Args:
+        failures_by_type: Dictionary of failures grouped by type
+    """
+    if not failures_by_type:
+        return
+    
+    log_subsection("失败原因分析")
+    
+    total_failures = sum(len(items) for items in failures_by_type.values())
+    log.info("总失败数: %d", total_failures)
+    log.info("")
+    
+    # Missing objects (most common in VIEW scenarios)
+    if FailureType.MISSING_OBJECT in failures_by_type:
+        items = failures_by_type[FailureType.MISSING_OBJECT]
+        log.info("❌ 依赖对象不存在: %d 个 (可在后续轮次重试)", len(items))
+        log.info("   建议: 这些脚本会在依赖对象创建后自动重试成功")
+        if len(items) <= 5:
+            for item in items[:5]:
+                log.info("     - %s", item.path.name)
+    
+    # Permission denied
+    if FailureType.PERMISSION_DENIED in failures_by_type:
+        items = failures_by_type[FailureType.PERMISSION_DENIED]
+        log.info("❌ 权限不足: %d 个", len(items))
+        log.info("   建议: 检查并执行 fixup_scripts/grants/ 下的授权脚本")
+        if len(items) <= 3:
+            for item in items[:3]:
+                log.info("     - %s", item.path.name)
+    
+    # Syntax errors
+    if FailureType.SYNTAX_ERROR in failures_by_type:
+        items = failures_by_type[FailureType.SYNTAX_ERROR]
+        log.info("❌ SQL语法错误: %d 个", len(items))
+        log.info("   建议: 检查DDL兼容性，可能需要手动修复")
+        if len(items) <= 3:
+            for item in items[:3]:
+                log.info("     - %s", item.path.name)
+    
+    # Duplicate/existing objects
+    if FailureType.DUPLICATE_OBJECT in failures_by_type or FailureType.NAME_IN_USE in failures_by_type:
+        dup_count = len(failures_by_type.get(FailureType.DUPLICATE_OBJECT, []))
+        name_count = len(failures_by_type.get(FailureType.NAME_IN_USE, []))
+        total_dup = dup_count + name_count
+        log.info("✓ 对象已存在: %d 个 (可忽略)", total_dup)
+        log.info("   说明: 这些对象已在目标库存在，无需重复创建")
+    
+    # Unknown errors
+    if FailureType.UNKNOWN in failures_by_type:
+        items = failures_by_type[FailureType.UNKNOWN]
+        log.info("❓ 未知错误: %d 个", len(items))
+        log.info("   建议: 查看详细错误信息进行诊断")
+        if len(items) <= 3:
+            for item in items[:3]:
+                msg_preview = item.message.splitlines()[0][:80] if item.message else "无错误信息"
+                log.info("     - %s: %s", item.path.name, msg_preview)
+    
+    log.info("")
+
+
 TYPE_DIR_MAP = {
     "SEQUENCE": "sequence",
     "TABLE": "table",
@@ -435,6 +576,9 @@ def parse_args() -> argparse.Namespace:
           --smart-order  : 启用依赖感知执行顺序（推荐）
           --recompile    : 自动重编译 INVALID 对象
           --max-retries  : 重编译最大重试次数（默认 5）
+          --iterative    : 启用迭代执行模式，自动重试失败脚本（推荐用于VIEW）
+          --max-rounds   : 最大迭代轮次（默认 10）
+          --min-progress : 最小进展阈值（默认 1）
         
         保留原有功能：
           --only-dirs    : 按子目录过滤
@@ -479,6 +623,26 @@ def parse_args() -> argparse.Namespace:
     )
     
     parser.add_argument(
+        "--iterative",
+        action="store_true",
+        help="Enable iterative execution with automatic retry of failed scripts (recommended for VIEWs)",
+    )
+    
+    parser.add_argument(
+        "--max-rounds",
+        type=int,
+        default=10,
+        help="Maximum iteration rounds for --iterative mode (default: 10)",
+    )
+    
+    parser.add_argument(
+        "--min-progress",
+        type=int,
+        default=1,
+        help="Minimum progress per round for --iterative mode (default: 1)",
+    )
+    
+    parser.add_argument(
         "--only-dirs",
         action="append",
         help="Only execute scripts under these subdirectories (comma-separated)",
@@ -516,6 +680,15 @@ def parse_csv_args(arg_list: List[str]) -> List[str]:
 
 
 def main() -> None:
+    """
+    Main entry point with optional iterative fixup support.
+    
+    New --iterative flag enables multi-round execution with:
+    - Automatic retry of failed scripts
+    - Convergence detection
+    - Error pattern analysis
+    - Progress tracking across rounds
+    """
     args = parse_args()
     config_arg = Path(args.config)
     
@@ -565,9 +738,38 @@ def main() -> None:
         level_name = "INFO"
     level = getattr(logging, level_name)
     set_console_log_level(level)
+    
+    # Check if iterative mode requested via config or args
+    iterative_mode = getattr(args, 'iterative', False)
+    max_rounds = getattr(args, 'max_rounds', 10)
+    min_progress = getattr(args, 'min_progress', 1)
+    
+    if iterative_mode:
+        run_iterative_fixup(
+            args, ob_cfg, fixup_dir, repo_root, 
+            only_dirs, exclude_dirs,
+            max_rounds, min_progress
+        )
+    else:
+        run_single_fixup(
+            args, ob_cfg, fixup_dir, repo_root,
+            only_dirs, exclude_dirs
+        )
+
+
+def run_single_fixup(
+    args,
+    ob_cfg: Dict[str, str],
+    fixup_dir: Path,
+    repo_root: Path,
+    only_dirs: List[str],
+    exclude_dirs: List[str]
+) -> None:
+    """Original single-round fixup execution (backward compatible)."""
+    
     log_section("修补脚本执行器")
-    log.info("配置文件: %s", config_arg.resolve())
-    log.info("日志级别: %s", logging.getLevelName(level))
+    log.info("配置文件: %s", Path(args.config).resolve())
+    log.info("日志级别: %s", logging.getLevelName(logging.getLogger().level))
     log.info("项目主页: %s (问题反馈: %s)", REPO_URL, REPO_ISSUES_URL)
     
     done_dir = fixup_dir / DONE_DIR_NAME
@@ -689,6 +891,11 @@ def main() -> None:
         if remaining_invalid > 0:
             log.info("提示: 运行 'SELECT * FROM DBA_OBJECTS WHERE STATUS=\\'INVALID\\';' 查看详情")
     
+    # Analyze failures
+    failures_by_type = analyze_failure_patterns(results)
+    if failures_by_type:
+        log_failure_analysis(failures_by_type)
+    
     # Detailed table
     if results:
         log_subsection("详细结果")
@@ -723,6 +930,237 @@ def main() -> None:
     log_section("执行结束")
     
     exit_code = 0 if failed == 0 else 1
+    sys.exit(exit_code)
+
+
+def run_iterative_fixup(
+    args,
+    ob_cfg: Dict[str, str],
+    fixup_dir: Path,
+    repo_root: Path,
+    only_dirs: List[str],
+    exclude_dirs: List[str],
+    max_rounds: int = 10,
+    min_progress: int = 1
+) -> None:
+    """
+    Multi-round iterative fixup execution with automatic retry.
+    
+    Solves the VIEW dependency problem where 800 DDLs fail on first run
+    because dependent objects don't exist yet.
+    
+    Args:
+        args: Command line arguments
+        ob_cfg: OceanBase connection config
+        fixup_dir: Directory containing fixup scripts
+        repo_root: Repository root path
+        only_dirs: Directories to include
+        exclude_dirs: Directories to exclude
+        max_rounds: Maximum iteration rounds (default: 10)
+        min_progress: Minimum progress per round (default: 1)
+    """
+    log_section("修补脚本执行器 (迭代模式)")
+    log.info("配置文件: %s", Path(args.config).resolve())
+    log.info("日志级别: %s", logging.getLevelName(logging.getLogger().level))
+    log.info("最大轮次: %d", max_rounds)
+    log.info("最小进展: 每轮至少 %d 个成功", min_progress)
+    log.info("项目主页: %s (问题反馈: %s)", REPO_URL, REPO_ISSUES_URL)
+    log.info("")
+    log.info("迭代模式说明:")
+    log.info("  - 自动重试失败的脚本")
+    log.info("  - 逐轮解决依赖关系")
+    log.info("  - 收敛检测停止条件")
+    log.info("")
+    
+    done_dir = fixup_dir / DONE_DIR_NAME
+    done_dir.mkdir(exist_ok=True)
+    
+    obclient_cmd = build_obclient_command(ob_cfg)
+    ob_timeout = int(ob_cfg.get("timeout", DEFAULT_OBCLIENT_TIMEOUT))
+    
+    round_num = 0
+    last_success_count = 0
+    cumulative_success = 0
+    cumulative_failed = 0
+    
+    all_round_results = []
+    
+    while round_num < max_rounds:
+        round_num += 1
+        
+        log_section(f"第 {round_num}/{max_rounds} 轮")
+        
+        # Collect pending SQL files (excluding done/)
+        files_with_layer = collect_sql_files_by_layer(
+            fixup_dir,
+            smart_order=args.smart_order,
+            include_dirs=set(only_dirs) if only_dirs else None,
+            exclude_dirs=set(exclude_dirs),
+            glob_patterns=args.glob_patterns or None,
+        )
+        
+        if not files_with_layer:
+            log.info("✓ 所有脚本已成功执行！")
+            break
+        
+        total_scripts = len(files_with_layer)
+        log.info("待处理脚本: %d 个", total_scripts)
+        
+        round_results: List[ScriptResult] = []
+        width = len(str(total_scripts)) or 1
+        current_layer = -1
+        
+        # Execute scripts for this round
+        for idx, (layer, sql_path) in enumerate(files_with_layer, start=1):
+            if args.smart_order and layer != current_layer:
+                current_layer = layer
+                layer_name = "未知层" if layer == 999 else f"第 {layer} 层"
+                log_subsection(f"执行层 {layer_name}")
+            
+            relative_path = sql_path.relative_to(repo_root)
+            label = f"[{idx:0{width}}/{total_scripts}]"
+            
+            try:
+                sql_text = sql_path.read_text(encoding="utf-8")
+            except Exception as exc:
+                msg = f"读取文件失败: {exc}"
+                round_results.append(ScriptResult(relative_path, "ERROR", msg, layer))
+                log.error("%s %s -> ERROR (%s)", label, relative_path, msg)
+                continue
+            
+            if not sql_text.strip():
+                round_results.append(ScriptResult(relative_path, "SKIPPED", "文件为空", layer))
+                log.warning("%s %s -> SKIP (文件为空)", label, relative_path)
+                continue
+            
+            try:
+                result = run_sql(obclient_cmd, sql_text, timeout=ob_timeout)
+                if result.returncode == 0:
+                    move_note = ""
+                    try:
+                        target_dir = done_dir / sql_path.parent.name
+                        target_dir.mkdir(parents=True, exist_ok=True)
+                        target_path = target_dir / sql_path.name
+                        shutil.move(str(sql_path), target_path)
+                        move_note = f"(已移至 done/{sql_path.parent.name}/)"
+                    except Exception as exc:
+                        move_note = f"(移动失败: {exc})"
+
+                    round_results.append(ScriptResult(relative_path, "SUCCESS", move_note.strip(), layer))
+                    log.info("%s %s -> OK %s", label, relative_path, move_note)
+                else:
+                    stderr = (result.stderr or "").strip()
+                    round_results.append(ScriptResult(relative_path, "FAILED", stderr, layer))
+                    error_type = classify_sql_error(stderr)
+                    
+                    # Only log details for non-retryable errors
+                    if error_type in [FailureType.SYNTAX_ERROR, FailureType.PERMISSION_DENIED, FailureType.UNKNOWN]:
+                        log.error("%s %s -> FAIL", label, relative_path)
+                        if stderr:
+                            first_line = stderr.splitlines()[0] if stderr.splitlines() else stderr
+                            log.error("  %s", first_line[:200])
+                    else:
+                        # Retryable errors - just warning
+                        log.warning("%s %s -> FAIL (将在下轮重试)", label, relative_path)
+                        
+            except subprocess.TimeoutExpired:
+                msg = f"执行超时 (> {ob_timeout} 秒)"
+                round_results.append(ScriptResult(relative_path, "FAILED", msg, layer))
+                log.error("%s %s -> TIMEOUT", label, relative_path)
+                log.error("  %s", msg)
+        
+        # Round summary
+        round_success = sum(1 for r in round_results if r.status == "SUCCESS")
+        round_failed = sum(1 for r in round_results if r.status in ("FAILED", "ERROR"))
+        round_skipped = sum(1 for r in round_results if r.status == "SKIPPED")
+        
+        cumulative_success += round_success
+        cumulative_failed = round_failed  # Only count current failures
+        
+        log_subsection(f"第 {round_num} 轮结果")
+        log.info("本轮成功: %d", round_success)
+        log.info("本轮失败: %d", round_failed)
+        log.info("本轮跳过: %d", round_skipped)
+        log.info("累计成功: %d", cumulative_success)
+        log.info("")
+        
+        all_round_results.append({
+            'round': round_num,
+            'success': round_success,
+            'failed': round_failed,
+            'results': round_results
+        })
+        
+        # Convergence check
+        if round_success == 0:
+            log.warning("本轮无新成功脚本，停止迭代。")
+            
+            # Analyze remaining failures
+            failures_by_type = analyze_failure_patterns(round_results)
+            if failures_by_type:
+                log_failure_analysis(failures_by_type)
+            
+            break
+        
+        if round_success < min_progress:
+            log.warning(f"本轮成功数 ({round_success}) 低于最小进展阈值 ({min_progress})，停止迭代。")
+            break
+        
+        # Check for oscillation
+        if round_success == last_success_count and round_num > 1:
+            log.warning("检测到收敛停滞（成功数未增长），停止迭代。")
+            break
+        
+        last_success_count = round_success
+        
+        # Recompile after each round if enabled
+        if args.recompile:
+            log_subsection("轮次重编译")
+            recomp, invalid = recompile_invalid_objects(
+                obclient_cmd, ob_timeout, 2  # Fewer retries per round
+            )
+            if recomp > 0:
+                log.info("重编译成功 %d 个对象", recomp)
+    
+    # Final recompilation
+    total_recompiled = 0
+    remaining_invalid = 0
+    if args.recompile:
+        log_section("最终重编译")
+        total_recompiled, remaining_invalid = recompile_invalid_objects(
+            obclient_cmd, ob_timeout, args.max_retries
+        )
+    
+    # Final summary
+    log_section("迭代执行汇总")
+    log.info("执行轮次: %d", round_num)
+    log.info("总计成功: %d", cumulative_success)
+    log.info("剩余失败: %d", cumulative_failed)
+    
+    if args.recompile:
+        log_subsection("最终重编译统计")
+        log.info("重编译成功: %d", total_recompiled)
+        log.info("仍为INVALID: %d", remaining_invalid)
+    
+    # Final failure analysis
+    if round_num > 0 and all_round_results:
+        final_results = all_round_results[-1]['results']
+        failures_by_type = analyze_failure_patterns(final_results)
+        if failures_by_type:
+            log_failure_analysis(failures_by_type)
+    
+    # Per-round breakdown
+    if len(all_round_results) > 1:
+        log_subsection("各轮执行统计")
+        for round_data in all_round_results:
+            log.info("第 %d 轮: 成功 %d, 失败 %d",
+                    round_data['round'],
+                    round_data['success'],
+                    round_data['failed'])
+    
+    log_section("执行结束")
+    
+    exit_code = 0 if cumulative_failed == 0 else 1
     sys.exit(exit_code)
 
 

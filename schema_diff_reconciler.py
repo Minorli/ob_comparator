@@ -5419,10 +5419,16 @@ def compare_indexes_for_table(
 
     # 处理同名索引但SYS_NC列名不同的情况
     def normalize_sys_nc_columns(cols: Tuple[str, ...]) -> Tuple[str, ...]:
-        """将SYS_NC开头的列名标准化为通用形式"""
+        """
+        将SYS_NC开头的列名标准化为通用形式。
+        Oracle可能生成多种格式：SYS_NC00001$, SYS_NC_OID$, SYS_NC_ROWINFO$ 等
+        """
         normalized = []
         for col in cols:
-            if col.startswith('SYS_NC') and '$' in col:
+            # 匹配多种SYS_NC格式：
+            # - SYS_NC<digits>$ (如 SYS_NC00001$)
+            # - SYS_NC_<WORD>$ (如 SYS_NC_OID$, SYS_NC_ROWINFO$)
+            if re.match(r'^SYS_NC\d+\$', col) or re.match(r'^SYS_NC_[A-Z_]+\$', col):
                 normalized.append('SYS_NC$')  # 标准化为通用形式
             else:
                 normalized.append(col)
@@ -5553,12 +5559,14 @@ def compare_constraints_for_table(
             ref_owner = cons.get("ref_table_owner")
             ref_name = cons.get("ref_table_name")
             if ref_owner and ref_name:
-                ref_src_full = f"{str(ref_owner).upper()}.{str(ref_name).upper()}"
+                ref_full_raw = f"{str(ref_owner).upper()}.{str(ref_name).upper()}"
                 if is_source:
-                    mapped = get_mapped_target(full_object_mapping, ref_src_full, 'TABLE') or ref_src_full
-                    ref_full = mapped.upper()
+                    # 源端FK引用：应用remap规则
+                    mapped = get_mapped_target(full_object_mapping, ref_full_raw, 'TABLE')
+                    ref_full = (mapped or ref_full_raw).upper()
                 else:
-                    ref_full = ref_src_full.upper()
+                    # 目标端FK引用：使用原始名称（目标端已经是remapped之后的名称）
+                    ref_full = ref_full_raw.upper()
             entries.append((cols, name, ref_full))
         return entries
 
@@ -5671,19 +5679,40 @@ def compare_sequences_for_schema(
     if src_seqs is None:
         log.warning(f"[序列检查] 未找到 {src_schema} 的 Oracle 序列元数据。")
         tgt_seqs_snapshot = ob_meta.sequences.get(tgt_schema.upper(), set())
+        
+        # 改进：区分元数据加载失败 vs schema确实没有序列
+        # 检查该schema是否在objects中有记录（说明schema存在）
+        schema_has_objects = any(
+            obj_schema == src_schema.upper() 
+            for obj_schema in oracle_meta.objects.keys()
+        )
+        
+        if not schema_has_objects:
+            # Schema不存在于元数据中，可能是配置错误或权限问题，跳过比较
+            note = f"源端schema {src_schema} 未在Oracle元数据中找到，跳过序列比较。"
+            log.info(note)
+            return True, None  # 跳过，不报告不一致
+        
+        # Schema存在但sequences为None，说明确实没有序列（或DBA_SEQUENCES查询为空）
         note = (
-            f"Oracle 用户已成功查询，但在 schema {src_schema} 的 DBA_SEQUENCES 未返回任何记录，请检查该 schema 是否确实存在序列。"
+            f"Oracle schema {src_schema} 中无序列定义"
+            f"（DBA_SEQUENCES未返回记录，可能schema确实无序列或权限不足）。"
         )
         if tgt_seqs_snapshot:
-            note += f" 目标端现有序列：{', '.join(sorted(tgt_seqs_snapshot))}。"
-        return False, SequenceMismatch(
-            src_schema=src_schema,
-            tgt_schema=tgt_schema,
-            missing_sequences=set(),
-            extra_sequences=tgt_seqs_snapshot,
-            note=note,
-            missing_mappings=[]
-        )
+            note += f" 目标端存在序列：{', '.join(sorted(tgt_seqs_snapshot))}。"
+            # 源端没有，目标端有，报告为额外序列
+            return False, SequenceMismatch(
+                src_schema=src_schema,
+                tgt_schema=tgt_schema,
+                missing_sequences=set(),
+                extra_sequences=tgt_seqs_snapshot,
+                note=note,
+                missing_mappings=[]
+            )
+        else:
+            # 双方都没有序列，认为一致
+            log.debug(f"[序列检查] 源端和目标端都无序列，认为一致。")
+            return True, None
 
     tgt_seqs = ob_meta.sequences.get(tgt_schema.upper(), set())
 
@@ -5720,12 +5749,19 @@ def compare_triggers_for_table(
     tgt_key = (tgt_schema.upper(), tgt_table.upper())
     tgt_trg = ob_meta.triggers.get(tgt_key, {})
 
-    # 源端没有触发器（空字典或 None）
+    # 明确区分None（元数据未加载）和空字典（确实没有触发器）
+    if src_trg is None:
+        log.warning(f"[触发器检查] 源端表 {src_schema}.{src_table} 触发器元数据未加载（None）。")
+        # 元数据未加载时，无法准确比较，跳过触发器比较
+        # 避免误报目标端触发器为"额外"
+        return True, None
+    
+    # 源端没有触发器（空字典或空集合）
     if not src_trg:
         # 如果目标端也没有触发器，则视为一致
         if not tgt_trg:
             return True, None
-        # 源端没有触发器但目标端有，记录目标端额外的触发器
+        # 源端确实没有触发器但目标端有，记录目标端额外的触发器
         extra_triggers: Set[str] = set()
         for name, info in tgt_trg.items():
             owner_u = (info.get("owner") or tgt_schema).upper()
@@ -9707,9 +9743,87 @@ def generate_fixup_scripts(
 
     log.info("[FIXUP] (4/9) 正在生成 VIEW / MATERIALIZED VIEW / 其他对象脚本...")
     
-    # 处理VIEW对象
+    # 处理VIEW对象 - 使用简化的拓扑排序
     if view_missing_objects:
-        log.info("[FIXUP] (4a/9) 正在生成 %d 个VIEW脚本...", len(view_missing_objects))
+        log.info("[FIXUP] (4a/9) 正在排序 %d 个VIEW依赖关系...", len(view_missing_objects))
+        
+        # Simple topological sort using already-fetched DDLs
+        try:
+            # Step 1: Fetch all VIEW DDLs first
+            view_ddl_map = {}  # (src_schema, src_obj) -> DDL
+            for src_schema, src_obj, tgt_schema, tgt_obj in view_missing_objects:
+                fetch_result = fetch_ddl_with_timing(src_schema, 'VIEW', src_obj)
+                if len(fetch_result) == 3:
+                    raw_ddl, _, _ = fetch_result
+                    if raw_ddl:
+                        view_ddl_map[(src_schema, src_obj)] = raw_ddl
+            
+            # Step 2: Build dependency graph
+            view_deps = {}  # (tgt_schema, tgt_obj) -> set of (tgt_schema, tgt_obj) dependencies
+            src_to_tgt = {(s_sch, s_obj): (t_sch, t_obj) 
+                         for s_sch, s_obj, t_sch, t_obj in view_missing_objects}
+            tgtfull_to_tuple = {f"{t_sch}.{t_obj}".upper(): (t_sch, t_obj)
+                               for _, _, t_sch, t_obj in view_missing_objects}
+            
+            for src_schema, src_obj, tgt_schema, tgt_obj in view_missing_objects:
+                tgt_key = (tgt_schema, tgt_obj)
+                view_deps[tgt_key] = set()
+                
+                ddl = view_ddl_map.get((src_schema, src_obj), "")
+                if ddl:
+                    # Extract dependencies
+                    try:
+                        dependencies = extract_view_dependencies(ddl, src_schema)
+                        for dep in dependencies:
+                            dep_upper = dep.upper()
+                            # Check if this dependency is another VIEW in our list
+                            for (s_sch_d, s_obj_d), (t_sch_d, t_obj_d) in src_to_tgt.items():
+                                if f"{s_sch_d}.{s_obj_d}".upper() == dep_upper:
+                                    view_deps[tgt_key].add((t_sch_d, t_obj_d))
+                                    break
+                    except Exception as e:
+                        log.debug(f"[FIXUP] 提取 VIEW {src_schema}.{src_obj} 依赖失败: {e}")
+            
+            # Step 3: Topological sort using Kahn's algorithm
+            from collections import defaultdict, deque
+            in_degree = defaultdict(int)
+            dep_graph = defaultdict(set)  # dependency -> [dependents]
+            
+            for view_key, deps in view_deps.items():
+                if view_key not in in_degree:
+                    in_degree[view_key] = 0
+                for dep_key in deps:
+                    in_degree[view_key] += 1
+                    dep_graph[dep_key].add(view_key)
+            
+            queue = deque([v for v in view_deps.keys() if in_degree[v] == 0])
+            sorted_view_tuples = []
+            
+            while queue:
+                current = queue.popleft()
+                sorted_view_tuples.append(current)
+                for dependent in dep_graph.get(current, set()):
+                    in_degree[dependent] -= 1
+                    if in_degree[dependent] == 0:
+                        queue.append(dependent)
+            
+            # Check for cycles
+            if len(sorted_view_tuples) < len(view_deps):
+                circular = [v for v, d in in_degree.items() if d > 0]
+                log.warning(f"[FIXUP] 发现 {len(circular)} 个循环依赖的VIEW，将最后创建")
+                sorted_view_tuples.extend(circular)
+            
+            # Map back to original format
+            tgt_to_orig = {(t_sch, t_obj): (s_sch, s_obj, t_sch, t_obj)
+                          for s_sch, s_obj, t_sch, t_obj in view_missing_objects}
+            view_missing_objects = [tgt_to_orig[v] for v in sorted_view_tuples if v in tgt_to_orig]
+            
+            log.info("[FIXUP] VIEW拓扑排序完成：依赖对象将优先创建")
+            
+        except Exception as e:
+            log.warning(f"[FIXUP] VIEW拓扑排序失败: {e}, 使用原始顺序")
+        
+        log.info("[FIXUP] 正在生成 %d 个VIEW脚本...", len(view_missing_objects))
         for src_schema, src_obj, tgt_schema, tgt_obj in view_missing_objects:
             try:
                 fetch_result = fetch_ddl_with_timing(src_schema, 'VIEW', src_obj)
@@ -9821,7 +9935,12 @@ def generate_fixup_scripts(
                 if ot.upper() in ['PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'TYPE', 'TYPE BODY']:
                     ddl_adj = remap_plsql_object_references(ddl_adj, ot, full_object_mapping, source_schema=ss)
                 ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
-                ddl_adj = prepend_set_schema(ddl_adj, ts)
+                
+                # PUBLIC SYNONYM 不需要 ALTER SESSION SET CURRENT_SCHEMA = PUBLIC（多余）
+                # 但用户schema的SYNONYM需要ALTER SESSION来确保对象在正确的schema创建
+                if not (ot.upper() == 'SYNONYM' and ts.upper() == 'PUBLIC'):
+                    ddl_adj = prepend_set_schema(ddl_adj, ts)
+                
                 ddl_adj = normalize_ddl_for_ob(ddl_adj)
                 ddl_adj = apply_ddl_cleanup_rules(ddl_adj, ot)
                 ddl_adj = strip_constraint_enable(ddl_adj)

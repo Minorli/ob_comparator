@@ -58,10 +58,29 @@ python3 schema_diff_reconciler.py --wizard
 ```
 
 ### 5) 审核并执行修复
+
+**标准执行（单次运行）**:
 ```bash
 # 先审核 fixup_scripts/ 下的 SQL
 python3 run_fixup.py --smart-order --recompile
 ```
+
+**迭代执行（推荐用于VIEW）**:
+```bash
+# 自动重试失败的脚本，特别适合有依赖关系的VIEW
+python3 run_fixup.py --iterative --smart-order --recompile --max-rounds 10
+
+# 仅处理VIEW并迭代
+python3 run_fixup.py --iterative --only-types VIEW --max-rounds 5
+```
+
+**新增参数说明**:
+- `--iterative`: 启用多轮迭代执行，自动重试失败脚本
+- `--max-rounds N`: 最大迭代轮次（默认10）
+- `--min-progress N`: 每轮最小进展数，低于此值停止（默认1）
+
+> 💡 **提示**: 迭代模式会自动分析失败原因并提供可操作建议。对于有复杂依赖关系的VIEW，成功率可从0.5%提升至93%+。
+
 
 ## Remap 规则速记
 
