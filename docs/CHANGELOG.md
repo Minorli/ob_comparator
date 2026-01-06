@@ -7,6 +7,17 @@ All notable changes to OceanBase Comparator Toolkit will be documented in this f
 ### Added
 - 支持 trigger_list 过滤缺失触发器脚本，仅生成清单内的 TRIGGER，并输出 trigger_miss.txt 记录无效/不存在条目。
 
+## [0.9.5] - 2026-01-07
+
+### Added
+- Run summary section appended to the report with total/phase runtimes, executed vs skipped actions, key findings, attention items, and next-step suggestions.
+- End-of-run structured summary in runtime logs.
+- Project homepage and issue tracker links in report output and CLI help/startup logs.
+
+### Changed
+- Trigger list fallback now generates full trigger fixups when the list is missing, unreadable, or empty.
+- Log output formatting unified for clearer phase-based progress and summaries.
+
 ## [0.9.4] - 2026-01-07
 
 ### Changed

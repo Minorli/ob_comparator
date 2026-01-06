@@ -16,7 +16,7 @@
 
 """
 
-数据库对象对比工具 (V0.9.4 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
+数据库对象对比工具 (V0.9.5 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -33,7 +33,7 @@
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.9.4 核心)：
+3. 性能架构 (V0.9.5 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          DBA_OBJECTS
@@ -69,9 +69,12 @@ import sys
 import logging
 import math
 import re
+from contextlib import contextmanager
 
-__version__ = "0.9.4"
+__version__ = "0.9.5"
 __author__ = "Minor Li"
+REPO_URL = "https://github.com/Minorli/ob_comparator"
+REPO_ISSUES_URL = f"{REPO_URL}/issues"
 import os
 import threading
 import json
@@ -108,12 +111,135 @@ def strip_ansi_text(text: str) -> str:
     return ANSI_RE.sub("", text)
 
 # --- 日志配置 ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] - %(message)s',
-    stream=sys.stderr
-)
+LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+LOG_FILE_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
+LOG_SECTION_WIDTH = 80
+
+
+def _build_console_handler(level: int) -> logging.Handler:
+    try:
+        from rich.logging import RichHandler
+        handler = RichHandler(
+            level=level,
+            show_time=True,
+            omit_repeated_times=False,
+            show_level=True,
+            show_path=False,
+            rich_tracebacks=False,
+            log_time_format=LOG_TIME_FORMAT
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        return handler
+    except Exception:
+        handler = logging.StreamHandler()
+        handler.setLevel(level)
+        handler.setFormatter(logging.Formatter(LOG_FILE_FORMAT, datefmt=LOG_TIME_FORMAT))
+        return handler
+
+
+def init_console_logging(level: int = logging.INFO) -> None:
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    for handler in list(root_logger.handlers):
+        if isinstance(handler, logging.FileHandler):
+            continue
+        root_logger.removeHandler(handler)
+    root_logger.addHandler(_build_console_handler(level))
+
+
+def set_console_log_level(root_logger: logging.Logger, level: int) -> None:
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            continue
+        handler.setLevel(level)
+
+
+def log_section(title: str, fill_char: str = "=") -> None:
+    clean = f" {title.strip()} "
+    if len(clean) >= LOG_SECTION_WIDTH:
+        log.info("%s", title.strip())
+        return
+    log.info("%s", clean.center(LOG_SECTION_WIDTH, fill_char))
+
+
+def log_subsection(title: str, fill_char: str = "-") -> None:
+    clean = f" {title.strip()} "
+    if len(clean) >= LOG_SECTION_WIDTH:
+        log.info("%s", title.strip())
+        return
+    log.info("%s", clean.center(LOG_SECTION_WIDTH, fill_char))
+
+
+init_console_logging()
 log = logging.getLogger(__name__)
+
+RUN_PHASE_ORDER: Tuple[str, ...] = (
+    "加载配置与初始化",
+    "对象映射准备",
+    "OceanBase 元数据转储",
+    "Oracle 元数据转储",
+    "主对象校验",
+    "扩展对象校验",
+    "依赖/授权校验",
+    "修补脚本生成",
+    "报告输出",
+)
+
+
+class RunPhaseInfo(NamedTuple):
+    name: str
+    duration: Optional[float]
+    status: str
+
+
+class RunSummary(NamedTuple):
+    start_time: datetime
+    end_time: datetime
+    total_seconds: float
+    phases: List[RunPhaseInfo]
+    actions_done: List[str]
+    actions_skipped: List[str]
+    findings: List[str]
+    attention: List[str]
+    next_steps: List[str]
+
+
+class RunSummaryContext(NamedTuple):
+    start_time: datetime
+    start_perf: float
+    phase_durations: Dict[str, float]
+    phase_skip_reasons: Dict[str, str]
+    enabled_primary_types: Set[str]
+    enabled_extra_types: Set[str]
+    print_only_types: Set[str]
+    total_checked: int
+    enable_dependencies_check: bool
+    enable_comment_check: bool
+    enable_schema_mapping_infer: bool
+    fixup_enabled: bool
+    fixup_dir: str
+    dependency_chain_file: Optional[Path]
+    trigger_list_summary: Optional[Dict[str, object]]
+    report_start_perf: float
+
+
+@contextmanager
+def phase_timer(phase: str, durations: Dict[str, float]):
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        durations[phase] = durations.get(phase, 0.0) + (time.perf_counter() - start)
+
+
+def format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m{sec:.0f}s"
+    hours, rem = divmod(minutes, 60)
+    return f"{int(hours)}h{int(rem)}m{sec:.0f}s"
 
 
 def setup_run_logging(settings: Dict, timestamp: str) -> Optional[Path]:
@@ -129,22 +255,26 @@ def setup_run_logging(settings: Dict, timestamp: str) -> Optional[Path]:
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / f"run_{timestamp}.log"
 
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] - %(message)s'))
-
         root_logger = logging.getLogger()
         # 允许 DEBUG 记录进入文件，但控制台按 log_level 过滤
         root_logger.setLevel(logging.DEBUG)
-        root_logger.addHandler(file_handler)
+        existing_files = [
+            handler for handler in root_logger.handlers
+            if isinstance(handler, logging.FileHandler)
+            and getattr(handler, "baseFilename", "") == str(log_file)
+        ]
+        if not existing_files:
+            file_handler = logging.FileHandler(log_file, encoding="utf-8")
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(logging.Formatter(LOG_FILE_FORMAT, datefmt=LOG_TIME_FORMAT))
+            root_logger.addHandler(file_handler)
 
         level_name = (settings.get("log_level") or "INFO").strip().upper()
         console_level = getattr(logging, level_name, logging.INFO)
-        for handler in root_logger.handlers:
-            if isinstance(handler, logging.StreamHandler):
-                handler.setLevel(console_level)
+        set_console_log_level(root_logger, console_level)
 
         log.info("本次运行日志将输出到: %s", log_file.resolve())
+        log.info("日志级别: console=%s, file=DEBUG", logging.getLevelName(console_level))
         return log_file
     except Exception as exc:
         log.warning("初始化日志文件失败，将仅输出到控制台: %s", exc)
@@ -785,7 +915,7 @@ def validate_runtime_paths(settings: Dict, ob_cfg: ObConfig) -> None:
     trigger_list_path = settings.get('trigger_list', '').strip()
     if trigger_list_path and not Path(trigger_list_path).expanduser().exists():
         warnings.append(
-            f"trigger_list 文件不存在: {trigger_list_path}（将记录在报告中并跳过触发器脚本生成）。"
+            f"trigger_list 文件不存在: {trigger_list_path}（将记录在报告中并回退全量触发器生成）。"
         )
 
     # dbcat / JAVA_HOME 仅在生成 fixup 时提示
@@ -1237,11 +1367,17 @@ def build_trigger_list_report(
         "not_found": 0,
         "not_missing": 0,
         "check_disabled": False,
-        "error": read_error or ""
+        "error": read_error or "",
+        "fallback_full": False,
+        "fallback_reason": ""
     }
     rows: List[TriggerListReportRow] = []
 
     if read_error:
+        summary["fallback_full"] = True
+        summary["fallback_reason"] = "read_error"
+        _, _, total_missing = collect_missing_trigger_mappings(extra_results)
+        summary["missing_not_listed"] = total_missing
         rows.append(TriggerListReportRow(
             entry=str(trigger_list_path),
             status="ERROR",
@@ -1270,6 +1406,18 @@ def build_trigger_list_report(
                 status="CHECK_DISABLED",
                 detail="TRIGGER 未启用检查，无法判定缺失状态"
             ))
+        return rows, summary
+
+    if not entries:
+        summary["fallback_full"] = True
+        summary["fallback_reason"] = "empty_list"
+        _, _, total_missing = collect_missing_trigger_mappings(extra_results)
+        summary["missing_not_listed"] = total_missing
+        rows.append(TriggerListReportRow(
+            entry=str(trigger_list_path),
+            status="EMPTY",
+            detail="清单为空，已回退全量触发器"
+        ))
         return rows, summary
 
     src_to_tgt, missing_targets, total_missing = collect_missing_trigger_mappings(extra_results)
@@ -2786,11 +2934,10 @@ def build_schema_mapping(master_list: MasterCheckList) -> Dict[str, str]:
     
     # 提示：一对多场景下的推导策略
     if one_to_many_schemas:
-        log.info("=" * 80)
+        log_subsection("一对多 schema 映射场景")
         log.info("检测到一对多 schema 映射场景（源schema的表分散到多个目标schema）：")
         for src_schema, tgt_set in one_to_many_schemas:
             log.info("  %s -> %s", src_schema, sorted(tgt_set))
-        log.info("")
         log.info("推导策略：")
         log.info("  1. 独立对象（VIEW/PROCEDURE/FUNCTION/PACKAGE等）：")
         log.info("     - 优先通过依赖分析推导（分析对象引用的表，选择出现最多的目标schema）")
@@ -2799,8 +2946,7 @@ def build_schema_mapping(master_list: MasterCheckList) -> Dict[str, str]:
         log.info("     - 自动跟随父表的 schema，无需显式指定")
         log.info("  3. TRIGGER：")
         log.info("     - 默认保持源 schema，除非在 remap_rules.txt 中显式指定")
-        log.info("=" * 80)
-    
+
     return final_mapping
 
 
@@ -4459,7 +4605,7 @@ def check_primary_objects(
         log.info("主校验清单为空，没有需要校验的对象。")
         return results
 
-    log.info("--- 开始执行主对象批量验证 (TABLE/VIEW/PROC/FUNC/PACKAGE/PACKAGE BODY/SYNONYM) ---")
+    log_subsection("主对象校验 (TABLE/VIEW/PROC/FUNC/PACKAGE/PACKAGE BODY/SYNONYM)")
 
     allowed_types = enabled_primary_types or set(PRIMARY_OBJECT_TYPES)
     print_only_types_u = {t.upper() for t in (print_only_types or set())}
@@ -4469,7 +4615,8 @@ def check_primary_objects(
     for i, (src_name, tgt_name, obj_type) in enumerate(master_list):
 
         if (i + 1) % 100 == 0:
-            log.info(f"  主对象校验进度: {i+1} / {total} ...")
+            pct = (i + 1) * 100.0 / total if total else 100.0
+            log.info("主对象校验进度 %d/%d (%.1f%%)...", i + 1, total, pct)
 
         obj_type_u = obj_type.upper()
         try:
@@ -5111,7 +5258,7 @@ def check_extra_objects(
         log.info("已根据配置跳过扩展对象校验 (索引/约束/序列/触发器)。")
         return extra_results
 
-    log.info("--- 开始执行扩展对象校验 (索引/约束/序列/触发器) ---")
+    log_subsection("扩展对象校验 (索引/约束/序列/触发器)")
 
     # 1) 针对每个 TABLE 做索引/约束/触发器校验
     total_tables = sum(1 for _, _, t in master_list if t.upper() == 'TABLE')
@@ -5123,7 +5270,8 @@ def check_extra_objects(
 
         done_tables += 1
         if done_tables % 100 == 0:
-            log.info(f"  扩展校验 (索引/约束/触发器) 进度: {done_tables} / {total_tables} ...")
+            pct = done_tables * 100.0 / total_tables if total_tables else 100.0
+            log.info("扩展校验进度 %d/%d (%.1f%%)...", done_tables, total_tables, pct)
 
         try:
             src_schema, src_table = src_name.split('.')
@@ -8165,7 +8313,8 @@ def generate_fixup_scripts(
     if trigger_filter_enabled:
         log.info("[FIXUP] 已启用 trigger_list 过滤，清单条目数=%d。", len(trigger_filter_set))
         if not trigger_filter_set:
-            log.warning("[FIXUP] trigger_list 为空或读取失败，TRIGGER 脚本将全部跳过。")
+            log.warning("[FIXUP] trigger_list 为空，已回退全量 TRIGGER 生成。")
+            trigger_filter_enabled = False
     allowed_synonym_targets = {s.upper() for s in settings.get('source_schemas_list', [])}
 
     base_dir = Path(settings.get('fixup_dir', 'fixup_scripts')).expanduser()
@@ -8361,7 +8510,8 @@ def generate_fixup_scripts(
                 if should_log:
                     state["last"] = now
                     suffix = f" [{extra}]" if extra else ""
-                    log.info("%s 进度 %d/%d%s", label, state["done"], total, suffix)
+                    pct = state["done"] * 100.0 / total if total else 100.0
+                    log.info("%s 进度 %d/%d (%.1f%%)%s", label, state["done"], total, pct, suffix)
 
         return _tick
 
@@ -9779,6 +9929,14 @@ def export_trigger_miss_report(
     ]
     if summary.get("error"):
         lines.append(f"# ERROR: {summary.get('error')}")
+    if summary.get("fallback_full"):
+        reason = summary.get("fallback_reason") or "unknown"
+        note = "清单不可用，已回退全量触发器"
+        if reason == "empty_list":
+            note = "清单为空，已回退全量触发器"
+        elif reason == "read_error":
+            note = "清单读取失败，已回退全量触发器"
+        lines.append(f"# NOTE: {note}")
     if summary.get("check_disabled"):
         lines.append("# NOTE: TRIGGER 未启用检查，清单仅做格式校验。")
     lines.append("# 字段说明: ENTRY | STATUS | DETAIL")
@@ -9827,6 +9985,273 @@ def collect_blacklisted_missing_tables(
     }
 
 
+def build_run_summary(
+    ctx: RunSummaryContext,
+    tv_results: ReportResults,
+    extra_results: ExtraCheckResults,
+    comment_results: Dict[str, object],
+    dependency_report: DependencyReport,
+    required_grants: Dict[str, Set[Tuple[str, str]]],
+    remap_conflicts: List[Tuple[str, str, str]],
+    extraneous_rules: List[str],
+    blacklisted_missing_tables: Optional[BlacklistTableMap],
+    report_file: Optional[Path]
+) -> RunSummary:
+    end_time = datetime.now()
+    total_seconds = time.perf_counter() - ctx.start_perf
+
+    phases: List[RunPhaseInfo] = []
+    for phase in RUN_PHASE_ORDER:
+        if phase in ctx.phase_durations:
+            phases.append(RunPhaseInfo(phase, ctx.phase_durations[phase], "完成"))
+        else:
+            reason = ctx.phase_skip_reasons.get(phase, "跳过")
+            phases.append(RunPhaseInfo(phase, None, reason))
+
+    actions_done: List[str] = []
+    actions_skipped: List[str] = []
+
+    if ctx.total_checked > 0:
+        actions_done.append(
+            f"主对象校验: {', '.join(sorted(ctx.enabled_primary_types))} (校验对象 {ctx.total_checked})"
+        )
+    else:
+        actions_skipped.append("主对象校验: 主校验清单为空")
+
+    if ctx.print_only_types:
+        actions_done.append(f"仅打印不校验: {', '.join(sorted(ctx.print_only_types))}")
+
+    if ctx.enabled_extra_types:
+        actions_done.append(f"扩展对象校验: {', '.join(sorted(ctx.enabled_extra_types))}")
+    else:
+        actions_skipped.append("扩展对象校验: check_extra_types 为空")
+
+    comment_skip_reason = comment_results.get("skipped_reason")
+    if ctx.enable_comment_check:
+        if comment_skip_reason:
+            actions_skipped.append(f"注释一致性校验: 跳过 ({comment_skip_reason})")
+        else:
+            actions_done.append("注释一致性校验: 启用")
+    else:
+        actions_skipped.append("注释一致性校验: check_comments=false")
+
+    if ctx.enable_dependencies_check:
+        actions_done.append("依赖/授权校验: 启用")
+        if ctx.dependency_chain_file:
+            actions_done.append(f"依赖链路输出: {ctx.dependency_chain_file}")
+    else:
+        actions_skipped.append("依赖/授权校验: check_dependencies=false")
+
+    if ctx.enable_schema_mapping_infer:
+        actions_done.append("schema 推导: 启用")
+    else:
+        actions_skipped.append("schema 推导: infer_schema_mapping=false")
+
+    if ctx.fixup_enabled:
+        actions_done.append(f"修补脚本生成: 启用 (目录 {ctx.fixup_dir})")
+    else:
+        actions_skipped.append("修补脚本生成: generate_fixup=false")
+
+    trigger_summary = ctx.trigger_list_summary or {}
+    if trigger_summary.get("enabled"):
+        if trigger_summary.get("error"):
+            actions_done.append(f"触发器清单: 读取失败，已回退全量触发器 ({trigger_summary.get('error')})")
+        elif trigger_summary.get("check_disabled"):
+            actions_skipped.append("触发器清单: TRIGGER 未启用检查，仅校验清单格式")
+        elif trigger_summary.get("fallback_full"):
+            actions_done.append("触发器清单: 为空或无有效条目，已回退全量触发器")
+        else:
+            actions_done.append(
+                "触发器清单: 生效 (列表 {valid_entries}, 命中缺失 {selected_missing})".format(
+                    valid_entries=trigger_summary.get("valid_entries", 0),
+                    selected_missing=trigger_summary.get("selected_missing", 0)
+                )
+            )
+    else:
+        actions_skipped.append("触发器清单: 未配置")
+
+    if report_file:
+        actions_done.append(f"报告输出: {Path(report_file).resolve()}")
+
+    missing_count = len(tv_results.get("missing", []))
+    mismatched_count = len(tv_results.get("mismatched", []))
+    extra_target_cnt = len(tv_results.get("extra_targets", []))
+    skipped_count = len(tv_results.get("skipped", []))
+    remap_conflict_cnt = len(remap_conflicts)
+    extraneous_count = len(extraneous_rules)
+    blacklist_missing_cnt = len(blacklisted_missing_tables or {})
+    comment_mis_cnt = len(comment_results.get("mismatched", []))
+    idx_mis_cnt = len(extra_results.get("index_mismatched", []))
+    cons_mis_cnt = len(extra_results.get("constraint_mismatched", []))
+    seq_mis_cnt = len(extra_results.get("sequence_mismatched", []))
+    trg_mis_cnt = len(extra_results.get("trigger_mismatched", []))
+    dep_missing_cnt = len(dependency_report.get("missing", []))
+    dep_unexpected_cnt = len(dependency_report.get("unexpected", []))
+    dep_skipped_cnt = len(dependency_report.get("skipped", []))
+    grant_stmt_cnt = sum(len(entries) for entries in required_grants.values())
+
+    findings: List[str] = [
+        f"主对象: 缺失 {missing_count}, 不匹配 {mismatched_count}, 多余 {extra_target_cnt}, 仅打印 {skipped_count}"
+    ]
+    if extraneous_count:
+        findings.append(f"无效 remap 规则: {extraneous_count}")
+    if remap_conflict_cnt:
+        findings.append(f"无法推导对象: {remap_conflict_cnt}")
+    if blacklist_missing_cnt:
+        findings.append(f"黑名单缺失表: {blacklist_missing_cnt}")
+    if ctx.enable_comment_check and not comment_skip_reason:
+        findings.append(f"注释差异: {comment_mis_cnt}")
+    else:
+        findings.append(f"注释校验: 跳过 ({comment_skip_reason or '未启用'})")
+    if ctx.enabled_extra_types:
+        findings.append(
+            f"扩展对象差异: INDEX {idx_mis_cnt}, CONSTRAINT {cons_mis_cnt}, "
+            f"SEQUENCE {seq_mis_cnt}, TRIGGER {trg_mis_cnt}"
+        )
+    if ctx.enable_dependencies_check:
+        findings.append(f"依赖差异: 缺失 {dep_missing_cnt}, 额外 {dep_unexpected_cnt}, 跳过 {dep_skipped_cnt}")
+    if grant_stmt_cnt:
+        findings.append(f"授权建议: {grant_stmt_cnt}")
+
+    if trigger_summary.get("enabled"):
+        if trigger_summary.get("fallback_full"):
+            findings.append(
+                "触发器清单: 回退全量，缺失触发器 {missing_not_listed}".format(
+                    missing_not_listed=trigger_summary.get("missing_not_listed", 0)
+                )
+            )
+        elif not trigger_summary.get("error"):
+            findings.append(
+                "触发器清单: 列表 {valid_entries}, 命中缺失 {selected_missing}, 未列出缺失 {missing_not_listed}, "
+                "无效 {invalid_entries}, 未找到 {not_found}".format(
+                    valid_entries=trigger_summary.get("valid_entries", 0),
+                    selected_missing=trigger_summary.get("selected_missing", 0),
+                    missing_not_listed=trigger_summary.get("missing_not_listed", 0),
+                    invalid_entries=trigger_summary.get("invalid_entries", 0),
+                    not_found=trigger_summary.get("not_found", 0)
+                )
+            )
+
+    attention: List[str] = []
+    if missing_count or mismatched_count or extra_target_cnt:
+        attention.append("目标端结构与源端不一致，需要处理缺失/差异/多余对象。")
+    if remap_conflict_cnt:
+        attention.append("存在无法自动推导的对象，需要在 remap_rules.txt 显式配置。")
+    if extraneous_count:
+        attention.append("remap_rules.txt 存在无效条目，建议清理。")
+    if ctx.enable_comment_check and comment_skip_reason:
+        attention.append("注释一致性未完成校验，报告中的注释差异可能不完整。")
+    if not ctx.enable_dependencies_check:
+        attention.append("依赖/授权校验已关闭，依赖差异可能未暴露。")
+    if dep_missing_cnt or dep_unexpected_cnt:
+        attention.append("依赖关系存在缺失或额外，需要补齐或清理。")
+    if blacklist_missing_cnt:
+        attention.append("存在黑名单表，未生成 OMS 规则。")
+    if trigger_summary.get("error") or trigger_summary.get("invalid_entries"):
+        attention.append("触发器清单存在读取失败或无效条目。")
+
+    next_steps: List[str] = []
+    if remap_conflict_cnt:
+        next_steps.append("补充 remap_rules.txt，为无法推导对象显式配置映射。")
+    if missing_count or mismatched_count or idx_mis_cnt or cons_mis_cnt or seq_mis_cnt or trg_mis_cnt:
+        if ctx.fixup_enabled:
+            next_steps.append(f"审核并执行 {ctx.fixup_dir} 中的修补脚本。")
+        else:
+            next_steps.append("如需自动生成修补脚本，请设置 generate_fixup=true。")
+    if missing_count:
+        next_steps.append("将 main_reports/tables_views_miss 下的规则提供给 OMS 进行迁移。")
+    if blacklist_missing_cnt:
+        next_steps.append("查看 main_reports/blacklist_tables.txt，确认黑名单表处理方案。")
+    if trigger_summary.get("invalid_entries") or trigger_summary.get("not_found"):
+        next_steps.append("修正 trigger_list 清单内容后重新运行。")
+    if dep_missing_cnt or dep_unexpected_cnt:
+        next_steps.append("根据依赖差异报告补齐编译或授权。")
+    if comment_mis_cnt:
+        next_steps.append("确认注释差异是否需要修复。")
+
+    return RunSummary(
+        start_time=ctx.start_time,
+        end_time=end_time,
+        total_seconds=total_seconds,
+        phases=phases,
+        actions_done=actions_done,
+        actions_skipped=actions_skipped,
+        findings=findings,
+        attention=attention,
+        next_steps=next_steps
+    )
+
+
+def render_run_summary_panel(summary: RunSummary, width: int) -> Panel:
+    def render_section(title: str, items: List[str], empty_text: str = "无") -> str:
+        lines = [f"[bold]{title}[/bold]"]
+        if not items:
+            lines.append(f"- {empty_text}")
+        else:
+            lines.extend([f"- {item}" for item in items])
+        return "\n".join(lines)
+
+    phase_lines: List[str] = []
+    for phase in summary.phases:
+        if phase.duration is not None:
+            phase_lines.append(f"- {phase.name}: {format_duration(phase.duration)}")
+        else:
+            phase_lines.append(f"- {phase.name}: 跳过 ({phase.status})")
+
+    overview = "\n".join([
+        "[bold]运行概览[/bold]",
+        f"- 开始时间: {summary.start_time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- 结束时间: {summary.end_time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- 总耗时: {format_duration(summary.total_seconds)}"
+    ])
+    phases = "\n".join(["[bold]阶段耗时[/bold]"] + phase_lines)
+    actions = render_section("本次执行", summary.actions_done, empty_text="无已执行动作")
+    skipped = render_section("本次未执行", summary.actions_skipped, empty_text="无")
+    findings = render_section("关键发现", summary.findings, empty_text="无")
+    attention = render_section("需要注意", summary.attention, empty_text="无")
+    next_steps = render_section("下一步建议", summary.next_steps, empty_text="无")
+
+    text = "\n\n".join([overview, phases, actions, skipped, findings, attention, next_steps])
+    return Panel.fit(text, title="[info]运行总结", border_style="info", width=width)
+
+
+def log_run_summary(summary: RunSummary) -> None:
+    log_section("运行总结")
+    log.info("开始时间: %s", summary.start_time.strftime("%Y-%m-%d %H:%M:%S"))
+    log.info("结束时间: %s", summary.end_time.strftime("%Y-%m-%d %H:%M:%S"))
+    log.info("总耗时: %s", format_duration(summary.total_seconds))
+
+    log_subsection("阶段耗时")
+    for phase in summary.phases:
+        if phase.duration is not None:
+            log.info("%s: %s", phase.name, format_duration(phase.duration))
+        else:
+            log.info("%s: 跳过 (%s)", phase.name, phase.status)
+
+    log_subsection("本次执行")
+    for item in summary.actions_done:
+        log.info("完成: %s", item)
+    for item in summary.actions_skipped:
+        log.info("跳过: %s", item)
+
+    log_subsection("关键发现")
+    for item in summary.findings:
+        log.info("%s", item)
+
+    log_subsection("需要注意")
+    if summary.attention:
+        for item in summary.attention:
+            log.info("%s", item)
+    else:
+        log.info("无")
+
+    log_subsection("下一步建议")
+    if summary.next_steps:
+        for item in summary.next_steps:
+            log.info("%s", item)
+    else:
+        log.info("无")
+
 def print_final_report(
     tv_results: ReportResults,
     total_checked: int,
@@ -9842,7 +10267,8 @@ def print_final_report(
     blacklisted_missing_tables: Optional[BlacklistTableMap] = None,
     blacklist_report_rows: Optional[List[BlacklistReportRow]] = None,
     trigger_list_summary: Optional[Dict[str, object]] = None,
-    trigger_list_rows: Optional[List[TriggerListReportRow]] = None
+    trigger_list_rows: Optional[List[TriggerListReportRow]] = None,
+    run_summary_ctx: Optional[RunSummaryContext] = None
 ):
     custom_theme = Theme({
         "ok": "green",
@@ -9917,6 +10343,8 @@ def print_final_report(
     source_missing_schema_cnt = len(schema_summary.get("source_missing", []))
 
     console.print(Panel.fit(f"[bold]数据库对象迁移校验报告 (V{__version__} - Rich)[/bold]", style="title"))
+    console.print(f"[info]项目主页: {REPO_URL} | 问题反馈: {REPO_ISSUES_URL}[/info]")
+    console.print("")
 
     section_width = 140
     count_table_kwargs: Dict[str, object] = {"width": section_width, "expand": False}
@@ -10038,11 +10466,13 @@ def print_final_report(
         filter_text = Text()
         if trigger_list_summary.get("error"):
             filter_text.append(
-                f"trigger_list 读取失败: {trigger_list_summary.get('error')}",
+                f"trigger_list 读取失败: {trigger_list_summary.get('error')} (已回退全量触发器)",
                 style="mismatch"
             )
         elif trigger_list_summary.get("check_disabled"):
             filter_text.append("TRIGGER 未启用检查，清单仅做格式校验。", style="mismatch")
+        elif trigger_list_summary.get("fallback_full"):
+            filter_text.append("清单为空或无有效条目，已回退全量触发器。", style="info")
         else:
             filter_text.append("列表: ", style="info")
             filter_text.append(str(trigger_list_summary.get("valid_entries", 0)))
@@ -10097,7 +10527,8 @@ def print_final_report(
         for item in extra_results.get("trigger_mismatched", []):
             addition_counts["TRIGGER"] += len(item.missing_triggers)
         if trigger_list_summary and trigger_list_summary.get("enabled"):
-            addition_counts["TRIGGER"] = int(trigger_list_summary.get("selected_missing", 0) or 0)
+            if not trigger_list_summary.get("fallback_full") and not trigger_list_summary.get("error"):
+                addition_counts["TRIGGER"] = int(trigger_list_summary.get("selected_missing", 0) or 0)
 
         def format_block(title: str, data: OrderedDict) -> str:
             lines = [f"[bold]{title}[/bold]"]
@@ -10449,6 +10880,23 @@ def print_final_report(
         border_style="info"
     )
     console.print(fixup_panel)
+    run_summary: Optional[RunSummary] = None
+    if run_summary_ctx:
+        run_summary_ctx.phase_durations["报告输出"] = time.perf_counter() - run_summary_ctx.report_start_perf
+        run_summary = build_run_summary(
+            run_summary_ctx,
+            tv_results,
+            extra_results,
+            comment_results,
+            dependency_report,
+            required_grants,
+            remap_conflicts,
+            tv_results.get("extraneous", []),
+            blacklisted_missing_tables,
+            report_file
+        )
+        console.print(render_run_summary_panel(run_summary, section_width))
+
     console.print(Panel.fit("[bold]报告结束[/bold]", style="title"))
 
     if report_file:
@@ -10482,6 +10930,8 @@ def print_final_report(
                 log.info("触发器清单筛选报告已输出到: %s", trigger_miss_path)
         except OSError as exc:
             console.print(f"[missing]报告写入失败: {exc}")
+
+    return run_summary
 
 
 # ====================== 主函数 ======================
@@ -10523,8 +10973,11 @@ def parse_cli_args() -> argparse.Namespace:
           main_reports/blacklist_tables.txt 黑名单表清单 (含 LONG 转换校验状态)
           main_reports/trigger_miss.txt  触发器清单筛选报告 (仅配置 trigger_list 时生成)
           fixup_scripts/                按类型分类的订正 SQL
+        项目信息:
+          主页: {repo_url}
+          反馈: {issues_url}
         """
-    )
+    ).format(repo_url=REPO_URL, issues_url=REPO_ISSUES_URL)
     parser = argparse.ArgumentParser(
         description=desc,
         epilog=epilog,
@@ -10549,180 +11002,198 @@ def main():
     args = parse_cli_args()
     config_file = args.config
     config_path = Path(config_file).resolve()
+    run_start_time = datetime.now()
+    run_start_perf = time.perf_counter()
+    phase_durations: Dict[str, float] = OrderedDict()
+    phase_skip_reasons: Dict[str, str] = {}
 
     if args.wizard:
         run_config_wizard(config_path)
 
-    # 1) 加载配置
-    ora_cfg, ob_cfg, settings = load_config(str(config_path))
-    # 为本次运行初始化日志文件（尽量早，以便记录后续步骤）
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    setup_run_logging(settings, timestamp)
-    validate_runtime_paths(settings, ob_cfg)
+    # 1) 加载配置 + 初始化
+    with phase_timer("加载配置与初始化", phase_durations):
+        ora_cfg, ob_cfg, settings = load_config(str(config_path))
+        # 为本次运行初始化日志文件（尽量早，以便记录后续步骤）
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        setup_run_logging(settings, timestamp)
+        log_section("启动与配置")
+        log.info("配置文件: %s", config_path)
+        validate_runtime_paths(settings, ob_cfg)
 
-    log.info("OceanBase Comparator Toolkit v%s", __version__)
-    enabled_primary_types: Set[str] = set(settings.get('enabled_primary_types') or set(PRIMARY_OBJECT_TYPES))
-    enabled_extra_types: Set[str] = set(settings.get('enabled_extra_types') or set(EXTRA_OBJECT_CHECK_TYPES))
-    print_only_primary_types = set(PRINT_ONLY_PRIMARY_TYPES)
-    print_only_types = enabled_primary_types & print_only_primary_types
-    checked_primary_types = enabled_primary_types - print_only_types
-    enabled_object_types = enabled_primary_types | enabled_extra_types
-    enable_dependencies_check: bool = bool(settings.get('enable_dependencies_check', True))
-    enable_comment_check: bool = bool(settings.get('enable_comment_check', True))
+        log.info("OceanBase Comparator Toolkit v%s", __version__)
+        log.info("项目主页: %s (问题反馈: %s)", REPO_URL, REPO_ISSUES_URL)
+        enabled_primary_types: Set[str] = set(settings.get('enabled_primary_types') or set(PRIMARY_OBJECT_TYPES))
+        enabled_extra_types: Set[str] = set(settings.get('enabled_extra_types') or set(EXTRA_OBJECT_CHECK_TYPES))
+        print_only_primary_types = set(PRINT_ONLY_PRIMARY_TYPES)
+        print_only_types = enabled_primary_types & print_only_primary_types
+        checked_primary_types = enabled_primary_types - print_only_types
+        enabled_object_types = enabled_primary_types | enabled_extra_types
+        enable_dependencies_check: bool = bool(settings.get('enable_dependencies_check', True))
+        enable_comment_check: bool = bool(settings.get('enable_comment_check', True))
 
-    log.info(
-        "本次启用的主对象类型: %s",
-        ", ".join(sorted(enabled_primary_types))
-    )
-    if print_only_types:
         log.info(
-            "以下主对象类型仅打印不校验: %s",
-            ", ".join(sorted(print_only_types))
+            "本次启用的主对象类型: %s",
+            ", ".join(sorted(enabled_primary_types))
         )
-    log.info(
-        "本次启用的扩展校验: %s",
-        ", ".join(sorted(enabled_extra_types)) if enabled_extra_types else "<无>"
-    )
+        if print_only_types:
+            log.info(
+                "以下主对象类型仅打印不校验: %s",
+                ", ".join(sorted(print_only_types))
+            )
+        log.info(
+            "本次启用的扩展校验: %s",
+            ", ".join(sorted(enabled_extra_types)) if enabled_extra_types else "<无>"
+        )
+        if not enable_dependencies_check:
+            log.info("已根据配置跳过依赖关系校验与 GRANT 计算。")
+        if not enable_comment_check:
+            log.info("已根据配置关闭注释一致性校验。")
+
+        # 初始化 Oracle Instant Client (Thick Mode)
+        init_oracle_client_from_settings(settings)
+
+        oracle_env_info = collect_oracle_env_info(ora_cfg)
+        ob_env_info = collect_ob_env_info(ob_cfg)
+        endpoint_info = {
+            "oracle": oracle_env_info,
+            "oceanbase": ob_env_info
+        }
+
+    generate_fixup_enabled = settings.get('generate_fixup', 'true').strip().lower() in ('true', '1', 'yes')
+    if not enabled_extra_types:
+        phase_skip_reasons["扩展对象校验"] = "check_extra_types 为空"
     if not enable_dependencies_check:
-        log.info("已根据配置跳过依赖关系校验与 GRANT 计算。")
-    if not enable_comment_check:
-        log.info("已根据配置关闭注释一致性校验。")
+        phase_skip_reasons["依赖/授权校验"] = "check_dependencies=false"
+    if not generate_fixup_enabled:
+        phase_skip_reasons["修补脚本生成"] = "generate_fixup=false"
 
-    # 初始化 Oracle Instant Client (Thick Mode)
-    init_oracle_client_from_settings(settings)
+    log_section("对象映射准备")
+    with phase_timer("对象映射准备", phase_durations):
+        # 2) 加载 Remap 规则
+        remap_rules = load_remap_rules(settings['remap_file'])
 
-    oracle_env_info = collect_oracle_env_info(ora_cfg)
-    ob_env_info = collect_ob_env_info(ob_cfg)
-    endpoint_info = {
-        "oracle": oracle_env_info,
-        "oceanbase": ob_env_info
-    }
+        # 3) 加载源端主对象 (TABLE/VIEW/PROC/FUNC/PACKAGE/PACKAGE BODY/SYNONYM)
+        source_objects = get_source_objects(
+            ora_cfg,
+            settings['source_schemas_list']
+        )
 
-    # 2) 加载 Remap 规则
-    remap_rules = load_remap_rules(settings['remap_file'])
-
-    # 3) 加载源端主对象 (TABLE/VIEW/PROC/FUNC/PACKAGE/PACKAGE BODY/SYNONYM)
-    source_objects = get_source_objects(
-        ora_cfg,
-        settings['source_schemas_list']
-    )
-
-    # 4) 验证 Remap 规则
-    extraneous_rules = validate_remap_rules(remap_rules, source_objects, settings.get("remap_file"))
-    schema_mapping_from_tables: Optional[Dict[str, str]] = None
-    
-    # 4.1) 获取依附对象（如 TRIGGER）的父表映射，用于 one-to-many schema 拆分场景
-    object_parent_map = get_object_parent_tables(
-        ora_cfg,
-        settings['source_schemas_list'],
-        enabled_object_types=enabled_object_types
-    )
-    
-    # 4.2) 加载源端依赖关系（用于智能推导一对多场景的目标schema）
-    oracle_dependencies: List[DependencyRecord] = []
-    source_dependencies_set: Optional[SourceDependencySet] = None
-    # 依赖既用于缺失依赖校验，也用于 one-to-many remap 推导；即便关闭 check_dependencies 也可能需要推导
-    infer_candidate_types = enabled_object_types - NO_INFER_SCHEMA_TYPES - {'TABLE', 'INDEX', 'CONSTRAINT'}
-    need_dependency_infer = enable_dependencies_check or (
-        bool(settings.get("enable_schema_mapping_infer", True)) and bool(infer_candidate_types)
-    )
-    if need_dependency_infer:
-        oracle_dependencies = load_oracle_dependencies(
+        # 4) 验证 Remap 规则
+        extraneous_rules = validate_remap_rules(remap_rules, source_objects, settings.get("remap_file"))
+        schema_mapping_from_tables: Optional[Dict[str, str]] = None
+        
+        # 4.1) 获取依附对象（如 TRIGGER）的父表映射，用于 one-to-many schema 拆分场景
+        object_parent_map = get_object_parent_tables(
             ora_cfg,
             settings['source_schemas_list'],
-            object_types=enabled_object_types
+            enabled_object_types=enabled_object_types
         )
-        # 转换为简化格式：(dep_owner, dep_name, dep_type, ref_owner, ref_name, ref_type)
-        source_dependencies_set = {
-            (dep.owner.upper(), dep.name.upper(), dep.object_type.upper(),
-             dep.referenced_owner.upper(), dep.referenced_name.upper(), dep.referenced_type.upper())
-            for dep in oracle_dependencies
-        }
-    dependency_graph: DependencyGraph = build_dependency_graph(source_dependencies_set) if source_dependencies_set else {}
-    # 4.2.b) 预计算递归依赖表集合（性能优化：避免每对象 DFS）
-    transitive_table_cache: Optional[TransitiveTableCache] = None
-    if settings.get("enable_schema_mapping_infer") and dependency_graph:
-        log.info("正在预计算依赖图的递归 TABLE/MVIEW 引用缓存以加速 remap 推导...")
-        transitive_table_cache = precompute_transitive_table_cache(
-            dependency_graph,
-            object_parent_map=object_parent_map
+        
+        # 4.2) 加载源端依赖关系（用于智能推导一对多场景的目标schema）
+        oracle_dependencies: List[DependencyRecord] = []
+        source_dependencies_set: Optional[SourceDependencySet] = None
+        # 依赖既用于缺失依赖校验，也用于 one-to-many remap 推导；即便关闭 check_dependencies 也可能需要推导
+        infer_candidate_types = enabled_object_types - NO_INFER_SCHEMA_TYPES - {'TABLE', 'INDEX', 'CONSTRAINT'}
+        need_dependency_infer = enable_dependencies_check or (
+            bool(settings.get("enable_schema_mapping_infer", True)) and bool(infer_candidate_types)
         )
-        log.info("递归依赖表缓存完成，共 %d 个节点。", len(transitive_table_cache))
-    # 4.3) 缓存同义词元数据，供 PUBLIC 等大规模同义词快速生成 DDL
-    synonym_meta = load_synonym_metadata(
-        ora_cfg,
-        settings['source_schemas_list'],
-        allowed_target_schemas=settings['source_schemas_list']
-    )
+        if need_dependency_infer:
+            oracle_dependencies = load_oracle_dependencies(
+                ora_cfg,
+                settings['source_schemas_list'],
+                object_types=enabled_object_types
+            )
+            # 转换为简化格式：(dep_owner, dep_name, dep_type, ref_owner, ref_name, ref_type)
+            source_dependencies_set = {
+                (dep.owner.upper(), dep.name.upper(), dep.object_type.upper(),
+                 dep.referenced_owner.upper(), dep.referenced_name.upper(), dep.referenced_type.upper())
+                for dep in oracle_dependencies
+            }
+        dependency_graph: DependencyGraph = build_dependency_graph(source_dependencies_set) if source_dependencies_set else {}
+        # 4.2.b) 预计算递归依赖表集合（性能优化：避免每对象 DFS）
+        transitive_table_cache: Optional[TransitiveTableCache] = None
+        if settings.get("enable_schema_mapping_infer") and dependency_graph:
+            log.info("正在预计算依赖图的递归 TABLE/MVIEW 引用缓存以加速 remap 推导...")
+            transitive_table_cache = precompute_transitive_table_cache(
+                dependency_graph,
+                object_parent_map=object_parent_map
+            )
+            log.info("递归依赖表缓存完成，共 %d 个节点。", len(transitive_table_cache))
+        # 4.3) 缓存同义词元数据，供 PUBLIC 等大规模同义词快速生成 DDL
+        synonym_meta = load_synonym_metadata(
+            ora_cfg,
+            settings['source_schemas_list'],
+            allowed_target_schemas=settings['source_schemas_list']
+        )
 
-    # 5) 先不推导 schema，生成基础映射/清单，用于推导 TABLE 唯一映射
-    remap_conflicts: RemapConflictMap = {}
-    base_full_mapping = build_full_object_mapping(
-        source_objects,
-        remap_rules,
-        schema_mapping=None,
-        object_parent_map=object_parent_map,
-        transitive_table_cache=transitive_table_cache,
-        source_dependencies=source_dependencies_set,
-        dependency_graph=dependency_graph,
-        enabled_types=enabled_object_types,
-        remap_conflicts=remap_conflicts
-    )
-    base_master_list = generate_master_list(
-        source_objects,
-        remap_rules,
-        enabled_primary_types=enabled_primary_types,
-        schema_mapping=None,
-        precomputed_mapping=base_full_mapping,
-        object_parent_map=object_parent_map,
-        transitive_table_cache=transitive_table_cache,
-        source_dependencies=source_dependencies_set,
-        dependency_graph=dependency_graph,
-        remap_conflicts=remap_conflicts
-    )
-    if settings.get("enable_schema_mapping_infer"):
-        schema_mapping_from_tables = build_schema_mapping(base_master_list)
-
-    # 6) 基于 TABLE 推导的 schema 映射（仅作用于非 TABLE 对象）+ 依赖分析，重建映射与校验清单
-    full_object_mapping = build_full_object_mapping(
-        source_objects,
-        remap_rules,
-        schema_mapping=schema_mapping_from_tables,
-        object_parent_map=object_parent_map,
-        transitive_table_cache=transitive_table_cache,
-        source_dependencies=source_dependencies_set,
-        dependency_graph=dependency_graph,
-        enabled_types=enabled_object_types,
-        remap_conflicts=remap_conflicts
-    )
-    master_list = generate_master_list(
-        source_objects,
-        remap_rules,
-        enabled_primary_types=enabled_primary_types,
-        schema_mapping=schema_mapping_from_tables,
-        precomputed_mapping=full_object_mapping,
-        object_parent_map=object_parent_map,
-        transitive_table_cache=transitive_table_cache,
-        source_dependencies=source_dependencies_set,
-        dependency_graph=dependency_graph,
-        remap_conflicts=remap_conflicts
-    )
-    expected_dependency_pairs: Set[Tuple[str, str, str, str]] = set()
-    skipped_dependency_pairs: List[DependencyIssue] = []
-    if enable_dependencies_check:
-        expected_dependency_pairs, skipped_dependency_pairs = build_expected_dependency_pairs(
-            oracle_dependencies,
-            full_object_mapping
+        # 5) 先不推导 schema，生成基础映射/清单，用于推导 TABLE 唯一映射
+        remap_conflicts: RemapConflictMap = {}
+        base_full_mapping = build_full_object_mapping(
+            source_objects,
+            remap_rules,
+            schema_mapping=None,
+            object_parent_map=object_parent_map,
+            transitive_table_cache=transitive_table_cache,
+            source_dependencies=source_dependencies_set,
+            dependency_graph=dependency_graph,
+            enabled_types=enabled_object_types,
+            remap_conflicts=remap_conflicts
         )
-    target_schemas: Set[str] = set()
-    for type_map in full_object_mapping.values():
-        for tgt_name in type_map.values():
-            try:
-                schema, _ = tgt_name.split('.', 1)
-                target_schemas.add(schema.upper())
-            except ValueError:
-                continue
-    target_table_pairs = collect_table_pairs(master_list, use_target=True)
+        base_master_list = generate_master_list(
+            source_objects,
+            remap_rules,
+            enabled_primary_types=enabled_primary_types,
+            schema_mapping=None,
+            precomputed_mapping=base_full_mapping,
+            object_parent_map=object_parent_map,
+            transitive_table_cache=transitive_table_cache,
+            source_dependencies=source_dependencies_set,
+            dependency_graph=dependency_graph,
+            remap_conflicts=remap_conflicts
+        )
+        if settings.get("enable_schema_mapping_infer"):
+            schema_mapping_from_tables = build_schema_mapping(base_master_list)
+
+        # 6) 基于 TABLE 推导的 schema 映射（仅作用于非 TABLE 对象）+ 依赖分析，重建映射与校验清单
+        full_object_mapping = build_full_object_mapping(
+            source_objects,
+            remap_rules,
+            schema_mapping=schema_mapping_from_tables,
+            object_parent_map=object_parent_map,
+            transitive_table_cache=transitive_table_cache,
+            source_dependencies=source_dependencies_set,
+            dependency_graph=dependency_graph,
+            enabled_types=enabled_object_types,
+            remap_conflicts=remap_conflicts
+        )
+        master_list = generate_master_list(
+            source_objects,
+            remap_rules,
+            enabled_primary_types=enabled_primary_types,
+            schema_mapping=schema_mapping_from_tables,
+            precomputed_mapping=full_object_mapping,
+            object_parent_map=object_parent_map,
+            transitive_table_cache=transitive_table_cache,
+            source_dependencies=source_dependencies_set,
+            dependency_graph=dependency_graph,
+            remap_conflicts=remap_conflicts
+        )
+        expected_dependency_pairs: Set[Tuple[str, str, str, str]] = set()
+        skipped_dependency_pairs: List[DependencyIssue] = []
+        if enable_dependencies_check:
+            expected_dependency_pairs, skipped_dependency_pairs = build_expected_dependency_pairs(
+                oracle_dependencies,
+                full_object_mapping
+            )
+        target_schemas: Set[str] = set()
+        for type_map in full_object_mapping.values():
+            for tgt_name in type_map.values():
+                try:
+                    schema, _ = tgt_name.split('.', 1)
+                    target_schemas.add(schema.upper())
+                except ValueError:
+                    continue
+        target_table_pairs = collect_table_pairs(master_list, use_target=True)
 
     report_dir_setting = settings.get('report_dir', 'main_reports').strip() or 'main_reports'
     report_dir = Path(report_dir_setting)
@@ -10758,6 +11229,16 @@ def main():
     schema_summary: Optional[Dict[str, List[str]]] = None
 
     if not master_list:
+        for phase in (
+            "OceanBase 元数据转储",
+            "Oracle 元数据转储",
+            "主对象校验",
+            "扩展对象校验",
+            "依赖/授权校验",
+            "修补脚本生成"
+        ):
+            phase_skip_reasons[phase] = "主校验清单为空"
+
         log.info("主校验清单为空，程序结束。")
         tv_results: ReportResults = {
             "missing": [],
@@ -10783,7 +11264,40 @@ def main():
             "mismatched": [],
             "skipped_reason": "主校验清单为空，未执行注释比对。"
         }
-        print_final_report(
+        report_start_perf = time.perf_counter()
+        trigger_summary_stub = None
+        trigger_list_path = settings.get("trigger_list", "").strip()
+        if trigger_list_path:
+            trigger_summary_stub = {
+                "enabled": True,
+                "path": trigger_list_path,
+                "valid_entries": 0,
+                "selected_missing": 0,
+                "missing_not_listed": 0,
+                "invalid_entries": 0,
+                "not_found": 0,
+                "check_disabled": True,
+                "error": ""
+            }
+        run_summary_ctx = RunSummaryContext(
+            start_time=run_start_time,
+            start_perf=run_start_perf,
+            phase_durations=phase_durations,
+            phase_skip_reasons=phase_skip_reasons,
+            enabled_primary_types=enabled_primary_types,
+            enabled_extra_types=enabled_extra_types,
+            print_only_types=print_only_types,
+            total_checked=0,
+            enable_dependencies_check=enable_dependencies_check,
+            enable_comment_check=enable_comment_check,
+            enable_schema_mapping_infer=settings.get("enable_schema_mapping_infer", True),
+            fixup_enabled=generate_fixup_enabled,
+            fixup_dir=settings.get('fixup_dir', 'fixup_scripts') or 'fixup_scripts',
+            dependency_chain_file=None,
+            trigger_list_summary=trigger_summary_stub,
+            report_start_perf=report_start_perf
+        )
+        run_summary = print_final_report(
             tv_results,
             0,
             extra_results,
@@ -10798,97 +11312,118 @@ def main():
             blacklisted_missing_tables={},
             blacklist_report_rows=[],
             trigger_list_summary=None,
-            trigger_list_rows=None
+            trigger_list_rows=None,
+            run_summary_ctx=run_summary_ctx
         )
+        if run_summary:
+            log_run_summary(run_summary)
         return
 
-    # 6) 计算目标端 schema 集合并一次性 dump OB 元数据
-    tracked_types = set(checked_primary_types) | (set(enabled_extra_types) & set(ALL_TRACKED_OBJECT_TYPES))
-    if not tracked_types:
-        tracked_types = {'TABLE'}
+    log_section("元数据转储")
+    with phase_timer("OceanBase 元数据转储", phase_durations):
+        log_subsection("OceanBase 元数据")
+        # 6) 计算目标端 schema 集合并一次性 dump OB 元数据
+        tracked_types = set(checked_primary_types) | (set(enabled_extra_types) & set(ALL_TRACKED_OBJECT_TYPES))
+        if not tracked_types:
+            tracked_types = {'TABLE'}
 
-    ob_meta = dump_ob_metadata(
-        ob_cfg,
-        target_schemas,
-        tracked_object_types=tracked_types,
-        include_tab_columns='TABLE' in enabled_primary_types,
-        include_indexes='INDEX' in enabled_extra_types,
-        include_constraints='CONSTRAINT' in enabled_extra_types,
-        include_triggers='TRIGGER' in enabled_extra_types,
-        include_sequences='SEQUENCE' in enabled_extra_types,
-        include_comments=enable_comment_check,
-        target_table_pairs=target_table_pairs if enable_comment_check else set()
-    )
-    ob_dependencies: Set[Tuple[str, str, str, str]] = set()
-    if enable_dependencies_check:
-        ob_dependencies = load_ob_dependencies(
+        ob_meta = dump_ob_metadata(
             ob_cfg,
             target_schemas,
-            object_types=enabled_object_types
+            tracked_object_types=tracked_types,
+            include_tab_columns='TABLE' in enabled_primary_types,
+            include_indexes='INDEX' in enabled_extra_types,
+            include_constraints='CONSTRAINT' in enabled_extra_types,
+            include_triggers='TRIGGER' in enabled_extra_types,
+            include_sequences='SEQUENCE' in enabled_extra_types,
+            include_comments=enable_comment_check,
+            target_table_pairs=target_table_pairs if enable_comment_check else set()
+        )
+        ob_dependencies: Set[Tuple[str, str, str, str]] = set()
+        if enable_dependencies_check:
+            ob_dependencies = load_ob_dependencies(
+                ob_cfg,
+                target_schemas,
+                object_types=enabled_object_types
+            )
+
+        schema_summary = compute_schema_coverage(
+            settings['source_schemas_list'],
+            source_objects,
+            target_schemas,
+            ob_meta
         )
 
-    schema_summary = compute_schema_coverage(
-        settings['source_schemas_list'],
-        source_objects,
-        target_schemas,
-        ob_meta
-    )
-
     # 7) 主对象校验
-    oracle_meta = dump_oracle_metadata(
-        ora_cfg,
-        master_list,
-        settings,
-        include_indexes='INDEX' in enabled_extra_types,
-        include_constraints='CONSTRAINT' in enabled_extra_types,
-        include_triggers='TRIGGER' in enabled_extra_types,
-        include_sequences='SEQUENCE' in enabled_extra_types,
-        include_comments=enable_comment_check
-    )
+    with phase_timer("Oracle 元数据转储", phase_durations):
+        log_subsection("Oracle 元数据")
+        oracle_meta = dump_oracle_metadata(
+            ora_cfg,
+            master_list,
+            settings,
+            include_indexes='INDEX' in enabled_extra_types,
+            include_constraints='CONSTRAINT' in enabled_extra_types,
+            include_triggers='TRIGGER' in enabled_extra_types,
+            include_sequences='SEQUENCE' in enabled_extra_types,
+            include_comments=enable_comment_check
+        )
 
-    table_target_map = build_table_target_map(master_list)
-    blacklist_report_rows = build_blacklist_report_rows(
-        oracle_meta.blacklist_tables,
-        table_target_map,
-        oracle_meta,
-        ob_meta
-    )
+        table_target_map = build_table_target_map(master_list)
+        blacklist_report_rows = build_blacklist_report_rows(
+            oracle_meta.blacklist_tables,
+            table_target_map,
+            oracle_meta,
+            ob_meta
+        )
 
+    log_section("差异校验")
     monitored_types: Tuple[str, ...] = tuple(
         t for t in OBJECT_COUNT_TYPES
         if (t.upper() in checked_primary_types) or (t.upper() in enabled_extra_types)
     ) or ('TABLE',)
 
-    object_counts_summary = compute_object_counts(full_object_mapping, ob_meta, oracle_meta, monitored_types)
-    tv_results = check_primary_objects(
-        master_list,
-        extraneous_rules,
-        ob_meta,
-        oracle_meta,
-        enabled_primary_types,
-        print_only_types
-    )
-    tv_results["remap_conflicts"] = remap_conflict_items
-    blacklisted_missing_tables = collect_blacklisted_missing_tables(
-        tv_results,
-        oracle_meta.blacklist_tables
-    )
-    comment_results = check_comments(
-        master_list,
-        oracle_meta,
-        ob_meta,
-        enable_comment_check
-    )
+    with phase_timer("主对象校验", phase_durations):
+        object_counts_summary = compute_object_counts(full_object_mapping, ob_meta, oracle_meta, monitored_types)
+        tv_results = check_primary_objects(
+            master_list,
+            extraneous_rules,
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types,
+            print_only_types
+        )
+        tv_results["remap_conflicts"] = remap_conflict_items
+        blacklisted_missing_tables = collect_blacklisted_missing_tables(
+            tv_results,
+            oracle_meta.blacklist_tables
+        )
+        comment_results = check_comments(
+            master_list,
+            oracle_meta,
+            ob_meta,
+            enable_comment_check
+        )
 
     # 8) 扩展对象校验 (索引/约束/序列/触发器)
-    extra_results = check_extra_objects(
-        settings,
-        master_list,
-        ob_meta,
-        oracle_meta,
-        full_object_mapping,
-        enabled_extra_types
-    )
+    if enabled_extra_types:
+        with phase_timer("扩展对象校验", phase_durations):
+            extra_results = check_extra_objects(
+                settings,
+                master_list,
+                ob_meta,
+                oracle_meta,
+                full_object_mapping,
+                enabled_extra_types
+            )
+    else:
+        extra_results = check_extra_objects(
+            settings,
+            master_list,
+            ob_meta,
+            oracle_meta,
+            full_object_mapping,
+            enabled_extra_types
+        )
 
     trigger_list_summary: Optional[Dict[str, object]] = None
     trigger_list_rows: Optional[List[TriggerListReportRow]] = None
@@ -10896,7 +11431,6 @@ def main():
     trigger_filter_enabled = False
     trigger_list_path = settings.get("trigger_list", "").strip()
     if trigger_list_path:
-        trigger_filter_enabled = True
         entries, invalid_entries, duplicate_entries, total_lines, read_error = parse_trigger_list_file(trigger_list_path)
         trigger_list_rows, trigger_list_summary = build_trigger_list_report(
             trigger_list_path,
@@ -10913,10 +11447,16 @@ def main():
         )
         trigger_filter_entries = entries
         if trigger_list_summary.get("error"):
-            log.warning("trigger_list 读取失败，将跳过触发器筛选与生成: %s", trigger_list_summary.get("error"))
+            log.warning("trigger_list 读取失败，将回退全量触发器生成: %s", trigger_list_summary.get("error"))
+            trigger_filter_enabled = False
         elif trigger_list_summary.get("check_disabled"):
             log.warning("TRIGGER 未启用检查，trigger_list 将不会用于缺失触发器筛选。")
+            trigger_filter_enabled = False
+        elif trigger_list_summary.get("fallback_full"):
+            log.warning("trigger_list 为空或无有效条目，已回退全量触发器生成。")
+            trigger_filter_enabled = False
         else:
+            trigger_filter_enabled = True
             log.info(
                 "trigger_list 生效: 列表=%d, 命中缺失=%d, 未列出缺失=%d。",
                 trigger_list_summary.get("valid_entries", 0),
@@ -10925,27 +11465,28 @@ def main():
             )
 
     if enable_dependencies_check:
-        dependency_report = check_dependencies_against_ob(
-            expected_dependency_pairs,
-            ob_dependencies,
-            skipped_dependency_pairs,
-            ob_meta
-        )
-        required_grants = compute_required_grants(expected_dependency_pairs)
-        # 过滤目标端已具备的授权，避免重复提示/生成冗余 grants.sql
-        required_grants = filter_existing_required_grants(required_grants, ob_cfg)
-        if settings.get("print_dependency_chains", True):
-            dep_chain_path = report_dir / f"dependency_chains_{timestamp}.txt"
-            source_dep_pairs = to_raw_dependency_pairs(oracle_dependencies) if oracle_dependencies else set()
-            dependency_chain_file = export_dependency_chains(
+        with phase_timer("依赖/授权校验", phase_durations):
+            dependency_report = check_dependencies_against_ob(
                 expected_dependency_pairs,
-                dep_chain_path,
-                source_pairs=source_dep_pairs
+                ob_dependencies,
+                skipped_dependency_pairs,
+                ob_meta
             )
-            if dependency_chain_file:
-                log.info("依赖链路已输出: %s", dependency_chain_file)
-            else:
-                log.info("依赖链路输出已跳过（无数据或写入失败）。")
+            required_grants = compute_required_grants(expected_dependency_pairs)
+            # 过滤目标端已具备的授权，避免重复提示/生成冗余 grants.sql
+            required_grants = filter_existing_required_grants(required_grants, ob_cfg)
+            if settings.get("print_dependency_chains", True):
+                dep_chain_path = report_dir / f"dependency_chains_{timestamp}.txt"
+                source_dep_pairs = to_raw_dependency_pairs(oracle_dependencies) if oracle_dependencies else set()
+                dependency_chain_file = export_dependency_chains(
+                    expected_dependency_pairs,
+                    dep_chain_path,
+                    source_pairs=source_dep_pairs
+                )
+                if dependency_chain_file:
+                    log.info("依赖链路已输出: %s", dependency_chain_file)
+                else:
+                    log.info("依赖链路输出已跳过（无数据或写入失败）。")
     else:
         dependency_report = {
             "missing": [],
@@ -10954,28 +11495,30 @@ def main():
         }
         required_grants = {}
 
+    log_section("修补脚本与报告")
     # 9) 生成目标端订正 SQL
-    if settings.get('generate_fixup', 'true').strip().lower() in ('true', '1', 'yes'):
+    if generate_fixup_enabled:
         fixup_dir_label = settings.get('fixup_dir', 'fixup_scripts') or 'fixup_scripts'
         log.info('已开启修补脚本生成，开始写入 %s 目录...', fixup_dir_label)
-        generate_fixup_scripts(
-            ora_cfg,
-            ob_cfg,
-            settings,
-            tv_results,
-            extra_results,
-            master_list,
-            oracle_meta,
-            full_object_mapping,
-            remap_rules,
-            required_grants,
-            dependency_report,
-            ob_meta,
-            expected_dependency_pairs,
-            synonym_meta,
-            trigger_filter_entries,
-            trigger_filter_enabled
-        )
+        with phase_timer("修补脚本生成", phase_durations):
+            generate_fixup_scripts(
+                ora_cfg,
+                ob_cfg,
+                settings,
+                tv_results,
+                extra_results,
+                master_list,
+                oracle_meta,
+                full_object_mapping,
+                remap_rules,
+                required_grants,
+                dependency_report,
+                ob_meta,
+                expected_dependency_pairs,
+                synonym_meta,
+                trigger_filter_entries,
+                trigger_filter_enabled
+            )
     else:
         log.info('已根据配置跳过修补脚本生成，仅打印对比报告。')
 
@@ -10984,7 +11527,26 @@ def main():
         1 for _, _, obj_type in master_list
         if obj_type.upper() in checked_primary_types
     )
-    print_final_report(
+    report_start_perf = time.perf_counter()
+    run_summary_ctx = RunSummaryContext(
+        start_time=run_start_time,
+        start_perf=run_start_perf,
+        phase_durations=phase_durations,
+        phase_skip_reasons=phase_skip_reasons,
+        enabled_primary_types=enabled_primary_types,
+        enabled_extra_types=enabled_extra_types,
+        print_only_types=print_only_types,
+        total_checked=total_checked,
+        enable_dependencies_check=enable_dependencies_check,
+        enable_comment_check=enable_comment_check,
+        enable_schema_mapping_infer=settings.get("enable_schema_mapping_infer", True),
+        fixup_enabled=generate_fixup_enabled,
+        fixup_dir=settings.get('fixup_dir', 'fixup_scripts') or 'fixup_scripts',
+        dependency_chain_file=dependency_chain_file,
+        trigger_list_summary=trigger_list_summary,
+        report_start_perf=report_start_perf
+    )
+    run_summary = print_final_report(
         tv_results,
         total_checked,
         extra_results,
@@ -10999,8 +11561,11 @@ def main():
         blacklisted_missing_tables,
         blacklist_report_rows,
         trigger_list_summary,
-        trigger_list_rows
+        trigger_list_rows,
+        run_summary_ctx=run_summary_ctx
     )
+    if run_summary:
+        log_run_summary(run_summary)
 
 
 if __name__ == "__main__":

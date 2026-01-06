@@ -37,6 +37,7 @@ import argparse
 import configparser
 import fnmatch
 import json
+import logging
 import re
 import shutil
 import subprocess
@@ -52,6 +53,72 @@ DEFAULT_FIXUP_DIR = "fixup_scripts"
 DONE_DIR_NAME = "done"
 DEFAULT_OBCLIENT_TIMEOUT = 60
 MAX_RECOMPILE_RETRIES = 5
+REPO_URL = "https://github.com/Minorli/ob_comparator"
+REPO_ISSUES_URL = f"{REPO_URL}/issues"
+
+LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+LOG_FILE_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
+LOG_SECTION_WIDTH = 80
+
+
+def _build_console_handler(level: int) -> logging.Handler:
+    try:
+        from rich.logging import RichHandler
+        handler = RichHandler(
+            level=level,
+            show_time=True,
+            omit_repeated_times=False,
+            show_level=True,
+            show_path=False,
+            rich_tracebacks=False,
+            log_time_format=LOG_TIME_FORMAT
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        return handler
+    except Exception:
+        handler = logging.StreamHandler()
+        handler.setLevel(level)
+        handler.setFormatter(logging.Formatter(LOG_FILE_FORMAT, datefmt=LOG_TIME_FORMAT))
+        return handler
+
+
+def init_console_logging(level: int = logging.INFO) -> None:
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    for handler in list(root_logger.handlers):
+        if isinstance(handler, logging.FileHandler):
+            continue
+        root_logger.removeHandler(handler)
+    root_logger.addHandler(_build_console_handler(level))
+
+
+def set_console_log_level(level: int) -> None:
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            continue
+        handler.setLevel(level)
+
+
+def log_section(title: str, fill_char: str = "=") -> None:
+    clean = f" {title.strip()} "
+    if len(clean) >= LOG_SECTION_WIDTH:
+        log.info("%s", title.strip())
+        return
+    log.info("%s", clean.center(LOG_SECTION_WIDTH, fill_char))
+
+
+def log_subsection(title: str, fill_char: str = "-") -> None:
+    clean = f" {title.strip()} "
+    if len(clean) >= LOG_SECTION_WIDTH:
+        log.info("%s", title.strip())
+        return
+    log.info("%s", clean.center(LOG_SECTION_WIDTH, fill_char))
+
+
+init_console_logging()
+log = logging.getLogger(__name__)
 
 TYPE_DIR_MAP = {
     "SEQUENCE": "sequence",
@@ -103,7 +170,7 @@ class ScriptResult:
     layer: int = -1
 
 
-def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path]:
+def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str]:
     """Load OceanBase connection info and fixup directory from config.ini."""
     parser = configparser.ConfigParser()
     if not config_path.exists():
@@ -137,7 +204,8 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path]:
     if not fixup_path.exists():
         raise ConfigError(f"修补脚本目录不存在: {fixup_path}")
 
-    return ob_cfg, fixup_path, repo_root
+    log_level = parser.get("SETTINGS", "log_level", fallback="INFO").strip().upper() or "INFO"
+    return ob_cfg, fixup_path, repo_root, log_level
 
 
 def build_obclient_command(ob_cfg: Dict[str, str]) -> List[str]:
@@ -315,7 +383,12 @@ def recompile_invalid_objects(
         if not invalid_objects:
             return total_recompiled, 0
         
-        print(f"\n[重编译] 第 {retry + 1}/{max_retries} 轮，发现 {len(invalid_objects)} 个 INVALID 对象")
+        log.info(
+            "重编译轮次 %d/%d, INVALID=%d",
+            retry + 1,
+            max_retries,
+            len(invalid_objects)
+        )
         
         recompiled_this_round = 0
         for owner, obj_name, obj_type in invalid_objects:
@@ -324,11 +397,23 @@ def recompile_invalid_objects(
                 result = run_sql(obclient_cmd, compile_sql, timeout)
                 if result.returncode == 0:
                     recompiled_this_round += 1
-                    print(f"  ✓ {owner}.{obj_name} ({obj_type})")
+                    log.info("  OK %s.%s (%s)", owner, obj_name, obj_type)
                 else:
-                    print(f"  ✗ {owner}.{obj_name} ({obj_type}): {result.stderr.strip()[:100]}")
+                    log.warning(
+                        "  FAIL %s.%s (%s): %s",
+                        owner,
+                        obj_name,
+                        obj_type,
+                        result.stderr.strip()[:100]
+                    )
             except Exception as e:
-                print(f"  ✗ {owner}.{obj_name} ({obj_type}): {str(e)[:100]}")
+                log.warning(
+                    "  FAIL %s.%s (%s): %s",
+                    owner,
+                    obj_name,
+                    obj_type,
+                    str(e)[:100]
+                )
         
         total_recompiled += recompiled_this_round
         
@@ -355,8 +440,12 @@ def parse_args() -> argparse.Namespace:
           --only-dirs    : 按子目录过滤
           --only-types   : 按对象类型过滤
           --glob         : 按文件名模式过滤
+
+        项目信息：
+          主页: {repo_url}
+          反馈: {issues_url}
         """
-    )
+    ).format(repo_url=REPO_URL, issues_url=REPO_ISSUES_URL)
     
     parser = argparse.ArgumentParser(
         description=desc,
@@ -447,7 +536,7 @@ def main() -> None:
             unknown_types.append(t)
     
     if unknown_types:
-        print(f"[警告] 未识别的对象类型: {', '.join(unknown_types)}", file=sys.stderr)
+        log.warning("未识别的对象类型: %s", ", ".join(unknown_types))
     
     if mapped_dirs:
         if only_dirs:
@@ -462,13 +551,24 @@ def main() -> None:
     
     # Load configuration
     try:
-        ob_cfg, fixup_dir, repo_root = load_ob_config(config_arg.resolve())
+        ob_cfg, fixup_dir, repo_root, log_level = load_ob_config(config_arg.resolve())
     except ConfigError as exc:
-        print(f"[配置错误] {exc}", file=sys.stderr)
+        log.error("配置错误: %s", exc)
         sys.exit(1)
     except Exception as exc:
-        print(f"[致命错误] 无法读取配置: {exc}", file=sys.stderr)
+        log.error("致命错误: 无法读取配置: %s", exc)
         sys.exit(1)
+
+    level_name = log_level or "INFO"
+    if not hasattr(logging, level_name):
+        log.warning("未知 log_level: %s，使用 INFO", level_name)
+        level_name = "INFO"
+    level = getattr(logging, level_name)
+    set_console_log_level(level)
+    log_section("修补脚本执行器")
+    log.info("配置文件: %s", config_arg.resolve())
+    log.info("日志级别: %s", logging.getLevelName(level))
+    log.info("项目主页: %s (问题反馈: %s)", REPO_URL, REPO_ISSUES_URL)
     
     done_dir = fixup_dir / DONE_DIR_NAME
     done_dir.mkdir(exist_ok=True)
@@ -483,7 +583,7 @@ def main() -> None:
     )
     
     if not files_with_layer:
-        print(f"[提示] 目录 {fixup_dir} 中未找到任何 *.sql 文件。")
+        log.warning("目录 %s 中未找到任何 *.sql 文件。", fixup_dir)
         return
     
     obclient_cmd = build_obclient_command(ob_cfg)
@@ -493,25 +593,20 @@ def main() -> None:
     width = len(str(total_scripts)) or 1
     results: List[ScriptResult] = []
     
-    # Print header
-    header = "=" * 70
-    print(header)
-    print("开始执行修补脚本")
-    print(f"目录: {fixup_dir}")
-    if args.smart_order:
-        print("模式: 依赖感知排序 (SMART ORDER)")
-    else:
-        print("模式: 标准优先级排序")
+    log_section("执行配置")
+    log.info("目录: %s", fixup_dir)
+    log.info("模式: %s", "依赖感知排序 (SMART ORDER)" if args.smart_order else "标准优先级排序")
     if args.recompile:
-        print(f"重编译: 启用 (最多 {args.max_retries} 次重试)")
+        log.info("重编译: 启用 (最多 %d 次重试)", args.max_retries)
     if only_dirs:
-        print(f"子目录过滤: {sorted(set(only_dirs))}")
+        log.info("子目录过滤: %s", sorted(set(only_dirs)))
     if exclude_dirs:
-        print(f"跳过子目录: {sorted(set(exclude_dirs))}")
+        log.info("跳过子目录: %s", sorted(set(exclude_dirs)))
     if args.glob_patterns:
-        print(f"文件过滤: {args.glob_patterns}")
-    print(f"共发现 SQL 文件: {total_scripts}")
-    print(header)
+        log.info("文件过滤: %s", args.glob_patterns)
+    log.info("共发现 SQL 文件: %d", total_scripts)
+
+    log_section("开始执行")
     
     # Execute scripts
     current_layer = -1
@@ -519,9 +614,7 @@ def main() -> None:
         if args.smart_order and layer != current_layer:
             current_layer = layer
             layer_name = "未知层" if layer == 999 else f"第 {layer} 层"
-            print(f"\n{'='*70}")
-            print(f"{layer_name}")
-            print(f"{'='*70}")
+            log_subsection(f"执行层 {layer_name}")
         
         relative_path = sql_path.relative_to(repo_root)
         label = f"[{idx:0{width}}/{total_scripts}]"
@@ -531,13 +624,12 @@ def main() -> None:
         except Exception as exc:
             msg = f"读取文件失败: {exc}"
             results.append(ScriptResult(relative_path, "ERROR", msg, layer))
-            print(f"{label} {relative_path} -> 错误")
-            print(f"    {msg}")
+            log.error("%s %s -> ERROR (%s)", label, relative_path, msg)
             continue
         
         if not sql_text.strip():
             results.append(ScriptResult(relative_path, "SKIPPED", "文件为空", layer))
-            print(f"{label} {relative_path} -> 跳过 (文件为空)")
+            log.warning("%s %s -> SKIP (文件为空)", label, relative_path)
             continue
         
         try:
@@ -552,30 +644,27 @@ def main() -> None:
                     move_note = f"(已移至 done/{sql_path.parent.name}/)"
                 except Exception as exc:
                     move_note = f"(移动失败: {exc})"
-                
+
                 results.append(ScriptResult(relative_path, "SUCCESS", move_note.strip(), layer))
-                print(f"{label} {relative_path} -> ✓ 成功 {move_note}")
+                log.info("%s %s -> OK %s", label, relative_path, move_note)
             else:
                 stderr = (result.stderr or "").strip()
                 results.append(ScriptResult(relative_path, "FAILED", stderr, layer))
-                print(f"{label} {relative_path} -> ✗ 失败")
+                log.error("%s %s -> FAIL", label, relative_path)
                 if stderr:
-                    # Print first line of error
                     first_line = stderr.splitlines()[0] if stderr.splitlines() else stderr
-                    print(f"    {first_line[:200]}")
+                    log.error("  %s", first_line[:200])
         except subprocess.TimeoutExpired:
             msg = f"执行超时 (> {ob_timeout} 秒)"
             results.append(ScriptResult(relative_path, "FAILED", msg, layer))
-            print(f"{label} {relative_path} -> ✗ 失败")
-            print(f"    {msg}")
+            log.error("%s %s -> TIMEOUT", label, relative_path)
+            log.error("  %s", msg)
     
     # Recompilation phase
     total_recompiled = 0
     remaining_invalid = 0
     if args.recompile:
-        print(f"\n{'='*70}")
-        print("重编译阶段")
-        print(f"{'='*70}")
+        log_subsection("重编译阶段")
         total_recompiled, remaining_invalid = recompile_invalid_objects(
             obclient_cmd, ob_timeout, args.max_retries
         )
@@ -586,27 +675,23 @@ def main() -> None:
     failed = sum(1 for r in results if r.status in ("FAILED", "ERROR"))
     skipped = sum(1 for r in results if r.status == "SKIPPED")
     
-    print(f"\n{'='*70}")
-    print("执行结果汇总")
-    print(f"{'='*70}")
-    print(f"扫描脚本数 : {total_scripts}")
-    print(f"实际执行数 : {executed}")
-    print(f"成功       : {success}")
-    print(f"失败       : {failed}")
-    print(f"跳过       : {skipped}")
+    log_section("执行结果汇总")
+    log.info("扫描脚本数 : %d", total_scripts)
+    log.info("实际执行数 : %d", executed)
+    log.info("成功       : %d", success)
+    log.info("失败       : %d", failed)
+    log.info("跳过       : %d", skipped)
     
     if args.recompile:
-        print(f"\n重编译统计:")
-        print(f"  重编译成功 : {total_recompiled}")
-        print(f"  仍为INVALID: {remaining_invalid}")
+        log_subsection("重编译统计")
+        log.info("重编译成功 : %d", total_recompiled)
+        log.info("仍为INVALID: %d", remaining_invalid)
         if remaining_invalid > 0:
-            print(f"  提示: 运行 'SELECT * FROM DBA_OBJECTS WHERE STATUS=\\'INVALID\\';' 查看详情")
+            log.info("提示: 运行 'SELECT * FROM DBA_OBJECTS WHERE STATUS=\\'INVALID\\';' 查看详情")
     
     # Detailed table
     if results:
-        print(f"\n{'='*70}")
-        print("详细结果")
-        print(f"{'='*70}")
+        log_subsection("详细结果")
         
         # Group by status
         by_status = defaultdict(list)
@@ -625,17 +710,17 @@ def main() -> None:
                 "SKIPPED": "○ 跳过"
             }[status]
             
-            print(f"\n{status_label} ({len(items)}):")
+            log.info("%s (%d)", status_label, len(items))
             for item in items[:20]:  # Limit to first 20
                 msg = item.message.splitlines()[0][:100] if item.message else ""
-                print(f"  {item.path}")
+                log.info("  %s", item.path)
                 if msg:
-                    print(f"    {msg}")
-            
+                    log.info("    %s", msg)
+
             if len(items) > 20:
-                print(f"  ... 还有 {len(items) - 20} 个")
-    
-    print(f"{'='*70}\n")
+                log.info("  ... 还有 %d 个", len(items) - 20)
+
+    log_section("执行结束")
     
     exit_code = 0 if failed == 0 else 1
     sys.exit(exit_code)
