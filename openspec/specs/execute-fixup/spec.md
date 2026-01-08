@@ -61,6 +61,46 @@ The fixup executor SHALL move successfully executed scripts to fixup_scripts/don
 - **WHEN** a script execution fails
 - **THEN** it remains in place for retry
 
+### Requirement: Statement-level execution
+The fixup executor SHALL execute SQL scripts statement-by-statement and continue after statement failures.
+
+#### Scenario: Partial failures in a script
+- **WHEN** a script contains multiple statements and one fails
+- **THEN** remaining statements are still executed and the script is marked as failed with a failure count
+
+### Requirement: Grant pruning and error report
+The fixup executor SHALL execute GRANT scripts statement-by-statement, remove successful GRANT statements from the source file, and move the file to done when no statements remain. The executor SHALL write a capped error report under fixup_scripts/errors.
+
+#### Scenario: Grant statements succeed
+- **WHEN** a GRANT file executes and some statements succeed
+- **THEN** successful GRANT statements are removed from the file and only failed GRANTs remain
+
+#### Scenario: All grant statements succeed
+- **WHEN** all GRANT statements in a file succeed
+- **THEN** the file is moved into fixup_scripts/done
+
+#### Scenario: Error report generated
+- **WHEN** statement failures occur during execution
+- **THEN** an error report file is written under fixup_scripts/errors with capped entries
+
+### Requirement: Iterative retry mode
+The fixup executor SHALL support iterative retry rounds when --iterative is enabled.
+
+#### Scenario: Iterative mode enabled
+- **WHEN** --iterative is set
+- **THEN** the executor repeats execution rounds until progress stops or max rounds is reached
+
+### Requirement: View-chain autofix
+The fixup executor SHALL support --view-chain-autofix to generate per-view plans and SQL from VIEWs_chain and auto-execute them.
+
+#### Scenario: View already exists
+- **WHEN** a VIEW is present in the target
+- **THEN** the per-view plan/SQL is generated and marked as skipped without execution
+
+#### Scenario: View-chain grants missing
+- **WHEN** a view-chain plan needs grants and no matching entries are found
+- **THEN** the executor auto-generates object-level GRANT statements
+
 ### Requirement: Recompile retries
 The fixup executor SHALL optionally recompile INVALID objects when --recompile is enabled.
 

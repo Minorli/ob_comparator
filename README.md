@@ -1,6 +1,6 @@
 # OceanBase Comparator Toolkit
 
-> 当前版本：V0.9.5  
+> 当前版本：V0.9.7  
 > 关键词：一次转储、本地对比、Remap 推导、精确修复脚本
 
 这是一套面向 Oracle → OceanBase 的对象对比与修复工具。它把元数据一次性拉到本地内存进行比对，避免循环查库带来的性能与稳定性问题，并能生成可审计的修复脚本。
@@ -74,12 +74,21 @@ python3 run_fixup.py --iterative --smart-order --recompile --max-rounds 10
 python3 run_fixup.py --iterative --only-types VIEW --max-rounds 5
 ```
 
+**VIEW 链路自动修复**:
+```bash
+# 基于 VIEWs_chain 生成的依赖链进行精准修复
+python3 run_fixup.py --view-chain-autofix
+```
+
 **新增参数说明**:
 - `--iterative`: 启用多轮迭代执行，自动重试失败脚本
 - `--max-rounds N`: 最大迭代轮次（默认10）
 - `--min-progress N`: 每轮最小进展数，低于此值停止（默认1）
+- `--view-chain-autofix`: 依据最新 VIEWs_chain 生成并执行按 VIEW 拆分的修复计划
 
 > 💡 **提示**: 迭代模式会自动分析失败原因并提供可操作建议。对于有复杂依赖关系的VIEW，成功率可从0.5%提升至93%+。
+
+> 💡 **提示**: view-chain 模式默认跳过已存在 VIEW（仍输出 plan/sql 标记 SKIPPED），并在 DDL 缺失时从 `fixup_scripts/done/` 兜底查找。
 
 
 ## Remap 规则速记
@@ -110,10 +119,15 @@ SRC_A.TRG_ORDER = OB_A.TRG_ORDER
 
 - `main_reports/report_*.txt`：完整对比报告（建议先看这个）
 - `main_reports/remap_conflicts_*.txt`：无法自动推导的对象清单
-- `main_reports/tables_views_miss/`：按目标 schema 输出缺失 TABLE/VIEW 规则（可直接给 OMS，用于支持的对象）
+- `main_reports/tables_views_miss/`：按目标 schema 输出缺失 TABLE/VIEW 规则（`schema_T.txt` / `schema_V.txt`）
 - `main_reports/blacklist_tables.txt`：黑名单表清单（按 schema 分组，附原因与 LONG 转换校验状态）
-- `fixup_scripts/`：按对象类型生成的修复 SQL（执行前需审核，VIEW DDL 优先 dbcat，缺失时 DBMS_METADATA 兜底）
-- `fixup_scripts/grants/`：授权脚本（对象/系统/角色，`generate_grants=true` 时生成）
+- `main_reports/filtered_grants.txt`：被过滤的不兼容 GRANT 权限清单
+- `main_reports/VIEWs_chain_*.txt`：缺失 VIEW 的依赖链路与权限标记
+- `fixup_scripts/`：按对象类型生成的修复 SQL（执行前需审核，VIEW DDL 使用 DBMS_METADATA）
+- `fixup_scripts/grants_miss/`：缺失授权脚本（优先执行）
+- `fixup_scripts/grants_all/`：全量授权脚本（用于审计）
+- `fixup_scripts/view_chain_plans/`：VIEW 链路自动修复计划
+- `fixup_scripts/view_chain_sql/`：VIEW 链路自动修复 SQL
 - `dbcat_output/`：DDL 缓存（下次复用）
 
 > 如果源库存在 `OMS_USER.TMP_BLACK_TABLE`，则缺失表会先与黑名单比对：黑名单缺失表不会进入 `tables_views_miss/`，仅在 `blacklist_tables.txt` 中说明原因与状态。
@@ -137,12 +151,24 @@ generate_fixup = true
 generate_grants = true
 ```
 
+**授权脚本压缩（大量 GRANT 场景）：**
+```ini
+# 仅抽取 source_schemas 拥有的对象权限，减少规模
+grant_tab_privs_scope = owner
+# 合并多权限/多 grantee，显著减少 GRANT 语句数量
+grant_merge_privileges = true
+grant_merge_grantees = true
+# 可选：覆盖系统/对象权限白名单
+# grant_supported_sys_privs = CREATE SESSION,CREATE TABLE
+# grant_supported_object_privs = SELECT,INSERT,UPDATE,DELETE,REFERENCES,EXECUTE
+```
+
 ## 项目结构速览
 
 | 路径 | 说明 |
 | --- | --- |
 | `schema_diff_reconciler.py` | 主程序：对比、推导、报告、fixup 生成 |
-| `run_fixup.py` | 修复脚本执行器（支持 smart-order 和 recompile） |
+| `run_fixup.py` | 修复脚本执行器（支持 smart-order、recompile 与迭代执行） |
 | `config.ini.template` | 配置模板 |
 | `readme_config.txt` | 配置项完整说明 |
 | `remap_rules.txt` | Remap 规则 |

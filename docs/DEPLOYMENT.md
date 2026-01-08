@@ -1,7 +1,7 @@
 # 数据库对象对比工具 - 跨平台打包与执行指南 (Wheelhouse 版)
 
 > 适用场景：需要把当前目录下的 Python 程序（保持源码不改）打包到另一台机器运行，目标 Python 可能是 3.6/3.7.8，且目标机可能无法联网。本文只使用 wheelhouse+venv，不用 PyInstaller。
-> 适用版本：V0.9.5（保持“一次转储，本地对比”，支持 Remap 冲突报告与智能排序执行）。
+> 适用版本：V0.9.7（保持“一次转储，本地对比”，支持 Remap 冲突报告与智能排序执行）。
 
 ## 0. 环境与外部依赖清单（目标机必须具备）
 - **Python 解释器**：与打包时的版本和架构匹配（建议提前在目标机装好 3.6.x 或 3.7.x，对应 cp36/cp37）。  
@@ -121,8 +121,9 @@ ls main_reports
 ls fixup_scripts
 # 如需处理推导冲突，查看 main_reports/remap_conflicts_*.txt
 # OMS 缺失规则与黑名单清单：
-# main_reports/tables_views_miss/
+# main_reports/tables_views_miss/ (schema_T.txt / schema_V.txt)
 # main_reports/blacklist_tables.txt
+# main_reports/filtered_grants.txt
 
 # 执行修补脚本（可多次重跑）
 python run_fixup.py --smart-order --recompile  # 同样可传 config.ini 路径

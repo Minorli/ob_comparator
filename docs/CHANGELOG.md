@@ -3,9 +3,40 @@
 All notable changes to OceanBase Comparator Toolkit will be documented in this file.
 
 ## [Unreleased]
+- TBD
+
+## [0.9.7] - 2026-01-08
 
 ### Added
-- 支持 trigger_list 过滤缺失触发器脚本，仅生成清单内的 TRIGGER，并输出 trigger_miss.txt 记录无效/不存在条目。
+- VIEW 链路自动修复：基于 `VIEWs_chain_*.txt` 生成每个 VIEW 的计划与 SQL 并自动执行。
+- VIEW 依赖链报告：缺失 VIEW 输出依赖链、对象存在性与授权状态。
+- 授权修剪与错误报告：授权脚本逐行执行，成功行自动移除，错误汇总输出到 `fixup_scripts/errors/`。
+- 授权缺失输出：`fixup_scripts/grants_miss/` + `fixup_scripts/grants_all/` 分离缺失与全量授权。
+- GRANT 目标存在性过滤：目标端不存在的用户/角色授权会被跳过并提示。
+
+### Changed
+- VIEW DDL 来源切换为 DBMS_METADATA；dbcat 不再导出 VIEW。
+- VIEW DDL 清理保留 `FORCE/NO FORCE`，移除 Oracle-only 修饰，`WITH CHECK OPTION` 仅在 OB >= 4.2.5.7 保留。
+- run_fixup 语句级执行并继续失败语句，默认超时提升到小时级并支持禁用超时。
+- 授权推导支持 VIEW/同义词链路的 `WITH GRANT OPTION` 补齐。
+
+### Fixed
+- VIEW DDL 行内注释吞行与被拆分列名的修复逻辑更稳健。
+
+## [0.9.6] - 2026-01-07
+
+### Added
+- `run_fixup.py` 支持迭代执行模式（`--iterative/--max-rounds/--min-progress`），自动重试依赖失败脚本并输出错误分类建议。
+- VIEW 缺失修补脚本生成前加入简单拓扑排序，提升依赖场景成功率。
+
+### Changed
+- PUBLIC 同义词 DDL 生成去除冗余 `ALTER SESSION`。
+- FK 引用目标的 remap 校验逻辑优化，确保源端引用按 remap 规则对齐。
+- SYS_NC 索引列名标准化覆盖更多 Oracle 自动命名形式。
+
+### Fixed
+- 序列元数据缺失场景不再因错误字段引用导致崩溃。
+- 触发器比较逻辑修复：源端无触发器时可正确识别目标端多余触发器。
 
 ## [0.9.5] - 2026-01-07
 
@@ -13,6 +44,7 @@ All notable changes to OceanBase Comparator Toolkit will be documented in this f
 - Run summary section appended to the report with total/phase runtimes, executed vs skipped actions, key findings, attention items, and next-step suggestions.
 - End-of-run structured summary in runtime logs.
 - Project homepage and issue tracker links in report output and CLI help/startup logs.
+- 支持 trigger_list 过滤缺失触发器脚本，仅生成清单内的 TRIGGER，并输出 trigger_miss.txt 记录无效/不存在条目。
 
 ### Changed
 - Trigger list fallback now generates full trigger fixups when the list is missing, unreadable, or empty.

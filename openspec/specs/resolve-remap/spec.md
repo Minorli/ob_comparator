@@ -45,6 +45,10 @@ The system SHALL keep VIEW, MATERIALIZED VIEW, TRIGGER, PACKAGE, and PACKAGE BOD
 - **WHEN** a TRIGGER depends on a remapped TABLE but has no explicit TRIGGER remap
 - **THEN** the TRIGGER target schema remains the source schema
 
+#### Scenario: View without explicit remap
+- **WHEN** a VIEW or MATERIALIZED VIEW has no explicit remap rule
+- **THEN** the target schema remains the source schema
+
 ### Requirement: Paired object schema consistency
 The system SHALL keep PACKAGE/PACKAGE BODY and TYPE/TYPE BODY mappings aligned to the same target schema.
 

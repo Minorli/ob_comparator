@@ -28,6 +28,9 @@ cli_timeout             = 600
 # obclient 调用超时，单位秒；控制元数据/执行脚本超时
 # 建议值：60~600（视对象数量与网络情况而定）
 obclient_timeout        = 120
+# run_fixup 执行 SQL 的超时（秒）；0 表示不设超时
+# 建议值：3600（视授权/视图规模调整）
+fixup_cli_timeout       = 3600
 
 # 报告与修复脚本输出目录（可为相对路径或绝对路径）
 fixup_dir               = fixup_scripts
@@ -48,12 +51,28 @@ progress_log_interval   = 10
 # 建议值：100~300
 dbcat_chunk_size        = 150
 
-# 是否在对比后生成修复脚本（dbcat 抽取，DBMS_METADATA 兜底）
+# 是否在对比后生成修复脚本（dbcat 抽取，VIEW 走 DBMS_METADATA）
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 generate_fixup          = true
 # 是否生成授权脚本并附加到修补 DDL（依赖于源端权限/依赖推导）
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 generate_grants         = true
+# 授权抽取范围（DBA_TAB_PRIVS）
+# owner: 仅加载源 schema 拥有的对象权限（默认，性能更佳）
+# owner_or_grantee: 兼容旧逻辑，额外加载 grantee 在源 schema 的对象授权
+grant_tab_privs_scope   = owner
+# 授权合并（减少 GRANT 语句数量）
+# grant_merge_privileges: 合并同一对象的多权限
+# grant_merge_grantees: 合并同一权限的多 grantee
+grant_merge_privileges  = true
+grant_merge_grantees    = true
+# 授权兼容过滤（可选覆盖）
+# grant_supported_sys_privs: 支持的系统权限清单（逗号分隔，留空自动探测）
+# grant_supported_object_privs: 支持的对象权限清单（逗号分隔，留空使用默认）
+# grant_include_oracle_maintained_roles: 是否生成 ORACLE_MAINTAINED 角色 (true/false)
+grant_supported_sys_privs       = 
+grant_supported_object_privs    = 
+grant_include_oracle_maintained_roles = false
 # 仅生成指定目标 schema/对象类型的修补脚本（留空为全量）
 # fixup_schemas 示例：HERO_A,HERO_B
 # fixup_types 可选值：

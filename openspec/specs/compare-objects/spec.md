@@ -69,6 +69,14 @@ The system SHALL detect missing tables and compare table columns with OMS and hi
 - **WHEN** a common column is LONG or LONG RAW in the source
 - **THEN** the target column type MUST be CLOB or BLOB and the table is marked mismatched if not
 
+#### Scenario: LONG mapped to CLOB
+- **WHEN** the source column type is LONG and the target column type is CLOB
+- **THEN** the column is treated as matching for comparison
+
+#### Scenario: LONG RAW mapped to BLOB
+- **WHEN** the source column type is LONG RAW and the target column type is BLOB
+- **THEN** the column is treated as matching for comparison
+
 #### Scenario: Source column metadata missing
 - **WHEN** the source column metadata for a TABLE cannot be loaded
 - **THEN** the TABLE is recorded as mismatched with a missing metadata note

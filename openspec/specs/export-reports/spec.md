@@ -20,12 +20,26 @@ The system SHALL render a summary report to the console and export a plain-text 
 - **WHEN** the primary check list is empty
 - **THEN** the system still writes a report with zero counts and skip reasons
 
+### Requirement: Project reference in report
+The system SHALL include the project homepage and issue tracker URLs in the report output.
+
+#### Scenario: Report includes project links
+- **WHEN** a report is generated
+- **THEN** the report displays the project homepage and issue tracker URLs
+
 ### Requirement: Grant output suppressed
 The system SHALL omit GRANT details from report output and keep grant scripts in fixup outputs only.
 
 #### Scenario: Grant output suppressed
 - **WHEN** a comparison run completes
 - **THEN** the report does not display GRANT statements or counts
+
+### Requirement: Filtered grant export
+The system SHALL export filtered or unsupported GRANT privileges to main_reports/filtered_grants.txt when any privileges are skipped.
+
+#### Scenario: Filtered grant entries exist
+- **WHEN** unsupported GRANT privileges are filtered
+- **THEN** filtered_grants.txt lists the filtered entries with category, grantee, privilege, object, and reason
 
 ### Requirement: Object mapping export
 The system SHALL export full object mappings to main_reports/object_mapping_<timestamp>.txt.
@@ -48,6 +62,13 @@ The system SHALL export dependency chains when print_dependency_chains is enable
 - **WHEN** print_dependency_chains is true and dependencies are available
 - **THEN** the system writes main_reports/dependency_chains_<timestamp>.txt
 
+### Requirement: VIEW fixup chain export
+The system SHALL export VIEW fixup dependency chains for missing views when dependency data is available.
+
+#### Scenario: VIEW fixup chains generated
+- **WHEN** missing VIEWs exist and dependency pairs are available
+- **THEN** the system writes main_reports/VIEWs_chain_<timestamp>.txt with per-chain status markers
+
 ### Requirement: Schema coverage summary
 The system SHALL report missing source schemas and missing or extra target schemas in the summary.
 
@@ -56,15 +77,15 @@ The system SHALL report missing source schemas and missing or extra target schem
 - **THEN** the report includes a hint about missing target schemas
 
 ### Requirement: OMS-ready missing TABLE/VIEW export
-The system SHALL export missing TABLE and VIEW mappings grouped by target schema under main_reports/tables_views_miss.
+The system SHALL export missing TABLE and VIEW mappings grouped by target schema under main_reports/tables_views_miss, using separate per-schema files for TABLE and VIEW.
 
 #### Scenario: Missing table mapping
 - **WHEN** a TABLE is missing and not blacklisted
-- **THEN** the schema file includes SRC=TARGET or SRC when names match
+- **THEN** the schema_T.txt file includes SRC=TARGET or SRC when names match
 
 #### Scenario: Missing view mapping
 - **WHEN** a VIEW is missing
-- **THEN** the schema file includes the missing view mapping
+- **THEN** the schema_V.txt file includes the missing view mapping
 
 ### Requirement: Blacklist report export
 The system SHALL export blacklisted tables to main_reports/blacklist_tables.txt grouped by schema with reasons and status details.
@@ -72,6 +93,10 @@ The system SHALL export blacklisted tables to main_reports/blacklist_tables.txt 
 #### Scenario: Blacklisted tables listed
 - **WHEN** tables match TMP_BLACK_TABLE entries
 - **THEN** blacklist_tables.txt lists TABLE, BLACK_TYPE, DATA_TYPE, STATUS, DETAIL, and reason
+
+#### Scenario: Black type normalization
+- **WHEN** a blacklisted table has a lowercase or mixed-case BLACK_TYPE
+- **THEN** the report normalizes the category and applies the mapped reason text
 
 #### Scenario: Unknown blacklist category
 - **WHEN** a blacklisted table has an unrecognized BLACK_TYPE

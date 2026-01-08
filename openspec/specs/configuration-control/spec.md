@@ -109,11 +109,18 @@ The system SHALL write a run log file to log_dir and honor log_level for console
 - **WHEN** log_dir cannot be created
 - **THEN** the system logs a warning and continues with console-only output
 
+### Requirement: Project reference logging
+The system SHALL log the project homepage and issue tracker URLs during startup.
+
+#### Scenario: Startup logging
+- **WHEN** a comparison run starts
+- **THEN** the runtime log prints the project homepage and issue tracker URLs
+
 ### Requirement: Timeout controls
-The system SHALL honor cli_timeout for dbcat execution and obclient_timeout for OceanBase CLI calls.
+The system SHALL honor cli_timeout for dbcat execution, obclient_timeout for OceanBase CLI calls, and fixup_cli_timeout for run_fixup execution.
 
 #### Scenario: Custom timeouts
-- **WHEN** cli_timeout or obclient_timeout is configured
+- **WHEN** cli_timeout, obclient_timeout, or fixup_cli_timeout is configured
 - **THEN** external commands use those timeouts during execution
 
 ### Requirement: Fixup tuning parameters
@@ -164,9 +171,45 @@ The system SHALL provide a generate_grants setting to control grant DDL generati
 - **THEN** the system loads privilege metadata and generates grant SQL under fixup_scripts/grants
 
 ### Requirement: Oracle privilege metadata sources
-The system SHALL read Oracle privilege metadata from DBA_TAB_PRIVS, DBA_SYS_PRIVS, and DBA_ROLE_PRIVS when grant generation is enabled.
+The system SHALL read Oracle privilege metadata from DBA_TAB_PRIVS, DBA_SYS_PRIVS, DBA_ROLE_PRIVS, and DBA_ROLES when grant generation is enabled.
 
 #### Scenario: Privilege metadata load
 - **WHEN** generate_grants is true
-- **THEN** privilege data is loaded and cached for grant generation
+- **THEN** privilege and role metadata are loaded and cached for grant generation
 
+### Requirement: Grant extraction scope
+The system SHALL support grant_tab_privs_scope to control how DBA_TAB_PRIVS is filtered.
+
+#### Scenario: Owner-only scope
+- **WHEN** grant_tab_privs_scope is set to owner
+- **THEN** object privileges are loaded only for objects owned by the configured source schemas
+
+#### Scenario: Owner-or-grantee scope
+- **WHEN** grant_tab_privs_scope is set to owner_or_grantee
+- **THEN** object privileges are loaded for objects owned by the source schemas and for grants where the grantee is in scope
+
+### Requirement: Grant statement merging toggles
+The system SHALL support grant_merge_privileges and grant_merge_grantees to control GRANT statement compaction.
+
+#### Scenario: Merge privileges enabled
+- **WHEN** grant_merge_privileges is true
+- **THEN** multiple privileges for the same grantee/object/grantable are merged into one GRANT statement
+
+#### Scenario: Merge grantees enabled
+- **WHEN** grant_merge_grantees is true
+- **THEN** multiple grantees for the same object/privilege/grantable are merged into one GRANT statement
+
+### Requirement: Grant compatibility settings
+The system SHALL allow configuration overrides for supported system privileges, supported object privileges, and Oracle-maintained role inclusion.
+
+#### Scenario: Default supported privileges
+- **WHEN** no override is provided
+- **THEN** system privileges are derived from the target OceanBase catalog and object privileges use the built-in allowlist
+
+#### Scenario: Supported privilege override
+- **WHEN** grant_supported_sys_privs or grant_supported_object_privs is configured
+- **THEN** the system uses the configured lists instead of defaults
+
+#### Scenario: Oracle-maintained roles toggle
+- **WHEN** grant_include_oracle_maintained_roles is false
+- **THEN** roles marked ORACLE_MAINTAINED are skipped in CREATE ROLE generation

@@ -1,7 +1,7 @@
 # 数据库对象对比工具设计文档
 
 本文档描述最新版 OceanBase Comparator Toolkit 的设计思路。新版本在原有“Oracle vs OceanBase” 元数据对比基础上，加入了依赖分析、授权推导、dbcat DDL 提取、Rich 报告与全量 fix-up 管道。
-> 当前版本：V0.9.5（Dump-Once, Compare-Locally + 依赖分析 + ALTER 级修补 + 注释校验；支持交互式配置向导与运行前自检）
+> 当前版本：V0.9.7（Dump-Once, Compare-Locally + 依赖分析 + ALTER 级修补 + 注释校验；支持交互式配置向导与运行前自检）
 
 ## 1. 核心目标
 
@@ -34,13 +34,15 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
 2. **元数据缓存**：Oracle 侧使用 Thick Mode + 批量查询；OceanBase 侧使用 obclient 执行预设 SQL，所有数据一次性加载到内存。
 3. **差异分析**：依赖 `master_list`（源→目标）完成表/列校验；索引/约束/触发器使用 Oracle/OB 双缓存进行集合比对；序列按 schema 级别比较。
 4. **依赖 & 授权**：`DBA_DEPENDENCIES` 映射后生成期望依赖集合，与目标库实际依赖比较并给出原因；授权脚本基于 Oracle 权限元数据与依赖推导生成。
-5. **修补脚本**：构建 dbcat 请求（含 schema→对象类型的任务集合），复用 `dbcat_output` 缓存，对 DDL 做 schema remap、语法清理、授权插入，并按对象类型输出到 `fixup_scripts/`（含依赖重编译/授权脚本）。
+5. **修补脚本**：构建 dbcat 请求（含 schema→对象类型的任务集合，VIEW 走 DBMS_METADATA），复用 `dbcat_output` 缓存，对 DDL 做 schema remap、语法清理、授权插入，并按对象类型输出到 `fixup_scripts/`（含依赖重编译/授权脚本）。
 6. **报告与执行**：Rich 控制台输出+落地文件；`run_fixup.py` 负责在 OceanBase 上顺序执行 SQL 并回写结果。
 
 ## 3. 配置与 Remap 驱动
 
 - `config.ini` 完全驱动运行参数：除了连接信息外，还包含 `fixup_dir`、`report_dir`、`generate_fixup`、`obclient_timeout`、`cli_timeout`（dbcat）、`dbcat_*` 等。  
 - `check_primary_types` / `check_extra_types` 决定元数据加载、Remap 推导、对比与修复脚本生成的范围；未包含的类型不会参与本轮流程。  
+- `grant_tab_privs_scope` 控制 `DBA_TAB_PRIVS` 的抽取范围；`grant_merge_privileges` / `grant_merge_grantees` 可显著减少 GRANT 语句数量。  
+- `grant_supported_sys_privs` / `grant_supported_object_privs` 可覆盖授权兼容白名单；`grant_include_oracle_maintained_roles` 控制是否生成 Oracle 维护角色。  
 - `remap_rules.txt` 控制源/目标对象映射，支持 `PACKAGE BODY` 特殊写法及注释。加载时会验证：
   - 源对象是否存在；
   - 是否出现“多对一”目标对象（直接报错）。
@@ -98,8 +100,10 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
   - **额外依赖**：提示目标端存在额外耦合，需人工判断。
   - **跳过项**：源/目标缺少 remap 信息时记录原因但不报错。
 - 对于缺失依赖但目标对象已存在的情况，会生成 `ALTER ... COMPILE` 脚本以尝试重编译。
-- 授权脚本由 Oracle 权限元数据（`DBA_TAB_PRIVS`/`DBA_SYS_PRIVS`/`DBA_ROLE_PRIVS`）+ 依赖推导生成，应用 remap 后写入 `fixup_scripts/grants/`（仅 `generate_grants=true` 时生成，报告不展示授权明细）。
+- 授权脚本由 Oracle 权限元数据（`DBA_TAB_PRIVS`/`DBA_SYS_PRIVS`/`DBA_ROLE_PRIVS`）+ 依赖推导生成，应用 remap 后写入 `fixup_scripts/grants_all/` 与 `fixup_scripts/grants_miss/`（仅 `generate_grants=true` 时生成，报告不展示授权明细）。
+- 支持按需压缩 GRANT 语句：可合并同对象多权限或同权限多 grantee，显著降低执行量。
 - 当触发器与目标表不在同一 schema 时，fixup 会在触发器脚本中附带必要的授权语句。
+- 对缺失 VIEW 输出 `main_reports/VIEWs_chain_*.txt`，展示依赖链路、对象存在性与权限状态（含同义词下探）。
 
 ## 7. 修补脚本生成
 
@@ -108,7 +112,7 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
 - 根据差异收集“需要 DDL 的对象集合”，以 schema 为维度构造 dbcat 命令：
   - 可复用 `dbcat_output/<schema>/...` 缓存，未命中的对象再触发 dbcat。
   - 运行 dbcat 需要 `JAVA_HOME` 与 `dbcat_from/dbcat_to` profile，超时时间由 `cli_timeout` 控制。
-  - VIEW DDL 优先使用 dbcat，dbcat 未命中时才使用 DBMS_METADATA 兜底。
+  - VIEW DDL 使用 DBMS_METADATA；dbcat 仅负责非 VIEW 对象。
 - DDL 后处理：
   - `adjust_ddl_for_object`：根据 Remap 替换 schema/name，支持额外引用对象的重写。
   - `cleanup_dbcat_wrappers`：移除 `DELIMITER/$$` 包裹。
@@ -117,7 +121,7 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
 
 ### 输出顺序与目录
 
-生成顺序遵循依赖关系：SEQUENCE → TABLE（CREATE + ALTER）→ 代码对象 → INDEX → CONSTRAINT → TRIGGER → 依赖重编译（COMPILE）→ 授权脚本 → 其他对象。所有文件位于 `fixup_scripts/<object_type>/`，并带有头部注释（源/目标信息、审核提示）。  
+生成顺序遵循依赖关系：SEQUENCE → TABLE（CREATE + ALTER）→ 代码对象 → INDEX → CONSTRAINT → TRIGGER → 依赖重编译（COMPILE）→ 授权脚本 → 其他对象。VIEW 会做简单拓扑排序以提高创建成功率。所有文件位于 `fixup_scripts/<object_type>/`，并带有头部注释（源/目标信息、审核提示）。  
 
 表列差异专门写入 `fixup_scripts/table_alter/`，对缺失列生成 `ADD COLUMN`（`LONG/LONG RAW` 自动映射为 `CLOB/BLOB`），对长度不足或 LONG 类型不一致生成 `MODIFY`，长度过大的列以 WARNING 形式提示人工评估；多余列仅以注释形式提示 `DROP`。  
 
@@ -130,13 +134,14 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
 - **Rich 控制台报告**：包含综合概要、表级差异、索引/约束/序列/触发器明细、依赖缺口、Remap 冲突等；授权脚本仅输出到 fixup 目录，不在报告中展示。
 - **文本快照 (`main_reports/report_<timestamp>.txt`)**：通过 `Console(record=True)` 同步导出，方便归档或发给其他团队，并在开头展示源/目标数据库的版本与连接概览。
 - **Remap 冲突清单 (`main_reports/remap_conflicts_<timestamp>.txt`)**：列出无法自动推导的对象，需显式 remap 后重跑。
-- **OMS 缺失规则 (`main_reports/tables_views_miss/`)**：仅输出支持迁移的 TABLE/VIEW 规则，可直接交给 OMS。
+- **OMS 缺失规则 (`main_reports/tables_views_miss/`)**：仅输出支持迁移的 TABLE/VIEW 规则（`schema_T.txt` / `schema_V.txt`），可直接交给 OMS。
 - **黑名单清单 (`main_reports/blacklist_tables.txt`)**：列出黑名单表并标注原因与 LONG 转换校验状态（缺失表不会生成 OMS 规则）。
+- **过滤授权清单 (`main_reports/filtered_grants.txt`)**：记录因 OB 不支持或未知而跳过的 GRANT 权限。
 - **fixup_scripts 指南**：报告结尾展示各子目录含义，提醒人工审核。
 - **`run_fixup.py` 执行器**：
   - 读取 `fixup_scripts/` 第一层子目录下的 SQL。
   - 通过 obclient 顺序执行，成功后移动到 `fixup_scripts/done/<subdir>/`，失败则保留原地并打印错误。
-  - 输出明细表与累计结果，便于反复执行。
+  - 可选迭代执行模式：自动重试依赖失败的脚本并分类错误原因，适合复杂 VIEW 依赖场景。
 
 ## 9. 健壮性设计
 
@@ -150,7 +155,7 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
 
 ## 10. 配套工具与资产
 
-- `run_fixup.py`：在 OceanBase 上顺序执行 `fixup_scripts/` 第一层子目录的 SQL，支持 `--only-dirs/--only-types/--glob` 过滤，并将成功文件搬运到 `fixup_scripts/done/` 便于幂等重跑。  
+- `run_fixup.py`：在 OceanBase 上顺序执行 `fixup_scripts/` 第一层子目录的 SQL，支持 `--only-dirs/--only-types/--glob` 过滤与迭代执行模式，并将成功文件搬运到 `fixup_scripts/done/` 便于幂等重跑。  
 - `init_test.py`：读取 `config.ini`，对 `test_scenarios/gorgon_knot_case` 的 Oracle/OB SQL 进行分号与 `/` 划分后逐条执行，快速搭建冒烟环境。  
 - `test_scenarios/*`：三套场景覆盖不同特性：`labyrinth_case`（默认配置、列长度/依赖/GRANT）、`hydra_matrix_case`（多 schema 网格与复杂 remap）、`gorgon_knot_case`（多对一/一对多映射与名称冲突）。每套都附带 remap 与 README。  
 - `dbcat_output/`：缓存最近的 dbcat 提取结果（当前为 Labyrinth 表/MV），在下次生成时可复用以减少对源库的扫描。  

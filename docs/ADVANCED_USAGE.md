@@ -121,9 +121,42 @@ infer_schema_mapping = false
 ### 9. 黑名单表与 OMS 规则输出
 
 当源端存在 `OMS_USER.TMP_BLACK_TABLE` 时：
-- 缺失 TABLE 会先与黑名单匹配；黑名单表不会进入 `main_reports/tables_views_miss/`。
+- 缺失 TABLE 会先与黑名单匹配；黑名单表不会进入 `main_reports/tables_views_miss/`（按 schema 输出 `*_T.txt` / `*_V.txt`）。
 - 被过滤的表会写入 `main_reports/blacklist_tables.txt`，按 schema 分组并注明 `BLACK_TYPE`/`DATA_TYPE`、原因与 LONG 转换校验状态。
 - `LONG/LONG RAW` 列在补列 DDL 中会自动映射为 `CLOB/BLOB`。
+
+### 10. 授权脚本优化（大量 GRANT）
+
+当源端存在几十万条授权时，可通过以下配置降低抽取与执行成本：
+```ini
+# 仅抽取 source_schemas 拥有的对象权限
+grant_tab_privs_scope = owner
+# 合并授权语句
+grant_merge_privileges = true
+grant_merge_grantees = true
+```
+过滤掉的不兼容权限会写入 `main_reports/filtered_grants.txt`，便于人工复核。
+授权脚本会过滤掉目标端不存在的用户/角色（PUBLIC 除外），并在日志中提示缺失名单，
+请先创建后重新生成授权脚本。
+如需覆盖权限白名单或保留 Oracle 维护角色，可使用：
+```ini
+grant_supported_sys_privs = CREATE SESSION,CREATE TABLE
+grant_supported_object_privs = SELECT,INSERT,UPDATE,DELETE,REFERENCES,EXECUTE
+grant_include_oracle_maintained_roles = false
+```
+如需保留旧逻辑，可设置：
+```ini
+grant_tab_privs_scope = owner_or_grantee
+```
+
+#### VIEW 授权与同义词下探
+- 当 VIEW 被授予非 owner 时，会补齐 view owner 对依赖对象的 `WITH GRANT OPTION` 授权。
+- VIEW 依赖同义词时，会下钻到最终对象生成授权，避免因同义词导致的权限缺失。
+
+#### VIEW DDL 清洗
+- 修复 VIEW DDL 中“行内注释吞行”问题（DBMS_METADATA/转换后 DDL 均适用）。
+- 仅在命中视图列元数据时，才合并被拆分的列名（避免误修别名）。
+- OceanBase 版本 < 4.2.5.7 时移除 `WITH CHECK OPTION`，高版本保留。
 
 ---
 
@@ -133,6 +166,8 @@ infer_schema_mapping = false
 - 依赖感知排序（`--smart-order`）
 - 自动重编译 INVALID 对象（`--recompile`）
 - 目录/类型/文件名过滤
+- 授权脚本逐行执行，失败行保留到原文件
+- 错误报告输出到 `fixup_scripts/errors/`
 
 ### 1. 推荐执行方式
 ```bash
@@ -143,7 +178,7 @@ python3 run_fixup.py --smart-order --recompile
 
 仅执行部分目录：
 ```bash
-python3 run_fixup.py --only-dirs table,table_alter,grants
+python3 run_fixup.py --only-dirs table,table_alter,grants_miss
 ```
 
 按对象类型过滤（自动映射到目录）：
@@ -173,7 +208,7 @@ sequence -> table -> table_alter -> constraint -> index -> view -> ...
 Layer 0: sequence
 Layer 1: table
 Layer 2: table_alter
-Layer 3: grants
+Layer 3: grants_miss (默认；可手动指定 grants_all)
 Layer 4: view, synonym
 Layer 5: materialized_view
 Layer 6: procedure, function
@@ -196,6 +231,12 @@ Layer 11: job, schedule
 python3 run_fixup.py --smart-order --recompile --max-retries 10
 ```
 
+### 4.1 超时控制
+
+`run_fixup.py` 使用 `fixup_cli_timeout` 控制 SQL 执行超时（单位秒）：
+- `fixup_cli_timeout = 3600`：单条语句最长 1 小时
+- `fixup_cli_timeout = 0`：不设置超时（可能阻塞）
+
 ### 5. 幂等执行
 
 `run_fixup.py` 具有幂等性：
@@ -204,7 +245,7 @@ python3 run_fixup.py --smart-order --recompile --max-retries 10
 
 ### 6. 迭代执行模式（推荐用于VIEW）
 
-**新增功能（V0.9.5+）**: 支持多轮迭代执行，自动重试失败的脚本。
+**新增功能（V0.9.7+）**: 支持多轮迭代执行，自动重试失败的脚本。
 
 #### 基本用法
 ```bash
@@ -246,9 +287,11 @@ VIEW_C 依赖 VIEW_B 依赖 VIEW_A
    建议: 这些脚本会在依赖对象创建后自动重试成功
 
 ❌ 权限不足: 5 个
-   建议: 检查并执行 fixup_scripts/grants/ 下的授权脚本
+   建议: 检查并执行 fixup_scripts/grants_miss/ 下的授权脚本
 
 ✓ 对象已存在: 10 个 (可忽略)
+❌ 数据冲突/唯一约束违反: 3 个
+   建议: 清理重复数据后重试相关DDL
 ```
 
 #### 与其他参数组合
@@ -270,6 +313,30 @@ python3 run_fixup.py --iterative --glob "*SCHEMA_A*.sql" --max-rounds 10
 - ❌ **不推荐**: 仅处理TABLE（通常无依赖问题）
 - ❌ **不推荐**: 已知有语法错误的脚本（迭代无法修复）
 
+### 7. VIEW 链路自动修复（--view-chain-autofix）
+
+该模式会读取最新的 `main_reports/VIEWs_chain_*.txt`，为每个缺失 VIEW 生成修复计划与 SQL，
+并按依赖顺序执行。授权语句只从 `grants_miss/`、`grants_all/` 中精准挑选匹配项，不会全量执行。
+
+输出目录：
+- `fixup_scripts/view_chain_plans/`：每个 VIEW 的修复计划
+- `fixup_scripts/view_chain_sql/`：每个 VIEW 的修复 SQL
+
+默认行为：
+- 已存在 VIEW 会自动跳过执行（计划/SQL 仍会输出并标记 SKIPPED）
+- 依赖 DDL 缺失时会从 `fixup_scripts/done/` 兜底查找
+- 授权缺失且 grants 中找不到匹配项时自动生成对象授权语句
+- 输出执行结果：SUCCESS / PARTIAL / FAILED / BLOCKED / SKIPPED
+
+示例：
+```bash
+python3 run_fixup.py --view-chain-autofix
+```
+
+注意事项：
+- 未找到链路文件时会直接退出（需先生成 fixup + 依赖链报告）
+- 依赖链存在环或缺失 DDL 会标记 BLOCKED 并跳过自动执行
+
 
 ---
 
@@ -286,4 +353,4 @@ A: 检查范围被限制为 TABLE，其他类型不会加载也不会推导。
 
 ---
 
-更新时间：2026-01-06 (V0.9.5: 新增迭代执行模式)
+更新时间：2026-01-08 (V0.9.7: VIEW 链路修复与授权修剪增强)

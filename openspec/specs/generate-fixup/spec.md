@@ -34,6 +34,10 @@ The system SHALL support trigger_list to limit TRIGGER fixup generation when the
 - **WHEN** trigger_list cannot be read or contains no valid entries
 - **THEN** the system logs a warning and generates all missing triggers
 
+#### Scenario: Trigger list contains invalid entries
+- **WHEN** trigger_list contains malformed lines or unknown trigger names
+- **THEN** the invalid entries are reported and ignored for fixup generation
+
 #### Scenario: Trigger checks disabled
 - **WHEN** TRIGGER is not enabled in check_extra_types
 - **THEN** trigger_list is only format-validated and does not filter fixup generation
@@ -88,19 +92,15 @@ The system SHALL map LONG to CLOB and LONG RAW to BLOB when generating missing-c
 - **THEN** an ALTER TABLE MODIFY statement is generated to use CLOB or BLOB
 
 ### Requirement: DDL extraction fallback
-The system SHALL prefer dbcat DDL output and fall back to DBMS_METADATA for TABLE and VIEW DDL when dbcat output is missing or unsupported.
+The system SHALL prefer dbcat DDL output and fall back to DBMS_METADATA for TABLE DDL when dbcat output is missing or unsupported. The system SHALL use DBMS_METADATA as the primary source for VIEW DDL and ignore dbcat view output.
 
 #### Scenario: dbcat returns unsupported table DDL
 - **WHEN** dbcat output indicates unsupported TABLE DDL
 - **THEN** the system attempts to fetch TABLE DDL via DBMS_METADATA
 
-#### Scenario: dbcat provides view DDL
-- **WHEN** dbcat returns VIEW DDL for a missing VIEW
-- **THEN** the system uses the dbcat DDL for fixup generation
-
-#### Scenario: dbcat missing view DDL
-- **WHEN** dbcat does not return VIEW DDL for a missing VIEW
-- **THEN** the system attempts to fetch VIEW DDL via DBMS_METADATA
+#### Scenario: VIEW DDL uses DBMS_METADATA
+- **WHEN** a VIEW is missing in the target
+- **THEN** the system fetches VIEW DDL via DBMS_METADATA and does not use dbcat view output
 
 #### Scenario: dbcat not configured
 - **WHEN** generate_fixup is enabled but dbcat_bin is missing
@@ -114,11 +114,19 @@ The system SHALL preserve trigger schema, rewrite ON clause table references to 
 - **THEN** the trigger DDL references the remapped table and includes necessary GRANT statements
 
 ### Requirement: DDL cleanup for OceanBase
-The system SHALL remove Oracle-only clauses from generated DDL to improve OceanBase compatibility.
+The system SHALL remove Oracle-only clauses from generated DDL to improve OceanBase compatibility, preserving OceanBase-supported VIEW syntax.
+
+#### Scenario: VIEW cleanup removes Oracle-only modifiers
+- **WHEN** a VIEW DDL contains Oracle-only modifiers such as EDITIONABLE
+- **THEN** the modifiers are removed while preserving FORCE/NO FORCE and WITH READ ONLY/WITH CHECK OPTION
 
 #### Scenario: VIEW cleanup uses OceanBase version
-- **WHEN** a VIEW DDL contains Oracle-only clauses such as EDITIONABLE or WITH CHECK OPTION
-- **THEN** the clauses are removed based on the detected OceanBase version
+- **WHEN** a VIEW DDL contains WITH CHECK OPTION and OceanBase version < 4.2.5.7
+- **THEN** the WITH CHECK OPTION clause is removed
+
+#### Scenario: VIEW cleanup preserves CHECK OPTION on supported versions
+- **WHEN** a VIEW DDL contains WITH CHECK OPTION and OceanBase version >= 4.2.5.7
+- **THEN** the WITH CHECK OPTION clause is preserved
 
 ### Requirement: SQL rewrite safety
 The system SHALL avoid rewriting object references inside string literals and comments.
@@ -139,7 +147,7 @@ The system SHALL generate synonym DDL using cached synonym metadata when availab
 - **THEN** those PUBLIC synonyms are ignored in cached metadata
 
 ### Requirement: Compile and grant scripts
-The system SHALL generate compile scripts for missing dependencies and GRANT scripts derived from Oracle privileges and dependency-based grants when generate_grants is enabled.
+The system SHALL generate compile scripts for missing dependencies and GRANT scripts derived from Oracle privileges and dependency-based grants when generate_grants is enabled, emitting both missing-grant and full-audit outputs.
 
 #### Scenario: Missing dependency
 - **WHEN** a dependent object exists but required dependencies are missing in the target
@@ -147,7 +155,7 @@ The system SHALL generate compile scripts for missing dependencies and GRANT scr
 
 #### Scenario: Grant generation enabled
 - **WHEN** generate_grants is true
-- **THEN** fixup_scripts/grants contains object, role, and system GRANT statements
+- **THEN** fixup_scripts/grants_all contains object, role, and system GRANT statements, and fixup_scripts/grants_miss contains missing grants only
 
 #### Scenario: Grant generation disabled
 - **WHEN** generate_grants is false
@@ -165,15 +173,56 @@ The system SHALL remap Oracle object privileges to target objects and schemas, p
 - **THEN** the GRANT statement includes WITH GRANT OPTION
 
 ### Requirement: Role and system grants
-The system SHALL emit GRANT statements for DBA_ROLE_PRIVS and DBA_SYS_PRIVS entries, preserving ADMIN OPTION when present.
+The system SHALL emit GRANT statements for DBA_ROLE_PRIVS entries and for DBA_SYS_PRIVS entries that are supported by the target OceanBase privilege catalog, preserving ADMIN OPTION when present. Unsupported system privileges SHALL be skipped with a warning summary.
 
 #### Scenario: Role grant preserved
 - **WHEN** a role is granted to a schema in Oracle
 - **THEN** the system emits GRANT <role> TO <grantee> [WITH ADMIN OPTION]
 
-#### Scenario: System privilege preserved
-- **WHEN** a system privilege exists in Oracle
+#### Scenario: Supported system privilege preserved
+- **WHEN** a system privilege exists in Oracle and is supported by the target OceanBase catalog
 - **THEN** the system emits GRANT <privilege> TO <grantee> [WITH ADMIN OPTION]
+
+#### Scenario: Unsupported system privilege skipped
+- **WHEN** a system privilege exists in Oracle but is not supported by the target OceanBase catalog
+- **THEN** the system skips the GRANT and logs a warning summary
+
+### Requirement: Object privilege compatibility filtering
+The system SHALL filter object-level GRANT statements to a supported privilege allowlist and skip unsupported object privileges with a warning summary.
+
+#### Scenario: Unsupported object privilege skipped
+- **WHEN** a table privilege is not in the supported allowlist
+- **THEN** the system omits the GRANT statement and records it in the warning summary
+
+#### Scenario: MERGE VIEW privilege filtered
+- **WHEN** a GRANT statement contains MERGE VIEW
+- **THEN** the system skips it as unsupported in OceanBase
+
+### Requirement: Role DDL generation
+The system SHALL generate CREATE ROLE statements for user-defined roles referenced by grants and emit them before any GRANT statements that reference those roles.
+
+#### Scenario: Custom role created
+- **WHEN** a role referenced in grants is user-defined
+- **THEN** a CREATE ROLE statement is emitted before the GRANTs
+
+#### Scenario: Oracle-maintained role skipped
+- **WHEN** a role is marked ORACLE_MAINTAINED and the include switch is false
+- **THEN** no CREATE ROLE statement is emitted
+
+#### Scenario: Role authentication type unknown
+- **WHEN** a role requires a password or external authentication
+- **THEN** the system emits CREATE ROLE with NOT IDENTIFIED and logs a warning for manual follow-up
+
+### Requirement: GRANT statement compaction
+The system SHALL optionally compact object GRANT statements when grant_merge_privileges and/or grant_merge_grantees are enabled.
+
+#### Scenario: Merge privileges for a grantee
+- **WHEN** multiple privileges exist for the same grantee/object/grantable and grant_merge_privileges is true
+- **THEN** a single GRANT statement with multiple privileges is emitted
+
+#### Scenario: Merge grantees for a privilege
+- **WHEN** multiple grantees share the same object/privilege/grantable and grant_merge_grantees is true
+- **THEN** a single GRANT statement with multiple grantees is emitted
 
 ### Requirement: Dependency-derived grants
 The system SHALL add cross-schema grants required by remapped dependency edges and deep view dependency chains.

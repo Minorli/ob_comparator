@@ -16,7 +16,7 @@
 
 """
 
-数据库对象对比工具 (V0.9.5 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
+数据库对象对比工具 (V0.9.7 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -33,7 +33,7 @@
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.9.5 核心)：
+3. 性能架构 (V0.9.7 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          DBA_OBJECTS
@@ -71,7 +71,7 @@ import math
 import re
 from contextlib import contextmanager
 
-__version__ = "0.9.5"
+__version__ = "0.9.7"
 __author__ = "Minor Li"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
 REPO_ISSUES_URL = f"{REPO_URL}/issues"
@@ -220,6 +220,7 @@ class RunSummaryContext(NamedTuple):
     fixup_enabled: bool
     fixup_dir: str
     dependency_chain_file: Optional[Path]
+    view_chain_file: Optional[Path]
     trigger_list_summary: Optional[Dict[str, object]]
     report_start_perf: float
 
@@ -325,6 +326,7 @@ class ObMetadata(NamedTuple):
     constraints: Dict[Tuple[str, str], Dict[str, Dict]]  # (OWNER, TABLE_NAME) -> {CONS_NAME: {type, columns[list]}}
     triggers: Dict[Tuple[str, str], Dict[str, Dict]]     # (OWNER, TABLE_NAME) -> {TRG_NAME: {event, status}}
     sequences: Dict[str, Set[str]]                       # SEQUENCE_OWNER -> {SEQUENCE_NAME}
+    roles: Set[str]                                      # DBA_ROLES -> {ROLE}
     table_comments: Dict[Tuple[str, str], Optional[str]] # (OWNER, TABLE_NAME) -> COMMENT
     column_comments: Dict[Tuple[str, str], Dict[str, Optional[str]]]  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: COMMENT}
     comments_complete: bool                              # 元数据是否完整加载（两端失败则跳过注释校验）
@@ -343,9 +345,12 @@ class OracleMetadata(NamedTuple):
     column_comments: Dict[Tuple[str, str], Dict[str, Optional[str]]]  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: COMMENT}
     comments_complete: bool                                # 注释元数据是否加载完成
     blacklist_tables: BlacklistTableMap                    # (OWNER, TABLE) -> {(BLACK_TYPE, DATA_TYPE)}
-    object_privileges: List[OracleObjectPrivilege]         # DBA_TAB_PRIVS (对象权限)
-    sys_privileges: List[OracleSysPrivilege]               # DBA_SYS_PRIVS (系统权限)
-    role_privileges: List[OracleRolePrivilege]             # DBA_ROLE_PRIVS (角色授权)
+    object_privileges: List["OracleObjectPrivilege"]         # DBA_TAB_PRIVS (对象权限)
+    sys_privileges: List["OracleSysPrivilege"]               # DBA_SYS_PRIVS (系统权限)
+    role_privileges: List["OracleRolePrivilege"]             # DBA_ROLE_PRIVS (角色授权)
+    role_metadata: Dict[str, "OracleRoleInfo"]               # DBA_ROLES 角色元数据
+    system_privilege_map: Set[str]                           # SYSTEM_PRIVILEGE_MAP
+    table_privilege_map: Set[str]                            # TABLE_PRIVILEGE_MAP
 
 
 class DependencyRecord(NamedTuple):
@@ -397,6 +402,13 @@ class OracleRolePrivilege(NamedTuple):
     admin_option: bool
 
 
+class OracleRoleInfo(NamedTuple):
+    role: str
+    authentication_type: str
+    password_required: bool
+    oracle_maintained: Optional[bool]
+
+
 class ObjectGrantEntry(NamedTuple):
     privilege: str
     object_full: str
@@ -413,10 +425,29 @@ class RoleGrantEntry(NamedTuple):
     admin_option: bool
 
 
+class FilteredGrantEntry(NamedTuple):
+    category: str  # SYSTEM | OBJECT
+    grantee: str
+    privilege: str
+    object_full: str
+    reason: str
+
+
 class GrantPlan(NamedTuple):
     object_grants: Dict[str, Set[ObjectGrantEntry]]
     sys_privs: Dict[str, Set[SystemGrantEntry]]
     role_privs: Dict[str, Set[RoleGrantEntry]]
+    role_ddls: List[str]
+    filtered_grants: List[FilteredGrantEntry]
+
+
+class ObGrantCatalog(NamedTuple):
+    object_privs: Set[Tuple[str, str, str]]          # (GRANTEE, PRIV, OWNER.OBJ)
+    object_privs_grantable: Set[Tuple[str, str, str]]  # grantable subset
+    sys_privs: Set[Tuple[str, str]]                  # (GRANTEE, PRIV)
+    sys_privs_admin: Set[Tuple[str, str]]            # admin_option subset
+    role_privs: Set[Tuple[str, str]]                 # (GRANTEE, ROLE)
+    role_privs_admin: Set[Tuple[str, str]]           # admin_option subset
 
 
 class ColumnLengthIssue(NamedTuple):
@@ -506,6 +537,8 @@ EXTRA_OBJECT_CHECK_TYPES: Tuple[str, ...] = (
 
 # 注释比对时批量 IN 子句的大小，避免 ORA-01795
 COMMENT_BATCH_SIZE = 200
+# 授权规模提示阈值（对象权限条数）
+GRANT_WARN_THRESHOLD = 200000
 
 # OceanBase 目标端自动生成且需在列对比中忽略的 OMS 列
 IGNORED_OMS_COLUMNS: Tuple[str, ...] = (
@@ -642,6 +675,15 @@ def parse_type_list(
     return parsed & allowed
 
 
+def parse_csv_set(raw_value: Optional[str]) -> Set[str]:
+    """
+    解析逗号分隔列表为大写集合。
+    """
+    if not raw_value or not str(raw_value).strip():
+        return set()
+    return {item.strip().upper() for item in str(raw_value).split(',') if item.strip()}
+
+
 def chunk_list(items: List[str], size: int) -> List[List[str]]:
     """Split list into batches of given size."""
     return [items[i:i + size] for i in range(0, len(items), size)]
@@ -748,6 +790,22 @@ GRANT_PRIVILEGE_BY_TYPE: Dict[str, str] = {
     'FUNCTION': 'EXECUTE',
     'PACKAGE': 'EXECUTE',
     'PACKAGE BODY': 'EXECUTE'
+}
+
+# OceanBase Oracle 模式下常用对象权限（缺省白名单，可在配置中覆盖）
+DEFAULT_SUPPORTED_OBJECT_PRIVS: Set[str] = {
+    'SELECT',
+    'INSERT',
+    'UPDATE',
+    'DELETE',
+    'REFERENCES',
+    'EXECUTE'
+}
+
+ROLE_AUTH_WARN_TYPES: Set[str] = {
+    'PASSWORD',
+    'EXTERNAL',
+    'GLOBAL'
 }
 
 # 系统权限对对象权限的兜底映射（用于过滤已满足的 GRANT 建议）
@@ -859,6 +917,12 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('fixup_types', '')
         settings.setdefault('trigger_list', '')
         settings.setdefault('generate_grants', 'true')
+        settings.setdefault('grant_tab_privs_scope', 'owner')
+        settings.setdefault('grant_merge_privileges', 'true')
+        settings.setdefault('grant_merge_grantees', 'true')
+        settings.setdefault('grant_supported_sys_privs', '')
+        settings.setdefault('grant_supported_object_privs', '')
+        settings.setdefault('grant_include_oracle_maintained_roles', 'false')
         # 检查范围开关
         settings.setdefault('check_primary_types', '')
         settings.setdefault('check_extra_types', '')
@@ -893,6 +957,15 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings['enable_grant_generation'] = parse_bool_flag(
             settings.get('generate_grants', 'true'),
             True
+        )
+        settings['grant_tab_privs_scope'] = settings.get('grant_tab_privs_scope', 'owner').strip().lower()
+        settings['grant_supported_sys_privs_set'] = parse_csv_set(settings.get('grant_supported_sys_privs', ''))
+        settings['grant_supported_object_privs_set'] = parse_csv_set(
+            settings.get('grant_supported_object_privs', '')
+        )
+        settings['grant_include_oracle_maintained_roles'] = parse_bool_flag(
+            settings.get('grant_include_oracle_maintained_roles', 'false'),
+            False
         )
         settings['enable_comment_check'] = parse_bool_flag(
             settings.get('check_comments', 'true'),
@@ -1076,6 +1149,12 @@ def run_config_wizard(config_path: Path) -> None:
         except ValueError:
             return False, "需要正整数"
 
+    def _validate_grant_scope(val: str) -> Tuple[bool, str]:
+        v = val.strip().lower()
+        if v in ("owner", "owner_or_grantee"):
+            return True, ""
+        return False, "仅支持 owner 或 owner_or_grantee"
+
     def _bool_transform(val: str) -> str:
         v = val.strip().lower()
         if v in ("true", "1", "yes", "y", "on"):
@@ -1143,6 +1222,46 @@ def run_config_wizard(config_path: Path) -> None:
         "generate_grants",
         "是否生成授权脚本并附加到修复 DDL (true/false)",
         default=cfg.get("SETTINGS", "generate_grants", fallback="true"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "grant_tab_privs_scope",
+        "授权抽取范围 (owner/owner_or_grantee)",
+        default=cfg.get("SETTINGS", "grant_tab_privs_scope", fallback="owner"),
+        validator=_validate_grant_scope,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "grant_merge_privileges",
+        "授权合并: 合并同一对象的多权限 (true/false)",
+        default=cfg.get("SETTINGS", "grant_merge_privileges", fallback="true"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "grant_merge_grantees",
+        "授权合并: 合并同权限的多 grantee (true/false)",
+        default=cfg.get("SETTINGS", "grant_merge_grantees", fallback="true"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "grant_supported_sys_privs",
+        "支持的系统权限清单 (逗号分隔，留空自动探测)",
+        default=cfg.get("SETTINGS", "grant_supported_sys_privs", fallback=""),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "grant_supported_object_privs",
+        "支持的对象权限清单 (逗号分隔，留空使用默认)",
+        default=cfg.get("SETTINGS", "grant_supported_object_privs", fallback=""),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "grant_include_oracle_maintained_roles",
+        "是否生成 ORACLE_MAINTAINED 角色 (true/false)",
+        default=cfg.get("SETTINGS", "grant_include_oracle_maintained_roles", fallback="false"),
         transform=_bool_transform,
     )
     _prompt_field(
@@ -1697,6 +1816,7 @@ def get_source_objects(
 
     # Materialized View 在 DBA_OBJECTS 中通常会同时作为 TABLE 出现，去重以避免误将 MV 当成 TABLE 校验/抽取。
     mview_dedup = 0
+    mview_table_keep = 0
     pure_tables = table_pairs - mview_pairs  # DBA_TABLES 也包含 MVIEW，这里只保留真实 TABLE
     for full_name, types in source_objects.items():
         if 'MATERIALIZED VIEW' in types and 'TABLE' in types:
@@ -1709,9 +1829,15 @@ def get_source_objects(
             if key in mview_pairs and key not in pure_tables:
                 types.discard('TABLE')
                 mview_dedup += 1
+            elif key in pure_tables:
+                mview_table_keep += 1
+                log.warning(
+                    "检测到同名 TABLE 与 MATERIALIZED VIEW，保留 TABLE 校验: %s",
+                    full_name
+                )
     if mview_dedup:
         log.info(
-            "检测到 %d 个 MATERIALIZED VIEW 同时出现在 TABLE 列表中，已移除重复的 TABLE 类型以使用 --mview 处理。",
+            "检测到 %d 个 MATERIALIZED VIEW 同时出现在 TABLE 列表中，已按 MVIEW 处理并移除重复 TABLE 类型。",
             mview_dedup
         )
 
@@ -1853,7 +1979,7 @@ def load_synonym_metadata(
     """
     快速读取同义词定义，避免逐个 DBMS_METADATA 调用。
     返回 {(OWNER, SYNONYM_NAME): SynonymMeta}
-    allowed_target_schemas: 当 owner=PUBLIC 时，仅保留指向这些 schema 的同义词，过滤掉系统自带的 PUBLIC 同义词。
+    allowed_target_schemas: 仅保留指向这些 schema 的同义词（用于过滤系统 PUBLIC 同义词等无关对象）。
     """
     if not schemas_list:
         return {}
@@ -1861,10 +1987,19 @@ def load_synonym_metadata(
     allowed_targets = {s.upper() for s in (allowed_target_schemas or [])}
     owners = sorted(set(s.upper() for s in schemas_list) | {"PUBLIC"})
     placeholders = ','.join([f":{i+1}" for i in range(len(owners))])
+    target_placeholders = ','.join([f":{i+1+len(owners)}" for i in range(len(allowed_targets))])
+    target_filter = ""
+    params = list(owners)
+    if allowed_targets:
+        target_filter = f"AND TABLE_OWNER IN ({target_placeholders})"
+        params.extend(sorted(allowed_targets))
     sql = f"""
         SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME, DB_LINK
         FROM DBA_SYNONYMS
         WHERE OWNER IN ({placeholders})
+          AND TABLE_OWNER IS NOT NULL
+          AND TABLE_NAME IS NOT NULL
+          {target_filter}
     """
 
     result: Dict[Tuple[str, str], SynonymMeta] = {}
@@ -1876,7 +2011,7 @@ def load_synonym_metadata(
             dsn=ora_cfg['dsn']
         ) as connection:
             with connection.cursor() as cursor:
-                cursor.execute(sql, owners)
+                cursor.execute(sql, params)
                 for row in cursor:
                     owner = (row[0] or '').strip().upper()
                     name = (row[1] or '').strip().upper()
@@ -1899,11 +2034,12 @@ def load_synonym_metadata(
     except oracledb.Error as exc:
         log.warning("读取同义词元数据失败，将回退 DBMS_METADATA：%s", exc)
 
+    target_hint = ",".join(sorted(allowed_targets)) if allowed_targets else "<ALL>"
     log.info(
-        "已缓存 %d 个同义词元数据（OWNER IN %s，跳过 PUBLIC 系统同义词 %d 个）。",
+        "已缓存 %d 个同义词元数据（OWNER IN %s，TABLE_OWNER IN %s）。",
         len(result),
         ",".join(owners),
-        skipped_public
+        target_hint
     )
     return result
 
@@ -3202,6 +3338,7 @@ def dump_ob_metadata(
     include_triggers: bool = True,
     include_sequences: bool = True,
     include_comments: bool = True,
+    include_roles: bool = False,
     target_table_pairs: Optional[Set[Tuple[str, str]]] = None
 ) -> ObMetadata:
     """
@@ -3217,12 +3354,18 @@ def dump_ob_metadata(
             constraints={},
             triggers={},
             sequences={},
+            roles=set(),
             table_comments={},
             column_comments={},
             comments_complete=False
         )
 
-    owners_in = ",".join(f"'{s}'" for s in sorted(target_schemas))
+    owners_in_list = sorted(target_schemas)
+    owners_in = ",".join(f"'{s}'" for s in owners_in_list)
+    owners_in_objects_list = list(owners_in_list)
+    if 'PUBLIC' in target_schemas and '__PUBLIC' not in owners_in_objects_list:
+        owners_in_objects_list.append('__PUBLIC')
+    owners_in_objects = ",".join(f"'{s}'" for s in sorted(owners_in_objects_list))
 
     # --- 1. DBA_OBJECTS ---
     objects_by_type: Dict[str, Set[str]] = {}
@@ -3234,7 +3377,7 @@ def dump_ob_metadata(
     sql = f"""
         SELECT OWNER, OBJECT_NAME, OBJECT_TYPE
         FROM DBA_OBJECTS
-        WHERE OWNER IN ({owners_in})
+        WHERE UPPER(OWNER) IN ({owners_in_objects})
           AND OBJECT_TYPE IN (
               {object_types_clause}
           )
@@ -3250,6 +3393,8 @@ def dump_ob_metadata(
             if len(parts) < 3:
                 continue
             owner, name, obj_type = parts[0].strip().upper(), parts[1].strip().upper(), parts[2].strip().upper()
+            if obj_type == 'SYNONYM' and owner == '__PUBLIC':
+                owner = 'PUBLIC'
             full = f"{owner}.{name}"
             objects_by_type.setdefault(obj_type, set()).add(full)
 
@@ -3641,6 +3786,19 @@ def dump_ob_metadata(
                 owner, seq_name = parts[0].strip().upper(), parts[1].strip().upper()
                 sequences.setdefault(owner, set()).add(seq_name)
 
+    roles: Set[str] = set()
+    # --- 9. DBA_ROLES ---
+    if include_roles:
+        sql = "SELECT ROLE FROM DBA_ROLES"
+        ok, out, err = obclient_run_sql(ob_cfg, sql)
+        if not ok:
+            log.warning("读取 DBA_ROLES 失败，角色列表可能不完整: %s", err)
+        elif out:
+            for line in out.splitlines():
+                role = (line or "").strip().upper()
+                if role:
+                    roles.add(role)
+
     log.info("OceanBase 元数据转储完成 (根据开关加载 DBA_OBJECTS/列/索引/约束/触发器/序列/注释)。")
     return ObMetadata(
         objects_by_type=objects_by_type,
@@ -3649,9 +3807,188 @@ def dump_ob_metadata(
         constraints=constraints,
         triggers=triggers,
         sequences=sequences,
+        roles=roles,
         table_comments=table_comments,
         column_comments=column_comments,
         comments_complete=comments_complete
+    )
+
+
+def load_ob_supported_sys_privs(ob_cfg: ObConfig) -> Set[str]:
+    """
+    读取 OceanBase 支持的系统权限集合（以 DBA_SYS_PRIVS 中 SYS 拥有的权限为准）。
+    """
+    privs: Set[str] = set()
+    sql = "SELECT PRIVILEGE FROM DBA_SYS_PRIVS WHERE GRANTEE='SYS'"
+    ok, out, err = obclient_run_sql(ob_cfg, sql)
+    if not ok:
+        log.warning("读取 OceanBase DBA_SYS_PRIVS 失败，系统权限过滤将基于 Oracle 合法性校验: %s", err)
+        return set()
+    if out:
+        for line in out.splitlines():
+            name = (line or "").strip().upper()
+            if name:
+                privs.add(name)
+    return privs
+
+
+def load_ob_roles(ob_cfg: ObConfig) -> Optional[Set[str]]:
+    """
+    读取 OceanBase 侧角色列表，用于避免重复 CREATE ROLE。
+    """
+    roles: Set[str] = set()
+    sql = "SELECT ROLE FROM DBA_ROLES"
+    ok, out, err = obclient_run_sql(ob_cfg, sql)
+    if not ok:
+        log.warning("读取 OceanBase DBA_ROLES 失败，将无法避免重复 CREATE ROLE: %s", err)
+        return None
+    if out:
+        for line in out.splitlines():
+            role = (line or "").strip().upper()
+            if role:
+                roles.add(role)
+    if not roles:
+        log.warning("OB 端角色列表为空，授权 grantee 角色过滤可能不完整。")
+    return roles
+
+
+def load_ob_users(ob_cfg: ObConfig) -> Optional[Set[str]]:
+    """
+    读取 OceanBase 侧用户列表，用于过滤授权目标。
+    优先使用 DBA_USERS，失败时回退 ALL_USERS。
+    """
+    users: Set[str] = set()
+    sql = "SELECT USERNAME FROM DBA_USERS"
+    ok, out, err = obclient_run_sql(ob_cfg, sql)
+    if not ok:
+        log.warning("读取 OceanBase DBA_USERS 失败，将尝试 ALL_USERS: %s", err)
+        sql = "SELECT USERNAME FROM ALL_USERS"
+        ok, out, err = obclient_run_sql(ob_cfg, sql)
+        if not ok:
+            log.warning("读取 OceanBase ALL_USERS 失败，将跳过授权目标用户过滤: %s", err)
+            return None
+    if out:
+        for line in out.splitlines():
+            name = (line or "").strip().upper()
+            if name:
+                users.add(name)
+    if not users:
+        log.warning("OB 端用户列表为空，授权 grantee 用户过滤可能不完整。")
+    return users
+
+
+def load_ob_grant_catalog(
+    ob_cfg: ObConfig,
+    grantees: Set[str]
+) -> Optional[ObGrantCatalog]:
+    """
+    读取 OceanBase 端权限目录，用于缺失授权计算。
+    仅检查直接授权（DBA_TAB_PRIVS / DBA_SYS_PRIVS / DBA_ROLE_PRIVS）。
+    """
+    if not grantees:
+        return ObGrantCatalog(set(), set(), set(), set(), set(), set())
+
+    def _sql_list(vals: List[str]) -> str:
+        safe_vals = [v.replace("'", "''") for v in vals if v]
+        return ",".join(f"'{v}'" for v in safe_vals)
+
+    object_privs: Set[Tuple[str, str, str]] = set()
+    object_privs_grantable: Set[Tuple[str, str, str]] = set()
+    sys_privs: Set[Tuple[str, str]] = set()
+    sys_privs_admin: Set[Tuple[str, str]] = set()
+    role_privs: Set[Tuple[str, str]] = set()
+    role_privs_admin: Set[Tuple[str, str]] = set()
+
+    try:
+        for chunk in chunk_list(sorted(grantees), 900):
+            grantee_list = _sql_list([g.upper() for g in chunk if g])
+            if not grantee_list:
+                continue
+
+            tab_sql = textwrap.dedent(f"""
+                SELECT GRANTEE, PRIVILEGE, OWNER, TABLE_NAME, GRANTABLE
+                FROM DBA_TAB_PRIVS
+                WHERE GRANTEE IN ({grantee_list})
+            """).strip()
+            ok, out, err = obclient_run_sql(ob_cfg, tab_sql)
+            if not ok:
+                log.warning("[GRANT_MISS] 读取 DBA_TAB_PRIVS 失败: %s", err)
+                return None
+            if out:
+                for line in out.splitlines():
+                    parts = line.split('\t')
+                    if len(parts) < 5:
+                        continue
+                    grantee = (parts[0] or "").strip().upper()
+                    priv = (parts[1] or "").strip().upper()
+                    owner = (parts[2] or "").strip().upper()
+                    name = (parts[3] or "").strip().upper()
+                    grantable = (parts[4] or "").strip().upper() == "YES"
+                    if not grantee or not priv or not owner or not name:
+                        continue
+                    key = (grantee, priv, f"{owner}.{name}")
+                    object_privs.add(key)
+                    if grantable:
+                        object_privs_grantable.add(key)
+
+            sys_sql = textwrap.dedent(f"""
+                SELECT GRANTEE, PRIVILEGE, ADMIN_OPTION
+                FROM DBA_SYS_PRIVS
+                WHERE GRANTEE IN ({grantee_list})
+            """).strip()
+            ok, out, err = obclient_run_sql(ob_cfg, sys_sql)
+            if not ok:
+                log.warning("[GRANT_MISS] 读取 DBA_SYS_PRIVS 失败: %s", err)
+                return None
+            if out:
+                for line in out.splitlines():
+                    parts = line.split('\t')
+                    if len(parts) < 3:
+                        continue
+                    grantee = (parts[0] or "").strip().upper()
+                    priv = (parts[1] or "").strip().upper()
+                    admin = (parts[2] or "").strip().upper() == "YES"
+                    if not grantee or not priv:
+                        continue
+                    key = (grantee, priv)
+                    sys_privs.add(key)
+                    if admin:
+                        sys_privs_admin.add(key)
+
+            role_sql = textwrap.dedent(f"""
+                SELECT GRANTEE, GRANTED_ROLE, ADMIN_OPTION
+                FROM DBA_ROLE_PRIVS
+                WHERE GRANTEE IN ({grantee_list})
+            """).strip()
+            ok, out, err = obclient_run_sql(ob_cfg, role_sql)
+            if not ok:
+                log.warning("[GRANT_MISS] 读取 DBA_ROLE_PRIVS 失败: %s", err)
+                return None
+            if out:
+                for line in out.splitlines():
+                    parts = line.split('\t')
+                    if len(parts) < 3:
+                        continue
+                    grantee = (parts[0] or "").strip().upper()
+                    role = (parts[1] or "").strip().upper()
+                    admin = (parts[2] or "").strip().upper() == "YES"
+                    if not grantee or not role:
+                        continue
+                    key = (grantee, role)
+                    role_privs.add(key)
+                    if admin:
+                        role_privs_admin.add(key)
+    except Exception as exc:  # pragma: no cover
+        log.warning("[GRANT_MISS] 读取 OB 权限目录失败: %s", exc)
+        return None
+
+    return ObGrantCatalog(
+        object_privs=object_privs,
+        object_privs_grantable=object_privs_grantable,
+        sys_privs=sys_privs,
+        sys_privs_admin=sys_privs_admin,
+        role_privs=role_privs,
+        role_privs_admin=role_privs_admin
     )
 
 
@@ -3701,6 +4038,91 @@ def load_oracle_role_privileges(
     return role_grants, discovered_roles
 
 
+def load_oracle_roles(ora_conn) -> Dict[str, OracleRoleInfo]:
+    """
+    读取 DBA_ROLES，用于生成 CREATE ROLE DDL。
+    """
+    roles: Dict[str, OracleRoleInfo] = {}
+
+    def _supports_oracle_maintained() -> bool:
+        try:
+            with ora_conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT COUNT(*)
+                    FROM DBA_TAB_COLUMNS
+                    WHERE OWNER = 'SYS'
+                      AND TABLE_NAME = 'DBA_ROLES'
+                      AND COLUMN_NAME = 'ORACLE_MAINTAINED'
+                """)
+                row = cursor.fetchone()
+                return bool(row and row[0] and int(row[0]) > 0)
+        except oracledb.Error:
+            return False
+
+    try:
+        has_om = _supports_oracle_maintained()
+        select_cols = "ROLE, AUTHENTICATION_TYPE, PASSWORD_REQUIRED"
+        if has_om:
+            select_cols += ", ORACLE_MAINTAINED"
+        sql = f"SELECT {select_cols} FROM DBA_ROLES"
+        with ora_conn.cursor() as cursor:
+            cursor.execute(sql)
+            for row in cursor:
+                role = (row[0] or "").strip().upper()
+                if not role:
+                    continue
+                auth_type = (row[1] or "").strip().upper()
+                pwd_required = (row[2] or "").strip().upper() == "YES"
+                oracle_maintained: Optional[bool] = None
+                if has_om and len(row) > 3:
+                    oracle_maintained = (row[3] or "").strip().upper() == "Y"
+                roles[role] = OracleRoleInfo(
+                    role=role,
+                    authentication_type=auth_type,
+                    password_required=pwd_required,
+                    oracle_maintained=oracle_maintained
+                )
+    except oracledb.Error as exc:
+        log.warning("读取 DBA_ROLES 失败，角色 DDL 将仅基于授权引用推断: %s", exc)
+        return {}
+
+    return roles
+
+
+def load_oracle_system_privilege_map(ora_conn) -> Set[str]:
+    """
+    读取 SYSTEM_PRIVILEGE_MAP，提供 Oracle 侧系统权限全集。
+    """
+    privs: Set[str] = set()
+    try:
+        with ora_conn.cursor() as cursor:
+            cursor.execute("SELECT NAME FROM SYSTEM_PRIVILEGE_MAP")
+            for row in cursor:
+                name = (row[0] or "").strip().upper()
+                if name:
+                    privs.add(name)
+    except oracledb.Error as exc:
+        log.warning("读取 SYSTEM_PRIVILEGE_MAP 失败，将跳过 Oracle 系统权限合法性校验: %s", exc)
+    return privs
+
+
+def load_oracle_table_privilege_map(ora_conn) -> Set[str]:
+    """
+    读取 TABLE_PRIVILEGE_MAP，提供 Oracle 侧对象权限全集。
+    """
+    privs: Set[str] = set()
+    try:
+        with ora_conn.cursor() as cursor:
+            cursor.execute("SELECT NAME FROM TABLE_PRIVILEGE_MAP")
+            for row in cursor:
+                name = (row[0] or "").strip().upper()
+                if name:
+                    privs.add(name)
+    except oracledb.Error as exc:
+        log.warning("读取 TABLE_PRIVILEGE_MAP 失败，将跳过 Oracle 对象权限合法性校验: %s", exc)
+    return privs
+
+
 def load_oracle_sys_privileges(
     ora_conn,
     grantees: Set[str]
@@ -3735,10 +4157,11 @@ def load_oracle_sys_privileges(
 def load_oracle_tab_privileges(
     ora_conn,
     owners: Set[str],
-    grantees: Set[str]
+    grantees: Set[str],
+    scope: str = "owner"
 ) -> List[OracleObjectPrivilege]:
     """
-    读取 DBA_TAB_PRIVS，按 OWNER 与 GRANTEE 双向过滤后去重。
+    读取 DBA_TAB_PRIVS，按 OWNER 或 OWNER+GRANTEE 范围过滤后去重。
     """
     def _supports_type_column() -> bool:
         try:
@@ -3793,9 +4216,15 @@ def load_oracle_tab_privileges(
         return results
 
     has_type = _supports_type_column()
+    scope_u = (scope or "owner").strip().lower()
+    if scope_u not in ("owner", "owner_or_grantee"):
+        log.warning("未知 grant_tab_privs_scope=%s，回退为 owner。", scope)
+        scope_u = "owner"
+
     results: List[OracleObjectPrivilege] = []
     results.extend(_load_for("OWNER", owners, has_type))
-    results.extend(_load_for("GRANTEE", grantees, has_type))
+    if scope_u == "owner_or_grantee":
+        results.extend(_load_for("GRANTEE", grantees, has_type))
 
     deduped: Dict[Tuple[str, str, str, str, str, bool], OracleObjectPrivilege] = {}
     for item in results:
@@ -3848,7 +4277,10 @@ def dump_oracle_metadata(
             blacklist_tables={},
             object_privileges=[],
             sys_privileges=[],
-            role_privileges=[]
+            role_privileges=[],
+            role_metadata={},
+            system_privilege_map=set(),
+            table_privilege_map=set()
         )
 
     def _make_in_clause(values: List[str]) -> str:
@@ -3860,6 +4292,7 @@ def dump_oracle_metadata(
     constraints: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     triggers: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     sequences: Dict[str, Set[str]] = {}
+    roles: Set[str] = set()
     table_comments: Dict[Tuple[str, str], Optional[str]] = {}
     column_comments: Dict[Tuple[str, str], Dict[str, Optional[str]]] = {}
     comments_complete = False
@@ -3867,6 +4300,9 @@ def dump_oracle_metadata(
     object_privileges: List[OracleObjectPrivilege] = []
     sys_privileges: List[OracleSysPrivilege] = []
     role_privileges: List[OracleRolePrivilege] = []
+    role_metadata: Dict[str, OracleRoleInfo] = {}
+    system_privilege_map: Set[str] = set()
+    table_privilege_map: Set[str] = set()
 
     def _safe_upper(value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -4215,20 +4651,28 @@ def dump_oracle_metadata(
                     object_privileges = load_oracle_tab_privileges(
                         ora_conn,
                         privilege_owners,
-                        grantee_scope
+                        grantee_scope,
+                        settings.get('grant_tab_privs_scope', 'owner')
                     )
+                    role_metadata = load_oracle_roles(ora_conn)
+                    system_privilege_map = load_oracle_system_privilege_map(ora_conn)
+                    table_privilege_map = load_oracle_table_privilege_map(ora_conn)
                     log.info(
-                        "Oracle 权限元数据加载完成：对象权限=%d, 系统权限=%d, 角色授权=%d, 角色数=%d",
+                        "Oracle 权限元数据加载完成：对象权限=%d, 系统权限=%d, 角色授权=%d, 角色数=%d, scope=%s",
                         len(object_privileges),
                         len(sys_privileges),
                         len(role_privileges),
-                        len(role_names)
+                        len(role_names),
+                        settings.get('grant_tab_privs_scope', 'owner')
                     )
                 except oracledb.Error as e:
                     log.warning("读取 Oracle 权限元数据失败，将跳过授权生成：%s", e)
                     object_privileges = []
                     sys_privileges = []
                     role_privileges = []
+                    role_metadata = {}
+                    system_privilege_map = set()
+                    table_privilege_map = set()
 
             if seq_owners and include_sequences:
                 seq_clause = _make_in_clause(seq_owners)
@@ -4273,7 +4717,10 @@ def dump_oracle_metadata(
         blacklist_tables=blacklist_tables,
         object_privileges=object_privileges,
         sys_privileges=sys_privileges,
-        role_privileges=role_privileges
+        role_privileges=role_privileges,
+        role_metadata=role_metadata,
+        system_privilege_map=system_privilege_map,
+        table_privilege_map=table_privilege_map
     )
 
 
@@ -4548,6 +4995,233 @@ def export_dependency_chains(
         return None
 
     return output_path
+
+
+def build_target_to_source_mapping(
+    full_object_mapping: FullObjectMapping
+) -> Dict[Tuple[str, str], str]:
+    mapping: Dict[Tuple[str, str], str] = {}
+    for src_full, type_map in full_object_mapping.items():
+        src_full_u = (src_full or "").upper()
+        for obj_type, tgt_full in type_map.items():
+            key = ((tgt_full or "").upper(), (obj_type or "").upper())
+            if not key[0] or not key[1]:
+                continue
+            mapping.setdefault(key, src_full_u)
+    return mapping
+
+
+def infer_type_from_mapping(
+    full_object_mapping: FullObjectMapping,
+    source_full: str,
+    preferred_types: Tuple[str, ...]
+) -> Optional[str]:
+    type_map = full_object_mapping.get((source_full or "").upper(), {})
+    for obj_type in preferred_types:
+        if obj_type in type_map:
+            return obj_type
+    if type_map:
+        return sorted(type_map.keys())[0]
+    return None
+
+
+def resolve_synonym_chain_target(
+    synonym_full: str,
+    synonym_type: str,
+    target_to_source: Dict[Tuple[str, str], str],
+    synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]],
+    full_object_mapping: FullObjectMapping,
+    remap_rules: RemapRules
+) -> Tuple[Optional[str], Optional[str]]:
+    if (synonym_type or "").upper() != "SYNONYM":
+        return None, None
+    if not synonym_meta:
+        return None, None
+    syn_full_u = (synonym_full or "").upper()
+    src_full = target_to_source.get((syn_full_u, "SYNONYM"), syn_full_u)
+    if '.' not in src_full:
+        return None, None
+    owner, name = src_full.split('.', 1)
+    meta = synonym_meta.get((owner, name))
+    if not meta or not meta.table_owner or not meta.table_name:
+        return None, None
+    if meta.db_link:
+        return None, None
+    target_source = f"{meta.table_owner}.{meta.table_name}".upper()
+    mapped = find_mapped_target_any_type(
+        full_object_mapping,
+        target_source,
+        preferred_types=("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM", "FUNCTION", "PROCEDURE", "PACKAGE", "TYPE")
+    ) or remap_rules.get(target_source) or target_source
+    target_type = infer_type_from_mapping(
+        full_object_mapping,
+        target_source,
+        ("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM", "FUNCTION", "PROCEDURE", "PACKAGE", "TYPE")
+    ) or "UNKNOWN"
+    return (mapped or "").upper(), target_type
+
+
+def build_view_fixup_chains(
+    view_targets: List[str],
+    dependency_pairs: Set[Tuple[str, str, str, str]],
+    full_object_mapping: FullObjectMapping,
+    remap_rules: RemapRules,
+    synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]] = None,
+    ob_meta: Optional[ObMetadata] = None,
+    ob_grant_catalog: Optional[ObGrantCatalog] = None,
+    max_depth: int = 30
+) -> Tuple[List[str], List[str]]:
+    if not view_targets:
+        return [], []
+
+    graph: Dict[DependencyNode, Set[DependencyNode]] = defaultdict(set)
+    all_nodes: Set[DependencyNode] = set()
+
+    for dep_name, dep_type, ref_name, ref_type in dependency_pairs:
+        dep_node = ((dep_name or "").upper(), (dep_type or "").upper())
+        ref_node = ((ref_name or "").upper(), (ref_type or "").upper())
+        if not dep_node[0] or not dep_node[1] or not ref_node[0] or not ref_node[1]:
+            continue
+        graph[dep_node].add(ref_node)
+        all_nodes.add(dep_node)
+        all_nodes.add(ref_node)
+
+    target_to_source = build_target_to_source_mapping(full_object_mapping)
+    synonym_target_map: Dict[DependencyNode, DependencyNode] = {}
+    for node in sorted(all_nodes):
+        if node[1] != "SYNONYM":
+            continue
+        target_full, target_type = resolve_synonym_chain_target(
+            node[0],
+            node[1],
+            target_to_source,
+            synonym_meta,
+            full_object_mapping,
+            remap_rules
+        )
+        if not target_full or not target_type:
+            continue
+        target_node = (target_full, target_type)
+        graph[node].add(target_node)
+        synonym_target_map[node] = target_node
+
+    def _exists(node: DependencyNode) -> str:
+        if not ob_meta:
+            return "UNKNOWN"
+        obj_type = (node[1] or "").upper()
+        obj_full = (node[0] or "").upper()
+        obj_set = ob_meta.objects_by_type.get(obj_type)
+        if obj_set is None:
+            return "UNKNOWN"
+        return "EXISTS" if obj_full in obj_set else "MISSING"
+
+    def _grant_status(dep_node: DependencyNode, ref_node: DependencyNode) -> str:
+        if not ob_grant_catalog:
+            return "GRANT_UNKNOWN"
+        if dep_node in synonym_target_map and synonym_target_map.get(dep_node) == ref_node:
+            return "GRANT_NA"
+        dep_full = (dep_node[0] or "").upper()
+        if '.' not in dep_full:
+            return "GRANT_UNKNOWN"
+        dep_schema = dep_full.split('.', 1)[0]
+
+        ref_full, ref_type = ref_node
+        if ref_node in synonym_target_map:
+            ref_full, ref_type = synonym_target_map[ref_node]
+        ref_full_u = (ref_full or "").upper()
+        if '.' not in ref_full_u:
+            return "GRANT_UNKNOWN"
+        ref_schema = ref_full_u.split('.', 1)[0]
+        if dep_schema == ref_schema:
+            return "GRANT_OK"
+
+        required_priv = GRANT_PRIVILEGE_BY_TYPE.get((ref_type or "").upper())
+        if not required_priv:
+            return "GRANT_UNKNOWN"
+        obj_key = (dep_schema, required_priv, ref_full_u)
+        if obj_key in ob_grant_catalog.object_privs or obj_key in ob_grant_catalog.object_privs_grantable:
+            return "GRANT_OK"
+        implied = SYS_PRIV_IMPLICATIONS.get(required_priv, set())
+        for sys_priv in implied:
+            sys_key = (dep_schema, sys_priv)
+            if sys_key in ob_grant_catalog.sys_privs or sys_key in ob_grant_catalog.sys_privs_admin:
+                return "GRANT_OK"
+        return "GRANT_MISSING"
+
+    def _format_chain(path: List[DependencyNode]) -> str:
+        parts: List[str] = []
+        for idx, node in enumerate(path):
+            obj_type = (node[1] or "UNKNOWN").upper()
+            exists = _exists(node)
+            grant_status = "GRANT_NA" if idx == 0 else _grant_status(path[idx - 1], node)
+            parts.append(f"{node[0]}[{obj_type}|{exists}|{grant_status}]")
+        return " -> ".join(parts)
+
+    chains: List[str] = []
+    cycles: List[str] = []
+
+    def dfs(node: DependencyNode, path: List[DependencyNode], seen: Set[DependencyNode]) -> None:
+        if node in seen:
+            cycles.append(_format_chain(path + [node]) + " (CYCLE)")
+            return
+        if len(path) >= max_depth:
+            chains.append(_format_chain(path) + " -> ... (DEPTH_LIMIT)")
+            return
+        refs = sorted(graph.get(node, set()))
+        if not refs:
+            chains.append(_format_chain(path))
+            return
+        for ref in refs:
+            dfs(ref, path + [ref], seen | {node})
+
+    for view_full in sorted({v.upper() for v in view_targets if v}):
+        view_node = (view_full, "VIEW")
+        if view_node not in graph:
+            chains.append(_format_chain([view_node]))
+            continue
+        dfs(view_node, [view_node], set())
+
+    return chains, cycles
+
+
+def export_view_fixup_chains(
+    view_targets: List[str],
+    dependency_pairs: Set[Tuple[str, str, str, str]],
+    output_path: Path,
+    full_object_mapping: FullObjectMapping,
+    remap_rules: RemapRules,
+    synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]] = None,
+    ob_meta: Optional[ObMetadata] = None,
+    ob_grant_catalog: Optional[ObGrantCatalog] = None
+) -> Optional[Path]:
+    chains, cycles = build_view_fixup_chains(
+        view_targets,
+        dependency_pairs,
+        full_object_mapping,
+        remap_rules,
+        synonym_meta=synonym_meta,
+        ob_meta=ob_meta,
+        ob_grant_catalog=ob_grant_catalog
+    )
+    if not chains:
+        return None
+
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open('w', encoding='utf-8') as f:
+            f.write("# VIEW fixup dependency chains\n")
+            f.write("# 格式: OWNER.OBJ[TYPE|EXISTS|GRANT_STATUS]\n")
+            f.write(f"# views={len(set(view_targets))}, chains={len(chains)}, cycles={len(cycles)}\n\n")
+            for idx, line in enumerate(chains, 1):
+                f.write(f"{idx:05d}. {line}\n")
+            if cycles:
+                f.write("\n[CYCLES]\n")
+                for cyc in cycles:
+                    f.write(f"- {cyc}\n")
+        return output_path
+    except OSError as exc:
+        log.warning("写入 VIEWs_chain 文件失败: %s", exc)
+        return None
 
 
 def check_dependencies_against_ob(
@@ -4826,6 +5500,89 @@ def filter_existing_required_grants(
     return filtered
 
 
+def filter_missing_grant_entries(
+    object_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]],
+    sys_privs_by_grantee: Dict[str, Set[SystemGrantEntry]],
+    role_privs_by_grantee: Dict[str, Set[RoleGrantEntry]],
+    ob_catalog: Optional[ObGrantCatalog]
+) -> Tuple[
+    Dict[str, Set[ObjectGrantEntry]],
+    Dict[str, Set[SystemGrantEntry]],
+    Dict[str, Set[RoleGrantEntry]]
+]:
+    """
+    基于 OB 权限目录过滤已存在的授权，返回缺失授权集合。
+    如果 ob_catalog 为空，返回原始集合（缺失集合=全量）。
+    """
+    if ob_catalog is None:
+        return object_grants_by_grantee, sys_privs_by_grantee, role_privs_by_grantee
+
+    miss_obj: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
+    miss_sys: Dict[str, Set[SystemGrantEntry]] = defaultdict(set)
+    miss_role: Dict[str, Set[RoleGrantEntry]] = defaultdict(set)
+
+    obj_basic = ob_catalog.object_privs
+    obj_grantable = ob_catalog.object_privs_grantable
+    sys_basic = ob_catalog.sys_privs
+    sys_admin = ob_catalog.sys_privs_admin
+    role_basic = ob_catalog.role_privs
+    role_admin = ob_catalog.role_privs_admin
+
+    for grantee, entries in object_grants_by_grantee.items():
+        g_u = (grantee or "").upper()
+        if not g_u:
+            continue
+        for entry in entries:
+            priv_u = (entry.privilege or "").upper()
+            obj_u = (entry.object_full or "").upper()
+            if not priv_u or not obj_u:
+                continue
+            key = (g_u, priv_u, obj_u)
+            if entry.grantable:
+                if key in obj_grantable:
+                    continue
+            else:
+                if key in obj_basic or key in obj_grantable:
+                    continue
+            miss_obj[g_u].add(entry)
+
+    for grantee, entries in sys_privs_by_grantee.items():
+        g_u = (grantee or "").upper()
+        if not g_u:
+            continue
+        for entry in entries:
+            priv_u = (entry.privilege or "").upper()
+            if not priv_u:
+                continue
+            key = (g_u, priv_u)
+            if entry.admin_option:
+                if key in sys_admin:
+                    continue
+            else:
+                if key in sys_basic or key in sys_admin:
+                    continue
+            miss_sys[g_u].add(entry)
+
+    for grantee, entries in role_privs_by_grantee.items():
+        g_u = (grantee or "").upper()
+        if not g_u:
+            continue
+        for entry in entries:
+            role_u = (entry.role or "").upper()
+            if not role_u:
+                continue
+            key = (g_u, role_u)
+            if entry.admin_option:
+                if key in role_admin:
+                    continue
+            else:
+                if key in role_basic or key in role_admin:
+                    continue
+            miss_role[g_u].add(entry)
+
+    return miss_obj, miss_sys, miss_role
+
+
 PRIVILEGE_TYPE_PRIORITY: Tuple[str, ...] = (
     'TABLE',
     'VIEW',
@@ -4947,14 +5704,28 @@ def resolve_synonym_dependency(
     if not synonym_meta or '.' not in ref_full_u:
         return ref_full_u, "SYNONYM"
     owner, name = ref_full_u.split('.', 1)
-    meta = synonym_meta.get((owner, name))
-    if not meta or not meta.table_name:
-        return ref_full_u, "SYNONYM"
-    if meta.db_link:
-        return ref_full_u, "SYNONYM"
-    target_full = f"{meta.table_owner}.{meta.table_name}".upper()
-    obj_type = infer_privilege_object_type(target_full, source_objects) or "TABLE"
-    return target_full, obj_type
+    visited: Set[Tuple[str, str]] = set()
+    cur_owner = owner
+    cur_name = name
+    for _ in range(12):
+        key = (cur_owner, cur_name)
+        if key in visited:
+            break
+        visited.add(key)
+        meta = synonym_meta.get(key)
+        if not meta or not meta.table_name or not meta.table_owner:
+            break
+        if meta.db_link:
+            break
+        target_full = f"{meta.table_owner}.{meta.table_name}".upper()
+        target_key = (meta.table_owner.upper(), meta.table_name.upper())
+        if target_key in synonym_meta:
+            cur_owner, cur_name = target_key
+            continue
+        obj_type = infer_privilege_object_type(target_full, source_objects) or "TABLE"
+        return target_full, obj_type
+    obj_type = infer_privilege_object_type(ref_full_u, source_objects) or "SYNONYM"
+    return ref_full_u, obj_type
 
 
 def build_dependency_pairs_for_grants(
@@ -4969,7 +5740,8 @@ def build_dependency_pairs_for_grants(
     source_dependencies: Optional[SourceDependencySet],
     source_schema_set: Set[str],
     remap_conflicts: Optional[RemapConflictMap],
-    synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]]
+    synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]],
+    progress_interval: float = 10.0
 ) -> Set[Tuple[str, str, str, str]]:
     expected: Set[Tuple[str, str, str, str]] = set()
     if not dependencies:
@@ -5047,7 +5819,13 @@ def build_dependency_pairs_for_grants(
         transitive_cache[node] = seen
         return seen
 
-    for dep in dependencies:
+    total = len(dependencies)
+    if total:
+        log.info("[GRANT] 依赖推导授权处理中，共 %d 条依赖记录。", total)
+    last_log = time.time()
+    progress_interval = max(1.0, progress_interval)
+
+    for idx, dep in enumerate(dependencies, 1):
         dep_full = f"{dep.owner}.{dep.name}".upper()
         dep_type = (dep.object_type or "").upper()
         ref_full = f"{dep.referenced_owner}.{dep.referenced_name}".upper()
@@ -5058,6 +5836,10 @@ def build_dependency_pairs_for_grants(
         if dep_type in view_types:
             for ref_full_t, ref_type_t in get_transitive_refs((dep_full, dep_type)):
                 add_pair(dep_full, dep_type, ref_full_t, ref_type_t)
+        if total and (idx == total or (time.time() - last_log) >= progress_interval):
+            pct = idx * 100.0 / total if total else 100.0
+            log.info("[GRANT] 依赖推导进度 %d/%d (%.1f%%)。", idx, total, pct)
+            last_log = time.time()
 
     return expected
 
@@ -5075,24 +5857,68 @@ def build_grant_plan(
     source_schema_set: Set[str],
     remap_conflicts: Optional[RemapConflictMap],
     synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]],
-    dependencies: Optional[List[DependencyRecord]] = None
+    supported_sys_privs: Optional[Set[str]] = None,
+    supported_object_privs: Optional[Set[str]] = None,
+    oracle_sys_privs_map: Optional[Set[str]] = None,
+    oracle_obj_privs_map: Optional[Set[str]] = None,
+    oracle_roles: Optional[Dict[str, OracleRoleInfo]] = None,
+    ob_roles: Optional[Set[str]] = None,
+    ob_users: Optional[Set[str]] = None,
+    include_oracle_maintained_roles: bool = False,
+    dependencies: Optional[List[DependencyRecord]] = None,
+    progress_interval: float = 10.0
 ) -> GrantPlan:
     object_grants: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
     sys_privs: Dict[str, Set[SystemGrantEntry]] = defaultdict(set)
     role_privs: Dict[str, Set[RoleGrantEntry]] = defaultdict(set)
+    role_ddls: List[str] = []
+    filtered_grants: List[FilteredGrantEntry] = []
 
     schema_mapping = schema_mapping or {}
     role_names = build_role_name_set(oracle_meta.role_privileges, source_schema_set)
     skipped_object_privs = 0
+    target_cache: Dict[Tuple[str, str], Optional[str]] = {}
+    obj_type_cache: Dict[str, str] = {}
+    grantee_cache: Dict[str, str] = {}
+    supported_sys_privs = {p.upper() for p in (supported_sys_privs or set())}
+    if not supported_object_privs:
+        supported_object_privs = set(DEFAULT_SUPPORTED_OBJECT_PRIVS)
+    supported_object_privs = {p.upper() for p in supported_object_privs}
+    oracle_sys_privs_map = oracle_sys_privs_map or oracle_meta.system_privilege_map or set()
+    oracle_obj_privs_map = oracle_obj_privs_map or oracle_meta.table_privilege_map or set()
+    oracle_roles = oracle_roles or oracle_meta.role_metadata or {}
+    ob_roles_input = ob_roles
+    ob_users_input = ob_users
+    ob_roles = {r.upper() for r in (ob_roles or set())}
+    ob_users = {u.upper() for u in (ob_users or set())}
+    ob_roles_loaded = ob_roles_input is not None
+    ob_users_loaded = ob_users_input is not None
+    role_candidates = {r.upper() for r in role_names}
+    role_candidates.update({r.upper() for r in oracle_roles.keys()})
+    missing_role_grantees: Set[str] = set()
+    missing_user_grantees: Set[str] = set()
+    skipped_missing_grants = 0
 
-    # 1) Source object grants (DBA_TAB_PRIVS)
-    for item in oracle_meta.object_privileges:
-        grantee_u = remap_grantee_schema(item.grantee, schema_mapping, role_names)
-        src_full = f"{item.owner}.{item.object_name}".upper()
-        obj_type = normalize_privilege_object_type(item.object_type) or infer_privilege_object_type(src_full, source_objects)
+    def map_grantee(grantee: str) -> str:
+        g_u = (grantee or "").upper()
+        if not g_u:
+            return g_u
+        cached = grantee_cache.get(g_u)
+        if cached is not None:
+            return cached
+        mapped = remap_grantee_schema(g_u, schema_mapping, role_names)
+        grantee_cache[g_u] = mapped
+        return mapped
+
+    def resolve_target_cached(src_full: str, obj_type: str) -> Optional[str]:
+        src_full_u = src_full.upper()
+        obj_type_u = normalize_privilege_object_type(obj_type) or (obj_type or "").upper()
+        key = (src_full_u, obj_type_u)
+        if key in target_cache:
+            return target_cache[key]
         target = resolve_privilege_target(
-            src_full,
-            obj_type,
+            src_full_u,
+            obj_type_u,
             full_mapping,
             remap_rules,
             source_objects,
@@ -5104,28 +5930,171 @@ def build_grant_plan(
             source_schema_set,
             remap_conflicts
         )
+        target_cache[key] = target
+        return target
+
+    view_grant_targets: Set[str] = set()
+    if oracle_meta.object_privileges:
+        view_types = {"VIEW", "MATERIALIZED VIEW"}
+        for item in oracle_meta.object_privileges:
+            owner_u = (item.owner or "").upper()
+            grantee_u = (item.grantee or "").upper()
+            if not owner_u or not grantee_u or grantee_u == owner_u:
+                continue
+            obj_name_u = (item.object_name or "").upper()
+            if not obj_name_u:
+                continue
+            src_full = f"{owner_u}.{obj_name_u}"
+            obj_type = normalize_privilege_object_type(item.object_type)
+            if not obj_type:
+                obj_type = infer_privilege_object_type(src_full, source_objects) or ""
+            if obj_type.upper() not in view_types:
+                continue
+            target = resolve_target_cached(src_full, obj_type)
+            if target:
+                view_grant_targets.add(target.upper())
+
+    def record_filtered(category: str, grantee: str, privilege: str, obj_full: str, reason: str) -> None:
+        filtered_grants.append(FilteredGrantEntry(
+            category=category,
+            grantee=grantee,
+            privilege=privilege,
+            object_full=obj_full,
+            reason=reason
+        ))
+
+    def is_supported_sys_priv(privilege: str) -> Tuple[bool, Optional[str]]:
+        priv_u = (privilege or "").upper()
+        if oracle_sys_privs_map and priv_u not in oracle_sys_privs_map:
+            return False, "NOT_IN_ORACLE_SYSTEM_PRIVILEGE_MAP"
+        if supported_sys_privs and priv_u not in supported_sys_privs:
+            return False, "UNSUPPORTED_SYS_PRIV_IN_OB"
+        return True, None
+
+    def is_supported_object_priv(privilege: str) -> Tuple[bool, Optional[str]]:
+        priv_u = (privilege or "").upper()
+        if oracle_obj_privs_map and priv_u not in oracle_obj_privs_map:
+            return False, "NOT_IN_ORACLE_OBJECT_PRIVILEGE_MAP"
+        if supported_object_privs and priv_u not in supported_object_privs:
+            return False, "UNSUPPORTED_OBJECT_PRIV_IN_OB"
+        return True, None
+
+    def add_object_grant_entry(grantee: str, privilege: str, object_full: str, grantable: bool) -> None:
+        grantee_u = (grantee or "").upper()
+        object_u = (object_full or "").upper()
+        priv_u = (privilege or "").upper()
+        if not grantee_u or not object_u or not priv_u:
+            return
+        if grantable:
+            object_grants[grantee_u].discard(ObjectGrantEntry(priv_u, object_u, False))
+            object_grants[grantee_u].add(ObjectGrantEntry(priv_u, object_u, True))
+            return
+        if ObjectGrantEntry(priv_u, object_u, True) in object_grants[grantee_u]:
+            return
+        object_grants[grantee_u].add(ObjectGrantEntry(priv_u, object_u, False))
+
+    def format_grantee_list(items: Set[str], limit: int = 30) -> str:
+        if not items:
+            return ""
+        sorted_items = sorted(items)
+        if len(sorted_items) <= limit:
+            return ", ".join(sorted_items)
+        return ", ".join(sorted_items[:limit]) + f"...(+{len(sorted_items) - limit})"
+
+    def grantee_exists(grantee: str) -> bool:
+        g_u = (grantee or "").upper()
+        if not g_u:
+            return False
+        if g_u == "PUBLIC":
+            return True
+        if not ob_roles_loaded and not ob_users_loaded:
+            return True
+        if ob_users_loaded and g_u in ob_users:
+            return True
+        if ob_roles_loaded and g_u in ob_roles:
+            return True
+        is_role = g_u in role_candidates
+        if is_role:
+            if ob_roles_loaded:
+                missing_role_grantees.add(g_u)
+                return False
+            return True
+        if ob_users_loaded:
+            missing_user_grantees.add(g_u)
+            return False
+        return True
+
+    # 1) Source object grants (DBA_TAB_PRIVS)
+    total_obj = len(oracle_meta.object_privileges)
+    if total_obj:
+        log.info("[GRANT] 正在处理对象权限 %d 条...", total_obj)
+        if total_obj >= GRANT_WARN_THRESHOLD:
+            log.warning(
+                "[GRANT] 检测到对象授权规模较大（%d 条），授权规划可能耗时较久，请耐心等待。",
+                total_obj
+            )
+    last_log = time.time()
+    progress_interval = max(1.0, progress_interval)
+
+    for idx, item in enumerate(oracle_meta.object_privileges, 1):
+        grantee_u = map_grantee(item.grantee)
+        if not grantee_exists(grantee_u):
+            skipped_missing_grants += 1
+            continue
+        src_full = f"{item.owner}.{item.object_name}".upper()
+        priv_u = (item.privilege or "").upper()
+        ok, reason = is_supported_object_priv(priv_u)
+        if not ok:
+            record_filtered("OBJECT", grantee_u, priv_u, src_full, reason or "UNSUPPORTED_OBJECT_PRIV")
+            if total_obj and (idx == total_obj or (time.time() - last_log) >= progress_interval):
+                pct = idx * 100.0 / total_obj if total_obj else 100.0
+                log.info("[GRANT] 对象权限进度 %d/%d (%.1f%%)。", idx, total_obj, pct)
+                last_log = time.time()
+            continue
+        obj_type = normalize_privilege_object_type(item.object_type)
+        if not obj_type:
+            obj_type = obj_type_cache.get(src_full, "")
+            if not obj_type:
+                obj_type = infer_privilege_object_type(src_full, source_objects) or ""
+                obj_type_cache[src_full] = obj_type
+        target = resolve_target_cached(src_full, obj_type)
         if not target:
             skipped_object_privs += 1
             continue
-        object_grants[grantee_u].add(ObjectGrantEntry(
-            privilege=item.privilege.upper(),
-            object_full=target.upper(),
-            grantable=bool(item.grantable)
-        ))
+        add_object_grant_entry(grantee_u, priv_u, target.upper(), bool(item.grantable))
+        if total_obj and (idx == total_obj or (time.time() - last_log) >= progress_interval):
+            pct = idx * 100.0 / total_obj if total_obj else 100.0
+            log.info("[GRANT] 对象权限进度 %d/%d (%.1f%%)。", idx, total_obj, pct)
+            last_log = time.time()
 
     if skipped_object_privs:
         log.warning("[GRANT] 已跳过 %d 条无法映射的对象授权。", skipped_object_privs)
 
     # 2) System and role grants
+    if oracle_meta.sys_privileges:
+        log.info("[GRANT] 正在处理系统权限 %d 条...", len(oracle_meta.sys_privileges))
     for item in oracle_meta.sys_privileges:
-        grantee_u = remap_grantee_schema(item.grantee, schema_mapping, role_names)
+        grantee_u = map_grantee(item.grantee)
         if not grantee_u:
             continue
-        sys_privs[grantee_u].add(SystemGrantEntry(item.privilege.upper(), bool(item.admin_option)))
+        if not grantee_exists(grantee_u):
+            skipped_missing_grants += 1
+            continue
+        priv_u = (item.privilege or "").upper()
+        ok, reason = is_supported_sys_priv(priv_u)
+        if not ok:
+            record_filtered("SYSTEM", grantee_u, priv_u, "", reason or "UNSUPPORTED_SYS_PRIV")
+            continue
+        sys_privs[grantee_u].add(SystemGrantEntry(priv_u, bool(item.admin_option)))
 
+    if oracle_meta.role_privileges:
+        log.info("[GRANT] 正在处理角色授权 %d 条...", len(oracle_meta.role_privileges))
     for item in oracle_meta.role_privileges:
-        grantee_u = remap_grantee_schema(item.grantee, schema_mapping, role_names)
+        grantee_u = map_grantee(item.grantee)
         if not grantee_u or not item.role:
+            continue
+        if not grantee_exists(grantee_u):
+            skipped_missing_grants += 1
             continue
         role_privs[grantee_u].add(RoleGrantEntry(item.role.upper(), bool(item.admin_option)))
 
@@ -5144,7 +6113,8 @@ def build_grant_plan(
             source_dependencies,
             source_schema_set,
             remap_conflicts,
-            synonym_meta
+            synonym_meta,
+            progress_interval=progress_interval
         )
         for dep_full, dep_type, ref_full, ref_type in expected_pairs:
             if '.' not in dep_full or '.' not in ref_full:
@@ -5153,24 +6123,108 @@ def build_grant_plan(
             ref_schema = ref_full.split('.', 1)[0]
             if dep_schema == ref_schema:
                 continue
+            if not grantee_exists(dep_schema):
+                skipped_missing_grants += 1
+                continue
+            grantable_for_view = dep_full in view_grant_targets and dep_type.upper() in {"VIEW", "MATERIALIZED VIEW"}
             privilege = GRANT_PRIVILEGE_BY_TYPE.get(ref_type.upper())
             if privilege:
-                object_grants[dep_schema].add(ObjectGrantEntry(
-                    privilege=privilege,
-                    object_full=ref_full.upper(),
-                    grantable=False
-                ))
+                ok, reason = is_supported_object_priv(privilege)
+                if ok:
+                    add_object_grant_entry(dep_schema, privilege, ref_full.upper(), grantable_for_view)
+                else:
+                    record_filtered("OBJECT", dep_schema, privilege, ref_full.upper(), reason or "UNSUPPORTED_OBJECT_PRIV")
             if ref_type.upper() == "TABLE" and dep_type.upper() == "TABLE":
-                object_grants[dep_schema].add(ObjectGrantEntry(
-                    privilege="REFERENCES",
-                    object_full=ref_full.upper(),
-                    grantable=False
-                ))
+                ok, reason = is_supported_object_priv("REFERENCES")
+                if ok:
+                    add_object_grant_entry(dep_schema, "REFERENCES", ref_full.upper(), False)
+                else:
+                    record_filtered("OBJECT", dep_schema, "REFERENCES", ref_full.upper(), reason or "UNSUPPORTED_OBJECT_PRIV")
+
+    if missing_user_grantees:
+        log.warning(
+            "[GRANT] 目标端缺失用户 %d 个，已跳过相关授权: %s",
+            len(missing_user_grantees),
+            format_grantee_list(missing_user_grantees)
+        )
+    if missing_role_grantees:
+        log.warning(
+            "[GRANT] 目标端缺失角色 %d 个，已跳过相关授权: %s",
+            len(missing_role_grantees),
+            format_grantee_list(missing_role_grantees)
+        )
+    if skipped_missing_grants and (missing_user_grantees or missing_role_grantees):
+        log.warning(
+            "[GRANT] 共跳过 %d 条授权，请先在目标端创建对应用户/角色后重新生成。",
+            skipped_missing_grants
+        )
+
+    # 4) Role DDL (user-defined roles referenced by grants)
+    referenced_roles: Set[str] = set()
+    known_roles: Set[str] = {r.upper() for r in oracle_roles.keys()}
+    referenced_roles.update({item.role.upper() for item in oracle_meta.role_privileges if item.role})
+    if not known_roles:
+        known_roles = set(referenced_roles)
+    if known_roles:
+        for item in oracle_meta.role_privileges:
+            grantee = (item.grantee or "").upper()
+            if grantee in known_roles:
+                referenced_roles.add(grantee)
+        for item in oracle_meta.sys_privileges:
+            grantee = (item.grantee or "").upper()
+            if grantee in known_roles:
+                referenced_roles.add(grantee)
+        for item in oracle_meta.object_privileges:
+            grantee = (item.grantee or "").upper()
+            if grantee in known_roles:
+                referenced_roles.add(grantee)
+
+    skipped_existing: Set[str] = set()
+    skipped_oracle_maintained: Set[str] = set()
+    role_warnings: List[str] = []
+    for role in sorted(referenced_roles):
+        role_u = (role or "").upper()
+        if not role_u or role_u == "PUBLIC":
+            continue
+        info = oracle_roles.get(role_u)
+        if info and info.oracle_maintained and not include_oracle_maintained_roles:
+            skipped_oracle_maintained.add(role_u)
+            continue
+        if role_u in ob_roles:
+            skipped_existing.add(role_u)
+            continue
+        ddl_lines: List[str] = []
+        if info:
+            meta = [
+                f"AUTHENTICATION_TYPE={info.authentication_type or '-'}",
+                f"PASSWORD_REQUIRED={'YES' if info.password_required else 'NO'}"
+            ]
+            if info.oracle_maintained is not None:
+                meta.append(f"ORACLE_MAINTAINED={'Y' if info.oracle_maintained else 'N'}")
+            ddl_lines.append(f"-- ROLE: {role_u} ({', '.join(meta)})")
+            if info.authentication_type in ROLE_AUTH_WARN_TYPES or info.password_required:
+                role_warnings.append(role_u)
+                ddl_lines.append("-- NOTE: 该角色需要密码/外部认证，已生成 NOT IDENTIFIED，需人工补充。")
+        else:
+            ddl_lines.append(f"-- ROLE: {role_u} (metadata unavailable)")
+        ddl_lines.append(f"CREATE ROLE {role_u};")
+        role_ddls.extend(ddl_lines)
+
+    if role_ddls:
+        log.info("[GRANT] 需生成角色 DDL %d 条。", sum(1 for line in role_ddls if line.startswith("CREATE ROLE ")))
+    if skipped_existing:
+        log.info("[GRANT] 已存在于 OB 的角色（跳过创建）: %s", ", ".join(sorted(skipped_existing)))
+    if skipped_oracle_maintained:
+        log.info("[GRANT] Oracle 维护角色已跳过创建: %s", ", ".join(sorted(skipped_oracle_maintained)))
+    if role_warnings:
+        log.warning("[GRANT] 以下角色需要密码/外部认证，请人工处理: %s", ", ".join(sorted(set(role_warnings))))
 
     return GrantPlan(
         object_grants=object_grants,
         sys_privs=sys_privs,
-        role_privs=role_privs
+        role_privs=role_privs,
+        role_ddls=role_ddls,
+        filtered_grants=filtered_grants
     )
 
 
@@ -7098,8 +8152,6 @@ def clean_view_ddl_for_oceanbase(ddl: str, ob_version: Optional[str] = None) -> 
         # EDITIONABLE 在所有版本都需要移除
         r'\s+EDITIONABLE\s+',
         r'\s+NONEDITIONABLE\s+',
-        # FORCE 关键字
-        r'\bFORCE\s+',
         # BEQUEATH 子句
         r'\s+BEQUEATH\s+(?:CURRENT_USER|DEFINER)',
         # SHARING 子句 (Oracle 12c+)
@@ -7116,9 +8168,6 @@ def clean_view_ddl_for_oceanbase(ddl: str, ob_version: Optional[str] = None) -> 
         # 如果版本 < 4.2.5.7，需要移除 WITH CHECK OPTION
         if compare_version(ob_version, "4.2.5.7") < 0:
             patterns_to_remove.append(r'\s+WITH\s+CHECK\s+OPTION')
-    else:
-        # 版本未知时，保守起见移除 WITH CHECK OPTION
-        patterns_to_remove.append(r'\s+WITH\s+CHECK\s+OPTION')
     
     cleaned_ddl = ddl
     for pattern in patterns_to_remove:
@@ -7176,6 +8225,170 @@ class SqlMasker:
         for k, v in self.literals.items():
             sql = sql.replace(k, v)
         return sql
+
+
+def _find_inline_comment_split(segment: str) -> Optional[int]:
+    if not segment.startswith("--"):
+        return None
+    # Try to detect the next column token after a collapsed inline comment.
+    m = re.search(r"\s+(?:[A-Za-z_][A-Za-z0-9_#$]*|\"[^\"]+\")\.", segment)
+    if m:
+        return m.start()
+    m = re.search(r"\s+FROM\b", segment, flags=re.IGNORECASE)
+    if m:
+        return m.start()
+    return None
+
+
+def fix_inline_comment_collapse(ddl: str) -> str:
+    """
+    修复 SELECT 列表中因换行被压缩导致的行内注释吞行问题。
+    仅在检测到注释后仍有列/FROM 关键字时插入换行。
+    """
+    if not ddl or "--" not in ddl:
+        return ddl
+    out: List[str] = []
+    i = 0
+    in_single = False
+    in_double = False
+    in_block = False
+    while i < len(ddl):
+        ch = ddl[i]
+        nxt = ddl[i + 1] if i + 1 < len(ddl) else ""
+
+        if in_block:
+            if ch == "*" and nxt == "/":
+                out.append("*/")
+                i += 2
+                in_block = False
+                continue
+            out.append(ch)
+            i += 1
+            continue
+
+        if in_single:
+            out.append(ch)
+            if ch == "'" and nxt == "'":
+                out.append(nxt)
+                i += 2
+                continue
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+
+        if in_double:
+            out.append(ch)
+            if ch == '"' and nxt == '"':
+                out.append(nxt)
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+
+        if ch == "'" and not in_double:
+            in_single = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            in_block = True
+            out.append("/*")
+            i += 2
+            continue
+
+        if ch == "-" and nxt == "-":
+            line_end = ddl.find("\n", i)
+            if line_end == -1:
+                line_end = len(ddl)
+            segment = ddl[i:line_end]
+            split_at = _find_inline_comment_split(segment)
+            if split_at is not None:
+                out.append(segment[:split_at])
+                out.append("\n")
+                i += split_at
+                continue
+            out.append(segment)
+            i = line_end
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def repair_split_identifiers(ddl: str, column_names: Set[str]) -> str:
+    """
+    修复被错误拆分的列标识符，例如 TOT_P ERM -> TOT_PERM。
+    仅当拼接后命中视图列元数据时才会修复。
+    """
+    if not ddl or not column_names:
+        return ddl
+    names_upper = {c.upper() for c in column_names if c}
+    masker = SqlMasker(ddl)
+    masked = masker.masked_sql
+    chars = list(masked)
+    length = len(masked)
+    i = 0
+
+    def _is_ident_start(ch: str) -> bool:
+        return ch.isalpha() or ch == "_"
+
+    def _is_ident_char(ch: str) -> bool:
+        return ch.isalnum() or ch in "_#$"
+
+    while i < length:
+        ch = masked[i]
+        if not _is_ident_start(ch):
+            i += 1
+            continue
+        if i > 0 and masked[i - 1] == '"':
+            i += 1
+            continue
+        j = i + 1
+        while j < length and _is_ident_char(masked[j]):
+            j += 1
+        k = j
+        while k < length and masked[k].isspace():
+            k += 1
+        if k == j or k >= length or not _is_ident_start(masked[k]):
+            i = j
+            continue
+        if masked[k - 1] == '"' or (k + 1 < length and masked[k + 1] == '"'):
+            i = j
+            continue
+        l = k + 1
+        while l < length and _is_ident_char(masked[l]):
+            l += 1
+        combined = f"{masked[i:j]}{masked[k:l]}".upper()
+        if combined in names_upper:
+            for idx in range(j, k):
+                chars[idx] = ""
+            i = l
+            continue
+        i = j
+
+    return masker.unmask("".join(chars))
+
+
+def sanitize_view_ddl(ddl: str, column_names: Optional[Set[str]] = None) -> str:
+    """
+    对 VIEW DDL 进行质量修复：修复行内注释吞行、拆分列名。
+    """
+    if not ddl:
+        return ddl
+    cleaned = fix_inline_comment_collapse(ddl)
+    if column_names:
+        cleaned = repair_split_identifiers(cleaned, column_names)
+    return cleaned
 
 
 def extract_view_dependencies(ddl: str, default_schema: Optional[str] = None) -> Set[str]:
@@ -8942,7 +10155,9 @@ def generate_fixup_scripts(
     expected_dependency_pairs: Optional[Set[Tuple[str, str, str, str]]] = None,
     synonym_metadata: Optional[Dict[Tuple[str, str], SynonymMeta]] = None,
     trigger_filter_entries: Optional[Set[str]] = None,
-    trigger_filter_enabled: bool = False
+    trigger_filter_enabled: bool = False,
+    report_dir: Optional[Path] = None,
+    report_timestamp: Optional[str] = None
 ):
     """
     基于校验结果生成 fixup_scripts DDL 脚本，并按依赖顺序排列：
@@ -8973,10 +10188,12 @@ def generate_fixup_scripts(
     allowed_synonym_targets = {s.upper() for s in settings.get('source_schemas_list', [])}
 
     base_dir = Path(settings.get('fixup_dir', 'fixup_scripts')).expanduser()
+    log.info("[FIXUP] 准备生成修补脚本，目标目录=%s", base_dir.resolve())
+    view_chain_file: Optional[Path] = None
 
     if not master_list:
         log.info("[FIXUP] master_list 为空，未生成目标端订正 SQL。")
-        return
+        return None
 
     ensure_dir(base_dir)
     safe_to_clean = False
@@ -8988,11 +10205,17 @@ def generate_fixup_scripts(
         safe_to_clean = not base_dir.is_absolute()
 
     if safe_to_clean:
+        removed_files = 0
+        removed_dirs = 0
+        log.info("[FIXUP] 正在清理旧脚本目录: %s", base_dir.resolve())
         for child in base_dir.iterdir():
             if child.is_file():
                 child.unlink()
+                removed_files += 1
             elif child.is_dir():
                 shutil.rmtree(child, ignore_errors=True)
+                removed_dirs += 1
+        log.info("[FIXUP] 旧脚本清理完成: files=%d, dirs=%d", removed_files, removed_dirs)
     else:
         log.warning(
             "[FIXUP] fixup_dir=%s 位于运行目录之外，已跳过自动清理以避免误删。",
@@ -9110,6 +10333,17 @@ def generate_fixup_scripts(
                 )
                 return ddl, "META_SYN", elapsed
 
+        # VIEW 固定使用 DBMS_METADATA，忽略 dbcat 输出
+        if obj_type.upper() == 'VIEW':
+            ddl = get_fallback_ddl(schema, obj_type, obj_name)
+            source_label = "DBMS_METADATA" if ddl else "MISSING"
+            elapsed = time.time() - start_time
+            log.info(
+                "[DDL_FETCH] %s.%s (%s) 来源=%s 耗时=%.3fs",
+                schema, obj_name, obj_type, source_label, elapsed
+            )
+            return ddl, source_label, elapsed
+
         ddl = (
             dbcat_data
             .get(schema.upper(), {})
@@ -9216,9 +10450,21 @@ def generate_fixup_scripts(
 
     grant_enabled = bool(enable_grant_generation)
     if grant_plan is None:
-        grant_plan = GrantPlan(object_grants={}, sys_privs={}, role_privs={})
+        grant_plan = GrantPlan(
+            object_grants={},
+            sys_privs={},
+            role_privs={},
+            role_ddls=[],
+            filtered_grants=[]
+        )
     if not grant_enabled:
-        grant_plan = GrantPlan(object_grants={}, sys_privs={}, role_privs={})
+        grant_plan = GrantPlan(
+            object_grants={},
+            sys_privs={},
+            role_privs={},
+            role_ddls=[],
+            filtered_grants=[]
+        )
 
     object_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
     sys_privs_by_grantee: Dict[str, Set[SystemGrantEntry]] = defaultdict(set)
@@ -9235,11 +10481,27 @@ def generate_fixup_scripts(
             if entries:
                 role_privs_by_grantee[(grantee or "").upper()].update(entries)
 
-    object_grant_lookup: Dict[str, List[str]] = defaultdict(list)
+    object_grant_lookup: Dict[str, List[str]] = {}
+    grants_by_owner: Dict[str, Set[str]] = {}
+    merge_privileges = parse_bool_flag(settings.get('grant_merge_privileges', 'true'), True)
+    merge_grantees = parse_bool_flag(settings.get('grant_merge_grantees', 'true'), True)
 
     def format_object_grant(grantee: str, entry: ObjectGrantEntry) -> str:
         stmt = f"GRANT {entry.privilege.upper()} ON {entry.object_full.upper()} TO {grantee.upper()}"
         if entry.grantable:
+            stmt += " WITH GRANT OPTION"
+        return stmt + ";"
+
+    def format_object_grant_stmt(
+        privileges: List[str],
+        object_full: str,
+        grantees: List[str],
+        grantable: bool
+    ) -> str:
+        priv_part = ", ".join(privileges)
+        grantee_part = ", ".join(grantees)
+        stmt = f"GRANT {priv_part} ON {object_full.upper()} TO {grantee_part}"
+        if grantable:
             stmt += " WITH GRANT OPTION"
         return stmt + ";"
 
@@ -9263,10 +10525,24 @@ def generate_fixup_scripts(
         privilege_u = (privilege or "").upper()
         if not grantee_u or not object_u or not privilege_u:
             return
+        if grantable:
+            object_grants_by_grantee[grantee_u].discard(ObjectGrantEntry(
+                privilege=privilege_u,
+                object_full=object_u,
+                grantable=False
+            ))
+            object_grants_by_grantee[grantee_u].add(ObjectGrantEntry(
+                privilege=privilege_u,
+                object_full=object_u,
+                grantable=True
+            ))
+            return
+        if ObjectGrantEntry(privilege_u, object_u, True) in object_grants_by_grantee[grantee_u]:
+            return
         object_grants_by_grantee[grantee_u].add(ObjectGrantEntry(
             privilege=privilege_u,
             object_full=object_u,
-            grantable=bool(grantable)
+            grantable=False
         ))
 
     def collect_grants_for_object(target_full: str) -> List[str]:
@@ -9274,15 +10550,124 @@ def generate_fixup_scripts(
             return []
         return sorted(set(object_grant_lookup.get(target_full.upper(), [])))
 
-    if grant_enabled and object_grants_by_grantee:
-        for grantee, entries in object_grants_by_grantee.items():
+    def build_object_grant_statements_for(
+        grants_by_grantee: Dict[str, Set[ObjectGrantEntry]]
+    ) -> Tuple[int, int, Dict[str, List[str]], Dict[str, Set[str]]]:
+        object_grant_lookup_local: Dict[str, List[str]] = defaultdict(list)
+        grants_by_owner_local: Dict[str, Set[str]] = defaultdict(set)
+        raw_count = sum(len(v) for v in grants_by_grantee.values())
+        if not raw_count:
+            return 0, 0, dict(object_grant_lookup_local), dict(grants_by_owner_local)
+        object_index: Dict[str, Dict[bool, Dict[str, Set[str]]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
+        for grantee, entries in grants_by_grantee.items():
             grantee_u = (grantee or "").upper()
             if not grantee_u:
                 continue
             for entry in entries:
                 if not entry or not entry.object_full:
                     continue
-                object_grant_lookup[entry.object_full.upper()].append(format_object_grant(grantee_u, entry))
+                obj_full_u = entry.object_full.upper()
+                object_index[obj_full_u][bool(entry.grantable)][grantee_u].add(entry.privilege.upper())
+
+        merged_count = 0
+        for obj_full, grantable_map in object_index.items():
+            owner = obj_full.split('.', 1)[0] if '.' in obj_full else obj_full
+            for grantable, grantee_map in grantable_map.items():
+                if merge_grantees:
+                    if merge_privileges:
+                        group_by_privs: Dict[Tuple[str, ...], Set[str]] = defaultdict(set)
+                        for grantee_u, privs in grantee_map.items():
+                            priv_key = tuple(sorted(privs))
+                            group_by_privs[priv_key].add(grantee_u)
+                        for priv_key, grantees in group_by_privs.items():
+                            stmt = format_object_grant_stmt(
+                                list(priv_key),
+                                obj_full,
+                                sorted(grantees),
+                                grantable
+                            )
+                            object_grant_lookup_local[obj_full].append(stmt)
+                            grants_by_owner_local[owner].add(stmt)
+                            merged_count += 1
+                    else:
+                        group_by_priv: Dict[str, Set[str]] = defaultdict(set)
+                        for grantee_u, privs in grantee_map.items():
+                            for priv in privs:
+                                group_by_priv[priv].add(grantee_u)
+                        for priv, grantees in group_by_priv.items():
+                            stmt = format_object_grant_stmt(
+                                [priv],
+                                obj_full,
+                                sorted(grantees),
+                                grantable
+                            )
+                            object_grant_lookup_local[obj_full].append(stmt)
+                            grants_by_owner_local[owner].add(stmt)
+                            merged_count += 1
+                else:
+                    for grantee_u, privs in grantee_map.items():
+                        if merge_privileges:
+                            stmt = format_object_grant_stmt(
+                                sorted(privs),
+                                obj_full,
+                                [grantee_u],
+                                grantable
+                            )
+                            object_grant_lookup_local[obj_full].append(stmt)
+                            grants_by_owner_local[owner].add(stmt)
+                            merged_count += 1
+                        else:
+                            for priv in sorted(privs):
+                                stmt = format_object_grant_stmt(
+                                    [priv],
+                                    obj_full,
+                                    [grantee_u],
+                                    grantable
+                                )
+                                object_grant_lookup_local[obj_full].append(stmt)
+                                grants_by_owner_local[owner].add(stmt)
+                                merged_count += 1
+        return raw_count, merged_count, dict(object_grant_lookup_local), dict(grants_by_owner_local)
+
+    def pre_add_cross_schema_grants(
+        constraint_tasks: List[Tuple[ConstraintMismatch, str, str, str, str]],
+        trigger_tasks: List[Tuple[str, str, str, str, str, str, str]]
+    ) -> int:
+        if not grant_enabled:
+            return 0
+        added = 0
+        for item, src_schema, src_table, tgt_schema, _tgt_table in constraint_tasks:
+            cons_map = oracle_meta.constraints.get((src_schema.upper(), src_table.upper()), {})
+            for cons_name in item.missing_constraints:
+                cons_meta = cons_map.get(cons_name.upper())
+                if not cons_meta:
+                    continue
+                ctype = (cons_meta.get("type") or "").upper()
+                if ctype != "R":
+                    continue
+                ref_owner = cons_meta.get("ref_table_owner") or cons_meta.get("r_owner")
+                ref_table = cons_meta.get("ref_table_name")
+                if not ref_owner or not ref_table:
+                    continue
+                ref_owner_u = ref_owner.upper()
+                ref_table_u = ref_table.upper()
+                ref_src_full = f"{ref_owner_u}.{ref_table_u}"
+                ref_tgt_full = get_mapped_target(full_object_mapping, ref_src_full, 'TABLE') or ref_src_full
+                if '.' in ref_tgt_full:
+                    ref_tgt_schema, ref_tgt_table = ref_tgt_full.split('.', 1)
+                else:
+                    ref_tgt_schema, ref_tgt_table = ref_owner_u, ref_table_u
+                if ref_tgt_schema.upper() != tgt_schema.upper():
+                    add_object_grant(tgt_schema, "REFERENCES", f"{ref_tgt_schema}.{ref_tgt_table}")
+                    added += 1
+
+        for _ss, _tn, ts, _to, _st, tts, tt in trigger_tasks:
+            if tts and tt and ts and tts.upper() != ts.upper():
+                required_priv = GRANT_PRIVILEGE_BY_TYPE.get('TABLE', 'SELECT')
+                add_object_grant(ts, required_priv, f"{tts}.{tt}")
+                added += 1
+
+        return added
 
     schema_requests: Dict[str, Dict[str, Set[str]]] = defaultdict(lambda: defaultdict(set))
     unsupported_types: Set[str] = set()
@@ -9301,6 +10686,9 @@ def generate_fixup_scripts(
         obj_type_u = obj_type.upper()
         schema_u = schema.upper()
         obj_name_u = obj_name.upper()
+        if obj_type_u == 'VIEW':
+            # VIEW 固定走 DBMS_METADATA，不加入 dbcat 导出队列
+            return
         if schema_u == 'PUBLIC' and obj_type_u == 'SYNONYM':
             public_synonym_fallback.add((schema_u, obj_name_u))
             return
@@ -9461,7 +10849,47 @@ def generate_fixup_scripts(
     )
     log.info("[FIXUP] 进度日志间隔 %.0f 秒，可通过 progress_log_interval 配置。", progress_log_interval)
     if public_synonym_fallback:
-        log.info("[FIXUP] 检测到 %d 个 PUBLIC 同义词，将跳过 dbcat，改用 DBMS_METADATA 导出并清理 EDITIONABLE 关键字。", len(public_synonym_fallback))
+        log.info(
+            "[FIXUP] 检测到 %d 个 PUBLIC 同义词，将跳过 dbcat，优先使用同义词元数据；缺失时再用 DBMS_METADATA 兜底。",
+            len(public_synonym_fallback)
+        )
+
+    ob_grant_catalog: Optional[ObGrantCatalog] = None
+    object_grants_missing_by_grantee: Dict[str, Set[ObjectGrantEntry]] = {}
+    sys_privs_missing_by_grantee: Dict[str, Set[SystemGrantEntry]] = {}
+    role_privs_missing_by_grantee: Dict[str, Set[RoleGrantEntry]] = {}
+
+    if grant_enabled:
+        pre_added = pre_add_cross_schema_grants(constraint_tasks, trigger_tasks)
+        if pre_added:
+            log.info("[GRANT] 预追加跨 schema 授权 %d 条 (FK/Trigger)。", pre_added)
+        expected_grantees = set(object_grants_by_grantee.keys())
+        expected_grantees.update(sys_privs_by_grantee.keys())
+        expected_grantees.update(role_privs_by_grantee.keys())
+        ob_grant_catalog = load_ob_grant_catalog(ob_cfg, expected_grantees)
+        if ob_grant_catalog is None:
+            log.warning("[GRANT_MISS] OB 权限读取失败，缺失授权将退化为全量输出。")
+        (
+            object_grants_missing_by_grantee,
+            sys_privs_missing_by_grantee,
+            role_privs_missing_by_grantee
+        ) = filter_missing_grant_entries(
+            object_grants_by_grantee,
+            sys_privs_by_grantee,
+            role_privs_by_grantee,
+            ob_grant_catalog
+        )
+        if object_grants_by_grantee:
+            raw_count, merged_count, object_grant_lookup, grants_by_owner = build_object_grant_statements_for(
+                object_grants_by_grantee
+            )
+            log.info(
+                "[GRANT] 对象授权合并: 原始=%d, 合并后=%d, merge_privileges=%s, merge_grantees=%s",
+                raw_count,
+                merged_count,
+                "true" if merge_privileges else "false",
+                "true" if merge_grantees else "false"
+            )
 
     # 分离VIEW对象和其他对象（需要在使用前定义）
     view_missing_objects: List[Tuple[str, str, str, str]] = []
@@ -9472,6 +10900,26 @@ def generate_fixup_scripts(
             view_missing_objects.append((src_schema, src_obj, tgt_schema, tgt_obj))
         else:
             non_view_missing_objects.append((obj_type, src_schema, src_obj, tgt_schema, tgt_obj))
+
+    if report_dir and report_timestamp and view_missing_objects:
+        view_targets = [f"{tgt_schema}.{tgt_obj}" for _, _, tgt_schema, tgt_obj in view_missing_objects]
+        dep_pairs = expected_dependency_pairs or set()
+        if dep_pairs:
+            view_chain_path = Path(report_dir) / f"VIEWs_chain_{report_timestamp}.txt"
+            view_chain_file = export_view_fixup_chains(
+                view_targets,
+                dep_pairs,
+                view_chain_path,
+                full_object_mapping,
+                remap_rules,
+                synonym_meta=synonym_meta_map,
+                ob_meta=ob_meta,
+                ob_grant_catalog=ob_grant_catalog
+            )
+            if view_chain_file:
+                log.info("VIEW fixup 依赖链已输出: %s", view_chain_file)
+            else:
+                log.info("VIEW fixup 依赖链输出已跳过（无链路或写入失败）。")
 
     dbcat_data, ddl_source_meta = fetch_dbcat_schema_objects(ora_cfg, settings, schema_requests)
 
@@ -9485,10 +10933,9 @@ def generate_fixup_scripts(
         if not dbcat_data.get(src_schema.upper(), {}).get(obj_type.upper(), {}).get(src_obj.upper()):
             fallback_needed.append((src_schema, obj_type, src_obj))
 
-    # 视图任务（dbcat 缺失时允许 DBMS_METADATA 兜底）
+    # 视图任务（VIEW 固定使用 DBMS_METADATA）
     for src_schema, src_obj, _, _ in view_missing_objects:
-        if not dbcat_data.get(src_schema.upper(), {}).get('VIEW', {}).get(src_obj.upper()):
-            fallback_needed.append((src_schema, 'VIEW', src_obj))
+        fallback_needed.append((src_schema, 'VIEW', src_obj))
     
     # 序列任务
     for src_schema, src_seq, tgt_schema, tgt_seq in sequence_tasks:
@@ -9804,7 +11251,7 @@ def generate_fixup_scripts(
                         log.debug(f"[FIXUP] 提取 VIEW {src_schema}.{src_obj} 依赖失败: {e}")
             
             # Step 3: Topological sort using Kahn's algorithm
-            from collections import defaultdict, deque
+            from collections import deque
             in_degree = defaultdict(int)
             dep_graph = defaultdict(set)  # dependency -> [dependents]
             
@@ -9863,6 +11310,10 @@ def generate_fixup_scripts(
                 
                 # 清理DDL使其兼容OceanBase
                 cleaned_ddl = clean_view_ddl_for_oceanbase(raw_ddl, ob_version)
+
+                # 修复 dbcat DDL 的注释/列名异常
+                col_meta = oracle_meta.table_columns.get((src_schema.upper(), src_obj.upper()), {}) or {}
+                cleaned_ddl = sanitize_view_ddl(cleaned_ddl, set(col_meta.keys()))
                 
                 # 重写依赖对象引用
                 remapped_ddl = remap_view_dependencies(
@@ -10350,19 +11801,31 @@ def generate_fixup_scripts(
         log.info("[FIXUP] (8/9) 无需生成依赖重编译脚本。")
 
     if grant_enabled:
+        grant_dir_all = 'grants_all'
+        grant_dir_miss = 'grants_miss'
+
+        if grant_plan.role_ddls:
+            role_content = "\n".join(grant_plan.role_ddls).strip()
+            if role_content:
+                log.info("[FIXUP] (9/9) 正在生成角色 DDL 脚本...")
+                write_fixup_file(
+                    base_dir,
+                    grant_dir_all,
+                    "roles.sql",
+                    role_content,
+                    "角色 DDL (来自 Oracle 授权引用)"
+                )
+                write_fixup_file(
+                    base_dir,
+                    grant_dir_miss,
+                    "roles.sql",
+                    role_content,
+                    "角色 DDL (来自 Oracle 授权引用)"
+                )
+
         if object_grants_by_grantee or sys_privs_by_grantee or role_privs_by_grantee:
             log.info("[FIXUP] (9/9) 正在生成授权脚本...")
-            grants_by_owner: Dict[str, Set[str]] = defaultdict(set)
-            for grantee, entries in sorted(object_grants_by_grantee.items()):
-                if not entries:
-                    continue
-                for entry in entries:
-                    if not entry.object_full or '.' not in entry.object_full:
-                        continue
-                    owner, _ = entry.object_full.split('.', 1)
-                    stmt = format_object_grant(grantee, entry)
-                    grants_by_owner[owner.upper()].add(stmt)
-
+            # --- grants_all ---
             if grants_by_owner:
                 for owner, stmts in sorted(grants_by_owner.items()):
                     if not stmts:
@@ -10371,7 +11834,7 @@ def generate_fixup_scripts(
                     header = f"{owner} 对象权限授权"
                     write_fixup_file(
                         base_dir,
-                        'grants',
+                        grant_dir_all,
                         f"{owner}.grants.sql",
                         content,
                         header
@@ -10392,16 +11855,65 @@ def generate_fixup_scripts(
                 header = f"{grantee} 系统/角色权限授权"
                 write_fixup_file(
                     base_dir,
-                    'grants',
+                    grant_dir_all,
                     f"{grantee}.privs.sql",
                     content,
                     header
                 )
 
-            if not grants_by_owner and not privs_by_grantee:
+            # --- grants_miss ---
+            miss_grants_by_owner: Dict[str, Set[str]] = {}
+            if object_grants_missing_by_grantee:
+                _raw_miss, _merged_miss, _obj_lookup_miss, miss_grants_by_owner = (
+                    build_object_grant_statements_for(object_grants_missing_by_grantee)
+                )
+
+            if miss_grants_by_owner:
+                for owner, stmts in sorted(miss_grants_by_owner.items()):
+                    if not stmts:
+                        continue
+                    content = prepend_set_schema("\n".join(sorted(stmts)), owner)
+                    header = f"{owner} 对象权限授权"
+                    write_fixup_file(
+                        base_dir,
+                        grant_dir_miss,
+                        f"{owner}.grants.sql",
+                        content,
+                        header
+                    )
+
+            miss_privs_by_grantee: Dict[str, Set[str]] = defaultdict(set)
+            for grantee, entries in sys_privs_missing_by_grantee.items():
+                for entry in entries:
+                    miss_privs_by_grantee[grantee.upper()].add(format_sys_grant(grantee, entry))
+            for grantee, entries in role_privs_missing_by_grantee.items():
+                for entry in entries:
+                    miss_privs_by_grantee[grantee.upper()].add(format_role_grant(grantee, entry))
+
+            for grantee, stmts in sorted(miss_privs_by_grantee.items()):
+                if not stmts:
+                    continue
+                content = "\n".join(sorted(stmts))
+                header = f"{grantee} 系统/角色权限授权"
+                write_fixup_file(
+                    base_dir,
+                    grant_dir_miss,
+                    f"{grantee}.privs.sql",
+                    content,
+                    header
+                )
+
+            if (
+                not grants_by_owner
+                and not privs_by_grantee
+                and not grant_plan.role_ddls
+                and not miss_grants_by_owner
+                and not miss_privs_by_grantee
+            ):
                 log.info("[FIXUP] (9/9) 无需生成授权脚本。")
         else:
-            log.info("[FIXUP] (9/9) 无需生成授权脚本。")
+            if not grant_plan.role_ddls:
+                log.info("[FIXUP] (9/9) 无需生成授权脚本。")
     else:
         log.info("[FIXUP] (9/9) 授权脚本生成已关闭。")
 
@@ -10429,6 +11941,7 @@ def generate_fixup_scripts(
             "[dbcat] 以下对象类型当前未集成自动导出，需人工处理: %s",
             ", ".join(sorted(unsupported_types))
         )
+    return view_chain_file
 
 
 # ====================== 报告输出 (Rich) ======================
@@ -10522,6 +12035,7 @@ def export_missing_table_view_mappings(
 ) -> Optional[Path]:
     """
     将缺失的 TABLE/VIEW 映射按目标 schema 输出为文本，便于迁移工具直接消费。
+    输出文件示例：SCHEMA_T.txt / SCHEMA_V.txt
     若提供 blacklisted_tables，则跳过黑名单 TABLE。
     """
     if not report_dir:
@@ -10531,11 +12045,12 @@ def export_missing_table_view_mappings(
     if output_dir.exists():
         shutil.rmtree(output_dir, ignore_errors=True)
 
-    grouped: Dict[str, List[str]] = defaultdict(list)
+    grouped: Dict[str, Dict[str, List[str]]] = defaultdict(lambda: {"TABLE": [], "VIEW": []})
     for obj_type, tgt_name, src_name in tv_results.get("missing", []):
-        if obj_type.upper() not in ("TABLE", "VIEW"):
+        obj_type_u = obj_type.upper()
+        if obj_type_u not in ("TABLE", "VIEW"):
             continue
-        if obj_type.upper() == "TABLE" and blacklisted_tables:
+        if obj_type_u == "TABLE" and blacklisted_tables:
             src_key = parse_full_object_name(src_name)
             if src_key and src_key in blacklisted_tables:
                 continue
@@ -10544,7 +12059,7 @@ def export_missing_table_view_mappings(
         tgt_schema = tgt_name.split(".")[0].upper()
         formatted = format_missing_mapping(src_name, tgt_name)
         if formatted:
-            grouped[tgt_schema].append(formatted)
+            grouped[tgt_schema][obj_type_u].append(formatted)
 
     if not grouped:
         return None
@@ -10555,13 +12070,17 @@ def export_missing_table_view_mappings(
         log.warning("无法创建缺失 TABLE/VIEW 映射目录 %s: %s", output_dir, exc)
         return None
 
-    for tgt_schema, mappings in sorted(grouped.items()):
-        file_path = output_dir / f"{tgt_schema}.txt"
-        lines = sorted(set(mappings))
-        try:
-            file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        except OSError as exc:
-            log.warning("写入缺失映射文件失败 %s: %s", file_path, exc)
+    for tgt_schema, type_map in sorted(grouped.items()):
+        for obj_type, mappings in sorted(type_map.items()):
+            if not mappings:
+                continue
+            suffix = "T" if obj_type == "TABLE" else "V"
+            file_path = output_dir / f"{tgt_schema}_{suffix}.txt"
+            lines = sorted(set(mappings))
+            try:
+                file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            except OSError as exc:
+                log.warning("写入缺失映射文件失败 %s: %s", file_path, exc)
     return output_dir
 
 
@@ -10828,6 +12347,62 @@ def export_trigger_miss_report(
         return None
 
 
+def export_filtered_grants(
+    filtered_grants: List[FilteredGrantEntry],
+    report_dir: Path
+) -> Optional[Path]:
+    """
+    输出被过滤掉的 GRANT 权限清单。
+    """
+    if not report_dir or not filtered_grants:
+        return None
+
+    output_path = Path(report_dir) / "filtered_grants.txt"
+    rows = sorted(
+        filtered_grants,
+        key=lambda r: (r.category, r.grantee, r.privilege, r.object_full, r.reason)
+    )
+    lines: List[str] = [
+        "# 被过滤掉的 GRANT 权限 (Oracle/OB 不兼容或未知权限)",
+        f"# total={len(rows)}",
+        "# 字段说明: CATEGORY | GRANTEE | PRIVILEGE | OBJECT | REASON"
+    ]
+
+    cat_w = max(len("CATEGORY"), max((len(r.category) for r in rows), default=0))
+    grantee_w = max(len("GRANTEE"), max((len(r.grantee) for r in rows), default=0))
+    priv_w = max(len("PRIVILEGE"), max((len(r.privilege) for r in rows), default=0))
+    obj_w = max(len("OBJECT"), max((len(r.object_full or "-") for r in rows), default=0))
+
+    header = (
+        f"{'CATEGORY'.ljust(cat_w)}  "
+        f"{'GRANTEE'.ljust(grantee_w)}  "
+        f"{'PRIVILEGE'.ljust(priv_w)}  "
+        f"{'OBJECT'.ljust(obj_w)}  "
+        f"REASON"
+    )
+    lines.append(header)
+    lines.append("-" * len(header))
+
+    for row in rows:
+        obj = row.object_full or "-"
+        lines.append(
+            f"{row.category.ljust(cat_w)}  "
+            f"{row.grantee.ljust(grantee_w)}  "
+            f"{row.privilege.ljust(priv_w)}  "
+            f"{obj.ljust(obj_w)}  "
+            f"{row.reason}"
+        )
+
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        content = "\n".join(lines).rstrip() + "\n"
+        output_path.write_text(content, encoding="utf-8")
+        return output_path
+    except OSError as exc:
+        log.warning("写入 filtered_grants 报告失败 %s: %s", output_path, exc)
+        return None
+
+
 def collect_blacklisted_missing_tables(
     tv_results: ReportResults,
     blacklist_tables: BlacklistTableMap
@@ -10862,7 +12437,9 @@ def build_run_summary(
     remap_conflicts: List[Tuple[str, str, str]],
     extraneous_rules: List[str],
     blacklisted_missing_tables: Optional[BlacklistTableMap],
-    report_file: Optional[Path]
+    report_file: Optional[Path],
+    filtered_grants_path: Optional[Path] = None,
+    filtered_grants_count: int = 0
 ) -> RunSummary:
     end_time = datetime.now()
     total_seconds = time.perf_counter() - ctx.start_perf
@@ -10906,6 +12483,8 @@ def build_run_summary(
         actions_done.append("依赖校验: 启用")
         if ctx.dependency_chain_file:
             actions_done.append(f"依赖链路输出: {ctx.dependency_chain_file}")
+        if ctx.view_chain_file:
+            actions_done.append(f"VIEW fixup 链路输出: {ctx.view_chain_file}")
     else:
         actions_skipped.append("依赖校验: check_dependencies=false")
 
@@ -10921,7 +12500,12 @@ def build_run_summary(
 
     if ctx.enable_grant_generation:
         if ctx.fixup_enabled:
-            actions_done.append(f"授权脚本生成: 启用 (目录 {Path(ctx.fixup_dir) / 'grants'})")
+            actions_done.append(
+                "授权脚本生成: 启用 (目录 {miss}, {all})".format(
+                    miss=Path(ctx.fixup_dir) / 'grants_miss',
+                    all=Path(ctx.fixup_dir) / 'grants_all'
+                )
+            )
         else:
             actions_skipped.append("授权脚本生成: generate_fixup=false")
     else:
@@ -10983,6 +12567,11 @@ def build_run_summary(
         )
     if ctx.enable_dependencies_check:
         findings.append(f"依赖差异: 缺失 {dep_missing_cnt}, 额外 {dep_unexpected_cnt}, 跳过 {dep_skipped_cnt}")
+    if filtered_grants_count:
+        if filtered_grants_path:
+            findings.append(f"权限兼容过滤: {filtered_grants_count} 条 (见 {filtered_grants_path})")
+        else:
+            findings.append(f"权限兼容过滤: {filtered_grants_count} 条")
 
     if trigger_summary.get("enabled"):
         if trigger_summary.get("fallback_full"):
@@ -11034,7 +12623,7 @@ def build_run_summary(
         else:
             next_steps.append("如需自动生成修补脚本，请设置 generate_fixup=true。")
     if missing_count:
-        next_steps.append("将 main_reports/tables_views_miss 下的规则提供给 OMS 进行迁移。")
+        next_steps.append("将 main_reports/tables_views_miss 下的 schema_T.txt / schema_V.txt 规则提供给 OMS 进行迁移。")
     if blacklist_missing_cnt:
         next_steps.append("查看 main_reports/blacklist_tables.txt，确认黑名单表处理方案。")
     if trigger_summary.get("invalid_entries") or trigger_summary.get("not_found"):
@@ -11044,7 +12633,12 @@ def build_run_summary(
     if comment_mis_cnt:
         next_steps.append("确认注释差异是否需要修复。")
     if ctx.enable_grant_generation and ctx.fixup_enabled:
-        next_steps.append(f"审核 {Path(ctx.fixup_dir) / 'grants'} 中的授权脚本。")
+        next_steps.append(
+            "审核 {miss} 中的授权脚本（全量审计见 {all}）。".format(
+                miss=Path(ctx.fixup_dir) / 'grants_miss',
+                all=Path(ctx.fixup_dir) / 'grants_all'
+            )
+        )
 
     return RunSummary(
         start_time=ctx.start_time,
@@ -11144,7 +12738,8 @@ def print_final_report(
     blacklist_report_rows: Optional[List[BlacklistReportRow]] = None,
     trigger_list_summary: Optional[Dict[str, object]] = None,
     trigger_list_rows: Optional[List[TriggerListReportRow]] = None,
-    run_summary_ctx: Optional[RunSummaryContext] = None
+    run_summary_ctx: Optional[RunSummaryContext] = None,
+    filtered_grants: Optional[List[FilteredGrantEntry]] = None
 ):
     custom_theme = Theme({
         "ok": "green",
@@ -11730,7 +13325,8 @@ def print_final_report(
         "fixup_scripts/sequence      : 缺失 SEQUENCE 的 CREATE 脚本\n"
         "fixup_scripts/trigger       : 缺失 TRIGGER 的 CREATE 脚本\n"
         "fixup_scripts/compile       : 依赖重编译脚本 (ALTER ... COMPILE)\n"
-        "fixup_scripts/grants        : 授权脚本 (对象/角色/系统，generate_grants=true 时生成)\n"
+        "fixup_scripts/grants_miss   : 缺失授权脚本 (对象/角色/系统)\n"
+        "fixup_scripts/grants_all    : 全量授权脚本 (对象/角色/系统)\n"
         "fixup_scripts/table_alter   : 列不匹配 TABLE 的 ALTER 修补脚本\n\n"
         "[bold]请在 OceanBase 执行前逐一人工审核上述脚本。[/bold]",
         title="[info]提示",
@@ -11740,6 +13336,10 @@ def print_final_report(
     run_summary: Optional[RunSummary] = None
     if run_summary_ctx:
         run_summary_ctx.phase_durations["报告输出"] = time.perf_counter() - run_summary_ctx.report_start_perf
+        filtered_grants_count = len(filtered_grants or [])
+        filtered_grants_path = None
+        if filtered_grants_count and report_file:
+            filtered_grants_path = Path(report_file).parent / "filtered_grants.txt"
         run_summary = build_run_summary(
             run_summary_ctx,
             tv_results,
@@ -11749,7 +13349,9 @@ def print_final_report(
             remap_conflicts,
             tv_results.get("extraneous", []),
             blacklisted_missing_tables,
-            report_file
+            report_file,
+            filtered_grants_path=filtered_grants_path,
+            filtered_grants_count=filtered_grants_count
         )
         console.print(render_run_summary_panel(run_summary, section_width))
 
@@ -11771,6 +13373,10 @@ def print_final_report(
                 trigger_list_summary,
                 report_path.parent
             )
+        filtered_grants_path = export_filtered_grants(
+            filtered_grants or [],
+            report_path.parent
+        )
         try:
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report_text = console.export_text(clear=False)
@@ -11784,6 +13390,8 @@ def print_final_report(
                 log.info("黑名单表清单已输出到: %s", blacklist_path)
             if trigger_miss_path:
                 log.info("触发器清单筛选报告已输出到: %s", trigger_miss_path)
+            if filtered_grants_path:
+                log.info("过滤授权清单已输出到: %s", filtered_grants_path)
         except OSError as exc:
             console.print(f"[missing]报告写入失败: {exc}")
 
@@ -11820,6 +13428,12 @@ def parse_cli_args() -> argparse.Namespace:
             trigger_list            仅生成指定触发器清单 (每行 SCHEMA.TRIGGER_NAME)
             check_dependencies      true/false 控制依赖校验
             generate_grants         true/false 控制授权脚本生成
+            grant_tab_privs_scope   owner/owner_or_grantee 控制 DBA_TAB_PRIVS 抽取范围
+            grant_merge_privileges  true/false 合并同对象多权限授权
+            grant_merge_grantees    true/false 合并同权限多 grantee 授权
+            grant_supported_sys_privs    逗号分隔系统权限清单（留空自动探测）
+            grant_supported_object_privs 逗号分隔对象权限清单（留空使用默认白名单）
+            grant_include_oracle_maintained_roles true/false 是否生成 Oracle 维护角色
             generate_fixup          true/false 控制是否生成脚本
 
         用法示例:
@@ -11827,9 +13441,10 @@ def parse_cli_args() -> argparse.Namespace:
           python schema_diff_reconciler.py /path/to/conf.ini # 指定配置
         输出:
           main_reports/report_<ts>.txt  Rich 报告文本
-          main_reports/tables_views_miss/ 按 schema 输出缺失 TABLE/VIEW 规则 (OMS 使用)
+          main_reports/tables_views_miss/ 按 schema 输出缺失 TABLE/VIEW 规则 (schema_T.txt / schema_V.txt)
           main_reports/blacklist_tables.txt 黑名单表清单 (含 LONG 转换校验状态)
           main_reports/trigger_miss.txt  触发器清单筛选报告 (仅配置 trigger_list 时生成)
+          main_reports/filtered_grants.txt 过滤掉的不兼容 GRANT 权限清单
           fixup_scripts/                按类型分类的订正 SQL
         项目信息:
           主页: {repo_url}
@@ -12102,6 +13717,7 @@ def main():
         "skipped": skipped_dependency_pairs
     }
     dependency_chain_file: Optional[Path] = None
+    view_chain_file: Optional[Path] = None
     grant_plan: Optional[GrantPlan] = None
     object_counts_summary: Optional[ObjectCountSummary] = None
     schema_summary: Optional[Dict[str, List[str]]] = None
@@ -12173,6 +13789,7 @@ def main():
             fixup_enabled=generate_fixup_enabled,
             fixup_dir=settings.get('fixup_dir', 'fixup_scripts') or 'fixup_scripts',
             dependency_chain_file=None,
+            view_chain_file=None,
             trigger_list_summary=trigger_summary_stub,
             report_start_perf=report_start_perf
         )
@@ -12191,7 +13808,8 @@ def main():
             blacklist_report_rows=[],
             trigger_list_summary=None,
             trigger_list_rows=None,
-            run_summary_ctx=run_summary_ctx
+            run_summary_ctx=run_summary_ctx,
+            filtered_grants=None
         )
         if run_summary:
             log_run_summary(run_summary)
@@ -12215,6 +13833,7 @@ def main():
             include_triggers='TRIGGER' in enabled_extra_types,
             include_sequences='SEQUENCE' in enabled_extra_types,
             include_comments=enable_comment_check,
+            include_roles=enable_grant_generation,
             target_table_pairs=target_table_pairs if enable_comment_check else set()
         )
         ob_dependencies: Set[Tuple[str, str, str, str]] = set()
@@ -12380,6 +13999,41 @@ def main():
         log.info('已开启修补脚本生成，开始写入 %s 目录...', fixup_dir_label)
         with phase_timer("修补脚本生成", phase_durations):
             if enable_grant_generation:
+                try:
+                    grant_progress_interval = float(settings.get('progress_log_interval', 10))
+                except (TypeError, ValueError):
+                    grant_progress_interval = 10.0
+                grant_progress_interval = max(1.0, grant_progress_interval)
+                supported_sys_privs = settings.get('grant_supported_sys_privs_set', set())
+                if not supported_sys_privs:
+                    supported_sys_privs = load_ob_supported_sys_privs(ob_cfg)
+                supported_object_privs = settings.get('grant_supported_object_privs_set', set())
+                if not supported_object_privs:
+                    supported_object_privs = set(DEFAULT_SUPPORTED_OBJECT_PRIVS)
+                include_oracle_maintained_roles = bool(settings.get('grant_include_oracle_maintained_roles', False))
+                ob_roles: Optional[Set[str]] = None
+                if ob_meta and ob_meta.roles:
+                    ob_roles = set(ob_meta.roles)
+                elif enable_grant_generation:
+                    ob_roles = load_ob_roles(ob_cfg)
+                ob_users = load_ob_users(ob_cfg) if enable_grant_generation else None
+                if not supported_sys_privs:
+                    log.warning("[GRANT] 未获取到 OceanBase 系统权限清单，将仅依据 Oracle 权限合法性过滤。")
+                log.info(
+                    "[GRANT] 权限过滤参数：sys_privs=%d, obj_privs=%d, include_oracle_maintained_roles=%s, ob_roles=%d, ob_users=%d",
+                    len(supported_sys_privs),
+                    len(supported_object_privs),
+                    "true" if include_oracle_maintained_roles else "false",
+                    len(ob_roles or set()),
+                    len(ob_users or set())
+                )
+                log.info(
+                    "[GRANT] 开始生成授权计划：对象权限=%d, 系统权限=%d, 角色授权=%d, 依赖记录=%d。",
+                    len(oracle_meta.object_privileges),
+                    len(oracle_meta.sys_privileges),
+                    len(oracle_meta.role_privileges),
+                    len(oracle_dependencies_for_grants)
+                )
                 grant_plan = build_grant_plan(
                     oracle_meta,
                     full_object_mapping,
@@ -12393,7 +14047,16 @@ def main():
                     source_schema_set,
                     remap_conflicts,
                     synonym_meta,
-                    dependencies=oracle_dependencies_for_grants
+                    supported_sys_privs=supported_sys_privs,
+                    supported_object_privs=supported_object_privs,
+                    oracle_sys_privs_map=oracle_meta.system_privilege_map,
+                    oracle_obj_privs_map=oracle_meta.table_privilege_map,
+                    oracle_roles=oracle_meta.role_metadata,
+                    ob_roles=ob_roles,
+                    ob_users=ob_users,
+                    include_oracle_maintained_roles=include_oracle_maintained_roles,
+                    dependencies=oracle_dependencies_for_grants,
+                    progress_interval=grant_progress_interval
                 )
                 object_grant_cnt = sum(len(v) for v in grant_plan.object_grants.values())
                 sys_grant_cnt = sum(len(v) for v in grant_plan.sys_privs.values())
@@ -12404,7 +14067,12 @@ def main():
                     sys_grant_cnt,
                     role_grant_cnt
                 )
-            generate_fixup_scripts(
+                if grant_plan.filtered_grants:
+                    log.warning(
+                        "[GRANT] 已过滤不兼容权限 %d 条，将输出 main_reports/filtered_grants.txt。",
+                        len(grant_plan.filtered_grants)
+                    )
+            view_chain_file = generate_fixup_scripts(
                 ora_cfg,
                 ob_cfg,
                 settings,
@@ -12421,7 +14089,9 @@ def main():
                 expected_dependency_pairs,
                 synonym_meta,
                 trigger_filter_entries,
-                trigger_filter_enabled
+                trigger_filter_enabled,
+                report_dir=report_dir,
+                report_timestamp=timestamp
             )
     else:
         log.info('已根据配置跳过修补脚本生成，仅打印对比报告。')
@@ -12450,6 +14120,7 @@ def main():
         fixup_enabled=generate_fixup_enabled,
         fixup_dir=settings.get('fixup_dir', 'fixup_scripts') or 'fixup_scripts',
         dependency_chain_file=dependency_chain_file,
+        view_chain_file=view_chain_file,
         trigger_list_summary=trigger_list_summary,
         report_start_perf=report_start_perf
     )
@@ -12468,7 +14139,8 @@ def main():
         blacklist_report_rows,
         trigger_list_summary,
         trigger_list_rows,
-        run_summary_ctx=run_summary_ctx
+        run_summary_ctx=run_summary_ctx,
+        filtered_grants=(grant_plan.filtered_grants if grant_plan else None)
     )
     if run_summary:
         log_run_summary(run_summary)
