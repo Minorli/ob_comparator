@@ -82,6 +82,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import uuid
 import shutil
 import time
+import tempfile
 from collections import defaultdict, OrderedDict
 from datetime import datetime
 from pathlib import Path
@@ -290,6 +291,7 @@ SourceObjectMap = Dict[str, Set[str]]  # {'OWNER.OBJ': {'TYPE1', 'TYPE2'}}
 FullObjectMapping = Dict[str, Dict[str, str]]  # {'OWNER.OBJ': {'TYPE': 'TGT_OWNER.OBJ'}}
 MasterCheckList = List[Tuple[str, str, str]]  # [(src_name, tgt_name, type)]
 ReportResults = Dict[str, List]
+PackageCompareResults = Dict[str, object]
 # object_counts_summary keys: oracle/oceanbase/missing/extra -> {OBJECT_TYPE: count}
 ObjectCountSummary = Dict[str, Dict[str, int]]
 # 源端依赖集合的简化元组：(dep_owner, dep_name, dep_type, ref_owner, ref_name, ref_type)
@@ -312,6 +314,13 @@ class BlacklistReportRow(NamedTuple):
     status: str
     detail: str
 
+
+class DdlCleanReportRow(NamedTuple):
+    obj_type: str
+    obj_full: str
+    replaced: int
+    samples: List[Tuple[str, str]]
+
 # --- 全局 obclient timeout（秒），由配置初始化 ---
 OBC_TIMEOUT: int = 60
 
@@ -330,6 +339,9 @@ class ObMetadata(NamedTuple):
     table_comments: Dict[Tuple[str, str], Optional[str]] # (OWNER, TABLE_NAME) -> COMMENT
     column_comments: Dict[Tuple[str, str], Dict[str, Optional[str]]]  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: COMMENT}
     comments_complete: bool                              # 元数据是否完整加载（两端失败则跳过注释校验）
+    object_statuses: Dict[Tuple[str, str, str], str]     # (OWNER, OBJECT_NAME, OBJECT_TYPE) -> STATUS
+    package_errors: Dict[Tuple[str, str, str], "PackageErrorInfo"]  # (OWNER, NAME, TYPE) -> error summary
+    package_errors_complete: bool                        # 目标端错误信息是否完整
 
 
 class OracleMetadata(NamedTuple):
@@ -351,6 +363,9 @@ class OracleMetadata(NamedTuple):
     role_metadata: Dict[str, "OracleRoleInfo"]               # DBA_ROLES 角色元数据
     system_privilege_map: Set[str]                           # SYSTEM_PRIVILEGE_MAP
     table_privilege_map: Set[str]                            # TABLE_PRIVILEGE_MAP
+    object_statuses: Dict[Tuple[str, str, str], str]         # (OWNER, OBJECT_NAME, OBJECT_TYPE) -> STATUS
+    package_errors: Dict[Tuple[str, str, str], "PackageErrorInfo"]  # (OWNER, NAME, TYPE) -> error summary
+    package_errors_complete: bool                            # 源端错误信息是否完整
 
 
 class DependencyRecord(NamedTuple):
@@ -465,6 +480,22 @@ class ColumnTypeIssue(NamedTuple):
     expected_type: str
 
 
+class PackageErrorInfo(NamedTuple):
+    count: int
+    first_error: str
+
+
+class PackageCompareRow(NamedTuple):
+    src_full: str
+    obj_type: str
+    src_status: str
+    tgt_full: str
+    tgt_status: str
+    result: str
+    error_count: int
+    first_error: str
+
+
 # --- 对象类型常量 ---
 PRIMARY_OBJECT_TYPES: Tuple[str, ...] = (
     'TABLE',
@@ -482,16 +513,17 @@ PRIMARY_OBJECT_TYPES: Tuple[str, ...] = (
 )
 
 PRINT_ONLY_PRIMARY_TYPES: Tuple[str, ...] = (
-    'MATERIALIZED VIEW',
-    'PACKAGE',
-    'PACKAGE BODY'
+    'MATERIALIZED VIEW'
 )
 
 PRINT_ONLY_PRIMARY_REASONS: Dict[str, str] = {
-    'MATERIALIZED VIEW': "OB 暂不支持 MATERIALIZED VIEW，仅打印不校验",
-    'PACKAGE': "PACKAGE 默认仅打印不校验",
-    'PACKAGE BODY': "PACKAGE BODY 默认仅打印不校验"
+    'MATERIALIZED VIEW': "OB 暂不支持 MATERIALIZED VIEW，仅打印不校验"
 }
+
+PACKAGE_OBJECT_TYPES: Tuple[str, ...] = (
+    'PACKAGE',
+    'PACKAGE BODY'
+)
 
 # 这些类型不参与 schema 推导（除非显式 remap）
 NO_INFER_SCHEMA_TYPES: Set[str] = {
@@ -537,6 +569,8 @@ EXTRA_OBJECT_CHECK_TYPES: Tuple[str, ...] = (
 
 # 注释比对时批量 IN 子句的大小，避免 ORA-01795
 COMMENT_BATCH_SIZE = 200
+# Oracle IN 列表最大表达式数量为 1000，预留余量
+ORACLE_IN_BATCH_SIZE = 900
 # 授权规模提示阈值（对象权限条数）
 GRANT_WARN_THRESHOLD = 200000
 
@@ -687,6 +721,21 @@ def parse_csv_set(raw_value: Optional[str]) -> Set[str]:
 def chunk_list(items: List[str], size: int) -> List[List[str]]:
     """Split list into batches of given size."""
     return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def build_bind_placeholders(count: int, offset: int = 0) -> str:
+    if count <= 0:
+        return ""
+    return ",".join(f":{i+1+offset}" for i in range(count))
+
+
+def iter_in_chunks(items: List[str], batch_size: int = ORACLE_IN_BATCH_SIZE) -> List[Tuple[str, List[str]]]:
+    chunks: List[Tuple[str, List[str]]] = []
+    for chunk in chunk_list(items, batch_size):
+        if not chunk:
+            continue
+        chunks.append((build_bind_placeholders(len(chunk)), chunk))
+    return chunks
 
 
 # --- 扩展检查结果结构 ---
@@ -911,6 +960,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('dbcat_from', '')
         settings.setdefault('dbcat_to', '')
         settings.setdefault('dbcat_output_dir', 'dbcat_output')
+        settings.setdefault('dbcat_no_cal_dep', 'false')
+        settings.setdefault('dbcat_query_meta_thread', '')
+        settings.setdefault('dbcat_progress_interval', '15')
         settings.setdefault('java_home', os.environ.get('JAVA_HOME', ''))
         # fixup 定向生成选项
         settings.setdefault('fixup_schemas', '')
@@ -930,6 +982,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('print_dependency_chains', 'true')
         settings.setdefault('check_comments', 'true')
         settings.setdefault('infer_schema_mapping', 'true')
+        settings.setdefault('ddl_punct_sanitize', 'true')
         settings.setdefault('dbcat_chunk_size', '150')
         settings.setdefault('fixup_workers', '')
         settings.setdefault('progress_log_interval', '10')
@@ -971,6 +1024,10 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             settings.get('check_comments', 'true'),
             True
         )
+        settings['enable_ddl_punct_sanitize'] = parse_bool_flag(
+            settings.get('ddl_punct_sanitize', 'true'),
+            True
+        )
         settings['print_dependency_chains'] = parse_bool_flag(
             settings.get('print_dependency_chains', 'true'),
             True
@@ -1000,6 +1057,19 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             settings['dbcat_chunk_size'] = int(settings.get('dbcat_chunk_size', '150'))
         except ValueError:
             settings['dbcat_chunk_size'] = 150
+        settings['dbcat_no_cal_dep'] = parse_bool_flag(settings.get('dbcat_no_cal_dep', 'false'), False)
+        try:
+            settings['dbcat_query_meta_thread'] = int(settings.get('dbcat_query_meta_thread') or 0)
+        except (TypeError, ValueError):
+            settings['dbcat_query_meta_thread'] = 0
+        if settings['dbcat_query_meta_thread'] < 0:
+            settings['dbcat_query_meta_thread'] = 0
+        try:
+            settings['dbcat_progress_interval'] = int(settings.get('dbcat_progress_interval', '15'))
+        except (TypeError, ValueError):
+            settings['dbcat_progress_interval'] = 15
+        if settings['dbcat_progress_interval'] < 0:
+            settings['dbcat_progress_interval'] = 0
 
         global OBC_TIMEOUT
         try:
@@ -1719,7 +1789,6 @@ def get_source_objects(
     if not object_types_for_objects and not include_synonyms:
         log.warning("未启用任何可管理对象类型，源端对象列表为空。")
         return {}
-    placeholders = ','.join([f":{i+1}" for i in range(len(schemas_list))])
     object_types_clause = ",".join(f"'{obj}'" for obj in sorted(object_types_for_objects)) if object_types_for_objects else ""
 
     source_objects: SourceObjectMap = defaultdict(set)
@@ -1737,7 +1806,7 @@ def get_source_objects(
         ) as connection:
             log.info("Oracle 连接成功。正在查询源对象列表...")
             if object_types_for_objects:
-                sql = f"""
+                sql_tpl = """
                     SELECT OWNER, OBJECT_NAME, OBJECT_TYPE
                     FROM DBA_OBJECTS
                     WHERE OWNER IN ({placeholders})
@@ -1746,25 +1815,30 @@ def get_source_objects(
                       )
                 """
                 with connection.cursor() as cursor:
-                    cursor.execute(sql, schemas_list)
-                    for row in cursor:
-                        owner = (row[0] or '').strip().upper()
-                        obj_name = (row[1] or '').strip().upper()
-                        obj_type = (row[2] or '').strip().upper()
-                        if not owner or not obj_name or not obj_type:
-                            continue
-                        if obj_name.startswith("SYS_IOT_OVER_"):
-                            skipped_iot += 1
-                            continue
-                        full_name = f"{owner}.{obj_name}"
-                        source_objects[full_name].add(obj_type)
+                    for placeholders, chunk in iter_in_chunks(schemas_list):
+                        sql = sql_tpl.format(
+                            placeholders=placeholders,
+                            object_types_clause=object_types_clause
+                        )
+                        cursor.execute(sql, chunk)
+                        for row in cursor:
+                            owner = (row[0] or '').strip().upper()
+                            obj_name = (row[1] or '').strip().upper()
+                            obj_type = (row[2] or '').strip().upper()
+                            if not owner or not obj_name or not obj_type:
+                                continue
+                            if obj_name.startswith("SYS_IOT_OVER_"):
+                                skipped_iot += 1
+                                continue
+                            full_name = f"{owner}.{obj_name}"
+                            source_objects[full_name].add(obj_type)
             if include_synonyms:
                 synonym_owners = sorted(set(s.upper() for s in schemas_list) | {"PUBLIC"})
                 target_owners = sorted({s.upper() for s in schemas_list})
                 if target_owners:
-                    owner_ph = ','.join([f":{i+1}" for i in range(len(synonym_owners))])
-                    target_ph = ','.join([f":{i+1+len(synonym_owners)}" for i in range(len(target_owners))])
-                    sql = f"""
+                    synonym_chunks = chunk_list(synonym_owners, ORACLE_IN_BATCH_SIZE)
+                    target_chunks = chunk_list(target_owners, ORACLE_IN_BATCH_SIZE)
+                    sql_tpl = """
                         SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME
                         FROM DBA_SYNONYMS
                         WHERE OWNER IN ({owner_ph})
@@ -1772,44 +1846,51 @@ def get_source_objects(
                           AND TABLE_NAME IS NOT NULL
                     """
                     with connection.cursor() as cursor:
-                        cursor.execute(sql, synonym_owners + target_owners)
-                        for row in cursor:
-                            owner = (row[0] or '').strip().upper()
-                            syn_name = (row[1] or '').strip().upper()
-                            table_owner = (row[2] or '').strip().upper()
-                            table_name = (row[3] or '').strip().upper()
-                            if not owner or not syn_name or not table_owner or not table_name:
-                                continue
-                            full_name = f"{owner}.{syn_name}"
-                            source_objects[full_name].add('SYNONYM')
-                            if owner == 'PUBLIC':
-                                added_public_synonyms += 1
-                            else:
-                                added_synonyms += 1
+                        for owner_chunk in synonym_chunks:
+                            owner_ph = build_bind_placeholders(len(owner_chunk))
+                            for target_chunk in target_chunks:
+                                target_ph = build_bind_placeholders(len(target_chunk), offset=len(owner_chunk))
+                                sql = sql_tpl.format(owner_ph=owner_ph, target_ph=target_ph)
+                                cursor.execute(sql, owner_chunk + target_chunk)
+                                for row in cursor:
+                                    owner = (row[0] or '').strip().upper()
+                                    syn_name = (row[1] or '').strip().upper()
+                                    table_owner = (row[2] or '').strip().upper()
+                                    table_name = (row[3] or '').strip().upper()
+                                    if not owner or not syn_name or not table_owner or not table_name:
+                                        continue
+                                    full_name = f"{owner}.{syn_name}"
+                                    source_objects[full_name].add('SYNONYM')
+                                    if owner == 'PUBLIC':
+                                        added_public_synonyms += 1
+                                    else:
+                                        added_synonyms += 1
             # 精确认定物化视图集合，避免误删真实表
             with connection.cursor() as cursor:
-                cursor.execute(
-                    f"SELECT OWNER, MVIEW_NAME FROM DBA_MVIEWS WHERE OWNER IN ({placeholders})",
-                    schemas_list
-                )
-                for row in cursor:
-                    owner = (row[0] or '').strip().upper()
-                    name = (row[1] or '').strip().upper()
-                    if owner and name:
-                        mview_pairs.add((owner, name))
+                for placeholders, chunk in iter_in_chunks(schemas_list):
+                    cursor.execute(
+                        f"SELECT OWNER, MVIEW_NAME FROM DBA_MVIEWS WHERE OWNER IN ({placeholders})",
+                        chunk
+                    )
+                    for row in cursor:
+                        owner = (row[0] or '').strip().upper()
+                        name = (row[1] or '').strip().upper()
+                        if owner and name:
+                            mview_pairs.add((owner, name))
             with connection.cursor() as cursor:
-                cursor.execute(
-                    f"SELECT OWNER, TABLE_NAME FROM DBA_TABLES WHERE OWNER IN ({placeholders})",
-                    schemas_list
-                )
-                for row in cursor:
-                    owner = (row[0] or '').strip().upper()
-                    name = (row[1] or '').strip().upper()
-                    if owner and name:
-                        if name.startswith("SYS_IOT_OVER_"):
-                            skipped_iot += 1
-                            continue
-                        table_pairs.add((owner, name))
+                for placeholders, chunk in iter_in_chunks(schemas_list):
+                    cursor.execute(
+                        f"SELECT OWNER, TABLE_NAME FROM DBA_TABLES WHERE OWNER IN ({placeholders})",
+                        chunk
+                    )
+                    for row in cursor:
+                        owner = (row[0] or '').strip().upper()
+                        name = (row[1] or '').strip().upper()
+                        if owner and name:
+                            if name.startswith("SYS_IOT_OVER_"):
+                                skipped_iot += 1
+                                continue
+                            table_pairs.add((owner, name))
     except oracledb.Error as e:
         log.error(f"严重错误: 连接或查询 Oracle 失败: {e}")
         sys.exit(1)
@@ -1873,7 +1954,6 @@ def get_object_parent_tables(
       - TRIGGER 仅用于依赖推导（触发器自身 schema 不随父表 remap）
     """
     parent_map: ObjectParentMap = {}
-    placeholders = ','.join([f":{i+1}" for i in range(len(schemas_list))])
     enabled_types = {t.upper() for t in (enabled_object_types or set(ALL_TRACKED_OBJECT_TYPES))}
     include_triggers = 'TRIGGER' in enabled_types
     include_synonyms = 'SYNONYM' in enabled_types
@@ -1888,81 +1968,93 @@ def get_object_parent_tables(
         ) as connection:
             # 获取触发器所属的表
             if include_triggers:
+                sql_tpl = """
+                    SELECT OWNER, TRIGGER_NAME, TABLE_OWNER, TABLE_NAME
+                    FROM DBA_TRIGGERS
+                    WHERE OWNER IN ({placeholders})
+                      AND TABLE_NAME IS NOT NULL
+                      AND BASE_OBJECT_TYPE IN ('TABLE', 'VIEW')
+                """
                 with connection.cursor() as cursor:
-                    cursor.execute(f"""
-                        SELECT OWNER, TRIGGER_NAME, TABLE_OWNER, TABLE_NAME
-                        FROM DBA_TRIGGERS
-                        WHERE OWNER IN ({placeholders})
-                          AND TABLE_NAME IS NOT NULL
-                          AND BASE_OBJECT_TYPE IN ('TABLE', 'VIEW')
-                    """, schemas_list)
-                    for row in cursor:
-                        owner = (row[0] or '').strip().upper()
-                        trigger_name = (row[1] or '').strip().upper()
-                        table_owner = (row[2] or '').strip().upper()
-                        table_name = (row[3] or '').strip().upper()
-                        if owner and trigger_name and table_owner and table_name:
-                            trigger_key = f"{owner}.{trigger_name}"
-                            table_key = f"{table_owner}.{table_name}"
-                            parent_map[trigger_key] = table_key
+                    for placeholders, chunk in iter_in_chunks(schemas_list):
+                        sql = sql_tpl.format(placeholders=placeholders)
+                        cursor.execute(sql, chunk)
+                        for row in cursor:
+                            owner = (row[0] or '').strip().upper()
+                            trigger_name = (row[1] or '').strip().upper()
+                            table_owner = (row[2] or '').strip().upper()
+                            table_name = (row[3] or '').strip().upper()
+                            if owner and trigger_name and table_owner and table_name:
+                                trigger_key = f"{owner}.{trigger_name}"
+                                table_key = f"{table_owner}.{table_name}"
+                                parent_map[trigger_key] = table_key
 
             # 获取同义词指向的表/视图，使同义词也能跟随父表 schema
             if include_synonyms:
+                sql_tpl = """
+                    SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME
+                    FROM DBA_SYNONYMS
+                    WHERE OWNER IN ({placeholders})
+                      AND TABLE_OWNER IS NOT NULL
+                      AND TABLE_NAME IS NOT NULL
+                """
                 with connection.cursor() as cursor:
-                    cursor.execute(f"""
-                        SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME
-                        FROM DBA_SYNONYMS
-                        WHERE OWNER IN ({placeholders})
-                          AND TABLE_OWNER IS NOT NULL
-                          AND TABLE_NAME IS NOT NULL
-                    """, schemas_list)
-                    for row in cursor:
-                        owner = (row[0] or '').strip().upper()
-                        syn_name = (row[1] or '').strip().upper()
-                        table_owner = (row[2] or '').strip().upper()
-                        table_name = (row[3] or '').strip().upper()
-                        if owner and syn_name and table_owner and table_name:
-                            syn_key = f"{owner}.{syn_name}"
-                            table_key = f"{table_owner}.{table_name}"
-                            parent_map[syn_key] = table_key
+                    for placeholders, chunk in iter_in_chunks(schemas_list):
+                        sql = sql_tpl.format(placeholders=placeholders)
+                        cursor.execute(sql, chunk)
+                        for row in cursor:
+                            owner = (row[0] or '').strip().upper()
+                            syn_name = (row[1] or '').strip().upper()
+                            table_owner = (row[2] or '').strip().upper()
+                            table_name = (row[3] or '').strip().upper()
+                            if owner and syn_name and table_owner and table_name:
+                                syn_key = f"{owner}.{syn_name}"
+                                table_key = f"{table_owner}.{table_name}"
+                                parent_map[syn_key] = table_key
 
             # 获取索引所属的表
             if include_indexes:
+                sql_tpl = """
+                    SELECT OWNER, INDEX_NAME, TABLE_OWNER, TABLE_NAME
+                    FROM DBA_INDEXES
+                    WHERE OWNER IN ({placeholders})
+                      AND TABLE_OWNER IS NOT NULL
+                      AND TABLE_NAME IS NOT NULL
+                """
                 with connection.cursor() as cursor:
-                    cursor.execute(f"""
-                        SELECT OWNER, INDEX_NAME, TABLE_OWNER, TABLE_NAME
-                        FROM DBA_INDEXES
-                        WHERE OWNER IN ({placeholders})
-                          AND TABLE_OWNER IS NOT NULL
-                          AND TABLE_NAME IS NOT NULL
-                    """, schemas_list)
-                    for row in cursor:
-                        owner = (row[0] or '').strip().upper()
-                        index_name = (row[1] or '').strip().upper()
-                        table_owner = (row[2] or '').strip().upper()
-                        table_name = (row[3] or '').strip().upper()
-                        if owner and index_name and table_owner and table_name:
-                            index_key = f"{owner}.{index_name}"
-                            table_key = f"{table_owner}.{table_name}"
-                            parent_map[index_key] = table_key
+                    for placeholders, chunk in iter_in_chunks(schemas_list):
+                        sql = sql_tpl.format(placeholders=placeholders)
+                        cursor.execute(sql, chunk)
+                        for row in cursor:
+                            owner = (row[0] or '').strip().upper()
+                            index_name = (row[1] or '').strip().upper()
+                            table_owner = (row[2] or '').strip().upper()
+                            table_name = (row[3] or '').strip().upper()
+                            if owner and index_name and table_owner and table_name:
+                                index_key = f"{owner}.{index_name}"
+                                table_key = f"{table_owner}.{table_name}"
+                                parent_map[index_key] = table_key
 
             # 获取约束所属的表
             if include_constraints:
+                sql_tpl = """
+                    SELECT OWNER, CONSTRAINT_NAME, TABLE_NAME
+                    FROM DBA_CONSTRAINTS
+                    WHERE OWNER IN ({placeholders})
+                      AND TABLE_NAME IS NOT NULL
+                """
                 with connection.cursor() as cursor:
-                    cursor.execute(f"""
-                        SELECT OWNER, CONSTRAINT_NAME, TABLE_NAME
-                        FROM DBA_CONSTRAINTS
-                        WHERE OWNER IN ({placeholders})
-                          AND TABLE_NAME IS NOT NULL
-                    """, schemas_list)
-                    for row in cursor:
-                        owner = (row[0] or '').strip().upper()
-                        cons_name = (row[1] or '').strip().upper()
-                        table_name = (row[2] or '').strip().upper()
-                        if owner and cons_name and table_name:
-                            cons_key = f"{owner}.{cons_name}"
-                            table_key = f"{owner}.{table_name}"
-                            parent_map[cons_key] = table_key
+                    for placeholders, chunk in iter_in_chunks(schemas_list):
+                        sql = sql_tpl.format(placeholders=placeholders)
+                        cursor.execute(sql, chunk)
+                        for row in cursor:
+                            owner = (row[0] or '').strip().upper()
+                            cons_name = (row[1] or '').strip().upper()
+                            table_name = (row[2] or '').strip().upper()
+                            if owner and cons_name and table_name:
+                                cons_key = f"{owner}.{cons_name}"
+                                table_key = f"{owner}.{table_name}"
+                                parent_map[cons_key] = table_key
 
             log.info("已获取 %d 个依附对象的父表映射（触发器/同义词/索引/约束）。", len(parent_map))
     except oracledb.Error as e:
@@ -1986,17 +2078,10 @@ def load_synonym_metadata(
 
     allowed_targets = {s.upper() for s in (allowed_target_schemas or [])}
     owners = sorted(set(s.upper() for s in schemas_list) | {"PUBLIC"})
-    placeholders = ','.join([f":{i+1}" for i in range(len(owners))])
-    target_placeholders = ','.join([f":{i+1+len(owners)}" for i in range(len(allowed_targets))])
-    target_filter = ""
-    params = list(owners)
-    if allowed_targets:
-        target_filter = f"AND TABLE_OWNER IN ({target_placeholders})"
-        params.extend(sorted(allowed_targets))
-    sql = f"""
+    sql_tpl = """
         SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME, DB_LINK
         FROM DBA_SYNONYMS
-        WHERE OWNER IN ({placeholders})
+        WHERE OWNER IN ({owner_ph})
           AND TABLE_OWNER IS NOT NULL
           AND TABLE_NAME IS NOT NULL
           {target_filter}
@@ -2011,26 +2096,56 @@ def load_synonym_metadata(
             dsn=ora_cfg['dsn']
         ) as connection:
             with connection.cursor() as cursor:
-                cursor.execute(sql, params)
-                for row in cursor:
-                    owner = (row[0] or '').strip().upper()
-                    name = (row[1] or '').strip().upper()
-                    table_owner = (row[2] or '').strip().upper()
-                    table_name = (row[3] or '').strip().upper()
-                    db_link = (row[4] or '').strip().upper() if row[4] else None
-                    if not owner or not name or not table_name:
-                        continue
-                    if owner == 'PUBLIC' and allowed_targets and table_owner and table_owner.upper() not in allowed_targets:
-                        skipped_public += 1
-                        continue
-                    key = (owner, name)
-                    result[key] = SynonymMeta(
-                        owner=owner,
-                        name=name,
-                        table_owner=table_owner,
-                        table_name=table_name,
-                        db_link=db_link
-                    )
+                owner_chunks = chunk_list(owners, ORACLE_IN_BATCH_SIZE)
+                target_chunks = chunk_list(sorted(allowed_targets), ORACLE_IN_BATCH_SIZE) if allowed_targets else []
+                if not allowed_targets:
+                    for owner_chunk in owner_chunks:
+                        owner_ph = build_bind_placeholders(len(owner_chunk))
+                        sql = sql_tpl.format(owner_ph=owner_ph, target_filter="")
+                        cursor.execute(sql, owner_chunk)
+                        for row in cursor:
+                            owner = (row[0] or '').strip().upper()
+                            name = (row[1] or '').strip().upper()
+                            table_owner = (row[2] or '').strip().upper()
+                            table_name = (row[3] or '').strip().upper()
+                            db_link = (row[4] or '').strip().upper() if row[4] else None
+                            if not owner or not name or not table_name:
+                                continue
+                            key = (owner, name)
+                            result[key] = SynonymMeta(
+                                owner=owner,
+                                name=name,
+                                table_owner=table_owner,
+                                table_name=table_name,
+                                db_link=db_link
+                            )
+                else:
+                    for owner_chunk in owner_chunks:
+                        owner_ph = build_bind_placeholders(len(owner_chunk))
+                        for target_chunk in target_chunks:
+                            target_ph = build_bind_placeholders(len(target_chunk), offset=len(owner_chunk))
+                            target_filter = f"AND TABLE_OWNER IN ({target_ph})"
+                            sql = sql_tpl.format(owner_ph=owner_ph, target_filter=target_filter)
+                            cursor.execute(sql, owner_chunk + target_chunk)
+                            for row in cursor:
+                                owner = (row[0] or '').strip().upper()
+                                name = (row[1] or '').strip().upper()
+                                table_owner = (row[2] or '').strip().upper()
+                                table_name = (row[3] or '').strip().upper()
+                                db_link = (row[4] or '').strip().upper() if row[4] else None
+                                if not owner or not name or not table_name:
+                                    continue
+                                if owner == 'PUBLIC' and table_owner and table_owner.upper() not in allowed_targets:
+                                    skipped_public += 1
+                                    continue
+                                key = (owner, name)
+                                result[key] = SynonymMeta(
+                                    owner=owner,
+                                    name=name,
+                                    table_owner=table_owner,
+                                    table_name=table_name,
+                                    db_link=db_link
+                                )
     except oracledb.Error as exc:
         log.warning("读取同义词元数据失败，将回退 DBMS_METADATA：%s", exc)
 
@@ -3201,6 +3316,21 @@ def compute_object_counts(
                 continue
             expected_by_type[obj_type_u].add(tgt_name.upper())
 
+    invalid_targets_by_type: Dict[str, Set[str]] = defaultdict(set)
+    for src_full, type_map in full_object_mapping.items():
+        if "." not in src_full:
+            continue
+        src_schema, src_obj = src_full.split(".", 1)
+        src_schema_u = src_schema.upper()
+        src_obj_u = src_obj.upper()
+        for obj_type in PACKAGE_OBJECT_TYPES:
+            tgt_name = type_map.get(obj_type)
+            if not tgt_name:
+                continue
+            status = oracle_meta.object_statuses.get((src_schema_u, src_obj_u, obj_type))
+            if normalize_object_status(status) == "INVALID":
+                invalid_targets_by_type[obj_type].add(tgt_name.upper())
+
     actual_by_type: Dict[str, Set[str]] = {
         t.upper(): {name.upper() for name in ob_meta.objects_by_type.get(t.upper(), set())}
         for t in monitored_types if t != 'CONSTRAINT'
@@ -3231,6 +3361,8 @@ def compute_object_counts(
             }
         else:
             expected_set = expected_by_type.get(obj_type_u, set())
+            if obj_type_u in invalid_targets_by_type:
+                expected_set = expected_set - invalid_targets_by_type[obj_type_u]
             actual_set = actual_by_type.get(obj_type_u, set())
 
         # For constraints and indexes, names can be system-generated. A simple name comparison is not enough.
@@ -3357,7 +3489,10 @@ def dump_ob_metadata(
             roles=set(),
             table_comments={},
             column_comments={},
-            comments_complete=False
+            comments_complete=False,
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False
         )
 
     owners_in_list = sorted(target_schemas)
@@ -3369,13 +3504,14 @@ def dump_ob_metadata(
 
     # --- 1. DBA_OBJECTS ---
     objects_by_type: Dict[str, Set[str]] = {}
+    object_statuses: Dict[Tuple[str, str, str], str] = {}
     object_types_filter = tracked_object_types or set(ALL_TRACKED_OBJECT_TYPES)
     if not object_types_filter:
         object_types_filter = {'TABLE'}
     object_types_clause = ",".join(f"'{obj}'" for obj in sorted(object_types_filter))
 
     sql = f"""
-        SELECT OWNER, OBJECT_NAME, OBJECT_TYPE
+        SELECT OWNER, OBJECT_NAME, OBJECT_TYPE, STATUS
         FROM DBA_OBJECTS
         WHERE UPPER(OWNER) IN ({owners_in_objects})
           AND OBJECT_TYPE IN (
@@ -3392,11 +3528,15 @@ def dump_ob_metadata(
             parts = line.split('\t')
             if len(parts) < 3:
                 continue
-            owner, name, obj_type = parts[0].strip().upper(), parts[1].strip().upper(), parts[2].strip().upper()
+            owner = parts[0].strip().upper()
+            name = parts[1].strip().upper()
+            obj_type = parts[2].strip().upper()
+            status = parts[3].strip().upper() if len(parts) > 3 else "UNKNOWN"
             if obj_type == 'SYNONYM' and owner == '__PUBLIC':
                 owner = 'PUBLIC'
             full = f"{owner}.{name}"
             objects_by_type.setdefault(obj_type, set()).add(full)
+            object_statuses[(owner, name, obj_type)] = status or "UNKNOWN"
 
     # 补充 DBA_TYPES (部分 OB 环境中 TYPE 不出现在 DBA_OBJECTS)
     # 注意：DBA_TYPES.TYPECODE=OBJECT 仅表示对象类型，本身不代表存在 TYPE BODY，
@@ -3439,6 +3579,48 @@ def dump_ob_metadata(
                 owner, name = parts[0].strip().upper(), parts[1].strip().upper()
                 full = f"{owner}.{name}"
                 objects_by_type.setdefault('TYPE BODY', set()).add(full)
+
+    package_errors: Dict[Tuple[str, str, str], PackageErrorInfo] = {}
+    package_errors_complete = True
+    if 'PACKAGE' in object_types_filter or 'PACKAGE BODY' in object_types_filter:
+        sql_pkg_err = f"""
+            SELECT OWNER, NAME, TYPE, LINE, POSITION, TEXT
+            FROM DBA_ERRORS
+            WHERE OWNER IN ({owners_in})
+              AND TYPE IN ('PACKAGE', 'PACKAGE BODY')
+            ORDER BY OWNER, NAME, TYPE, SEQUENCE
+        """
+        ok, out, err = obclient_run_sql(ob_cfg, sql_pkg_err)
+        if not ok:
+            package_errors_complete = False
+            log.warning("读取 OB DBA_ERRORS 失败，包错误信息将为空: %s", err)
+        elif out:
+            temp_errors: Dict[Tuple[str, str, str], Dict[str, object]] = defaultdict(
+                lambda: {"count": 0, "first_error": ""}
+            )
+            for line in out.splitlines():
+                parts = line.split('\t')
+                if len(parts) < 6:
+                    continue
+                owner = parts[0].strip().upper()
+                name = parts[1].strip().upper()
+                err_type = parts[2].strip().upper()
+                err_line = parts[3].strip()
+                err_pos = parts[4].strip()
+                err_text = normalize_error_text(parts[5])
+                if not owner or not name or not err_type:
+                    continue
+                key = (owner, name, err_type)
+                entry = temp_errors[key]
+                entry["count"] = int(entry["count"]) + 1
+                if not entry["first_error"]:
+                    prefix = f"L{err_line}:{err_pos} " if err_line or err_pos else ""
+                    entry["first_error"] = f"{prefix}{err_text}".strip()
+            for key, info in temp_errors.items():
+                package_errors[key] = PackageErrorInfo(
+                    count=int(info.get("count") or 0),
+                    first_error=str(info.get("first_error") or "")
+                )
 
     # --- 2. DBA_TAB_COLUMNS ---
     sql_cols_ext = f"""
@@ -3810,7 +3992,10 @@ def dump_ob_metadata(
         roles=roles,
         table_comments=table_comments,
         column_comments=column_comments,
-        comments_complete=comments_complete
+        comments_complete=comments_complete,
+        object_statuses=object_statuses,
+        package_errors=package_errors,
+        package_errors_complete=package_errors_complete
     )
 
 
@@ -4015,25 +4200,26 @@ def load_oracle_role_privileges(
         if not batch:
             break
         seen.update(batch)
-        placeholders = ",".join(f":{i+1}" for i in range(len(batch)))
-        sql = f"""
+        sql_tpl = """
             SELECT GRANTEE, GRANTED_ROLE, ADMIN_OPTION
             FROM DBA_ROLE_PRIVS
             WHERE GRANTEE IN ({placeholders})
         """
         with ora_conn.cursor() as cursor:
-            cursor.execute(sql, batch)
-            for row in cursor:
-                grantee = (row[0] or "").strip().upper()
-                role = (row[1] or "").strip().upper()
-                admin_opt = (row[2] or "").strip().upper() == "YES"
-                if not grantee or not role:
-                    continue
-                role_grants.append(OracleRolePrivilege(grantee, role, admin_opt))
-                if role not in discovered_roles:
-                    discovered_roles.add(role)
-                    if role not in seen:
-                        pending.add(role)
+            for placeholders, chunk in iter_in_chunks(batch):
+                sql = sql_tpl.format(placeholders=placeholders)
+                cursor.execute(sql, chunk)
+                for row in cursor:
+                    grantee = (row[0] or "").strip().upper()
+                    role = (row[1] or "").strip().upper()
+                    admin_opt = (row[2] or "").strip().upper() == "YES"
+                    if not grantee or not role:
+                        continue
+                    role_grants.append(OracleRolePrivilege(grantee, role, admin_opt))
+                    if role not in discovered_roles:
+                        discovered_roles.add(role)
+                        if role not in seen:
+                            pending.add(role)
 
     return role_grants, discovered_roles
 
@@ -4134,7 +4320,7 @@ def load_oracle_sys_privileges(
     if not grantees:
         return sys_privs
 
-    for chunk in chunk_list(sorted(grantees), 900):
+    for chunk in chunk_list(sorted(grantees), ORACLE_IN_BATCH_SIZE):
         placeholders = ",".join(f":{i+1}" for i in range(len(chunk)))
         sql = f"""
             SELECT GRANTEE, PRIVILEGE, ADMIN_OPTION
@@ -4185,7 +4371,7 @@ def load_oracle_tab_privileges(
         select_cols = "GRANTEE, OWNER, TABLE_NAME, PRIVILEGE, GRANTABLE"
         if has_type:
             select_cols += ", TYPE"
-        for chunk in chunk_list(sorted(values), 900):
+        for chunk in chunk_list(sorted(values), ORACLE_IN_BATCH_SIZE):
             placeholders = ",".join(f":{i+1}" for i in range(len(chunk)))
             sql = f"""
                 SELECT {select_cols}
@@ -4280,11 +4466,11 @@ def dump_oracle_metadata(
             role_privileges=[],
             role_metadata={},
             system_privilege_map=set(),
-            table_privilege_map=set()
+            table_privilege_map=set(),
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False
         )
-
-    def _make_in_clause(values: List[str]) -> str:
-        return ",".join(f":{i+1}" for i in range(len(values)))
 
     log.info("正在批量加载 Oracle 元数据 (DBA_TAB_COLUMNS/DBA_INDEXES/DBA_CONSTRAINTS/DBA_TRIGGERS/DBA_SEQUENCES)...")
     table_columns: Dict[Tuple[str, str], Dict[str, Dict]] = {}
@@ -4303,6 +4489,9 @@ def dump_oracle_metadata(
     role_metadata: Dict[str, OracleRoleInfo] = {}
     system_privilege_map: Set[str] = set()
     table_privilege_map: Set[str] = set()
+    object_statuses: Dict[Tuple[str, str, str], str] = {}
+    package_errors: Dict[Tuple[str, str, str], PackageErrorInfo] = {}
+    package_errors_complete = True
 
     def _safe_upper(value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -4318,9 +4507,13 @@ def dump_oracle_metadata(
             password=ora_cfg['password'],
             dsn=ora_cfg['dsn']
         ) as ora_conn:
-            if owners:
-                owners_clause = _make_in_clause(owners)
-
+            owner_chunks = chunk_list(owners, ORACLE_IN_BATCH_SIZE)
+            seq_owner_chunks = chunk_list(seq_owners, ORACLE_IN_BATCH_SIZE)
+            need_package_status = any(
+                (obj_type or "").upper() in PACKAGE_OBJECT_TYPES
+                for _, _, obj_type in master_list
+            )
+            if owners or need_package_status:
                 # 检测是否支持 HIDDEN_COLUMN 字段（部分低版本/权限受限环境不存在）
                 support_hidden_col = False
                 try:
@@ -4339,16 +4532,15 @@ def dump_oracle_metadata(
                     support_hidden_col = False
 
                 # 列定义
-                def _load_ora_tab_columns(include_hidden: bool):
+                def _load_ora_tab_columns_sql(include_hidden: bool) -> str:
                     hidden_col = ", NVL(TO_CHAR(HIDDEN_COLUMN),'NO') AS HIDDEN_COLUMN" if include_hidden else ""
-                    sql = f"""
+                    return f"""
                         SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
                                DATA_LENGTH, DATA_PRECISION, DATA_SCALE,
                                NULLABLE, DATA_DEFAULT, CHAR_USED, CHAR_LENGTH{hidden_col}
                         FROM DBA_TAB_COLUMNS
-                        WHERE OWNER IN ({owners_clause})
+                        WHERE OWNER IN ({{owners_clause}})
                     """
-                    return sql
 
                 def _parse_tab_column_row(row, include_hidden: bool) -> Dict:
                     return {
@@ -4363,27 +4555,13 @@ def dump_oracle_metadata(
                         "hidden": (row[11] if include_hidden and len(row) > 11 else "NO") == "YES" if include_hidden else False
                     }
 
-                sql = _load_ora_tab_columns(include_hidden=support_hidden_col)
                 try:
+                    sql_tpl = _load_ora_tab_columns_sql(include_hidden=support_hidden_col)
                     with ora_conn.cursor() as cursor:
-                        cursor.execute(sql, owners)
-                        for row in cursor:
-                            owner = _safe_upper(row[0])
-                            table = _safe_upper(row[1])
-                            col = _safe_upper(row[2])
-                            if not owner or not table or not col:
-                                continue
-                            key = (owner, table)
-                            if key not in table_pairs:
-                                continue
-                            table_columns.setdefault(key, {})[col] = _parse_tab_column_row(row, support_hidden_col)
-                except oracledb.Error as e:
-                    if support_hidden_col:
-                        log.info("读取 DBA_TAB_COLUMNS(含 hidden) 失败，尝试不含 hidden：%s", e)
-                        support_hidden_col = False
-                        sql = _load_ora_tab_columns(include_hidden=False)
-                        with ora_conn.cursor() as cursor:
-                            cursor.execute(sql, owners)
+                        for owner_chunk in owner_chunks:
+                            owners_clause = build_bind_placeholders(len(owner_chunk))
+                            sql = sql_tpl.format(owners_clause=owners_clause)
+                            cursor.execute(sql, owner_chunk)
                             for row in cursor:
                                 owner = _safe_upper(row[0])
                                 table = _safe_upper(row[1])
@@ -4393,62 +4571,88 @@ def dump_oracle_metadata(
                                 key = (owner, table)
                                 if key not in table_pairs:
                                     continue
-                                table_columns.setdefault(key, {})[col] = _parse_tab_column_row(row, False)
+                                table_columns.setdefault(key, {})[col] = _parse_tab_column_row(row, support_hidden_col)
+                except oracledb.Error as e:
+                    if support_hidden_col:
+                        log.info("读取 DBA_TAB_COLUMNS(含 hidden) 失败，尝试不含 hidden：%s", e)
+                        support_hidden_col = False
+                        sql_tpl = _load_ora_tab_columns_sql(include_hidden=False)
+                        with ora_conn.cursor() as cursor:
+                            for owner_chunk in owner_chunks:
+                                owners_clause = build_bind_placeholders(len(owner_chunk))
+                                sql = sql_tpl.format(owners_clause=owners_clause)
+                                cursor.execute(sql, owner_chunk)
+                                for row in cursor:
+                                    owner = _safe_upper(row[0])
+                                    table = _safe_upper(row[1])
+                                    col = _safe_upper(row[2])
+                                    if not owner or not table or not col:
+                                        continue
+                                    key = (owner, table)
+                                    if key not in table_pairs:
+                                        continue
+                                    table_columns.setdefault(key, {})[col] = _parse_tab_column_row(row, False)
                     else:
                         raise
 
                 # 索引
                 if include_indexes:
-                    sql_idx = f"""
+                    sql_idx_tpl = """
                         SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, UNIQUENESS
                         FROM DBA_INDEXES
                         WHERE TABLE_OWNER IN ({owners_clause})
                     """
                     with ora_conn.cursor() as cursor:
-                        cursor.execute(sql_idx, owners)
-                        for row in cursor:
-                            owner = _safe_upper(row[0])
-                            table = _safe_upper(row[1])
-                            if not owner or not table:
-                                continue
-                            key = (owner, table)
-                            if key not in table_pairs:
-                                continue
-                            idx_name = _safe_upper(row[2])
-                            if not idx_name:
-                                continue
-                            indexes.setdefault(key, {})[idx_name] = {
-                                "uniqueness": (row[3] or "").upper(),
-                                "columns": []
-                            }
+                        for owner_chunk in owner_chunks:
+                            owners_clause = build_bind_placeholders(len(owner_chunk))
+                            sql_idx = sql_idx_tpl.format(owners_clause=owners_clause)
+                            cursor.execute(sql_idx, owner_chunk)
+                            for row in cursor:
+                                owner = _safe_upper(row[0])
+                                table = _safe_upper(row[1])
+                                if not owner or not table:
+                                    continue
+                                key = (owner, table)
+                                if key not in table_pairs:
+                                    continue
+                                idx_name = _safe_upper(row[2])
+                                if not idx_name:
+                                    continue
+                                indexes.setdefault(key, {})[idx_name] = {
+                                    "uniqueness": (row[3] or "").upper(),
+                                    "columns": []
+                                }
 
-                    sql_idx_cols = f"""
+                    sql_idx_cols_tpl = """
                         SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_NAME
                         FROM DBA_IND_COLUMNS
                         WHERE TABLE_OWNER IN ({owners_clause})
                         ORDER BY TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_POSITION
                     """
                     with ora_conn.cursor() as cursor:
-                        cursor.execute(sql_idx_cols, owners)
-                        for row in cursor:
-                            owner = _safe_upper(row[0])
-                            table = _safe_upper(row[1])
-                            if not owner or not table:
-                                continue
-                            key = (owner, table)
-                            if key not in table_pairs:
-                                continue
-                            idx_name = _safe_upper(row[2])
-                            col_name = _safe_upper(row[3])
-                            if not idx_name or not col_name:
-                                continue
-                            indexes.setdefault(key, {}).setdefault(
-                                idx_name, {"uniqueness": "UNKNOWN", "columns": []}
-                            )["columns"].append(col_name)
+                        for owner_chunk in owner_chunks:
+                            owners_clause = build_bind_placeholders(len(owner_chunk))
+                            sql_idx_cols = sql_idx_cols_tpl.format(owners_clause=owners_clause)
+                            cursor.execute(sql_idx_cols, owner_chunk)
+                            for row in cursor:
+                                owner = _safe_upper(row[0])
+                                table = _safe_upper(row[1])
+                                if not owner or not table:
+                                    continue
+                                key = (owner, table)
+                                if key not in table_pairs:
+                                    continue
+                                idx_name = _safe_upper(row[2])
+                                col_name = _safe_upper(row[3])
+                                if not idx_name or not col_name:
+                                    continue
+                                indexes.setdefault(key, {}).setdefault(
+                                    idx_name, {"uniqueness": "UNKNOWN", "columns": []}
+                                )["columns"].append(col_name)
 
                 # 约束
                 if include_constraints:
-                    sql_cons = f"""
+                    sql_cons_tpl = """
                         SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME
                         FROM DBA_CONSTRAINTS
                         WHERE OWNER IN ({owners_clause})
@@ -4456,48 +4660,54 @@ def dump_oracle_metadata(
                           AND STATUS = 'ENABLED'
                     """
                     with ora_conn.cursor() as cursor:
-                        cursor.execute(sql_cons, owners)
-                        for row in cursor:
-                            owner = _safe_upper(row[0])
-                            table = _safe_upper(row[1])
-                            if not owner or not table:
-                                continue
-                            key = (owner, table)
-                            if key not in table_pairs:
-                                continue
-                            name = _safe_upper(row[2])
-                            if not name:
-                                continue
-                            constraints.setdefault(key, {})[name] = {
-                                "type": (row[3] or "").upper(),
-                                "columns": [],
-                                "r_owner": _safe_upper(row[4]) if row[4] else None,
-                                "r_constraint": _safe_upper(row[5]) if row[5] else None,
-                            }
+                        for owner_chunk in owner_chunks:
+                            owners_clause = build_bind_placeholders(len(owner_chunk))
+                            sql_cons = sql_cons_tpl.format(owners_clause=owners_clause)
+                            cursor.execute(sql_cons, owner_chunk)
+                            for row in cursor:
+                                owner = _safe_upper(row[0])
+                                table = _safe_upper(row[1])
+                                if not owner or not table:
+                                    continue
+                                key = (owner, table)
+                                if key not in table_pairs:
+                                    continue
+                                name = _safe_upper(row[2])
+                                if not name:
+                                    continue
+                                constraints.setdefault(key, {})[name] = {
+                                    "type": (row[3] or "").upper(),
+                                    "columns": [],
+                                    "r_owner": _safe_upper(row[4]) if row[4] else None,
+                                    "r_constraint": _safe_upper(row[5]) if row[5] else None,
+                                }
 
-                    sql_cons_cols = f"""
+                    sql_cons_cols_tpl = """
                         SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME
                         FROM DBA_CONS_COLUMNS
                         WHERE OWNER IN ({owners_clause})
                         ORDER BY OWNER, TABLE_NAME, CONSTRAINT_NAME, POSITION
                     """
                     with ora_conn.cursor() as cursor:
-                        cursor.execute(sql_cons_cols, owners)
-                        for row in cursor:
-                            owner = _safe_upper(row[0])
-                            table = _safe_upper(row[1])
-                            if not owner or not table:
-                                continue
-                            key = (owner, table)
-                            if key not in table_pairs:
-                                continue
-                            cons_name = _safe_upper(row[2])
-                            col_name = _safe_upper(row[3])
-                            if not cons_name or not col_name:
-                                continue
-                            constraints.setdefault(key, {}).setdefault(
-                                cons_name, {"type": "UNKNOWN", "columns": []}
-                            )["columns"].append(col_name)
+                        for owner_chunk in owner_chunks:
+                            owners_clause = build_bind_placeholders(len(owner_chunk))
+                            sql_cons_cols = sql_cons_cols_tpl.format(owners_clause=owners_clause)
+                            cursor.execute(sql_cons_cols, owner_chunk)
+                            for row in cursor:
+                                owner = _safe_upper(row[0])
+                                table = _safe_upper(row[1])
+                                if not owner or not table:
+                                    continue
+                                key = (owner, table)
+                                if key not in table_pairs:
+                                    continue
+                                cons_name = _safe_upper(row[2])
+                                col_name = _safe_upper(row[3])
+                                if not cons_name or not col_name:
+                                    continue
+                                constraints.setdefault(key, {}).setdefault(
+                                    cons_name, {"type": "UNKNOWN", "columns": []}
+                                )["columns"].append(col_name)
 
                     # 为外键补齐被引用表信息 (基于约束引用)
                     cons_table_lookup: Dict[Tuple[str, str], Tuple[str, str]] = {}
@@ -4521,30 +4731,97 @@ def dump_oracle_metadata(
 
                 # 触发器
                 if include_triggers:
-                    sql_trg = f"""
+                    sql_trg_tpl = """
                         SELECT OWNER, TABLE_OWNER, TABLE_NAME, TRIGGER_NAME, TRIGGERING_EVENT, STATUS
                         FROM DBA_TRIGGERS
                         WHERE TABLE_OWNER IN ({owners_clause})
                     """
                     with ora_conn.cursor() as cursor:
-                        cursor.execute(sql_trg, owners)
-                        for row in cursor:
-                            trg_owner = _safe_upper(row[0])
-                            owner = _safe_upper(row[1])
-                            table = _safe_upper(row[2])
-                            if not owner or not table:
-                                continue
-                            key = (owner, table)
-                            if key not in table_pairs:
-                                continue
-                            trg_name = _safe_upper(row[3])
-                            if not trg_name:
-                                continue
-                            triggers.setdefault(key, {})[trg_name] = {
-                                "event": row[4],
-                                "status": row[5],
-                                "owner": trg_owner or owner
-                            }
+                        for owner_chunk in owner_chunks:
+                            owners_clause = build_bind_placeholders(len(owner_chunk))
+                            sql_trg = sql_trg_tpl.format(owners_clause=owners_clause)
+                            cursor.execute(sql_trg, owner_chunk)
+                            for row in cursor:
+                                trg_owner = _safe_upper(row[0])
+                                owner = _safe_upper(row[1])
+                                table = _safe_upper(row[2])
+                                if not owner or not table:
+                                    continue
+                                key = (owner, table)
+                                if key not in table_pairs:
+                                    continue
+                                trg_name = _safe_upper(row[3])
+                                if not trg_name:
+                                    continue
+                                triggers.setdefault(key, {})[trg_name] = {
+                                    "event": row[4],
+                                    "status": row[5],
+                                    "owner": trg_owner or owner
+                                }
+
+                if need_package_status:
+                    pkg_owners = sorted(source_schema_set | set(owners))
+                    if pkg_owners:
+                        pkg_owner_chunks = chunk_list(pkg_owners, ORACLE_IN_BATCH_SIZE)
+                        sql_pkg_tpl = """
+                            SELECT OWNER, OBJECT_NAME, OBJECT_TYPE, STATUS
+                            FROM DBA_OBJECTS
+                            WHERE OWNER IN ({owners_clause})
+                              AND OBJECT_TYPE IN ('PACKAGE', 'PACKAGE BODY')
+                        """
+                        with ora_conn.cursor() as cursor:
+                            for owner_chunk in pkg_owner_chunks:
+                                owners_clause = build_bind_placeholders(len(owner_chunk))
+                                sql_pkg = sql_pkg_tpl.format(owners_clause=owners_clause)
+                                cursor.execute(sql_pkg, owner_chunk)
+                                for row in cursor:
+                                    owner = _safe_upper(row[0])
+                                    name = _safe_upper(row[1])
+                                    obj_type = _safe_upper(row[2])
+                                    status = _safe_upper(row[3]) if row[3] else "UNKNOWN"
+                                    if not owner or not name or not obj_type:
+                                        continue
+                                    object_statuses[(owner, name, obj_type)] = status or "UNKNOWN"
+
+                        try:
+                            sql_pkg_err_tpl = """
+                                SELECT OWNER, NAME, TYPE, LINE, POSITION, TEXT
+                                FROM DBA_ERRORS
+                                WHERE OWNER IN ({owners_clause})
+                                  AND TYPE IN ('PACKAGE', 'PACKAGE BODY')
+                                ORDER BY OWNER, NAME, TYPE, SEQUENCE
+                            """
+                            temp_errors: Dict[Tuple[str, str, str], Dict[str, object]] = defaultdict(
+                                lambda: {"count": 0, "first_error": ""}
+                            )
+                            with ora_conn.cursor() as cursor:
+                                for owner_chunk in pkg_owner_chunks:
+                                    owners_clause = build_bind_placeholders(len(owner_chunk))
+                                    sql_pkg_err = sql_pkg_err_tpl.format(owners_clause=owners_clause)
+                                    cursor.execute(sql_pkg_err, owner_chunk)
+                                    for row in cursor:
+                                        owner = _safe_upper(row[0])
+                                        name = _safe_upper(row[1])
+                                        err_type = _safe_upper(row[2])
+                                        err_line = str(row[3]).strip() if row[3] is not None else ""
+                                        err_pos = str(row[4]).strip() if row[4] is not None else ""
+                                        err_text = normalize_error_text(row[5] if len(row) > 5 else "")
+                                        if not owner or not name or not err_type:
+                                            continue
+                                        key = (owner, name, err_type)
+                                        entry = temp_errors[key]
+                                        entry["count"] = int(entry["count"]) + 1
+                                        if not entry["first_error"]:
+                                            prefix = f"L{err_line}:{err_pos} " if err_line or err_pos else ""
+                                            entry["first_error"] = f"{prefix}{err_text}".strip()
+                            for key, info in temp_errors.items():
+                                package_errors[key] = PackageErrorInfo(
+                                    count=int(info.get("count") or 0),
+                                    first_error=str(info.get("first_error") or "")
+                                )
+                        except oracledb.Error as e:
+                            package_errors_complete = False
+                            log.warning("读取 Oracle DBA_ERRORS 失败，包错误信息将为空: %s", e)
 
                 if include_comments:
                     if not table_pairs:
@@ -4557,7 +4834,7 @@ def dump_oracle_metadata(
                                 for chunk in chunk_list(comment_keys, COMMENT_BATCH_SIZE):
                                     if not chunk:
                                         continue
-                                    placeholders = _make_in_clause(chunk)
+                                    placeholders = build_bind_placeholders(len(chunk))
                                     sql_cmt = f"""
                                         SELECT OWNER, TABLE_NAME, COMMENTS
                                         FROM DBA_TAB_COMMENTS
@@ -4574,7 +4851,7 @@ def dump_oracle_metadata(
                                 for chunk in chunk_list(comment_keys, COMMENT_BATCH_SIZE):
                                     if not chunk:
                                         continue
-                                    placeholders = _make_in_clause(chunk)
+                                    placeholders = build_bind_placeholders(len(chunk))
                                     sql_cmt_col = f"""
                                         SELECT OWNER, TABLE_NAME, COLUMN_NAME, COMMENTS
                                         FROM DBA_COL_COMMENTS
@@ -4597,16 +4874,20 @@ def dump_oracle_metadata(
 
                 if include_blacklist:
                     blacklist_available = True
-                    sql_blacklist_count = f"""
-                        SELECT COUNT(*)
-                        FROM OMS_USER.TMP_BLACK_TABLE
-                        WHERE OWNER IN ({owners_clause})
-                    """
                     try:
+                        total_blacklist = 0
                         with ora_conn.cursor() as cursor:
-                            cursor.execute(sql_blacklist_count, owners)
-                            row = cursor.fetchone()
-                            total_blacklist = int(row[0]) if row and row[0] is not None else 0
+                            sql_blacklist_count_tpl = """
+                                SELECT COUNT(*)
+                                FROM OMS_USER.TMP_BLACK_TABLE
+                                WHERE OWNER IN ({owners_clause})
+                            """
+                            for owner_chunk in owner_chunks:
+                                owners_clause = build_bind_placeholders(len(owner_chunk))
+                                sql_blacklist_count = sql_blacklist_count_tpl.format(owners_clause=owners_clause)
+                                cursor.execute(sql_blacklist_count, owner_chunk)
+                                row = cursor.fetchone()
+                                total_blacklist += int(row[0]) if row and row[0] is not None else 0
                         if total_blacklist <= 0:
                             log.warning("未检测到 OMS_USER.TMP_BLACK_TABLE 黑名单记录（当前 schema）。")
                         else:
@@ -4620,25 +4901,28 @@ def dump_oracle_metadata(
                             log.warning("读取 OMS_USER.TMP_BLACK_TABLE 失败，将跳过黑名单过滤：%s", e)
 
                     if blacklist_available:
-                        sql_blacklist = f"""
+                        sql_blacklist_tpl = """
                             SELECT OWNER, TABLE_NAME, DATA_TYPE, BLACK_TYPE
                             FROM OMS_USER.TMP_BLACK_TABLE
                             WHERE OWNER IN ({owners_clause})
                         """
                         try:
                             with ora_conn.cursor() as cursor:
-                                cursor.execute(sql_blacklist, owners)
-                                for row in cursor:
-                                    owner = _safe_upper(row[0])
-                                    table = _safe_upper(row[1])
-                                    if not owner or not table:
-                                        continue
-                                    key = (owner, table)
-                                    if key not in table_pairs:
-                                        continue
-                                    data_type = normalize_black_data_type(row[2])
-                                    black_type = normalize_black_type(row[3]) or "UNKNOWN"
-                                    blacklist_tables.setdefault(key, set()).add((black_type, data_type))
+                                for owner_chunk in owner_chunks:
+                                    owners_clause = build_bind_placeholders(len(owner_chunk))
+                                    sql_blacklist = sql_blacklist_tpl.format(owners_clause=owners_clause)
+                                    cursor.execute(sql_blacklist, owner_chunk)
+                                    for row in cursor:
+                                        owner = _safe_upper(row[0])
+                                        table = _safe_upper(row[1])
+                                        if not owner or not table:
+                                            continue
+                                        key = (owner, table)
+                                        if key not in table_pairs:
+                                            continue
+                                        data_type = normalize_black_data_type(row[2])
+                                        black_type = normalize_black_type(row[3]) or "UNKNOWN"
+                                        blacklist_tables.setdefault(key, set()).add((black_type, data_type))
                         except oracledb.Error as e:
                             log.warning("读取 OMS_USER.TMP_BLACK_TABLE 失败，将跳过黑名单过滤：%s", e)
 
@@ -4675,20 +4959,22 @@ def dump_oracle_metadata(
                     table_privilege_map = set()
 
             if seq_owners and include_sequences:
-                seq_clause = _make_in_clause(seq_owners)
-                sql_seq = f"""
-                    SELECT SEQUENCE_OWNER, SEQUENCE_NAME
-                    FROM DBA_SEQUENCES
-                    WHERE SEQUENCE_OWNER IN ({seq_clause})
-                """
                 with ora_conn.cursor() as cursor:
-                    cursor.execute(sql_seq, seq_owners)
-                    for row in cursor:
-                        owner = _safe_upper(row[0])
-                        seq_name = _safe_upper(row[1])
-                        if not owner or not seq_name:
-                            continue
-                        sequences.setdefault(owner, set()).add(seq_name)
+                    sql_seq_tpl = """
+                        SELECT SEQUENCE_OWNER, SEQUENCE_NAME
+                        FROM DBA_SEQUENCES
+                        WHERE SEQUENCE_OWNER IN ({owners_clause})
+                    """
+                    for owner_chunk in seq_owner_chunks:
+                        owners_clause = build_bind_placeholders(len(owner_chunk))
+                        sql_seq = sql_seq_tpl.format(owners_clause=owners_clause)
+                        cursor.execute(sql_seq, owner_chunk)
+                        for row in cursor:
+                            owner = _safe_upper(row[0])
+                            seq_name = _safe_upper(row[1])
+                            if not owner or not seq_name:
+                                continue
+                            sequences.setdefault(owner, set()).add(seq_name)
 
     except oracledb.Error as e:
         log.error(f"严重错误: 批量获取 Oracle 元数据失败: {e}")
@@ -4720,7 +5006,10 @@ def dump_oracle_metadata(
         role_privileges=role_privileges,
         role_metadata=role_metadata,
         system_privilege_map=system_privilege_map,
-        table_privilege_map=table_privilege_map
+        table_privilege_map=table_privilege_map,
+        object_statuses=object_statuses,
+        package_errors=package_errors,
+        package_errors_complete=package_errors_complete
     )
 
 
@@ -4736,23 +5025,31 @@ def load_oracle_dependencies(
     if not schemas_list:
         return []
 
-    owners_clause = ','.join([f":{i+1}" for i in range(len(schemas_list))])
+    owners = sorted({s.upper() for s in schemas_list})
     enabled_types = {t.upper() for t in (object_types or set(ALL_TRACKED_OBJECT_TYPES))}
     enabled_types &= set(ALL_TRACKED_OBJECT_TYPES)
     if not enabled_types:
         log.info("未启用依赖分析对象类型，跳过 Oracle 依赖读取。")
         return []
     types_clause = ",".join(f"'{t}'" for t in sorted(enabled_types))
-
-    ref_owner_clause = "" if include_external_refs else f"AND REFERENCED_OWNER IN ({owners_clause})"
-    sql = f"""
-        SELECT OWNER, NAME, TYPE, REFERENCED_OWNER, REFERENCED_NAME, REFERENCED_TYPE
-        FROM DBA_DEPENDENCIES
-        WHERE OWNER IN ({owners_clause})
-          {ref_owner_clause}
-          AND TYPE IN ({types_clause})
-          AND REFERENCED_TYPE IN ({types_clause})
-    """
+    owner_chunks = chunk_list(owners, ORACLE_IN_BATCH_SIZE)
+    if include_external_refs:
+        sql_tpl = """
+            SELECT OWNER, NAME, TYPE, REFERENCED_OWNER, REFERENCED_NAME, REFERENCED_TYPE
+            FROM DBA_DEPENDENCIES
+            WHERE OWNER IN ({owner_ph})
+              AND TYPE IN ({types_clause})
+              AND REFERENCED_TYPE IN ({types_clause})
+        """
+    else:
+        sql_tpl = """
+            SELECT OWNER, NAME, TYPE, REFERENCED_OWNER, REFERENCED_NAME, REFERENCED_TYPE
+            FROM DBA_DEPENDENCIES
+            WHERE OWNER IN ({owner_ph})
+              AND REFERENCED_OWNER IN ({ref_ph})
+              AND TYPE IN ({types_clause})
+              AND REFERENCED_TYPE IN ({types_clause})
+        """
 
     records: List[DependencyRecord] = []
     try:
@@ -4762,24 +5059,52 @@ def load_oracle_dependencies(
             dsn=ora_cfg['dsn']
         ) as connection:
             with connection.cursor() as cursor:
-                cursor.execute(sql, schemas_list)
-                for row in cursor:
-                    owner = (row[0] or '').strip().upper()
-                    name = (row[1] or '').strip().upper()
-                    obj_type = (row[2] or '').strip().upper()
-                    ref_owner = (row[3] or '').strip().upper()
-                    ref_name = (row[4] or '').strip().upper()
-                    ref_type = (row[5] or '').strip().upper()
-                    if not owner or not name or not ref_owner or not ref_name:
-                        continue
-                    records.append(DependencyRecord(
-                        owner=owner,
-                        name=name,
-                        object_type=obj_type,
-                        referenced_owner=ref_owner,
-                        referenced_name=ref_name,
-                        referenced_type=ref_type
-                    ))
+                if include_external_refs:
+                    for owner_chunk in owner_chunks:
+                        owner_ph = build_bind_placeholders(len(owner_chunk))
+                        sql = sql_tpl.format(owner_ph=owner_ph, types_clause=types_clause)
+                        cursor.execute(sql, owner_chunk)
+                        for row in cursor:
+                            owner = (row[0] or '').strip().upper()
+                            name = (row[1] or '').strip().upper()
+                            obj_type = (row[2] or '').strip().upper()
+                            ref_owner = (row[3] or '').strip().upper()
+                            ref_name = (row[4] or '').strip().upper()
+                            ref_type = (row[5] or '').strip().upper()
+                            if not owner or not name or not ref_owner or not ref_name:
+                                continue
+                            records.append(DependencyRecord(
+                                owner=owner,
+                                name=name,
+                                object_type=obj_type,
+                                referenced_owner=ref_owner,
+                                referenced_name=ref_name,
+                                referenced_type=ref_type
+                            ))
+                else:
+                    for owner_chunk in owner_chunks:
+                        owner_ph = build_bind_placeholders(len(owner_chunk))
+                        for ref_chunk in owner_chunks:
+                            ref_ph = build_bind_placeholders(len(ref_chunk), offset=len(owner_chunk))
+                            sql = sql_tpl.format(owner_ph=owner_ph, ref_ph=ref_ph, types_clause=types_clause)
+                            cursor.execute(sql, owner_chunk + ref_chunk)
+                            for row in cursor:
+                                owner = (row[0] or '').strip().upper()
+                                name = (row[1] or '').strip().upper()
+                                obj_type = (row[2] or '').strip().upper()
+                                ref_owner = (row[3] or '').strip().upper()
+                                ref_name = (row[4] or '').strip().upper()
+                                ref_type = (row[5] or '').strip().upper()
+                                if not owner or not name or not ref_owner or not ref_name:
+                                    continue
+                                records.append(DependencyRecord(
+                                    owner=owner,
+                                    name=name,
+                                    object_type=obj_type,
+                                    referenced_owner=ref_owner,
+                                    referenced_name=ref_name,
+                                    referenced_type=ref_type
+                                ))
     except oracledb.Error as exc:
         log.error(f"严重错误: 加载 Oracle 依赖信息失败: {exc}")
         sys.exit(1)
@@ -6243,7 +6568,8 @@ def check_primary_objects(
       - TABLE: 存在性 + 列名集合 (忽略 OMS_OBJECT_NUMBER/OMS_RELATIVE_FNO/OMS_BLOCK_NUMBER/OMS_ROW_NUMBER)
       - LONG/LONG RAW 列要求目标端类型为 CLOB/BLOB
       - VIEW / PROCEDURE / FUNCTION / SYNONYM: 只校验存在性
-      - MATERIALIZED VIEW / PACKAGE / PACKAGE BODY: 默认仅打印不校验（若未被禁用）
+      - MATERIALIZED VIEW: 默认仅打印不校验（若未被禁用）
+      - PACKAGE / PACKAGE BODY: 单独走包有效性对比，不在这里处理
     """
     results: ReportResults = {
         "missing": [],
@@ -6258,7 +6584,7 @@ def check_primary_objects(
         log.info("主校验清单为空，没有需要校验的对象。")
         return results
 
-    log_subsection("主对象校验 (TABLE/VIEW/PROC/FUNC/PACKAGE/PACKAGE BODY/SYNONYM)")
+    log_subsection("主对象校验 (TABLE/VIEW/PROC/FUNC/SYNONYM + PACKAGE 有效性)")
 
     allowed_types = enabled_primary_types or set(PRIMARY_OBJECT_TYPES)
     print_only_types_u = {t.upper() for t in (print_only_types or set())}
@@ -6290,6 +6616,10 @@ def check_primary_objects(
         if obj_type_u in print_only_types_u:
             reason = PRINT_ONLY_PRIMARY_REASONS.get(obj_type_u, "仅打印不校验")
             results['skipped'].append((obj_type_u, full_tgt, src_name, reason))
+            continue
+
+        if obj_type_u in PACKAGE_OBJECT_TYPES:
+            # PACKAGE/PKG BODY 使用独立有效性对比逻辑
             continue
 
         expected_targets[obj_type_u].add(full_tgt)
@@ -6424,6 +6754,108 @@ def check_primary_objects(
 
 
 # ====================== 扩展：索引 / 约束 / 序列 / 触发器 ======================
+
+def normalize_object_status(status: Optional[str]) -> str:
+    if status is None:
+        return "UNKNOWN"
+    status_u = str(status).strip().upper()
+    return status_u if status_u else "UNKNOWN"
+
+
+def normalize_error_text(text: Optional[str]) -> str:
+    if text is None:
+        return ""
+    cleaned = str(text).replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    return " ".join(cleaned.split())
+
+
+def compare_package_objects(
+    master_list: MasterCheckList,
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata,
+    enabled_primary_types: Optional[Set[str]] = None
+) -> PackageCompareResults:
+    """
+    对 PACKAGE / PACKAGE BODY 做存在性 + VALID/INVALID 对比，并记录错误信息（若可用）。
+    SOURCE_INVALID 不计入 mismatch 统计，但会列出详情。
+    """
+    enabled_types = {t.upper() for t in (enabled_primary_types or set(PRIMARY_OBJECT_TYPES))}
+    if not (set(PACKAGE_OBJECT_TYPES) & enabled_types):
+        return {"rows": [], "summary": {}}
+
+    rows: List[PackageCompareRow] = []
+    summary: Dict[str, int] = defaultdict(int)
+    ob_pkg_set = ob_meta.objects_by_type.get("PACKAGE", set())
+    ob_pkg_body_set = ob_meta.objects_by_type.get("PACKAGE BODY", set())
+
+    for src_name, tgt_name, obj_type in master_list:
+        obj_type_u = obj_type.upper()
+        if obj_type_u not in PACKAGE_OBJECT_TYPES:
+            continue
+        if "." not in src_name or "." not in tgt_name:
+            continue
+        src_schema, src_obj = src_name.split(".", 1)
+        tgt_schema, tgt_obj = tgt_name.split(".", 1)
+        src_schema_u = src_schema.upper()
+        src_obj_u = src_obj.upper()
+        tgt_schema_u = tgt_schema.upper()
+        tgt_obj_u = tgt_obj.upper()
+        src_full = f"{src_schema_u}.{src_obj_u}"
+        tgt_full = f"{tgt_schema_u}.{tgt_obj_u}"
+
+        src_status = normalize_object_status(
+            oracle_meta.object_statuses.get((src_schema_u, src_obj_u, obj_type_u))
+        )
+        if obj_type_u == "PACKAGE":
+            tgt_exists = tgt_full in ob_pkg_set
+        else:
+            tgt_exists = tgt_full in ob_pkg_body_set
+        tgt_status = "MISSING"
+        if tgt_exists:
+            tgt_status = normalize_object_status(
+                ob_meta.object_statuses.get((tgt_schema_u, tgt_obj_u, obj_type_u))
+            )
+
+        error_count = 0
+        first_error = ""
+
+        if src_status == "INVALID":
+            result = "SOURCE_INVALID"
+            err = oracle_meta.package_errors.get((src_schema_u, src_obj_u, obj_type_u))
+            if err:
+                error_count = err.count
+                first_error = err.first_error
+        elif not tgt_exists:
+            result = "MISSING_TARGET"
+        else:
+            if src_status == "VALID" and tgt_status == "VALID":
+                result = "OK"
+            elif tgt_status == "INVALID":
+                result = "TARGET_INVALID"
+                err = ob_meta.package_errors.get((tgt_schema_u, tgt_obj_u, obj_type_u))
+                if err:
+                    error_count = err.count
+                    first_error = err.first_error
+            else:
+                result = "STATUS_MISMATCH"
+
+        summary[result] += 1
+        rows.append(PackageCompareRow(
+            src_full=src_full,
+            obj_type=obj_type_u,
+            src_status=src_status,
+            tgt_full=tgt_full,
+            tgt_status=tgt_status,
+            result=result,
+            error_count=error_count,
+            first_error=first_error
+        ))
+
+    return {
+        "rows": rows,
+        "summary": dict(summary),
+        "diff_rows": [row for row in rows if row.result != "OK"]
+    }
 
 def compare_indexes_for_table(
     oracle_meta: OracleMetadata,
@@ -7874,6 +8306,13 @@ def fetch_dbcat_schema_objects(
     cli_timeout = int(settings.get('cli_timeout', 600))
     dbcat_from = settings.get('dbcat_from', '')
     dbcat_to = settings.get('dbcat_to', '')
+    dbcat_no_cal_dep = parse_bool_flag(settings.get('dbcat_no_cal_dep', 'false'), False)
+    dbcat_query_meta_thread = int(settings.get('dbcat_query_meta_thread') or 0)
+    dbcat_progress_interval = int(settings.get('dbcat_progress_interval') or 0)
+    if dbcat_query_meta_thread < 0:
+        dbcat_query_meta_thread = 0
+    if dbcat_progress_interval < 1:
+        dbcat_progress_interval = 0
     
     # 并行导出的 worker 数量，默认 4，防止打爆主机
     parallel_workers = int(settings.get('dbcat_parallel_workers', 4))
@@ -7916,7 +8355,13 @@ def fetch_dbcat_schema_objects(
         ensure_dir(run_dir)
         chunk_time_map: Dict[Tuple[str, str, str], float] = {}
         
-        def _run_dbcat_chunk(option: str, chunk_names: List[str], obj_type: str) -> Optional[str]:
+        def _run_dbcat_chunk(
+            option: str,
+            chunk_names: List[str],
+            obj_type: str,
+            chunk_idx: int,
+            total_chunks: int
+        ) -> Optional[str]:
             cmd = [
                 str(dbcat_cli),
                 'convert',
@@ -7932,46 +8377,74 @@ def fetch_dbcat_schema_objects(
             ]
             if service:
                 cmd.extend(['--service-name', service])
+            if dbcat_no_cal_dep:
+                cmd.append('--no-cal-dep')
+            if dbcat_query_meta_thread:
+                cmd.extend(['--query-meta-thread', str(dbcat_query_meta_thread)])
             cmd.extend([option, ','.join(chunk_names)])
 
             env = os.environ.copy()
             env['JAVA_HOME'] = java_home
             env.setdefault('JRE_HOME', java_home)
 
-            log.info("[dbcat] 导出 schema=%s option=%s 对象数=%d...", schema, option, len(chunk_names))
+            log.info(
+                "[dbcat] 导出 schema=%s option=%s chunk=%d/%d 对象数=%d...",
+                schema, option, chunk_idx, total_chunks, len(chunk_names)
+            )
             start_time = time.time()
             try:
-                proc = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    encoding='utf-8',
-                    errors='ignore',
-                    timeout=cli_timeout,
-                    env=env
+                with tempfile.TemporaryFile() as stdout_buf, tempfile.TemporaryFile() as stderr_buf:
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=stdout_buf,
+                        stderr=stderr_buf,
+                        env=env
+                    )
+                    last_log = start_time
+                    while True:
+                        if proc.poll() is not None:
+                            break
+                        now = time.time()
+                        elapsed = now - start_time
+                        if cli_timeout and elapsed > cli_timeout:
+                            proc.kill()
+                            proc.wait(timeout=5)
+                            return f"[dbcat] 转换 schema={schema} 超时 ({cli_timeout}s)"
+                        if dbcat_progress_interval and (now - last_log) >= dbcat_progress_interval:
+                            log.info(
+                                "[dbcat] 导出 schema=%s option=%s chunk=%d/%d 仍在运行 (已耗时 %.1fs)...",
+                                schema, option, chunk_idx, total_chunks, elapsed
+                            )
+                            last_log = now
+                        time.sleep(0.5)
+                    elapsed = time.time() - start_time
+                    stdout_buf.seek(0)
+                    stderr_buf.seek(0)
+                    stdout_text = stdout_buf.read().decode('utf-8', errors='ignore')
+                    stderr_text = stderr_buf.read().decode('utf-8', errors='ignore')
+                    if proc.returncode != 0:
+                        return f"[dbcat] 转换 schema={schema} 失败: {stderr_text or stdout_text}"
+                log.info(
+                    "[dbcat] 导出 schema=%s option=%s chunk=%d/%d 完成，用时 %.2fs。",
+                    schema, option, chunk_idx, total_chunks, elapsed
                 )
-                elapsed = time.time() - start_time
-                if proc.returncode != 0:
-                    return f"[dbcat] 转换 schema={schema} 失败: {proc.stderr or proc.stdout}"
-                log.info("[dbcat] 导出 schema=%s option=%s 完成，用时 %.2fs。", schema, option, elapsed)
                 # 将批次总耗时平均分配给每个对象
                 avg_elapsed = elapsed / len(chunk_names) if chunk_names else elapsed
                 for obj_name in chunk_names:
                     key = (schema.upper(), obj_type.upper(), obj_name.upper())
                     chunk_time_map[key] = avg_elapsed
                 return None
-            except subprocess.TimeoutExpired:
-                return f"[dbcat] 转换 schema={schema} 超时 ({cli_timeout}s)"
             except Exception as e:
                 return f"[dbcat] 转换 schema={schema} 异常: {e}"
         
         # 执行所有 chunk
         for option, obj_type, name_list in prepared:
             chunks = [name_list[i:i + max_chunk] for i in range(0, len(name_list), max_chunk)]
-            for chunk in chunks:
+            total_chunks = len(chunks)
+            for idx, chunk in enumerate(chunks, start=1):
                 if error_occurred.is_set():
                     return None
-                err = _run_dbcat_chunk(option, chunk, obj_type)
+                err = _run_dbcat_chunk(option, chunk, obj_type, idx, total_chunks)
                 if err:
                     error_occurred.set()
                     return err
@@ -8225,6 +8698,107 @@ class SqlMasker:
         for k, v in self.literals.items():
             sql = sql.replace(k, v)
         return sql
+
+
+class SqlPunctuationMasker:
+    """
+    针对全角标点清洗的掩码器：
+    - 屏蔽字符串字面量、注释、双引号标识符
+    - 避免清洗时误改语义
+    """
+    def __init__(self, sql: str):
+        self.original_sql = sql
+        self.masked_sql = sql
+        self.literals: Dict[str, str] = {}
+        self.comments: Dict[str, str] = {}
+        self.quoted_identifiers: Dict[str, str] = {}
+        self._mask()
+
+    def _mask_pattern(self, pattern: str, store: Dict[str, str], prefix: str, flags: int = 0) -> None:
+        def _repl(match):
+            key = f"###{prefix}_{len(store)}###"
+            store[key] = match.group(0)
+            return key
+        self.masked_sql = re.sub(pattern, _repl, self.masked_sql, flags=flags)
+
+    def _mask(self) -> None:
+        # 1) 字符串字面量
+        self._mask_pattern(r"'(?:''|[^'])*'", self.literals, "PUNC_STR")
+        # 2) 块注释
+        self._mask_pattern(r"/\*.*?\*/", self.comments, "PUNC_CMT_BLK", flags=re.DOTALL)
+        # 3) 行注释
+        self._mask_pattern(r"--.*?$", self.comments, "PUNC_CMT_LN", flags=re.MULTILINE)
+        # 4) 双引号标识符
+        self._mask_pattern(r'"(?:\"\"|[^"])*"', self.quoted_identifiers, "PUNC_QID")
+
+    def unmask(self, sql: str) -> str:
+        for k, v in self.quoted_identifiers.items():
+            sql = sql.replace(k, v)
+        for k, v in self.comments.items():
+            sql = sql.replace(k, v)
+        for k, v in self.literals.items():
+            sql = sql.replace(k, v)
+        return sql
+
+
+ASCII_PUNCT_FOR_FULLWIDTH = "!#$%&()*+,-./:;<=>?@[\\]^_`{|}~"
+FULLWIDTH_PUNCT_REPLACEMENTS = {
+    chr(ord(ch) + 0xFEE0): ch for ch in ASCII_PUNCT_FOR_FULLWIDTH
+}
+FULLWIDTH_PUNCT_REPLACEMENTS.update({
+    "\u3000": " ",  # IDEOGRAPHIC SPACE
+    "\u3001": ",",  # IDEOGRAPHIC COMMA
+    "\u3002": ".",  # IDEOGRAPHIC PERIOD
+    "\u3010": "[",  # LEFT BLACK LENTICULAR BRACKET
+    "\u3011": "]",  # RIGHT BLACK LENTICULAR BRACKET
+})
+
+PLSQL_PUNCT_SANITIZE_TYPES = {
+    "PROCEDURE",
+    "FUNCTION",
+    "PACKAGE",
+    "PACKAGE BODY",
+    "TYPE",
+    "TYPE BODY",
+    "TRIGGER",
+}
+
+
+def sanitize_plsql_punctuation(
+    ddl: str,
+    obj_type: str,
+    sample_limit: int = 5
+) -> Tuple[str, int, List[Tuple[str, str]]]:
+    """
+    将PL/SQL DDL中的全角标点替换为半角，避免目标端解析失败。
+    保护字符串字面量、注释、双引号标识符不被替换。
+
+    Returns:
+        (sanitized_ddl, replaced_count, samples)
+    """
+    if not ddl:
+        return ddl, 0, []
+    if (obj_type or "").upper() not in PLSQL_PUNCT_SANITIZE_TYPES:
+        return ddl, 0, []
+
+    masker = SqlPunctuationMasker(ddl)
+    masked = masker.masked_sql
+    replaced = 0
+    samples: List[Tuple[str, str]] = []
+    out_chars: List[str] = []
+
+    for ch in masked:
+        repl = FULLWIDTH_PUNCT_REPLACEMENTS.get(ch)
+        if repl is not None:
+            replaced += 1
+            if len(samples) < sample_limit and (ch, repl) not in samples:
+                samples.append((ch, repl))
+            out_chars.append(repl)
+        else:
+            out_chars.append(ch)
+
+    sanitized = masker.unmask("".join(out_chars))
+    return sanitized, replaced, samples
 
 
 def _find_inline_comment_split(segment: str) -> Optional[int]:
@@ -9764,7 +10338,8 @@ def write_fixup_file(
     filename: str,
     content: str,
     header_comment: str,
-    grants_to_add: Optional[List[str]] = None
+    grants_to_add: Optional[List[str]] = None,
+    extra_comments: Optional[List[str]] = None
 ):
     target_dir = base_dir / subdir
     ensure_dir(target_dir)
@@ -9772,6 +10347,11 @@ def write_fixup_file(
     with open(file_path, 'w', encoding='utf-8') as f:
         f.write(f"-- {header_comment}\n")
         f.write("-- 本文件由校验工具自动生成，请在 OceanBase 执行前仔细审核。\n\n")
+        if extra_comments:
+            for line in extra_comments:
+                if line:
+                    f.write(f"-- {line}\n")
+            f.write("\n")
         
         body = content.strip()
         f.write(body)
@@ -10156,6 +10736,7 @@ def generate_fixup_scripts(
     synonym_metadata: Optional[Dict[Tuple[str, str], SynonymMeta]] = None,
     trigger_filter_entries: Optional[Set[str]] = None,
     trigger_filter_enabled: bool = False,
+    package_results: Optional[PackageCompareResults] = None,
     report_dir: Optional[Path] = None,
     report_timestamp: Optional[str] = None
 ):
@@ -10223,6 +10804,8 @@ def generate_fixup_scripts(
         )
 
     log.info(f"[FIXUP] 目标端订正 SQL 将生成到目录: {base_dir.resolve()}")
+    if not settings.get('enable_ddl_punct_sanitize', True):
+        log.info("[DDL_CLEAN] 已关闭 PL/SQL 全角标点清洗。")
 
     table_map: Dict[str, str] = {
         tgt_name: src_name
@@ -10287,6 +10870,26 @@ def generate_fixup_scripts(
     def mark_source(obj_type: str, source: str) -> None:
         with ddl_source_lock:
             ddl_source_stats[obj_type.upper()][source] += 1
+
+    ddl_clean_records: List[DdlCleanReportRow] = []
+    ddl_clean_lock = threading.Lock()
+
+    def record_ddl_clean(
+        obj_type: str,
+        obj_full: str,
+        replaced: int,
+        samples: List[Tuple[str, str]]
+    ) -> None:
+        if replaced <= 0:
+            return
+        row = DdlCleanReportRow(
+            obj_type=obj_type.upper(),
+            obj_full=obj_full,
+            replaced=replaced,
+            samples=samples or []
+        )
+        with ddl_clean_lock:
+            ddl_clean_records.append(row)
 
     def source_tag(label: str) -> str:
         return f"[{label}]"
@@ -10732,6 +11335,26 @@ def generate_fixup_scripts(
         if obj_type_u == 'TABLE':
             missing_tables.append((src_schema, src_obj, tgt_schema, tgt_obj))
         else:
+            other_missing_objects.append((obj_type_u, src_schema, src_obj, tgt_schema, tgt_obj))
+
+    if package_results:
+        for row in package_results.get("rows", []):
+            if row.result != "MISSING_TARGET":
+                continue
+            if row.src_status == "INVALID":
+                log.info(
+                    "[FIXUP] 跳过源端 INVALID 的 %s %s (不生成 DDL)。",
+                    row.obj_type, row.src_full
+                )
+                continue
+            if "." not in row.src_full or "." not in row.tgt_full:
+                continue
+            src_schema, src_obj = row.src_full.split(".", 1)
+            tgt_schema, tgt_obj = row.tgt_full.split(".", 1)
+            obj_type_u = row.obj_type.upper()
+            if not allow_fixup(obj_type_u, tgt_schema):
+                continue
+            queue_request(src_schema, obj_type_u, src_obj)
             other_missing_objects.append((obj_type_u, src_schema, src_obj, tgt_schema, tgt_obj))
 
     sequence_tasks: List[Tuple[str, str, str, str]] = []
@@ -11413,6 +12036,22 @@ def generate_fixup_scripts(
                 
                 ddl_adj = normalize_ddl_for_ob(ddl_adj)
                 ddl_adj = apply_ddl_cleanup_rules(ddl_adj, ot)
+                clean_notes = None
+                if settings.get('enable_ddl_punct_sanitize', True):
+                    ddl_adj, replaced, samples = sanitize_plsql_punctuation(ddl_adj, ot)
+                    if replaced:
+                        obj_full = f"{ts}.{to}"
+                        sample_text = ", ".join(f"{src}->{dst}" for src, dst in samples)
+                        suffix = f" 示例: {sample_text}" if sample_text else ""
+                        log.info(
+                            "[DDL_CLEAN] %s %s 全角标点清洗 %d 处。%s",
+                            ot,
+                            obj_full,
+                            replaced,
+                            suffix
+                        )
+                        record_ddl_clean(ot, obj_full, replaced, samples)
+                        clean_notes = [f"DDL_CLEAN: 全角标点清洗 {replaced} 处。{suffix}"]
                 ddl_adj = strip_constraint_enable(ddl_adj)
                 ddl_adj = enforce_schema_for_ddl(ddl_adj, ts, ot)
                 
@@ -11423,7 +12062,15 @@ def generate_fixup_scripts(
                 filename = f"{ts}.{to}.sql"
                 header = f"修补缺失的 {ot} {ts}.{to} (源: {ss}.{so})"
                 log.info("[FIXUP]%s 写入 %s 脚本: %s", source_tag(ddl_source_label), ot, filename)
-                write_fixup_file(base_dir, subdir, filename, ddl_adj, header, grants_to_add=grants_for_this_object)
+                write_fixup_file(
+                    base_dir,
+                    subdir,
+                    filename,
+                    ddl_adj,
+                    header,
+                    grants_to_add=grants_for_this_object,
+                    extra_comments=clean_notes
+                )
             finally:
                 other_progress()
         other_jobs.append(_job)
@@ -11706,6 +12353,21 @@ def generate_fixup_scripts(
                 ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
                 ddl_adj = prepend_set_schema(ddl_adj, ts)
                 ddl_adj = apply_ddl_cleanup_rules(ddl_adj, 'TRIGGER')
+                clean_notes = None
+                if settings.get('enable_ddl_punct_sanitize', True):
+                    ddl_adj, replaced, samples = sanitize_plsql_punctuation(ddl_adj, 'TRIGGER')
+                    if replaced:
+                        obj_full = f"{ts}.{to}"
+                        sample_text = ", ".join(f"{src}->{dst}" for src, dst in samples)
+                        suffix = f" 示例: {sample_text}" if sample_text else ""
+                        log.info(
+                            "[DDL_CLEAN] TRIGGER %s 全角标点清洗 %d 处。%s",
+                            obj_full,
+                            replaced,
+                            suffix
+                        )
+                        record_ddl_clean('TRIGGER', obj_full, replaced, samples)
+                        clean_notes = [f"DDL_CLEAN: 全角标点清洗 {replaced} 处。{suffix}"]
                 ddl_adj = strip_constraint_enable(ddl_adj)
                 ddl_adj = enforce_schema_for_ddl(ddl_adj, ts, 'TRIGGER')
                 grants_for_trigger: Set[str] = set()
@@ -11732,7 +12394,8 @@ def generate_fixup_scripts(
                     filename,
                     ddl_adj,
                     header,
-                    grants_to_add=sorted(grants_for_trigger) if grants_for_trigger else None
+                    grants_to_add=sorted(grants_for_trigger) if grants_for_trigger else None,
+                    extra_comments=clean_notes
                 )
             finally:
                 trigger_progress()
@@ -11936,6 +12599,11 @@ def generate_fixup_scripts(
         if summary_lines:
             log.info("[FIXUP] DDL 来源统计: %s", " | ".join(summary_lines))
 
+    if ddl_clean_records and report_dir and report_timestamp:
+        clean_report_path = export_ddl_clean_report(ddl_clean_records, report_dir, report_timestamp)
+        if clean_report_path:
+            log.info("[DDL_CLEAN] 全角标点清洗报告已输出: %s", clean_report_path)
+
     if unsupported_types:
         log.warning(
             "[dbcat] 以下对象类型当前未集成自动导出，需人工处理: %s",
@@ -12082,6 +12750,134 @@ def export_missing_table_view_mappings(
             except OSError as exc:
                 log.warning("写入缺失映射文件失败 %s: %s", file_path, exc)
     return output_dir
+
+
+def derive_package_report_path(report_file: Path) -> Path:
+    name = report_file.name
+    if name.startswith("report_"):
+        suffix = name[len("report_"):]
+        return report_file.parent / f"package_compare_{suffix}"
+    return report_file.parent / "package_compare.txt"
+
+
+def export_package_compare_report(
+    rows: List[PackageCompareRow],
+    output_path: Path
+) -> Optional[Path]:
+    """
+    输出 PACKAGE / PACKAGE BODY 校验明细。
+    """
+    if not rows or not output_path:
+        return None
+    def _package_sort_key(row: PackageCompareRow) -> Tuple[str, str, int, str, str]:
+        parsed = parse_full_object_name(row.src_full) or parse_full_object_name(row.tgt_full)
+        owner, name = parsed if parsed else ("", "")
+        type_u = (row.obj_type or "").upper()
+        type_rank = 0 if type_u == "PACKAGE" else 1 if type_u == "PACKAGE BODY" else 2
+        return (owner, name, type_rank, row.src_full, row.tgt_full)
+
+    rows_sorted = sorted(rows, key=_package_sort_key)
+    delimiter = "|"
+    header = delimiter.join([
+        "SRC_FULL",
+        "TYPE",
+        "SRC_STATUS",
+        "TGT_FULL",
+        "TGT_STATUS",
+        "RESULT",
+        "ERROR_COUNT",
+        "FIRST_ERROR"
+    ])
+    lines: List[str] = [
+        "# PACKAGE/PACKAGE BODY 对比明细",
+        f"# total={len(rows_sorted)}",
+        f"# 分隔符: {delimiter}",
+        f"# 字段说明: {header}",
+        header
+    ]
+    for row in rows_sorted:
+        first_error = normalize_error_text(row.first_error)
+        lines.append(delimiter.join([
+            row.src_full,
+            row.obj_type,
+            row.src_status,
+            row.tgt_full,
+            row.tgt_status,
+            row.result,
+            str(row.error_count),
+            first_error
+        ]))
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        return output_path
+    except OSError as exc:
+        log.warning("写入 package_compare 报告失败 %s: %s", output_path, exc)
+        return None
+
+
+def export_ddl_clean_report(
+    rows: List[DdlCleanReportRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出 PL/SQL 全角标点清洗报告。
+    """
+    if not report_dir or not rows or not report_timestamp:
+        return None
+
+    output_path = Path(report_dir) / f"ddl_punct_clean_{report_timestamp}.txt"
+    rows_sorted = sorted(rows, key=lambda r: (r.obj_type, r.obj_full))
+    total_replaced = sum(r.replaced for r in rows_sorted)
+    lines: List[str] = [
+        "# PL/SQL 全角标点清洗报告",
+        f"# total_objects={len(rows_sorted)} total_replacements={total_replaced}",
+        "# 字段说明: TYPE | OBJECT | REPLACED | SAMPLES"
+    ]
+
+    sample_texts: List[str] = []
+    for row in rows_sorted:
+        if row.samples:
+            sample_texts.append(", ".join(f"{src}->{dst}" for src, dst in row.samples))
+        else:
+            sample_texts.append("-")
+
+    type_w = max(len("TYPE"), max((len(r.obj_type) for r in rows_sorted), default=0))
+    obj_w = max(len("OBJECT"), max((len(r.obj_full) for r in rows_sorted), default=0))
+    replaced_w = max(len("REPLACED"), max((len(str(r.replaced)) for r in rows_sorted), default=0))
+    sample_w = max(len("SAMPLES"), max((len(text) for text in sample_texts), default=0))
+
+    header = (
+        f"{'TYPE'.ljust(type_w)}  "
+        f"{'OBJECT'.ljust(obj_w)}  "
+        f"{'REPLACED'.rjust(replaced_w)}  "
+        f"{'SAMPLES'.ljust(sample_w)}"
+    )
+    lines.append(header)
+    lines.append(
+        f"{'-' * type_w}  "
+        f"{'-' * obj_w}  "
+        f"{'-' * replaced_w}  "
+        f"{'-' * sample_w}"
+    )
+
+    for row, sample in zip(rows_sorted, sample_texts):
+        lines.append(
+            f"{row.obj_type.ljust(type_w)}  "
+            f"{row.obj_full.ljust(obj_w)}  "
+            f"{str(row.replaced).rjust(replaced_w)}  "
+            f"{sample.ljust(sample_w)}"
+        )
+
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        content = "\n".join(lines).rstrip() + "\n"
+        output_path.write_text(content, encoding="utf-8")
+        return output_path
+    except OSError as exc:
+        log.warning("写入全角标点清洗报告失败 %s: %s", output_path, exc)
+        return None
 
 
 def evaluate_long_conversion_status(
@@ -12738,6 +13534,7 @@ def print_final_report(
     blacklist_report_rows: Optional[List[BlacklistReportRow]] = None,
     trigger_list_summary: Optional[Dict[str, object]] = None,
     trigger_list_rows: Optional[List[TriggerListReportRow]] = None,
+    package_results: Optional[PackageCompareResults] = None,
     run_summary_ctx: Optional[RunSummaryContext] = None,
     filtered_grants: Optional[List[FilteredGrantEntry]] = None
 ):
@@ -12809,6 +13606,25 @@ def print_final_report(
     dep_unexpected_cnt = len(dependency_report.get("unexpected", []))
     dep_skipped_cnt = len(dependency_report.get("skipped", []))
     source_missing_schema_cnt = len(schema_summary.get("source_missing", []))
+    package_rows: List[PackageCompareRow] = []
+    package_diff_rows: List[PackageCompareRow] = []
+    package_summary: Dict[str, int] = {}
+    if package_results:
+        package_rows = list(package_results.get("rows") or [])
+        package_diff_rows = list(package_results.get("diff_rows") or [])
+        def _package_sort_key(row: PackageCompareRow) -> Tuple[str, str, int, str, str]:
+            parsed = parse_full_object_name(row.src_full) or parse_full_object_name(row.tgt_full)
+            owner, name = parsed if parsed else ("", "")
+            type_u = (row.obj_type or "").upper()
+            type_rank = 0 if type_u == "PACKAGE" else 1 if type_u == "PACKAGE BODY" else 2
+            return (owner, name, type_rank, row.src_full, row.tgt_full)
+        if package_diff_rows:
+            package_diff_rows = sorted(package_diff_rows, key=_package_sort_key)
+        package_summary = dict(package_results.get("summary") or {})
+    package_missing_cnt = int(package_summary.get("MISSING_TARGET", 0) or 0)
+    package_src_invalid_cnt = int(package_summary.get("SOURCE_INVALID", 0) or 0)
+    package_tgt_invalid_cnt = int(package_summary.get("TARGET_INVALID", 0) or 0)
+    package_status_mismatch_cnt = int(package_summary.get("STATUS_MISMATCH", 0) or 0)
 
     console.print(Panel.fit(f"[bold]数据库对象迁移校验报告 (V{__version__} - Rich)[/bold]", style="title"))
     console.print(f"[info]项目主页: {REPO_URL} | 问题反馈: {REPO_ISSUES_URL}[/info]")
@@ -12904,6 +13720,22 @@ def print_final_report(
         primary_text.append("无法推导: ", style="mismatch")
         primary_text.append(f"{remap_conflict_cnt}")
     summary_table.add_row("[bold]主对象 (TABLE/VIEW/etc.)[/bold]", primary_text)
+
+    if package_rows:
+        pkg_text = Text()
+        pkg_text.append("源端无效: ", style="mismatch")
+        pkg_text.append(f"{package_src_invalid_cnt}\n")
+        pkg_text.append("目标缺失: ", style="missing")
+        pkg_text.append(f"{package_missing_cnt}\n")
+        pkg_text.append("目标无效: ", style="mismatch")
+        pkg_text.append(f"{package_tgt_invalid_cnt}\n")
+        pkg_text.append("状态不一致: ", style="mismatch")
+        pkg_text.append(f"{package_status_mismatch_cnt}")
+        if report_file:
+            pkg_report_hint = derive_package_report_path(Path(report_file))
+            pkg_text.append("\n")
+            pkg_text.append(f"详见: {pkg_report_hint.name}", style="info")
+        summary_table.add_row("[bold]PACKAGE/PKG BODY[/bold]", pkg_text)
 
     comment_text = Text()
     if comment_skip_reason:
@@ -13117,8 +13949,33 @@ def print_final_report(
             )
         console.print(table)
 
+    if package_diff_rows:
+        table = Table(
+            title=f"[header]1.d PACKAGE/PKG BODY 差异 (共 {len(package_diff_rows)} 个)",
+            width=section_width
+        )
+        table.add_column("类型", style="info", width=TYPE_COL_WIDTH)
+        table.add_column("对象 (源名[=目标名])", style="info", width=OBJECT_COL_WIDTH)
+        table.add_column("源状态", style="info", width=12)
+        table.add_column("目标状态", style="info", width=12)
+        table.add_column("结果", style="info", width=16)
+        table.add_column("错误摘要", style="info", width=DETAIL_COL_WIDTH)
+        for row in package_diff_rows:
+            error_hint = "-"
+            if row.error_count:
+                error_hint = f"{row.error_count} | {row.first_error}" if row.first_error else str(row.error_count)
+            table.add_row(
+                f"[{row.obj_type}]",
+                format_missing_mapping(row.src_full, row.tgt_full),
+                row.src_status,
+                row.tgt_status,
+                row.result,
+                error_hint
+            )
+        console.print(table)
+
     if remap_conflicts:
-        table = Table(title=f"[header]1.d 无法自动推导的对象 (共 {remap_conflict_cnt} 个)", width=section_width)
+        table = Table(title=f"[header]1.e 无法自动推导的对象 (共 {remap_conflict_cnt} 个)", width=section_width)
         table.add_column("类型", style="info", width=TYPE_COL_WIDTH)
         table.add_column("对象 (源端)", style="info", width=OBJECT_COL_WIDTH)
         table.add_column("原因", style="info", width=DETAIL_COL_WIDTH)
@@ -13313,8 +14170,8 @@ def print_final_report(
         "fixup_scripts/materialized_view : MATERIALIZED VIEW 默认仅打印不生成\n"
         "fixup_scripts/procedure     : 缺失 PROCEDURE 的 CREATE 脚本\n"
         "fixup_scripts/function      : 缺失 FUNCTION 的 CREATE 脚本\n"
-        "fixup_scripts/package       : PACKAGE 默认仅打印不生成\n"
-        "fixup_scripts/package_body  : PACKAGE BODY 默认仅打印不生成\n"
+        "fixup_scripts/package       : 缺失 PACKAGE 的 CREATE 脚本\n"
+        "fixup_scripts/package_body  : 缺失 PACKAGE BODY 的 CREATE 脚本\n"
         "fixup_scripts/synonym       : 缺失 SYNONYM 的 CREATE 脚本\n"
         "fixup_scripts/job           : 缺失 JOB 的 CREATE 脚本\n"
         "fixup_scripts/schedule      : 缺失 SCHEDULE 的 CREATE 脚本\n"
@@ -13365,6 +14222,12 @@ def print_final_report(
             report_path.parent,
             blacklisted_tables=blacklisted_table_keys
         )
+        package_report_path = None
+        if package_rows:
+            package_report_path = export_package_compare_report(
+                package_rows,
+                derive_package_report_path(report_path)
+            )
         blacklist_path = export_blacklist_tables(blacklist_report_rows or [], report_path.parent)
         trigger_miss_path = None
         if trigger_list_summary and trigger_list_summary.get("enabled"):
@@ -13386,6 +14249,8 @@ def print_final_report(
             console.print(f"[info]报告已保存(纯文本): {report_path}")
             if export_dir:
                 log.info("缺失 TABLE/VIEW 映射已输出到: %s", export_dir)
+            if package_report_path:
+                log.info("PACKAGE 对比明细已输出到: %s", package_report_path)
             if blacklist_path:
                 log.info("黑名单表清单已输出到: %s", blacklist_path)
             if trigger_miss_path:
@@ -13441,6 +14306,7 @@ def parse_cli_args() -> argparse.Namespace:
           python schema_diff_reconciler.py /path/to/conf.ini # 指定配置
         输出:
           main_reports/report_<ts>.txt  Rich 报告文本
+          main_reports/package_compare_<ts>.txt  PACKAGE/PKG BODY 对比明细
           main_reports/tables_views_miss/ 按 schema 输出缺失 TABLE/VIEW 规则 (schema_T.txt / schema_V.txt)
           main_reports/blacklist_tables.txt 黑名单表清单 (含 LONG 转换校验状态)
           main_reports/trigger_miss.txt  触发器清单筛选报告 (仅配置 trigger_list 时生成)
@@ -13743,6 +14609,7 @@ def main():
             "extraneous": extraneous_rules,
             "extra_targets": []
         }
+        package_results: PackageCompareResults = {"rows": [], "summary": {}, "diff_rows": []}
         extra_results: ExtraCheckResults = {
             "index_ok": [],
             "index_mismatched": [],
@@ -13808,6 +14675,7 @@ def main():
             blacklist_report_rows=[],
             trigger_list_summary=None,
             trigger_list_rows=None,
+            package_results=package_results,
             run_summary_ctx=run_summary_ctx,
             filtered_grants=None
         )
@@ -13891,6 +14759,12 @@ def main():
             print_only_types
         )
         tv_results["remap_conflicts"] = remap_conflict_items
+        package_results = compare_package_objects(
+            master_list,
+            oracle_meta,
+            ob_meta,
+            enabled_primary_types
+        )
         blacklisted_missing_tables = collect_blacklisted_missing_tables(
             tv_results,
             oracle_meta.blacklist_tables
@@ -14090,6 +14964,7 @@ def main():
                 synonym_meta,
                 trigger_filter_entries,
                 trigger_filter_enabled,
+                package_results=package_results,
                 report_dir=report_dir,
                 report_timestamp=timestamp
             )
@@ -14139,6 +15014,7 @@ def main():
         blacklist_report_rows,
         trigger_list_summary,
         trigger_list_rows,
+        package_results=package_results,
         run_summary_ctx=run_summary_ctx,
         filtered_grants=(grant_plan.filtered_grants if grant_plan else None)
     )
