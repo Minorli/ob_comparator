@@ -342,6 +342,7 @@ class ObMetadata(NamedTuple):
     object_statuses: Dict[Tuple[str, str, str], str]     # (OWNER, OBJECT_NAME, OBJECT_TYPE) -> STATUS
     package_errors: Dict[Tuple[str, str, str], "PackageErrorInfo"]  # (OWNER, NAME, TYPE) -> error summary
     package_errors_complete: bool                        # 目标端错误信息是否完整
+    partition_key_columns: Dict[Tuple[str, str], List[str]]  # (OWNER, TABLE_NAME) -> [PARTITION_COLS...]
 
 
 class OracleMetadata(NamedTuple):
@@ -366,6 +367,7 @@ class OracleMetadata(NamedTuple):
     object_statuses: Dict[Tuple[str, str, str], str]         # (OWNER, OBJECT_NAME, OBJECT_TYPE) -> STATUS
     package_errors: Dict[Tuple[str, str, str], "PackageErrorInfo"]  # (OWNER, NAME, TYPE) -> error summary
     package_errors_complete: bool                            # 源端错误信息是否完整
+    partition_key_columns: Dict[Tuple[str, str], List[str]]   # (OWNER, TABLE_NAME) -> [PARTITION_COLS...]
 
 
 class DependencyRecord(NamedTuple):
@@ -751,6 +753,7 @@ class ConstraintMismatch(NamedTuple):
     missing_constraints: Set[str]
     extra_constraints: Set[str]
     detail_mismatch: List[str]
+    downgraded_pk_constraints: Set[str]
 
 
 class SequenceMismatch(NamedTuple):
@@ -3493,7 +3496,8 @@ def dump_ob_metadata(
             comments_complete=False,
             object_statuses={},
             package_errors={},
-            package_errors_complete=False
+            package_errors_complete=False,
+            partition_key_columns={}
         )
 
     owners_in_list = sorted(target_schemas)
@@ -3950,6 +3954,7 @@ def dump_ob_metadata(
 
     # --- 8. DBA_SEQUENCES ---
     sequences: Dict[str, Set[str]] = {}
+    partition_key_columns: Dict[Tuple[str, str], List[str]] = {}
     if include_sequences:
         sql = f"""
             SELECT SEQUENCE_OWNER, SEQUENCE_NAME
@@ -3968,6 +3973,61 @@ def dump_ob_metadata(
                     continue
                 owner, seq_name = parts[0].strip().upper(), parts[1].strip().upper()
                 sequences.setdefault(owner, set()).add(seq_name)
+
+    # --- 8.5. DBA_PART_KEY_COLUMNS / DBA_SUBPART_KEY_COLUMNS ---
+    if include_constraints:
+        target_table_pairs_u = {(o.upper(), t.upper()) for o, t in (target_table_pairs or set())}
+
+        def _append_ob_part_col(key: Tuple[str, str], col: Optional[str]) -> None:
+            if not col:
+                return
+            cols = partition_key_columns.setdefault(key, [])
+            col_u = col.upper()
+            if col_u not in cols:
+                cols.append(col_u)
+
+        def _load_ob_part_keys(view_name: str, with_object_type: bool = True) -> None:
+            if with_object_type:
+                sql = f"""
+                    SELECT OWNER, NAME, COLUMN_NAME, COLUMN_POSITION
+                    FROM {view_name}
+                    WHERE OWNER IN ({owners_in})
+                      AND OBJECT_TYPE = 'TABLE'
+                    ORDER BY OWNER, NAME, COLUMN_POSITION
+                """
+            else:
+                sql = f"""
+                    SELECT OWNER, NAME, COLUMN_NAME, COLUMN_POSITION
+                    FROM {view_name}
+                    WHERE OWNER IN ({owners_in})
+                    ORDER BY OWNER, NAME, COLUMN_POSITION
+                """
+            ok, out, err = obclient_run_sql(ob_cfg, sql)
+            if not ok:
+                if with_object_type:
+                    log.warning("读取 OB %s 失败，将尝试忽略 OBJECT_TYPE: %s", view_name, err)
+                    _load_ob_part_keys(view_name, with_object_type=False)
+                else:
+                    log.warning("读取 OB %s 失败，将跳过分区键列读取: %s", view_name, err)
+                return
+            if not out:
+                return
+            for line in out.splitlines():
+                parts = line.split('\t')
+                if len(parts) < 3:
+                    continue
+                owner = (parts[0] or "").strip().upper()
+                table = (parts[1] or "").strip().upper()
+                col = (parts[2] or "").strip().upper()
+                if not owner or not table or not col:
+                    continue
+                key = (owner, table)
+                if target_table_pairs_u and key not in target_table_pairs_u:
+                    continue
+                _append_ob_part_col(key, col)
+
+        _load_ob_part_keys("DBA_PART_KEY_COLUMNS")
+        _load_ob_part_keys("DBA_SUBPART_KEY_COLUMNS")
 
     roles: Set[str] = set()
     # --- 9. DBA_ROLES ---
@@ -3996,7 +4056,8 @@ def dump_ob_metadata(
         comments_complete=comments_complete,
         object_statuses=object_statuses,
         package_errors=package_errors,
-        package_errors_complete=package_errors_complete
+        package_errors_complete=package_errors_complete,
+        partition_key_columns=partition_key_columns
     )
 
 
@@ -4470,7 +4531,8 @@ def dump_oracle_metadata(
             table_privilege_map=set(),
             object_statuses={},
             package_errors={},
-            package_errors_complete=False
+            package_errors_complete=False,
+            partition_key_columns={}
         )
 
     log.info("正在批量加载 Oracle 元数据 (DBA_TAB_COLUMNS/DBA_INDEXES/DBA_CONSTRAINTS/DBA_TRIGGERS/DBA_SEQUENCES)...")
@@ -4493,6 +4555,7 @@ def dump_oracle_metadata(
     object_statuses: Dict[Tuple[str, str, str], str] = {}
     package_errors: Dict[Tuple[str, str, str], PackageErrorInfo] = {}
     package_errors_complete = True
+    partition_key_columns: Dict[Tuple[str, str], List[str]] = {}
 
     def _safe_upper(value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -4729,6 +4792,46 @@ def dump_oracle_metadata(
                             ref_table = cons_table_lookup.get((r_owner, r_cons))
                             if ref_table:
                                 info["ref_table_owner"], info["ref_table_name"] = ref_table
+
+                    # 分区键列 (partition/subpartition) 用于 PK 兼容判断
+                    if table_pairs:
+                        def _append_partition_col(key: Tuple[str, str], col: Optional[str]) -> None:
+                            if not col:
+                                return
+                            cols = partition_key_columns.setdefault(key, [])
+                            col_u = col.upper()
+                            if col_u not in cols:
+                                cols.append(col_u)
+
+                        def _load_part_keys(view_name: str) -> None:
+                            sql_tpl = f"""
+                                SELECT OWNER, NAME, COLUMN_NAME, COLUMN_POSITION
+                                FROM {view_name}
+                                WHERE OWNER IN ({{owners_clause}})
+                                  AND OBJECT_TYPE = 'TABLE'
+                                ORDER BY OWNER, NAME, COLUMN_POSITION
+                            """
+                            with ora_conn.cursor() as cursor:
+                                for owner_chunk in owner_chunks:
+                                    owners_clause = build_bind_placeholders(len(owner_chunk))
+                                    sql = sql_tpl.format(owners_clause=owners_clause)
+                                    cursor.execute(sql, owner_chunk)
+                                    for row in cursor:
+                                        owner = _safe_upper(row[0])
+                                        table = _safe_upper(row[1])
+                                        col = _safe_upper(row[2]) if len(row) > 2 else None
+                                        if not owner or not table or not col:
+                                            continue
+                                        key = (owner, table)
+                                        if key not in table_pairs:
+                                            continue
+                                        _append_partition_col(key, col)
+
+                        try:
+                            _load_part_keys("DBA_PART_KEY_COLUMNS")
+                            _load_part_keys("DBA_SUBPART_KEY_COLUMNS")
+                        except oracledb.Error as e:
+                            log.warning("读取 Oracle 分区键列失败，将跳过 PK 分区规则处理: %s", e)
 
                 # 触发器
                 if include_triggers:
@@ -5010,7 +5113,8 @@ def dump_oracle_metadata(
         table_privilege_map=table_privilege_map,
         object_statuses=object_statuses,
         package_errors=package_errors,
-        package_errors_complete=package_errors_complete
+        package_errors_complete=package_errors_complete,
+        partition_key_columns=partition_key_columns
     )
 
 
@@ -7038,6 +7142,15 @@ def compare_indexes_for_table(
         )
 
 
+def get_partition_key_set(
+    meta: OracleMetadata,
+    schema: str,
+    table: str
+) -> Set[str]:
+    cols = meta.partition_key_columns.get((schema.upper(), table.upper()), [])
+    return {c.upper() for c in cols if c}
+
+
 def compare_constraints_for_table(
     oracle_meta: OracleMetadata,
     ob_meta: ObMetadata,
@@ -7059,6 +7172,7 @@ def compare_constraints_for_table(
     detail_mismatch: List[str] = []
     missing: Set[str] = set()
     extra: Set[str] = set()
+    downgraded_missing: Set[str] = set()
 
     source_all_cols: Set[Tuple[str, ...]] = {
         normalize_column_sequence(cons.get("columns"))
@@ -7106,12 +7220,29 @@ def compare_constraints_for_table(
     grouped_src_fk = bucket_fk(src_cons, is_source=True)
     grouped_tgt_fk = bucket_fk(tgt_cons, is_source=False)
 
+    src_pk_list = grouped_src_pkuk.get('P', [])
+    src_uk_list = grouped_src_pkuk.get('U', [])
+    tgt_pk_list = grouped_tgt_pkuk.get('P', [])
+    tgt_uk_list = grouped_tgt_pkuk.get('U', [])
+
+    partition_key_set = get_partition_key_set(oracle_meta, src_schema, src_table)
+    src_pk_inclusive: List[Tuple[Tuple[str, ...], str]] = []
+    src_pk_downgrade: List[Tuple[Tuple[str, ...], str]] = []
+    for cols, name in src_pk_list:
+        if partition_key_set and not partition_key_set.issubset(set(cols)):
+            src_pk_downgrade.append((cols, name))
+        else:
+            src_pk_inclusive.append((cols, name))
+
+    tgt_pk_used = [False] * len(tgt_pk_list)
+    tgt_uk_used = [False] * len(tgt_uk_list)
+
     def match_constraints(
         label: str,
         src_list: List[Tuple[Tuple[str, ...], str]],
-        tgt_list: List[Tuple[Tuple[str, ...], str]]
+        tgt_list: List[Tuple[Tuple[str, ...], str]],
+        tgt_used: List[bool]
     ) -> None:
-        tgt_used = [False] * len(tgt_list)
         for cols, name in src_list:
             found_idx = None
             for idx, (t_cols, _t_name) in enumerate(tgt_list):
@@ -7126,18 +7257,25 @@ def compare_constraints_for_table(
                 detail_mismatch.append(
                     f"{label}: 源约束 {name} (列 {list(cols)}) 在目标端未找到。"
                 )
+
+    def mark_extra_constraints(
+        label: str,
+        tgt_list: List[Tuple[Tuple[str, ...], str]],
+        tgt_used: List[bool]
+    ) -> None:
         for idx, used in enumerate(tgt_used):
-            if not used:
-                extra_name = tgt_list[idx][1]
-                extra_cols = tgt_list[idx][0]
-                if extra_cols in source_all_cols:
-                    continue
-                if "_OMS_ROWID" in (extra_name or ""):
-                    continue
-                extra.add(extra_name)
-                detail_mismatch.append(
-                    f"{label}: 目标端存在额外约束 {extra_name} (列 {list(extra_cols)})。"
-                )
+            if used:
+                continue
+            extra_name = tgt_list[idx][1]
+            extra_cols = tgt_list[idx][0]
+            if extra_cols in source_all_cols:
+                continue
+            if "_OMS_ROWID" in (extra_name or ""):
+                continue
+            extra.add(extra_name)
+            detail_mismatch.append(
+                f"{label}: 目标端存在额外约束 {extra_name} (列 {list(extra_cols)})。"
+            )
 
     def match_foreign_keys(
         src_list: List[Tuple[Tuple[str, ...], str, Optional[str]]],
@@ -7184,8 +7322,36 @@ def compare_constraints_for_table(
                     f"FOREIGN KEY: 目标端存在额外约束 {extra_name} (列 {list(extra_cols)}){ref_note}。"
                 )
 
-    match_constraints("PRIMARY KEY", grouped_src_pkuk.get('P', []), grouped_tgt_pkuk.get('P', []))
-    match_constraints("UNIQUE KEY", grouped_src_pkuk.get('U', []), grouped_tgt_pkuk.get('U', []))
+    match_constraints("PRIMARY KEY", src_pk_inclusive, tgt_pk_list, tgt_pk_used)
+
+    # 分区键未包含在 PK 中时，按 UNIQUE 处理（允许目标端 PK/UK 任一匹配）
+    for cols, name in src_pk_downgrade:
+        matched = False
+        for idx, (t_cols, _t_name) in enumerate(tgt_uk_list):
+            if tgt_uk_used[idx]:
+                continue
+            if cols == t_cols:
+                tgt_uk_used[idx] = True
+                matched = True
+                break
+        if not matched:
+            for idx, (t_cols, _t_name) in enumerate(tgt_pk_list):
+                if tgt_pk_used[idx]:
+                    continue
+                if cols == t_cols:
+                    tgt_pk_used[idx] = True
+                    matched = True
+                    break
+        if not matched:
+            missing.add(name)
+            downgraded_missing.add(name)
+            detail_mismatch.append(
+                f"PRIMARY KEY(降级为UNIQUE): 源约束 {name} (列 {list(cols)}) 在目标端未找到。"
+            )
+
+    match_constraints("UNIQUE KEY", src_uk_list, tgt_uk_list, tgt_uk_used)
+    mark_extra_constraints("PRIMARY KEY", tgt_pk_list, tgt_pk_used)
+    mark_extra_constraints("UNIQUE KEY", tgt_uk_list, tgt_uk_used)
     match_foreign_keys(grouped_src_fk, grouped_tgt_fk)
 
     all_good = (not missing) and (not extra) and (not detail_mismatch)
@@ -7196,7 +7362,8 @@ def compare_constraints_for_table(
             table=f"{tgt_schema}.{tgt_table}",
             missing_constraints=missing,
             extra_constraints=extra,
-            detail_mismatch=detail_mismatch
+            detail_mismatch=detail_mismatch,
+            downgraded_pk_constraints=downgraded_missing
         )
 
 
@@ -12242,6 +12409,7 @@ def generate_fixup_scripts(
                     source_label = "DBCAT" if statements else "META"
                     cons_meta = oracle_meta.constraints.get((ss.upper(), st.upper()), {}).get(cons_name_u)
                     ctype = (cons_meta or {}).get("type", "").upper()
+                    downgrade_pk = cons_name_u in it.downgraded_pk_constraints
                     cols = cons_meta.get("columns") if cons_meta else []
                     # FK 引用表的 remap 映射，用于替换 DDL 中的 REFERENCES 子句
                     fk_ref_replacements: List[Tuple[Tuple[str, str], Tuple[str, str]]] = []
@@ -12279,7 +12447,7 @@ def generate_fixup_scripts(
                     if not statements:
                         cols_join = ", ".join(c for c in cols if c)
                         if cols_join and ctype in ('P', 'U'):
-                            add_clause = "PRIMARY KEY" if ctype == 'P' else "UNIQUE"
+                            add_clause = "PRIMARY KEY" if ctype == 'P' and not downgrade_pk else "UNIQUE"
                             stmt = (
                                 f"ALTER TABLE {ts}.{tt} "
                                 f"ADD CONSTRAINT {cons_name_u} {add_clause} ({cols_join})"
@@ -12360,6 +12528,8 @@ def generate_fixup_scripts(
                             tt,
                             extra_identifiers=constraint_replacements
                         )
+                        if downgrade_pk and ctype == 'P':
+                            ddl_adj = re.sub(r'\bPRIMARY\s+KEY\b', 'UNIQUE', ddl_adj, flags=re.IGNORECASE)
                         ddl_adj = normalize_ddl_for_ob(ddl_adj)
                         ddl_adj = strip_constraint_enable(ddl_adj)
                         ddl_adj = strip_enable_novalidate(ddl_adj)
@@ -12367,6 +12537,9 @@ def generate_fixup_scripts(
                     content = prepend_set_schema("\n".join(ddl_lines), ts)
                     filename = f"{ts}.{cons_name_u}.sql"
                     header = f"修补缺失的约束 {cons_name_u} (表: {ts}.{tt})"
+                    extra_comments = None
+                    if downgrade_pk and ctype == 'P':
+                        extra_comments = ["NOTE: 源端为分区表且主键未包含分区键，已降级为 UNIQUE。"]
                     log.info("[FIXUP]%s 写入 CONSTRAINT 脚本: %s", source_tag(source_label), filename)
                     write_fixup_file(
                         base_dir,
@@ -12374,7 +12547,8 @@ def generate_fixup_scripts(
                         filename,
                         content,
                         header,
-                        grants_to_add=sorted(grants_for_constraint) if grants_for_constraint else None
+                        grants_to_add=sorted(grants_for_constraint) if grants_for_constraint else None,
+                        extra_comments=extra_comments
                     )
                 finally:
                     constraint_progress()
