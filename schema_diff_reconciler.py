@@ -2765,8 +2765,9 @@ def resolve_remap_target(
                 _record_conflict("同义词直接依赖映射到多个 schema，无法自动推导")
                 return None
 
-        # 对于依附对象（INDEX/CONSTRAINT/SEQUENCE/SYNONYM），使用父表的 remap 目标 schema
-        if '.' in src_name and object_parent_map:
+        # 对于依附对象（INDEX/CONSTRAINT/SEQUENCE），使用父表的 remap 目标 schema
+        # SYNONYM 保持自身 schema（避免跨 schema 同义词被错误合并到父表 schema）
+        if '.' in src_name and object_parent_map and obj_type_u in ('INDEX', 'CONSTRAINT', 'SEQUENCE'):
             parent_table = object_parent_map.get(src_name.upper())
             if parent_table:
                 parent_target = remap_rules.get(parent_table.upper())
