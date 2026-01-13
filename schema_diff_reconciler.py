@@ -8620,6 +8620,23 @@ def clean_view_ddl_for_oceanbase(ddl: str, ob_version: Optional[str] = None) -> 
     if not ddl:
         return ddl
     
+    cleaned_ddl = ddl
+
+    # 先移除 WITH CHECK OPTION 的 CONSTRAINT 名称（保留 CHECK OPTION 本身）
+    cleaned_ddl = re.sub(
+        r'(\bWITH\s+CHECK\s+OPTION)\s+CONSTRAINT\s+("(?:""|[^"])*"|[A-Za-z0-9_#$]+)',
+        r'\1',
+        cleaned_ddl,
+        flags=re.IGNORECASE
+    )
+    # 兜底移除尾部残留的 CONSTRAINT 名称
+    cleaned_ddl = re.sub(
+        r'\s+CONSTRAINT\s+("(?:""|[^"])*"|[A-Za-z0-9_#$]+)\s*(;)?\s*$',
+        r'\2',
+        cleaned_ddl,
+        flags=re.IGNORECASE
+    )
+
     # 需要移除的关键字模式
     patterns_to_remove = [
         # EDITIONABLE 在所有版本都需要移除
@@ -8637,12 +8654,13 @@ def clean_view_ddl_for_oceanbase(ddl: str, ob_version: Optional[str] = None) -> 
     ]
     
     # 版本相关的清理
+    remove_check_option = True
     if ob_version:
-        # 如果版本 < 4.2.5.7，需要移除 WITH CHECK OPTION
-        if compare_version(ob_version, "4.2.5.7") < 0:
-            patterns_to_remove.append(r'\s+WITH\s+CHECK\s+OPTION')
-    
-    cleaned_ddl = ddl
+        # 如果版本 >= 4.2.5.7，可保留 WITH CHECK OPTION
+        remove_check_option = compare_version(ob_version, "4.2.5.7") < 0
+    if remove_check_option:
+        patterns_to_remove.append(r'\s+WITH\s+CHECK\s+OPTION')
+
     for pattern in patterns_to_remove:
         cleaned_ddl = re.sub(pattern, ' ', cleaned_ddl, flags=re.IGNORECASE)
     
@@ -10863,6 +10881,7 @@ def generate_fixup_scripts(
 
     fixup_schema_filter: Set[str] = set(settings.get('fixup_schema_list', []))
     fixup_type_filter: Set[str] = set(settings.get('fixup_type_set', []))
+    fixup_schema_used_source_match = False
 
     ddl_source_stats: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
     ddl_source_lock = threading.Lock()
@@ -10894,14 +10913,27 @@ def generate_fixup_scripts(
     def source_tag(label: str) -> str:
         return f"[{label}]"
 
-    def allow_fixup(obj_type: str, tgt_schema: str) -> bool:
+    def allow_fixup(obj_type: str, tgt_schema: str, src_schema: Optional[str] = None) -> bool:
+        nonlocal fixup_schema_used_source_match
         obj_type_u = obj_type.upper()
         schema_u = tgt_schema.upper() if tgt_schema else ""
         if fixup_type_filter and obj_type_u not in fixup_type_filter:
             return False
-        if fixup_schema_filter and schema_u not in fixup_schema_filter:
-            return False
-        return True
+        if not fixup_schema_filter:
+            return True
+        if schema_u in fixup_schema_filter:
+            return True
+        src_schema_u = (src_schema or "").upper()
+        if src_schema_u and src_schema_u in fixup_schema_filter:
+            if not fixup_schema_used_source_match:
+                log.info(
+                    "[FIXUP] fixup_schemas 命中源 schema=%s (目标=%s)，已放行生成。",
+                    src_schema_u,
+                    schema_u or "-"
+                )
+                fixup_schema_used_source_match = True
+            return True
+        return False
 
     def fetch_ddl_with_timing(schema: str, obj_type: str, obj_name: str) -> Tuple[Optional[str], str, float]:
         """
@@ -11302,6 +11334,8 @@ def generate_fixup_scripts(
 
     missing_tables: List[Tuple[str, str, str, str]] = []
     other_missing_objects: List[Tuple[str, str, str, str, str]] = []
+    missing_total_by_type: Dict[str, int] = defaultdict(int)
+    missing_allowed_by_type: Dict[str, int] = defaultdict(int)
 
     for (obj_type, tgt_name, src_name) in tv_results.get('missing', []):
         obj_type_u = obj_type.upper()
@@ -11329,13 +11363,25 @@ def generate_fixup_scripts(
                     src_schema, src_obj
                 )
                 continue
-        if not allow_fixup(obj_type_u, tgt_schema):
+        missing_total_by_type[obj_type_u] += 1
+        if not allow_fixup(obj_type_u, tgt_schema, src_schema):
             continue
+        missing_allowed_by_type[obj_type_u] += 1
         queue_request(src_schema, obj_type_u, src_obj)
         if obj_type_u == 'TABLE':
             missing_tables.append((src_schema, src_obj, tgt_schema, tgt_obj))
         else:
             other_missing_objects.append((obj_type_u, src_schema, src_obj, tgt_schema, tgt_obj))
+
+    if fixup_schema_filter or fixup_type_filter:
+        filtered = []
+        for obj_type_u in sorted(missing_total_by_type.keys()):
+            total = missing_total_by_type[obj_type_u]
+            allowed = missing_allowed_by_type.get(obj_type_u, 0)
+            if allowed != total:
+                filtered.append(f"{obj_type_u}={allowed}/{total}")
+        if filtered:
+            log.info("[FIXUP] fixup_types/fixup_schemas 生效: %s", ", ".join(filtered))
 
     if package_results:
         for row in package_results.get("rows", []):
@@ -11352,7 +11398,7 @@ def generate_fixup_scripts(
             src_schema, src_obj = row.src_full.split(".", 1)
             tgt_schema, tgt_obj = row.tgt_full.split(".", 1)
             obj_type_u = row.obj_type.upper()
-            if not allow_fixup(obj_type_u, tgt_schema):
+            if not allow_fixup(obj_type_u, tgt_schema, src_schema):
                 continue
             queue_request(src_schema, obj_type_u, src_obj)
             other_missing_objects.append((obj_type_u, src_schema, src_obj, tgt_schema, tgt_obj))
@@ -11369,7 +11415,7 @@ def generate_fixup_scripts(
             else:
                 tgt_schema = seq_mis.tgt_schema.upper()
                 tgt_name = seq_name_u
-            if not allow_fixup('SEQUENCE', tgt_schema):
+            if not allow_fixup('SEQUENCE', tgt_schema, src_schema):
                 continue
             queue_request(src_schema, 'SEQUENCE', seq_name_u)
             sequence_tasks.append((src_schema, seq_name_u, tgt_schema, tgt_name))
@@ -11384,7 +11430,7 @@ def generate_fixup_scripts(
             continue
         src_schema, src_table = src_name.split('.')
         tgt_schema, tgt_table = table_str.split('.')
-        if not allow_fixup('INDEX', tgt_schema):
+        if not allow_fixup('INDEX', tgt_schema, src_schema):
             continue
         queue_request(src_schema, 'TABLE', src_table)
         index_tasks.append((item, src_schema, src_table, tgt_schema.upper(), tgt_table.upper()))
@@ -11399,7 +11445,7 @@ def generate_fixup_scripts(
             continue
         src_schema, src_table = src_name.split('.')
         tgt_schema, tgt_table = table_str.split('.')
-        if not allow_fixup('CONSTRAINT', tgt_schema):
+        if not allow_fixup('CONSTRAINT', tgt_schema, src_schema):
             continue
         queue_request(src_schema, 'TABLE', src_table)
         constraint_tasks.append((item, src_schema, src_table, tgt_schema.upper(), tgt_table.upper()))
@@ -11423,7 +11469,7 @@ def generate_fixup_scripts(
                 tgt_schema_final, tgt_obj = tgt_full.split('.', 1)
                 if not _trigger_allowed(src_full, tgt_full):
                     continue
-                if not allow_fixup('TRIGGER', tgt_schema_final):
+                if not allow_fixup('TRIGGER', tgt_schema_final, src_schema_u):
                     continue
                 queue_request(src_schema_u, 'TRIGGER', src_trg)
                 trigger_tasks.append((src_schema_u, src_trg, tgt_schema_final, tgt_obj, src_table, tgt_schema, tgt_table))
@@ -11440,7 +11486,7 @@ def generate_fixup_scripts(
                 tgt_full = f"{tgt_schema_final}.{tgt_obj}"
                 if not _trigger_allowed(src_full, tgt_full):
                     continue
-                if not allow_fixup('TRIGGER', tgt_schema_final):
+                if not allow_fixup('TRIGGER', tgt_schema_final, src_schema):
                     continue
                 queue_request(src_schema, 'TRIGGER', trg_name_u)
                 trigger_tasks.append((src_schema, trg_name_u, tgt_schema_final, tgt_obj, src_table, tgt_schema, tgt_table))
