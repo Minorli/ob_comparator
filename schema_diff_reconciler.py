@@ -6753,6 +6753,50 @@ def check_primary_objects(
     return results
 
 
+def supplement_missing_views_from_mapping(
+    tv_results: ReportResults,
+    full_object_mapping: FullObjectMapping,
+    ob_meta: ObMetadata,
+    enabled_primary_types: Optional[Set[str]] = None
+) -> int:
+    """
+    当主对象校验未能产出 VIEW 缺失清单时，基于映射+目标端对象集补齐。
+    用于保障 fixup/report 能进入 VIEW 生成流程。
+    """
+    enabled_types = {t.upper() for t in (enabled_primary_types or set(PRIMARY_OBJECT_TYPES))}
+    if 'VIEW' not in enabled_types:
+        return 0
+
+    missing_list = tv_results.get("missing", [])
+    existing_missing = {
+        (src_name.upper(), tgt_name.upper())
+        for obj_type, tgt_name, src_name in missing_list
+        if (obj_type or "").upper() == "VIEW"
+    }
+
+    ob_views = {name.upper() for name in ob_meta.objects_by_type.get("VIEW", set())}
+    expected_pairs: List[Tuple[str, str]] = []
+    for src_full, type_map in full_object_mapping.items():
+        tgt_full = type_map.get("VIEW")
+        if not tgt_full or "." not in tgt_full or "." not in src_full:
+            continue
+        expected_pairs.append((src_full.upper(), tgt_full.upper()))
+
+    added = 0
+    for src_full, tgt_full in expected_pairs:
+        if tgt_full in ob_views:
+            continue
+        if (src_full, tgt_full) in existing_missing:
+            continue
+        missing_list.append(("VIEW", tgt_full, src_full))
+        existing_missing.add((src_full, tgt_full))
+        added += 1
+
+    if added:
+        log.warning("[VIEW] 缺失视图清单补齐 %d 条（基于映射与目标端对象集）。", added)
+    return added
+
+
 # ====================== 扩展：索引 / 约束 / 序列 / 触发器 ======================
 
 def normalize_object_status(status: Optional[str]) -> str:
@@ -14803,6 +14847,12 @@ def main():
             oracle_meta,
             enabled_primary_types,
             print_only_types
+        )
+        supplement_missing_views_from_mapping(
+            tv_results,
+            full_object_mapping,
+            ob_meta,
+            enabled_primary_types
         )
         tv_results["remap_conflicts"] = remap_conflict_items
         package_results = compare_package_objects(
