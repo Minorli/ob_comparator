@@ -4,3 +4,6 @@
 - [x] 1.3 Add/adjust logs to report scope and filtered counts for SYNONYM
 - [x] 1.4 Update config templates and docs with the new switch and usage examples
 - [x] 1.5 Add or update tests for synonym scope filtering
+
+## 2. Validation
+- [x] 2.1 `openspec validate update-synonym-fixup-scope --strict`
