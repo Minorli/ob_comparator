@@ -13,7 +13,6 @@ schema_diff_reconciler_review_report.md
 schema_diff_reconciler_audit_report_20251212.md
 schema_diff_reconciler_backup_20251212_pre_patch.py
 schema_diff_reconciler_v0.8.8.py
-test_schema_diff_reconciler.py
 logs
 config.ini
 AGENTS.md
