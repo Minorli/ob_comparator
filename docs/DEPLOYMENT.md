@@ -122,6 +122,7 @@ ls fixup_scripts
 # 如需处理推导冲突，查看 main_reports/remap_conflicts_*.txt
 # OMS 缺失规则与黑名单清单：
 # main_reports/tables_views_miss/ (schema_T.txt / schema_V.txt)
+# main_reports/package_compare_*.txt
 # main_reports/blacklist_tables.txt
 # main_reports/filtered_grants.txt
 

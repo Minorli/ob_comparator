@@ -99,7 +99,7 @@ python3 run_fixup.py --view-chain-autofix
 - **VIEW / MATERIALIZED VIEW / TRIGGER**：默认保持原 schema，不会跟随父表 remap。
 - **INDEX / CONSTRAINT / SEQUENCE**：依附表，默认跟随父表的 remap 目标。
 - **PROCEDURE / FUNCTION / TYPE / SYNONYM**：允许通过依赖推导目标 schema（可关闭）。
-- **PACKAGE / PACKAGE BODY**：默认仅打印不校验。
+- **PACKAGE / PACKAGE BODY**：纳入存在性与有效性对比，缺失时生成修补 DDL。
 - **MATERIALIZED VIEW**：OB 不支持，仅打印不校验。
 
 如果推导失败或出现冲突，报告会输出 `remap_conflicts_*.txt`，需要在 `remap_rules.txt` 中显式补齐。
@@ -118,6 +118,7 @@ SRC_A.TRG_ORDER = OB_A.TRG_ORDER
 ## 运行后会生成什么？
 
 - `main_reports/report_*.txt`：完整对比报告（建议先看这个）
+- `main_reports/package_compare_*.txt`：PACKAGE/PKG BODY 对比明细（含有效性与错误摘要）
 - `main_reports/remap_conflicts_*.txt`：无法自动推导的对象清单
 - `main_reports/tables_views_miss/`：按目标 schema 输出缺失 TABLE/VIEW 规则（`schema_T.txt` / `schema_V.txt`）
 - `main_reports/blacklist_tables.txt`：黑名单表清单（按 schema 分组，附原因与 LONG 转换校验状态）

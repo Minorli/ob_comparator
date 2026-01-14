@@ -17,4 +17,5 @@ test_schema_diff_reconciler.py
 logs
 config.ini
 AGENTS.md
+docs/MIGRATION_PROPOSAL_1567_SCHEMAS.md
 .venv

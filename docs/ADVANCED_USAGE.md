@@ -29,7 +29,8 @@
 这意味着：
 - **触发器不会自动改 schema**。如果触发器依赖的表被 remap 到其他 schema，会自动在 fixup 阶段补充授权。
 - **视图不会自动改 schema**。但视图内部对表的引用仍会按 remap 规则替换。
-- **MATERIALIZED VIEW / PACKAGE / PACKAGE BODY** 默认仅打印不校验（OB 不支持或默认跳过）。
+- **MATERIALIZED VIEW** 默认仅打印不校验（OB 不支持或默认跳过）。
+- **PACKAGE / PACKAGE BODY** 纳入存在性与有效性对比，缺失时生成修补 DDL。
 
 ### 3. 依附对象如何跟随父表？
 

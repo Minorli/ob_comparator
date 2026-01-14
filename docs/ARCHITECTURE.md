@@ -5,7 +5,7 @@
 
 ## 1. 核心目标
 
-1. **准确识别差异**：覆盖 TABLE/VIEW/PLSQL/TYPE/JOB/SCHEDULE 等主对象，并扩展校验 INDEX/CONSTRAINT/SEQUENCE/TRIGGER；MATERIALIZED VIEW 与 PACKAGE/PACKAGE BODY 默认仅打印不校验。
+1. **准确识别差异**：覆盖 TABLE/VIEW/PLSQL/TYPE/JOB/SCHEDULE 等主对象，并扩展校验 INDEX/CONSTRAINT/SEQUENCE/TRIGGER；MATERIALIZED VIEW 仅打印不校验，PACKAGE/PACKAGE BODY 纳入有效性对比。
 2. **自动化修补**：对缺失对象、列差异、授权缺口生成结构化 SQL，支持自动执行。
 3. **可追踪的报告**：通过 Rich 报表与文本快照输出，记录所有差异、依赖状态、Remap 冲突等，使迁移过程可审计。
 4. **高性能 & 低负载**：仍坚持“一次转储、本地对比”，避免循环访问数据库。
@@ -81,7 +81,8 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
 1. **主对象**  
    - TABLE：检查存在性、列名集合（过滤 `OMS_*` 内部列）、`VARCHAR/VARCHAR2` 列长度是否落在 `[ceil(1.5 * 源长度), ceil(2.5 * 源长度)]` 区间；不足则生成 ALTER，过大则给出 WARNING。
    - VIEW/类型/PLSQL/SYNONYM/JOB/SCHEDULE 等：验证存在性即可。
-   - MATERIALIZED VIEW / PACKAGE / PACKAGE BODY：默认仅打印不校验（OB 不支持或默认跳过）。
+   - MATERIALIZED VIEW：默认仅打印不校验（OB 不支持或默认跳过）。
+   - PACKAGE / PACKAGE BODY：纳入存在性与有效性对比，缺失时生成修补 DDL。
 2. **扩展对象**  
    - INDEX：按列序列+唯一性匹配；多余或缺少的索引列集合会在报告中详细列出；若源端缺失元数据，也会打印目标端现存索引列表。
    - CONSTRAINT：区分 PK/UK/FK，比较列组合和定义；目标端名称包含 `_OMS_ROWID` 的约束会被忽略；源端元数据缺失时同样输出目标端现存约束列表。
@@ -133,6 +134,7 @@ Oracle Thick Mode (DBA_OBJECTS / DBA_DEPENDENCIES / DBMS_METADATA)
 
 - **Rich 控制台报告**：包含综合概要、表级差异、索引/约束/序列/触发器明细、依赖缺口、Remap 冲突等；授权脚本仅输出到 fixup 目录，不在报告中展示。
 - **文本快照 (`main_reports/report_<timestamp>.txt`)**：通过 `Console(record=True)` 同步导出，方便归档或发给其他团队，并在开头展示源/目标数据库的版本与连接概览。
+- **包对比明细 (`main_reports/package_compare_<timestamp>.txt`)**：列出 PACKAGE/PACKAGE BODY 的源/目标状态、差异与错误摘要。
 - **Remap 冲突清单 (`main_reports/remap_conflicts_<timestamp>.txt`)**：列出无法自动推导的对象，需显式 remap 后重跑。
 - **OMS 缺失规则 (`main_reports/tables_views_miss/`)**：仅输出支持迁移的 TABLE/VIEW 规则（`schema_T.txt` / `schema_V.txt`），可直接交给 OMS。
 - **黑名单清单 (`main_reports/blacklist_tables.txt`)**：列出黑名单表并标注原因与 LONG 转换校验状态（缺失表不会生成 OMS 规则）。

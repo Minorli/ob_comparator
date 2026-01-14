@@ -88,7 +88,7 @@ trigger_list            =
 # check_primary_types 可选值：
 #   TABLE, VIEW, MATERIALIZED VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY,
 #   SYNONYM, JOB, SCHEDULE, TYPE, TYPE BODY
-#   注意：MATERIALIZED VIEW / PACKAGE / PACKAGE BODY 默认仅打印不校验（仍会在报告中展示）
+#   注意：MATERIALIZED VIEW 默认仅打印不校验（仍会在报告中展示）
 # check_extra_types 可选值：
 #   INDEX, CONSTRAINT, SEQUENCE, TRIGGER
 # 示例：
@@ -109,6 +109,8 @@ check_comments          = true
 # 是否启用 schema 推导（一对多场景下用于非表对象）
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 infer_schema_mapping    = true
+# 是否清洗 PL/SQL DDL 中的全角标点（默认开启，避免目标端解析失败）
+ddl_punct_sanitize      = true
 
 # Oracle Instant Client 目录 (必须包含 libclntsh.so)
 oracle_client_lib_dir   = /path/to/instantclient_19_29
@@ -123,3 +125,9 @@ dbcat_output_dir        = dbcat_output
 # dbcat_from/dbcat_to 为 dbcat profile（依 dbcat 版本可选）
 dbcat_from              = oracle19c
 dbcat_to                = oboracle422
+# dbcat_no_cal_dep: 禁用依赖计算以加速抽取（true/false）
+dbcat_no_cal_dep        = false
+# dbcat_query_meta_thread: 元数据查询线程数（dbcat 参数 --query-meta-thread）
+dbcat_query_meta_thread =
+# dbcat_progress_interval: dbcat 长时间运行时的进度心跳间隔（秒，<=0 关闭）
+dbcat_progress_interval = 15

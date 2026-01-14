@@ -68,7 +68,7 @@
   有效值:
     TABLE, VIEW, MATERIALIZED VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY,
     SYNONYM, JOB, SCHEDULE, TYPE, TYPE BODY
-  注意: MATERIALIZED VIEW / PACKAGE / PACKAGE BODY 默认仅打印不校验。
+  注意: MATERIALIZED VIEW 默认仅打印不校验。
   说明: 该范围会影响元数据加载、Remap 推导、对比与修复脚本生成。
 - check_extra_types: 限制额外对象检查。
   有效值: INDEX, CONSTRAINT, SEQUENCE, TRIGGER
@@ -77,6 +77,7 @@
 - print_dependency_chains: true/false/1/0/yes/no. 打印依赖链（仅当 check_dependencies=true 时生效）。
 - check_comments: true/false/1/0/yes/no. 对比表/列注释。
 - infer_schema_mapping: true/false/1/0/yes/no. 在一对多映射场景中启用 schema 推导。
+- ddl_punct_sanitize: true/false/1/0/yes/no. 清洗 PL/SQL DDL 中的全角标点（默认开启）。
 
 Oracle 客户端 (Oracle client)
 - oracle_client_lib_dir: Oracle Instant Client 目录（必须包含 libclntsh.so）。
@@ -87,6 +88,9 @@ dbcat 工具 (dbcat)
 - dbcat_output_dir: dbcat 输出目录。
 - dbcat_from: dbcat 源端 profile（取决于 dbcat 版本）。
 - dbcat_to: dbcat 目标端 profile（取决于 dbcat 版本）。
+- dbcat_no_cal_dep: 是否关闭依赖计算以加速抽取 (true/false)。
+- dbcat_query_meta_thread: dbcat 元数据查询线程数 (>=1)。
+- dbcat_progress_interval: dbcat 进度心跳间隔（秒，<=0 关闭）。
 - java_home: JAVA_HOME 路径（dbcat 需要）。
 
 5) 默认值 (Defaults)
