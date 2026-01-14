@@ -321,6 +321,30 @@ class DdlCleanReportRow(NamedTuple):
     replaced: int
     samples: List[Tuple[str, str]]
 
+
+class DdlHintCleanReportRow(NamedTuple):
+    obj_type: str
+    obj_full: str
+    policy: str
+    total: int
+    kept: int
+    removed: int
+    unknown: int
+    kept_samples: List[str]
+    removed_samples: List[str]
+    unknown_samples: List[str]
+
+
+class HintFilterResult(NamedTuple):
+    ddl: str
+    total: int
+    kept: int
+    removed: int
+    unknown: int
+    kept_samples: List[str]
+    removed_samples: List[str]
+    unknown_samples: List[str]
+
 # --- 全局 obclient timeout（秒），由配置初始化 ---
 OBC_TIMEOUT: int = 60
 
@@ -720,6 +744,42 @@ def parse_csv_set(raw_value: Optional[str]) -> Set[str]:
     return {item.strip().upper() for item in str(raw_value).split(',') if item.strip()}
 
 
+def normalize_hint_policy(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return DDL_HINT_POLICY_DEFAULT
+    policy = str(raw_value).strip().lower()
+    if policy not in DDL_HINT_POLICY_VALUES:
+        log.warning(
+            "ddl_hint_policy=%s 不在支持范围内，将回退为 %s。",
+            raw_value,
+            DDL_HINT_POLICY_DEFAULT
+        )
+        return DDL_HINT_POLICY_DEFAULT
+    return policy
+
+
+def load_hint_allowlist_file(path_value: Optional[str]) -> Set[str]:
+    if not path_value or not str(path_value).strip():
+        return set()
+    path = Path(str(path_value).strip()).expanduser()
+    try:
+        raw_lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        log.warning("ddl_hint_allowlist_file 读取失败: %s (%s)", path, exc)
+        return set()
+    hints: Set[str] = set()
+    for line in raw_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "#" in stripped:
+            stripped = stripped.split("#", 1)[0].strip()
+        if not stripped:
+            continue
+        hints.add(stripped.upper())
+    return hints
+
+
 def chunk_list(items: List[str], size: int) -> List[List[str]]:
     """Split list into batches of given size."""
     return [items[i:i + size] for i in range(0, len(items), size)]
@@ -925,6 +985,151 @@ DBCAT_DIR_TO_TYPE: Dict[str, str] = {
     for hint in hints
 }
 
+DDL_HINT_POLICY_DROP_ALL = "drop_all"
+DDL_HINT_POLICY_KEEP_SUPPORTED = "keep_supported"
+DDL_HINT_POLICY_KEEP_ALL = "keep_all"
+DDL_HINT_POLICY_REPORT_ONLY = "report_only"
+DDL_HINT_POLICY_VALUES = {
+    DDL_HINT_POLICY_DROP_ALL,
+    DDL_HINT_POLICY_KEEP_SUPPORTED,
+    DDL_HINT_POLICY_KEEP_ALL,
+    DDL_HINT_POLICY_REPORT_ONLY
+}
+DDL_HINT_POLICY_DEFAULT = DDL_HINT_POLICY_KEEP_SUPPORTED
+
+OB_ORACLE_HINT_ALLOWLIST: Set[str] = {
+    "AGGR_FIRST_UNNEST",
+    "APPEND",
+    "BEGIN_OUTLINE_DATA",
+    "COALESCE_SQ",
+    "COUNT_TO_EXISTS",
+    "CURSOR_SHARING_EXACT",
+    "DECORRELATE",
+    "DIRECT",
+    "DISABLE_PARALLEL_DAS_DML",
+    "DISABLE_PARALLEL_DML",
+    "DISTINCT_PUSHDOWN",
+    "DYNAMIC_SAMPLING",
+    "ELIMINATE_JOIN",
+    "ENABLE_PARALLEL_DAS_DML",
+    "ENABLE_PARALLEL_DML",
+    "END_OUTLINE_DATA",
+    "FAST_MINMAX",
+    "FULL",
+    "GATHER_OPTIMIZER_STATISTICS",
+    "GBY_PUSHDOWN",
+    "INDEX",
+    "INDEX_SS",
+    "INLINE",
+    "JOIN_FIRST_UNNEST",
+    "LEADING",
+    "LEFT_TO_ANTI",
+    "LOAD_BATCH_SIZE",
+    "LOG_LEVEL",
+    "MATERIALIZE",
+    "MAX_CONCURRENT",
+    "MERGE",
+    "MONITOR",
+    "MV_REWRITE",
+    "NO_AGGR_FIRST_UNNEST",
+    "NO_COALESCE_SQ",
+    "NO_COST_BASED_QUERY_TRANSFORMATION",
+    "NO_COUNT_TO_EXISTS",
+    "NO_DECORRELATE",
+    "NO_DIRECT",
+    "NO_DISTINCT_PUSHDOWN",
+    "NO_ELIMINATE_JOIN",
+    "NO_EXPAND",
+    "NO_FAST_MINMAX",
+    "NO_GATHER_OPTIMIZER_STATISTICS",
+    "NO_GBY_PUSHDOWN",
+    "NO_INDEX",
+    "NO_JOIN_FIRST_UNNEST",
+    "NO_LEFT_TO_ANTI",
+    "NO_MERGE",
+    "NO_MV_REWRITE",
+    "NO_OUTER_TO_INNER",
+    "NO_PARALLEL",
+    "NO_PLACE_GROUP_BY",
+    "NO_PRED_DEDUCE",
+    "NO_PROJECT_PRUNE",
+    "NO_PULLUP_EXPR",
+    "NO_PUSH_LIMIT",
+    "NO_PX_JOIN_FILTER",
+    "NO_PX_PART_JOIN_FILTER",
+    "NO_QUERY_TRANSFORMATION",
+    "NO_REPLACE_CONST",
+    "NO_REWRITE",
+    "NO_SEMI_TO_INNER",
+    "NO_SIMPLIFY_DISTINCT",
+    "NO_SIMPLIFY_EXPR",
+    "NO_SIMPLIFY_GROUP_BY",
+    "NO_SIMPLIFY_LIMIT",
+    "NO_SIMPLIFY_ORDER_BY",
+    "NO_SIMPLIFY_SET",
+    "NO_SIMPLIFY_SUBQUERY",
+    "NO_SIMPLIFY_WINFUNC",
+    "NO_UNNEST",
+    "NO_USE_COLUMN_TABLE",
+    "NO_USE_DAS",
+    "NO_USE_DISTRIBUTED_DML",
+    "NO_USE_HASH",
+    "NO_USE_HASH_AGGREGATION",
+    "NO_USE_HASH_DISTINCT",
+    "NO_USE_HASH_SET",
+    "NO_USE_MERGE",
+    "NO_USE_NL",
+    "NO_USE_NL_MATERIALIZATION",
+    "NO_WIN_MAGIC",
+    "OPTIMIZER_FEATURES_ENABLE",
+    "OPT_PARAM",
+    "ORDERED",
+    "OUTER_TO_INNER",
+    "PARALLEL",
+    "PLACE_GROUP_BY",
+    "PQ_DISTRIBUTE",
+    "PQ_MAP",
+    "PQ_SET",
+    "PRED_DEDUCE",
+    "PROJECT_PRUNE",
+    "PULLUP_EXPR",
+    "PUSH_LIMIT",
+    "PX_JOIN_FILTER",
+    "PX_PART_JOIN_FILTER",
+    "QB_NAME",
+    "QUERY_TIMEOUT",
+    "READ_CONSISTENCY",
+    "REPLACE_CONST",
+    "RESOURCE_GROUP",
+    "SEMI_TO_INNER",
+    "SIMPLIFY_DISTINCT",
+    "SIMPLIFY_EXPR",
+    "SIMPLIFY_GROUP_BY",
+    "SIMPLIFY_LIMIT",
+    "SIMPLIFY_ORDER_BY",
+    "SIMPLIFY_SET",
+    "SIMPLIFY_SUBQUERY",
+    "SIMPLIFY_WINFUNC",
+    "STAT",
+    "TRACING",
+    "TRANS_PARAM",
+    "UNNEST",
+    "USE_COLUMN_TABLE",
+    "USE_CONCAT",
+    "USE_DAS",
+    "USE_DISTRIBUTED_DML",
+    "USE_HASH",
+    "USE_HASH_AGGREGATION",
+    "USE_HASH_DISTINCT",
+    "USE_HASH_SET",
+    "USE_MERGE",
+    "USE_NL",
+    "USE_NL_MATERIALIZATION",
+    "USE_PLAN_CACHE",
+    "USE_PX",
+    "WIN_MAGIC",
+}
+
 # ====================== 通用配置和基础函数 ======================
 
 def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
@@ -986,6 +1191,10 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('check_comments', 'true')
         settings.setdefault('infer_schema_mapping', 'true')
         settings.setdefault('ddl_punct_sanitize', 'true')
+        settings.setdefault('ddl_hint_policy', DDL_HINT_POLICY_DEFAULT)
+        settings.setdefault('ddl_hint_allowlist', '')
+        settings.setdefault('ddl_hint_denylist', '')
+        settings.setdefault('ddl_hint_allowlist_file', '')
         settings.setdefault('dbcat_chunk_size', '150')
         settings.setdefault('fixup_workers', '')
         settings.setdefault('progress_log_interval', '10')
@@ -1030,6 +1239,12 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings['enable_ddl_punct_sanitize'] = parse_bool_flag(
             settings.get('ddl_punct_sanitize', 'true'),
             True
+        )
+        settings['ddl_hint_policy'] = normalize_hint_policy(settings.get('ddl_hint_policy'))
+        settings['ddl_hint_allowlist_set'] = parse_csv_set(settings.get('ddl_hint_allowlist', ''))
+        settings['ddl_hint_denylist_set'] = parse_csv_set(settings.get('ddl_hint_denylist', ''))
+        settings['ddl_hint_allowlist_file_set'] = load_hint_allowlist_file(
+            settings.get('ddl_hint_allowlist_file', '')
         )
         settings['print_dependency_chains'] = parse_bool_flag(
             settings.get('print_dependency_chains', 'true'),
@@ -10130,6 +10345,268 @@ def remap_plsql_object_references(
     return masker.unmask(working_sql)
 
 
+_HINT_KEYWORD_RE = re.compile(r'([A-Z_][A-Z0-9_$#]*)(?:@[\w$#]+)?', re.IGNORECASE)
+_Q_QUOTE_PAIRS = {
+    "[": "]",
+    "{": "}",
+    "(": ")",
+    "<": ">",
+}
+HINT_SAMPLE_LIMIT = 6
+
+
+def _normalize_hint_sample(token: str, max_len: int = 60) -> str:
+    text = re.sub(r'\s+', ' ', (token or '').strip())
+    if len(text) > max_len:
+        return text[:max_len - 3] + "..."
+    return text
+
+
+def _append_hint_sample(samples: List[str], value: str, limit: int = HINT_SAMPLE_LIMIT) -> None:
+    if not value or value in samples or len(samples) >= limit:
+        return
+    samples.append(value)
+
+
+def _extract_hint_keyword(token: str) -> str:
+    if not token:
+        return ""
+    match = _HINT_KEYWORD_RE.match(token.strip())
+    return match.group(1).upper() if match else ""
+
+
+def _split_hint_tokens(content: str) -> List[str]:
+    tokens: List[str] = []
+    buf: List[str] = []
+    depth = 0
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(content)
+
+    def flush() -> None:
+        token = "".join(buf).strip()
+        if token:
+            tokens.append(token)
+        buf.clear()
+
+    while i < n:
+        ch = content[i]
+        nxt = content[i + 1] if i + 1 < n else ""
+
+        if in_single:
+            buf.append(ch)
+            if ch == "'" and nxt == "'":
+                buf.append(nxt)
+                i += 2
+                continue
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+
+        if in_double:
+            buf.append(ch)
+            if ch == '"' and nxt == '"':
+                buf.append(nxt)
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+
+        if ch == "'":
+            in_single = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ")" and depth > 0:
+            depth -= 1
+            buf.append(ch)
+            i += 1
+            continue
+
+        if depth == 0 and (ch.isspace() or ch == ","):
+            flush()
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    flush()
+    return tokens
+
+
+def _consume_q_quote(sql: str, start: int) -> Optional[int]:
+    n = len(sql)
+    if start + 2 >= n or sql[start + 1] != "'":
+        return None
+    delimiter = sql[start + 2]
+    end_delim = _Q_QUOTE_PAIRS.get(delimiter, delimiter)
+    i = start + 3
+    while i + 1 < n:
+        if sql[i] == end_delim and sql[i + 1] == "'":
+            return i + 2
+        i += 1
+    return n
+
+
+def filter_oracle_hints(
+    ddl: str,
+    policy: str,
+    allowlist: Set[str],
+    denylist: Set[str],
+    sample_limit: int = HINT_SAMPLE_LIMIT
+) -> HintFilterResult:
+    if not ddl:
+        return HintFilterResult(ddl, 0, 0, 0, 0, [], [], [])
+    if "/*+" not in ddl:
+        return HintFilterResult(ddl, 0, 0, 0, 0, [], [], [])
+
+    policy = policy if policy in DDL_HINT_POLICY_VALUES else DDL_HINT_POLICY_DEFAULT
+    allowset = {h.upper() for h in (allowlist or set())}
+    denyset = {h.upper() for h in (denylist or set())}
+
+    kept_samples: List[str] = []
+    removed_samples: List[str] = []
+    unknown_samples: List[str] = []
+    total = kept = removed = unknown = 0
+
+    out: List[str] = []
+    i = 0
+    n = len(ddl)
+    in_single = False
+    in_double = False
+    in_line_comment = False
+    in_block_comment = False
+
+    while i < n:
+        ch = ddl[i]
+        nxt = ddl[i + 1] if i + 1 < n else ""
+
+        if in_line_comment:
+            out.append(ch)
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+
+        if in_block_comment:
+            out.append(ch)
+            if ch == "*" and nxt == "/":
+                out.append(nxt)
+                in_block_comment = False
+                i += 2
+            else:
+                i += 1
+            continue
+
+        if not in_single and not in_double:
+            if ch in ("q", "Q") and nxt == "'":
+                if i == 0 or not (ddl[i - 1].isalnum() or ddl[i - 1] in ("_", "$", "#")):
+                    end = _consume_q_quote(ddl, i)
+                    if end:
+                        out.append(ddl[i:end])
+                        i = end
+                        continue
+            if ch == "-" and nxt == "-":
+                in_line_comment = True
+                out.append(ch)
+                out.append(nxt)
+                i += 2
+                continue
+            if ch == "/" and nxt == "*":
+                if i + 2 < n and ddl[i + 2] == "+":
+                    end = ddl.find("*/", i + 3)
+                    if end == -1:
+                        out.append(ddl[i:])
+                        break
+                    content = ddl[i + 3:end]
+                    tokens = _split_hint_tokens(content)
+                    kept_tokens: List[str] = []
+                    for token in tokens:
+                        keyword = _extract_hint_keyword(token)
+                        supported = bool(keyword) and keyword in allowset
+                        denied = bool(keyword) and keyword in denyset
+                        is_unknown = not supported
+                        total += 1
+                        if is_unknown:
+                            unknown += 1
+                            sample = _normalize_hint_sample(keyword or token)
+                            _append_hint_sample(unknown_samples, sample, sample_limit)
+                        if denied or policy == DDL_HINT_POLICY_DROP_ALL:
+                            removed += 1
+                            sample = _normalize_hint_sample(keyword or token)
+                            _append_hint_sample(removed_samples, sample, sample_limit)
+                            continue
+                        if policy == DDL_HINT_POLICY_KEEP_SUPPORTED and not supported:
+                            removed += 1
+                            sample = _normalize_hint_sample(keyword or token)
+                            _append_hint_sample(removed_samples, sample, sample_limit)
+                            continue
+                        kept += 1
+                        kept_tokens.append(token)
+                        sample = _normalize_hint_sample(keyword or token)
+                        _append_hint_sample(kept_samples, sample, sample_limit)
+                    if kept_tokens:
+                        out.append("/*+ " + " ".join(kept_tokens) + " */")
+                    else:
+                        out.append(" ")
+                    i = end + 2
+                    continue
+                in_block_comment = True
+                out.append(ch)
+                out.append(nxt)
+                i += 2
+                continue
+
+        if not in_double and ch == "'":
+            out.append(ch)
+            if in_single and nxt == "'":
+                out.append(nxt)
+                i += 2
+                continue
+            in_single = not in_single
+            i += 1
+            continue
+
+        if not in_single and ch == '"':
+            out.append(ch)
+            if in_double and nxt == '"':
+                out.append(nxt)
+                i += 2
+                continue
+            in_double = not in_double
+            i += 1
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return HintFilterResult(
+        "".join(out),
+        total,
+        kept,
+        removed,
+        unknown,
+        kept_samples,
+        removed_samples,
+        unknown_samples
+    )
+
+
 def clean_oracle_hints(ddl: str) -> str:
     """移除Oracle特有的Hint语法"""
     if not ddl:
@@ -10233,7 +10710,6 @@ DDL_CLEANUP_RULES = {
             clean_plsql_ending,
             clean_semicolon_before_slash,
             clean_pragma_statements,
-            clean_oracle_hints,
             clean_oracle_specific_syntax,
             clean_extra_semicolons,
             clean_extra_dots,
@@ -10247,7 +10723,6 @@ DDL_CLEANUP_RULES = {
         'types': ['TABLE'],
         'rules': [
             clean_storage_clauses,
-            clean_oracle_hints,
             clean_oracle_specific_syntax,
             clean_extra_semicolons,
             clean_extra_dots,
@@ -10261,7 +10736,6 @@ DDL_CLEANUP_RULES = {
         'types': ['SEQUENCE'],
         'rules': [
             clean_sequence_unsupported_options,
-            clean_oracle_hints,
             clean_oracle_specific_syntax,
             clean_extra_semicolons,
             clean_extra_dots,
@@ -10275,7 +10749,6 @@ DDL_CLEANUP_RULES = {
         'types': ['VIEW', 'MATERIALIZED VIEW', 'SYNONYM'],
         'rules': [
             clean_editionable_flags,
-            clean_oracle_hints,
             clean_oracle_specific_syntax,
             clean_extra_semicolons,
             clean_extra_dots,
@@ -11036,6 +11509,17 @@ def generate_fixup_scripts(
     log.info(f"[FIXUP] 目标端订正 SQL 将生成到目录: {base_dir.resolve()}")
     if not settings.get('enable_ddl_punct_sanitize', True):
         log.info("[DDL_CLEAN] 已关闭 PL/SQL 全角标点清洗。")
+    hint_policy = settings.get('ddl_hint_policy', DDL_HINT_POLICY_DEFAULT)
+    hint_allowlist: Set[str] = set(OB_ORACLE_HINT_ALLOWLIST)
+    hint_allowlist.update(settings.get('ddl_hint_allowlist_set', set()))
+    hint_allowlist.update(settings.get('ddl_hint_allowlist_file_set', set()))
+    hint_denylist: Set[str] = set(settings.get('ddl_hint_denylist_set', set()))
+    log.info(
+        "[DDL_HINT] hint_policy=%s allowlist=%d denylist=%d",
+        hint_policy,
+        len(hint_allowlist),
+        len(hint_denylist)
+    )
 
     table_map: Dict[str, str] = {
         tgt_name: src_name
@@ -11104,6 +11588,8 @@ def generate_fixup_scripts(
 
     ddl_clean_records: List[DdlCleanReportRow] = []
     ddl_clean_lock = threading.Lock()
+    hint_clean_records: List[DdlHintCleanReportRow] = []
+    hint_clean_lock = threading.Lock()
 
     def record_ddl_clean(
         obj_type: str,
@@ -11121,6 +11607,35 @@ def generate_fixup_scripts(
         )
         with ddl_clean_lock:
             ddl_clean_records.append(row)
+
+    def record_hint_clean(
+        obj_type: str,
+        obj_full: str,
+        result: HintFilterResult
+    ) -> None:
+        if result.total <= 0:
+            return
+        if result.removed <= 0 and result.unknown <= 0:
+            return
+        row = DdlHintCleanReportRow(
+            obj_type=obj_type.upper(),
+            obj_full=obj_full,
+            policy=hint_policy,
+            total=result.total,
+            kept=result.kept,
+            removed=result.removed,
+            unknown=result.unknown,
+            kept_samples=result.kept_samples,
+            removed_samples=result.removed_samples,
+            unknown_samples=result.unknown_samples
+        )
+        with hint_clean_lock:
+            hint_clean_records.append(row)
+
+    def apply_hint_filter(obj_type: str, obj_full: str, ddl_text: str) -> str:
+        result = filter_oracle_hints(ddl_text, hint_policy, hint_allowlist, hint_denylist)
+        record_hint_clean(obj_type, obj_full, result)
+        return result.ddl
 
     def source_tag(label: str) -> str:
         return f"[{label}]"
@@ -11957,11 +12472,13 @@ def generate_fixup_scripts(
                 ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
                 ddl_adj = prepend_set_schema(ddl_adj, ts)
                 ddl_adj = normalize_ddl_for_ob(ddl_adj)
+                obj_full = f"{ts}.{tn}"
+                ddl_adj = apply_hint_filter('SEQUENCE', obj_full, ddl_adj)
                 ddl_adj = apply_ddl_cleanup_rules(ddl_adj, 'SEQUENCE')
                 ddl_adj = strip_constraint_enable(ddl_adj)
                 filename = f"{ts}.{tn}.sql"
-                header = f"修补缺失的 SEQUENCE {ts}.{tn} (源: {ss}.{sn})"
-                grants_for_seq = collect_grants_for_object(f"{ts}.{tn}")
+                header = f"修补缺失的 SEQUENCE {obj_full} (源: {ss}.{sn})"
+                grants_for_seq = collect_grants_for_object(obj_full)
                 log.info("[FIXUP]%s 写入 SEQUENCE 脚本: %s", source_tag(ddl_source_label), filename)
                 write_fixup_file(
                     base_dir,
@@ -12034,12 +12551,14 @@ def generate_fixup_scripts(
                 ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
                 ddl_adj = prepend_set_schema(ddl_adj, ts)
                 ddl_adj = normalize_ddl_for_ob(ddl_adj)
+                obj_full = f"{ts}.{tt}"
+                ddl_adj = apply_hint_filter('TABLE', obj_full, ddl_adj)
                 ddl_adj = apply_ddl_cleanup_rules(ddl_adj, 'TABLE')
                 ddl_adj = strip_constraint_enable(ddl_adj)
                 ddl_adj = strip_enable_novalidate(ddl_adj)
                 filename = f"{ts}.{tt}.sql"
-                header = f"修补缺失的 TABLE {ts}.{tt} (源: {ss}.{st})"
-                grants_for_table = collect_grants_for_object(f"{ts}.{tt}")
+                header = f"修补缺失的 TABLE {obj_full} (源: {ss}.{st})"
+                grants_for_table = collect_grants_for_object(obj_full)
                 log.info("[FIXUP]%s 写入 TABLE 脚本: %s", source_tag(ddl_source_label), filename)
                 write_fixup_file(
                     base_dir,
@@ -12219,6 +12738,8 @@ def generate_fixup_scripts(
                 final_ddl = cleanup_dbcat_wrappers(final_ddl)
                 final_ddl = prepend_set_schema(final_ddl, tgt_schema)
                 final_ddl = normalize_ddl_for_ob(final_ddl)
+                obj_full = f"{tgt_schema}.{tgt_obj}"
+                final_ddl = apply_hint_filter('VIEW', obj_full, final_ddl)
                 final_ddl = apply_ddl_cleanup_rules(final_ddl, 'VIEW')
                 final_ddl = strip_constraint_enable(final_ddl)
                 final_ddl = enforce_schema_for_ddl(final_ddl, tgt_schema, 'VIEW')
@@ -12230,7 +12751,7 @@ def generate_fixup_scripts(
                 # 写入文件
                 filename = f"{tgt_schema}.{tgt_obj}.sql"
                 header = f"修补缺失的 VIEW {tgt_obj} (源: {src_schema}.{src_obj})"
-                grants_for_view = collect_grants_for_object(f"{tgt_schema}.{tgt_obj}")
+                grants_for_view = collect_grants_for_object(obj_full)
                 log.info("[FIXUP]%s 写入 VIEW 脚本: %s", source_tag(ddl_source_label), filename)
                 write_fixup_file(
                     base_dir,
@@ -12293,12 +12814,13 @@ def generate_fixup_scripts(
                     ddl_adj = prepend_set_schema(ddl_adj, ts)
                 
                 ddl_adj = normalize_ddl_for_ob(ddl_adj)
+                obj_full = f"{ts}.{to}"
+                ddl_adj = apply_hint_filter(ot, obj_full, ddl_adj)
                 ddl_adj = apply_ddl_cleanup_rules(ddl_adj, ot)
                 clean_notes = None
                 if settings.get('enable_ddl_punct_sanitize', True):
                     ddl_adj, replaced, samples = sanitize_plsql_punctuation(ddl_adj, ot)
                     if replaced:
-                        obj_full = f"{ts}.{to}"
                         sample_text = ", ".join(f"{src}->{dst}" for src, dst in samples)
                         suffix = f" 示例: {sample_text}" if sample_text else ""
                         log.info(
@@ -12314,11 +12836,11 @@ def generate_fixup_scripts(
                 ddl_adj = enforce_schema_for_ddl(ddl_adj, ts, ot)
                 
                 # --- Find and prepare grants for this object ---
-                grants_for_this_object = collect_grants_for_object(f"{ts}.{to}")
+                grants_for_this_object = collect_grants_for_object(obj_full)
 
                 subdir = obj_type_to_dir.get(ot, ot.lower())
                 filename = f"{ts}.{to}.sql"
-                header = f"修补缺失的 {ot} {ts}.{to} (源: {ss}.{so})"
+                header = f"修补缺失的 {ot} {obj_full} (源: {ss}.{so})"
                 log.info("[FIXUP]%s 写入 %s 脚本: %s", source_tag(ddl_source_label), ot, filename)
                 write_fixup_file(
                     base_dir,
@@ -12617,12 +13139,13 @@ def generate_fixup_scripts(
                 ddl_adj = _rewrite_trigger_name_and_on(ddl_adj)
                 ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
                 ddl_adj = prepend_set_schema(ddl_adj, ts)
+                obj_full = f"{ts}.{to}"
+                ddl_adj = apply_hint_filter('TRIGGER', obj_full, ddl_adj)
                 ddl_adj = apply_ddl_cleanup_rules(ddl_adj, 'TRIGGER')
                 clean_notes = None
                 if settings.get('enable_ddl_punct_sanitize', True):
                     ddl_adj, replaced, samples = sanitize_plsql_punctuation(ddl_adj, 'TRIGGER')
                     if replaced:
-                        obj_full = f"{ts}.{to}"
                         sample_text = ", ".join(f"{src}->{dst}" for src, dst in samples)
                         suffix = f" 示例: {sample_text}" if sample_text else ""
                         log.info(
@@ -12868,6 +13391,21 @@ def generate_fixup_scripts(
         clean_report_path = export_ddl_clean_report(ddl_clean_records, report_dir, report_timestamp)
         if clean_report_path:
             log.info("[DDL_CLEAN] 全角标点清洗报告已输出: %s", clean_report_path)
+
+    if hint_clean_records:
+        total_removed = sum(row.removed for row in hint_clean_records)
+        total_unknown = sum(row.unknown for row in hint_clean_records)
+        log.info(
+            "[DDL_HINT] hint 清洗汇总: objects=%d removed=%d unknown=%d policy=%s",
+            len(hint_clean_records),
+            total_removed,
+            total_unknown,
+            hint_policy
+        )
+    if hint_clean_records and report_dir and report_timestamp:
+        hint_report_path = export_ddl_hint_clean_report(hint_clean_records, report_dir, report_timestamp)
+        if hint_report_path:
+            log.info("[DDL_HINT] hint 清洗报告已输出: %s", hint_report_path)
 
     if unsupported_types:
         log.warning(
@@ -13142,6 +13680,100 @@ def export_ddl_clean_report(
         return output_path
     except OSError as exc:
         log.warning("写入全角标点清洗报告失败 %s: %s", output_path, exc)
+        return None
+
+
+def export_ddl_hint_clean_report(
+    rows: List[DdlHintCleanReportRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出 DDL hint 清洗报告。
+    """
+    if not report_dir or not rows or not report_timestamp:
+        return None
+
+    output_path = Path(report_dir) / f"ddl_hint_clean_{report_timestamp}.txt"
+    rows_sorted = sorted(rows, key=lambda r: (r.obj_type, r.obj_full))
+    total_tokens = sum(r.total for r in rows_sorted)
+    total_kept = sum(r.kept for r in rows_sorted)
+    total_removed = sum(r.removed for r in rows_sorted)
+    total_unknown = sum(r.unknown for r in rows_sorted)
+
+    def join_samples(samples: List[str]) -> str:
+        return ", ".join(samples) if samples else "-"
+
+    kept_texts = [join_samples(row.kept_samples) for row in rows_sorted]
+    removed_texts = [join_samples(row.removed_samples) for row in rows_sorted]
+    unknown_texts = [join_samples(row.unknown_samples) for row in rows_sorted]
+
+    type_w = max(len("TYPE"), max((len(r.obj_type) for r in rows_sorted), default=0))
+    obj_w = max(len("OBJECT"), max((len(r.obj_full) for r in rows_sorted), default=0))
+    policy_w = max(len("POLICY"), max((len(r.policy) for r in rows_sorted), default=0))
+    total_w = max(len("TOKENS"), max((len(str(r.total)) for r in rows_sorted), default=0))
+    kept_w = max(len("KEPT"), max((len(str(r.kept)) for r in rows_sorted), default=0))
+    removed_w = max(len("REMOVED"), max((len(str(r.removed)) for r in rows_sorted), default=0))
+    unknown_w = max(len("UNKNOWN"), max((len(str(r.unknown)) for r in rows_sorted), default=0))
+    kept_s_w = max(len("KEPT_SAMPLES"), max((len(text) for text in kept_texts), default=0))
+    removed_s_w = max(len("REMOVED_SAMPLES"), max((len(text) for text in removed_texts), default=0))
+    unknown_s_w = max(len("UNKNOWN_SAMPLES"), max((len(text) for text in unknown_texts), default=0))
+
+    lines: List[str] = [
+        "# DDL hint clean report",
+        (
+            f"# total_objects={len(rows_sorted)} total_tokens={total_tokens} "
+            f"kept={total_kept} removed={total_removed} unknown={total_unknown}"
+        ),
+        "# 字段说明: TYPE | OBJECT | POLICY | TOKENS | KEPT | REMOVED | UNKNOWN | KEPT_SAMPLES | REMOVED_SAMPLES | UNKNOWN_SAMPLES"
+    ]
+
+    header = (
+        f"{'TYPE'.ljust(type_w)}  "
+        f"{'OBJECT'.ljust(obj_w)}  "
+        f"{'POLICY'.ljust(policy_w)}  "
+        f"{'TOKENS'.rjust(total_w)}  "
+        f"{'KEPT'.rjust(kept_w)}  "
+        f"{'REMOVED'.rjust(removed_w)}  "
+        f"{'UNKNOWN'.rjust(unknown_w)}  "
+        f"{'KEPT_SAMPLES'.ljust(kept_s_w)}  "
+        f"{'REMOVED_SAMPLES'.ljust(removed_s_w)}  "
+        f"{'UNKNOWN_SAMPLES'.ljust(unknown_s_w)}"
+    )
+    lines.append(header)
+    lines.append(
+        f"{'-' * type_w}  "
+        f"{'-' * obj_w}  "
+        f"{'-' * policy_w}  "
+        f"{'-' * total_w}  "
+        f"{'-' * kept_w}  "
+        f"{'-' * removed_w}  "
+        f"{'-' * unknown_w}  "
+        f"{'-' * kept_s_w}  "
+        f"{'-' * removed_s_w}  "
+        f"{'-' * unknown_s_w}"
+    )
+
+    for row, kept_text, removed_text, unknown_text in zip(rows_sorted, kept_texts, removed_texts, unknown_texts):
+        lines.append(
+            f"{row.obj_type.ljust(type_w)}  "
+            f"{row.obj_full.ljust(obj_w)}  "
+            f"{row.policy.ljust(policy_w)}  "
+            f"{str(row.total).rjust(total_w)}  "
+            f"{str(row.kept).rjust(kept_w)}  "
+            f"{str(row.removed).rjust(removed_w)}  "
+            f"{str(row.unknown).rjust(unknown_w)}  "
+            f"{kept_text.ljust(kept_s_w)}  "
+            f"{removed_text.ljust(removed_s_w)}  "
+            f"{unknown_text.ljust(unknown_s_w)}"
+        )
+
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        return output_path
+    except OSError as exc:
+        log.warning("写入 ddl_hint_clean 报告失败 %s: %s", output_path, exc)
         return None
 
 
