@@ -54,6 +54,9 @@
   默认 false；仅在 DBA_ROLES 可读取时生效。
 - fixup_workers: 修复生成并发数；留空 or 0 则使用 min(12, CPU)。
 - progress_log_interval: 进度日志间隔（秒）(>=1)。
+- extra_check_workers: 扩展对象校验并发数；留空 or 0 则使用 min(4, CPU)。
+- extra_check_chunk_size: 扩展对象校验单批表数量（默认 200）。
+- extra_check_progress_interval: 扩展对象校验进度日志间隔（秒）(>=1)。
 - dbcat_chunk_size: 每批次 dbcat 处理的对象数量（建议 100-300）。
 - fixup_schemas: 仅为指定目标 schema 生成修复脚本；留空表示全部。
 - fixup_types: 仅为指定对象类型生成修复脚本；留空表示全部。
@@ -78,6 +81,10 @@
 - check_comments: true/false/1/0/yes/no. 对比表/列注释。
 - infer_schema_mapping: true/false/1/0/yes/no. 在一对多映射场景中启用 schema 推导。
 - ddl_punct_sanitize: true/false/1/0/yes/no. 清洗 PL/SQL DDL 中的全角标点（默认开启）。
+- ddl_hint_policy: hint 清洗策略（drop_all/keep_supported/keep_all/report_only）。
+- ddl_hint_allowlist: 额外允许的 hint（逗号分隔）。
+- ddl_hint_denylist: 强制删除的 hint（逗号分隔）。
+- ddl_hint_allowlist_file: 额外允许 hint 文件（每行一个，# 开头视为注释）。
 
 Oracle 客户端 (Oracle client)
 - oracle_client_lib_dir: Oracle Instant Client 目录（必须包含 libclntsh.so）。
@@ -91,6 +98,8 @@ dbcat 工具 (dbcat)
 - dbcat_no_cal_dep: 是否关闭依赖计算以加速抽取 (true/false)。
 - dbcat_query_meta_thread: dbcat 元数据查询线程数 (>=1)。
 - dbcat_progress_interval: dbcat 进度心跳间隔（秒，<=0 关闭）。
+- cache_parallel_workers: 缓存读取并发 (>=1)。
+- dbcat_cleanup_run_dirs: 是否清理每次运行的 dbcat 临时目录 (true/false)。
 - java_home: JAVA_HOME 路径（dbcat 需要）。
 
 5) 默认值 (Defaults)

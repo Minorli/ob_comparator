@@ -1,73 +1,37 @@
-# Main Program Index
+# 主程序索引
 
-This doc is a lightweight map of the primary entrypoints and the main execution
-phases. It is meant to avoid re-reading large files during iteration.
+本文件是主入口与核心流程的速查表，用于快速定位关键逻辑。
 
-## Entrypoints
+## 入口脚本
+- `schema_diff_reconciler.py`：主对比与修补脚本生成流程。
+- `run_fixup.py`：修补脚本执行器（单轮/迭代/VIEW 链路）。
+- `init_users_roles.py`：用户/角色初始化与授权同步。
+- `init_test.py`：测试场景初始化工具（基于 `test_scenarios/`）。
 
-- `schema_diff_reconciler.py`: main compare and fixup generation flow.
-- `run_fixup.py`: executes generated fixup scripts (single, iterative, or view-chain modes).
+## schema_diff_reconciler.py 主流程
+1. 解析 CLI 参数，必要时进入 `--wizard` 向导。
+2. 读取配置、初始化日志、校验路径与依赖。
+3. 加载 remap 规则，读取源端对象清单。
+4. 读取依附对象父表关系、依赖关系、同义词元数据。
+5. 生成对象映射与 master_list（主对象检查清单）。
+6. Dump OceanBase 元数据（一次转储）。
+7. Dump Oracle 元数据（批量查询）。
+8. 主对象检查 + PACKAGE 有效性对比。
+9. 扩展对象检查（INDEX/CONSTRAINT/SEQUENCE/TRIGGER）。
+10. 注释一致性校验（可配置关闭）。
+11. 依赖关系校验与缺失依赖定位。
+12. 授权计划与缺失授权脚本生成（可配置关闭）。
+13. DDL 提取与清洗（dbcat + DBMS_METADATA）。
+14. 生成 fixup_scripts（分类型输出）。
+15. 输出报告与运行总结。
 
-## schema_diff_reconciler.py Index
+## run_fixup.py 执行模式
+- `run_single_fixup`：单轮执行 + 依赖排序。
+- `run_iterative_fixup`：多轮迭代自动重试，适合依赖复杂对象。
+- `run_view_chain_autofix`：按 VIEW 依赖链生成执行计划。
 
-### Core sections (top to bottom)
-
-- Logging and console helpers: `strip_ansi_text`, `init_console_logging`, `log_section`.
-- Run summary types: `RunSummary`, `RunSummaryContext`.
-- Remap and dependency utilities: `load_remap_rules`, `build_dependency_graph`,
-  `resolve_remap_target`, `build_full_object_mapping`, `generate_master_list`.
-- Metadata dump: `dump_ob_metadata`, `dump_oracle_metadata`.
-- Comparison logic: `check_primary_objects`, `compare_package_objects`,
-  `check_extra_objects`, `check_comments`.
-- Grant planning: `build_grant_plan`, `filter_missing_grant_entries`.
-- DDL cleanup and fixup: `normalize_ddl_for_ob`, `generate_fixup_scripts`.
-- Reporting: `export_*` helpers, `print_final_report`, `log_run_summary`.
-- CLI and entrypoint: `parse_cli_args`, `main`.
-
-### Main progress map (main)
-
-1. Parse CLI args; optional `--wizard` config flow.
-2. Load config, setup logging, validate paths, init Oracle client.
-3. Load remap rules and source objects; validate remap rules.
-4. Load dependencies and synonym metadata (if needed).
-5. Build mapping and master list; infer schema mapping if enabled.
-6. Compute target schemas and expected dependency pairs.
-7. Dump OceanBase metadata; optionally load OB dependencies.
-8. Dump Oracle metadata; build blacklist report rows.
-9. Compare primary objects; compare packages; check comments.
-10. Compare extra objects (index, constraint, sequence, trigger).
-11. Process trigger list report (optional).
-12. Check dependencies and export dependency chains (optional).
-13. Generate fixup scripts and grant plan (optional).
-14. Render final report and run summary.
-
-### Short-circuit / gating conditions
-
-- Empty master list short-circuits the heavy phases and produces a minimal report.
-- `generate_fixup=false` skips fixup generation (and grant scripts).
-- `check_dependencies=false` skips dependency analysis and chain export.
-- `check_comments=false` skips comment comparison and related metadata.
-- `check_extra_types` empty skips extra object checks.
-- `trigger_list` file controls trigger filtering and reporting.
-- `enable_schema_mapping_infer` controls dependency-driven schema inference.
-
-## run_fixup.py Progress Map
-
-### Main modes
-
-- `run_single_fixup`: one pass execution with optional `--smart-order`.
-- `run_iterative_fixup`: multi-round retries with progress tracking.
-- `run_view_chain_autofix`: uses view chain plans and SQL output.
-
-### Flow (main)
-
-1. Parse args and map object types to directories.
-2. Load OB config, fixup directory, report directory.
-3. Select mode: view-chain, iterative, or single.
-4. Collect SQL files and execute with status summary.
-5. Optionally recompile invalid objects and produce error report.
-
-## Files to jump to for debugging
-
-- `schema_diff_reconciler.py`: `main`, `generate_fixup_scripts`, `print_final_report`.
-- `run_fixup.py`: `main`, `run_single_fixup`, `run_iterative_fixup`.
+## 核心输出位置
+- `main_reports/report_*.txt`：主报告
+- `main_reports/VIEWs_chain_*.txt`：VIEW 依赖链
+- `fixup_scripts/`：修补脚本目录
+- `fixup_scripts/errors/`：run_fixup 错误报告

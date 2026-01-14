@@ -440,6 +440,13 @@ RE_WITH_OPTION = re.compile(
 )
 RE_CHAIN_NODE = re.compile(r"(?P<name>[^\[]+)\[(?P<meta>[^\]]+)\]")
 
+Q_QUOTE_DELIMS = {
+    "[": "]",
+    "(": ")",
+    "{": "}",
+    "<": ">",
+}
+
 
 class ConfigError(Exception):
     """Custom exception for configuration issues."""
@@ -1475,6 +1482,8 @@ def split_sql_statements(sql_text: str) -> List[str]:
     in_single = False
     in_double = False
     in_block_comment = False
+    in_q_quote = False
+    q_quote_end = ""
     slash_block = False
 
     def flush_buffer() -> None:
@@ -1508,7 +1517,27 @@ def split_sql_statements(sql_text: str) -> List[str]:
                 idx += 1
                 continue
 
+            if in_q_quote:
+                buffer.append(ch)
+                if ch == q_quote_end and nxt == "'":
+                    buffer.append(nxt)
+                    idx += 2
+                    in_q_quote = False
+                    continue
+                idx += 1
+                continue
+
             if not in_single and not in_double:
+                if ch in ("q", "Q") and nxt == "'" and idx + 2 < len(line):
+                    delimiter = line[idx + 2]
+                    if not delimiter.isspace():
+                        q_quote_end = Q_QUOTE_DELIMS.get(delimiter, delimiter)
+                        in_q_quote = True
+                        buffer.append(ch)
+                        buffer.append(nxt)
+                        buffer.append(delimiter)
+                        idx += 3
+                        continue
                 if ch == "/" and nxt == "*":
                     buffer.append(ch)
                     buffer.append(nxt)
@@ -2230,6 +2259,21 @@ def query_invalid_objects(obclient_cmd: List[str], timeout: Optional[int]) -> Li
         return []
 
 
+def build_compile_statement(owner: str, obj_name: str, obj_type: str) -> Optional[str]:
+    if not owner or not obj_name or not obj_type:
+        return None
+    obj_type_u = obj_type.strip().upper()
+    owner_u = owner.strip()
+    name_u = obj_name.strip()
+    if obj_type_u == "PACKAGE BODY":
+        return f"ALTER PACKAGE {owner_u}.{name_u} COMPILE BODY;"
+    if obj_type_u == "TYPE BODY":
+        return f"ALTER TYPE {owner_u}.{name_u} COMPILE BODY;"
+    if obj_type_u in {"PACKAGE", "TYPE", "PROCEDURE", "FUNCTION", "VIEW", "TRIGGER"}:
+        return f"ALTER {obj_type_u} {owner_u}.{name_u} COMPILE;"
+    return None
+
+
 def recompile_invalid_objects(
     obclient_cmd: List[str],
     timeout: Optional[int],
@@ -2257,7 +2301,10 @@ def recompile_invalid_objects(
         
         recompiled_this_round = 0
         for owner, obj_name, obj_type in invalid_objects:
-            compile_sql = f"ALTER {obj_type} {owner}.{obj_name} COMPILE;"
+            compile_sql = build_compile_statement(owner, obj_name, obj_type)
+            if not compile_sql:
+                log.info("  SKIP %s.%s (%s): unsupported compile type", owner, obj_name, obj_type)
+                continue
             try:
                 result = run_sql(obclient_cmd, compile_sql, timeout)
                 if result.returncode == 0:

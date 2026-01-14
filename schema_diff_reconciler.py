@@ -78,7 +78,7 @@ REPO_ISSUES_URL = f"{REPO_URL}/issues"
 import os
 import threading
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import uuid
 import shutil
 import time
@@ -850,6 +850,54 @@ class CommentMismatch(NamedTuple):
 ExtraCheckResults = Dict[str, List]
 
 
+TableEntry = Tuple[str, str, str, str]  # (SRC_SCHEMA, SRC_TABLE, TGT_SCHEMA, TGT_TABLE)
+
+
+class ConstraintSignature(NamedTuple):
+    pk: Set[Tuple[str, ...]]
+    uk: Set[Tuple[str, ...]]
+    fk: Set[Tuple[Tuple[str, ...], Optional[str]]]
+
+
+class IndexCompareCache(NamedTuple):
+    src_map: Dict[Tuple[str, ...], Dict[str, Set[str]]]
+    tgt_map: Dict[Tuple[str, ...], Dict[str, Set[str]]]
+    src_sig: Dict[Tuple[str, ...], Set[str]]
+    tgt_sig: Dict[Tuple[str, ...], Set[str]]
+    constraint_index_cols: Set[Tuple[str, ...]]
+
+
+class ConstraintCompareCache(NamedTuple):
+    src_cons: Dict[str, Dict]
+    tgt_cons: Dict[str, Dict]
+    src_norm_cols: Dict[str, Tuple[str, ...]]
+    tgt_norm_cols: Dict[str, Tuple[str, ...]]
+    src_sig: ConstraintSignature
+    tgt_sig: ConstraintSignature
+    source_all_cols: Set[Tuple[str, ...]]
+    partition_key_set: Set[str]
+
+
+class TriggerCompareCache(NamedTuple):
+    src_info_map: Dict[str, Dict[str, str]]
+    tgt_info_map: Dict[str, Dict]
+    src_sig: Set[Tuple[str, str, str]]
+    tgt_sig: Set[Tuple[str, str, str]]
+
+
+class ExtraTableResult(NamedTuple):
+    tgt_name: str
+    index_ok: Optional[bool]
+    index_mismatch: Optional[IndexMismatch]
+    constraint_ok: Optional[bool]
+    constraint_mismatch: Optional[ConstraintMismatch]
+    trigger_ok: Optional[bool]
+    trigger_mismatch: Optional[TriggerMismatch]
+    index_time: float
+    constraint_time: float
+    trigger_time: float
+
+
 def normalize_column_sequence(columns: Optional[List[str]]) -> Tuple[str, ...]:
     if not columns:
         return tuple()
@@ -1198,6 +1246,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('dbcat_chunk_size', '150')
         settings.setdefault('fixup_workers', '')
         settings.setdefault('progress_log_interval', '10')
+        settings.setdefault('extra_check_workers', '')
+        settings.setdefault('extra_check_chunk_size', '200')
+        settings.setdefault('extra_check_progress_interval', '10')
         settings.setdefault('report_width', '160')  # 报告宽度，避免nohup时被截断为80
         # 运行日志目录与级别
         settings.setdefault('log_dir', 'logs')
@@ -1263,18 +1314,40 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             set(ALL_TRACKED_OBJECT_TYPES) | set(EXTRA_OBJECT_CHECK_TYPES),
             'fixup_types'
         )
+        cpu_default = max(1, os.cpu_count() or 1)
         try:
-            cpu_default = max(1, os.cpu_count() or 1)
             settings['fixup_workers'] = int(settings.get('fixup_workers') or min(12, cpu_default))
             if settings['fixup_workers'] <= 0:
                 settings['fixup_workers'] = min(12, cpu_default)
         except (TypeError, ValueError):
-            cpu_default = max(1, os.cpu_count() or 1)
             settings['fixup_workers'] = min(12, cpu_default)
+        try:
+            settings['extra_check_workers'] = int(
+                settings.get('extra_check_workers') or min(4, cpu_default)
+            )
+            if settings['extra_check_workers'] <= 0:
+                settings['extra_check_workers'] = min(4, cpu_default)
+        except (TypeError, ValueError):
+            settings['extra_check_workers'] = min(4, cpu_default)
+        settings['extra_check_workers'] = max(1, min(int(settings['extra_check_workers']), cpu_default))
         try:
             settings['dbcat_chunk_size'] = int(settings.get('dbcat_chunk_size', '150'))
         except ValueError:
             settings['dbcat_chunk_size'] = 150
+        try:
+            settings['extra_check_chunk_size'] = int(settings.get('extra_check_chunk_size', '200'))
+        except (TypeError, ValueError):
+            settings['extra_check_chunk_size'] = 200
+        if settings['extra_check_chunk_size'] < 1:
+            settings['extra_check_chunk_size'] = 200
+        try:
+            settings['extra_check_progress_interval'] = float(
+                settings.get('extra_check_progress_interval', '10')
+            )
+        except (TypeError, ValueError):
+            settings['extra_check_progress_interval'] = 10.0
+        if settings['extra_check_progress_interval'] < 1:
+            settings['extra_check_progress_interval'] = 1.0
         settings['dbcat_no_cal_dep'] = parse_bool_flag(settings.get('dbcat_no_cal_dep', 'false'), False)
         try:
             settings['dbcat_query_meta_thread'] = int(settings.get('dbcat_query_meta_thread') or 0)
@@ -1591,6 +1664,27 @@ def run_config_wizard(config_path: Path) -> None:
         "check_extra_types",
         "扩展对象过滤 (留空或 index,constraint,sequence,trigger)",
         default=cfg.get("SETTINGS", "check_extra_types", fallback="index,constraint,sequence,trigger"),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "extra_check_workers",
+        "扩展对象校验并发进程数 (建议 4 或 8)",
+        default=cfg.get("SETTINGS", "extra_check_workers", fallback="4"),
+        validator=_validate_positive_int,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "extra_check_chunk_size",
+        "扩展对象校验单批表数量 (默认 200)",
+        default=cfg.get("SETTINGS", "extra_check_chunk_size", fallback="200"),
+        validator=_validate_positive_int,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "extra_check_progress_interval",
+        "扩展对象校验进度日志间隔（秒）",
+        default=cfg.get("SETTINGS", "extra_check_progress_interval", fallback="10"),
+        validator=_validate_positive_int,
     )
     _prompt_field(
         "SETTINGS",
@@ -7221,45 +7315,249 @@ def compare_package_objects(
         "diff_rows": [row for row in rows if row.result != "OK"]
     }
 
-def compare_indexes_for_table(
+
+def build_index_map(entries: Dict[str, Dict]) -> Dict[Tuple[str, ...], Dict[str, Set[str]]]:
+    result: Dict[Tuple[str, ...], Dict[str, Set[str]]] = {}
+    for name, info in (entries or {}).items():
+        cols = normalize_column_sequence(info.get("columns"))
+        if not cols:
+            continue
+        uniq = (info.get("uniqueness") or "").upper()
+        bucket = result.setdefault(cols, {"names": set(), "uniq": set()})
+        name_u = (name or "").upper()
+        if name_u:
+            bucket["names"].add(name_u)
+        bucket["uniq"].add(uniq)
+    return result
+
+
+def build_index_signature(
+    index_map: Dict[Tuple[str, ...], Dict[str, Set[str]]]
+) -> Dict[Tuple[str, ...], Set[str]]:
+    return {
+        cols: set(info.get("uniq") or set())
+        for cols, info in (index_map or {}).items()
+    }
+
+
+def build_constraint_signature(
+    cons_dict: Dict[str, Dict],
+    norm_cols: Dict[str, Tuple[str, ...]],
+    full_object_mapping: FullObjectMapping,
+    *,
+    is_source: bool
+) -> ConstraintSignature:
+    pk: Set[Tuple[str, ...]] = set()
+    uk: Set[Tuple[str, ...]] = set()
+    fk: Set[Tuple[Tuple[str, ...], Optional[str]]] = set()
+    for name, cons in (cons_dict or {}).items():
+        ctype = (cons.get("type") or "").upper()
+        cols = norm_cols.get(name) or normalize_column_sequence(cons.get("columns"))
+        if ctype == "P":
+            pk.add(cols)
+        elif ctype == "U":
+            uk.add(cols)
+        elif ctype == "R":
+            ref_full: Optional[str] = None
+            ref_owner = cons.get("ref_table_owner")
+            ref_name = cons.get("ref_table_name")
+            if ref_owner and ref_name:
+                ref_full_raw = f"{str(ref_owner).upper()}.{str(ref_name).upper()}"
+                if is_source:
+                    mapped = get_mapped_target(full_object_mapping, ref_full_raw, 'TABLE')
+                    ref_full = (mapped or ref_full_raw).upper()
+                else:
+                    ref_full = ref_full_raw.upper()
+            fk.add((cols, ref_full))
+    return ConstraintSignature(pk=pk, uk=uk, fk=fk)
+
+
+def build_index_cache_for_table(
     oracle_meta: OracleMetadata,
     ob_meta: ObMetadata,
     src_schema: str,
     src_table: str,
     tgt_schema: str,
     tgt_table: str
-) -> Tuple[bool, Optional[IndexMismatch]]:
+) -> IndexCompareCache:
     src_key = (src_schema.upper(), src_table.upper())
-    src_idx = oracle_meta.indexes.get(src_key)
     tgt_key = (tgt_schema.upper(), tgt_table.upper())
-    tgt_idx = ob_meta.indexes.get(tgt_key, {})
-
-    # 源端元数据为 None 时，视为源端该表无索引（或元数据加载为空），继续比较并标记目标端 extra
+    src_idx = oracle_meta.indexes.get(src_key)
     if src_idx is None:
         src_idx = {}
-
+    tgt_idx = ob_meta.indexes.get(tgt_key, {})
+    src_map = build_index_map(src_idx)
+    tgt_map = build_index_map(tgt_idx)
+    src_sig = build_index_signature(src_map)
+    tgt_sig = build_index_signature(tgt_map)
     tgt_constraints = ob_meta.constraints.get(tgt_key, {})
     constraint_index_cols: Set[Tuple[str, ...]] = {
         normalize_column_sequence(cons.get("columns"))
         for cons in tgt_constraints.values()
         if (cons.get("type") or "").upper() in ("P", "U")
     }
+    return IndexCompareCache(
+        src_map=src_map,
+        tgt_map=tgt_map,
+        src_sig=src_sig,
+        tgt_sig=tgt_sig,
+        constraint_index_cols=constraint_index_cols
+    )
 
-    def build_index_map(entries: Dict[str, Dict]) -> Dict[Tuple[str, ...], Dict[str, Set[str]]]:
-        result: Dict[Tuple[str, ...], Dict[str, Set[str]]] = {}
-        for name, info in entries.items():
-            cols = normalize_column_sequence(info.get("columns"))
-            if not cols:
+
+def build_constraint_cache_for_table(
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata,
+    src_schema: str,
+    src_table: str,
+    tgt_schema: str,
+    tgt_table: str,
+    full_object_mapping: FullObjectMapping
+) -> ConstraintCompareCache:
+    src_key = (src_schema.upper(), src_table.upper())
+    tgt_key = (tgt_schema.upper(), tgt_table.upper())
+    src_cons = oracle_meta.constraints.get(src_key)
+    if src_cons is None:
+        src_cons = {}
+    tgt_cons = ob_meta.constraints.get(tgt_key, {})
+    src_norm_cols = {
+        name: normalize_column_sequence(cons.get("columns"))
+        for name, cons in src_cons.items()
+    }
+    tgt_norm_cols = {
+        name: normalize_column_sequence(cons.get("columns"))
+        for name, cons in tgt_cons.items()
+    }
+    src_sig = build_constraint_signature(
+        src_cons, src_norm_cols, full_object_mapping, is_source=True
+    )
+    tgt_sig = build_constraint_signature(
+        tgt_cons, tgt_norm_cols, full_object_mapping, is_source=False
+    )
+    source_all_cols: Set[Tuple[str, ...]] = set(src_norm_cols.values())
+    partition_key_set = get_partition_key_set(oracle_meta, src_schema, src_table)
+    return ConstraintCompareCache(
+        src_cons=src_cons,
+        tgt_cons=tgt_cons,
+        src_norm_cols=src_norm_cols,
+        tgt_norm_cols=tgt_norm_cols,
+        src_sig=src_sig,
+        tgt_sig=tgt_sig,
+        source_all_cols=source_all_cols,
+        partition_key_set=partition_key_set
+    )
+
+
+def build_trigger_cache_for_table(
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata,
+    src_schema: str,
+    src_table: str,
+    tgt_schema: str,
+    tgt_table: str,
+    full_object_mapping: FullObjectMapping
+) -> TriggerCompareCache:
+    src_key = (src_schema.upper(), src_table.upper())
+    tgt_key = (tgt_schema.upper(), tgt_table.upper())
+    src_trg = oracle_meta.triggers.get(src_key) or {}
+    tgt_trg = ob_meta.triggers.get(tgt_key, {}) or {}
+    src_info_map: Dict[str, Dict[str, str]] = {}
+    tgt_info_map: Dict[str, Dict] = {}
+    src_sig: Set[Tuple[str, str, str]] = set()
+    tgt_sig: Set[Tuple[str, str, str]] = set()
+
+    for name, info in src_trg.items():
+        trg_owner = (info.get("owner") or src_schema).upper()
+        name_u = (name or "").upper()
+        if not name_u:
+            continue
+        src_full = f"{trg_owner}.{name_u}"
+        mapped = get_mapped_target(full_object_mapping, src_full, 'TRIGGER')
+        if mapped and '.' in mapped:
+            tgt_owner, tgt_name = mapped.split('.', 1)
+            tgt_owner_u = tgt_owner.upper()
+            tgt_name_u = tgt_name.upper()
+        else:
+            tgt_owner_u = trg_owner or src_schema.upper()
+            tgt_name_u = name_u
+            ensure_mapping_entry(
+                full_object_mapping,
+                src_full,
+                'TRIGGER',
+                f"{tgt_owner_u}.{tgt_name_u}"
+            )
+        tgt_full = f"{tgt_owner_u}.{tgt_name_u}"
+        event = (info.get("event") or "").strip()
+        status = (info.get("status") or "").strip()
+        src_info_map[tgt_full] = {
+            "src_owner": trg_owner,
+            "src_name": name_u,
+            "tgt_owner": tgt_owner_u,
+            "tgt_name": tgt_name_u,
+            "event": event,
+            "status": status
+        }
+        src_sig.add((tgt_full, event, status))
+
+    for name, info in tgt_trg.items():
+        owner_u = (info.get("owner") or tgt_schema).upper()
+        name_u = (name or "").upper()
+        if not name_u:
+            continue
+        full = f"{owner_u}.{name_u}"
+        event = (info.get("event") or "").strip()
+        status = (info.get("status") or "").strip()
+        tgt_info_map[full] = info
+        tgt_sig.add((full, event, status))
+
+    return TriggerCompareCache(
+        src_info_map=src_info_map,
+        tgt_info_map=tgt_info_map,
+        src_sig=src_sig,
+        tgt_sig=tgt_sig
+    )
+
+
+def ensure_trigger_mappings_for_extra_checks(
+    master_list: MasterCheckList,
+    oracle_meta: OracleMetadata,
+    full_object_mapping: FullObjectMapping
+) -> None:
+    for src_name, _tgt_name, obj_type in master_list:
+        if (obj_type or "").upper() != "TABLE":
+            continue
+        try:
+            src_schema, src_table = src_name.split('.', 1)
+        except ValueError:
+            continue
+        src_key = (src_schema.upper(), src_table.upper())
+        src_trg = oracle_meta.triggers.get(src_key) or {}
+        for trg_name, info in src_trg.items():
+            name_u = (trg_name or "").upper()
+            if not name_u:
                 continue
-            uniq = (info.get("uniqueness") or "").upper()
-            bucket = result.setdefault(cols, {"names": set(), "uniq": set()})
-            bucket["names"].add(name)
-            bucket["uniq"].add(uniq)
-        return result
+            trg_owner = (info.get("owner") or src_schema).upper()
+            src_full = f"{trg_owner}.{name_u}"
+            mapped = get_mapped_target(full_object_mapping, src_full, 'TRIGGER')
+            if mapped and '.' in mapped:
+                continue
+            tgt_owner_u = trg_owner or src_schema.upper()
+            tgt_name_u = name_u
+            ensure_mapping_entry(
+                full_object_mapping,
+                src_full,
+                'TRIGGER',
+                f"{tgt_owner_u}.{tgt_name_u}"
+            )
 
-    src_map = build_index_map(src_idx)
-    tgt_map = build_index_map(tgt_idx)
 
+def compare_index_maps(
+    src_map: Dict[Tuple[str, ...], Dict[str, Set[str]]],
+    tgt_map: Dict[Tuple[str, ...], Dict[str, Set[str]]],
+    constraint_index_cols: Set[Tuple[str, ...]],
+    tgt_schema: str,
+    tgt_table: str
+) -> Tuple[bool, Optional[IndexMismatch]]:
     def rep_name(entry_map: Dict[Tuple[str, ...], Dict[str, Set[str]]], cols: Tuple[str, ...]) -> str:
         names = entry_map.get(cols, {}).get("names") or []
         return next(iter(names), f"{cols}")
@@ -7267,40 +7565,27 @@ def compare_indexes_for_table(
     missing_cols = set(src_map.keys()) - set(tgt_map.keys())
     extra_cols = set(tgt_map.keys()) - set(src_map.keys())
 
-    # 处理同名索引但SYS_NC列名不同的情况
     def normalize_sys_nc_columns(cols: Tuple[str, ...]) -> Tuple[str, ...]:
-        """
-        将SYS_NC开头的列名标准化为通用形式。
-        Oracle可能生成多种格式：SYS_NC00001$, SYS_NC_OID$, SYS_NC_ROWINFO$ 等
-        """
         normalized = []
         for col in cols:
-            # 匹配多种SYS_NC格式：
-            # - SYS_NC<digits>$ (如 SYS_NC00001$)
-            # - SYS_NC_<WORD>$ (如 SYS_NC_OID$, SYS_NC_ROWINFO$)
             if re.match(r'^SYS_NC\d+\$', col) or re.match(r'^SYS_NC_[A-Z_]+\$', col):
-                normalized.append('SYS_NC$')  # 标准化为通用形式
+                normalized.append('SYS_NC$')
             else:
                 normalized.append(col)
         return tuple(normalized)
 
     def has_same_named_index(src_cols: Tuple[str, ...], tgt_cols: Tuple[str, ...]) -> bool:
-        """检查是否存在同名索引"""
         src_names = src_map.get(src_cols, {}).get("names", set())
         tgt_names = tgt_map.get(tgt_cols, {}).get("names", set())
-        return bool(src_names & tgt_names)  # 有交集说明存在同名索引
+        return bool(src_names & tgt_names)
 
     def is_sys_nc_only_diff(src_cols: Tuple[str, ...], tgt_cols: Tuple[str, ...]) -> bool:
-        """检查是否仅SYS_NC列名不同"""
         return normalize_sys_nc_columns(src_cols) == normalize_sys_nc_columns(tgt_cols)
 
-    # 找出因SYS_NC列名不同而被误判的同名索引
-    sys_nc_matched_pairs = []
     for src_cols in list(missing_cols):
         for tgt_cols in list(extra_cols):
-            if (has_same_named_index(src_cols, tgt_cols) and 
+            if (has_same_named_index(src_cols, tgt_cols) and
                 is_sys_nc_only_diff(src_cols, tgt_cols)):
-                sys_nc_matched_pairs.append((src_cols, tgt_cols))
                 missing_cols.discard(src_cols)
                 extra_cols.discard(tgt_cols)
                 break
@@ -7311,23 +7596,17 @@ def compare_indexes_for_table(
         src_uniq = src_map[cols]["uniq"]
         tgt_uniq = tgt_map[cols]["uniq"]
         if src_uniq != tgt_uniq:
-            # 检查是否是源端NONUNIQUE变成目标端UNIQUE的情况
             src_has_nonunique = "NONUNIQUE" in src_uniq
             tgt_has_unique = "UNIQUE" in tgt_uniq
-            
-            # 如果源端是NONUNIQUE，目标端是UNIQUE，且该列集有约束支撑，则认为是正常的
             if src_has_nonunique and tgt_has_unique and cols in constraint_index_cols:
                 log.debug("索引列 %s: 源端NONUNIQUE变目标端UNIQUE，有约束支撑，视为正常迁移", list(cols))
                 continue
-            
-            # 其他唯一性不一致情况仍然报告
             detail_mismatch.append(
                 f"索引列 {list(cols)} 唯一性不一致 (源 {sorted(src_uniq)}, 目标 {sorted(tgt_uniq)})。"
             )
 
     filtered_missing_cols: Set[Tuple[str, ...]] = set()
     for cols in missing_cols:
-        # 如果已有 PK/UK 约束覆盖了同一列集，则视为已有唯一性支持，不再要求单独索引
         if cols in constraint_index_cols:
             continue
         filtered_missing_cols.add(cols)
@@ -7348,13 +7627,50 @@ def compare_indexes_for_table(
     all_good = (not missing) and (not extra) and not detail_mismatch
     if all_good:
         return True, None
-    else:
-        return False, IndexMismatch(
-            table=f"{tgt_schema}.{tgt_table}",
-            missing_indexes=missing,
-            extra_indexes=extra,
-            detail_mismatch=detail_mismatch
+    return False, IndexMismatch(
+        table=f"{tgt_schema}.{tgt_table}",
+        missing_indexes=missing,
+        extra_indexes=extra,
+        detail_mismatch=detail_mismatch
+    )
+
+def compare_indexes_for_table(
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata,
+    src_schema: str,
+    src_table: str,
+    tgt_schema: str,
+    tgt_table: str,
+    cache: Optional[IndexCompareCache] = None
+) -> Tuple[bool, Optional[IndexMismatch]]:
+    if cache:
+        if cache.src_sig == cache.tgt_sig:
+            return True, None
+        return compare_index_maps(
+            cache.src_map,
+            cache.tgt_map,
+            cache.constraint_index_cols,
+            tgt_schema,
+            tgt_table
         )
+
+    src_key = (src_schema.upper(), src_table.upper())
+    tgt_key = (tgt_schema.upper(), tgt_table.upper())
+    src_idx = oracle_meta.indexes.get(src_key)
+    if src_idx is None:
+        src_idx = {}
+    tgt_idx = ob_meta.indexes.get(tgt_key, {})
+    tgt_constraints = ob_meta.constraints.get(tgt_key, {})
+    constraint_index_cols: Set[Tuple[str, ...]] = {
+        normalize_column_sequence(cons.get("columns"))
+        for cons in tgt_constraints.values()
+        if (cons.get("type") or "").upper() in ("P", "U")
+    }
+    src_map = build_index_map(src_idx)
+    tgt_map = build_index_map(tgt_idx)
+    if build_index_signature(src_map) == build_index_signature(tgt_map):
+        return True, None
+    return compare_index_maps(src_map, tgt_map, constraint_index_cols, tgt_schema, tgt_table)
 
 
 def get_partition_key_set(
@@ -7373,26 +7689,45 @@ def compare_constraints_for_table(
     src_table: str,
     tgt_schema: str,
     tgt_table: str,
-    full_object_mapping: FullObjectMapping
+    full_object_mapping: FullObjectMapping,
+    cache: Optional[ConstraintCompareCache] = None
 ) -> Tuple[bool, Optional[ConstraintMismatch]]:
-    src_key = (src_schema.upper(), src_table.upper())
-    src_cons = oracle_meta.constraints.get(src_key)
-    tgt_key = (tgt_schema.upper(), tgt_table.upper())
-    tgt_cons = ob_meta.constraints.get(tgt_key, {})
-
-    # 源端元数据为 None 时，视为源端该表无约束（或元数据加载为空），继续比较并标记目标端 extra
-    if src_cons is None:
-        src_cons = {}
+    if cache:
+        src_cons = cache.src_cons
+        tgt_cons = cache.tgt_cons
+        src_norm_cols = cache.src_norm_cols
+        tgt_norm_cols = cache.tgt_norm_cols
+        source_all_cols = cache.source_all_cols
+        partition_key_set = cache.partition_key_set
+        if cache.src_sig == cache.tgt_sig:
+            return True, None
+    else:
+        src_key = (src_schema.upper(), src_table.upper())
+        tgt_key = (tgt_schema.upper(), tgt_table.upper())
+        src_cons = oracle_meta.constraints.get(src_key)
+        tgt_cons = ob_meta.constraints.get(tgt_key, {})
+        if src_cons is None:
+            src_cons = {}
+        src_norm_cols = {
+            name: normalize_column_sequence(cons.get("columns"))
+            for name, cons in src_cons.items()
+        }
+        tgt_norm_cols = {
+            name: normalize_column_sequence(cons.get("columns"))
+            for name, cons in tgt_cons.items()
+        }
+        source_all_cols = set(src_norm_cols.values())
+        partition_key_set = get_partition_key_set(oracle_meta, src_schema, src_table)
 
     detail_mismatch: List[str] = []
     missing: Set[str] = set()
     extra: Set[str] = set()
     downgraded_missing: Set[str] = set()
 
-    source_all_cols: Set[Tuple[str, ...]] = {
-        normalize_column_sequence(cons.get("columns"))
-        for cons in src_cons.values()
-    }
+    def _norm_cols(name: str, cons: Dict, *, is_source: bool) -> Tuple[str, ...]:
+        if is_source:
+            return src_norm_cols.get(name) or normalize_column_sequence(cons.get("columns"))
+        return tgt_norm_cols.get(name) or normalize_column_sequence(cons.get("columns"))
 
     def bucket_pk_uk(cons_dict: Dict[str, Dict]) -> Dict[str, List[Tuple[Tuple[str, ...], str]]]:
         buckets: Dict[str, List[Tuple[Tuple[str, ...], str]]] = {'P': [], 'U': []}
@@ -7400,7 +7735,7 @@ def compare_constraints_for_table(
             ctype = (cons.get("type") or "").upper()
             if ctype not in buckets:
                 continue
-            cols = normalize_column_sequence(cons.get("columns"))
+            cols = _norm_cols(name, cons, is_source=(cons_dict is src_cons))
             buckets[ctype].append((cols, name))
         return buckets
 
@@ -7414,7 +7749,7 @@ def compare_constraints_for_table(
             ctype = (cons.get("type") or "").upper()
             if ctype != 'R':
                 continue
-            cols = normalize_column_sequence(cons.get("columns"))
+            cols = _norm_cols(name, cons, is_source=(cons_dict is src_cons))
             ref_full: Optional[str] = None
             ref_owner = cons.get("ref_table_owner")
             ref_name = cons.get("ref_table_name")
@@ -7440,7 +7775,6 @@ def compare_constraints_for_table(
     tgt_pk_list = grouped_tgt_pkuk.get('P', [])
     tgt_uk_list = grouped_tgt_pkuk.get('U', [])
 
-    partition_key_set = get_partition_key_set(oracle_meta, src_schema, src_table)
     src_pk_inclusive: List[Tuple[Tuple[str, ...], str]] = []
     src_pk_downgrade: List[Tuple[Tuple[str, ...], str]] = []
     for cols, name in src_pk_list:
@@ -7681,19 +8015,72 @@ def compare_triggers_for_table(
     src_table: str,
     tgt_schema: str,
     tgt_table: str,
-    full_object_mapping: FullObjectMapping
+    full_object_mapping: FullObjectMapping,
+    cache: Optional[TriggerCompareCache] = None
 ) -> Tuple[bool, Optional[TriggerMismatch]]:
+    if cache:
+        if cache.src_sig == cache.tgt_sig:
+            return True, None
+        src_info_map = cache.src_info_map
+        tgt_info_map = cache.tgt_info_map
+        if not src_info_map:
+            if not tgt_info_map:
+                return True, None
+            extra_triggers = set(tgt_info_map.keys())
+            return False, TriggerMismatch(
+                table=f"{tgt_schema}.{tgt_table}",
+                missing_triggers=set(),
+                extra_triggers=extra_triggers,
+                detail_mismatch=[f"源端无触发器，目标端存在额外触发器: {', '.join(sorted(extra_triggers))}"],
+                missing_mappings=[]
+            )
+        missing = set(src_info_map.keys()) - set(tgt_info_map.keys())
+        extra = set(tgt_info_map.keys()) - set(src_info_map.keys())
+        detail_mismatch: List[str] = []
+        missing_mappings: List[Tuple[str, str]] = []
+        for tgt_full in sorted(missing):
+            src_info = src_info_map.get(tgt_full, {})
+            missing_mappings.append(
+                (
+                    f"{src_info.get('src_owner', src_schema.upper())}.{src_info.get('src_name', tgt_full.split('.', 1)[-1])}",
+                    f"{src_info.get('tgt_owner', tgt_schema.upper())}.{src_info.get('tgt_name', tgt_full.split('.', 1)[-1])}"
+                )
+            )
+        common = set(src_info_map.keys()) & set(tgt_info_map.keys())
+        for tgt_full in common:
+            src_info = src_info_map.get(tgt_full, {})
+            tgt_info = tgt_info_map.get(tgt_full, {})
+            s_event = (src_info.get("event") or "").strip()
+            s_status = (src_info.get("status") or "").strip()
+            t_event = (tgt_info.get("event") or "").strip()
+            t_status = (tgt_info.get("status") or "").strip()
+            if s_event != t_event:
+                detail_mismatch.append(
+                    f"{tgt_full}: 触发事件不一致 (src={s_event}, tgt={t_event})"
+                )
+            if s_status != t_status:
+                detail_mismatch.append(
+                    f"{tgt_full}: 状态不一致 (src={s_status}, tgt={t_status})"
+                )
+        all_good = (not missing) and (not extra) and not detail_mismatch
+        if all_good:
+            return True, None
+        return False, TriggerMismatch(
+            table=f"{tgt_schema}.{tgt_table}",
+            missing_triggers=missing,
+            extra_triggers=extra,
+            detail_mismatch=detail_mismatch,
+            missing_mappings=missing_mappings
+        )
+
     src_key = (src_schema.upper(), src_table.upper())
     src_trg = oracle_meta.triggers.get(src_key) or {}
     tgt_key = (tgt_schema.upper(), tgt_table.upper())
     tgt_trg = ob_meta.triggers.get(tgt_key, {})
 
-    # 源端没有触发器（空字典或空集合）
     if not src_trg:
-        # 如果目标端也没有触发器，则视为一致
         if not tgt_trg:
             return True, None
-        # 源端确实没有触发器但目标端有，记录目标端额外的触发器
         extra_triggers: Set[str] = set()
         for name, info in tgt_trg.items():
             owner_u = (info.get("owner") or tgt_schema).upper()
@@ -7789,6 +8176,130 @@ def compare_triggers_for_table(
         )
 
 
+_EXTRA_CHECK_CONTEXT: Dict[str, object] = {}
+
+
+def _init_extra_check_worker(
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata,
+    full_object_mapping: FullObjectMapping,
+    enabled_types: Set[str]
+) -> None:
+    global _EXTRA_CHECK_CONTEXT
+    _EXTRA_CHECK_CONTEXT = {
+        "oracle_meta": oracle_meta,
+        "ob_meta": ob_meta,
+        "full_object_mapping": full_object_mapping,
+        "enabled_types": enabled_types
+    }
+
+
+def _extra_check_worker(table_entry: TableEntry) -> ExtraTableResult:
+    ctx = _EXTRA_CHECK_CONTEXT
+    return run_extra_check_for_table(
+        table_entry,
+        ctx["oracle_meta"],
+        ctx["ob_meta"],
+        ctx["full_object_mapping"],
+        ctx["enabled_types"]
+    )
+
+
+def run_extra_check_for_table(
+    table_entry: TableEntry,
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata,
+    full_object_mapping: FullObjectMapping,
+    enabled_types: Set[str]
+) -> ExtraTableResult:
+    src_schema, src_table, tgt_schema, tgt_table = table_entry
+    tgt_name = f"{tgt_schema}.{tgt_table}"
+    index_ok: Optional[bool] = None
+    constraint_ok: Optional[bool] = None
+    trigger_ok: Optional[bool] = None
+    index_mismatch: Optional[IndexMismatch] = None
+    constraint_mismatch: Optional[ConstraintMismatch] = None
+    trigger_mismatch: Optional[TriggerMismatch] = None
+    index_time = 0.0
+    constraint_time = 0.0
+    trigger_time = 0.0
+
+    if 'INDEX' in enabled_types:
+        idx_cache = build_index_cache_for_table(
+            oracle_meta, ob_meta, src_schema, src_table, tgt_schema, tgt_table
+        )
+        start = time.monotonic()
+        index_ok, index_mismatch = compare_indexes_for_table(
+            oracle_meta,
+            ob_meta,
+            src_schema,
+            src_table,
+            tgt_schema,
+            tgt_table,
+            cache=idx_cache
+        )
+        index_time = time.monotonic() - start
+
+    if 'CONSTRAINT' in enabled_types:
+        cons_cache = build_constraint_cache_for_table(
+            oracle_meta,
+            ob_meta,
+            src_schema,
+            src_table,
+            tgt_schema,
+            tgt_table,
+            full_object_mapping
+        )
+        start = time.monotonic()
+        constraint_ok, constraint_mismatch = compare_constraints_for_table(
+            oracle_meta,
+            ob_meta,
+            src_schema,
+            src_table,
+            tgt_schema,
+            tgt_table,
+            full_object_mapping,
+            cache=cons_cache
+        )
+        constraint_time = time.monotonic() - start
+
+    if 'TRIGGER' in enabled_types:
+        trg_cache = build_trigger_cache_for_table(
+            oracle_meta,
+            ob_meta,
+            src_schema,
+            src_table,
+            tgt_schema,
+            tgt_table,
+            full_object_mapping
+        )
+        start = time.monotonic()
+        trigger_ok, trigger_mismatch = compare_triggers_for_table(
+            oracle_meta,
+            ob_meta,
+            src_schema,
+            src_table,
+            tgt_schema,
+            tgt_table,
+            full_object_mapping,
+            cache=trg_cache
+        )
+        trigger_time = time.monotonic() - start
+
+    return ExtraTableResult(
+        tgt_name=tgt_name,
+        index_ok=index_ok,
+        index_mismatch=index_mismatch,
+        constraint_ok=constraint_ok,
+        constraint_mismatch=constraint_mismatch,
+        trigger_ok=trigger_ok,
+        trigger_mismatch=trigger_mismatch,
+        index_time=index_time,
+        constraint_time=constraint_time,
+        trigger_time=trigger_time
+    )
+
+
 def check_extra_objects(
     settings: Dict,
     master_list: MasterCheckList,
@@ -7817,6 +8328,7 @@ def check_extra_objects(
     }
 
     enabled_types = {t.upper() for t in (enabled_extra_types or set(EXTRA_OBJECT_CHECK_TYPES))}
+    table_check_types = enabled_types & {"INDEX", "CONSTRAINT", "TRIGGER"}
 
     if not master_list:
         return extra_results
@@ -7828,61 +8340,125 @@ def check_extra_objects(
     log_subsection("扩展对象校验 (索引/约束/序列/触发器)")
 
     # 1) 针对每个 TABLE 做索引/约束/触发器校验
-    total_tables = sum(1 for _, _, t in master_list if t.upper() == 'TABLE')
-    done_tables = 0
+    if 'TRIGGER' in table_check_types:
+        ensure_trigger_mappings_for_extra_checks(master_list, oracle_meta, full_object_mapping)
 
-    for src_name, tgt_name, obj_type in master_list:
-        if obj_type.upper() != 'TABLE':
-            continue
+    table_entries: List[TableEntry] = []
+    if table_check_types:
+        for src_name, tgt_name, obj_type in master_list:
+            if (obj_type or "").upper() != 'TABLE':
+                continue
+            try:
+                src_schema, src_table = src_name.split('.', 1)
+                tgt_schema, tgt_table = tgt_name.split('.', 1)
+            except ValueError:
+                continue
+            table_entries.append((
+                src_schema.upper(),
+                src_table.upper(),
+                tgt_schema.upper(),
+                tgt_table.upper()
+            ))
 
-        done_tables += 1
-        if done_tables % 100 == 0:
-            pct = done_tables * 100.0 / total_tables if total_tables else 100.0
-            log.info("扩展校验进度 %d/%d (%.1f%%)...", done_tables, total_tables, pct)
+    table_entries.sort(key=lambda item: (item[2], item[3]))
+    total_tables = len(table_entries)
+    idx_time_sum = 0.0
+    cons_time_sum = 0.0
+    trg_time_sum = 0.0
 
+    if total_tables:
+        worker_count = max(1, int(settings.get('extra_check_workers', 1) or 1))
+        worker_count = min(worker_count, max(1, total_tables))
+        chunk_size = max(1, int(settings.get('extra_check_chunk_size', 200) or 200))
         try:
-            src_schema, src_table = src_name.split('.')
-            tgt_schema, tgt_table = tgt_name.split('.')
-        except ValueError:
-            continue
+            progress_interval = float(settings.get('extra_check_progress_interval', 10))
+        except (TypeError, ValueError):
+            progress_interval = 10.0
+        progress_interval = max(1.0, progress_interval)
 
-        # 索引
-        if 'INDEX' in enabled_types:
-            ok_idx, idx_mis = compare_indexes_for_table(
-                oracle_meta, ob_meta,
-                src_schema, src_table,
-                tgt_schema, tgt_table
+        if worker_count <= 1:
+            log.info("[EXTRA] 并发未启用 (worker=1)，可通过 extra_check_workers=4 提升速度。")
+        else:
+            log.info(
+                "[EXTRA] 启用并发校验 (worker=%d, chunk=%d)。",
+                worker_count,
+                chunk_size
             )
-            if ok_idx:
-                extra_results["index_ok"].append(tgt_name)
-            elif idx_mis:
-                extra_results["index_mismatched"].append(idx_mis)
+        log.info(
+            "[EXTRA] 进度日志间隔 %.0f 秒，可通过 extra_check_progress_interval 配置。",
+            progress_interval
+        )
 
-        # 约束
-        if 'CONSTRAINT' in enabled_types:
-            ok_cons, cons_mis = compare_constraints_for_table(
-                oracle_meta, ob_meta,
-                src_schema, src_table,
-                tgt_schema, tgt_table,
-                full_object_mapping
-            )
-            if ok_cons:
-                extra_results["constraint_ok"].append(tgt_name)
-            elif cons_mis:
-                extra_results["constraint_mismatched"].append(cons_mis)
+        start_ts = time.monotonic()
+        last_log = start_ts
+        done_tables = 0
 
-        # 触发器
-        if 'TRIGGER' in enabled_types:
-            ok_trg, trg_mis = compare_triggers_for_table(
-                oracle_meta, ob_meta,
-                src_schema, src_table,
-                tgt_schema, tgt_table,
-                full_object_mapping
-            )
-            if ok_trg:
-                extra_results["trigger_ok"].append(tgt_name)
-            elif trg_mis:
-                extra_results["trigger_mismatched"].append(trg_mis)
+        def _accumulate_result(result: ExtraTableResult) -> None:
+            nonlocal idx_time_sum, cons_time_sum, trg_time_sum
+            if result.index_ok is True:
+                extra_results["index_ok"].append(result.tgt_name)
+            elif result.index_ok is False and result.index_mismatch:
+                extra_results["index_mismatched"].append(result.index_mismatch)
+            if result.constraint_ok is True:
+                extra_results["constraint_ok"].append(result.tgt_name)
+            elif result.constraint_ok is False and result.constraint_mismatch:
+                extra_results["constraint_mismatched"].append(result.constraint_mismatch)
+            if result.trigger_ok is True:
+                extra_results["trigger_ok"].append(result.tgt_name)
+            elif result.trigger_ok is False and result.trigger_mismatch:
+                extra_results["trigger_mismatched"].append(result.trigger_mismatch)
+            idx_time_sum += result.index_time
+            cons_time_sum += result.constraint_time
+            trg_time_sum += result.trigger_time
+
+        if worker_count > 1:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                initializer=_init_extra_check_worker,
+                initargs=(oracle_meta, ob_meta, full_object_mapping, table_check_types)
+            ) as executor:
+                for result in executor.map(
+                    _extra_check_worker,
+                    table_entries,
+                    chunksize=chunk_size
+                ):
+                    done_tables += 1
+                    _accumulate_result(result)
+                    now = time.monotonic()
+                    if done_tables == total_tables or (now - last_log) >= progress_interval:
+                        pct = done_tables * 100.0 / total_tables if total_tables else 100.0
+                        rate = done_tables / max(1e-6, now - start_ts)
+                        log.info(
+                            "扩展校验进度 %d/%d (%.1f%%, %.1f 表/秒)...",
+                            done_tables, total_tables, pct, rate
+                        )
+                        last_log = now
+        else:
+            for entry in table_entries:
+                result = run_extra_check_for_table(
+                    entry, oracle_meta, ob_meta, full_object_mapping, table_check_types
+                )
+                done_tables += 1
+                _accumulate_result(result)
+                now = time.monotonic()
+                if done_tables == total_tables or (now - last_log) >= progress_interval:
+                    pct = done_tables * 100.0 / total_tables if total_tables else 100.0
+                    rate = done_tables / max(1e-6, now - start_ts)
+                    log.info(
+                        "扩展校验进度 %d/%d (%.1f%%, %.1f 表/秒)...",
+                        done_tables, total_tables, pct, rate
+                    )
+                    last_log = now
+
+        wall_elapsed = time.monotonic() - start_ts
+        log.info(
+            "[EXTRA] 扩展对象校验完成: TABLE=%d, wall=%.1fs, INDEX=%.1fs, CONSTRAINT=%.1fs, TRIGGER=%.1fs (sum)",
+            total_tables,
+            wall_elapsed,
+            idx_time_sum,
+            cons_time_sum,
+            trg_time_sum
+        )
 
     # 2) 序列校验（考虑 remap 后的目标 schema）
     sequence_groups: Dict[Tuple[str, str], List[Tuple[str, str]]] = defaultdict(list)
@@ -9680,6 +10256,51 @@ def oracle_get_ddl(ora_conn, obj_type: str, owner: str, name: str) -> Optional[s
         return None
 
 
+def oracle_get_view_text(
+    ora_conn,
+    owner: str,
+    name: str
+) -> Optional[Tuple[str, str, str]]:
+    sql = """
+        SELECT TEXT, READ_ONLY, CHECK_OPTION
+        FROM DBA_VIEWS
+        WHERE OWNER = :1 AND VIEW_NAME = :2
+    """
+    try:
+        with ora_conn.cursor() as cursor:
+            cursor.execute(sql, [owner.upper(), name.upper()])
+            row = cursor.fetchone()
+            if not row or row[0] is None:
+                return None
+            text = str(row[0])
+            read_only = (row[1] or "").strip().upper()
+            check_option = (row[2] or "").strip().upper()
+            return text, read_only, check_option
+    except (oracledb.Error, Exception) as exc:
+        log.warning("[DDL] 读取 DBA_VIEWS.%s.%s 失败: %s", owner, name, exc)
+        return None
+
+
+def build_view_ddl_from_text(
+    owner: str,
+    name: str,
+    text: str,
+    read_only: str,
+    check_option: str
+) -> Optional[str]:
+    if not text:
+        return None
+    ddl = f"CREATE OR REPLACE VIEW {owner.upper()}.{name.upper()} AS {text.strip()}"
+    upper_text = text.upper()
+    if check_option and check_option != "NONE" and "WITH CHECK OPTION" not in upper_text:
+        ddl = f"{ddl} WITH CHECK OPTION"
+    if read_only == "Y" and "WITH READ ONLY" not in upper_text:
+        ddl = f"{ddl} WITH READ ONLY"
+    if not ddl.rstrip().endswith(";"):
+        ddl = ddl.rstrip() + ";"
+    return ddl
+
+
 # 批量获取 DDL 的对象类型（仅支持这些类型）
 BATCH_DDL_ALLOWED_TYPES = {
     'TABLE', 'VIEW', 'MATERIALIZED VIEW',
@@ -10111,6 +10732,22 @@ def clean_plsql_ending(ddl: str) -> str:
             i += 1
     
     return '\n'.join(cleaned_lines)
+
+
+END_SCHEMA_PREFIX_PATTERN = re.compile(
+    r'(^\s*END\s+)(?:(?:"[^"]+"|[A-Z0-9_$#]+)\s*\.\s*)(?P<obj>"[^"]+"|[A-Z0-9_$#]+)(\s*;\s*(?:--.*)?$)',
+    re.IGNORECASE | re.MULTILINE
+)
+
+
+def clean_end_schema_prefix(ddl: str) -> str:
+    """
+    清理 PL/SQL 结尾 END 子句中的 schema 前缀。
+    Oracle 允许 END schema.obj; 但 OceanBase 仅支持 END obj; 或 END;。
+    """
+    if not ddl:
+        return ddl
+    return END_SCHEMA_PREFIX_PATTERN.sub(r"\1\g<obj>\3", ddl)
 
 
 def clean_extra_semicolons(ddl: str) -> str:
@@ -10707,6 +11344,7 @@ DDL_CLEANUP_RULES = {
     'PLSQL_OBJECTS': {
         'types': ['PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'TYPE', 'TYPE BODY', 'TRIGGER'],
         'rules': [
+            clean_end_schema_prefix,
             clean_plsql_ending,
             clean_semicolon_before_slash,
             clean_pragma_statements,
@@ -11666,7 +12304,7 @@ def generate_fixup_scripts(
         """
         返回 (DDL, 来源标签, 耗时秒)，来源标签为:
           - DBCAT_CACHE / DBCAT_RUN / DBCAT_UNKNOWN
-          - DBMS_METADATA
+          - DBMS_METADATA / DBA_VIEWS
           - MISSING
         """
         key = (schema.upper(), obj_type.upper(), obj_name.upper())
@@ -11697,8 +12335,9 @@ def generate_fixup_scripts(
 
         # VIEW 固定使用 DBMS_METADATA，忽略 dbcat 输出
         if obj_type.upper() == 'VIEW':
-            ddl = get_fallback_ddl(schema, obj_type, obj_name)
-            source_label = "DBMS_METADATA" if ddl else "MISSING"
+            ddl, source_label = get_fallback_ddl(schema, obj_type, obj_name)
+            if not ddl:
+                source_label = "MISSING"
             elapsed = time.time() - start_time
             log.info(
                 "[DDL_FETCH] %s.%s (%s) 来源=%s 耗时=%.3fs",
@@ -11729,9 +12368,9 @@ def generate_fixup_scripts(
                 source_label = "DBCAT"
                 elapsed_hint = time.time() - start_time
         else:
-            ddl = get_fallback_ddl(schema, obj_type, obj_name)
+            ddl, fallback_source = get_fallback_ddl(schema, obj_type, obj_name)
             if ddl:
-                source_label = "DBMS_METADATA"
+                source_label = fallback_source
             else:
                 source_label = "MISSING"
 
@@ -12355,18 +12994,18 @@ def generate_fixup_scripts(
         msg = str(exc).upper()
         return any(code in msg for code in ("ORA-31603", "ORA-04043", "ORA-00942", "ORA-06512"))
 
-    def get_fallback_ddl(schema: str, obj_type: str, obj_name: str) -> Optional[str]:
+    def get_fallback_ddl(schema: str, obj_type: str, obj_name: str) -> Tuple[Optional[str], str]:
         """当 dbcat 缺失 DDL 时尝试使用 DBMS_METADATA 兜底，优先使用预取缓存。"""
         nonlocal oracle_conn
         allowed_types = BATCH_DDL_ALLOWED_TYPES
         if obj_type.upper() not in allowed_types:
-            return None
-        
-        # 优先使用预取缓存
+            return None, "MISSING"
+
+        # 优先使用预取缓存 (DBMS_METADATA)
         cache_key = (schema.upper(), obj_type.upper(), obj_name.upper())
         if cache_key in fallback_ddl_cache:
-            return fallback_ddl_cache[cache_key]
-        
+            return fallback_ddl_cache[cache_key], "DBMS_METADATA"
+
         # 缓存未命中，单独获取（兜底）
         with oracle_conn_lock:
             try:
@@ -12377,13 +13016,23 @@ def generate_fixup_scripts(
                         dsn=ora_cfg['dsn']
                     )
                     setup_metadata_session(oracle_conn)
-                return oracle_get_ddl(oracle_conn, obj_type, schema, obj_name)
+                ddl = oracle_get_ddl(oracle_conn, obj_type, schema, obj_name)
+                if ddl:
+                    return ddl, "DBMS_METADATA"
+                if obj_type.upper() == "VIEW":
+                    view_text = oracle_get_view_text(oracle_conn, schema, obj_name)
+                    if view_text:
+                        ddl = build_view_ddl_from_text(schema, obj_name, *view_text)
+                        if ddl:
+                            log.info("[DDL] VIEW %s.%s 使用 DBA_VIEWS 兜底生成 DDL。", schema, obj_name)
+                            return ddl, "DBA_VIEWS"
+                return None, "MISSING"
             except Exception as exc:
                 if _is_not_found_error(exc):
                     log.info("[DDL] DBMS_METADATA 未找到 %s.%s (%s)，跳过兜底。", schema, obj_name, obj_type)
-                    return None
+                    return None, "MISSING"
                 log.warning("[DDL] DBMS_METADATA 获取 %s.%s (%s) 失败: %s", schema, obj_name, obj_type, exc)
-                return None
+                return None, "MISSING"
 
     def _is_dbcat_unsupported_table(ddl: str) -> bool:
         """判断 dbcat 抓取的 TABLE DDL 是否包含 unsupported 提示。"""
@@ -12456,7 +13105,7 @@ def generate_fixup_scripts(
                     return
                 if ddl_source_label.startswith("DBCAT"):
                     mark_source('SEQUENCE', 'dbcat')
-                elif ddl_source_label == "DBMS_METADATA":
+                elif ddl_source_label in ("DBMS_METADATA", "DBA_VIEWS"):
                     mark_source('SEQUENCE', 'fallback')
                 else:
                     mark_source('SEQUENCE', 'missing')
@@ -12524,17 +13173,17 @@ def generate_fixup_scripts(
                     return
                 # 如果 dbcat 返回 unsupported，尝试 DBMS_METADATA 兜底，直接暴露给用户
                 if _is_dbcat_unsupported_table(ddl):
-                    fallback_ddl = get_fallback_ddl(ss, 'TABLE', st)
+                    fallback_ddl, fallback_label = get_fallback_ddl(ss, 'TABLE', st)
                     if fallback_ddl:
                         ddl = fallback_ddl
-                        ddl_source_label = "DBMS_METADATA"
+                        ddl_source_label = fallback_label
                         mark_source('TABLE', 'fallback')
-                        log.info("[FIXUP] TABLE %s.%s 的 dbcat DDL 为 unsupported，已使用 DBMS_METADATA 兜底。", ss, st)
+                        log.info("[FIXUP] TABLE %s.%s 的 dbcat DDL 为 unsupported，已使用 %s 兜底。", ss, st, fallback_label)
                     else:
                         log.warning("[FIXUP] TABLE %s.%s 的 dbcat DDL 为 unsupported，DBMS_METADATA 兜底失败，仍输出原始 DDL 供人工处理。", ss, st)
                 if ddl_source_label.startswith("DBCAT"):
                     mark_source('TABLE', 'dbcat')
-                elif ddl_source_label == "DBMS_METADATA":
+                elif ddl_source_label in ("DBMS_METADATA", "DBA_VIEWS"):
                     mark_source('TABLE', 'fallback')
                 else:
                     mark_source('TABLE', 'missing')
@@ -12703,7 +13352,7 @@ def generate_fixup_scripts(
                     continue
                 if ddl_source_label.startswith("DBCAT"):
                     mark_source('VIEW', 'dbcat')
-                elif ddl_source_label == "DBMS_METADATA":
+                elif ddl_source_label in ("DBMS_METADATA", "DBA_VIEWS"):
                     mark_source('VIEW', 'fallback')
                 else:
                     mark_source('VIEW', 'missing')
@@ -12782,7 +13431,7 @@ def generate_fixup_scripts(
                     return
                 if ddl_source_label.startswith("DBCAT"):
                     mark_source(ot, 'dbcat')
-                elif ddl_source_label == "DBMS_METADATA":
+                elif ddl_source_label in ("DBMS_METADATA", "DBA_VIEWS"):
                     mark_source(ot, 'fallback')
                 else:
                     mark_source(ot, 'missing')
@@ -13102,7 +13751,7 @@ def generate_fixup_scripts(
                     return
                 if ddl_source_label.startswith("DBCAT"):
                     mark_source('TRIGGER', 'dbcat')
-                elif ddl_source_label == "DBMS_METADATA":
+                elif ddl_source_label in ("DBMS_METADATA", "DBA_VIEWS"):
                     mark_source('TRIGGER', 'fallback')
                 else:
                     mark_source('TRIGGER', 'missing')
@@ -15185,6 +15834,9 @@ def parse_cli_args() -> argparse.Namespace:
           可选开关：
             check_primary_types     限制主对象类型（默认全量）
             check_extra_types       限制扩展对象 (index,constraint,sequence,trigger)
+            extra_check_workers     扩展对象校验并发进程数（默认 4）
+            extra_check_chunk_size  扩展对象校验批量表数量（默认 200）
+            extra_check_progress_interval 扩展对象校验进度日志间隔（秒）
             fixup_schemas           仅对指定目标 schema 生成订正 SQL（逗号分隔，留空为全部）
             fixup_types             仅生成指定对象类型的订正 SQL（留空为全部，例如 TABLE,TRIGGER）
             trigger_list            仅生成指定触发器清单 (每行 SCHEMA.TRIGGER_NAME)
