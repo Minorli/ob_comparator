@@ -38,6 +38,10 @@ fixup_cli_timeout       = 3600
 # 报告与修复脚本输出目录（可为相对路径或绝对路径）
 fixup_dir               = fixup_scripts
 report_dir              = main_reports
+# 报告目录布局：
+#   flat    -> 输出到 report_dir 根目录（旧行为）
+#   per_run -> 每次运行输出到 report_dir/run_<timestamp>（默认）
+report_dir_layout       = per_run
 # 日志目录与级别（日志文件与控制台输出）
 # log_level 可选值：DEBUG/INFO/WARNING/ERROR/CRITICAL
 log_dir                 = logs
@@ -91,8 +95,15 @@ grant_include_oracle_maintained_roles = false
 # 示例：fixup_types=TABLE,TRIGGER
 fixup_schemas           = 
 fixup_types             = 
-# 可选：触发器清单过滤（每行 SCHEMA.TRIGGER_NAME），配置后仅生成列表内触发器脚本
+# 同义词修补范围：
+#   all         -> 生成 PUBLIC + 私有同义词（默认）
+#   public_only -> 仅生成 PUBLIC 同义词
+synonym_fixup_scope     = all
+# 可选：触发器清单过滤（每行 SCHEMA.TRIGGER_NAME）
+# 配置后仅生成列表内触发器脚本，并输出 report_dir/trigger_miss.txt 记录无效/不存在/非缺失项
 trigger_list            =
+# 触发器 DDL 是否强制补全 schema 前缀 (true/false)
+trigger_qualify_schema  = true
 
 # 可选：限制本次只检查的对象类型/模块，留空表示全量（大小写不敏感，逗号分隔）
 # check_primary_types 可选值：
@@ -119,6 +130,11 @@ check_comments          = true
 # 是否启用 schema 推导（一对多场景下用于非表对象）
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 infer_schema_mapping    = true
+# SEQUENCE 目标 schema 推导策略：
+#   infer          -> 依赖推导 + 主流表 schema 推导
+#   source_only    -> 始终保持源 schema（默认）
+#   dominant_table -> 仅按主流表 schema 推导
+sequence_remap_policy   = source_only
 # 是否清洗 PL/SQL DDL 中的全角标点（默认开启，避免目标端解析失败）
 ddl_punct_sanitize      = true
 # DDL hint 清洗策略:

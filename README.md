@@ -56,6 +56,10 @@ password = xxx
 [SETTINGS]
 source_schemas = SCOTT,HR
 remap_file = remap_rules.txt
+synonym_fixup_scope = all
+sequence_remap_policy = source_only
+trigger_qualify_schema = true
+report_dir_layout = per_run
 oracle_client_lib_dir = /opt/instantclient_19_28
 dbcat_bin = /opt/dbcat-2.5.0-SNAPSHOT
 dbcat_output_dir = dbcat_output
@@ -114,12 +118,13 @@ python3 run_fixup.py --view-chain-autofix
 > 注意：`init_users_roles.py` 当前使用固定初始密码，需在上线前统一改密或二次调整。
 
 ## 主要输出
-- `main_reports/report_*.txt`：完整对比报告（首选查看）
-- `main_reports/package_compare_*.txt`：PACKAGE/PKG BODY 明细
-- `main_reports/remap_conflicts_*.txt`：Remap 冲突清单
-- `main_reports/VIEWs_chain_*.txt`：VIEW 依赖链报告
-- `main_reports/blacklist_tables.txt`：黑名单表清单
-- `main_reports/filtered_grants.txt`：过滤授权清单
+- `main_reports/run_<ts>/report_<ts>.txt`：完整对比报告（默认 per_run）
+- `main_reports/run_<ts>/package_compare_<ts>.txt`：PACKAGE/PKG BODY 明细
+- `main_reports/run_<ts>/remap_conflicts_<ts>.txt`：Remap 冲突清单
+- `main_reports/run_<ts>/VIEWs_chain_<ts>.txt`：VIEW 依赖链报告
+- `main_reports/run_<ts>/blacklist_tables.txt`：黑名单表清单
+- `main_reports/run_<ts>/filtered_grants.txt`：过滤授权清单
+- `main_reports/run_<ts>/missed_tables_views_for_OMS/`：OMS 缺失 TABLE/VIEW 规则
 - `fixup_scripts/`：修补脚本输出（执行前需人工审核）
 - `fixup_scripts/grants_miss/`：缺失授权脚本
 - `fixup_scripts/view_chain_plans/`：VIEW 链路修复计划

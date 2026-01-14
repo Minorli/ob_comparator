@@ -744,6 +744,107 @@ def parse_csv_set(raw_value: Optional[str]) -> Set[str]:
     return {item.strip().upper() for item in str(raw_value).split(',') if item.strip()}
 
 
+def collect_fixup_config_diagnostics(
+    settings: Dict,
+    enabled_primary_types: Set[str],
+    enabled_extra_types: Set[str]
+) -> List[str]:
+    """
+    汇总 check_* 与 fixup_* 的配置冲突或无效组合提示。
+    仅做诊断提示，不影响执行。
+    """
+    diagnostics: List[str] = []
+    fixup_types: Set[str] = set(settings.get("fixup_type_set", set()) or set())
+    if not fixup_types:
+        return diagnostics
+
+    primary_types = set(PRIMARY_OBJECT_TYPES)
+    extra_types = set(EXTRA_OBJECT_CHECK_TYPES)
+    print_only_types = set(PRINT_ONLY_PRIMARY_TYPES) | set(PACKAGE_OBJECT_TYPES)
+
+    for obj_type in sorted(fixup_types):
+        if obj_type in print_only_types:
+            diagnostics.append(f"fixup_types 包含 {obj_type}，但该类型为仅打印对象，不会生成修补脚本。")
+            continue
+        if obj_type in primary_types and obj_type not in enabled_primary_types:
+            diagnostics.append(f"fixup_types 包含 {obj_type}，但 check_primary_types 未启用该类型。")
+        if obj_type in extra_types and obj_type not in enabled_extra_types:
+            diagnostics.append(f"fixup_types 包含 {obj_type}，但 check_extra_types 未启用该类型。")
+
+    if fixup_types & {"INDEX", "CONSTRAINT", "TRIGGER"} and "TABLE" not in enabled_primary_types:
+        diagnostics.append("fixup_types 包含 INDEX/CONSTRAINT/TRIGGER，但 check_primary_types 未启用 TABLE，相关修补将无法生成。")
+
+    trigger_list_path = settings.get("trigger_list", "").strip()
+    if trigger_list_path and "TRIGGER" not in enabled_extra_types:
+        diagnostics.append("trigger_list 已配置，但 check_extra_types 未启用 TRIGGER，仅进行清单格式校验。")
+
+    return diagnostics
+
+
+SYNONYM_FIXUP_SCOPE_VALUES = {"all", "public_only"}
+SYNONYM_FIXUP_SCOPE_ALIASES = {
+    "public": "public_only",
+    "public-only": "public_only",
+    "publiconly": "public_only",
+    "all-synonyms": "all",
+    "all_synonyms": "all",
+}
+
+
+def normalize_synonym_fixup_scope(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "all"
+    value = str(raw_value).strip().lower()
+    value = SYNONYM_FIXUP_SCOPE_ALIASES.get(value, value)
+    if value not in SYNONYM_FIXUP_SCOPE_VALUES:
+        log.warning("synonym_fixup_scope=%s 不在支持范围内，将回退为 all。", raw_value)
+        return "all"
+    return value
+
+
+SEQUENCE_REMAP_POLICY_VALUES = {"infer", "source_only", "dominant_table"}
+SEQUENCE_REMAP_POLICY_ALIASES = {
+    "source": "source_only",
+    "source-only": "source_only",
+    "sourceonly": "source_only",
+    "dominant": "dominant_table",
+    "dominant-table": "dominant_table",
+    "dominanttable": "dominant_table",
+    "table": "dominant_table",
+}
+
+
+def normalize_sequence_remap_policy(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "source_only"
+    value = str(raw_value).strip().lower()
+    value = SEQUENCE_REMAP_POLICY_ALIASES.get(value, value)
+    if value not in SEQUENCE_REMAP_POLICY_VALUES:
+        log.warning("sequence_remap_policy=%s 不在支持范围内，将回退为 source_only。", raw_value)
+        return "source_only"
+    return value
+
+
+REPORT_DIR_LAYOUT_VALUES = {"flat", "per_run"}
+REPORT_DIR_LAYOUT_ALIASES = {
+    "per-run": "per_run",
+    "perrun": "per_run",
+    "run": "per_run",
+    "single": "flat",
+}
+
+
+def normalize_report_dir_layout(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "per_run"
+    value = str(raw_value).strip().lower()
+    value = REPORT_DIR_LAYOUT_ALIASES.get(value, value)
+    if value not in REPORT_DIR_LAYOUT_VALUES:
+        log.warning("report_dir_layout=%s 不在支持范围内，将回退为 per_run。", raw_value)
+        return "per_run"
+    return value
+
+
 def normalize_hint_policy(raw_value: Optional[str]) -> str:
     if not raw_value or not str(raw_value).strip():
         return DDL_HINT_POLICY_DEFAULT
@@ -1209,6 +1310,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('obclient_timeout', '60')
         # 报告输出目录
         settings.setdefault('report_dir', 'main_reports')
+        settings.setdefault('report_dir_layout', 'per_run')
         # Oracle Instant Client 目录 (Thick Mode)
         settings.setdefault('oracle_client_lib_dir', '')
         # dbcat 相关配置
@@ -1223,7 +1325,10 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         # fixup 定向生成选项
         settings.setdefault('fixup_schemas', '')
         settings.setdefault('fixup_types', '')
+        settings.setdefault('synonym_fixup_scope', 'all')
         settings.setdefault('trigger_list', '')
+        settings.setdefault('trigger_qualify_schema', 'true')
+        settings.setdefault('sequence_remap_policy', 'source_only')
         settings.setdefault('generate_grants', 'true')
         settings.setdefault('grant_tab_privs_scope', 'owner')
         settings.setdefault('grant_merge_privileges', 'true')
@@ -1296,6 +1401,19 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings['ddl_hint_denylist_set'] = parse_csv_set(settings.get('ddl_hint_denylist', ''))
         settings['ddl_hint_allowlist_file_set'] = load_hint_allowlist_file(
             settings.get('ddl_hint_allowlist_file', '')
+        )
+        settings['synonym_fixup_scope'] = normalize_synonym_fixup_scope(
+            settings.get('synonym_fixup_scope', 'all')
+        )
+        settings['report_dir_layout'] = normalize_report_dir_layout(
+            settings.get('report_dir_layout', 'per_run')
+        )
+        settings['sequence_remap_policy'] = normalize_sequence_remap_policy(
+            settings.get('sequence_remap_policy', 'source_only')
+        )
+        settings['trigger_qualify_schema'] = parse_bool_flag(
+            settings.get('trigger_qualify_schema', 'true'),
+            True
         )
         settings['print_dependency_chains'] = parse_bool_flag(
             settings.get('print_dependency_chains', 'true'),
@@ -1516,6 +1634,30 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "仅支持 owner 或 owner_or_grantee"
 
+    def _validate_synonym_fixup_scope(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = SYNONYM_FIXUP_SCOPE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in SYNONYM_FIXUP_SCOPE_VALUES:
+            return True, ""
+        return False, "仅支持 all 或 public_only"
+
+    def _validate_sequence_remap_policy(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = SEQUENCE_REMAP_POLICY_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in SEQUENCE_REMAP_POLICY_VALUES:
+            return True, ""
+        return False, "仅支持 infer/source_only/dominant_table"
+
+    def _validate_report_dir_layout(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = REPORT_DIR_LAYOUT_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in REPORT_DIR_LAYOUT_VALUES:
+            return True, ""
+        return False, "仅支持 flat/per_run"
+
     def _bool_transform(val: str) -> str:
         v = val.strip().lower()
         if v in ("true", "1", "yes", "y", "on"):
@@ -1584,6 +1726,22 @@ def run_config_wizard(config_path: Path) -> None:
         "是否生成授权脚本并附加到修复 DDL (true/false)",
         default=cfg.get("SETTINGS", "generate_grants", fallback="true"),
         transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "synonym_fixup_scope",
+        "同义词修补范围 (all/public_only)",
+        default=cfg.get("SETTINGS", "synonym_fixup_scope", fallback="all"),
+        validator=_validate_synonym_fixup_scope,
+        transform=normalize_synonym_fixup_scope,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "sequence_remap_policy",
+        "SEQUENCE 目标 schema 推导策略 (infer/source_only/dominant_table)",
+        default=cfg.get("SETTINGS", "sequence_remap_policy", fallback="source_only"),
+        validator=_validate_sequence_remap_policy,
+        transform=normalize_sequence_remap_policy,
     )
     _prompt_field(
         "SETTINGS",
@@ -1712,9 +1870,24 @@ def run_config_wizard(config_path: Path) -> None:
     )
     _prompt_field(
         "SETTINGS",
+        "trigger_qualify_schema",
+        "触发器 DDL 是否强制补全 schema 前缀 (true/false)",
+        default=cfg.get("SETTINGS", "trigger_qualify_schema", fallback="true"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
         "report_dir",
         "报告输出目录",
         default=cfg.get("SETTINGS", "report_dir", fallback="main_reports"),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "report_dir_layout",
+        "报告目录布局 (flat/per_run)",
+        default=cfg.get("SETTINGS", "report_dir_layout", fallback="per_run"),
+        validator=_validate_report_dir_layout,
+        transform=normalize_report_dir_layout,
     )
     _prompt_field(
         "SETTINGS",
@@ -2624,6 +2797,7 @@ def infer_sequence_target_schema_from_dependents(
     transitive_table_cache: Optional[TransitiveTableCache] = None,
     source_dependencies: Optional[SourceDependencySet] = None,
     remap_conflicts: Optional[RemapConflictMap] = None,
+    sequence_remap_policy: str = "source_only",
     _path: Optional[Set[Tuple[str, str]]] = None
 ) -> Tuple[Optional[str], bool]:
     """
@@ -2668,6 +2842,7 @@ def infer_sequence_target_schema_from_dependents(
                     transitive_table_cache=transitive_table_cache,
                     source_dependencies=source_dependencies,
                     remap_conflicts=remap_conflicts,
+                    sequence_remap_policy=sequence_remap_policy,
                     _path=_path
                 ) or parent_table
             else:
@@ -2684,6 +2859,7 @@ def infer_sequence_target_schema_from_dependents(
                 transitive_table_cache=transitive_table_cache,
                 source_dependencies=source_dependencies,
                 remap_conflicts=remap_conflicts,
+                sequence_remap_policy=sequence_remap_policy,
                 _path=_path
             ) or dep_full
         if dep_target is None:
@@ -2724,6 +2900,7 @@ def infer_target_schema_from_direct_dependencies(
     transitive_table_cache: Optional[TransitiveTableCache] = None,
     source_dependencies: Optional[SourceDependencySet] = None,
     remap_conflicts: Optional[RemapConflictMap] = None,
+    sequence_remap_policy: str = "source_only",
     *,
     ignore_public_synonyms: bool = True,
     _path: Optional[Set[Tuple[str, str]]] = None
@@ -2767,6 +2944,7 @@ def infer_target_schema_from_direct_dependencies(
             transitive_table_cache=transitive_table_cache,
             source_dependencies=source_dependencies,
             remap_conflicts=remap_conflicts,
+            sequence_remap_policy=sequence_remap_policy,
             _path=_path
         )
         if ref_target is None:
@@ -3011,6 +3189,7 @@ def resolve_remap_target(
     transitive_table_cache: Optional[TransitiveTableCache] = None,
     source_dependencies: Optional[SourceDependencySet] = None,
     remap_conflicts: Optional[RemapConflictMap] = None,
+    sequence_remap_policy: str = "source_only",
     _path: Optional[Set[Tuple[str, str]]] = None
 ) -> Optional[str]:
     """
@@ -3025,6 +3204,7 @@ def resolve_remap_target(
     """
     obj_type_u = obj_type.upper()
     src_name_u = src_name.upper()
+    sequence_policy = (sequence_remap_policy or "source_only").lower()
     path = _path if _path is not None else set()
     node = (src_name_u, obj_type_u)
     if node in path:
@@ -3048,6 +3228,9 @@ def resolve_remap_target(
                     return strip_body_suffix(tgt)
                 return tgt
 
+        if obj_type_u == 'SEQUENCE' and sequence_policy == "source_only":
+            return src_name_u
+
         if obj_type_u in NO_INFER_SCHEMA_TYPES:
             return src_name_u
 
@@ -3069,6 +3252,7 @@ def resolve_remap_target(
                 transitive_table_cache=transitive_table_cache,
                 source_dependencies=source_dependencies,
                 remap_conflicts=remap_conflicts,
+                sequence_remap_policy=sequence_remap_policy,
                 _path=path
             )
             if inferred_schema:
@@ -3108,6 +3292,7 @@ def resolve_remap_target(
                             dependency_graph=dependency_graph,
                             transitive_table_cache=transitive_table_cache,
                             source_dependencies=source_dependencies,
+                            sequence_remap_policy=sequence_policy,
                             _path=path
                         )
                         if parent_target:
@@ -3118,7 +3303,7 @@ def resolve_remap_target(
                     return f"{tgt_schema}.{src_obj}"
 
         # 对于 SEQUENCE，优先根据依赖对象的 remap 结果推导
-        if '.' in src_name and obj_type_u == 'SEQUENCE':
+        if '.' in src_name and obj_type_u == 'SEQUENCE' and sequence_policy == "infer":
             src_schema, src_obj = src_name.split('.', 1)
             inferred_schema, conflict = infer_sequence_target_schema_from_dependents(
                 src_name,
@@ -3130,6 +3315,7 @@ def resolve_remap_target(
                 transitive_table_cache=transitive_table_cache,
                 source_dependencies=source_dependencies,
                 remap_conflicts=remap_conflicts,
+                sequence_remap_policy=sequence_policy,
                 _path=path
             )
             if inferred_schema:
@@ -3142,6 +3328,8 @@ def resolve_remap_target(
 
         # 针对 SEQUENCE / SYNONYM，在 remap_rules 仅包含 TABLE 映射时，使用该 schema 的主流目标 schema
         if '.' in src_name and obj_type_u in ('SEQUENCE', 'SYNONYM'):
+            if obj_type_u == 'SEQUENCE' and sequence_policy == "source_only":
+                return src_name_u
             src_schema, src_obj = src_name.split('.', 1)
             dominant_schema = infer_dominant_schema_from_rules(remap_rules, src_schema, source_objects)
             if dominant_schema:
@@ -3161,6 +3349,7 @@ def resolve_remap_target(
                 transitive_table_cache=transitive_table_cache,
                 source_dependencies=source_dependencies,
                 remap_conflicts=remap_conflicts,
+                sequence_remap_policy=sequence_remap_policy,
                 _path=path
             )
             if inferred_schema:
@@ -3213,7 +3402,8 @@ def generate_master_list(
     transitive_table_cache: Optional[TransitiveTableCache] = None,
     source_dependencies: Optional[SourceDependencySet] = None,
     dependency_graph: Optional[DependencyGraph] = None,
-    remap_conflicts: Optional[RemapConflictMap] = None
+    remap_conflicts: Optional[RemapConflictMap] = None,
+    sequence_remap_policy: str = "source_only"
 ) -> MasterCheckList:
     """
     生成“最终校验清单”并检测 "多对一" 映射。
@@ -3248,7 +3438,8 @@ def generate_master_list(
                     dependency_graph=dependency_graph,
                     transitive_table_cache=transitive_table_cache,
                     source_dependencies=source_dependencies,
-                    remap_conflicts=remap_conflicts
+                    remap_conflicts=remap_conflicts,
+                    sequence_remap_policy=sequence_remap_policy
                 )
                 if remap_conflicts and (src_name_u, obj_type_u) in remap_conflicts:
                     continue
@@ -3283,7 +3474,8 @@ def build_full_object_mapping(
     source_dependencies: Optional[SourceDependencySet] = None,
     dependency_graph: Optional[DependencyGraph] = None,
     enabled_types: Optional[Set[str]] = None,
-    remap_conflicts: Optional[RemapConflictMap] = None
+    remap_conflicts: Optional[RemapConflictMap] = None,
+    sequence_remap_policy: str = "source_only"
 ) -> FullObjectMapping:
     """
     为所有受管对象建立映射 (源 -> 目标)。
@@ -3358,7 +3550,8 @@ def build_full_object_mapping(
                 dependency_graph=dependency_graph,
                 transitive_table_cache=transitive_table_cache,
                 source_dependencies=source_dependencies,
-                remap_conflicts=conflict_map
+                remap_conflicts=conflict_map,
+                sequence_remap_policy=sequence_remap_policy
             )
             if tgt_name is None:
                 if conflict_map and (src_name_u, obj_type_u) in conflict_map:
@@ -6403,7 +6596,8 @@ def resolve_privilege_target(
     transitive_table_cache: Optional[TransitiveTableCache],
     source_dependencies: Optional[SourceDependencySet],
     source_schema_set: Set[str],
-    remap_conflicts: Optional[RemapConflictMap] = None
+    remap_conflicts: Optional[RemapConflictMap] = None,
+    sequence_remap_policy: str = "source_only"
 ) -> Optional[str]:
     src_full_u = src_full.upper()
     obj_type_u = normalize_privilege_object_type(obj_type)
@@ -6424,7 +6618,8 @@ def resolve_privilege_target(
         dependency_graph=dependency_graph,
         transitive_table_cache=transitive_table_cache,
         source_dependencies=source_dependencies,
-        remap_conflicts=None
+        remap_conflicts=None,
+        sequence_remap_policy=sequence_remap_policy
     )
     if target:
         return target.upper()
@@ -6605,7 +6800,8 @@ def build_grant_plan(
     ob_users: Optional[Set[str]] = None,
     include_oracle_maintained_roles: bool = False,
     dependencies: Optional[List[DependencyRecord]] = None,
-    progress_interval: float = 10.0
+    progress_interval: float = 10.0,
+    sequence_remap_policy: str = "source_only"
 ) -> GrantPlan:
     object_grants: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
     sys_privs: Dict[str, Set[SystemGrantEntry]] = defaultdict(set)
@@ -6667,7 +6863,8 @@ def build_grant_plan(
             transitive_table_cache,
             source_dependencies,
             source_schema_set,
-            remap_conflicts
+            remap_conflicts,
+            sequence_remap_policy=sequence_remap_policy
         )
         target_cache[key] = target
         return target
@@ -10735,8 +10932,8 @@ def clean_plsql_ending(ddl: str) -> str:
 
 
 END_SCHEMA_PREFIX_PATTERN = re.compile(
-    r'(^\s*END\s+)(?:(?:"[^"]+"|[A-Z0-9_$#]+)\s*\.\s*)(?P<obj>"[^"]+"|[A-Z0-9_$#]+)(\s*;\s*(?:--.*)?$)',
-    re.IGNORECASE | re.MULTILINE
+    r'(\bEND\s+)(?:(?:"[^"]+"|[A-Z0-9_$#]+)\s*\.\s*)(?P<obj>"[^"]+"|[A-Z0-9_$#]+)(\s*;\s*(?:--.*)?)',
+    re.IGNORECASE
 )
 
 
@@ -10744,10 +10941,27 @@ def clean_end_schema_prefix(ddl: str) -> str:
     """
     清理 PL/SQL 结尾 END 子句中的 schema 前缀。
     Oracle 允许 END schema.obj; 但 OceanBase 仅支持 END obj; 或 END;。
+    支持单行 DDL（END 前后可能没有换行）。
     """
     if not ddl:
         return ddl
     return END_SCHEMA_PREFIX_PATTERN.sub(r"\1\g<obj>\3", ddl)
+
+
+FOR_LOOP_RANGE_SINGLE_DOT_PATTERN = re.compile(
+    r'(\bIN\s+-?\d+)\s*\.(\s*)(?=(?:"[^"]+"|[A-Z_]))',
+    re.IGNORECASE
+)
+
+
+def clean_for_loop_single_dot_range(ddl: str) -> str:
+    """
+    修复 FOR ... IN 1.var 这种单点范围写法为 1..var。
+    仅在 IN 后接整数(含 0/1/其他)且点号后为标识符时生效，避免误伤小数。
+    """
+    if not ddl:
+        return ddl
+    return FOR_LOOP_RANGE_SINGLE_DOT_PATTERN.sub(r"\1..\2", ddl)
 
 
 def clean_extra_semicolons(ddl: str) -> str:
@@ -10775,8 +10989,12 @@ def clean_extra_dots(ddl: str) -> str:
     if not ddl:
         return ddl
     
-    # 替换连续的点号为单个点号
-    cleaned = re.sub(r'\.+', '.', ddl)
+    # 仅处理对象标识符之间的多余点号，避免误伤 PL/SQL 的 .. 运算符
+    pattern = re.compile(
+        r'(?P<left>"[^"]+"|[A-Z_][A-Z0-9_$#]*)\s*\.(?:\s*\.)+\s*(?P<right>"[^"]+"|[A-Z_][A-Z0-9_$#]*)',
+        re.IGNORECASE
+    )
+    cleaned = pattern.sub(r"\g<left>.\g<right>", ddl)
     return cleaned
 
 
@@ -10889,26 +11107,200 @@ def remap_trigger_table_references(
     return result_ddl
 
 
+TRIGGER_REF_PREFERRED_TYPES: Tuple[str, ...] = (
+    "TABLE",
+    "VIEW",
+    "MATERIALIZED VIEW",
+    "SEQUENCE",
+    "SYNONYM",
+    "PACKAGE",
+    "PACKAGE BODY",
+    "FUNCTION",
+    "PROCEDURE",
+    "TYPE",
+    "TYPE BODY",
+    "TRIGGER"
+)
+
+TRIGGER_QUALIFIED_REF_PATTERN = re.compile(
+    r'\b("?[A-Z0-9_\$#]+"?)\s*\.\s*("?[A-Z0-9_\$#]+"?)\b',
+    re.IGNORECASE
+)
+TRIGGER_SEQ_UNQUALIFIED_PATTERN = re.compile(
+    r'(?<!\.)\b(?P<name>"?[A-Z0-9_\$#]+"?)\s*\.\s*(?P<suffix>NEXTVAL|CURRVAL)\b',
+    re.IGNORECASE
+)
+TRIGGER_DML_PATTERNS: Tuple[re.Pattern, ...] = (
+    re.compile(r'(\bINSERT\s+INTO\s+)(?P<name>"?[A-Z0-9_\$#]+"?)', re.IGNORECASE),
+    re.compile(r'(\bUPDATE\s+)(?!OF\b)(?P<name>"?[A-Z0-9_\$#]+"?)', re.IGNORECASE),
+    re.compile(r'(\bDELETE\s+FROM\s+)(?P<name>"?[A-Z0-9_\$#]+"?)', re.IGNORECASE),
+    re.compile(r'(\bMERGE\s+INTO\s+)(?P<name>"?[A-Z0-9_\$#]+"?)', re.IGNORECASE),
+    re.compile(r'(\bFROM\s+)(?P<name>"?[A-Z0-9_\$#]+"?)', re.IGNORECASE),
+    re.compile(r'(\bJOIN\s+)(?P<name>"?[A-Z0-9_\$#]+"?)', re.IGNORECASE),
+)
+
+
+def remap_trigger_object_references(
+    ddl: str,
+    full_object_mapping: FullObjectMapping,
+    source_schema: Optional[str],
+    tgt_schema: Optional[str],
+    tgt_trigger: Optional[str],
+    *,
+    on_target: Optional[Tuple[str, str]] = None,
+    qualify_schema: bool = True
+) -> str:
+    """
+    触发器 DDL 的 schema 补全与 remap 重写：
+    - CREATE TRIGGER 主对象名强制带目标 schema
+    - ON 子句与触发器体内 DML/序列引用补全 schema
+    - 已带 schema 的引用按 remap 规则重写
+    """
+    if not ddl:
+        return ddl
+    if not qualify_schema:
+        return remap_trigger_table_references(ddl, full_object_mapping)
+
+    src_schema_u = (source_schema or "").upper()
+    tgt_schema_u = (tgt_schema or "").upper()
+    tgt_trigger_u = (tgt_trigger or "").upper()
+    on_schema_u = (on_target[0] or "").upper() if on_target else ""
+    on_table_u = (on_target[1] or "").upper() if on_target else ""
+
+    def _strip_quotes(text: str) -> str:
+        return (text or "").strip().strip('"').upper()
+
+    def _map_full_name(schema: str, obj: str) -> Optional[str]:
+        if not schema or not obj:
+            return None
+        src_full = f"{schema}.{obj}".upper()
+        return find_mapped_target_any_type(
+            full_object_mapping,
+            src_full,
+            preferred_types=TRIGGER_REF_PREFERRED_TYPES
+        )
+
+    def _map_unqualified(name: str) -> Optional[str]:
+        if not src_schema_u or not name:
+            return None
+        return _map_full_name(src_schema_u, name)
+
+    masker = SqlMasker(ddl)
+    working_sql = masker.masked_sql
+
+    # CREATE TRIGGER 主对象名强制补 schema
+    if tgt_schema_u and tgt_trigger_u:
+        name_pattern = re.compile(
+            r'(CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+)(?P<name>"?[A-Z0-9_\$#]+"?(?:\s*\.\s*"?[A-Z0-9_\$#]+"?)?)',
+            re.IGNORECASE
+        )
+        working_sql = name_pattern.sub(
+            lambda m: f"{m.group(1)}{tgt_schema_u}.{tgt_trigger_u}",
+            working_sql,
+            count=1
+        )
+
+    # ON 子句（仅匹配 CREATE TRIGGER 段落）
+    if on_schema_u and on_table_u:
+        on_pattern = re.compile(
+            r'(CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\b.*?\bON\s+)(?P<name>"?[A-Z0-9_\$#]+"?(?:\s*\.\s*"?[A-Z0-9_\$#]+"?)?)',
+            re.IGNORECASE | re.DOTALL
+        )
+        working_sql = on_pattern.sub(
+            lambda m: f"{m.group(1)}{on_schema_u}.{on_table_u}",
+            working_sql,
+            count=1
+        )
+
+    # 替换已带 schema 的引用
+    def _replace_qualified(match: re.Match) -> str:
+        schema = _strip_quotes(match.group(1))
+        obj = _strip_quotes(match.group(2))
+        tgt_full = _map_full_name(schema, obj)
+        return tgt_full if tgt_full else match.group(0)
+
+    working_sql = TRIGGER_QUALIFIED_REF_PATTERN.sub(_replace_qualified, working_sql)
+
+    # 补全触发器体内 DML 对象引用
+    def _replace_dml(match: re.Match) -> str:
+        prefix = match.group(1)
+        name_raw = match.group("name")
+        name_clean = _strip_quotes(name_raw)
+        if not name_clean or "." in name_clean:
+            return match.group(0)
+        text = match.string
+        pos = match.end()
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if pos < len(text) and text[pos] == ".":
+            return match.group(0)
+        tgt_full = _map_unqualified(name_clean)
+        return f"{prefix}{tgt_full}" if tgt_full else match.group(0)
+
+    for pattern in TRIGGER_DML_PATTERNS:
+        working_sql = pattern.sub(_replace_dml, working_sql)
+
+    # 补全序列 NEXTVAL/CURRVAL
+    def _replace_seq(match: re.Match) -> str:
+        name_raw = match.group("name")
+        suffix = match.group("suffix")
+        name_clean = _strip_quotes(name_raw)
+        if not name_clean:
+            return match.group(0)
+        text = match.string
+        pos = match.start() - 1
+        while pos >= 0 and text[pos].isspace():
+            pos -= 1
+        if pos >= 0 and text[pos] == ".":
+            return match.group(0)
+        tgt_full = find_mapped_target_any_type(
+            full_object_mapping,
+            f"{src_schema_u}.{name_clean}" if src_schema_u else name_clean,
+            preferred_types=("SEQUENCE",)
+        )
+        if not tgt_full:
+            return match.group(0)
+        return f"{tgt_full}.{suffix}"
+
+    working_sql = TRIGGER_SEQ_UNQUALIFIED_PATTERN.sub(_replace_seq, working_sql)
+
+    return masker.unmask(working_sql)
+
+
 def remap_plsql_object_references(
     ddl: str,
     obj_type: str,
     full_object_mapping: FullObjectMapping,
-    source_schema: Optional[str] = None
+    source_schema: Optional[str] = None,
+    *,
+    trigger_qualify_schema: bool = True,
+    trigger_on_target: Optional[Tuple[str, str]] = None,
+    trigger_tgt_schema: Optional[str] = None,
+    trigger_tgt_name: Optional[str] = None
 ) -> str:
     """
     重映射PL/SQL对象（PROCEDURE、FUNCTION、PACKAGE等）中的对象引用
     改进：
     - 支持 source_schema 以解析本地未限定引用
     - 使用 SqlMasker 保护
+    - TRIGGER 可选强制补全 schema 前缀
     """
     if not ddl:
         return ddl
     
     obj_type_upper = obj_type.upper()
     
-    # 触发器需要特殊处理表引用 (保留原逻辑，但可增强)
+    # 触发器需要特殊处理表引用与 schema 补全
     if obj_type_upper == 'TRIGGER':
-        return remap_trigger_table_references(ddl, full_object_mapping)
+        return remap_trigger_object_references(
+            ddl,
+            full_object_mapping,
+            source_schema,
+            trigger_tgt_schema,
+            trigger_tgt_name,
+            on_target=trigger_on_target,
+            qualify_schema=trigger_qualify_schema
+        )
     
     masker = SqlMasker(ddl)
     working_sql = masker.masked_sql
@@ -11345,6 +11737,7 @@ DDL_CLEANUP_RULES = {
         'types': ['PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'TYPE', 'TYPE BODY', 'TRIGGER'],
         'rules': [
             clean_end_schema_prefix,
+            clean_for_loop_single_dot_range,
             clean_plsql_ending,
             clean_semicolon_before_slash,
             clean_pragma_statements,
@@ -12079,7 +12472,8 @@ def generate_fixup_scripts(
     trigger_filter_enabled: bool = False,
     package_results: Optional[PackageCompareResults] = None,
     report_dir: Optional[Path] = None,
-    report_timestamp: Optional[str] = None
+    report_timestamp: Optional[str] = None,
+    fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None
 ):
     """
     基于校验结果生成 fixup_scripts DDL 脚本，并按依赖顺序排列：
@@ -12216,6 +12610,18 @@ def generate_fixup_scripts(
     fixup_schema_filter: Set[str] = set(settings.get('fixup_schema_list', []))
     fixup_type_filter: Set[str] = set(settings.get('fixup_type_set', []))
     fixup_schema_used_source_match = False
+    synonym_fixup_scope = settings.get('synonym_fixup_scope', 'all')
+    if synonym_fixup_scope == "public_only":
+        log.info("[FIXUP] synonym_fixup_scope=public_only，仅生成 PUBLIC 同义词脚本。")
+
+    def allow_synonym_scope(src_schema: str, tgt_schema: str) -> bool:
+        if synonym_fixup_scope != "public_only":
+            return True
+        if (src_schema or "").upper() == "PUBLIC":
+            return True
+        if (tgt_schema or "").upper() == "PUBLIC":
+            return True
+        return False
 
     ddl_source_stats: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
     ddl_source_lock = threading.Lock()
@@ -12299,6 +12705,20 @@ def generate_fixup_scripts(
                 fixup_schema_used_source_match = True
             return True
         return False
+
+    def classify_fixup_skip(obj_type: str, tgt_schema: str, src_schema: Optional[str] = None) -> Optional[str]:
+        obj_type_u = obj_type.upper()
+        schema_u = tgt_schema.upper() if tgt_schema else ""
+        if fixup_type_filter and obj_type_u not in fixup_type_filter:
+            return "type_filter"
+        if not fixup_schema_filter:
+            return None
+        if schema_u in fixup_schema_filter:
+            return None
+        src_schema_u = (src_schema or "").upper()
+        if src_schema_u and src_schema_u in fixup_schema_filter:
+            return None
+        return "schema_filter"
 
     def fetch_ddl_with_timing(schema: str, obj_type: str, obj_name: str) -> Tuple[Optional[str], str, float]:
         """
@@ -12702,6 +13122,9 @@ def generate_fixup_scripts(
     other_missing_objects: List[Tuple[str, str, str, str, str]] = []
     missing_total_by_type: Dict[str, int] = defaultdict(int)
     missing_allowed_by_type: Dict[str, int] = defaultdict(int)
+    synonym_scope_skipped = 0
+    index_missing_total = sum(len(item.missing_indexes) for item in extra_results.get('index_mismatched', []))
+    index_skip_counts: Dict[str, int] = defaultdict(int)
 
     for (obj_type, tgt_name, src_name) in tv_results.get('missing', []):
         obj_type_u = obj_type.upper()
@@ -12732,6 +13155,9 @@ def generate_fixup_scripts(
         missing_total_by_type[obj_type_u] += 1
         if not allow_fixup(obj_type_u, tgt_schema, src_schema):
             continue
+        if obj_type_u == 'SYNONYM' and not allow_synonym_scope(src_schema, tgt_schema):
+            synonym_scope_skipped += 1
+            continue
         missing_allowed_by_type[obj_type_u] += 1
         queue_request(src_schema, obj_type_u, src_obj)
         if obj_type_u == 'TABLE':
@@ -12748,6 +13174,12 @@ def generate_fixup_scripts(
                 filtered.append(f"{obj_type_u}={allowed}/{total}")
         if filtered:
             log.info("[FIXUP] fixup_types/fixup_schemas 生效: %s", ", ".join(filtered))
+    if synonym_scope_skipped:
+        log.info(
+            "[FIXUP] synonym_fixup_scope=%s，已跳过非 PUBLIC 同义词 %d 个。",
+            synonym_fixup_scope,
+            synonym_scope_skipped
+        )
 
     if package_results:
         for row in package_results.get("rows", []):
@@ -12790,13 +13222,17 @@ def generate_fixup_scripts(
     for item in extra_results.get('index_mismatched', []):
         table_str = item.table.split()[0]
         if '.' not in table_str:
+            index_skip_counts["table_unmapped"] += len(item.missing_indexes)
             continue
         src_name = table_map.get(table_str)
         if not src_name or '.' not in src_name:
+            index_skip_counts["table_unmapped"] += len(item.missing_indexes)
             continue
         src_schema, src_table = src_name.split('.')
         tgt_schema, tgt_table = table_str.split('.')
         if not allow_fixup('INDEX', tgt_schema, src_schema):
+            reason = classify_fixup_skip('INDEX', tgt_schema, src_schema) or "filtered"
+            index_skip_counts[reason] += len(item.missing_indexes)
             continue
         queue_request(src_schema, 'TABLE', src_table)
         index_tasks.append((item, src_schema, src_table, tgt_schema.upper(), tgt_table.upper()))
@@ -13505,11 +13941,14 @@ def generate_fixup_scripts(
         other_jobs.append(_job)
     run_tasks(other_jobs, "OTHER_OBJECTS")
 
+    index_generated = 0
+    index_skip_lock = threading.Lock()
     log.info("[FIXUP] (5/9) 正在生成 INDEX 脚本...")
     index_progress = build_progress_tracker(index_total, "[FIXUP] (5/9) INDEX")
     index_jobs: List[Callable[[], None]] = []
     for item, src_schema, src_table, tgt_schema, tgt_table in index_tasks:
         def _job(it=item, ss=src_schema, st=src_table, ts=tgt_schema, tt=tgt_table):
+            nonlocal index_generated
             table_ddl = table_ddl_cache.get((ss.upper(), st.upper()))
             if not table_ddl:
                 log.warning("[FIXUP] 未找到 TABLE %s.%s 的 dbcat DDL，将尝试基于元数据重建索引。", ss, st)
@@ -13523,6 +13962,7 @@ def generate_fixup_scripts(
                 try:
                     statements = extracted.get(idx_name_u) or []
                     source_label = "DBCAT" if table_ddl else "META"
+                    meta_entry = oracle_meta.indexes.get((ss.upper(), st.upper()), {}).get(idx_name_u)
                     if not statements:
                         fallback_stmt = build_index_from_meta(ss, st, ts, tt, idx_name_u)
                         if fallback_stmt:
@@ -13532,6 +13972,11 @@ def generate_fixup_scripts(
                             mark_source('INDEX', 'fallback')
                         else:
                             mark_source('INDEX', 'missing')
+                            with index_skip_lock:
+                                if meta_entry:
+                                    index_skip_counts["meta_incomplete"] += 1
+                                else:
+                                    index_skip_counts["meta_missing"] += 1
                             log.warning("[FIXUP] 未在 TABLE %s.%s 的 DDL 中找到索引 %s，且无元数据可重建。", ss, st, idx_name_u)
                             continue
                     else:
@@ -13554,10 +13999,19 @@ def generate_fixup_scripts(
                     header = f"修补缺失的 INDEX {idx_name_u} (表: {ts}.{tt})"
                     log.info("[FIXUP]%s 写入 INDEX 脚本: %s", source_tag(source_label), filename)
                     write_fixup_file(base_dir, 'index', filename, content, header)
+                    with index_skip_lock:
+                        index_generated += 1
                 finally:
                     index_progress()
         index_jobs.append(_job)
     run_tasks(index_jobs, "INDEX")
+    if fixup_skip_summary is not None:
+        fixup_skip_summary["INDEX"] = {
+            "missing_total": index_missing_total,
+            "task_total": index_total,
+            "generated": index_generated,
+            "skipped": dict(index_skip_counts)
+        }
 
     log.info("[FIXUP] (6/9) 正在生成 CONSTRAINT 脚本...")
     constraint_progress = build_progress_tracker(constraint_total, "[FIXUP] (6/9) CONSTRAINT")
@@ -13767,25 +14221,34 @@ def generate_fixup_scripts(
                     extra_identifiers=extra_ids,
                     obj_type='TRIGGER'
                 )
-                # 重映射触发器中的表引用
-                ddl_adj = remap_plsql_object_references(ddl_adj, 'TRIGGER', full_object_mapping, source_schema=ss)
-                # 强化主对象与 ON 子句的 schema 替换（避免遗漏）
-                def _rewrite_trigger_name_and_on(text: str) -> str:
-                    # 替换 CREATE TRIGGER 段的 schema 前缀
-                    name_pattern = re.compile(
-                        rf'(CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+)"?{re.escape(ss)}"?\s*\.\s*"?{re.escape(tn)}"?',
-                        re.IGNORECASE
-                    )
-                    text = name_pattern.sub(rf'\1{ts}.{to}', text, count=1)
-                    # 替换 ON 子句表名
-                    if st and tt and tts:
-                        on_pattern = re.compile(
-                            rf'(\bON\s+)("?\s*{re.escape(ss)}\s*"?\s*\.\s*)?"?{re.escape(st)}"?',
+                # 重映射触发器中的对象引用并补全 schema
+                trigger_qualify_schema = bool(settings.get('trigger_qualify_schema', True))
+                ddl_adj = remap_plsql_object_references(
+                    ddl_adj,
+                    'TRIGGER',
+                    full_object_mapping,
+                    source_schema=ss,
+                    trigger_qualify_schema=trigger_qualify_schema,
+                    trigger_on_target=(tts, tt) if tts and tt else None,
+                    trigger_tgt_schema=ts,
+                    trigger_tgt_name=to
+                )
+                if not trigger_qualify_schema:
+                    # 保持旧逻辑：仅补全 CREATE TRIGGER 与 ON 子句
+                    def _rewrite_trigger_name_and_on(text: str) -> str:
+                        name_pattern = re.compile(
+                            rf'(CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+)"?{re.escape(ss)}"?\s*\.\s*"?{re.escape(tn)}"?',
                             re.IGNORECASE
                         )
-                        text = on_pattern.sub(rf'\1{tts}.{tt}', text, count=1)
-                    return text
-                ddl_adj = _rewrite_trigger_name_and_on(ddl_adj)
+                        text = name_pattern.sub(rf'\1{ts}.{to}', text, count=1)
+                        if st and tt and tts:
+                            on_pattern = re.compile(
+                                rf'(\bON\s+)("?\s*{re.escape(ss)}\s*"?\s*\.\s*)?"?{re.escape(st)}"?',
+                                re.IGNORECASE
+                            )
+                            text = on_pattern.sub(rf'\1{tts}.{tt}', text, count=1)
+                        return text
+                    ddl_adj = _rewrite_trigger_name_and_on(ddl_adj)
                 ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
                 ddl_adj = prepend_set_schema(ddl_adj, ts)
                 obj_full = f"{ts}.{to}"
@@ -14155,13 +14618,13 @@ def export_missing_table_view_mappings(
 ) -> Optional[Path]:
     """
     将缺失的 TABLE/VIEW 映射按目标 schema 输出为文本，便于迁移工具直接消费。
-    输出文件示例：SCHEMA_T.txt / SCHEMA_V.txt
+    输出文件示例：SCHEMA_T.txt / SCHEMA_V.txt（目录: missed_tables_views_for_OMS）
     若提供 blacklisted_tables，则跳过黑名单 TABLE。
     """
     if not report_dir:
         return None
 
-    output_dir = Path(report_dir) / "tables_views_miss"
+    output_dir = Path(report_dir) / "missed_tables_views_for_OMS"
     if output_dir.exists():
         shutil.rmtree(output_dir, ignore_errors=True)
 
@@ -14563,7 +15026,7 @@ def export_blacklist_tables(
 
     lines: List[str] = [
         "# 黑名单表清单（LONG/LONG RAW 将校验目标端转换情况）",
-        "# 说明: 黑名单缺失表不会生成 tables_views_miss 规则",
+        "# 说明: 黑名单缺失表不会生成 missed_tables_views_for_OMS 规则",
         "# 字段说明: TABLE_FULL | BLACK_TYPE | DATA_TYPE | STATUS | DETAIL | REASON"
     ]
     for schema in sorted(grouped.keys()):
@@ -14745,6 +15208,44 @@ def export_filtered_grants(
         return None
 
 
+def export_fixup_skip_summary(
+    summary: Dict[str, Dict[str, object]],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出 fixup 跳过原因汇总，用于解释缺失对象数量与实际生成脚本数量差异。
+    """
+    if not summary or not report_dir or not report_timestamp:
+        return None
+
+    output_path = Path(report_dir) / f"fixup_skip_summary_{report_timestamp}.txt"
+    lines: List[str] = [
+        "# Fixup 跳过原因汇总",
+        f"# timestamp={report_timestamp}",
+    ]
+    for obj_type, data in sorted(summary.items()):
+        missing_total = int(data.get("missing_total", 0) or 0)
+        task_total = int(data.get("task_total", 0) or 0)
+        generated = int(data.get("generated", 0) or 0)
+        skipped = data.get("skipped", {}) or {}
+        lines.append("")
+        lines.append(f"[{obj_type}] missing_total={missing_total} task_total={task_total} generated={generated}")
+        if skipped:
+            for reason, count in sorted(skipped.items()):
+                lines.append(f"  - {reason}: {count}")
+        else:
+            lines.append("  - skipped: 0")
+
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        return output_path
+    except OSError as exc:
+        log.warning("写入 fixup 跳过汇总失败 %s: %s", output_path, exc)
+        return None
+
+
 def collect_blacklisted_missing_tables(
     tv_results: ReportResults,
     blacklist_tables: BlacklistTableMap
@@ -14781,7 +15282,9 @@ def build_run_summary(
     blacklisted_missing_tables: Optional[BlacklistTableMap],
     report_file: Optional[Path],
     filtered_grants_path: Optional[Path] = None,
-    filtered_grants_count: int = 0
+    filtered_grants_count: int = 0,
+    config_diagnostics: Optional[List[str]] = None,
+    fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None
 ) -> RunSummary:
     end_time = datetime.now()
     total_seconds = time.perf_counter() - ctx.start_perf
@@ -14914,6 +15417,17 @@ def build_run_summary(
             findings.append(f"权限兼容过滤: {filtered_grants_count} 条 (见 {filtered_grants_path})")
         else:
             findings.append(f"权限兼容过滤: {filtered_grants_count} 条")
+    if fixup_skip_summary and fixup_skip_summary.get("INDEX"):
+        idx_summary = fixup_skip_summary.get("INDEX") or {}
+        skipped_map = idx_summary.get("skipped", {}) or {}
+        skipped_total = sum(int(v or 0) for v in skipped_map.values())
+        findings.append(
+            "INDEX 修补: 缺失 {missing}, 生成 {generated}, 跳过 {skipped}".format(
+                missing=idx_summary.get("missing_total", 0),
+                generated=idx_summary.get("generated", 0),
+                skipped=skipped_total
+            )
+        )
 
     if trigger_summary.get("enabled"):
         if trigger_summary.get("fallback_full"):
@@ -14955,6 +15469,8 @@ def build_run_summary(
         attention.append("授权脚本生成已关闭，权限调整需人工确认。")
     elif ctx.enable_grant_generation and not ctx.fixup_enabled:
         attention.append("授权脚本生成依赖 generate_fixup=true，当前未输出授权脚本。")
+    if config_diagnostics:
+        attention.append(f"配置诊断提示 {len(config_diagnostics)} 项（详见报告）。")
 
     next_steps: List[str] = []
     if remap_conflict_cnt:
@@ -14965,9 +15481,19 @@ def build_run_summary(
         else:
             next_steps.append("如需自动生成修补脚本，请设置 generate_fixup=true。")
     if missing_count:
-        next_steps.append("将 main_reports/tables_views_miss 下的 schema_T.txt / schema_V.txt 规则提供给 OMS 进行迁移。")
+        if report_file:
+            report_parent = Path(report_file).parent
+            next_steps.append(
+                f"将 {report_parent}/missed_tables_views_for_OMS 下的 schema_T.txt / schema_V.txt 规则提供给 OMS 进行迁移。"
+            )
+        else:
+            next_steps.append("将 missed_tables_views_for_OMS 下的 schema_T.txt / schema_V.txt 规则提供给 OMS 进行迁移。")
     if blacklist_missing_cnt:
-        next_steps.append("查看 main_reports/blacklist_tables.txt，确认黑名单表处理方案。")
+        if report_file:
+            report_parent = Path(report_file).parent
+            next_steps.append(f"查看 {report_parent}/blacklist_tables.txt，确认黑名单表处理方案。")
+        else:
+            next_steps.append("查看 blacklist_tables.txt，确认黑名单表处理方案。")
     if trigger_summary.get("invalid_entries") or trigger_summary.get("not_found"):
         next_steps.append("修正 trigger_list 清单内容后重新运行。")
     if dep_missing_cnt or dep_unexpected_cnt:
@@ -14981,6 +15507,12 @@ def build_run_summary(
                 all=Path(ctx.fixup_dir) / 'grants_all'
             )
         )
+    if fixup_skip_summary and fixup_skip_summary.get("INDEX"):
+        if report_file:
+            report_parent = Path(report_file).parent
+            next_steps.append(f"查看 {report_parent}/fixup_skip_summary_*.txt，确认索引修补跳过原因。")
+        else:
+            next_steps.append("查看 fixup_skip_summary_*.txt，确认索引修补跳过原因。")
 
     return RunSummary(
         start_time=ctx.start_time,
@@ -15082,7 +15614,9 @@ def print_final_report(
     trigger_list_rows: Optional[List[TriggerListReportRow]] = None,
     package_results: Optional[PackageCompareResults] = None,
     run_summary_ctx: Optional[RunSummaryContext] = None,
-    filtered_grants: Optional[List[FilteredGrantEntry]] = None
+    filtered_grants: Optional[List[FilteredGrantEntry]] = None,
+    config_diagnostics: Optional[List[str]] = None,
+    fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None
 ):
     custom_theme = Theme({
         "ok": "green",
@@ -15352,6 +15886,29 @@ def print_final_report(
     console.print(summary_table)
     console.print("")
     console.print("")
+
+    if config_diagnostics:
+        diag_table = Table(title="[header]0.c 配置诊断[/header]", width=section_width)
+        diag_table.add_column("提示", style="mismatch")
+        for item in config_diagnostics:
+            diag_table.add_row(item)
+        console.print(diag_table)
+        console.print("")
+
+    if fixup_skip_summary and fixup_skip_summary.get("INDEX"):
+        idx_summary = fixup_skip_summary.get("INDEX") or {}
+        skip_table = Table(title="[header]0.d Fixup 跳过汇总 (INDEX)[/header]", width=section_width)
+        skip_table.add_column("指标", style="info", width=36)
+        skip_table.add_column("数量", justify="right")
+        skip_table.add_row("缺失总数", str(idx_summary.get("missing_total", 0)))
+        skip_table.add_row("进入生成任务", str(idx_summary.get("task_total", 0)))
+        skip_table.add_row("实际生成脚本", str(idx_summary.get("generated", 0)))
+        skipped_map = idx_summary.get("skipped", {}) or {}
+        if skipped_map:
+            for reason, count in sorted(skipped_map.items()):
+                skip_table.add_row(f"跳过: {reason}", str(count))
+        console.print(skip_table)
+        console.print("")
 
     def summarize_actions() -> Panel:
         modify_counts = OrderedDict()
@@ -15754,7 +16311,9 @@ def print_final_report(
             blacklisted_missing_tables,
             report_file,
             filtered_grants_path=filtered_grants_path,
-            filtered_grants_count=filtered_grants_count
+            filtered_grants_count=filtered_grants_count,
+            config_diagnostics=config_diagnostics,
+            fixup_skip_summary=fixup_skip_summary
         )
         console.print(render_run_summary_panel(run_summary, section_width))
 
@@ -15762,6 +16321,9 @@ def print_final_report(
 
     if report_file:
         report_path = Path(report_file)
+        report_ts = None
+        if report_path.name.startswith("report_") and report_path.name.endswith(".txt"):
+            report_ts = report_path.name[len("report_"):-4]
         blacklisted_table_keys = set((blacklisted_missing_tables or {}).keys())
         export_dir = export_missing_table_view_mappings(
             tv_results,
@@ -15786,6 +16348,11 @@ def print_final_report(
             filtered_grants or [],
             report_path.parent
         )
+        fixup_skip_path = export_fixup_skip_summary(
+            fixup_skip_summary or {},
+            report_path.parent,
+            report_ts
+        )
         try:
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report_text = console.export_text(clear=False)
@@ -15803,6 +16370,8 @@ def print_final_report(
                 log.info("触发器清单筛选报告已输出到: %s", trigger_miss_path)
             if filtered_grants_path:
                 log.info("过滤授权清单已输出到: %s", filtered_grants_path)
+            if fixup_skip_path:
+                log.info("Fixup 跳过汇总已输出到: %s", fixup_skip_path)
         except OSError as exc:
             console.print(f"[missing]报告写入失败: {exc}")
 
@@ -15839,7 +16408,11 @@ def parse_cli_args() -> argparse.Namespace:
             extra_check_progress_interval 扩展对象校验进度日志间隔（秒）
             fixup_schemas           仅对指定目标 schema 生成订正 SQL（逗号分隔，留空为全部）
             fixup_types             仅生成指定对象类型的订正 SQL（留空为全部，例如 TABLE,TRIGGER）
+            synonym_fixup_scope     同义词修补范围 (all/public_only，默认 all)
             trigger_list            仅生成指定触发器清单 (每行 SCHEMA.TRIGGER_NAME)
+            trigger_qualify_schema  触发器 DDL 是否强制补全 schema 前缀 (true/false)
+            sequence_remap_policy   SEQUENCE 目标 schema 推导策略 (infer/source_only/dominant_table)
+            report_dir_layout       报告目录布局 (flat/per_run)
             check_dependencies      true/false 控制依赖校验
             generate_grants         true/false 控制授权脚本生成
             grant_tab_privs_scope   owner/owner_or_grantee 控制 DBA_TAB_PRIVS 抽取范围
@@ -15854,12 +16427,12 @@ def parse_cli_args() -> argparse.Namespace:
           python schema_diff_reconciler.py                   # 使用当前目录 config.ini
           python schema_diff_reconciler.py /path/to/conf.ini # 指定配置
         输出:
-          main_reports/report_<ts>.txt  Rich 报告文本
-          main_reports/package_compare_<ts>.txt  PACKAGE/PKG BODY 对比明细
-          main_reports/tables_views_miss/ 按 schema 输出缺失 TABLE/VIEW 规则 (schema_T.txt / schema_V.txt)
-          main_reports/blacklist_tables.txt 黑名单表清单 (含 LONG 转换校验状态)
-          main_reports/trigger_miss.txt  触发器清单筛选报告 (仅配置 trigger_list 时生成)
-          main_reports/filtered_grants.txt 过滤掉的不兼容 GRANT 权限清单
+          main_reports/run_<ts>/report_<ts>.txt  Rich 报告文本 (report_dir_layout=per_run)
+          main_reports/run_<ts>/package_compare_<ts>.txt  PACKAGE/PKG BODY 对比明细
+          main_reports/run_<ts>/missed_tables_views_for_OMS/ 按 schema 输出缺失 TABLE/VIEW 规则 (schema_T.txt / schema_V.txt)
+          main_reports/run_<ts>/blacklist_tables.txt 黑名单表清单 (含 LONG 转换校验状态)
+          main_reports/run_<ts>/trigger_miss.txt  触发器清单筛选报告 (仅配置 trigger_list 时生成)
+          main_reports/run_<ts>/filtered_grants.txt 过滤掉的不兼容 GRANT 权限清单
           fixup_scripts/                按类型分类的订正 SQL
         项目信息:
           主页: {repo_url}
@@ -15939,6 +16512,16 @@ def main():
             log.info("已根据配置关闭注释一致性校验。")
         if not enable_grant_generation:
             log.info("已根据配置关闭授权脚本生成。")
+
+        config_diagnostics = collect_fixup_config_diagnostics(
+            settings,
+            enabled_primary_types,
+            enabled_extra_types
+        )
+        if config_diagnostics:
+            log_subsection("配置诊断")
+            for item in config_diagnostics:
+                log.warning("[CONFIG] %s", item)
 
         # 初始化 Oracle Instant Client (Thick Mode)
         init_oracle_client_from_settings(settings)
@@ -16031,6 +16614,7 @@ def main():
             allowed_target_schemas=settings['source_schemas_list']
         )
 
+        sequence_policy = settings.get("sequence_remap_policy", "source_only")
         # 5) 先不推导 schema，生成基础映射/清单，用于推导 TABLE 唯一映射
         remap_conflicts: RemapConflictMap = {}
         base_full_mapping = build_full_object_mapping(
@@ -16042,7 +16626,8 @@ def main():
             source_dependencies=source_dependencies_set,
             dependency_graph=dependency_graph,
             enabled_types=enabled_object_types,
-            remap_conflicts=remap_conflicts
+            remap_conflicts=remap_conflicts,
+            sequence_remap_policy=sequence_policy
         )
         base_master_list = generate_master_list(
             source_objects,
@@ -16054,7 +16639,8 @@ def main():
             transitive_table_cache=transitive_table_cache,
             source_dependencies=source_dependencies_set,
             dependency_graph=dependency_graph,
-            remap_conflicts=remap_conflicts
+            remap_conflicts=remap_conflicts,
+            sequence_remap_policy=sequence_policy
         )
         if settings.get("enable_schema_mapping_infer"):
             schema_mapping_from_tables = build_schema_mapping(base_master_list)
@@ -16072,7 +16658,8 @@ def main():
             source_dependencies=source_dependencies_set,
             dependency_graph=dependency_graph,
             enabled_types=enabled_object_types,
-            remap_conflicts=remap_conflicts
+            remap_conflicts=remap_conflicts,
+            sequence_remap_policy=sequence_policy
         )
         master_list = generate_master_list(
             source_objects,
@@ -16084,7 +16671,8 @@ def main():
             transitive_table_cache=transitive_table_cache,
             source_dependencies=source_dependencies_set,
             dependency_graph=dependency_graph,
-            remap_conflicts=remap_conflicts
+            remap_conflicts=remap_conflicts,
+            sequence_remap_policy=sequence_policy
         )
         expected_dependency_pairs: Set[Tuple[str, str, str, str]] = set()
         skipped_dependency_pairs: List[DependencyIssue] = []
@@ -16104,8 +16692,11 @@ def main():
         target_table_pairs = collect_table_pairs(master_list, use_target=True)
 
     report_dir_setting = settings.get('report_dir', 'main_reports').strip() or 'main_reports'
-    report_dir = Path(report_dir_setting)
+    report_layout = settings.get('report_dir_layout', 'per_run')
+    report_root = Path(report_dir_setting)
+    report_dir = report_root / f"run_{timestamp}" if report_layout == "per_run" else report_root
     report_dir.mkdir(parents=True, exist_ok=True)
+    settings['report_dir_effective'] = str(report_dir)
     report_path = report_dir / f"report_{timestamp}.txt"
     log.info(f"本次报告将输出到: {report_path}")
 
@@ -16226,7 +16817,9 @@ def main():
             trigger_list_rows=None,
             package_results=package_results,
             run_summary_ctx=run_summary_ctx,
-            filtered_grants=None
+            filtered_grants=None,
+            config_diagnostics=config_diagnostics,
+            fixup_skip_summary=None
         )
         if run_summary:
             log_run_summary(run_summary)
@@ -16423,6 +17016,7 @@ def main():
 
     log_section("修补脚本与报告")
     # 9) 生成目标端订正 SQL
+    fixup_skip_summary: Dict[str, Dict[str, object]] = {}
     if generate_fixup_enabled:
         fixup_dir_label = settings.get('fixup_dir', 'fixup_scripts') or 'fixup_scripts'
         log.info('已开启修补脚本生成，开始写入 %s 目录...', fixup_dir_label)
@@ -16485,7 +17079,8 @@ def main():
                     ob_users=ob_users,
                     include_oracle_maintained_roles=include_oracle_maintained_roles,
                     dependencies=oracle_dependencies_for_grants,
-                    progress_interval=grant_progress_interval
+                    progress_interval=grant_progress_interval,
+                    sequence_remap_policy=sequence_policy
                 )
                 object_grant_cnt = sum(len(v) for v in grant_plan.object_grants.values())
                 sys_grant_cnt = sum(len(v) for v in grant_plan.sys_privs.values())
@@ -16497,32 +17092,35 @@ def main():
                     role_grant_cnt
                 )
                 if grant_plan.filtered_grants:
+                    report_dir_hint = settings.get("report_dir_effective") or settings.get("report_dir", "main_reports")
                     log.warning(
-                        "[GRANT] 已过滤不兼容权限 %d 条，将输出 main_reports/filtered_grants.txt。",
-                        len(grant_plan.filtered_grants)
+                        "[GRANT] 已过滤不兼容权限 %d 条，将输出 %s/filtered_grants.txt。",
+                        len(grant_plan.filtered_grants),
+                        report_dir_hint
                     )
-            view_chain_file = generate_fixup_scripts(
-                ora_cfg,
-                ob_cfg,
-                settings,
-                tv_results,
-                extra_results,
-                master_list,
-                oracle_meta,
-                full_object_mapping,
-                remap_rules,
-                grant_plan,
-                enable_grant_generation,
-                dependency_report,
-                ob_meta,
-                expected_dependency_pairs,
-                synonym_meta,
-                trigger_filter_entries,
-                trigger_filter_enabled,
-                package_results=package_results,
-                report_dir=report_dir,
-                report_timestamp=timestamp
-            )
+                view_chain_file = generate_fixup_scripts(
+                    ora_cfg,
+                    ob_cfg,
+                    settings,
+                    tv_results,
+                    extra_results,
+                    master_list,
+                    oracle_meta,
+                    full_object_mapping,
+                    remap_rules,
+                    grant_plan,
+                    enable_grant_generation,
+                    dependency_report,
+                    ob_meta,
+                    expected_dependency_pairs,
+                    synonym_meta,
+                    trigger_filter_entries,
+                    trigger_filter_enabled,
+                    package_results=package_results,
+                    report_dir=report_dir,
+                    report_timestamp=timestamp,
+                    fixup_skip_summary=fixup_skip_summary
+                )
     else:
         log.info('已根据配置跳过修补脚本生成，仅打印对比报告。')
         if enable_grant_generation:
@@ -16571,7 +17169,9 @@ def main():
         trigger_list_rows,
         package_results=package_results,
         run_summary_ctx=run_summary_ctx,
-        filtered_grants=(grant_plan.filtered_grants if grant_plan else None)
+        filtered_grants=(grant_plan.filtered_grants if grant_plan else None),
+        config_diagnostics=config_diagnostics,
+        fixup_skip_summary=fixup_skip_summary
     )
     if run_summary:
         log_run_summary(run_summary)

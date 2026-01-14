@@ -4,6 +4,12 @@
 
 ## [未发布]
 - 扩展对象校验支持并发与时间间隔进度日志，新增 extra_check_workers/extra_check_chunk_size/extra_check_progress_interval。
+- 新增 synonym_fixup_scope，可选择仅生成 PUBLIC 同义词或包含私有同义词的修补脚本。
+- 新增 report_dir_layout（per_run/flat），支持每次运行独立报告目录。
+- 新增 sequence_remap_policy，控制序列目标 schema 推导策略。
+- 新增 trigger_qualify_schema，触发器 DDL 强制补全 schema 前缀并重写引用对象。
+- 迁移 OMS 缺失规则目录更名为 missed_tables_views_for_OMS。
+- 新增 fixup 跳过原因汇总输出，便于解释索引修补数量差异。
 
 ## [0.9.7] - 2026-01-08
 

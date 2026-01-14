@@ -32,6 +32,9 @@
 输出设置 (Output)
 - fixup_dir: 修复脚本输出目录（相对或绝对路径）。
 - report_dir: 报告输出目录（相对或绝对路径）。
+- report_dir_layout: 报告目录布局 (flat/per_run)。
+  flat: 输出到 report_dir 根目录（旧行为）。
+  per_run: 每次运行输出到 report_dir/run_<timestamp>（默认）。
 - log_dir: run_*.log 日志文件的存放目录。
 - log_level: 日志级别 (DEBUG/INFO/WARNING/ERROR/CRITICAL)。
 - report_width: 丰富输出的报告宽度（避免被截断）。
@@ -63,8 +66,12 @@
   有效值:
     TABLE, VIEW, MATERIALIZED VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY,
     SYNONYM, JOB, SCHEDULE, TYPE, TYPE BODY, SEQUENCE, TRIGGER, INDEX, CONSTRAINT
+- synonym_fixup_scope: 同义词修补范围。
+  all: 生成 PUBLIC + 私有同义词（默认）。
+  public_only: 仅生成 PUBLIC 同义词。
 - trigger_list: 可选触发器清单过滤文件（每行 SCHEMA.TRIGGER_NAME）。
-  配置后仅生成列表内触发器脚本，并输出 main_reports/trigger_miss.txt 记录无效/不存在/非缺失项。
+  配置后仅生成列表内触发器脚本，并输出 report_dir/trigger_miss.txt 记录无效/不存在/非缺失项。
+- trigger_qualify_schema: 触发器 DDL 是否强制补全 schema 前缀 (true/false)。
 
 检查范围 (Check scope)
 - check_primary_types: 限制主要对象类型（留空表示全部）。
@@ -80,6 +87,7 @@
 - print_dependency_chains: true/false/1/0/yes/no. 打印依赖链（仅当 check_dependencies=true 时生效）。
 - check_comments: true/false/1/0/yes/no. 对比表/列注释。
 - infer_schema_mapping: true/false/1/0/yes/no. 在一对多映射场景中启用 schema 推导。
+- sequence_remap_policy: SEQUENCE 目标 schema 推导策略 (infer/source_only/dominant_table)。
 - ddl_punct_sanitize: true/false/1/0/yes/no. 清洗 PL/SQL DDL 中的全角标点（默认开启）。
 - ddl_hint_policy: hint 清洗策略（drop_all/keep_supported/keep_all/report_only）。
 - ddl_hint_allowlist: 额外允许的 hint（逗号分隔）。

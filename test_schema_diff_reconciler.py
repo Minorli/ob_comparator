@@ -78,6 +78,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             object_parent_map=object_parent_map,
             dependency_graph=graph,
             source_dependencies=deps,
+            sequence_remap_policy="infer",
         )
         self.assertEqual(target, "B.SEQ1")
 
@@ -211,6 +212,70 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertEqual(added, 1)
         self.assertIn(("VIEW", "A.V2", "A.V2"), tv_results["missing"])
+
+    def test_clean_end_schema_prefix_single_line(self):
+        ddl = "BEGIN NULL; END SCHEMA.PKG_TEST;"
+        cleaned = sdr.clean_end_schema_prefix(ddl)
+        self.assertIn("END PKG_TEST;", cleaned)
+        self.assertNotIn("END SCHEMA.PKG_TEST", cleaned)
+
+    def test_clean_for_loop_single_dot_range(self):
+        ddl = "BEGIN FOR i IN 1.v_tablen LOOP NULL; END LOOP; END;"
+        cleaned = sdr.clean_for_loop_single_dot_range(ddl)
+        self.assertIn("IN 1..v_tablen", cleaned)
+        ddl = "BEGIN FOR i IN 0.v_tablen LOOP NULL; END LOOP; END;"
+        cleaned = sdr.clean_for_loop_single_dot_range(ddl)
+        self.assertIn("IN 0..v_tablen", cleaned)
+        ddl = "BEGIN FOR i IN 7.v_tablen LOOP NULL; END LOOP; END;"
+        cleaned = sdr.clean_for_loop_single_dot_range(ddl)
+        self.assertIn("IN 7..v_tablen", cleaned)
+
+    def test_normalize_synonym_fixup_scope(self):
+        self.assertEqual(sdr.normalize_synonym_fixup_scope(None), "all")
+        self.assertEqual(sdr.normalize_synonym_fixup_scope("all"), "all")
+        self.assertEqual(sdr.normalize_synonym_fixup_scope("public"), "public_only")
+        self.assertEqual(sdr.normalize_synonym_fixup_scope("PUBLIC_ONLY"), "public_only")
+
+    def test_normalize_sequence_remap_policy(self):
+        self.assertEqual(sdr.normalize_sequence_remap_policy(None), "source_only")
+        self.assertEqual(sdr.normalize_sequence_remap_policy("infer"), "infer")
+        self.assertEqual(sdr.normalize_sequence_remap_policy("SOURCE"), "source_only")
+        self.assertEqual(sdr.normalize_sequence_remap_policy("dominant"), "dominant_table")
+
+    def test_normalize_report_dir_layout(self):
+        self.assertEqual(sdr.normalize_report_dir_layout(None), "per_run")
+        self.assertEqual(sdr.normalize_report_dir_layout("flat"), "flat")
+        self.assertEqual(sdr.normalize_report_dir_layout("per-run"), "per_run")
+
+    def test_remap_trigger_object_references(self):
+        ddl = (
+            "CREATE OR REPLACE TRIGGER trg1 BEFORE INSERT ON t1\n"
+            "BEGIN\n"
+            "  INSERT INTO t2(col) VALUES (1);\n"
+            "  INSERT INTO src.t2(col) VALUES (2);\n"
+            "  :new.id := seq1.NEXTVAL;\n"
+            "  :new.id2 := src.seq1 . NEXTVAL;\n"
+            "END;\n"
+        )
+        mapping = {
+            "SRC.T1": {"TABLE": "TGT.T1"},
+            "SRC.T2": {"TABLE": "TGT.T2"},
+            "SRC.SEQ1": {"SEQUENCE": "TGT.SEQ1"},
+        }
+        remapped = sdr.remap_trigger_object_references(
+            ddl,
+            mapping,
+            "SRC",
+            "TGT",
+            "TRG1",
+            on_target=("TGT", "T1"),
+            qualify_schema=True
+        )
+        self.assertIn("CREATE OR REPLACE TRIGGER TGT.TRG1", remapped)
+        self.assertIn("ON TGT.T1", remapped)
+        self.assertIn("INSERT INTO TGT.T2", remapped)
+        self.assertIn("TGT.SEQ1.NEXTVAL", remapped)
+        self.assertNotIn("TGT.TGT", remapped)
 
     def test_compare_package_objects_source_invalid_and_target_invalid(self):
         master_list = [
