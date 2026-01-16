@@ -2,6 +2,7 @@ import unittest
 import sys
 import types
 import tempfile
+import json
 from pathlib import Path
 
 # schema_diff_reconciler 在 import 时强依赖 oracledb；
@@ -163,7 +164,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             table_privilege_map=set(),
             object_statuses={},
             package_errors={},
-            package_errors_complete=False, partition_key_columns={}
+            package_errors_complete=False, partition_key_columns={}, interval_partitions={}
         )
         results = sdr.check_primary_objects(
             master_list,
@@ -305,7 +306,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             package_errors={
                 ("A", "P1", "PACKAGE"): sdr.PackageErrorInfo(2, "L1:1 bad"),
             },
-            package_errors_complete=True, partition_key_columns={}
+            package_errors_complete=True, partition_key_columns={}, interval_partitions={}
         )
         ob_meta = sdr.ObMetadata(
             objects_by_type={
@@ -470,7 +471,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
                 object_counts_summary=None,
                 endpoint_info=None,
                 schema_summary=None,
-                settings={"report_width": 120},
+                settings={"report_width": 120, "report_detail_mode": "full"},
                 blacklisted_missing_tables={},
                 blacklist_report_rows=[],
                 trigger_list_summary=None,
@@ -523,7 +524,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             table_privilege_map=set(),
             object_statuses={},
             package_errors={},
-            package_errors_complete=False, partition_key_columns={}
+            package_errors_complete=False, partition_key_columns={}, interval_partitions={}
         )
         ob_meta = sdr.ObMetadata(
             objects_by_type={"PACKAGE": set(), "PACKAGE BODY": set()},
@@ -615,7 +616,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             table_comments={}, column_comments={}, comments_complete=True,
             blacklist_tables={}, object_privileges=[], sys_privileges=[],
             role_privileges=[], role_metadata={}, system_privilege_map=set(),
-            table_privilege_map=set(), object_statuses={}, package_errors={}, package_errors_complete=False, partition_key_columns={}
+            table_privilege_map=set(), object_statuses={}, package_errors={}, package_errors_complete=False, partition_key_columns={}, interval_partitions={}
         )
         ob_meta = sdr.ObMetadata(
             objects_by_type={"PACKAGE": set(), "PACKAGE BODY": set()},
@@ -1118,7 +1119,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             table_privilege_map=set(),
             object_statuses={},
             package_errors={},
-            package_errors_complete=False, partition_key_columns={}
+            package_errors_complete=False, partition_key_columns={}, interval_partitions={}
         )
         deps = [
             sdr.DependencyRecord(
@@ -1209,7 +1210,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             table_privilege_map=set(),
             object_statuses={},
             package_errors={},
-            package_errors_complete=False, partition_key_columns={}
+            package_errors_complete=False, partition_key_columns={}, interval_partitions={}
         )
         source_objects = {"S1.T1": {"TABLE"}}
         full_mapping = {"S1.T1": {"TABLE": "S1.T1"}}
@@ -1331,7 +1332,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             table_privilege_map=set(),
             object_statuses={},
             package_errors={},
-            package_errors_complete=False, partition_key_columns={}
+            package_errors_complete=False, partition_key_columns={}, interval_partitions={}
         )
         ob_meta = sdr.ObMetadata(
             objects_by_type={},
@@ -1372,13 +1373,160 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             ]
         }
         blacklist = {
-            ("SRC", "T1"): {("SPE", "XMLTYPE")},
-            ("SRC", "T3"): {("DIY", "UDT")},
+            ("SRC", "T1"): {("SPE", "XMLTYPE"): sdr.BlacklistEntry("SPE", "XMLTYPE", "RULE=R1")},
+            ("SRC", "T3"): {("DIY", "UDT"): sdr.BlacklistEntry("DIY", "UDT", "")},
         }
         filtered = sdr.collect_blacklisted_missing_tables(tv_results, blacklist)
         self.assertIn(("SRC", "T1"), filtered)
         self.assertNotIn(("SRC", "T2"), filtered)
         self.assertNotIn(("SRC", "T3"), filtered)
+
+    def test_add_blacklist_entry_merges_sources(self):
+        blacklist = {}
+        sdr.add_blacklist_entry(blacklist, "A", "T1", "SPE", "XMLTYPE", "TABLE")
+        sdr.add_blacklist_entry(blacklist, "A", "T1", "SPE", "XMLTYPE", "RULE=R1")
+        entry = blacklist[("A", "T1")][("SPE", "XMLTYPE")]
+        self.assertIn("RULE=R1", entry.source)
+        self.assertIn("TABLE", entry.source)
+        self.assertEqual(sdr.format_blacklist_source(entry.source), "RULE=R1")
+
+    def test_blacklist_mode_normalization(self):
+        self.assertEqual(sdr.normalize_blacklist_mode("rules_only"), "rules_only")
+        self.assertEqual(sdr.normalize_blacklist_mode("UNKNOWN"), "auto")
+
+    def test_load_blacklist_rules_from_file(self):
+        payload = {
+            "rules": [
+                {
+                    "id": "SAMPLE",
+                    "black_type": "SPE",
+                    "sql": "SELECT OWNER, TABLE_NAME, DATA_TYPE, 'SPE' FROM DBA_TAB_COLUMNS WHERE OWNER IN ({{owners_clause}})"
+                }
+            ]
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            handle.write(json.dumps(payload))
+            path = handle.name
+        try:
+            rules = sdr.load_blacklist_rules(path)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].rule_id, "SAMPLE")
+
+    def test_blacklist_rule_enable_disable_and_version(self):
+        rule = sdr.BlacklistRule(
+            rule_id="R1",
+            black_type="SPE",
+            sql="SELECT 1 FROM DUAL",
+            min_ob_version="4.2.5.7",
+            max_ob_version=None,
+            enabled=True,
+        )
+        enabled, reason = sdr.is_blacklist_rule_enabled(rule, set(), set(), "4.2.5.7")
+        self.assertTrue(enabled)
+        self.assertEqual(reason, "")
+
+        enabled, reason = sdr.is_blacklist_rule_enabled(rule, set(), set(), "4.2.5.6")
+        self.assertFalse(enabled)
+        self.assertEqual(reason, "below_min_version")
+
+        enabled, reason = sdr.is_blacklist_rule_enabled(rule, set(), {"R1"}, "4.2.5.7")
+        self.assertFalse(enabled)
+        self.assertEqual(reason, "in_disable_set")
+
+        enabled, reason = sdr.is_blacklist_rule_enabled(rule, {"R2"}, set(), "4.2.5.7")
+        self.assertFalse(enabled)
+        self.assertEqual(reason, "not_in_enable_set")
+
+    def test_clean_interval_partition_clause(self):
+        ddl = (
+            "CREATE TABLE T1 (ID NUMBER) PARTITION BY RANGE (DT) "
+            "INTERVAL (NUMTOYMINTERVAL(1,'MONTH')) "
+            "(PARTITION P1 VALUES LESS THAN (TO_DATE('2024-01-01','YYYY-MM-DD')))"
+        )
+        cleaned = sdr.clean_interval_partition_clause(ddl)
+        self.assertNotIn("INTERVAL", cleaned.upper())
+
+    def test_parse_interval_expression(self):
+        spec = sdr.parse_interval_expression("NUMTOYMINTERVAL(1,'MONTH')")
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec.value, 1)
+        self.assertEqual(spec.unit, "MONTH")
+
+        spec = sdr.parse_interval_expression("NUMTODSINTERVAL(7,'DAY')")
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec.value, 7)
+        self.assertEqual(spec.unit, "DAY")
+
+    def test_parse_numeric_interval_expression(self):
+        spec = sdr.parse_numeric_interval_expression("INTERVAL (1)")
+        self.assertIsNotNone(spec)
+        self.assertEqual(str(spec.value), "1")
+
+        spec = sdr.parse_numeric_interval_expression("2.5")
+        self.assertIsNotNone(spec)
+        self.assertEqual(str(spec.value), "2.5")
+
+    def test_parse_partition_high_value(self):
+        expr = "TO_DATE('2024-01-01 00:00:00', 'YYYY-MM-DD HH24:MI:SS')"
+        parsed = sdr.parse_partition_high_value(expr)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.strftime("%Y-%m-%d"), "2024-01-01")
+
+    def test_parse_partition_high_value_numeric(self):
+        parsed = sdr.parse_partition_high_value_numeric("TO_NUMBER('10')")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(str(parsed), "10")
+
+        parsed = sdr.parse_partition_high_value_numeric(" 42 ")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(str(parsed), "42")
+
+    def test_generate_interval_partition_statements(self):
+        info = sdr.IntervalPartitionInfo(
+            interval_expr="NUMTOYMINTERVAL(1,'MONTH')",
+            partitioning_type="RANGE",
+            subpartitioning_type="",
+            last_partition_name="P20240101",
+            last_high_value="TO_DATE('2024-01-01','YYYY-MM-DD')",
+            last_partition_position=1,
+            partition_key_columns=["DT"],
+            existing_partition_names=set()
+        )
+        cutoff = sdr.datetime.strptime("20240401", "%Y%m%d")
+        stmts, warnings, kind = sdr.generate_interval_partition_statements(
+            info,
+            cutoff,
+            None,
+            "DATE",
+            "SCHEMA.T1"
+        )
+        self.assertFalse(warnings)
+        self.assertEqual(len(stmts), 3)
+        self.assertEqual(kind, "date")
+
+    def test_generate_numeric_interval_partition_statements(self):
+        info = sdr.IntervalPartitionInfo(
+            interval_expr="1",
+            partitioning_type="RANGE",
+            subpartitioning_type="",
+            last_partition_name="P0",
+            last_high_value="0",
+            last_partition_position=1,
+            partition_key_columns=["ID"],
+            existing_partition_names=set()
+        )
+        stmts, warnings, kind = sdr.generate_interval_partition_statements(
+            info,
+            None,
+            sdr.Decimal("3"),
+            "NUMBER",
+            "SCHEMA.T1"
+        )
+        self.assertFalse(warnings)
+        self.assertEqual(kind, "numeric")
+        self.assertEqual(len(stmts), 3)
 
     def test_format_oracle_column_type_maps_long(self):
         info_long = {"data_type": "LONG"}

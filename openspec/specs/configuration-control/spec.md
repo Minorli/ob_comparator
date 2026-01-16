@@ -152,6 +152,39 @@ The system SHALL use report_width to control report rendering width.
 - **WHEN** report_width is missing or invalid
 - **THEN** the system defaults to 160 columns
 
+### Requirement: Report detail mode
+The system SHALL honor report_detail_mode to control whether detailed sections are embedded or split into separate files.
+
+#### Scenario: Split mode
+- **WHEN** report_detail_mode is set to split
+- **THEN** detailed mismatch outputs are exported to *_detail_<timestamp>.txt files
+
+#### Scenario: Summary mode
+- **WHEN** report_detail_mode is set to summary
+- **THEN** the main report omits detail sections and no detail files are exported
+
+### Requirement: View compatibility rule overrides
+The system SHALL load view compatibility rules from view_compat_rules_path when provided, otherwise use built-in defaults.
+
+#### Scenario: External rule file provided
+- **WHEN** view_compat_rules_path points to a readable JSON file
+- **THEN** the system merges the provided rules into the built-in defaults
+
+#### Scenario: Missing rule file
+- **WHEN** view_compat_rules_path is empty or unreadable
+- **THEN** the system uses built-in view compatibility rules and logs a warning if the path is invalid
+
+### Requirement: View DBLINK policy
+The system SHALL honor view_dblink_policy to decide whether DBLINK usage in VIEW definitions is allowed.
+
+#### Scenario: DBLINK blocked
+- **WHEN** view_dblink_policy is block
+- **THEN** VIEW definitions with @ are marked unsupported
+
+#### Scenario: DBLINK allowed
+- **WHEN** view_dblink_policy is allow
+- **THEN** VIEW definitions with @ are not blocked solely due to DBLINK usage
+
 ### Requirement: Trigger list path validation
 The system SHALL validate trigger_list paths during initialization and warn when the list is missing.
 

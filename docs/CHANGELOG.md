@@ -3,13 +3,26 @@
 本文件记录 OceanBase Comparator Toolkit 的重要变更。
 
 ## [未发布]
-- 扩展对象校验支持并发与时间间隔进度日志，新增 extra_check_workers/extra_check_chunk_size/extra_check_progress_interval。
-- 新增 synonym_fixup_scope，可选择仅生成 PUBLIC 同义词或包含私有同义词的修补脚本。
-- 新增 report_dir_layout（per_run/flat），支持每次运行独立报告目录。
-- 新增 sequence_remap_policy，控制序列目标 schema 推导策略。
-- 新增 trigger_qualify_schema，触发器 DDL 强制补全 schema 前缀并重写引用对象。
-- 迁移 OMS 缺失规则目录更名为 missed_tables_views_for_OMS。
-- 新增 fixup 跳过原因汇总输出，便于解释索引修补数量差异。
+
+## [0.9.8] - 2026-01-09
+
+### 新增
+- 触发器状态对比：新增 VALID/INVALID + ENABLED/DISABLED 差异输出，统一到 trigger_status_report.txt。
+- 不支持/阻断对象分类：缺失对象新增支持状态统计与明细输出（unsupported_objects_detail_*）。
+- VIEW 兼容规则：识别 SYS.OBJ$、DBLINK、缺失系统视图等场景并给出原因。
+- 报告拆分模式：新增 report_detail_mode=full/split/summary 控制主报告体积与明细输出。
+- Fixup 分流目录：tables_unsupported/ 与 unsupported/ 输出不支持对象 DDL（默认不执行）。
+
+### 变更
+- OMS 缺失规则输出自动排除不支持/阻断的 TABLE/VIEW。
+- 检查汇总新增“不支持/阻断”列，主报告更易定位需改造对象。
+- run_fixup 默认跳过 tables_unsupported/ 与 unsupported/ 目录。
+
+### 修复
+- 触发器状态对比补充 object_statuses，避免 INVALID 触发器漏报。
+
+### 归档
+- 扩展对象并发校验开关、synonym_fixup_scope、report_dir_layout、sequence_remap_policy、trigger_qualify_schema、missed_tables_views_for_OMS 与 fixup 跳过汇总在本版本统一整理归档。
 
 ## [0.9.7] - 2026-01-08
 

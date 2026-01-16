@@ -42,6 +42,11 @@ report_dir              = main_reports
 #   flat    -> 输出到 report_dir 根目录（旧行为）
 #   per_run -> 每次运行输出到 report_dir/run_<timestamp>（默认）
 report_dir_layout       = per_run
+# 报告内容模式：
+#   full   -> 主报告包含全部明细
+#   split  -> 主报告仅概要，细节拆分到多个 *_detail_*.txt（默认）
+#   summary-> 仅输出概要，不生成细节文件
+report_detail_mode      = split
 # 日志目录与级别（日志文件与控制台输出）
 # log_level 可选值：DEBUG/INFO/WARNING/ERROR/CRITICAL
 log_dir                 = logs
@@ -68,6 +73,13 @@ dbcat_chunk_size        = 150
 # 是否在对比后生成修复脚本（dbcat 抽取，VIEW 走 DBMS_METADATA）
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 generate_fixup          = true
+# interval 分区补齐脚本（默认关闭）
+# generate_interval_partition_fixup: true/false
+# interval_partition_cutoff: 截止日期，格式 YYYYMMDD（默认 20280301）
+generate_interval_partition_fixup = false
+interval_partition_cutoff = 20280301
+# interval_partition_cutoff_numeric: 数值型 interval 分区补齐上限（仅数值分区键使用），如 100000
+interval_partition_cutoff_numeric =
 # 是否生成授权脚本并附加到修补 DDL（依赖于源端权限/依赖推导）
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 generate_grants         = true
@@ -100,7 +112,7 @@ fixup_types             =
 #   public_only -> 仅生成 PUBLIC 同义词
 synonym_fixup_scope     = all
 # 可选：触发器清单过滤（每行 SCHEMA.TRIGGER_NAME）
-# 配置后仅生成列表内触发器脚本，并输出 report_dir/trigger_miss.txt 记录无效/不存在/非缺失项
+# 配置后仅生成列表内触发器脚本，并输出 report_dir/trigger_status_report.txt 记录清单与状态差异
 trigger_list            =
 # 触发器 DDL 是否强制补全 schema 前缀 (true/false)
 trigger_qualify_schema  = true
@@ -127,6 +139,21 @@ print_dependency_chains = true
 # 是否比对表/列注释 (DBA_TAB_COMMENTS / DBA_COL_COMMENTS)，若元数据权限不足可设为 false
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 check_comments          = true
+# 黑名单规则来源：
+#   auto       -> TMP_BLACK_TABLE + 规则文件（默认）
+#   table_only -> 仅使用 TMP_BLACK_TABLE
+#   rules_only -> 仅使用规则文件
+#   disabled   -> 关闭黑名单过滤
+blacklist_mode          = auto
+# 黑名单规则文件（JSON），留空使用内置默认
+# 注意：blacklist_mode=auto/rules_only 时需保证该文件随工具一同部署，否则规则会被跳过
+blacklist_rules_path    = blacklist_rules.json
+# 仅启用指定规则（逗号分隔，留空表示全量）
+blacklist_rules_enable  =
+# 禁用指定规则（逗号分隔）
+blacklist_rules_disable =
+# LOB 体积阈值（MB）；超过阈值则标记为 LOB_OVERSIZE
+blacklist_lob_max_mb    = 512
 # 是否启用 schema 推导（一对多场景下用于非表对象）
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 infer_schema_mapping    = true
@@ -149,6 +176,12 @@ ddl_hint_allowlist      =
 ddl_hint_denylist       =
 # 额外允许 hint 文件（每行一个，# 开头视为注释）
 ddl_hint_allowlist_file =
+# 视图兼容性规则 JSON 路径（可选，留空使用内置规则）
+view_compat_rules_path  =
+# 视图 DBLINK 处理策略：
+#   block -> 遇到 @ 视为不支持
+#   allow -> 允许 DBLINK
+view_dblink_policy      = block
 # 是否清洗 PL/SQL DDL 中的全角标点（默认开启，避免目标端解析失败）
 ddl_punct_sanitize      = true
 # DDL hint 清洗策略:
@@ -189,9 +222,3 @@ cache_parallel_workers  = 1
 dbcat_cleanup_run_dirs  = true
 # JAVA_HOME 路径（dbcat 需要）
 java_home               =
-# dbcat_no_cal_dep: 禁用依赖计算以加速抽取（true/false）
-dbcat_no_cal_dep        = false
-# dbcat_query_meta_thread: 元数据查询线程数（dbcat 参数 --query-meta-thread）
-dbcat_query_meta_thread =
-# dbcat_progress_interval: dbcat 长时间运行时的进度心跳间隔（秒，<=0 关闭）
-dbcat_progress_interval = 15

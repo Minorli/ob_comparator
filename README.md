@@ -1,6 +1,6 @@
 # OceanBase Comparator Toolkit
 
-> 当前版本：V0.9.7  
+> 当前版本：V0.9.8  
 > 面向 Oracle → OceanBase (Oracle 模式) 的结构一致性校验与修补脚本生成工具  
 > 核心理念：一次转储、本地对比、脚本审计优先
 
@@ -11,7 +11,8 @@
 - **依赖与授权**：基于 DBA_DEPENDENCIES/DBA_*_PRIVS 生成缺失依赖与授权脚本。
 - **DDL 清洗与兼容**：VIEW DDL 走 DBMS_METADATA，PL/SQL 语法清洗与 Hint 过滤。
 - **修补脚本执行器**：支持 smart-order、迭代重试、VIEW 链路自动修复、错误报告。
-- **报告体系**：Rich 控制台 + 纯文本快照 + 关键清单输出。
+- **报告体系**：Rich 控制台 + 纯文本快照 + 细节分拆报告（可配置）。
+- **不支持对象识别**：黑名单/依赖阻断对象单独统计与分流输出。
 
 ## 适用场景
 - Oracle → OceanBase 迁移后的结构一致性审计
@@ -60,6 +61,7 @@ synonym_fixup_scope = all
 sequence_remap_policy = source_only
 trigger_qualify_schema = true
 report_dir_layout = per_run
+report_detail_mode = split
 oracle_client_lib_dir = /opt/instantclient_19_28
 dbcat_bin = /opt/dbcat-2.5.0-SNAPSHOT
 dbcat_output_dir = dbcat_output
@@ -124,11 +126,25 @@ python3 run_fixup.py --view-chain-autofix
 - `main_reports/run_<ts>/VIEWs_chain_<ts>.txt`：VIEW 依赖链报告
 - `main_reports/run_<ts>/blacklist_tables.txt`：黑名单表清单
 - `main_reports/run_<ts>/filtered_grants.txt`：过滤授权清单
+- `main_reports/run_<ts>/trigger_status_report.txt`：触发器清单/状态差异报告
+- `main_reports/run_<ts>/missing_objects_detail_<ts>.txt`：缺失对象支持性明细（report_detail_mode=split）
+- `main_reports/run_<ts>/unsupported_objects_detail_<ts>.txt`：不支持/阻断对象明细（report_detail_mode=split）
+- `main_reports/run_<ts>/extra_mismatch_detail_<ts>.txt`：扩展对象差异明细（report_detail_mode=split）
+- `main_reports/run_<ts>/dependency_detail_<ts>.txt`：依赖差异明细（report_detail_mode=split）
+- `*_detail_*.txt` 明细文件采用 `|` 分隔，并包含 `# total/# 字段说明` 头，格式与 `package_compare` 一致，便于 Excel 直接分隔导入。
 - `main_reports/run_<ts>/missed_tables_views_for_OMS/`：OMS 缺失 TABLE/VIEW 规则
 - `fixup_scripts/`：修补脚本输出（执行前需人工审核）
 - `fixup_scripts/grants_miss/`：缺失授权脚本
+- `fixup_scripts/tables_unsupported/`：不支持 TABLE 的 DDL（默认不执行）
+- `fixup_scripts/unsupported/`：不支持/阻断对象 DDL（默认不执行）
 - `fixup_scripts/view_chain_plans/`：VIEW 链路修复计划
 - `fixup_scripts/errors/`：run_fixup 错误报告
+
+## 黑名单规则
+- 默认启用 `blacklist_rules.json` 规则并尝试读取 `OMS_USER.TMP_BLACK_TABLE`（`blacklist_mode=auto`）。
+- 可通过 `blacklist_mode` 切换来源（table_only/rules_only/disabled），或用 `blacklist_rules_enable/disable` 精细控制规则。
+- LOB 体积阈值由 `blacklist_lob_max_mb` 控制（默认 512MB）。
+- 当使用 `blacklist_mode=auto` 或 `rules_only` 时，请确保 `blacklist_rules.json` 随工具部署；缺失时规则会被跳过。
 
 ## 常见配置片段
 **只看表结构，不生成修复：**

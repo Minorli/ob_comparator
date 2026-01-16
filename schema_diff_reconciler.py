@@ -16,7 +16,7 @@
 
 """
 
-数据库对象对比工具 (V0.9.7 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
+数据库对象对比工具 (V0.9.8 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -33,7 +33,7 @@
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.9.7 核心)：
+3. 性能架构 (V0.9.8 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          DBA_OBJECTS
@@ -71,7 +71,7 @@ import math
 import re
 from contextlib import contextmanager
 
-__version__ = "0.9.7"
+__version__ = "0.9.8"
 __author__ = "Minor Li"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
 REPO_ISSUES_URL = f"{REPO_URL}/issues"
@@ -83,10 +83,11 @@ import uuid
 import shutil
 import time
 import tempfile
-from collections import defaultdict, OrderedDict
-from datetime import datetime
+from collections import defaultdict, OrderedDict, deque
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Dict, Set, List, Tuple, Optional, NamedTuple, Callable
+from typing import Dict, Set, List, Tuple, Optional, NamedTuple, Callable, Union
 import textwrap
 
 # 尝试导入 oracledb，如果失败则提示安装
@@ -303,8 +304,14 @@ DependencyGraph = Dict[DependencyNode, Set[DependencyNode]]
 # 递归推导时每个节点的“最终引用表”缓存
 TransitiveTableCache = Dict[DependencyNode, Set[str]]
 RemapConflictMap = Dict[Tuple[str, str], str]  # {(SRC_FULL, TYPE): reason}
-BlacklistEntry = Tuple[str, str]  # (BLACK_TYPE, DATA_TYPE)
-BlacklistTableMap = Dict[Tuple[str, str], Set[BlacklistEntry]]  # (OWNER, TABLE) -> {(BLACK_TYPE, DATA_TYPE)}
+class BlacklistEntry(NamedTuple):
+    black_type: str
+    data_type: str
+    source: str = ""
+
+
+BlacklistEntryKey = Tuple[str, str]
+BlacklistTableMap = Dict[Tuple[str, str], Dict[BlacklistEntryKey, BlacklistEntry]]
 class BlacklistReportRow(NamedTuple):
     schema: str
     table: str
@@ -313,6 +320,49 @@ class BlacklistReportRow(NamedTuple):
     reason: str
     status: str
     detail: str
+
+
+class ObjectSupportReportRow(NamedTuple):
+    obj_type: str
+    src_full: str
+    tgt_full: str
+    support_state: str
+    reason_code: str
+    reason: str
+    dependency: str
+    action: str
+    detail: str
+
+
+class ViewCompatResult(NamedTuple):
+    support_state: str
+    reason_code: str
+    reason: str
+    detail: str
+    cleaned_ddl: str
+    rewrite_notes: List[str]
+
+
+class SupportClassificationResult(NamedTuple):
+    support_state_map: Dict[Tuple[str, str], ObjectSupportReportRow]
+    missing_detail_rows: List[ObjectSupportReportRow]
+    unsupported_rows: List[ObjectSupportReportRow]
+    missing_support_counts: Dict[str, Dict[str, int]]
+    extra_blocked_counts: Dict[str, int]
+    unsupported_table_keys: Set[Tuple[str, str]]
+    unsupported_view_keys: Set[Tuple[str, str]]
+    view_compat_map: Dict[Tuple[str, str], ViewCompatResult]
+
+
+class IntervalPartitionInfo(NamedTuple):
+    interval_expr: str
+    partitioning_type: str
+    subpartitioning_type: str
+    last_partition_name: str
+    last_high_value: str
+    last_partition_position: int
+    partition_key_columns: List[str]
+    existing_partition_names: Set[str]
 
 
 class DdlCleanReportRow(NamedTuple):
@@ -381,7 +431,7 @@ class OracleMetadata(NamedTuple):
     table_comments: Dict[Tuple[str, str], Optional[str]]   # (OWNER, TABLE_NAME) -> COMMENT
     column_comments: Dict[Tuple[str, str], Dict[str, Optional[str]]]  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: COMMENT}
     comments_complete: bool                                # 注释元数据是否加载完成
-    blacklist_tables: BlacklistTableMap                    # (OWNER, TABLE) -> {(BLACK_TYPE, DATA_TYPE)}
+    blacklist_tables: BlacklistTableMap                    # (OWNER, TABLE) -> {(BLACK_TYPE, DATA_TYPE): entry}
     object_privileges: List["OracleObjectPrivilege"]         # DBA_TAB_PRIVS (对象权限)
     sys_privileges: List["OracleSysPrivilege"]               # DBA_SYS_PRIVS (系统权限)
     role_privileges: List["OracleRolePrivilege"]             # DBA_ROLE_PRIVS (角色授权)
@@ -392,6 +442,7 @@ class OracleMetadata(NamedTuple):
     package_errors: Dict[Tuple[str, str, str], "PackageErrorInfo"]  # (OWNER, NAME, TYPE) -> error summary
     package_errors_complete: bool                            # 源端错误信息是否完整
     partition_key_columns: Dict[Tuple[str, str], List[str]]   # (OWNER, TABLE_NAME) -> [PARTITION_COLS...]
+    interval_partitions: Dict[Tuple[str, str], IntervalPartitionInfo]  # (OWNER, TABLE) -> interval info
 
 
 class DependencyRecord(NamedTuple):
@@ -569,6 +620,26 @@ BLACKLIST_REASON_BY_TYPE: Dict[str, str] = {
     'LONG': "LONG/LONG RAW 需人工转换为 CLOB/BLOB",
     'DBLINK': "源表可能是 IOT 表或者外部表，不需要生成DDL"
 }
+BLACKLIST_MODES: Set[str] = {"auto", "table_only", "rules_only", "disabled"}
+DEFAULT_BLACKLIST_RULES_PATH = str(Path(__file__).resolve().parent / "blacklist_rules.json")
+
+SUPPORT_STATE_SUPPORTED = "SUPPORTED"
+SUPPORT_STATE_UNSUPPORTED = "UNSUPPORTED"
+SUPPORT_STATE_BLOCKED = "BLOCKED"
+
+VIEW_UNSUPPORTED_DEFAULT_VIEWS: Set[str] = {
+    "DBA_DATA_FILES",
+    "ALL_RULES",
+}
+VIEW_PRIVILEGE_DEFAULT_VIEWS: Set[str] = {
+    "DBA_JOBS",
+    "DBA_OBJECTS",
+    "DBA_SOURCE",
+}
+VIEW_UNSUPPORTED_PATTERNS: Tuple[str, ...] = (
+    r'(?<!\w)"?SYS"?\s*\.\s*"?OBJ\$"?(?!\w)',
+)
+VIEW_DBLINK_POLICIES: Set[str] = {"block", "allow"}
 
 # 主对象中除 TABLE 外均做存在性验证
 PRIMARY_EXISTENCE_ONLY_TYPES: Tuple[str, ...] = tuple(
@@ -649,11 +720,120 @@ def normalize_black_data_type(value: Optional[str]) -> str:
     return str(value).strip().upper()
 
 
+def normalize_blacklist_mode(value: Optional[str]) -> str:
+    mode = (value or "auto").strip().lower()
+    if mode not in BLACKLIST_MODES:
+        log.warning("未知 blacklist_mode=%s，回退为 auto。", value)
+        return "auto"
+    return mode
+
+
+def merge_blacklist_sources(existing: str, incoming: str) -> str:
+    parts: List[str] = []
+    for raw in (existing, incoming):
+        if not raw:
+            continue
+        for item in str(raw).split(","):
+            token = item.strip()
+            if token:
+                parts.append(token)
+    merged: List[str] = []
+    for item in parts:
+        if item not in merged:
+            merged.append(item)
+    return ", ".join(merged)
+
+
+def format_blacklist_source(source: str) -> str:
+    if not source:
+        return ""
+    parts = [item.strip() for item in str(source).split(",") if item.strip()]
+    parts = [item for item in parts if item.upper() != "TABLE"]
+    return ", ".join(parts)
+
+
+def merge_detail_parts(*parts: Optional[str]) -> str:
+    items: List[str] = []
+    for part in parts:
+        if not part:
+            continue
+        token = str(part).strip()
+        if not token or token == "-":
+            continue
+        items.append(token)
+    return "; ".join(items) if items else "-"
+
+
+def add_blacklist_entry(
+    blacklist_tables: BlacklistTableMap,
+    owner: str,
+    table: str,
+    black_type: Optional[str],
+    data_type: Optional[str],
+    source: str = ""
+) -> bool:
+    owner_u = (owner or "").strip().upper()
+    table_u = (table or "").strip().upper()
+    if not owner_u or not table_u:
+        return False
+    black_type_u = normalize_black_type(black_type) or "UNKNOWN"
+    data_type_u = normalize_black_data_type(data_type)
+    entry_key = (black_type_u, data_type_u)
+    entries = blacklist_tables.setdefault((owner_u, table_u), {})
+    existing = entries.get(entry_key)
+    merged_source = merge_blacklist_sources(existing.source if existing else "", source)
+    if existing and merged_source == existing.source:
+        return False
+    entries[entry_key] = BlacklistEntry(black_type_u, data_type_u, merged_source)
+    return True
+
+
 def blacklist_reason(black_type: Optional[str]) -> str:
     black_type_u = normalize_black_type(black_type)
     if not black_type_u:
         return "未知黑名单类型"
     return BLACKLIST_REASON_BY_TYPE.get(black_type_u, "未知黑名单类型")
+
+
+def summarize_blacklist_entries(
+    entries: Dict[BlacklistEntryKey, BlacklistEntry]
+) -> Tuple[str, str, str]:
+    """
+    汇总黑名单条目，返回 (black_type, reason, detail)。
+    """
+    if not entries:
+        return "", "", ""
+    prefer_order = [
+        "TEMPORARY_TABLE",
+        "TEMP_TABLE",
+        "SPE",
+        "DIY",
+        "LONG",
+        "LOB_OVERSIZE",
+        "DBLINK",
+    ]
+    seen_types: List[str] = []
+    detail_parts: List[str] = []
+    for (black_type, data_type), entry in entries.items():
+        bt = (black_type or "").upper()
+        dt = (data_type or "").upper()
+        if bt:
+            seen_types.append(bt)
+        detail = f"{bt}:{dt}" if bt or dt else ""
+        if entry and entry.source:
+            detail = f"{detail}({entry.source})" if detail else f"SOURCE={entry.source}"
+        if detail:
+            detail_parts.append(detail)
+    chosen = ""
+    for cand in prefer_order:
+        if cand in seen_types:
+            chosen = cand
+            break
+    if not chosen and seen_types:
+        chosen = sorted(set(seen_types))[0]
+    reason = blacklist_reason(chosen)
+    detail = "; ".join(detail_parts)
+    return chosen, reason, detail
 
 
 def is_long_type(data_type: Optional[str]) -> bool:
@@ -744,6 +924,114 @@ def parse_csv_set(raw_value: Optional[str]) -> Set[str]:
     return {item.strip().upper() for item in str(raw_value).split(',') if item.strip()}
 
 
+def parse_interval_cutoff_date(value: Optional[str]) -> Optional[datetime]:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    if not re.match(r"^\d{8}$", raw):
+        return None
+    try:
+        return datetime.strptime(raw, "%Y%m%d")
+    except ValueError:
+        return None
+
+
+def parse_interval_cutoff_numeric(value: Optional[str]) -> Optional[Decimal]:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        numeric = Decimal(raw)
+    except (InvalidOperation, ValueError):
+        return None
+    if numeric <= 0:
+        return None
+    return numeric
+
+
+class BlacklistRule(NamedTuple):
+    rule_id: str
+    black_type: str
+    sql: str
+    min_ob_version: Optional[str] = None
+    max_ob_version: Optional[str] = None
+    enabled: bool = True
+
+
+def extract_ob_version_number(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    match = re.search(r"\d+(?:\.\d+){1,3}", str(raw))
+    return match.group(0) if match else None
+
+
+def load_blacklist_rules(path_value: Optional[str]) -> List[BlacklistRule]:
+    if not path_value or not str(path_value).strip():
+        return []
+    path = Path(str(path_value).strip()).expanduser()
+    if not path.exists():
+        log.warning("blacklist_rules_path 不存在: %s", path)
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("blacklist_rules_path 解析失败: %s (%s)", path, exc)
+        return []
+
+    raw_rules: List[dict] = []
+    if isinstance(payload, list):
+        raw_rules = payload
+    elif isinstance(payload, dict):
+        raw_rules = payload.get("rules") or []
+    else:
+        log.warning("blacklist_rules_path 内容格式不支持: %s", path)
+        return []
+
+    rules: List[BlacklistRule] = []
+    for idx, raw_rule in enumerate(raw_rules, 1):
+        if not isinstance(raw_rule, dict):
+            log.warning("黑名单规则格式异常(第%s条)，已跳过。", idx)
+            continue
+        rule_id = str(raw_rule.get("id") or "").strip()
+        sql = str(raw_rule.get("sql") or "").strip()
+        if not rule_id or not sql:
+            log.warning("黑名单规则缺少 id/sql(第%s条)，已跳过。", idx)
+            continue
+        black_type = str(raw_rule.get("black_type") or "").strip().upper() or "UNKNOWN"
+        rules.append(
+            BlacklistRule(
+                rule_id=rule_id,
+                black_type=black_type,
+                sql=sql,
+                min_ob_version=str(raw_rule.get("min_ob_version") or "").strip() or None,
+                max_ob_version=str(raw_rule.get("max_ob_version") or "").strip() or None,
+                enabled=bool(raw_rule.get("enabled", True)),
+            )
+        )
+    return rules
+
+
+def is_blacklist_rule_enabled(
+    rule: BlacklistRule,
+    enable_set: Set[str],
+    disable_set: Set[str],
+    ob_version: Optional[str]
+) -> Tuple[bool, str]:
+    rule_id_u = rule.rule_id.strip().upper()
+    if not rule.enabled:
+        return False, "rule_disabled"
+    if enable_set and rule_id_u not in enable_set:
+        return False, "not_in_enable_set"
+    if disable_set and rule_id_u in disable_set:
+        return False, "in_disable_set"
+    if ob_version:
+        if rule.min_ob_version and compare_version(ob_version, rule.min_ob_version) < 0:
+            return False, "below_min_version"
+        if rule.max_ob_version and compare_version(ob_version, rule.max_ob_version) > 0:
+            return False, "above_max_version"
+    return True, ""
+
+
 def collect_fixup_config_diagnostics(
     settings: Dict,
     enabled_primary_types: Set[str],
@@ -760,7 +1048,7 @@ def collect_fixup_config_diagnostics(
 
     primary_types = set(PRIMARY_OBJECT_TYPES)
     extra_types = set(EXTRA_OBJECT_CHECK_TYPES)
-    print_only_types = set(PRINT_ONLY_PRIMARY_TYPES) | set(PACKAGE_OBJECT_TYPES)
+    print_only_types = set(PRINT_ONLY_PRIMARY_TYPES)
 
     for obj_type in sorted(fixup_types):
         if obj_type in print_only_types:
@@ -777,6 +1065,15 @@ def collect_fixup_config_diagnostics(
     trigger_list_path = settings.get("trigger_list", "").strip()
     if trigger_list_path and "TRIGGER" not in enabled_extra_types:
         diagnostics.append("trigger_list 已配置，但 check_extra_types 未启用 TRIGGER，仅进行清单格式校验。")
+
+    if settings.get("generate_interval_partition_fixup"):
+        if "TABLE" not in enabled_primary_types:
+            diagnostics.append("已启用 interval 分区补齐，但 check_primary_types 未启用 TABLE，相关脚本将无法生成。")
+        if not settings.get("interval_partition_cutoff_date"):
+            diagnostics.append("interval_partition_cutoff 非法，interval 分区补齐将被跳过。")
+        cutoff_numeric_raw = (settings.get("interval_partition_cutoff_numeric") or "").strip()
+        if cutoff_numeric_raw and not settings.get("interval_partition_cutoff_numeric_value"):
+            diagnostics.append("interval_partition_cutoff_numeric 非法，数值 interval 分区补齐将被跳过。")
 
     return diagnostics
 
@@ -843,6 +1140,79 @@ def normalize_report_dir_layout(raw_value: Optional[str]) -> str:
         log.warning("report_dir_layout=%s 不在支持范围内，将回退为 per_run。", raw_value)
         return "per_run"
     return value
+
+
+REPORT_DETAIL_MODE_VALUES = {"full", "split", "summary"}
+REPORT_DETAIL_MODE_ALIASES = {
+    "detail": "full",
+    "details": "full",
+    "all": "full",
+    "simple": "summary",
+    "lite": "summary",
+}
+
+
+def normalize_report_detail_mode(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "split"
+    value = str(raw_value).strip().lower()
+    value = REPORT_DETAIL_MODE_ALIASES.get(value, value)
+    if value not in REPORT_DETAIL_MODE_VALUES:
+        log.warning("report_detail_mode=%s 不在支持范围内，将回退为 split。", raw_value)
+        return "split"
+    return value
+
+
+def normalize_view_dblink_policy(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "block"
+    value = str(raw_value).strip().lower()
+    if value not in VIEW_DBLINK_POLICIES:
+        log.warning("view_dblink_policy=%s 不在支持范围内，将回退为 block。", raw_value)
+        return "block"
+    return value
+
+
+def load_view_compat_rules(path_value: Optional[str]) -> Dict[str, object]:
+    rules = {
+        "unsupported_views": set(VIEW_UNSUPPORTED_DEFAULT_VIEWS),
+        "privilege_views": set(VIEW_PRIVILEGE_DEFAULT_VIEWS),
+        "unsupported_patterns": list(VIEW_UNSUPPORTED_PATTERNS),
+        "compiled_patterns": [re.compile(pat, flags=re.IGNORECASE) for pat in VIEW_UNSUPPORTED_PATTERNS]
+    }
+    if not path_value or not str(path_value).strip():
+        return rules
+    path = Path(str(path_value).strip()).expanduser()
+    if not path.exists():
+        log.warning("view_compat_rules_path 不存在: %s", path)
+        return rules
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("view_compat_rules_path 解析失败: %s (%s)", path, exc)
+        return rules
+
+    def _merge_set(key: str, src: object) -> None:
+        if isinstance(src, list):
+            for item in src:
+                if item:
+                    rules[key].add(str(item).strip().upper())
+
+    if isinstance(payload, dict):
+        _merge_set("unsupported_views", payload.get("unsupported_views"))
+        _merge_set("privilege_views", payload.get("privilege_views"))
+        patterns = payload.get("unsupported_patterns")
+        if isinstance(patterns, list):
+            merged = []
+            for item in patterns:
+                if item:
+                    merged.append(str(item).strip())
+            if merged:
+                rules["unsupported_patterns"] = merged
+                rules["compiled_patterns"] = [re.compile(p, flags=re.IGNORECASE) for p in merged]
+    else:
+        log.warning("view_compat_rules_path 内容格式不支持: %s", path)
+    return rules
 
 
 def normalize_hint_policy(raw_value: Optional[str]) -> str:
@@ -940,6 +1310,17 @@ class TriggerListReportRow(NamedTuple):
     detail: str
 
 
+class TriggerStatusReportRow(NamedTuple):
+    trigger_full: str
+    src_event: str
+    tgt_event: str
+    src_enabled: str
+    tgt_enabled: str
+    src_valid: str
+    tgt_valid: str
+    detail: str
+
+
 class CommentMismatch(NamedTuple):
     table: str
     table_comment: Optional[Tuple[str, str]]  # (src, tgt) when different
@@ -982,8 +1363,8 @@ class ConstraintCompareCache(NamedTuple):
 class TriggerCompareCache(NamedTuple):
     src_info_map: Dict[str, Dict[str, str]]
     tgt_info_map: Dict[str, Dict]
-    src_sig: Set[Tuple[str, str, str]]
-    tgt_sig: Set[Tuple[str, str, str]]
+    src_sig: Set[Tuple[str, str, str, str]]
+    tgt_sig: Set[Tuple[str, str, str, str]]
 
 
 class ExtraTableResult(NamedTuple):
@@ -1013,6 +1394,23 @@ def normalize_column_sequence(columns: Optional[List[str]]) -> Tuple[str, ...]:
         seen.add(col_u)
         normalized.append(col_u)
     return tuple(normalized)
+
+
+def normalize_trigger_status(value: Optional[str]) -> str:
+    status = (value or "").strip().upper()
+    return status or "UNKNOWN"
+
+
+def lookup_trigger_validity(
+    meta: Union[OracleMetadata, ObMetadata],
+    owner: str,
+    name: str
+) -> str:
+    owner_u = (owner or "").upper()
+    name_u = (name or "").upper()
+    if not owner_u or not name_u:
+        return "UNKNOWN"
+    return normalize_trigger_status(meta.object_statuses.get((owner_u, name_u, "TRIGGER")))
 
 
 def normalize_comment_text(text: Optional[str]) -> str:
@@ -1311,6 +1709,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         # 报告输出目录
         settings.setdefault('report_dir', 'main_reports')
         settings.setdefault('report_dir_layout', 'per_run')
+        settings.setdefault('report_detail_mode', 'split')
         # Oracle Instant Client 目录 (Thick Mode)
         settings.setdefault('oracle_client_lib_dir', '')
         # dbcat 相关配置
@@ -1342,12 +1741,22 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('check_dependencies', 'true')
         settings.setdefault('print_dependency_chains', 'true')
         settings.setdefault('check_comments', 'true')
+        settings.setdefault('generate_interval_partition_fixup', 'false')
+        settings.setdefault('interval_partition_cutoff', '20280301')
+        settings.setdefault('interval_partition_cutoff_numeric', '')
+        settings.setdefault('blacklist_mode', 'auto')
+        settings.setdefault('blacklist_rules_path', '')
+        settings.setdefault('blacklist_rules_enable', '')
+        settings.setdefault('blacklist_rules_disable', '')
+        settings.setdefault('blacklist_lob_max_mb', '512')
         settings.setdefault('infer_schema_mapping', 'true')
         settings.setdefault('ddl_punct_sanitize', 'true')
         settings.setdefault('ddl_hint_policy', DDL_HINT_POLICY_DEFAULT)
         settings.setdefault('ddl_hint_allowlist', '')
         settings.setdefault('ddl_hint_denylist', '')
         settings.setdefault('ddl_hint_allowlist_file', '')
+        settings.setdefault('view_compat_rules_path', '')
+        settings.setdefault('view_dblink_policy', 'block')
         settings.setdefault('dbcat_chunk_size', '150')
         settings.setdefault('fixup_workers', '')
         settings.setdefault('progress_log_interval', '10')
@@ -1392,6 +1801,45 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             settings.get('check_comments', 'true'),
             True
         )
+        settings['generate_interval_partition_fixup'] = parse_bool_flag(
+            settings.get('generate_interval_partition_fixup', 'false'),
+            False
+        )
+        cutoff_raw = (settings.get('interval_partition_cutoff', '20280301') or '').strip()
+        settings['interval_partition_cutoff'] = cutoff_raw or '20280301'
+        settings['interval_partition_cutoff_date'] = parse_interval_cutoff_date(
+            settings.get('interval_partition_cutoff', '20280301')
+        )
+        cutoff_numeric_raw = (settings.get('interval_partition_cutoff_numeric', '') or '').strip()
+        settings['interval_partition_cutoff_numeric'] = cutoff_numeric_raw
+        settings['interval_partition_cutoff_numeric_value'] = parse_interval_cutoff_numeric(
+            cutoff_numeric_raw
+        )
+        if settings['generate_interval_partition_fixup'] and not settings['interval_partition_cutoff_date']:
+            log.warning(
+                "interval_partition_cutoff=%s 非法，将跳过 interval 分区补齐脚本生成。",
+                settings.get('interval_partition_cutoff')
+            )
+        if (
+            settings['generate_interval_partition_fixup']
+            and cutoff_numeric_raw
+            and not settings.get('interval_partition_cutoff_numeric_value')
+        ):
+            log.warning(
+                "interval_partition_cutoff_numeric=%s 非法，将跳过数值 interval 分区补齐脚本生成。",
+                cutoff_numeric_raw
+            )
+        settings['blacklist_mode'] = normalize_blacklist_mode(settings.get('blacklist_mode', 'auto'))
+        settings['blacklist_rules_enable_set'] = parse_csv_set(settings.get('blacklist_rules_enable', ''))
+        settings['blacklist_rules_disable_set'] = parse_csv_set(settings.get('blacklist_rules_disable', ''))
+        rules_path = (settings.get('blacklist_rules_path') or "").strip()
+        settings['blacklist_rules_path'] = rules_path or DEFAULT_BLACKLIST_RULES_PATH
+        try:
+            settings['blacklist_lob_max_mb'] = int(settings.get('blacklist_lob_max_mb', '512'))
+        except (TypeError, ValueError):
+            settings['blacklist_lob_max_mb'] = 512
+        if settings['blacklist_lob_max_mb'] <= 0:
+            settings['blacklist_lob_max_mb'] = 512
         settings['enable_ddl_punct_sanitize'] = parse_bool_flag(
             settings.get('ddl_punct_sanitize', 'true'),
             True
@@ -1407,6 +1855,15 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         )
         settings['report_dir_layout'] = normalize_report_dir_layout(
             settings.get('report_dir_layout', 'per_run')
+        )
+        settings['report_detail_mode'] = normalize_report_detail_mode(
+            settings.get('report_detail_mode', 'split')
+        )
+        settings['view_dblink_policy'] = normalize_view_dblink_policy(
+            settings.get('view_dblink_policy', 'block')
+        )
+        settings['view_compat_rules'] = load_view_compat_rules(
+            settings.get('view_compat_rules_path', '')
         )
         settings['sequence_remap_policy'] = normalize_sequence_remap_policy(
             settings.get('sequence_remap_policy', 'source_only')
@@ -1521,6 +1978,14 @@ def validate_runtime_paths(settings: Dict, ob_cfg: ObConfig) -> None:
         warnings.append(
             f"trigger_list 文件不存在: {trigger_list_path}（将记录在报告中并回退全量触发器生成）。"
         )
+
+    blacklist_mode = settings.get('blacklist_mode', 'auto')
+    if blacklist_mode in ("auto", "rules_only"):
+        rules_path = settings.get('blacklist_rules_path', '').strip()
+        if rules_path and not Path(rules_path).expanduser().exists():
+            warnings.append(
+                f"blacklist_rules_path 不存在: {rules_path}（将跳过黑名单规则）。"
+            )
 
     # dbcat / JAVA_HOME 仅在生成 fixup 时提示
     generate_fixup_enabled = settings.get('generate_fixup', 'true').strip().lower() in ('true', '1', 'yes')
@@ -1657,6 +2122,21 @@ def run_config_wizard(config_path: Path) -> None:
         if normalized in REPORT_DIR_LAYOUT_VALUES:
             return True, ""
         return False, "仅支持 flat/per_run"
+
+    def _validate_report_detail_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = REPORT_DETAIL_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in REPORT_DETAIL_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 full/split/summary"
+
+    def _validate_view_dblink_policy(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        if val.strip().lower() in VIEW_DBLINK_POLICIES:
+            return True, ""
+        return False, "仅支持 block/allow"
 
     def _bool_transform(val: str) -> str:
         v = val.strip().lower()
@@ -1891,6 +2371,14 @@ def run_config_wizard(config_path: Path) -> None:
     )
     _prompt_field(
         "SETTINGS",
+        "report_detail_mode",
+        "报告内容模式 (full/split/summary)",
+        default=cfg.get("SETTINGS", "report_detail_mode", fallback="split"),
+        validator=_validate_report_detail_mode,
+        transform=normalize_report_detail_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
         "dbcat_output_dir",
         "dbcat 输出缓存目录",
         default=cfg.get("SETTINGS", "dbcat_output_dir", fallback="dbcat_output"),
@@ -1908,6 +2396,20 @@ def run_config_wizard(config_path: Path) -> None:
         "dbcat CLI 超时（秒）",
         default=cfg.get("SETTINGS", "cli_timeout", fallback="600"),
         validator=_validate_positive_int,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "view_dblink_policy",
+        "视图 DBLINK 处理策略 (block/allow)",
+        default=cfg.get("SETTINGS", "view_dblink_policy", fallback="block"),
+        validator=_validate_view_dblink_policy,
+        transform=normalize_view_dblink_policy,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "view_compat_rules_path",
+        "视图兼容性规则 JSON 路径 (可选)",
+        default=cfg.get("SETTINGS", "view_compat_rules_path", fallback=""),
     )
 
     # 只有生成 fixup 时才校验 dbcat/JAVA_HOME
@@ -2044,6 +2546,21 @@ def build_trigger_full_set(
             if trg_owner and name_u:
                 full_set.add(f"{trg_owner}.{name_u}")
     return full_set
+
+
+def build_trigger_full_map(
+    triggers: Dict[Tuple[str, str], Dict[str, Dict]]
+) -> Dict[str, Dict]:
+    """将元数据中的触发器转换为 OWNER.TRIGGER_NAME -> info 映射。"""
+    full_map: Dict[str, Dict] = {}
+    for (owner, _), trg_map in triggers.items():
+        owner_u = (owner or "").upper()
+        for trg_name, info in (trg_map or {}).items():
+            trg_owner = (info.get("owner") or owner_u).upper()
+            name_u = (trg_name or "").upper()
+            if trg_owner and name_u:
+                full_map[f"{trg_owner}.{name_u}"] = info
+    return full_map
 
 
 def collect_missing_trigger_mappings(
@@ -2222,6 +2739,367 @@ def build_trigger_list_report(
     summary["not_found"] = not_found
     summary["not_missing"] = not_missing
     return rows, summary
+
+
+def collect_trigger_status_rows(
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata,
+    full_object_mapping: FullObjectMapping
+) -> List[TriggerStatusReportRow]:
+    """
+    收集两端触发器的启用/有效性/事件差异明细。
+    仅对源端存在且目标端存在的触发器输出差异行。
+    """
+    rows: List[TriggerStatusReportRow] = []
+    src_map = build_trigger_full_map(oracle_meta.triggers or {})
+    tgt_map = build_trigger_full_map(ob_meta.triggers or {})
+    if not src_map or not tgt_map:
+        return rows
+
+    for src_full, src_info in src_map.items():
+        mapped = get_mapped_target(full_object_mapping, src_full, 'TRIGGER') or src_full
+        mapped_u = mapped.upper()
+        tgt_info = tgt_map.get(mapped_u)
+        if not tgt_info:
+            continue
+        if "." not in src_full or "." not in mapped_u:
+            continue
+        src_owner, src_name = src_full.split(".", 1)
+        tgt_owner, tgt_name = mapped_u.split(".", 1)
+        s_event = (src_info.get("event") or "").strip()
+        t_event = (tgt_info.get("event") or "").strip()
+        s_enabled = normalize_trigger_status(src_info.get("status"))
+        t_enabled = normalize_trigger_status(tgt_info.get("status"))
+        s_valid = lookup_trigger_validity(oracle_meta, src_owner, src_name)
+        t_valid = lookup_trigger_validity(ob_meta, tgt_owner, tgt_name)
+        if s_event == t_event and s_enabled == t_enabled and s_valid == t_valid:
+            continue
+        diffs: List[str] = []
+        if s_event != t_event:
+            diffs.append("EVENT")
+        if s_enabled != t_enabled:
+            diffs.append("ENABLED")
+        if s_valid != t_valid:
+            diffs.append("VALID")
+        rows.append(TriggerStatusReportRow(
+            trigger_full=mapped_u,
+            src_event=s_event,
+            tgt_event=t_event,
+            src_enabled=s_enabled,
+            tgt_enabled=t_enabled,
+            src_valid=s_valid,
+            tgt_valid=t_valid,
+            detail=",".join(diffs) if diffs else "-"
+        ))
+    return rows
+
+
+def build_blocked_dependency_map(
+    dependency_graph: Optional[DependencyGraph],
+    unsupported_nodes: Set[DependencyNode],
+    source_objects: Optional[SourceObjectMap] = None,
+    object_parent_map: Optional["ObjectParentMap"] = None
+) -> Dict[DependencyNode, Set[DependencyNode]]:
+    """
+    从不支持对象集合出发，沿依赖反向传播，构建被阻断的对象映射。
+    """
+    if not dependency_graph or not unsupported_nodes:
+        return {}
+
+    reverse_graph: Dict[DependencyNode, Set[DependencyNode]] = defaultdict(set)
+    for dep_node, refs in dependency_graph.items():
+        for ref_node in refs:
+            reverse_graph[ref_node].add(dep_node)
+
+    if object_parent_map:
+        for dep_full, parent_full in object_parent_map.items():
+            if not dep_full or not parent_full:
+                continue
+            dep_full_u = dep_full.upper()
+            parent_full_u = parent_full.upper()
+            dep_types = set()
+            if source_objects:
+                dep_types = {t.upper() for t in source_objects.get(dep_full_u, set()) if t}
+            if not dep_types:
+                dep_types = {"TRIGGER"}
+            for dep_type in dep_types:
+                reverse_graph[(parent_full_u, "TABLE")].add((dep_full_u, dep_type))
+
+    blocked_by: Dict[DependencyNode, Set[DependencyNode]] = defaultdict(set)
+    queue = deque(unsupported_nodes)
+    visited: Set[DependencyNode] = set(unsupported_nodes)
+
+    while queue:
+        node = queue.popleft()
+        for dep in reverse_graph.get(node, set()):
+            if dep in unsupported_nodes:
+                continue
+            blocked_by[dep].add(node)
+            if dep not in visited:
+                visited.add(dep)
+                queue.append(dep)
+
+    return dict(blocked_by)
+
+
+def classify_missing_objects(
+    ora_cfg: OraConfig,
+    settings: Dict,
+    tv_results: ReportResults,
+    extra_results: ExtraCheckResults,
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata,
+    full_object_mapping: FullObjectMapping,
+    source_objects: SourceObjectMap,
+    dependency_graph: Optional[DependencyGraph],
+    object_parent_map: Optional["ObjectParentMap"],
+    table_target_map: Dict[Tuple[str, str], Tuple[str, str]],
+    synonym_meta_map: Dict[Tuple[str, str], SynonymMeta]
+) -> SupportClassificationResult:
+    """
+    对缺失对象进行支持性分类，并输出支持/不支持/被阻断的统计与明细。
+    """
+    support_state_map: Dict[Tuple[str, str], ObjectSupportReportRow] = {}
+    missing_detail_rows: List[ObjectSupportReportRow] = []
+    unsupported_rows: List[ObjectSupportReportRow] = []
+    missing_support_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: {"supported": 0, "unsupported": 0, "blocked": 0})
+    extra_blocked_counts: Dict[str, int] = defaultdict(int)
+    unsupported_table_keys: Set[Tuple[str, str]] = set()
+    unsupported_view_keys: Set[Tuple[str, str]] = set()
+
+    view_compat_map: Dict[Tuple[str, str], ViewCompatResult] = {}
+
+    view_rules = settings.get("view_compat_rules") or {}
+    dblink_policy = settings.get("view_dblink_policy", "block")
+
+    missing_items = tv_results.get("missing", []) or []
+    missing_views: List[Tuple[str, str]] = []
+    for obj_type, _tgt_name, src_name in missing_items:
+        if (obj_type or "").upper() != "VIEW":
+            continue
+        if "." not in src_name:
+            continue
+        src_schema, src_obj = src_name.split(".", 1)
+        missing_views.append((src_schema.upper(), src_obj.upper()))
+
+    view_ddl_map: Dict[Tuple[str, str], str] = {}
+    if missing_views:
+        view_ddl_map = oracle_get_views_ddl_batch(ora_cfg, missing_views)
+        missing_ddl_keys = [key for key in missing_views if key not in view_ddl_map]
+        if missing_ddl_keys:
+            try:
+                with oracledb.connect(
+                    user=ora_cfg['user'],
+                    password=ora_cfg['password'],
+                    dsn=ora_cfg['dsn']
+                ) as ora_conn:
+                    for schema, view_name in missing_ddl_keys:
+                        view_text = oracle_get_view_text(ora_conn, schema, view_name)
+                        if view_text:
+                            ddl = build_view_ddl_from_text(schema, view_name, *view_text)
+                            if ddl:
+                                view_ddl_map[(schema, view_name)] = ddl
+            except Exception as exc:
+                log.warning("[VIEW] 读取 DBA_VIEWS 失败，将跳过部分视图兼容性分析: %s", exc)
+
+    for schema, view_name in missing_views:
+        ddl = view_ddl_map.get((schema, view_name))
+        view_compat_map[(schema, view_name)] = analyze_view_compatibility(
+            ddl,
+            view_rules,
+            dblink_policy
+        )
+
+    unsupported_nodes: Set[DependencyNode] = set()
+    unsupported_table_map: Dict[str, Tuple[str, str, str]] = {}
+    for (schema, table), entries in (oracle_meta.blacklist_tables or {}).items():
+        black_type, reason, detail = summarize_blacklist_entries(entries)
+        full = f"{schema.upper()}.{table.upper()}"
+        unsupported_nodes.add((full, "TABLE"))
+        unsupported_table_map[full] = (black_type, reason, detail)
+        unsupported_table_keys.add((schema.upper(), table.upper()))
+
+    for (schema, view_name), compat in view_compat_map.items():
+        if compat.support_state != SUPPORT_STATE_SUPPORTED:
+            full = f"{schema.upper()}.{view_name.upper()}"
+            unsupported_nodes.add((full, "VIEW"))
+            unsupported_view_keys.add((schema.upper(), view_name.upper()))
+
+    blocked_by_map = build_blocked_dependency_map(
+        dependency_graph,
+        unsupported_nodes,
+        source_objects=source_objects,
+        object_parent_map=object_parent_map
+    )
+
+    for obj_type, tgt_name, src_name in missing_items:
+        obj_type_u = (obj_type or "").upper()
+        if "." not in src_name or "." not in tgt_name:
+            continue
+        src_full = src_name.upper()
+        tgt_full = tgt_name.upper()
+        src_schema, src_obj = src_full.split(".", 1)
+
+        support_state = SUPPORT_STATE_SUPPORTED
+        reason_code = ""
+        reason = ""
+        dependency = ""
+        action = "FIXUP"
+        detail = ""
+
+        if obj_type_u == "TABLE":
+            entries = oracle_meta.blacklist_tables.get((src_schema, src_obj))
+            if entries:
+                black_type, reason, detail = summarize_blacklist_entries(entries)
+                support_state = SUPPORT_STATE_UNSUPPORTED
+                reason_code = f"BLACKLIST_{black_type}" if black_type else "BLACKLIST"
+                dependency = "-"
+                action = "改造/不迁移"
+        elif obj_type_u == "VIEW":
+            compat = view_compat_map.get((src_schema, src_obj))
+            if compat and compat.support_state != SUPPORT_STATE_SUPPORTED:
+                support_state = compat.support_state
+                reason_code = compat.reason_code
+                reason = compat.reason
+                detail = compat.detail
+                dependency = "-"
+                action = "改造/授权"
+        elif obj_type_u == "SYNONYM":
+            syn_meta = synonym_meta_map.get((src_schema, src_obj))
+            if syn_meta and syn_meta.table_owner and syn_meta.table_name:
+                ref_full = f"{syn_meta.table_owner.upper()}.{syn_meta.table_name.upper()}"
+                if ref_full in unsupported_table_map or (ref_full, "VIEW") in unsupported_nodes:
+                    support_state = SUPPORT_STATE_BLOCKED
+                    reason_code = "DEPENDENCY_UNSUPPORTED"
+                    reason = "同义词指向不支持对象"
+                    dependency = ref_full
+                    action = "先改造依赖对象"
+
+        if support_state == SUPPORT_STATE_SUPPORTED:
+            node = (src_full, obj_type_u)
+            blocked_refs = blocked_by_map.get(node)
+            if blocked_refs:
+                support_state = SUPPORT_STATE_BLOCKED
+                reason_code = "DEPENDENCY_UNSUPPORTED"
+                reason = "依赖不支持对象"
+                dependency = ",".join(sorted({n[0] for n in blocked_refs}))
+                action = "先改造依赖对象"
+
+        row = ObjectSupportReportRow(
+            obj_type=obj_type_u,
+            src_full=src_full,
+            tgt_full=tgt_full,
+            support_state=support_state,
+            reason_code=reason_code or ("-" if support_state == SUPPORT_STATE_SUPPORTED else ""),
+            reason=reason or ("-" if support_state == SUPPORT_STATE_SUPPORTED else ""),
+            dependency=dependency or ("-" if support_state == SUPPORT_STATE_SUPPORTED else ""),
+            action=action,
+            detail=detail or "-"
+        )
+        support_state_map[(obj_type_u, src_full)] = row
+        missing_detail_rows.append(row)
+        if support_state == SUPPORT_STATE_UNSUPPORTED:
+            missing_support_counts[obj_type_u]["unsupported"] += 1
+            unsupported_rows.append(row)
+        elif support_state == SUPPORT_STATE_BLOCKED:
+            missing_support_counts[obj_type_u]["blocked"] += 1
+            unsupported_rows.append(row)
+        else:
+            missing_support_counts[obj_type_u]["supported"] += 1
+
+    # 扩展对象：索引/约束/触发器被不支持表阻断时的明细统计
+    table_map: Dict[str, str] = {}
+    for (src_schema, src_table), (tgt_schema, tgt_table) in table_target_map.items():
+        table_map[f"{tgt_schema.upper()}.{tgt_table.upper()}"] = f"{src_schema.upper()}.{src_table.upper()}"
+
+    for item in extra_results.get('index_mismatched', []):
+        table_str = item.table.split()[0]
+        if '.' not in table_str:
+            continue
+        src_name = table_map.get(table_str)
+        if not src_name or '.' not in src_name:
+            continue
+        src_schema, src_table = src_name.split('.', 1)
+        if (src_schema.upper(), src_table.upper()) not in unsupported_table_keys:
+            continue
+        tgt_schema, _ = table_str.split('.', 1)
+        for idx_name in sorted(item.missing_indexes):
+            row = ObjectSupportReportRow(
+                obj_type="INDEX",
+                src_full=f"{src_schema.upper()}.{idx_name.upper()}",
+                tgt_full=f"{tgt_schema.upper()}.{idx_name.upper()}",
+                support_state=SUPPORT_STATE_BLOCKED,
+                reason_code="DEPENDENCY_UNSUPPORTED",
+                reason="依赖不支持表",
+                dependency=table_str.upper(),
+                action="先改造依赖表",
+                detail="INDEX"
+            )
+            unsupported_rows.append(row)
+            extra_blocked_counts["INDEX"] += 1
+
+    for item in extra_results.get('constraint_mismatched', []):
+        table_str = item.table.split()[0]
+        if '.' not in table_str:
+            continue
+        src_name = table_map.get(table_str)
+        if not src_name or '.' not in src_name:
+            continue
+        src_schema, src_table = src_name.split('.', 1)
+        if (src_schema.upper(), src_table.upper()) not in unsupported_table_keys:
+            continue
+        tgt_schema, _ = table_str.split('.', 1)
+        for cons_name in sorted(item.missing_constraints):
+            row = ObjectSupportReportRow(
+                obj_type="CONSTRAINT",
+                src_full=f"{src_schema.upper()}.{cons_name.upper()}",
+                tgt_full=f"{tgt_schema.upper()}.{cons_name.upper()}",
+                support_state=SUPPORT_STATE_BLOCKED,
+                reason_code="DEPENDENCY_UNSUPPORTED",
+                reason="依赖不支持表",
+                dependency=table_str.upper(),
+                action="先改造依赖表",
+                detail="CONSTRAINT"
+            )
+            unsupported_rows.append(row)
+            extra_blocked_counts["CONSTRAINT"] += 1
+
+    for item in extra_results.get('trigger_mismatched', []):
+        table_str = item.table.split()[0]
+        if '.' not in table_str:
+            continue
+        src_name = table_map.get(table_str)
+        if not src_name or '.' not in src_name:
+            continue
+        src_schema, src_table = src_name.split('.', 1)
+        if (src_schema.upper(), src_table.upper()) not in unsupported_table_keys:
+            continue
+        tgt_schema, _ = table_str.split('.', 1)
+        for trg_name in sorted(item.missing_triggers):
+            row = ObjectSupportReportRow(
+                obj_type="TRIGGER",
+                src_full=f"{src_schema.upper()}.{trg_name.upper()}",
+                tgt_full=f"{tgt_schema.upper()}.{trg_name.upper()}",
+                support_state=SUPPORT_STATE_BLOCKED,
+                reason_code="DEPENDENCY_UNSUPPORTED",
+                reason="依赖不支持表",
+                dependency=table_str.upper(),
+                action="先改造依赖表",
+                detail="TRIGGER"
+            )
+            unsupported_rows.append(row)
+            extra_blocked_counts["TRIGGER"] += 1
+
+    return SupportClassificationResult(
+        support_state_map=support_state_map,
+        missing_detail_rows=missing_detail_rows,
+        unsupported_rows=unsupported_rows,
+        missing_support_counts=dict(missing_support_counts),
+        extra_blocked_counts=dict(extra_blocked_counts),
+        unsupported_table_keys=unsupported_table_keys,
+        unsupported_view_keys=unsupported_view_keys,
+        view_compat_map=view_compat_map
+    )
 
 
 def init_oracle_client_from_settings(settings: Dict) -> None:
@@ -5000,7 +5878,8 @@ def dump_oracle_metadata(
     include_sequences: bool = True,
     include_comments: bool = True,
     include_blacklist: bool = True,
-    include_privileges: bool = True
+    include_privileges: bool = True,
+    include_interval_partitions: bool = False
 ) -> OracleMetadata:
     """
     预先加载 Oracle 端所需的所有元数据，避免在校验/修补阶段频繁查询。
@@ -5034,7 +5913,8 @@ def dump_oracle_metadata(
             object_statuses={},
             package_errors={},
             package_errors_complete=False,
-            partition_key_columns={}
+            partition_key_columns={},
+            interval_partitions={}
         )
 
     log.info("正在批量加载 Oracle 元数据 (DBA_TAB_COLUMNS/DBA_INDEXES/DBA_CONSTRAINTS/DBA_TRIGGERS/DBA_SEQUENCES)...")
@@ -5058,6 +5938,7 @@ def dump_oracle_metadata(
     package_errors: Dict[Tuple[str, str, str], PackageErrorInfo] = {}
     package_errors_complete = True
     partition_key_columns: Dict[Tuple[str, str], List[str]] = {}
+    interval_partitions: Dict[Tuple[str, str], IntervalPartitionInfo] = {}
 
     def _safe_upper(value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -5079,6 +5960,7 @@ def dump_oracle_metadata(
                 (obj_type or "").upper() in PACKAGE_OBJECT_TYPES
                 for _, _, obj_type in master_list
             )
+            include_partition_keys = include_constraints or include_interval_partitions
             if owners or need_package_status:
                 # 检测是否支持 HIDDEN_COLUMN 字段（部分低版本/权限受限环境不存在）
                 support_hidden_col = False
@@ -5295,45 +6177,137 @@ def dump_oracle_metadata(
                             if ref_table:
                                 info["ref_table_owner"], info["ref_table_name"] = ref_table
 
-                    # 分区键列 (partition/subpartition) 用于 PK 兼容判断
-                    if table_pairs:
-                        def _append_partition_col(key: Tuple[str, str], col: Optional[str]) -> None:
-                            if not col:
-                                return
-                            cols = partition_key_columns.setdefault(key, [])
-                            col_u = col.upper()
-                            if col_u not in cols:
-                                cols.append(col_u)
+                if include_partition_keys and table_pairs:
+                    def _append_partition_col(key: Tuple[str, str], col: Optional[str]) -> None:
+                        if not col:
+                            return
+                        cols = partition_key_columns.setdefault(key, [])
+                        col_u = col.upper()
+                        if col_u not in cols:
+                            cols.append(col_u)
 
-                        def _load_part_keys(view_name: str) -> None:
-                            sql_tpl = f"""
-                                SELECT OWNER, NAME, COLUMN_NAME, COLUMN_POSITION
-                                FROM {view_name}
-                                WHERE OWNER IN ({{owners_clause}})
-                                  AND OBJECT_TYPE = 'TABLE'
-                                ORDER BY OWNER, NAME, COLUMN_POSITION
-                            """
+                    def _load_part_keys(view_name: str) -> None:
+                        sql_tpl = f"""
+                            SELECT OWNER, NAME, COLUMN_NAME, COLUMN_POSITION
+                            FROM {view_name}
+                            WHERE OWNER IN ({{owners_clause}})
+                              AND OBJECT_TYPE = 'TABLE'
+                            ORDER BY OWNER, NAME, COLUMN_POSITION
+                        """
+                        with ora_conn.cursor() as cursor:
+                            for owner_chunk in owner_chunks:
+                                owners_clause = build_bind_placeholders(len(owner_chunk))
+                                sql = sql_tpl.format(owners_clause=owners_clause)
+                                cursor.execute(sql, owner_chunk)
+                                for row in cursor:
+                                    owner = _safe_upper(row[0])
+                                    table = _safe_upper(row[1])
+                                    col = _safe_upper(row[2]) if len(row) > 2 else None
+                                    if not owner or not table or not col:
+                                        continue
+                                    key = (owner, table)
+                                    if key not in table_pairs:
+                                        continue
+                                    _append_partition_col(key, col)
+
+                    try:
+                        _load_part_keys("DBA_PART_KEY_COLUMNS")
+                        _load_part_keys("DBA_SUBPART_KEY_COLUMNS")
+                    except oracledb.Error as e:
+                        log.warning("读取 Oracle 分区键列失败，将跳过分区键处理: %s", e)
+
+                if include_interval_partitions and table_pairs:
+                    interval_candidates: Dict[Tuple[str, str], Tuple[str, str, str]] = {}
+                    sql_interval_tpl = """
+                        SELECT OWNER, TABLE_NAME, PARTITIONING_TYPE, SUBPARTITIONING_TYPE, INTERVAL
+                        FROM DBA_PART_TABLES
+                        WHERE OWNER IN ({owners_clause})
+                          AND INTERVAL IS NOT NULL
+                    """
+                    try:
+                        with ora_conn.cursor() as cursor:
+                            for owner_chunk in owner_chunks:
+                                owners_clause = build_bind_placeholders(len(owner_chunk))
+                                sql_interval = sql_interval_tpl.format(owners_clause=owners_clause)
+                                cursor.execute(sql_interval, owner_chunk)
+                                for row in cursor:
+                                    owner = _safe_upper(row[0])
+                                    table = _safe_upper(row[1])
+                                    if not owner or not table:
+                                        continue
+                                    key = (owner, table)
+                                    if key not in table_pairs:
+                                        continue
+                                    interval_expr = str(row[4]).strip() if row[4] is not None else ""
+                                    if not interval_expr:
+                                        continue
+                                    part_type = (row[2] or "").upper()
+                                    subpart_type = (row[3] or "").upper()
+                                    interval_candidates[key] = (interval_expr, part_type, subpart_type)
+                    except oracledb.Error as e:
+                        log.warning("读取 Oracle interval 分区表失败，将跳过 interval 处理: %s", e)
+                        interval_candidates = {}
+
+                    if interval_candidates:
+                        part_stats: Dict[Tuple[str, str], Dict[str, object]] = {}
+                        for key in interval_candidates.keys():
+                            part_stats[key] = {
+                                "last_pos": -1,
+                                "last_name": "",
+                                "last_high": "",
+                                "names": set()
+                            }
+                        sql_part_tpl = """
+                            SELECT TABLE_OWNER, TABLE_NAME, PARTITION_NAME, HIGH_VALUE, PARTITION_POSITION
+                            FROM DBA_TAB_PARTITIONS
+                            WHERE TABLE_OWNER IN ({owners_clause})
+                            ORDER BY TABLE_OWNER, TABLE_NAME, PARTITION_POSITION
+                        """
+                        try:
                             with ora_conn.cursor() as cursor:
                                 for owner_chunk in owner_chunks:
                                     owners_clause = build_bind_placeholders(len(owner_chunk))
-                                    sql = sql_tpl.format(owners_clause=owners_clause)
-                                    cursor.execute(sql, owner_chunk)
+                                    sql_part = sql_part_tpl.format(owners_clause=owners_clause)
+                                    cursor.execute(sql_part, owner_chunk)
                                     for row in cursor:
                                         owner = _safe_upper(row[0])
                                         table = _safe_upper(row[1])
-                                        col = _safe_upper(row[2]) if len(row) > 2 else None
-                                        if not owner or not table or not col:
+                                        if not owner or not table:
                                             continue
                                         key = (owner, table)
-                                        if key not in table_pairs:
+                                        stats = part_stats.get(key)
+                                        if not stats:
                                             continue
-                                        _append_partition_col(key, col)
-
-                        try:
-                            _load_part_keys("DBA_PART_KEY_COLUMNS")
-                            _load_part_keys("DBA_SUBPART_KEY_COLUMNS")
+                                        part_name = _safe_upper(row[2]) if row[2] else ""
+                                        high_value = str(row[3]) if row[3] is not None else ""
+                                        try:
+                                            part_pos = int(row[4]) if row[4] is not None else -1
+                                        except (TypeError, ValueError):
+                                            part_pos = -1
+                                        if part_name:
+                                            stats["names"].add(part_name.upper())
+                                        if part_pos >= int(stats["last_pos"]):
+                                            stats["last_pos"] = part_pos
+                                            stats["last_name"] = part_name or ""
+                                            stats["last_high"] = high_value or ""
                         except oracledb.Error as e:
-                            log.warning("读取 Oracle 分区键列失败，将跳过 PK 分区规则处理: %s", e)
+                            log.warning("读取 Oracle 分区边界失败，将跳过 interval 处理: %s", e)
+                            part_stats = {}
+
+                        for key, info in interval_candidates.items():
+                            stats = part_stats.get(key)
+                            if not stats:
+                                continue
+                            interval_partitions[key] = IntervalPartitionInfo(
+                                interval_expr=info[0],
+                                partitioning_type=info[1],
+                                subpartitioning_type=info[2],
+                                last_partition_name=str(stats.get("last_name") or ""),
+                                last_high_value=str(stats.get("last_high") or ""),
+                                last_partition_position=int(stats.get("last_pos") or -1),
+                                partition_key_columns=partition_key_columns.get(key, []),
+                                existing_partition_names=set(stats.get("names") or set())
+                            )
 
                 # 触发器
                 if include_triggers:
@@ -5365,21 +6339,28 @@ def dump_oracle_metadata(
                                     "owner": trg_owner or owner
                                 }
 
+                status_types: Set[str] = set()
+                if include_triggers:
+                    status_types.add("TRIGGER")
                 if need_package_status:
-                    pkg_owners = sorted(source_schema_set | set(owners))
-                    if pkg_owners:
-                        pkg_owner_chunks = chunk_list(pkg_owners, ORACLE_IN_BATCH_SIZE)
-                        sql_pkg_tpl = """
+                    status_types.update({"PACKAGE", "PACKAGE BODY"})
+
+                if status_types:
+                    status_owners = sorted(source_schema_set | set(owners))
+                    if status_owners:
+                        status_owner_chunks = chunk_list(status_owners, ORACLE_IN_BATCH_SIZE)
+                        status_types_clause = ",".join(f"'{t}'" for t in sorted(status_types))
+                        sql_status_tpl = f"""
                             SELECT OWNER, OBJECT_NAME, OBJECT_TYPE, STATUS
                             FROM DBA_OBJECTS
-                            WHERE OWNER IN ({owners_clause})
-                              AND OBJECT_TYPE IN ('PACKAGE', 'PACKAGE BODY')
+                            WHERE OWNER IN ({{owners_clause}})
+                              AND OBJECT_TYPE IN ({status_types_clause})
                         """
                         with ora_conn.cursor() as cursor:
-                            for owner_chunk in pkg_owner_chunks:
+                            for owner_chunk in status_owner_chunks:
                                 owners_clause = build_bind_placeholders(len(owner_chunk))
-                                sql_pkg = sql_pkg_tpl.format(owners_clause=owners_clause)
-                                cursor.execute(sql_pkg, owner_chunk)
+                                sql_status = sql_status_tpl.format(owners_clause=owners_clause)
+                                cursor.execute(sql_status, owner_chunk)
                                 for row in cursor:
                                     owner = _safe_upper(row[0])
                                     name = _safe_upper(row[1])
@@ -5389,6 +6370,10 @@ def dump_oracle_metadata(
                                         continue
                                     object_statuses[(owner, name, obj_type)] = status or "UNKNOWN"
 
+                if need_package_status:
+                    pkg_owners = sorted(source_schema_set | set(owners))
+                    if pkg_owners:
+                        pkg_owner_chunks = chunk_list(pkg_owners, ORACLE_IN_BATCH_SIZE)
                         try:
                             sql_pkg_err_tpl = """
                                 SELECT OWNER, NAME, TYPE, LINE, POSITION, TEXT
@@ -5479,58 +6464,158 @@ def dump_oracle_metadata(
                             comments_complete = False
 
                 if include_blacklist:
-                    blacklist_available = True
-                    try:
-                        total_blacklist = 0
-                        with ora_conn.cursor() as cursor:
-                            sql_blacklist_count_tpl = """
-                                SELECT COUNT(*)
-                                FROM OMS_USER.TMP_BLACK_TABLE
-                                WHERE OWNER IN ({owners_clause})
-                            """
-                            for owner_chunk in owner_chunks:
-                                owners_clause = build_bind_placeholders(len(owner_chunk))
-                                sql_blacklist_count = sql_blacklist_count_tpl.format(owners_clause=owners_clause)
-                                cursor.execute(sql_blacklist_count, owner_chunk)
-                                row = cursor.fetchone()
-                                total_blacklist += int(row[0]) if row and row[0] is not None else 0
-                        if total_blacklist <= 0:
-                            log.warning("未检测到 OMS_USER.TMP_BLACK_TABLE 黑名单记录（当前 schema）。")
-                        else:
-                            log.info("检测到黑名单表记录 %d 条（当前 schema），将用于过滤缺失表规则。", total_blacklist)
-                    except oracledb.Error as e:
-                        blacklist_available = False
-                        err_msg = str(e)
-                        if any(code in err_msg for code in ("ORA-00942", "ORA-04043")):
-                            log.warning("未检测到 OMS_USER.TMP_BLACK_TABLE（黑名单过滤已跳过）。")
-                        else:
-                            log.warning("读取 OMS_USER.TMP_BLACK_TABLE 失败，将跳过黑名单过滤：%s", e)
+                    blacklist_mode = settings.get("blacklist_mode", "auto")
+                    use_table = blacklist_mode in ("auto", "table_only")
+                    use_rules = blacklist_mode in ("auto", "rules_only")
+                    table_loaded = False
+                    rules_loaded = False
+                    if blacklist_mode == "disabled":
+                        log.info("黑名单过滤已关闭 (blacklist_mode=disabled)。")
+                    else:
+                        if use_table:
+                            table_available = True
+                            try:
+                                total_blacklist = 0
+                                with ora_conn.cursor() as cursor:
+                                    sql_blacklist_count_tpl = """
+                                        SELECT COUNT(*)
+                                        FROM OMS_USER.TMP_BLACK_TABLE
+                                        WHERE OWNER IN ({owners_clause})
+                                    """
+                                    for owner_chunk in owner_chunks:
+                                        owners_clause = build_bind_placeholders(len(owner_chunk))
+                                        sql_blacklist_count = sql_blacklist_count_tpl.format(owners_clause=owners_clause)
+                                        cursor.execute(sql_blacklist_count, owner_chunk)
+                                        row = cursor.fetchone()
+                                        total_blacklist += int(row[0]) if row and row[0] is not None else 0
+                                if total_blacklist <= 0:
+                                    log.warning("未检测到 OMS_USER.TMP_BLACK_TABLE 黑名单记录（当前 schema）。")
+                                else:
+                                    log.info(
+                                        "检测到黑名单表记录 %d 条（当前 schema），将用于过滤缺失表规则。",
+                                        total_blacklist
+                                    )
+                            except oracledb.Error as e:
+                                table_available = False
+                                err_msg = str(e)
+                                if any(code in err_msg for code in ("ORA-00942", "ORA-04043")):
+                                    log.warning("未检测到 OMS_USER.TMP_BLACK_TABLE（将尝试规则引擎）。")
+                                else:
+                                    log.warning("读取 OMS_USER.TMP_BLACK_TABLE 失败：%s", e)
 
-                    if blacklist_available:
-                        sql_blacklist_tpl = """
-                            SELECT OWNER, TABLE_NAME, DATA_TYPE, BLACK_TYPE
-                            FROM OMS_USER.TMP_BLACK_TABLE
-                            WHERE OWNER IN ({owners_clause})
-                        """
-                        try:
-                            with ora_conn.cursor() as cursor:
-                                for owner_chunk in owner_chunks:
-                                    owners_clause = build_bind_placeholders(len(owner_chunk))
-                                    sql_blacklist = sql_blacklist_tpl.format(owners_clause=owners_clause)
-                                    cursor.execute(sql_blacklist, owner_chunk)
-                                    for row in cursor:
-                                        owner = _safe_upper(row[0])
-                                        table = _safe_upper(row[1])
-                                        if not owner or not table:
-                                            continue
-                                        key = (owner, table)
-                                        if key not in table_pairs:
-                                            continue
-                                        data_type = normalize_black_data_type(row[2])
-                                        black_type = normalize_black_type(row[3]) or "UNKNOWN"
-                                        blacklist_tables.setdefault(key, set()).add((black_type, data_type))
-                        except oracledb.Error as e:
-                            log.warning("读取 OMS_USER.TMP_BLACK_TABLE 失败，将跳过黑名单过滤：%s", e)
+                            if table_available:
+                                sql_blacklist_tpl = """
+                                    SELECT OWNER, TABLE_NAME, DATA_TYPE, BLACK_TYPE
+                                    FROM OMS_USER.TMP_BLACK_TABLE
+                                    WHERE OWNER IN ({owners_clause})
+                                """
+                                try:
+                                    with ora_conn.cursor() as cursor:
+                                        for owner_chunk in owner_chunks:
+                                            owners_clause = build_bind_placeholders(len(owner_chunk))
+                                            sql_blacklist = sql_blacklist_tpl.format(owners_clause=owners_clause)
+                                            cursor.execute(sql_blacklist, owner_chunk)
+                                            for row in cursor:
+                                                owner = _safe_upper(row[0])
+                                                table = _safe_upper(row[1])
+                                                if not owner or not table:
+                                                    continue
+                                                key = (owner, table)
+                                                if key not in table_pairs:
+                                                    continue
+                                                data_type = normalize_black_data_type(row[2])
+                                                black_type = normalize_black_type(row[3]) or "UNKNOWN"
+                                                add_blacklist_entry(
+                                                    blacklist_tables,
+                                                    owner,
+                                                    table,
+                                                    black_type,
+                                                    data_type,
+                                                    source="TABLE"
+                                                )
+                                    table_loaded = True
+                                except oracledb.Error as e:
+                                    log.warning("读取 OMS_USER.TMP_BLACK_TABLE 失败：%s", e)
+
+                        if use_rules:
+                            rules_path = settings.get("blacklist_rules_path", "")
+                            rules = load_blacklist_rules(rules_path)
+                            if not rules:
+                                log.warning("黑名单规则文件为空或不可用，将跳过规则引擎。")
+                            else:
+                                enable_set = settings.get("blacklist_rules_enable_set", set())
+                                disable_set = settings.get("blacklist_rules_disable_set", set())
+                                ob_version = settings.get("ob_version")
+                                lob_max_mb = int(settings.get("blacklist_lob_max_mb", 512))
+                                rule_stats: Dict[str, int] = {}
+                                skipped: Dict[str, int] = defaultdict(int)
+                                for rule in rules:
+                                    enabled, reason = is_blacklist_rule_enabled(
+                                        rule,
+                                        enable_set,
+                                        disable_set,
+                                        ob_version
+                                    )
+                                    if not enabled:
+                                        skipped[reason or "disabled"] += 1
+                                        continue
+                                    sql_tpl = rule.sql
+                                    if "{{owners_clause}}" not in sql_tpl:
+                                        log.warning("黑名单规则 %s 缺少 {{owners_clause}}，已跳过。", rule.rule_id)
+                                        skipped["missing_owner_clause"] += 1
+                                        continue
+                                    sql_tpl = sql_tpl.replace("{{lob_max_mb}}", str(lob_max_mb))
+                                    added = 0
+                                    try:
+                                        with ora_conn.cursor() as cursor:
+                                            for owner_chunk in owner_chunks:
+                                                owners_clause = build_bind_placeholders(len(owner_chunk))
+                                                sql_rule = sql_tpl.replace("{{owners_clause}}", owners_clause)
+                                                cursor.execute(sql_rule, owner_chunk)
+                                                for row in cursor:
+                                                    owner = _safe_upper(row[0]) if len(row) > 0 else None
+                                                    table = _safe_upper(row[1]) if len(row) > 1 else None
+                                                    if not owner or not table:
+                                                        continue
+                                                    key = (owner, table)
+                                                    if key not in table_pairs:
+                                                        continue
+                                                    data_type = normalize_black_data_type(row[2]) if len(row) > 2 else ""
+                                                    black_type = normalize_black_type(row[3]) if len(row) > 3 else ""
+                                                    black_type = black_type or rule.black_type or "UNKNOWN"
+                                                    if add_blacklist_entry(
+                                                        blacklist_tables,
+                                                        owner,
+                                                        table,
+                                                        black_type,
+                                                        data_type,
+                                                        source=f"RULE={rule.rule_id}"
+                                                    ):
+                                                        added += 1
+                                        rules_loaded = True
+                                        rule_stats[rule.rule_id] = added
+                                    except oracledb.Error as e:
+                                        log.warning("黑名单规则 %s 执行失败：%s", rule.rule_id, e)
+                                        skipped["query_failed"] += 1
+
+                                if rule_stats:
+                                    total_added = sum(rule_stats.values())
+                                    log.info(
+                                        "黑名单规则执行完成：rules=%d, entries=%d",
+                                        len(rule_stats),
+                                        total_added
+                                    )
+                                    for rule_id, count in sorted(rule_stats.items()):
+                                        if count:
+                                            log.info("  - %s: %d", rule_id, count)
+                                if skipped:
+                                    skipped_msg = ", ".join(
+                                        f"{k}={v}" for k, v in sorted(skipped.items())
+                                    )
+                                    log.info("黑名单规则跳过统计：%s", skipped_msg)
+
+                        if not table_loaded and not rules_loaded:
+                            log.warning("黑名单未加载（mode=%s），缺失表过滤将跳过。", blacklist_mode)
 
             if include_privileges:
                 try:
@@ -5616,7 +6701,8 @@ def dump_oracle_metadata(
         object_statuses=object_statuses,
         package_errors=package_errors,
         package_errors_complete=package_errors_complete,
-        partition_key_columns=partition_key_columns
+        partition_key_columns=partition_key_columns,
+        interval_partitions=interval_partitions
     )
 
 
@@ -7660,8 +8746,8 @@ def build_trigger_cache_for_table(
     tgt_trg = ob_meta.triggers.get(tgt_key, {}) or {}
     src_info_map: Dict[str, Dict[str, str]] = {}
     tgt_info_map: Dict[str, Dict] = {}
-    src_sig: Set[Tuple[str, str, str]] = set()
-    tgt_sig: Set[Tuple[str, str, str]] = set()
+    src_sig: Set[Tuple[str, str, str, str]] = set()
+    tgt_sig: Set[Tuple[str, str, str, str]] = set()
 
     for name, info in src_trg.items():
         trg_owner = (info.get("owner") or src_schema).upper()
@@ -7685,16 +8771,18 @@ def build_trigger_cache_for_table(
             )
         tgt_full = f"{tgt_owner_u}.{tgt_name_u}"
         event = (info.get("event") or "").strip()
-        status = (info.get("status") or "").strip()
+        status = normalize_trigger_status(info.get("status"))
+        valid = lookup_trigger_validity(oracle_meta, trg_owner, name_u)
         src_info_map[tgt_full] = {
             "src_owner": trg_owner,
             "src_name": name_u,
             "tgt_owner": tgt_owner_u,
             "tgt_name": tgt_name_u,
             "event": event,
-            "status": status
+            "status": status,
+            "valid": valid
         }
-        src_sig.add((tgt_full, event, status))
+        src_sig.add((tgt_full, event, status, valid))
 
     for name, info in tgt_trg.items():
         owner_u = (info.get("owner") or tgt_schema).upper()
@@ -7703,9 +8791,11 @@ def build_trigger_cache_for_table(
             continue
         full = f"{owner_u}.{name_u}"
         event = (info.get("event") or "").strip()
-        status = (info.get("status") or "").strip()
+        status = normalize_trigger_status(info.get("status"))
+        valid = lookup_trigger_validity(ob_meta, owner_u, name_u)
+        info["valid"] = valid
         tgt_info_map[full] = info
-        tgt_sig.add((full, event, status))
+        tgt_sig.add((full, event, status, valid))
 
     return TriggerCompareCache(
         src_info_map=src_info_map,
@@ -7877,6 +8967,356 @@ def get_partition_key_set(
 ) -> Set[str]:
     cols = meta.partition_key_columns.get((schema.upper(), table.upper()), [])
     return {c.upper() for c in cols if c}
+
+
+class IntervalSpec(NamedTuple):
+    value: int
+    unit: str
+    kind: str  # YEAR_MONTH or DAY_SECOND
+
+
+class NumericIntervalSpec(NamedTuple):
+    value: Decimal
+
+
+def parse_interval_expression(expr: str) -> Optional[IntervalSpec]:
+    if not expr:
+        return None
+    text = str(expr).strip()
+    match = re.search(
+        r"NUMTOYMINTERVAL\s*\(\s*([0-9]+)\s*,\s*'([A-Za-z]+)'\s*\)",
+        text,
+        flags=re.IGNORECASE
+    )
+    if match:
+        value = int(match.group(1))
+        unit = match.group(2).upper()
+        if unit not in ("MONTH", "YEAR"):
+            return None
+        return IntervalSpec(value=value, unit=unit, kind="YEAR_MONTH")
+
+    match = re.search(
+        r"NUMTODSINTERVAL\s*\(\s*([0-9]+)\s*,\s*'([A-Za-z]+)'\s*\)",
+        text,
+        flags=re.IGNORECASE
+    )
+    if match:
+        value = int(match.group(1))
+        unit = match.group(2).upper()
+        if unit not in ("DAY", "HOUR", "MINUTE", "SECOND"):
+            return None
+        return IntervalSpec(value=value, unit=unit, kind="DAY_SECOND")
+
+    return None
+
+
+def parse_numeric_interval_expression(expr: str) -> Optional[NumericIntervalSpec]:
+    if not expr:
+        return None
+    text = str(expr).strip()
+    match = re.search(
+        r"\bINTERVAL\s*\(\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*\)",
+        text,
+        flags=re.IGNORECASE
+    )
+    if match:
+        try:
+            value = Decimal(match.group(1))
+        except (InvalidOperation, ValueError):
+            return None
+        return NumericIntervalSpec(value=value)
+
+    raw = text.strip()
+    if raw.startswith("(") and raw.endswith(")"):
+        raw = raw[1:-1].strip()
+    if not re.fullmatch(r"[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", raw):
+        return None
+    try:
+        value = Decimal(raw)
+    except (InvalidOperation, ValueError):
+        return None
+    return NumericIntervalSpec(value=value)
+
+
+def is_numeric_partition_type(data_type: str) -> bool:
+    dt = (data_type or "").strip().upper()
+    if not dt:
+        return False
+    if dt.startswith(("NUMBER", "DECIMAL", "NUMERIC")):
+        return True
+    return dt in {
+        "INTEGER",
+        "INT",
+        "SMALLINT",
+        "FLOAT",
+        "BINARY_FLOAT",
+        "BINARY_DOUBLE",
+        "REAL",
+        "DOUBLE",
+        "DOUBLE PRECISION",
+    }
+
+
+def format_decimal_literal(value: Decimal) -> str:
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    if text == "-0":
+        text = "0"
+    return text or "0"
+
+
+def format_numeric_partition_name(value: Decimal) -> str:
+    text = format_decimal_literal(value)
+    if text.startswith("-"):
+        text = "NEG_" + text[1:]
+    text = text.replace("+", "")
+    text = text.replace(".", "_")
+    text = re.sub(r"[^A-Za-z0-9_]", "_", text)
+    return f"P{text}"
+
+
+def parse_partition_high_value_numeric(expr: str) -> Optional[Decimal]:
+    if not expr:
+        return None
+    raw = str(expr).strip()
+    if not raw:
+        return None
+    if "MAXVALUE" in raw.upper():
+        return None
+    match = re.search(r"TO_NUMBER\s*\(\s*'([^']+)'\s*\)", raw, flags=re.IGNORECASE)
+    if match:
+        raw = match.group(1).strip()
+    else:
+        match = re.search(r"TO_NUMBER\s*\(\s*([^)]+)\)", raw, flags=re.IGNORECASE)
+        if match:
+            raw = match.group(1).strip()
+    if raw.startswith("(") and raw.endswith(")"):
+        raw = raw[1:-1].strip()
+    if not re.search(r"\d", raw):
+        return None
+    match = re.search(r"[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", raw)
+    if not match:
+        return None
+    try:
+        return Decimal(match.group(0))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def days_in_month(year: int, month: int) -> int:
+    if month == 12:
+        next_month = datetime(year + 1, 1, 1)
+    else:
+        next_month = datetime(year, month + 1, 1)
+    return (next_month - datetime(year, month, 1)).days
+
+
+def add_months_to_datetime(value: datetime, months: int) -> datetime:
+    total = (value.year * 12 + (value.month - 1)) + months
+    year = total // 12
+    month = total % 12 + 1
+    day = min(value.day, days_in_month(year, month))
+    return value.replace(year=year, month=month, day=day)
+
+
+def add_interval(value: datetime, spec: IntervalSpec) -> Optional[datetime]:
+    if spec.value <= 0:
+        return None
+    if spec.kind == "YEAR_MONTH":
+        months = spec.value * (12 if spec.unit == "YEAR" else 1)
+        return add_months_to_datetime(value, months)
+    if spec.kind == "DAY_SECOND":
+        if spec.unit == "DAY":
+            return value + timedelta(days=spec.value)
+        if spec.unit == "HOUR":
+            return value + timedelta(hours=spec.value)
+        if spec.unit == "MINUTE":
+            return value + timedelta(minutes=spec.value)
+        if spec.unit == "SECOND":
+            return value + timedelta(seconds=spec.value)
+    return None
+
+
+def _normalize_datetime_literal(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    text = text.replace("T", " ")
+    match = re.search(r"(\d{4}[-/]\d{2}[-/]\d{2})(?:[ T](\d{2}:\d{2}:\d{2}))?", text)
+    if match:
+        date_part = match.group(1)
+        time_part = match.group(2)
+        if time_part:
+            return f"{date_part} {time_part}"
+        return date_part
+    match = re.search(r"\b(\d{8})\b", text)
+    if match:
+        return match.group(1)
+    return text
+
+
+def _try_parse_datetime(raw: str) -> Optional[datetime]:
+    normalized = _normalize_datetime_literal(raw)
+    if not normalized:
+        return None
+    candidates = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d",
+        "%Y%m%d",
+    ]
+    for fmt in candidates:
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_partition_high_value(expr: str) -> Optional[datetime]:
+    if not expr:
+        return None
+    raw = str(expr).strip()
+    if not raw:
+        return None
+    if "MAXVALUE" in raw.upper():
+        return None
+    patterns = [
+        r"TO_DATE\s*\(\s*'([^']+)'",
+        r"TO_TIMESTAMP_TZ\s*\(\s*'([^']+)'",
+        r"TO_TIMESTAMP\s*\(\s*'([^']+)'",
+        r"DATE\s*'([^']+)'",
+        r"TIMESTAMP\s*'([^']+)'",
+    ]
+    for pat in patterns:
+        match = re.search(pat, raw, flags=re.IGNORECASE)
+        if match:
+            value = match.group(1).strip()
+            parsed = _try_parse_datetime(value)
+            if parsed:
+                return parsed
+    return _try_parse_datetime(raw)
+
+
+def format_partition_boundary(value: datetime, data_type: str) -> str:
+    data_type_u = (data_type or "").upper()
+    if data_type_u.startswith("TIMESTAMP"):
+        fmt = "%Y-%m-%d %H:%M:%S"
+        return f"TO_TIMESTAMP('{value.strftime(fmt)}', 'YYYY-MM-DD HH24:MI:SS')"
+    if value.time() == datetime.min.time():
+        return f"TO_DATE('{value.strftime('%Y-%m-%d')}', 'YYYY-MM-DD')"
+    return f"TO_DATE('{value.strftime('%Y-%m-%d %H:%M:%S')}', 'YYYY-MM-DD HH24:MI:SS')"
+
+
+def generate_interval_partition_statements(
+    info: IntervalPartitionInfo,
+    cutoff_date: Optional[datetime],
+    cutoff_numeric: Optional[Decimal],
+    data_type: str,
+    table_full: str
+) -> Tuple[List[str], List[str], str]:
+    warnings: List[str] = []
+    if not info.interval_expr:
+        return [], ["interval_expr 为空，已跳过"], ""
+    if info.partitioning_type and info.partitioning_type.upper() != "RANGE":
+        return [], [f"partitioning_type={info.partitioning_type} 不支持 interval 补齐"], ""
+    if len(info.partition_key_columns) != 1:
+        return [], ["分区键列数量不为 1，已跳过"], ""
+
+    spec = parse_interval_expression(info.interval_expr)
+    if spec:
+        if not cutoff_date:
+            return [], ["interval_partition_cutoff 未配置或非法"], "date"
+
+        last_high = parse_partition_high_value(info.last_high_value)
+        if not last_high:
+            return [], [f"无法解析 HIGH_VALUE: {info.last_high_value}"], "date"
+
+        statements: List[str] = []
+        existing_names = {name.upper() for name in info.existing_partition_names}
+        next_boundary = add_interval(last_high, spec)
+        if not next_boundary:
+            return [], ["interval 计算失败或步长为 0"], "date"
+
+        def _format_partition_name(value: datetime, spec_item: IntervalSpec) -> str:
+            if spec_item.kind == "DAY_SECOND" and spec_item.unit in ("HOUR", "MINUTE", "SECOND"):
+                fmt = "%Y%m%d%H%M%S"
+            elif value.time() != datetime.min.time():
+                fmt = "%Y%m%d%H%M%S"
+            else:
+                fmt = "%Y%m%d"
+            return f"P{value.strftime(fmt)}"
+
+        max_iters = 10000
+        while next_boundary and next_boundary <= cutoff_date and max_iters > 0:
+            part_name = _format_partition_name(next_boundary, spec)
+            if part_name.upper() in existing_names:
+                suffix = 1
+                candidate = f"{part_name}_{suffix}"
+                while candidate.upper() in existing_names:
+                    suffix += 1
+                    candidate = f"{part_name}_{suffix}"
+                part_name = candidate
+            existing_names.add(part_name.upper())
+            boundary_expr = format_partition_boundary(next_boundary, data_type)
+            statements.append(
+                f"ALTER TABLE {table_full} ADD PARTITION {part_name} VALUES LESS THAN ({boundary_expr});"
+            )
+            last_high = next_boundary
+            next_boundary = add_interval(last_high, spec)
+            max_iters -= 1
+
+        if max_iters <= 0:
+            warnings.append("生成分区数量过多，已提前终止")
+
+        return statements, warnings, "date"
+
+    numeric_spec = parse_numeric_interval_expression(info.interval_expr)
+    if not numeric_spec:
+        return [], [f"interval 解析失败: {info.interval_expr}"], ""
+
+    if numeric_spec.value <= 0:
+        return [], ["interval 计算失败或步长为 0"], "numeric"
+    if not is_numeric_partition_type(data_type):
+        return [], [f"分区键类型非数值: {data_type}"], "numeric"
+    if not cutoff_numeric:
+        return [], ["interval_partition_cutoff_numeric 未配置或非法"], "numeric"
+
+    last_high_num = parse_partition_high_value_numeric(info.last_high_value)
+    if last_high_num is None:
+        return [], [f"无法解析 HIGH_VALUE: {info.last_high_value}"], "numeric"
+
+    statements = []
+    existing_names = {name.upper() for name in info.existing_partition_names}
+    next_boundary_num = last_high_num + numeric_spec.value
+    if next_boundary_num <= last_high_num:
+        return [], ["interval 计算失败或步长为 0"], "numeric"
+
+    max_iters = 10000
+    while next_boundary_num <= cutoff_numeric and max_iters > 0:
+        part_name = format_numeric_partition_name(next_boundary_num)
+        if part_name.upper() in existing_names:
+            suffix = 1
+            candidate = f"{part_name}_{suffix}"
+            while candidate.upper() in existing_names:
+                suffix += 1
+                candidate = f"{part_name}_{suffix}"
+            part_name = candidate
+        existing_names.add(part_name.upper())
+        boundary_expr = format_decimal_literal(next_boundary_num)
+        statements.append(
+            f"ALTER TABLE {table_full} ADD PARTITION {part_name} VALUES LESS THAN ({boundary_expr});"
+        )
+        last_high_num = next_boundary_num
+        next_boundary_num = last_high_num + numeric_spec.value
+        max_iters -= 1
+
+    if max_iters <= 0:
+        warnings.append("生成分区数量过多，已提前终止")
+
+    return statements, warnings, "numeric"
 
 
 def compare_constraints_for_table(
@@ -8248,16 +9688,30 @@ def compare_triggers_for_table(
             src_info = src_info_map.get(tgt_full, {})
             tgt_info = tgt_info_map.get(tgt_full, {})
             s_event = (src_info.get("event") or "").strip()
-            s_status = (src_info.get("status") or "").strip()
+            s_status = normalize_trigger_status(src_info.get("status"))
+            s_owner = (src_info.get("src_owner") or src_schema).upper()
+            s_name = (src_info.get("src_name") or "").upper()
+            s_valid = normalize_trigger_status(
+                src_info.get("valid") or lookup_trigger_validity(oracle_meta, s_owner, s_name)
+            )
             t_event = (tgt_info.get("event") or "").strip()
-            t_status = (tgt_info.get("status") or "").strip()
+            t_status = normalize_trigger_status(tgt_info.get("status"))
+            t_owner = (tgt_info.get("owner") or tgt_schema).upper()
+            t_name = (tgt_full.split(".", 1)[1] if "." in tgt_full else tgt_full).upper()
+            t_valid = normalize_trigger_status(
+                tgt_info.get("valid") or lookup_trigger_validity(ob_meta, t_owner, t_name)
+            )
             if s_event != t_event:
                 detail_mismatch.append(
                     f"{tgt_full}: 触发事件不一致 (src={s_event}, tgt={t_event})"
                 )
             if s_status != t_status:
                 detail_mismatch.append(
-                    f"{tgt_full}: 状态不一致 (src={s_status}, tgt={t_status})"
+                    f"{tgt_full}: 启用状态不一致 (src={s_status}, tgt={t_status})"
+                )
+            if s_valid != t_valid:
+                detail_mismatch.append(
+                    f"{tgt_full}: 有效性不一致 (src={s_valid}, tgt={t_valid})"
                 )
         all_good = (not missing) and (not extra) and not detail_mismatch
         if all_good:
@@ -8351,13 +9805,30 @@ def compare_triggers_for_table(
         s = src_trg.get(src_info_name) or {}
         t = tgt_info_map.get(tgt_full, {})
         display_name = tgt_full
-        if (s.get("event") or "").strip() != (t.get("event") or "").strip():
+        s_event = (s.get("event") or "").strip()
+        t_event = (t.get("event") or "").strip()
+        s_status = normalize_trigger_status(s.get("status"))
+        t_status = normalize_trigger_status(t.get("status"))
+        s_owner = (s.get("owner") or src_schema).upper()
+        t_owner = (t.get("owner") or tgt_schema).upper()
+        t_name = tgt_full.split(".", 1)[1] if "." in tgt_full else tgt_full
+        s_valid = normalize_trigger_status(
+            s.get("valid") or lookup_trigger_validity(oracle_meta, s_owner, src_info_name)
+        )
+        t_valid = normalize_trigger_status(
+            t.get("valid") or lookup_trigger_validity(ob_meta, t_owner, t_name)
+        )
+        if s_event != t_event:
             detail_mismatch.append(
-                f"{display_name}: 触发事件不一致 (src={s.get('event')}, tgt={t.get('event')})"
+                f"{display_name}: 触发事件不一致 (src={s_event}, tgt={t_event})"
             )
-        if (s.get("status") or "").strip() != (t.get("status") or "").strip():
+        if s_status != t_status:
             detail_mismatch.append(
-                f"{display_name}: 状态不一致 (src={s.get('status')}, tgt={t.get('status')})"
+                f"{display_name}: 启用状态不一致 (src={s_status}, tgt={t_status})"
+            )
+        if s_valid != t_valid:
+            detail_mismatch.append(
+                f"{display_name}: 有效性不一致 (src={s_valid}, tgt={t_valid})"
             )
 
     all_good = (not missing) and (not extra) and (not detail_mismatch)
@@ -10183,6 +11654,104 @@ def sanitize_view_ddl(ddl: str, column_names: Optional[Set[str]] = None) -> str:
     return cleaned
 
 
+def analyze_view_compatibility(
+    ddl: Optional[str],
+    rules: Dict[str, object],
+    dblink_policy: str
+) -> ViewCompatResult:
+    """
+    分析视图 DDL 是否存在 OceanBase 不支持的语法/对象，并执行必要的兼容性重写。
+    """
+    if not ddl:
+        return ViewCompatResult(
+            support_state=SUPPORT_STATE_BLOCKED,
+            reason_code="VIEW_DDL_MISSING",
+            reason="视图 DDL 获取失败",
+            detail="DDL 为空或不可读",
+            cleaned_ddl="",
+            rewrite_notes=[]
+        )
+
+    masker = SqlMasker(ddl)
+    masked = masker.masked_sql
+    masked_upper = masked.upper()
+    rewrite_notes: List[str] = []
+
+    if "DBA_USERS" in masked_upper and re.search(r"\bUSER_ID\b", masked_upper):
+        masked = re.sub(r"\bUSER_ID\b", "USERID", masked, flags=re.IGNORECASE)
+        rewrite_notes.append("DBA_USERS.USER_ID -> USERID")
+
+    cleaned = masker.unmask(masked)
+
+    unsupported_views = {v.upper() for v in (rules.get("unsupported_views") or set())}
+    privilege_views = {v.upper() for v in (rules.get("privilege_views") or set())}
+    compiled_patterns = rules.get("compiled_patterns") or []
+
+    sys_obj_hit = False
+    for pattern in compiled_patterns:
+        if pattern.search(masked_upper):
+            sys_obj_hit = True
+            break
+
+    dblink_hit = (dblink_policy == "block") and ("@" in masked_upper)
+
+    unsupported_hits: List[str] = []
+    for view_name in sorted(unsupported_views):
+        if re.search(rf"\b{re.escape(view_name)}\b", masked_upper):
+            unsupported_hits.append(view_name)
+
+    privilege_hits: List[str] = []
+    for view_name in sorted(privilege_views):
+        if re.search(rf"\b{re.escape(view_name)}\b", masked_upper):
+            privilege_hits.append(view_name)
+
+    if sys_obj_hit:
+        return ViewCompatResult(
+            support_state=SUPPORT_STATE_UNSUPPORTED,
+            reason_code="VIEW_SYS_OBJ",
+            reason="引用 SYS.OBJ$ 基表，OB 不支持",
+            detail="SYS.OBJ$",
+            cleaned_ddl=cleaned,
+            rewrite_notes=rewrite_notes
+        )
+    if dblink_hit:
+        return ViewCompatResult(
+            support_state=SUPPORT_STATE_UNSUPPORTED,
+            reason_code="VIEW_DBLINK",
+            reason="视图包含 DBLINK 引用（策略禁止）",
+            detail="DBLINK",
+            cleaned_ddl=cleaned,
+            rewrite_notes=rewrite_notes
+        )
+    if unsupported_hits:
+        return ViewCompatResult(
+            support_state=SUPPORT_STATE_UNSUPPORTED,
+            reason_code="VIEW_UNSUPPORTED_SYS_VIEW",
+            reason="引用 OB 不支持的系统视图",
+            detail=",".join(unsupported_hits),
+            cleaned_ddl=cleaned,
+            rewrite_notes=rewrite_notes
+        )
+    if privilege_hits:
+        return ViewCompatResult(
+            support_state=SUPPORT_STATE_BLOCKED,
+            reason_code="VIEW_PRIVILEGE_REQUIRED",
+            reason="引用 DBA 视图可能缺少权限",
+            detail=",".join(privilege_hits),
+            cleaned_ddl=cleaned,
+            rewrite_notes=rewrite_notes
+        )
+
+    return ViewCompatResult(
+        support_state=SUPPORT_STATE_SUPPORTED,
+        reason_code="",
+        reason="",
+        detail="",
+        cleaned_ddl=cleaned,
+        rewrite_notes=rewrite_notes
+    )
+
+
 def extract_view_dependencies(ddl: str, default_schema: Optional[str] = None) -> Set[str]:
     """
     从 VIEW DDL 中提取依赖的对象名（表/视图/同义词等）。
@@ -11685,6 +13254,62 @@ def clean_oracle_specific_syntax(ddl: str) -> str:
     return cleaned
 
 
+def clean_interval_partition_clause(ddl: str) -> str:
+    """移除 TABLE DDL 中的 INTERVAL 分区子句（OceanBase 不支持）。"""
+    if not ddl:
+        return ddl
+
+    upper = ddl.upper()
+    if "INTERVAL" not in upper:
+        return ddl
+
+    cleaned = ddl
+    search_pos = 0
+    while True:
+        match = re.search(r"\bINTERVAL\b", cleaned[search_pos:], flags=re.IGNORECASE)
+        if not match:
+            break
+        start = search_pos + match.start()
+        paren_start = cleaned.find("(", start + len(match.group(0)))
+        if paren_start == -1:
+            break
+        i = paren_start
+        depth = 0
+        in_single = False
+        in_double = False
+        while i < len(cleaned):
+            ch = cleaned[i]
+            if ch == "'" and not in_double:
+                if in_single and i + 1 < len(cleaned) and cleaned[i + 1] == "'":
+                    i += 2
+                    continue
+                in_single = not in_single
+                i += 1
+                continue
+            if ch == '"' and not in_single:
+                in_double = not in_double
+                i += 1
+                continue
+            if in_single or in_double:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    cleaned = cleaned[:start] + cleaned[i + 1:]
+                    search_pos = start
+                    break
+            i += 1
+        else:
+            break
+
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\s+\(", " (", cleaned)
+    return cleaned
+
+
 def clean_editionable_flags(ddl: str) -> str:
     """移除 EDITIONABLE / NONEDITIONABLE 关键字（OceanBase 不需要）。"""
     if not ddl:
@@ -11753,6 +13378,7 @@ DDL_CLEANUP_RULES = {
     'TABLE_OBJECTS': {
         'types': ['TABLE'],
         'rules': [
+            clean_interval_partition_clause,
             clean_storage_clauses,
             clean_oracle_specific_syntax,
             clean_extra_semicolons,
@@ -12452,6 +14078,128 @@ def generate_alter_for_table_columns(
     return "\n".join(lines) if lines else None
 
 
+def generate_interval_partition_fixup_scripts(
+    oracle_meta: OracleMetadata,
+    table_target_map: Dict[Tuple[str, str], Tuple[str, str]],
+    settings: Dict,
+    base_dir: Path,
+    allow_fixup_fn: Callable[[str, str, Optional[str]], bool],
+    unsupported_table_keys: Optional[Set[Tuple[str, str]]] = None
+) -> Optional[Path]:
+    if not settings.get("generate_interval_partition_fixup"):
+        return None
+
+    cutoff_date = settings.get("interval_partition_cutoff_date")
+    cutoff_str = (settings.get("interval_partition_cutoff") or "").strip()
+    cutoff_numeric = settings.get("interval_partition_cutoff_numeric_value")
+    cutoff_numeric_raw = (settings.get("interval_partition_cutoff_numeric") or "").strip()
+    if not cutoff_date and not cutoff_numeric:
+        log.warning(
+            "[FIXUP] interval_partition_cutoff/interval_partition_cutoff_numeric 未配置或非法，跳过 interval 分区补齐脚本。"
+        )
+        return None
+
+    interval_map = oracle_meta.interval_partitions or {}
+    if not interval_map:
+        log.info("[FIXUP] 未检测到 interval 分区表，跳过分区补齐脚本。")
+        return None
+    unsupported_table_keys = {
+        (s.upper(), t.upper()) for s, t in (unsupported_table_keys or set())
+    }
+
+    def _sanitize_cutoff_label(label: str) -> str:
+        sanitized = re.sub(r"[^A-Za-z0-9_]+", "_", (label or "").strip())
+        return sanitized or "numeric"
+
+    written = 0
+    output_dirs: Set[Path] = set()
+    for (src_schema, src_table), info in interval_map.items():
+        key = (src_schema.upper(), src_table.upper())
+        tgt_schema, tgt_table = table_target_map.get(key, key)
+        if key in unsupported_table_keys:
+            log.info(
+                "[FIXUP][INTERVAL] %s.%s 属于不支持表，跳过 interval 分区补齐脚本。",
+                src_schema,
+                src_table
+            )
+            continue
+        if not allow_fixup_fn("TABLE", tgt_schema, src_schema):
+            continue
+
+        if len(info.partition_key_columns) != 1:
+            log.warning(
+                "[FIXUP][INTERVAL] %s.%s 分区键列数量不为 1，已跳过。",
+                src_schema,
+                src_table
+            )
+            continue
+        part_col = info.partition_key_columns[0]
+        col_meta = oracle_meta.table_columns.get(key, {}).get(part_col, {})
+        data_type = (col_meta.get("data_type") or "").strip()
+        table_full = f"{tgt_schema.upper()}.{tgt_table.upper()}"
+        statements, warnings, kind = generate_interval_partition_statements(
+            info,
+            cutoff_date,
+            cutoff_numeric,
+            data_type,
+            table_full
+        )
+        if not statements:
+            msg = "; ".join(warnings) if warnings else "无可生成分区"
+            log.warning(
+                "[FIXUP][INTERVAL] %s.%s 未生成分区：%s",
+                src_schema,
+                src_table,
+                msg
+            )
+            continue
+
+        cutoff_label = cutoff_str if kind != "numeric" else _sanitize_cutoff_label(cutoff_numeric_raw)
+        subdir = (
+            f"table_alter/interval_add_{cutoff_label}"
+            if kind != "numeric"
+            else f"table_alter/interval_add_numeric_{cutoff_label}"
+        )
+        output_dir = base_dir / subdir
+        ensure_dir(output_dir)
+        output_dirs.add(output_dir)
+
+        header = f"基于 interval 分区规则补齐 {table_full} 的分区 (截止 {cutoff_label})"
+        extra_comments = [
+            f"source_table: {src_schema.upper()}.{src_table.upper()}",
+            f"interval_expr: {info.interval_expr}",
+            f"last_high_value: {info.last_high_value}",
+            f"partition_key: {part_col}",
+        ]
+        if kind == "numeric" and cutoff_numeric_raw:
+            extra_comments.append(f"numeric_cutoff: {cutoff_numeric_raw}")
+        if warnings:
+            extra_comments.append("warnings: " + "; ".join(warnings))
+
+        filename = f"{tgt_schema.upper()}.{tgt_table.upper()}.interval_add.sql"
+        write_fixup_file(
+            base_dir,
+            subdir,
+            filename,
+            "\n".join(statements),
+            header,
+            extra_comments=extra_comments
+        )
+        written += 1
+
+    if written:
+        dir_list = ", ".join(sorted({str(p) for p in output_dirs})) if output_dirs else "-"
+        log.info(
+            "[FIXUP] interval 分区补齐脚本已生成 %d 份，目录: %s",
+            written,
+            dir_list
+        )
+        return next(iter(output_dirs)) if output_dirs else None
+
+    log.info("[FIXUP] interval 分区补齐脚本未生成任何文件。")
+    return None
+
+
 def generate_fixup_scripts(
     ora_cfg: OraConfig,
     ob_cfg: ObConfig,
@@ -12473,19 +14221,23 @@ def generate_fixup_scripts(
     package_results: Optional[PackageCompareResults] = None,
     report_dir: Optional[Path] = None,
     report_timestamp: Optional[str] = None,
-    fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None
+    fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None,
+    support_state_map: Optional[Dict[Tuple[str, str], ObjectSupportReportRow]] = None,
+    unsupported_table_keys: Optional[Set[Tuple[str, str]]] = None,
+    view_compat_map: Optional[Dict[Tuple[str, str], ViewCompatResult]] = None
 ):
     """
     基于校验结果生成 fixup_scripts DDL 脚本，并按依赖顺序排列：
       1. SEQUENCE
       2. TABLE (CREATE)
       3. TABLE (ALTER - for column diffs)
-      4. VIEW / MATERIALIZED VIEW 等代码对象
-      5. INDEX
-      6. CONSTRAINT
-    7. TRIGGER
-    8. 依赖重编译 (ALTER ... COMPILE)
-    9. 授权脚本 (对象/角色/系统)
+      4. TABLE (INTERVAL 分区补齐)
+      5. VIEW / MATERIALIZED VIEW 等代码对象
+      6. INDEX
+      7. CONSTRAINT
+      8. TRIGGER
+      9. 依赖重编译 (ALTER ... COMPILE)
+     10. 授权脚本 (对象/角色/系统)
 
     如果配置了 trigger_list，则仅生成清单中列出的触发器脚本。
     """
@@ -12496,6 +14248,9 @@ def generate_fixup_scripts(
     progress_log_interval = max(1.0, progress_log_interval)
     synonym_meta_map = synonym_metadata or {}
     trigger_filter_set = {t.upper() for t in (trigger_filter_entries or set())}
+    support_state_map = support_state_map or {}
+    unsupported_table_keys = {(s.upper(), t.upper()) for s, t in (unsupported_table_keys or set())}
+    view_compat_map = view_compat_map or {}
     if trigger_filter_enabled:
         log.info("[FIXUP] 已启用 trigger_list 过滤，清单条目数=%d。", len(trigger_filter_set))
         if not trigger_filter_set:
@@ -12558,6 +14313,7 @@ def generate_fixup_scripts(
         for (src_name, tgt_name, obj_type) in master_list
         if obj_type.upper() == 'TABLE'
     }
+    table_target_map = build_table_target_map(master_list)
 
     object_replacements: List[Tuple[Tuple[str, str], Tuple[str, str]]] = []
     replacement_set: Set[Tuple[str, str, str, str]] = set()
@@ -12683,6 +14439,18 @@ def generate_fixup_scripts(
 
     def source_tag(label: str) -> str:
         return f"[{label}]"
+
+    def build_support_comments(row: Optional[ObjectSupportReportRow]) -> List[str]:
+        if not row:
+            return []
+        return [
+            f"support_state: {row.support_state}",
+            f"reason_code: {row.reason_code or '-'}",
+            f"reason: {row.reason or '-'}",
+            f"dependency: {row.dependency or '-'}",
+            f"action: {row.action or '-'}",
+            f"detail: {row.detail or '-'}",
+        ]
 
     def allow_fixup(obj_type: str, tgt_schema: str, src_schema: Optional[str] = None) -> bool:
         nonlocal fixup_schema_used_source_match
@@ -13118,13 +14886,23 @@ def generate_fixup_scripts(
             return
         schema_requests[schema_u][obj_type_u].add(obj_name_u)
 
-    missing_tables: List[Tuple[str, str, str, str]] = []
-    other_missing_objects: List[Tuple[str, str, str, str, str]] = []
+    missing_tables_supported: List[Tuple[str, str, str, str]] = []
+    missing_tables_unsupported: List[Tuple[str, str, str, str, ObjectSupportReportRow]] = []
+    other_missing_supported: List[Tuple[str, str, str, str, str]] = []
+    other_missing_unsupported: List[Tuple[str, str, str, str, str, ObjectSupportReportRow]] = []
     missing_total_by_type: Dict[str, int] = defaultdict(int)
     missing_allowed_by_type: Dict[str, int] = defaultdict(int)
     synonym_scope_skipped = 0
     index_missing_total = sum(len(item.missing_indexes) for item in extra_results.get('index_mismatched', []))
     index_skip_counts: Dict[str, int] = defaultdict(int)
+
+    def is_temporary_support_row(row: Optional[ObjectSupportReportRow]) -> bool:
+        if not row:
+            return False
+        code = (row.reason_code or "").upper()
+        if "TEMPORARY_TABLE" in code or "TEMP_TABLE" in code:
+            return True
+        return False
 
     for (obj_type, tgt_name, src_name) in tv_results.get('missing', []):
         obj_type_u = obj_type.upper()
@@ -13153,6 +14931,8 @@ def generate_fixup_scripts(
                 )
                 continue
         missing_total_by_type[obj_type_u] += 1
+        support_row = support_state_map.get((obj_type_u, f"{src_schema.upper()}.{src_obj.upper()}"))
+        support_state = support_row.support_state if support_row else SUPPORT_STATE_SUPPORTED
         if not allow_fixup(obj_type_u, tgt_schema, src_schema):
             continue
         if obj_type_u == 'SYNONYM' and not allow_synonym_scope(src_schema, tgt_schema):
@@ -13161,9 +14941,15 @@ def generate_fixup_scripts(
         missing_allowed_by_type[obj_type_u] += 1
         queue_request(src_schema, obj_type_u, src_obj)
         if obj_type_u == 'TABLE':
-            missing_tables.append((src_schema, src_obj, tgt_schema, tgt_obj))
+            if support_state == SUPPORT_STATE_SUPPORTED:
+                missing_tables_supported.append((src_schema, src_obj, tgt_schema, tgt_obj))
+            else:
+                missing_tables_unsupported.append((src_schema, src_obj, tgt_schema, tgt_obj, support_row))
         else:
-            other_missing_objects.append((obj_type_u, src_schema, src_obj, tgt_schema, tgt_obj))
+            if support_state == SUPPORT_STATE_SUPPORTED:
+                other_missing_supported.append((obj_type_u, src_schema, src_obj, tgt_schema, tgt_obj))
+            else:
+                other_missing_unsupported.append((obj_type_u, src_schema, src_obj, tgt_schema, tgt_obj, support_row))
 
     if fixup_schema_filter or fixup_type_filter:
         filtered = []
@@ -13198,8 +14984,13 @@ def generate_fixup_scripts(
             obj_type_u = row.obj_type.upper()
             if not allow_fixup(obj_type_u, tgt_schema, src_schema):
                 continue
+            support_row = support_state_map.get((obj_type_u, row.src_full.upper()))
+            support_state = support_row.support_state if support_row else SUPPORT_STATE_SUPPORTED
             queue_request(src_schema, obj_type_u, src_obj)
-            other_missing_objects.append((obj_type_u, src_schema, src_obj, tgt_schema, tgt_obj))
+            if support_state == SUPPORT_STATE_SUPPORTED:
+                other_missing_supported.append((obj_type_u, src_schema, src_obj, tgt_schema, tgt_obj))
+            else:
+                other_missing_unsupported.append((obj_type_u, src_schema, src_obj, tgt_schema, tgt_obj, support_row))
 
     sequence_tasks: List[Tuple[str, str, str, str]] = []
     for seq_mis in extra_results.get('sequence_mismatched', []):
@@ -13230,6 +15021,9 @@ def generate_fixup_scripts(
             continue
         src_schema, src_table = src_name.split('.')
         tgt_schema, tgt_table = table_str.split('.')
+        if (src_schema.upper(), src_table.upper()) in unsupported_table_keys:
+            index_skip_counts["unsupported_table"] += len(item.missing_indexes)
+            continue
         if not allow_fixup('INDEX', tgt_schema, src_schema):
             reason = classify_fixup_skip('INDEX', tgt_schema, src_schema) or "filtered"
             index_skip_counts[reason] += len(item.missing_indexes)
@@ -13247,6 +15041,8 @@ def generate_fixup_scripts(
             continue
         src_schema, src_table = src_name.split('.')
         tgt_schema, tgt_table = table_str.split('.')
+        if (src_schema.upper(), src_table.upper()) in unsupported_table_keys:
+            continue
         if not allow_fixup('CONSTRAINT', tgt_schema, src_schema):
             continue
         queue_request(src_schema, 'TABLE', src_table)
@@ -13262,6 +15058,8 @@ def generate_fixup_scripts(
             continue
         src_schema, src_table = src_name.split('.', 1)
         tgt_schema, tgt_table = table_str.split('.', 1)
+        if (src_schema.upper(), src_table.upper()) in unsupported_table_keys:
+            continue
         # 优先使用缺失映射对（源->目标），确保 dbcat 按源名导出
         if item.missing_mappings:
             for src_full, tgt_full in item.missing_mappings:
@@ -13294,24 +15092,34 @@ def generate_fixup_scripts(
                 trigger_tasks.append((src_schema, trg_name_u, tgt_schema_final, tgt_obj, src_table, tgt_schema, tgt_table))
 
     other_missing_summary: Dict[str, int] = defaultdict(int)
-    for ot, _, _, _, _ in other_missing_objects:
+    for ot, _, _, _, _ in other_missing_supported:
+        other_missing_summary[ot] += 1
+    for ot, _, _, _, _, _ in other_missing_unsupported:
         other_missing_summary[ot] += 1
     index_total = sum(len(item.missing_indexes) for item, _, _, _, _ in index_tasks)
     constraint_total = sum(len(item.missing_constraints) for item, _, _, _, _ in constraint_tasks)
+    supported_table_cnt = len(missing_tables_supported)
+    unsupported_table_cnt = len(missing_tables_unsupported)
+    supported_other_cnt = len(other_missing_supported)
+    unsupported_other_cnt = len(other_missing_unsupported)
     total_missing_scripts = (
         len(sequence_tasks)
-        + len(missing_tables)
-        + len(other_missing_objects)
+        + supported_table_cnt
+        + supported_other_cnt
         + index_total
         + constraint_total
         + len(trigger_tasks)
     )
+    unsupported_total = unsupported_table_cnt + unsupported_other_cnt
     other_summary = ", ".join(f"{k}={v}" for k, v in sorted(other_missing_summary.items())) or "无"
     log.info(
-        "[FIXUP] 待生成缺失对象/脚本总计 %d 个: TABLE=%d, 其他=%d (%s), INDEX=%d, CONSTRAINT=%d, SEQUENCE=%d, TRIGGER=%d",
+        "[FIXUP] 待生成缺失对象/脚本总计 %d 个 (unsupported=%d): TABLE=%d(+%d), 其他=%d(+%d) (%s), INDEX=%d, CONSTRAINT=%d, SEQUENCE=%d, TRIGGER=%d",
         total_missing_scripts,
-        len(missing_tables),
-        len(other_missing_objects),
+        unsupported_total,
+        supported_table_cnt,
+        unsupported_table_cnt,
+        supported_other_cnt,
+        unsupported_other_cnt,
         other_summary,
         index_total,
         constraint_total,
@@ -13324,6 +15132,8 @@ def generate_fixup_scripts(
             "[FIXUP] 检测到 %d 个 PUBLIC 同义词，将跳过 dbcat，优先使用同义词元数据；缺失时再用 DBMS_METADATA 兜底。",
             len(public_synonym_fallback)
         )
+
+    missing_tables = list(missing_tables_supported)
 
     ob_grant_catalog: Optional[ObGrantCatalog] = None
     object_grants_missing_by_grantee: Dict[str, Set[ObjectGrantEntry]] = {}
@@ -13362,18 +15172,29 @@ def generate_fixup_scripts(
                 "true" if merge_grantees else "false"
             )
 
-    # 分离VIEW对象和其他对象（需要在使用前定义）
-    view_missing_objects: List[Tuple[str, str, str, str]] = []
-    non_view_missing_objects: List[Tuple[str, str, str, str, str]] = []
-    
-    for (obj_type, src_schema, src_obj, tgt_schema, tgt_obj) in other_missing_objects:
-        if obj_type.upper() == 'VIEW':
-            view_missing_objects.append((src_schema, src_obj, tgt_schema, tgt_obj))
-        else:
-            non_view_missing_objects.append((obj_type, src_schema, src_obj, tgt_schema, tgt_obj))
+    # 分离 VIEW 对象和其他对象（支持/不支持）
+    view_missing_supported: List[Tuple[str, str, str, str]] = []
+    view_missing_unsupported: List[Tuple[str, str, str, str, ObjectSupportReportRow]] = []
+    non_view_missing_supported: List[Tuple[str, str, str, str, str]] = []
+    non_view_missing_unsupported: List[Tuple[str, str, str, str, str, ObjectSupportReportRow]] = []
 
-    if report_dir and report_timestamp and view_missing_objects:
-        view_targets = [f"{tgt_schema}.{tgt_obj}" for _, _, tgt_schema, tgt_obj in view_missing_objects]
+    for (obj_type, src_schema, src_obj, tgt_schema, tgt_obj) in other_missing_supported:
+        if obj_type.upper() == 'VIEW':
+            view_missing_supported.append((src_schema, src_obj, tgt_schema, tgt_obj))
+        else:
+            non_view_missing_supported.append((obj_type, src_schema, src_obj, tgt_schema, tgt_obj))
+
+    for (obj_type, src_schema, src_obj, tgt_schema, tgt_obj, support_row) in other_missing_unsupported:
+        if obj_type.upper() == 'VIEW':
+            view_missing_unsupported.append((src_schema, src_obj, tgt_schema, tgt_obj, support_row))
+        else:
+            non_view_missing_unsupported.append((obj_type, src_schema, src_obj, tgt_schema, tgt_obj, support_row))
+
+    view_missing_objects = list(view_missing_supported)
+    non_view_missing_objects = list(non_view_missing_supported)
+
+    if report_dir and report_timestamp and view_missing_supported:
+        view_targets = [f"{tgt_schema}.{tgt_obj}" for _, _, tgt_schema, tgt_obj in view_missing_supported]
         dep_pairs = expected_dependency_pairs or set()
         if dep_pairs:
             view_chain_path = Path(report_dir) / f"VIEWs_chain_{report_timestamp}.txt"
@@ -13399,13 +15220,18 @@ def generate_fixup_scripts(
     
     # 收集需要 fallback 的对象（dbcat 缺失时由 DBMS_METADATA 兜底）
     fallback_needed: List[Tuple[str, str, str]] = []
-    for obj_type, src_schema, src_obj, tgt_schema, tgt_obj in non_view_missing_objects:
+    for obj_type, src_schema, src_obj, tgt_schema, tgt_obj in non_view_missing_supported:
         # 检查 dbcat_data 中是否有
+        if not dbcat_data.get(src_schema.upper(), {}).get(obj_type.upper(), {}).get(src_obj.upper()):
+            fallback_needed.append((src_schema, obj_type, src_obj))
+    for obj_type, src_schema, src_obj, tgt_schema, tgt_obj, _support_row in non_view_missing_unsupported:
         if not dbcat_data.get(src_schema.upper(), {}).get(obj_type.upper(), {}).get(src_obj.upper()):
             fallback_needed.append((src_schema, obj_type, src_obj))
 
     # 视图任务（VIEW 固定使用 DBMS_METADATA）
-    for src_schema, src_obj, _, _ in view_missing_objects:
+    for src_schema, src_obj, _, _ in view_missing_supported:
+        fallback_needed.append((src_schema, 'VIEW', src_obj))
+    for src_schema, src_obj, _, _, _support_row in view_missing_unsupported:
         fallback_needed.append((src_schema, 'VIEW', src_obj))
     
     # 序列任务
@@ -13659,6 +15485,76 @@ def generate_fixup_scripts(
         table_jobs.append(_job)
     run_tasks(table_jobs, "TABLE")
 
+    if missing_tables_unsupported:
+        log.info("[FIXUP] (2b/9) 正在生成不支持 TABLE 的 DDL（仅输出，默认不执行）...")
+        table_unsup_jobs: List[Callable[[], None]] = []
+        table_unsup_progress = build_progress_tracker(
+            len(missing_tables_unsupported),
+            "[FIXUP] (2b/9) TABLE_UNSUPPORTED"
+        )
+        for src_schema, src_table, tgt_schema, tgt_table, support_row in missing_tables_unsupported:
+            def _job(ss=src_schema, st=src_table, ts=tgt_schema, tt=tgt_table, sr=support_row):
+                try:
+                    fetch_result = fetch_ddl_with_timing(ss, 'TABLE', st)
+                    if len(fetch_result) != 3:
+                        log.error("[FIXUP] TABLE fetch_ddl_with_timing 返回了 %d 个值，期望 3 个: %s", len(fetch_result), fetch_result)
+                        return
+                    ddl, ddl_source_label, _elapsed = fetch_result
+                    if not ddl:
+                        log.warning("[FIXUP] 未找到 TABLE %s.%s 的 dbcat DDL。", ss, st)
+                        mark_source('TABLE', 'missing')
+                        return
+                    if _is_dbcat_unsupported_table(ddl):
+                        fallback_ddl, fallback_label = get_fallback_ddl(ss, 'TABLE', st)
+                        if fallback_ddl:
+                            ddl = fallback_ddl
+                            ddl_source_label = fallback_label
+                            mark_source('TABLE', 'fallback')
+                            log.info("[FIXUP] TABLE %s.%s 的 dbcat DDL 为 unsupported，已使用 %s 兜底。", ss, st, fallback_label)
+                        else:
+                            log.warning("[FIXUP] TABLE %s.%s 的 dbcat DDL 为 unsupported，DBMS_METADATA 兜底失败，仍输出原始 DDL 供人工处理。", ss, st)
+                    if ddl_source_label.startswith("DBCAT"):
+                        mark_source('TABLE', 'dbcat')
+                    elif ddl_source_label in ("DBMS_METADATA", "DBA_VIEWS"):
+                        mark_source('TABLE', 'fallback')
+                    else:
+                        mark_source('TABLE', 'missing')
+                    ddl_adj = adjust_ddl_for_object(
+                        ddl,
+                        ss,
+                        st,
+                        ts,
+                        tt,
+                        extra_identifiers=get_relevant_replacements(ss),
+                        obj_type='TABLE'
+                    )
+                    ddl_adj = inflate_table_varchar_lengths(ddl_adj, ss, st, oracle_meta)
+                    ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
+                    ddl_adj = prepend_set_schema(ddl_adj, ts)
+                    ddl_adj = normalize_ddl_for_ob(ddl_adj)
+                    obj_full = f"{ts}.{tt}"
+                    ddl_adj = apply_hint_filter('TABLE', obj_full, ddl_adj)
+                    ddl_adj = apply_ddl_cleanup_rules(ddl_adj, 'TABLE')
+                    ddl_adj = strip_constraint_enable(ddl_adj)
+                    ddl_adj = strip_enable_novalidate(ddl_adj)
+                    filename = f"{ts}.{tt}.sql"
+                    header = f"不支持 TABLE DDL {obj_full} (源: {ss}.{st})"
+                    subdir = "tables_unsupported/temporary" if is_temporary_support_row(sr) else "tables_unsupported"
+                    extra_comments = build_support_comments(sr)
+                    log.info("[FIXUP]%s 写入不支持 TABLE 脚本: %s", source_tag(ddl_source_label), filename)
+                    write_fixup_file(
+                        base_dir,
+                        subdir,
+                        filename,
+                        ddl_adj,
+                        header,
+                        extra_comments=extra_comments
+                    )
+                finally:
+                    table_unsup_progress()
+            table_unsup_jobs.append(_job)
+        run_tasks(table_unsup_jobs, "TABLE_UNSUPPORTED")
+
     log.info("[FIXUP] (3/9) 正在生成 TABLE ALTER 脚本...")
     for (obj_type, tgt_name, missing_cols, extra_cols, length_mismatches, type_mismatches) in tv_results.get('mismatched', []):
         if obj_type.upper() != 'TABLE' or "获取失败" in tgt_name:
@@ -13668,6 +15564,8 @@ def generate_fixup_scripts(
             continue
         src_schema, src_table = src_name.split('.')
         tgt_schema, tgt_table = tgt_name.split('.')
+        if (src_schema.upper(), src_table.upper()) in unsupported_table_keys:
+            continue
         alter_sql = generate_alter_for_table_columns(
             oracle_meta,
             src_schema,
@@ -13685,6 +15583,17 @@ def generate_fixup_scripts(
             header = f"基于列差异的 ALTER TABLE 订正 SQL: {tgt_schema}.{tgt_table} (源: {src_schema}.{src_table})"
             write_fixup_file(base_dir, 'table_alter', filename, alter_sql, header)
 
+    if settings.get("generate_interval_partition_fixup"):
+        log.info("[FIXUP] (3b/9) 正在生成 interval 分区补齐脚本...")
+        generate_interval_partition_fixup_scripts(
+            oracle_meta,
+            table_target_map,
+            settings,
+            base_dir,
+            allow_fixup,
+            unsupported_table_keys
+        )
+
     # 获取OceanBase版本
     ob_version = get_oceanbase_version(ob_cfg)
     if ob_version:
@@ -13693,7 +15602,16 @@ def generate_fixup_scripts(
         log.warning("[VIEW] 无法获取OceanBase版本，将使用保守的DDL清理策略")
 
     log.info("[FIXUP] (4/9) 正在生成 VIEW / MATERIALIZED VIEW / 其他对象脚本...")
-    
+
+    def get_view_cached_ddl(
+        schema: str,
+        view_name: str
+    ) -> Tuple[Optional[str], Optional[ViewCompatResult]]:
+        compat = view_compat_map.get((schema.upper(), view_name.upper()))
+        if compat and compat.cleaned_ddl:
+            return compat.cleaned_ddl, compat
+        return None, compat
+
     # 处理VIEW对象 - 使用简化的拓扑排序
     if view_missing_objects:
         log.info("[FIXUP] (4a/9) 正在排序 %d 个VIEW依赖关系...", len(view_missing_objects))
@@ -13703,6 +15621,10 @@ def generate_fixup_scripts(
             # Step 1: Fetch all VIEW DDLs first
             view_ddl_map = {}  # (src_schema, src_obj) -> DDL
             for src_schema, src_obj, tgt_schema, tgt_obj in view_missing_objects:
+                cached_ddl, _compat = get_view_cached_ddl(src_schema, src_obj)
+                if cached_ddl:
+                    view_ddl_map[(src_schema, src_obj)] = cached_ddl
+                    continue
                 fetch_result = fetch_ddl_with_timing(src_schema, 'VIEW', src_obj)
                 if len(fetch_result) == 3:
                     raw_ddl, _, _ = fetch_result
@@ -13777,11 +15699,18 @@ def generate_fixup_scripts(
         log.info("[FIXUP] 正在生成 %d 个VIEW脚本...", len(view_missing_objects))
         for src_schema, src_obj, tgt_schema, tgt_obj in view_missing_objects:
             try:
-                fetch_result = fetch_ddl_with_timing(src_schema, 'VIEW', src_obj)
-                if len(fetch_result) != 3:
-                    log.error("[FIXUP] VIEW fetch_ddl_with_timing 返回了 %d 个值，期望 3 个: %s", len(fetch_result), fetch_result)
-                    continue
-                raw_ddl, ddl_source_label, _elapsed = fetch_result
+                raw_ddl = None
+                ddl_source_label = "MISSING"
+                compat = view_compat_map.get((src_schema.upper(), src_obj.upper()))
+                if compat and compat.cleaned_ddl:
+                    raw_ddl = compat.cleaned_ddl
+                    ddl_source_label = "VIEW_CACHE"
+                else:
+                    fetch_result = fetch_ddl_with_timing(src_schema, 'VIEW', src_obj)
+                    if len(fetch_result) != 3:
+                        log.error("[FIXUP] VIEW fetch_ddl_with_timing 返回了 %d 个值，期望 3 个: %s", len(fetch_result), fetch_result)
+                        continue
+                    raw_ddl, ddl_source_label, _elapsed = fetch_result
                 if not raw_ddl:
                     log.warning("[FIXUP] 未找到 VIEW %s.%s 的 DDL。", src_schema, src_obj)
                     mark_source('VIEW', 'missing')
@@ -13789,6 +15718,8 @@ def generate_fixup_scripts(
                 if ddl_source_label.startswith("DBCAT"):
                     mark_source('VIEW', 'dbcat')
                 elif ddl_source_label in ("DBMS_METADATA", "DBA_VIEWS"):
+                    mark_source('VIEW', 'fallback')
+                elif ddl_source_label == "VIEW_CACHE":
                     mark_source('VIEW', 'fallback')
                 else:
                     mark_source('VIEW', 'missing')
@@ -13836,6 +15767,9 @@ def generate_fixup_scripts(
                 # 写入文件
                 filename = f"{tgt_schema}.{tgt_obj}.sql"
                 header = f"修补缺失的 VIEW {tgt_obj} (源: {src_schema}.{src_obj})"
+                extra_comments = []
+                if compat and compat.rewrite_notes:
+                    extra_comments.append("rewrite_notes: " + "; ".join(compat.rewrite_notes))
                 grants_for_view = collect_grants_for_object(obj_full)
                 log.info("[FIXUP]%s 写入 VIEW 脚本: %s", source_tag(ddl_source_label), filename)
                 write_fixup_file(
@@ -13844,11 +15778,93 @@ def generate_fixup_scripts(
                     filename,
                     final_ddl,
                     header,
-                    grants_to_add=grants_for_view if grants_for_view else None
+                    grants_to_add=grants_for_view if grants_for_view else None,
+                    extra_comments=extra_comments if extra_comments else None
                 )
                 
             except Exception as exc:
                 log.error("[FIXUP] 处理 VIEW %s.%s 时出错: %s", src_schema, src_obj, exc)
+
+    if view_missing_unsupported:
+        log.info("[FIXUP] (4a/9) 正在生成不支持 VIEW 的 DDL（仅输出，默认不执行）...")
+        view_unsup_progress = build_progress_tracker(
+            len(view_missing_unsupported),
+            "[FIXUP] (4a/9) VIEW_UNSUPPORTED"
+        )
+        for src_schema, src_obj, tgt_schema, tgt_obj, support_row in view_missing_unsupported:
+            try:
+                raw_ddl = None
+                ddl_source_label = "MISSING"
+                compat = view_compat_map.get((src_schema.upper(), src_obj.upper()))
+                if compat and compat.cleaned_ddl:
+                    raw_ddl = compat.cleaned_ddl
+                    ddl_source_label = "VIEW_CACHE"
+                else:
+                    fetch_result = fetch_ddl_with_timing(src_schema, 'VIEW', src_obj)
+                    if len(fetch_result) != 3:
+                        log.error("[FIXUP] VIEW fetch_ddl_with_timing 返回了 %d 个值，期望 3 个: %s", len(fetch_result), fetch_result)
+                        continue
+                    raw_ddl, ddl_source_label, _elapsed = fetch_result
+                if not raw_ddl:
+                    log.warning("[FIXUP] 未找到 VIEW %s.%s 的 DDL。", src_schema, src_obj)
+                    mark_source('VIEW', 'missing')
+                    continue
+                if ddl_source_label.startswith("DBCAT"):
+                    mark_source('VIEW', 'dbcat')
+                elif ddl_source_label in ("DBMS_METADATA", "DBA_VIEWS"):
+                    mark_source('VIEW', 'fallback')
+                elif ddl_source_label == "VIEW_CACHE":
+                    mark_source('VIEW', 'fallback')
+                else:
+                    mark_source('VIEW', 'missing')
+
+                cleaned_ddl = clean_view_ddl_for_oceanbase(raw_ddl, ob_version)
+                col_meta = oracle_meta.table_columns.get((src_schema.upper(), src_obj.upper()), {}) or {}
+                cleaned_ddl = sanitize_view_ddl(cleaned_ddl, set(col_meta.keys()))
+                remapped_ddl = remap_view_dependencies(
+                    cleaned_ddl,
+                    src_schema,
+                    remap_rules,
+                    full_object_mapping
+                )
+                final_ddl = adjust_ddl_for_object(
+                    remapped_ddl,
+                    src_schema,
+                    src_obj,
+                    tgt_schema,
+                    tgt_obj,
+                    extra_identifiers=get_relevant_replacements(src_schema),
+                    obj_type='VIEW'
+                )
+                final_ddl = cleanup_dbcat_wrappers(final_ddl)
+                final_ddl = prepend_set_schema(final_ddl, tgt_schema)
+                final_ddl = normalize_ddl_for_ob(final_ddl)
+                obj_full = f"{tgt_schema}.{tgt_obj}"
+                final_ddl = apply_hint_filter('VIEW', obj_full, final_ddl)
+                final_ddl = apply_ddl_cleanup_rules(final_ddl, 'VIEW')
+                final_ddl = strip_constraint_enable(final_ddl)
+                final_ddl = enforce_schema_for_ddl(final_ddl, tgt_schema, 'VIEW')
+                if not final_ddl.rstrip().endswith(';'):
+                    final_ddl = final_ddl.rstrip() + ';'
+
+                filename = f"{tgt_schema}.{tgt_obj}.sql"
+                header = f"不支持 VIEW DDL {tgt_obj} (源: {src_schema}.{src_obj})"
+                extra_comments = build_support_comments(support_row)
+                if compat and compat.rewrite_notes:
+                    extra_comments.append("rewrite_notes: " + "; ".join(compat.rewrite_notes))
+                log.info("[FIXUP]%s 写入不支持 VIEW 脚本: %s", source_tag(ddl_source_label), filename)
+                write_fixup_file(
+                    base_dir,
+                    "unsupported/view",
+                    filename,
+                    final_ddl,
+                    header,
+                    extra_comments=extra_comments
+                )
+            except Exception as exc:
+                log.error("[FIXUP] 处理不支持 VIEW %s.%s 时出错: %s", src_schema, src_obj, exc)
+            finally:
+                view_unsup_progress()
 
     # 处理非VIEW对象
     other_progress = build_progress_tracker(len(non_view_missing_objects), "[FIXUP] (4b/9) 其他对象")
@@ -13940,6 +15956,94 @@ def generate_fixup_scripts(
                 other_progress()
         other_jobs.append(_job)
     run_tasks(other_jobs, "OTHER_OBJECTS")
+
+    if non_view_missing_unsupported:
+        other_unsup_progress = build_progress_tracker(
+            len(non_view_missing_unsupported),
+            "[FIXUP] (4c/9) 不支持对象"
+        )
+        other_unsup_jobs: List[Callable[[], None]] = []
+        for (obj_type, src_schema, src_obj, tgt_schema, tgt_obj, support_row) in non_view_missing_unsupported:
+            def _job(ot=obj_type, ss=src_schema, so=src_obj, ts=tgt_schema, to=tgt_obj, sr=support_row):
+                try:
+                    fetch_result = fetch_ddl_with_timing(ss, ot, so)
+                    if len(fetch_result) != 3:
+                        log.error("[FIXUP] fetch_ddl_with_timing 返回了 %d 个值，期望 3 个: %s", len(fetch_result), fetch_result)
+                        return
+                    ddl, ddl_source_label, _elapsed = fetch_result
+                    if not ddl:
+                        log.warning("[FIXUP] 未找到 %s %s.%s 的 dbcat DDL。", ot, ss, so)
+                        mark_source(ot, 'missing')
+                        return
+                    if ddl_source_label.startswith("DBCAT"):
+                        mark_source(ot, 'dbcat')
+                    elif ddl_source_label in ("DBMS_METADATA", "DBA_VIEWS"):
+                        mark_source(ot, 'fallback')
+                    else:
+                        mark_source(ot, 'missing')
+                    ddl_adj = adjust_ddl_for_object(
+                        ddl,
+                        ss,
+                        so,
+                        ts,
+                        to,
+                        extra_identifiers=get_relevant_replacements(ss),
+                        obj_type=ot
+                    )
+                    if ot.upper() == 'SYNONYM':
+                        ddl_adj = remap_synonym_target(
+                            ddl_adj,
+                            remap_rules,
+                            full_object_mapping
+                        )
+                        if ts.upper() == 'PUBLIC':
+                            ddl_adj = normalize_public_synonym_name(ddl_adj, to)
+                    if ot.upper() in ['PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'TYPE', 'TYPE BODY']:
+                        ddl_adj = remap_plsql_object_references(ddl_adj, ot, full_object_mapping, source_schema=ss)
+                    ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
+                    if not (ot.upper() == 'SYNONYM' and ts.upper() == 'PUBLIC'):
+                        ddl_adj = prepend_set_schema(ddl_adj, ts)
+                    ddl_adj = normalize_ddl_for_ob(ddl_adj)
+                    obj_full = f"{ts}.{to}"
+                    ddl_adj = apply_hint_filter(ot, obj_full, ddl_adj)
+                    ddl_adj = apply_ddl_cleanup_rules(ddl_adj, ot)
+                    clean_notes = None
+                    if settings.get('enable_ddl_punct_sanitize', True):
+                        ddl_adj, replaced, samples = sanitize_plsql_punctuation(ddl_adj, ot)
+                        if replaced:
+                            sample_text = ", ".join(f"{src}->{dst}" for src, dst in samples)
+                            suffix = f" 示例: {sample_text}" if sample_text else ""
+                            log.info(
+                                "[DDL_CLEAN] %s %s 全角标点清洗 %d 处。%s",
+                                ot,
+                                obj_full,
+                                replaced,
+                                suffix
+                            )
+                            record_ddl_clean(ot, obj_full, replaced, samples)
+                            clean_notes = [f"DDL_CLEAN: 全角标点清洗 {replaced} 处。{suffix}"]
+                    ddl_adj = strip_constraint_enable(ddl_adj)
+                    ddl_adj = enforce_schema_for_ddl(ddl_adj, ts, ot)
+
+                    subdir = f"unsupported/{obj_type_to_dir.get(ot, ot.lower())}"
+                    filename = f"{ts}.{to}.sql"
+                    header = f"不支持对象 DDL {obj_full} (源: {ss}.{so})"
+                    extra_comments = build_support_comments(sr)
+                    if clean_notes:
+                        extra_comments.extend(clean_notes)
+                    log.info("[FIXUP]%s 写入不支持 %s 脚本: %s", source_tag(ddl_source_label), ot, filename)
+                    write_fixup_file(
+                        base_dir,
+                        subdir,
+                        filename,
+                        ddl_adj,
+                        header,
+                        extra_comments=extra_comments
+                    )
+                finally:
+                    other_unsup_progress()
+            other_unsup_jobs.append(_job)
+        run_tasks(other_unsup_jobs, "OTHER_UNSUPPORTED")
 
     index_generated = 0
     index_skip_lock = threading.Lock()
@@ -14553,6 +16657,14 @@ def format_missing_mapping(src_name: str, tgt_name: str) -> str:
     return f"{src_clean}={tgt_clean}"
 
 
+def sanitize_pipe_field(value: Optional[str]) -> str:
+    if value is None:
+        return "-"
+    cleaned = normalize_error_text(str(value))
+    cleaned = cleaned.replace("|", "/")
+    return cleaned if cleaned else "-"
+
+
 def parse_full_object_name(name: str) -> Optional[Tuple[str, str]]:
     if not name or '.' not in name:
         return None
@@ -14614,12 +16726,14 @@ def export_remap_conflicts(
 def export_missing_table_view_mappings(
     tv_results: ReportResults,
     report_dir: Path,
-    blacklisted_tables: Optional[Set[Tuple[str, str]]] = None
+    blacklisted_tables: Optional[Set[Tuple[str, str]]] = None,
+    support_state_map: Optional[Dict[Tuple[str, str], ObjectSupportReportRow]] = None
 ) -> Optional[Path]:
     """
     将缺失的 TABLE/VIEW 映射按目标 schema 输出为文本，便于迁移工具直接消费。
     输出文件示例：SCHEMA_T.txt / SCHEMA_V.txt（目录: missed_tables_views_for_OMS）
     若提供 blacklisted_tables，则跳过黑名单 TABLE。
+    若提供 support_state_map，则跳过不支持/阻断的 TABLE/VIEW。
     """
     if not report_dir:
         return None
@@ -14633,6 +16747,11 @@ def export_missing_table_view_mappings(
         obj_type_u = obj_type.upper()
         if obj_type_u not in ("TABLE", "VIEW"):
             continue
+        if support_state_map and "." in src_name:
+            src_full = src_name.upper()
+            support_row = support_state_map.get((obj_type_u, src_full))
+            if support_row and support_row.support_state != SUPPORT_STATE_SUPPORTED:
+                continue
         if obj_type_u == "TABLE" and blacklisted_tables:
             src_key = parse_full_object_name(src_name)
             if src_key and src_key in blacklisted_tables:
@@ -14665,6 +16784,276 @@ def export_missing_table_view_mappings(
             except OSError as exc:
                 log.warning("写入缺失映射文件失败 %s: %s", file_path, exc)
     return output_dir
+
+
+def write_pipe_report(
+    title: str,
+    header_fields: List[str],
+    rows: List[List[str]],
+    output_path: Path
+) -> Optional[Path]:
+    """
+    写入 pipe 分隔报表，便于直接导入 Excel。
+    """
+    if not rows or not output_path:
+        return None
+    delimiter = "|"
+    header = delimiter.join(header_fields)
+    lines: List[str] = [
+        f"# {title}",
+        f"# total={len(rows)}",
+        f"# 分隔符: {delimiter}",
+        f"# 字段说明: {header}",
+        header
+    ]
+    for row in rows:
+        lines.append(delimiter.join(sanitize_pipe_field(item) for item in row))
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        return output_path
+    except OSError as exc:
+        log.warning("写入报告失败 %s: %s", output_path, exc)
+        return None
+
+
+def export_missing_objects_detail(
+    rows: List[ObjectSupportReportRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出缺失对象支持性明细，包含支持状态与原因。
+    """
+    if not report_dir or not rows or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"missing_objects_detail_{report_timestamp}.txt"
+    rows_sorted = sorted(rows, key=lambda r: (r.obj_type, r.src_full, r.tgt_full))
+    header_fields = [
+        "SRC_FULL",
+        "TYPE",
+        "TGT_FULL",
+        "STATE",
+        "REASON_CODE",
+        "REASON",
+        "DEPENDENCY",
+        "ACTION",
+        "DETAIL"
+    ]
+    data_rows = [
+        [
+            row.src_full,
+            row.obj_type,
+            row.tgt_full,
+            row.support_state,
+            row.reason_code,
+            row.reason,
+            row.dependency,
+            row.action,
+            row.detail
+        ]
+        for row in rows_sorted
+    ]
+    return write_pipe_report("缺失对象支持性明细", header_fields, data_rows, output_path)
+
+
+def export_unsupported_objects_detail(
+    rows: List[ObjectSupportReportRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出不支持/阻断对象明细。
+    """
+    if not report_dir or not rows or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"unsupported_objects_detail_{report_timestamp}.txt"
+    rows_sorted = sorted(rows, key=lambda r: (r.obj_type, r.src_full, r.tgt_full))
+    header_fields = [
+        "SRC_FULL",
+        "TYPE",
+        "TGT_FULL",
+        "STATE",
+        "REASON_CODE",
+        "REASON",
+        "DEPENDENCY",
+        "ACTION",
+        "DETAIL"
+    ]
+    data_rows = [
+        [
+            row.src_full,
+            row.obj_type,
+            row.tgt_full,
+            row.support_state,
+            row.reason_code,
+            row.reason,
+            row.dependency,
+            row.action,
+            row.detail
+        ]
+        for row in rows_sorted
+    ]
+    return write_pipe_report("不支持/阻断对象明细", header_fields, data_rows, output_path)
+
+
+def export_extra_targets_detail(
+    extra_targets: List[Tuple[str, str]],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not extra_targets or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"extra_targets_detail_{report_timestamp}.txt"
+    header_fields = ["TYPE", "TARGET_FULL"]
+    rows = [[obj_type, tgt_name] for obj_type, tgt_name in extra_targets]
+    return write_pipe_report("目标端多余对象明细", header_fields, rows, output_path)
+
+
+def export_skipped_objects_detail(
+    skipped_items: List[Tuple[str, str, str, str]],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not skipped_items or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"skipped_objects_detail_{report_timestamp}.txt"
+    header_fields = ["TYPE", "SRC_FULL", "TGT_FULL", "REASON"]
+    rows = [
+        [obj_type, src_name, tgt_name, reason or "-"]
+        for obj_type, tgt_name, src_name, reason in skipped_items
+    ]
+    return write_pipe_report("仅打印未校验对象明细", header_fields, rows, output_path)
+
+
+def export_mismatched_tables_detail(
+    mismatched_items: List[Tuple[str, str, Set[str], Set[str], List[Tuple[str, int, int, int, str]], List[Tuple[str, str, str, str]]]],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not mismatched_items or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"mismatched_tables_detail_{report_timestamp}.txt"
+    header_fields = ["TABLE", "MISSING_COLS", "EXTRA_COLS", "LENGTH_MISMATCHES", "TYPE_MISMATCHES"]
+    rows: List[List[str]] = []
+    for obj_type, tgt_name, missing, extra, length_mismatches, type_mismatches in mismatched_items:
+        if (obj_type or "").upper() != "TABLE":
+            continue
+        if "获取失败" in tgt_name:
+            rows.append([tgt_name, "SOURCE_META_FAILED", "-", "-", "-"])
+            continue
+        length_parts = []
+        for col, src_len, tgt_len, limit_len, issue_type in length_mismatches:
+            length_parts.append(f"{col}:{src_len}->{tgt_len}({issue_type}:{limit_len})")
+        type_parts = []
+        for col, src_type, tgt_type, expected_type in type_mismatches:
+            type_parts.append(f"{col}:{src_type}->{tgt_type}({expected_type})")
+        rows.append([
+            tgt_name,
+            ",".join(sorted(missing)) if missing else "-",
+            ",".join(sorted(extra)) if extra else "-",
+            ";".join(length_parts) if length_parts else "-",
+            ";".join(type_parts) if type_parts else "-"
+        ])
+    return write_pipe_report("表列不匹配明细", header_fields, rows, output_path)
+
+
+def export_comment_mismatch_detail(
+    comment_items: List[CommentMismatch],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not comment_items or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"comment_mismatch_detail_{report_timestamp}.txt"
+    header_fields = ["TABLE", "TABLE_COMMENT_DIFF", "MISSING_COLS", "EXTRA_COLS", "COLUMN_COMMENT_DIFFS"]
+    rows: List[List[str]] = []
+    for item in comment_items:
+        table_comment = "-"
+        if item.table_comment:
+            table_comment = f"{item.table_comment[0]} -> {item.table_comment[1]}"
+        col_comment_parts = []
+        for col, src_cmt, tgt_cmt in item.column_comment_diffs:
+            col_comment_parts.append(f"{col}:{src_cmt}->{tgt_cmt}")
+        rows.append([
+            item.table,
+            table_comment,
+            ",".join(sorted(item.missing_columns)) if item.missing_columns else "-",
+            ",".join(sorted(item.extra_columns)) if item.extra_columns else "-",
+            ";".join(col_comment_parts) if col_comment_parts else "-"
+        ])
+    return write_pipe_report("注释差异明细", header_fields, rows, output_path)
+
+
+def export_extra_mismatch_detail(
+    extra_results: ExtraCheckResults,
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not extra_results or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"extra_mismatch_detail_{report_timestamp}.txt"
+    header_fields = ["TYPE", "OBJECT", "MISSING", "EXTRA", "DETAIL"]
+    rows: List[List[str]] = []
+    for item in extra_results.get("index_mismatched", []):
+        rows.append([
+            "INDEX",
+            item.table,
+            ",".join(sorted(item.missing_indexes)) if item.missing_indexes else "-",
+            ",".join(sorted(item.extra_indexes)) if item.extra_indexes else "-",
+            ";".join(item.detail_mismatch) if item.detail_mismatch else "-"
+        ])
+    for item in extra_results.get("constraint_mismatched", []):
+        rows.append([
+            "CONSTRAINT",
+            item.table,
+            ",".join(sorted(item.missing_constraints)) if item.missing_constraints else "-",
+            ",".join(sorted(item.extra_constraints)) if item.extra_constraints else "-",
+            ";".join(item.detail_mismatch) if item.detail_mismatch else "-"
+        ])
+    for item in extra_results.get("sequence_mismatched", []):
+        missing = ",".join(sorted(item.missing_sequences)) if item.missing_sequences else "-"
+        extra = ",".join(sorted(item.extra_sequences)) if item.extra_sequences else "-"
+        note = item.note or "-"
+        rows.append([
+            "SEQUENCE",
+            f"{item.src_schema}->{item.tgt_schema}",
+            missing,
+            extra,
+            note
+        ])
+    for item in extra_results.get("trigger_mismatched", []):
+        rows.append([
+            "TRIGGER",
+            item.table,
+            ",".join(sorted(item.missing_triggers)) if item.missing_triggers else "-",
+            ",".join(sorted(item.extra_triggers)) if item.extra_triggers else "-",
+            ";".join(item.detail_mismatch) if item.detail_mismatch else "-"
+        ])
+    if not rows:
+        return None
+    return write_pipe_report("扩展对象差异明细", header_fields, rows, output_path)
+
+
+def export_dependency_detail(
+    dependency_report: DependencyReport,
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not dependency_report or not report_timestamp:
+        return None
+    rows: List[List[str]] = []
+    for issue in dependency_report.get("missing", []):
+        rows.append(["MISSING", issue.dependent, issue.dependent_type, issue.referenced, issue.referenced_type, issue.reason])
+    for issue in dependency_report.get("unexpected", []):
+        rows.append(["EXTRA", issue.dependent, issue.dependent_type, issue.referenced, issue.referenced_type, issue.reason])
+    for issue in dependency_report.get("skipped", []):
+        rows.append(["SKIPPED", issue.dependent, issue.dependent_type, issue.referenced, issue.referenced_type, issue.reason])
+    if not rows:
+        return None
+    output_path = Path(report_dir) / f"dependency_detail_{report_timestamp}.txt"
+    header_fields = ["CATEGORY", "DEPENDENT", "DEPENDENT_TYPE", "REFERENCED", "REFERENCED_TYPE", "REASON"]
+    return write_pipe_report("依赖关系差异明细", header_fields, rows, output_path)
 
 
 def derive_package_report_path(report_file: Path) -> Path:
@@ -14973,14 +17362,15 @@ def build_blacklist_report_rows(
         src_full = f"{schema_u}.{table_u}"
         mapping_hint = ""
         if mapped_full != src_full:
-            mapping_hint = f"目标端: {mapped_full}; "
+            mapping_hint = f"目标端: {mapped_full}"
 
-        for black_type, data_type in sorted(entries):
-            black_type_u = normalize_black_type(black_type) or "UNKNOWN"
-            data_type_u = normalize_black_data_type(data_type) or "-"
+        for entry in sorted(entries.values(), key=lambda e: (e.black_type, e.data_type, e.source)):
+            black_type_u = normalize_black_type(entry.black_type) or "UNKNOWN"
+            data_type_u = normalize_black_data_type(entry.data_type) or "-"
             reason = blacklist_reason(black_type_u)
             status = "BLACKLISTED"
-            detail = "-"
+            source_detail = format_blacklist_source(entry.source)
+            detail = source_detail or "-"
 
             if black_type_u == "LONG" or is_long_type(data_type_u):
                 status, detail, verified = evaluate_long_conversion_status(
@@ -14991,7 +17381,7 @@ def build_blacklist_report_rows(
                     tgt_schema,
                     tgt_table
                 )
-                detail = f"{mapping_hint}{detail}" if mapping_hint and detail != "-" else detail
+                detail = merge_detail_parts(source_detail, mapping_hint, detail)
                 if verified:
                     reason = "已校验: LONG/LONG RAW 已转换为 CLOB/BLOB"
 
@@ -15027,6 +17417,7 @@ def export_blacklist_tables(
     lines: List[str] = [
         "# 黑名单表清单（LONG/LONG RAW 将校验目标端转换情况）",
         "# 说明: 黑名单缺失表不会生成 missed_tables_views_for_OMS 规则",
+        "# DETAIL 可能包含 RULE=<id> 作为规则来源标记",
         "# 字段说明: TABLE_FULL | BLACK_TYPE | DATA_TYPE | STATUS | DETAIL | REASON"
     ]
     for schema in sorted(grouped.keys()):
@@ -15095,52 +17486,100 @@ def export_blacklist_tables(
         return None
 
 
-def export_trigger_miss_report(
-    rows: List[TriggerListReportRow],
-    summary: Dict[str, object],
+def export_trigger_status_report(
+    trigger_list_rows: List[TriggerListReportRow],
+    trigger_list_summary: Optional[Dict[str, object]],
+    status_rows: List[TriggerStatusReportRow],
     report_dir: Path
 ) -> Optional[Path]:
     """
-    输出触发器清单筛选报告。
+    输出触发器清单筛选 + 状态差异报告。
     """
-    if not report_dir or not summary or not summary.get("enabled"):
+    if not report_dir:
+        return None
+    has_list = bool(trigger_list_summary and trigger_list_summary.get("enabled"))
+    has_status = bool(status_rows)
+    if not has_list and not has_status:
         return None
 
-    output_path = Path(report_dir) / "trigger_miss.txt"
-    lines: List[str] = [
-        "# 触发器清单筛选报告 (trigger_list)",
-        f"# trigger_list: {summary.get('path', '')}",
-        (
-            "# 汇总: total_lines={total_lines}, valid={valid_entries}, invalid={invalid_entries}, "
-            "duplicate={duplicate_entries}, selected_missing={selected_missing}, "
-            "missing_not_listed={missing_not_listed}, not_found={not_found}, not_missing={not_missing}"
-        ).format(**{k: summary.get(k, 0) for k in [
-            "total_lines", "valid_entries", "invalid_entries", "duplicate_entries",
-            "selected_missing", "missing_not_listed", "not_found", "not_missing"
-        ]})
-    ]
-    if summary.get("error"):
-        lines.append(f"# ERROR: {summary.get('error')}")
-    if summary.get("fallback_full"):
-        reason = summary.get("fallback_reason") or "unknown"
-        note = "清单不可用，已回退全量触发器"
-        if reason == "empty_list":
-            note = "清单为空，已回退全量触发器"
-        elif reason == "read_error":
-            note = "清单读取失败，已回退全量触发器"
-        lines.append(f"# NOTE: {note}")
-    if summary.get("check_disabled"):
-        lines.append("# NOTE: TRIGGER 未启用检查，清单仅做格式校验。")
-    lines.append("# 字段说明: ENTRY | STATUS | DETAIL")
+    output_path = Path(report_dir) / "trigger_status_report.txt"
+    lines: List[str] = ["# 触发器状态与清单报告"]
 
-    if rows:
-        entry_w = max(len("ENTRY"), max((len(r.entry) for r in rows), default=0))
-        status_w = max(len("STATUS"), max((len(r.status) for r in rows), default=0))
-        header = f"{'ENTRY'.ljust(entry_w)}  {'STATUS'.ljust(status_w)}  DETAIL"
+    def append_pipe_section(
+        title: str,
+        header_fields: List[str],
+        rows: List[List[str]],
+        extra_notes: Optional[List[str]] = None
+    ) -> None:
+        lines.append("")
+        lines.append(f"# [Section] {title}")
+        if extra_notes:
+            for note in extra_notes:
+                if note:
+                    lines.append(f"# {note}")
+        lines.append(f"# total={len(rows)}")
+        lines.append("# 分隔符: |")
+        header = "|".join(header_fields)
+        lines.append(f"# 字段说明: {header}")
         lines.append(header)
-        lines.append("-" * len(header))
         for row in rows:
-            lines.append(f"{row.entry.ljust(entry_w)}  {row.status.ljust(status_w)}  {row.detail}")
+            lines.append("|".join(sanitize_pipe_field(item) for item in row))
+
+    if has_list and trigger_list_summary:
+        summary = trigger_list_summary
+        notes = [
+            f"trigger_list: {summary.get('path', '')}",
+            (
+                "汇总: total_lines={total_lines}, valid={valid_entries}, invalid={invalid_entries}, "
+                "duplicate={duplicate_entries}, selected_missing={selected_missing}, "
+                "missing_not_listed={missing_not_listed}, not_found={not_found}, not_missing={not_missing}"
+            ).format(**{k: summary.get(k, 0) for k in [
+                "total_lines", "valid_entries", "invalid_entries", "duplicate_entries",
+                "selected_missing", "missing_not_listed", "not_found", "not_missing"
+            ]})
+        ]
+        if summary.get("error"):
+            notes.append(f"ERROR: {summary.get('error')}")
+        if summary.get("fallback_full"):
+            reason = summary.get("fallback_reason") or "unknown"
+            note = "清单不可用，已回退全量触发器"
+            if reason == "empty_list":
+                note = "清单为空，已回退全量触发器"
+            elif reason == "read_error":
+                note = "清单读取失败，已回退全量触发器"
+            notes.append(f"NOTE: {note}")
+        if summary.get("check_disabled"):
+            notes.append("NOTE: TRIGGER 未启用检查，清单仅做格式校验。")
+        list_rows = [
+            [row.entry, row.status, row.detail]
+            for row in trigger_list_rows
+        ]
+        append_pipe_section(
+            "trigger_list 清单筛选",
+            ["ENTRY", "STATUS", "DETAIL"],
+            list_rows,
+            extra_notes=notes
+        )
+
+    if has_status:
+        status_data = [
+            [
+                row.trigger_full,
+                row.src_event,
+                row.tgt_event,
+                row.src_enabled,
+                row.tgt_enabled,
+                row.src_valid,
+                row.tgt_valid,
+                row.detail
+            ]
+            for row in status_rows
+        ]
+        append_pipe_section(
+            "触发器状态差异",
+            ["TRIGGER", "SRC_EVENT", "TGT_EVENT", "SRC_ENABLED", "TGT_ENABLED", "SRC_VALID", "TGT_VALID", "DETAIL"],
+            status_data
+        )
 
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -15148,7 +17587,7 @@ def export_trigger_miss_report(
         output_path.write_text(content, encoding="utf-8")
         return output_path
     except OSError as exc:
-        log.warning("写入 trigger_miss 报告失败 %s: %s", output_path, exc)
+        log.warning("写入 trigger_status_report 报告失败 %s: %s", output_path, exc)
         return None
 
 
@@ -15284,7 +17723,8 @@ def build_run_summary(
     filtered_grants_path: Optional[Path] = None,
     filtered_grants_count: int = 0,
     config_diagnostics: Optional[List[str]] = None,
-    fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None
+    fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None,
+    support_summary: Optional[SupportClassificationResult] = None
 ) -> RunSummary:
     end_time = datetime.now()
     total_seconds = time.perf_counter() - ctx.start_perf
@@ -15392,9 +17832,18 @@ def build_run_summary(
     dep_missing_cnt = len(dependency_report.get("missing", []))
     dep_unexpected_cnt = len(dependency_report.get("unexpected", []))
     dep_skipped_cnt = len(dependency_report.get("skipped", []))
+    unsupported_by_type: Dict[str, int] = {}
+    if support_summary:
+        for obj_type, counts in (support_summary.missing_support_counts or {}).items():
+            unsupported_cnt = int(counts.get("unsupported", 0) or 0) + int(counts.get("blocked", 0) or 0)
+            if unsupported_cnt:
+                unsupported_by_type[obj_type] = unsupported_cnt
     findings: List[str] = [
         f"主对象: 缺失 {missing_count}, 不匹配 {mismatched_count}, 多余 {extra_target_cnt}, 仅打印 {skipped_count}"
     ]
+    if unsupported_by_type:
+        items = ", ".join(f"{k}={v}" for k, v in sorted(unsupported_by_type.items()))
+        findings.append(f"缺失中不支持/阻断: {items}")
     if extraneous_count:
         findings.append(f"无效 remap 规则: {extraneous_count}")
     if remap_conflict_cnt:
@@ -15513,6 +17962,14 @@ def build_run_summary(
             next_steps.append(f"查看 {report_parent}/fixup_skip_summary_*.txt，确认索引修补跳过原因。")
         else:
             next_steps.append("查看 fixup_skip_summary_*.txt，确认索引修补跳过原因。")
+    if unsupported_by_type:
+        if report_file:
+            report_parent = Path(report_file).parent
+            next_steps.append(
+                f"如需明细，设置 report_detail_mode=split 后查看 {report_parent}/unsupported_objects_detail_*.txt。"
+            )
+        else:
+            next_steps.append("如需明细，设置 report_detail_mode=split 后查看 unsupported_objects_detail_*.txt。")
 
     return RunSummary(
         start_time=ctx.start_time,
@@ -15612,11 +18069,13 @@ def print_final_report(
     blacklist_report_rows: Optional[List[BlacklistReportRow]] = None,
     trigger_list_summary: Optional[Dict[str, object]] = None,
     trigger_list_rows: Optional[List[TriggerListReportRow]] = None,
+    trigger_status_rows: Optional[List[TriggerStatusReportRow]] = None,
     package_results: Optional[PackageCompareResults] = None,
     run_summary_ctx: Optional[RunSummaryContext] = None,
     filtered_grants: Optional[List[FilteredGrantEntry]] = None,
     config_diagnostics: Optional[List[str]] = None,
-    fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None
+    fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None,
+    support_summary: Optional[SupportClassificationResult] = None
 ):
     custom_theme = Theme({
         "ok": "green",
@@ -15635,6 +18094,18 @@ def print_final_report(
     else:
         report_width = 160
     console = Console(theme=custom_theme, record=report_file is not None, width=report_width)
+    report_detail_mode = (
+        settings.get('report_detail_mode', 'split')
+        if settings else 'full'
+    )
+    report_detail_mode = normalize_report_detail_mode(report_detail_mode)
+    show_detail_sections = report_detail_mode == "full"
+    emit_detail_files = report_detail_mode == "split"
+    report_ts: Optional[str] = None
+    if report_file:
+        report_name = Path(report_file).name
+        if report_name.startswith("report_") and report_name.endswith(".txt"):
+            report_ts = report_name[len("report_"):-4]
 
     if extra_results is None:
         extra_results = {
@@ -15654,6 +18125,7 @@ def print_final_report(
             "unexpected": [],
             "skipped": []
         }
+    trigger_status_rows = trigger_status_rows or []
     if schema_summary is None:
         schema_summary = {
             "source_missing": [],
@@ -15705,6 +18177,10 @@ def print_final_report(
     package_src_invalid_cnt = int(package_summary.get("SOURCE_INVALID", 0) or 0)
     package_tgt_invalid_cnt = int(package_summary.get("TARGET_INVALID", 0) or 0)
     package_status_mismatch_cnt = int(package_summary.get("STATUS_MISMATCH", 0) or 0)
+    support_counts = dict(support_summary.missing_support_counts) if support_summary else {}
+    unsupported_rows = list(support_summary.unsupported_rows) if support_summary else []
+    missing_detail_rows = list(support_summary.missing_detail_rows) if support_summary else []
+    extra_blocked_counts = dict(support_summary.extra_blocked_counts) if support_summary else {}
 
     console.print(Panel.fit(f"[bold]数据库对象迁移校验报告 (V{__version__} - Rich)[/bold]", style="title"))
     console.print(f"[info]项目主页: {REPO_URL} | 问题反馈: {REPO_ISSUES_URL}[/info]")
@@ -15786,6 +18262,14 @@ def print_final_report(
     primary_text.append(f"{ok_count}\n")
     primary_text.append("缺失: ", style="missing")
     primary_text.append(f"{missing_count}\n")
+    unsupported_total = 0
+    if support_counts:
+        for data in support_counts.values():
+            unsupported_total += int(data.get("unsupported", 0) or 0)
+            unsupported_total += int(data.get("blocked", 0) or 0)
+    if unsupported_total:
+        primary_text.append("缺失(不支持/阻断): ", style="mismatch")
+        primary_text.append(f"{unsupported_total}\n", style="mismatch")
     primary_text.append("不匹配 (表列/长度): ", style="mismatch")
     primary_text.append(f"{mismatched_count}\n")
     primary_text.append("多余: ", style="mismatch")
@@ -15828,18 +18312,29 @@ def print_final_report(
     summary_table.add_row("[bold]注释一致性[/bold]", comment_text)
 
     ext_text = Text()
+    idx_blocked_cnt = extra_blocked_counts.get("INDEX", 0)
+    cons_blocked_cnt = extra_blocked_counts.get("CONSTRAINT", 0)
+    trg_blocked_cnt = extra_blocked_counts.get("TRIGGER", 0)
     ext_text.append("索引: ", style="info")
     ext_text.append(f"一致 {idx_ok_cnt} / ", style="ok")
-    ext_text.append(f"差异 {idx_mis_cnt}\n", style="mismatch")
+    ext_text.append(f"差异 {idx_mis_cnt}", style="mismatch")
+    if idx_blocked_cnt:
+        ext_text.append(f" (不支持/阻断 {idx_blocked_cnt})", style="mismatch")
+    ext_text.append("\n")
     ext_text.append("约束: ", style="info")
     ext_text.append(f"一致 {cons_ok_cnt} / ", style="ok")
-    ext_text.append(f"差异 {cons_mis_cnt}\n", style="mismatch")
+    ext_text.append(f"差异 {cons_mis_cnt}", style="mismatch")
+    if cons_blocked_cnt:
+        ext_text.append(f" (不支持/阻断 {cons_blocked_cnt})", style="mismatch")
+    ext_text.append("\n")
     ext_text.append("序列: ", style="info")
     ext_text.append(f"一致 {seq_ok_cnt} / ", style="ok")
     ext_text.append(f"差异 {seq_mis_cnt}\n", style="mismatch")
     ext_text.append("触发器: ", style="info")
     ext_text.append(f"一致 {trg_ok_cnt} / ", style="ok")
     ext_text.append(f"差异 {trg_mis_cnt}", style="mismatch")
+    if trg_blocked_cnt:
+        ext_text.append(f" (不支持/阻断 {trg_blocked_cnt})", style="mismatch")
     summary_table.add_row("[bold]扩展对象 (INDEX/SEQ/etc.)[/bold]", ext_text)
 
     if trigger_list_summary and trigger_list_summary.get("enabled"):
@@ -15874,6 +18369,14 @@ def print_final_report(
                 filter_text.append(str(not_missing_cnt), style="info")
         summary_table.add_row("[bold]触发器筛选[/bold]", filter_text)
 
+    if trigger_status_rows:
+        status_text = Text()
+        status_text.append("差异: ", style="mismatch")
+        status_text.append(str(len(trigger_status_rows)), style="mismatch")
+        if report_file:
+            status_text.append("\n详见: trigger_status_report.txt", style="info")
+        summary_table.add_row("[bold]触发器状态[/bold]", status_text)
+
     dep_text = Text()
     dep_text.append("缺失依赖: ", style="missing")
     dep_text.append(f"{dep_missing_cnt}  ")
@@ -15886,6 +18389,20 @@ def print_final_report(
     console.print(summary_table)
     console.print("")
     console.print("")
+
+    if not show_detail_sections:
+        detail_hint_lines = [
+            f"report_detail_mode={report_detail_mode}，主报告仅保留概要。"
+        ]
+        if emit_detail_files:
+            detail_hint_lines.append(
+                "详细差异请查看分拆报告：missing_objects_detail / unsupported_objects_detail / extra_mismatch_detail 等。"
+            )
+            if report_ts:
+                detail_hint_lines.append(f"示例: missing_objects_detail_{report_ts}.txt")
+        else:
+            detail_hint_lines.append("未生成分拆报告，如需细节请设置 report_detail_mode=split。")
+        console.print(Panel.fit("\n".join(detail_hint_lines), style="info", width=section_width))
 
     if config_diagnostics:
         diag_table = Table(title="[header]0.c 配置诊断[/header]", width=section_width)
@@ -15977,35 +18494,32 @@ def print_final_report(
         count_table.add_column("Oracle (应校验)", justify="right", width=18)
         count_table.add_column("OceanBase (命中)", justify="right", width=18)
         count_table.add_column("缺失", justify="right", width=8)
+        count_table.add_column("不支持/阻断", justify="right", width=12)
         count_table.add_column("多余", justify="right", width=8)
         oracle_counts = dict(object_counts_summary.get("oracle", {}))
         ob_counts = dict(object_counts_summary.get("oceanbase", {}))
         missing_counts = dict(object_counts_summary.get("missing", {}))
         extra_counts = dict(object_counts_summary.get("extra", {}))
-        if blacklist_missing_cnt:
-            table_missing = missing_counts.get("TABLE", 0)
-            missing_counts["TABLE"] = max(0, table_missing - blacklist_missing_cnt)
-            oracle_counts["TABLE (BLACKLIST)"] = blacklist_missing_cnt
-            ob_counts["TABLE (BLACKLIST)"] = 0
-            missing_counts["TABLE (BLACKLIST)"] = blacklist_missing_cnt
-            extra_counts["TABLE (BLACKLIST)"] = 0
         count_types = sorted(set(oracle_counts) | set(ob_counts) | set(missing_counts) | set(extra_counts))
         for obj_type in count_types:
             ora_val = oracle_counts.get(obj_type, 0)
             ob_val = ob_counts.get(obj_type, 0)
             miss_val = missing_counts.get(obj_type, 0)
             extra_val = extra_counts.get(obj_type, 0)
+            support_info = support_counts.get(obj_type, {})
+            unsupported_val = int(support_info.get("unsupported", 0) or 0) + int(support_info.get("blocked", 0) or 0)
             count_table.add_row(
                 obj_type,
                 str(ora_val),
                 str(ob_val),
                 f"[missing]{miss_val}[/missing]" if miss_val else "0",
+                f"[mismatch]{unsupported_val}[/mismatch]" if unsupported_val else "0",
                 f"[mismatch]{extra_val}[/mismatch]" if extra_val else "0"
             )
         console.print(count_table)
 
     # --- 1. 缺失的主对象 ---
-    if tv_results['missing']:
+    if show_detail_sections and tv_results['missing']:
         table = Table(title=f"[header]1. 缺失的主对象 (共 {missing_count} 个) — 按目标 schema 分组[/header]", width=section_width)
         SCHEMA_COL_WIDTH = 18
         table.add_column("目标 Schema", style="info", width=SCHEMA_COL_WIDTH)
@@ -16029,7 +18543,7 @@ def print_final_report(
                 )
         console.print(table)
 
-    if tv_results.get('extra_targets'):
+    if show_detail_sections and tv_results.get('extra_targets'):
         extra_target_count = len(tv_results['extra_targets'])
         table = Table(title=f"[header]1.b 目标端多出的对象 (共 {extra_target_count} 个)", width=section_width)
         table.add_column("类型", style="info", width=TYPE_COL_WIDTH)
@@ -16038,7 +18552,7 @@ def print_final_report(
             table.add_row(f"[{obj_type}]", tgt_name)
         console.print(table)
 
-    if tv_results.get('skipped'):
+    if show_detail_sections and tv_results.get('skipped'):
         skipped_items = tv_results['skipped']
         table = Table(title=f"[header]1.c 仅打印未校验的主对象 (共 {len(skipped_items)} 个)", width=section_width)
         table.add_column("类型", style="info", width=TYPE_COL_WIDTH)
@@ -16052,7 +18566,7 @@ def print_final_report(
             )
         console.print(table)
 
-    if package_diff_rows:
+    if show_detail_sections and package_diff_rows:
         table = Table(
             title=f"[header]1.d PACKAGE/PKG BODY 差异 (共 {len(package_diff_rows)} 个)",
             width=section_width
@@ -16077,7 +18591,7 @@ def print_final_report(
             )
         console.print(table)
 
-    if remap_conflicts:
+    if show_detail_sections and remap_conflicts:
         table = Table(title=f"[header]1.e 无法自动推导的对象 (共 {remap_conflict_cnt} 个)", width=section_width)
         table.add_column("类型", style="info", width=TYPE_COL_WIDTH)
         table.add_column("对象 (源端)", style="info", width=OBJECT_COL_WIDTH)
@@ -16091,7 +18605,7 @@ def print_final_report(
         console.print(table)
 
     # --- 2. 列不匹配的表 ---
-    if tv_results['mismatched']:
+    if show_detail_sections and tv_results['mismatched']:
         table = Table(title=f"[header]2. 不匹配的表 (共 {mismatched_count} 个)", width=section_width)
         table.add_column("表名", style="info", width=OBJECT_COL_WIDTH)
         table.add_column("差异详情", width=DETAIL_COL_WIDTH)
@@ -16131,9 +18645,9 @@ def print_final_report(
         console.print(table)
 
     comment_mismatches = comment_results.get("mismatched", [])
-    if comment_skip_reason:
+    if show_detail_sections and comment_skip_reason:
         console.print(Panel.fit(str(comment_skip_reason), style="info", width=section_width))
-    if comment_mismatches:
+    if show_detail_sections and comment_mismatches:
         table = Table(title=f"[header]3. 表/列注释一致性检查 (共 {len(comment_mismatches)} 张表差异)", width=section_width)
         table.add_column("表名", style="info", width=OBJECT_COL_WIDTH)
         table.add_column("差异详情", width=DETAIL_COL_WIDTH)
@@ -16179,6 +18693,8 @@ def print_final_report(
 
     # --- 3. 扩展对象差异 ---
     def print_ext_mismatch_table(title, items, headers, render_func):
+        if not show_detail_sections:
+            return
         if not items:
             return
         table = Table(title=f"[header]{title} (共 {len(items)} 项差异)", width=section_width)
@@ -16232,7 +18748,7 @@ def print_final_report(
     )
 
     dep_total = dep_missing_cnt + dep_unexpected_cnt + dep_skipped_cnt
-    if dep_total:
+    if show_detail_sections and dep_total:
         dep_table = Table(title=f"[header]9. 依赖关系校验 (共 {dep_total} 项)", width=section_width)
         dep_table.add_column("类别", style="info", width=12)
         dep_table.add_column("依赖对象", style="info", width=OBJECT_COL_WIDTH)
@@ -16258,7 +18774,7 @@ def print_final_report(
         console.print(dep_table)
 
     # --- 4. 无效 Remap 规则 ---
-    if tv_results['extraneous']:
+    if show_detail_sections and tv_results['extraneous']:
         table = Table(title=f"[header]4. 无效的 Remap 规则 (共 {extraneous_count} 个)", width=section_width)
         table.add_column("在 remap_rules.txt 中定义, 但在源端 Oracle 中未找到的对象", style="info", width=section_width - 6)
         for item in tv_results['extraneous']:
@@ -16269,6 +18785,8 @@ def print_final_report(
     fixup_panel = Panel.fit(
         "[bold]Fixup 脚本生成目录[/bold]\n\n"
         "fixup_scripts/table         : 缺失 TABLE 的 CREATE 脚本\n"
+        "fixup_scripts/tables_unsupported : 不支持 TABLE 的 DDL (默认不执行)\n"
+        "fixup_scripts/tables_unsupported/temporary : 不支持临时表 DDL\n"
         "fixup_scripts/view          : 缺失 VIEW 的 CREATE 脚本\n"
         "fixup_scripts/materialized_view : MATERIALIZED VIEW 默认仅打印不生成\n"
         "fixup_scripts/procedure     : 缺失 PROCEDURE 的 CREATE 脚本\n"
@@ -16284,10 +18802,12 @@ def print_final_report(
         "fixup_scripts/constraint    : 缺失约束的 CREATE 脚本\n"
         "fixup_scripts/sequence      : 缺失 SEQUENCE 的 CREATE 脚本\n"
         "fixup_scripts/trigger       : 缺失 TRIGGER 的 CREATE 脚本\n"
+        "fixup_scripts/unsupported/* : 不支持/阻断对象 DDL (默认不执行)\n"
         "fixup_scripts/compile       : 依赖重编译脚本 (ALTER ... COMPILE)\n"
         "fixup_scripts/grants_miss   : 缺失授权脚本 (对象/角色/系统)\n"
         "fixup_scripts/grants_all    : 全量授权脚本 (对象/角色/系统)\n"
-        "fixup_scripts/table_alter   : 列不匹配 TABLE 的 ALTER 修补脚本\n\n"
+        "fixup_scripts/table_alter   : 列不匹配 TABLE 的 ALTER 修补脚本\n"
+        "fixup_scripts/table_alter/interval_add_<cutoff> : interval 分区补齐脚本\n\n"
         "[bold]请在 OceanBase 执行前逐一人工审核上述脚本。[/bold]",
         title="[info]提示",
         border_style="info"
@@ -16313,7 +18833,8 @@ def print_final_report(
             filtered_grants_path=filtered_grants_path,
             filtered_grants_count=filtered_grants_count,
             config_diagnostics=config_diagnostics,
-            fixup_skip_summary=fixup_skip_summary
+            fixup_skip_summary=fixup_skip_summary,
+            support_summary=support_summary
         )
         console.print(render_run_summary_panel(run_summary, section_width))
 
@@ -16321,14 +18842,12 @@ def print_final_report(
 
     if report_file:
         report_path = Path(report_file)
-        report_ts = None
-        if report_path.name.startswith("report_") and report_path.name.endswith(".txt"):
-            report_ts = report_path.name[len("report_"):-4]
         blacklisted_table_keys = set((blacklisted_missing_tables or {}).keys())
         export_dir = export_missing_table_view_mappings(
             tv_results,
             report_path.parent,
-            blacklisted_tables=blacklisted_table_keys
+            blacklisted_tables=blacklisted_table_keys,
+            support_state_map=(support_summary.support_state_map if support_summary else None)
         )
         package_report_path = None
         if package_rows:
@@ -16337,11 +18856,12 @@ def print_final_report(
                 derive_package_report_path(report_path)
             )
         blacklist_path = export_blacklist_tables(blacklist_report_rows or [], report_path.parent)
-        trigger_miss_path = None
-        if trigger_list_summary and trigger_list_summary.get("enabled"):
-            trigger_miss_path = export_trigger_miss_report(
+        trigger_report_path = None
+        if trigger_list_summary or trigger_status_rows:
+            trigger_report_path = export_trigger_status_report(
                 trigger_list_rows or [],
                 trigger_list_summary,
+                trigger_status_rows or [],
                 report_path.parent
             )
         filtered_grants_path = export_filtered_grants(
@@ -16353,6 +18873,56 @@ def print_final_report(
             report_path.parent,
             report_ts
         )
+        missing_detail_path = None
+        unsupported_detail_path = None
+        if emit_detail_files:
+            missing_detail_path = export_missing_objects_detail(
+                missing_detail_rows,
+                report_path.parent,
+                report_ts
+            )
+            unsupported_detail_path = export_unsupported_objects_detail(
+                unsupported_rows,
+                report_path.parent,
+                report_ts
+            )
+        extra_targets_path = None
+        skipped_detail_path = None
+        mismatched_tables_path = None
+        comment_mismatch_path = None
+        extra_mismatch_path = None
+        dependency_detail_path = None
+        if emit_detail_files and report_ts:
+            extra_targets_path = export_extra_targets_detail(
+                tv_results.get("extra_targets", []),
+                report_path.parent,
+                report_ts
+            )
+            skipped_detail_path = export_skipped_objects_detail(
+                tv_results.get("skipped", []),
+                report_path.parent,
+                report_ts
+            )
+            mismatched_tables_path = export_mismatched_tables_detail(
+                tv_results.get("mismatched", []),
+                report_path.parent,
+                report_ts
+            )
+            comment_mismatch_path = export_comment_mismatch_detail(
+                comment_results.get("mismatched", []),
+                report_path.parent,
+                report_ts
+            )
+            extra_mismatch_path = export_extra_mismatch_detail(
+                extra_results,
+                report_path.parent,
+                report_ts
+            )
+            dependency_detail_path = export_dependency_detail(
+                dependency_report,
+                report_path.parent,
+                report_ts
+            )
         try:
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report_text = console.export_text(clear=False)
@@ -16366,12 +18936,28 @@ def print_final_report(
                 log.info("PACKAGE 对比明细已输出到: %s", package_report_path)
             if blacklist_path:
                 log.info("黑名单表清单已输出到: %s", blacklist_path)
-            if trigger_miss_path:
-                log.info("触发器清单筛选报告已输出到: %s", trigger_miss_path)
+            if trigger_report_path:
+                log.info("触发器状态/清单报告已输出到: %s", trigger_report_path)
             if filtered_grants_path:
                 log.info("过滤授权清单已输出到: %s", filtered_grants_path)
             if fixup_skip_path:
                 log.info("Fixup 跳过汇总已输出到: %s", fixup_skip_path)
+            if missing_detail_path:
+                log.info("缺失对象支持性明细已输出到: %s", missing_detail_path)
+            if unsupported_detail_path:
+                log.info("不支持/阻断对象明细已输出到: %s", unsupported_detail_path)
+            if extra_targets_path:
+                log.info("目标端多余对象明细已输出到: %s", extra_targets_path)
+            if skipped_detail_path:
+                log.info("仅打印未校验对象明细已输出到: %s", skipped_detail_path)
+            if mismatched_tables_path:
+                log.info("表列不匹配明细已输出到: %s", mismatched_tables_path)
+            if comment_mismatch_path:
+                log.info("注释差异明细已输出到: %s", comment_mismatch_path)
+            if extra_mismatch_path:
+                log.info("扩展对象差异明细已输出到: %s", extra_mismatch_path)
+            if dependency_detail_path:
+                log.info("依赖关系差异明细已输出到: %s", dependency_detail_path)
         except OSError as exc:
             console.print(f"[missing]报告写入失败: {exc}")
 
@@ -16412,7 +18998,10 @@ def parse_cli_args() -> argparse.Namespace:
             trigger_list            仅生成指定触发器清单 (每行 SCHEMA.TRIGGER_NAME)
             trigger_qualify_schema  触发器 DDL 是否强制补全 schema 前缀 (true/false)
             sequence_remap_policy   SEQUENCE 目标 schema 推导策略 (infer/source_only/dominant_table)
+            report_detail_mode      报告内容模式 (full/split/summary)
             report_dir_layout       报告目录布局 (flat/per_run)
+            view_compat_rules_path  VIEW 兼容规则 JSON (可选)
+            view_dblink_policy      VIEW DBLINK 处理策略 (block/allow)
             check_dependencies      true/false 控制依赖校验
             generate_grants         true/false 控制授权脚本生成
             grant_tab_privs_scope   owner/owner_or_grantee 控制 DBA_TAB_PRIVS 抽取范围
@@ -16431,8 +19020,11 @@ def parse_cli_args() -> argparse.Namespace:
           main_reports/run_<ts>/package_compare_<ts>.txt  PACKAGE/PKG BODY 对比明细
           main_reports/run_<ts>/missed_tables_views_for_OMS/ 按 schema 输出缺失 TABLE/VIEW 规则 (schema_T.txt / schema_V.txt)
           main_reports/run_<ts>/blacklist_tables.txt 黑名单表清单 (含 LONG 转换校验状态)
-          main_reports/run_<ts>/trigger_miss.txt  触发器清单筛选报告 (仅配置 trigger_list 时生成)
+          main_reports/run_<ts>/trigger_status_report.txt  触发器状态/清单报告 (trigger_list 或触发器状态差异时生成)
           main_reports/run_<ts>/filtered_grants.txt 过滤掉的不兼容 GRANT 权限清单
+          main_reports/run_<ts>/missing_objects_detail_<ts>.txt 缺失对象支持性明细 (report_detail_mode=split)
+          main_reports/run_<ts>/unsupported_objects_detail_<ts>.txt 不支持/阻断对象明细 (report_detail_mode=split)
+          main_reports/run_<ts>/extra_mismatch_detail_<ts>.txt 扩展对象差异明细 (report_detail_mode=split)
           fixup_scripts/                按类型分类的订正 SQL
         项目信息:
           主页: {repo_url}
@@ -16532,6 +19124,9 @@ def main():
             "oracle": oracle_env_info,
             "oceanbase": ob_env_info
         }
+        settings["ob_version"] = extract_ob_version_number(ob_env_info.get("version", ""))
+        if settings.get("ob_version"):
+            log.info("OceanBase 版本(解析): %s", settings["ob_version"])
 
     generate_fixup_enabled = settings.get('generate_fixup', 'true').strip().lower() in ('true', '1', 'yes')
     if not enabled_extra_types:
@@ -16873,7 +19468,10 @@ def main():
             include_triggers='TRIGGER' in enabled_extra_types,
             include_sequences='SEQUENCE' in enabled_extra_types,
             include_comments=enable_comment_check,
-            include_privileges=enable_grant_generation
+            include_privileges=enable_grant_generation,
+            include_interval_partitions=bool(
+                settings.get("generate_interval_partition_fixup", False)
+            ) and generate_fixup_enabled
         )
 
         table_target_map = build_table_target_map(master_list)
@@ -16944,6 +19542,29 @@ def main():
             full_object_mapping,
             enabled_extra_types
         )
+
+    trigger_status_rows: List[TriggerStatusReportRow] = []
+    if 'TRIGGER' in enabled_extra_types:
+        trigger_status_rows = collect_trigger_status_rows(
+            oracle_meta,
+            ob_meta,
+            full_object_mapping
+        )
+
+    support_summary = classify_missing_objects(
+        ora_cfg,
+        settings,
+        tv_results,
+        extra_results,
+        oracle_meta,
+        ob_meta,
+        full_object_mapping,
+        source_objects,
+        dependency_graph,
+        object_parent_map,
+        table_target_map,
+        synonym_meta
+    )
 
     trigger_list_summary: Optional[Dict[str, object]] = None
     trigger_list_rows: Optional[List[TriggerListReportRow]] = None
@@ -17098,29 +19719,36 @@ def main():
                         len(grant_plan.filtered_grants),
                         report_dir_hint
                     )
-                view_chain_file = generate_fixup_scripts(
-                    ora_cfg,
-                    ob_cfg,
-                    settings,
-                    tv_results,
-                    extra_results,
-                    master_list,
-                    oracle_meta,
-                    full_object_mapping,
-                    remap_rules,
-                    grant_plan,
-                    enable_grant_generation,
-                    dependency_report,
-                    ob_meta,
-                    expected_dependency_pairs,
-                    synonym_meta,
-                    trigger_filter_entries,
-                    trigger_filter_enabled,
-                    package_results=package_results,
-                    report_dir=report_dir,
-                    report_timestamp=timestamp,
-                    fixup_skip_summary=fixup_skip_summary
-                )
+            else:
+                log.info("[GRANT] generate_grants=false，授权脚本生成已关闭。")
+                grant_plan = None
+
+            view_chain_file = generate_fixup_scripts(
+                ora_cfg,
+                ob_cfg,
+                settings,
+                tv_results,
+                extra_results,
+                master_list,
+                oracle_meta,
+                full_object_mapping,
+                remap_rules,
+                grant_plan,
+                enable_grant_generation,
+                dependency_report,
+                ob_meta,
+                expected_dependency_pairs,
+                synonym_meta,
+                trigger_filter_entries,
+                trigger_filter_enabled,
+                package_results=package_results,
+                report_dir=report_dir,
+                report_timestamp=timestamp,
+                fixup_skip_summary=fixup_skip_summary,
+                support_state_map=support_summary.support_state_map,
+                unsupported_table_keys=support_summary.unsupported_table_keys,
+                view_compat_map=support_summary.view_compat_map
+            )
     else:
         log.info('已根据配置跳过修补脚本生成，仅打印对比报告。')
         if enable_grant_generation:
@@ -17167,11 +19795,13 @@ def main():
         blacklist_report_rows,
         trigger_list_summary,
         trigger_list_rows,
+        trigger_status_rows,
         package_results=package_results,
         run_summary_ctx=run_summary_ctx,
         filtered_grants=(grant_plan.filtered_grants if grant_plan else None),
         config_diagnostics=config_diagnostics,
-        fixup_skip_summary=fixup_skip_summary
+        fixup_skip_summary=fixup_skip_summary,
+        support_summary=support_summary
     )
     if run_summary:
         log_run_summary(run_summary)

@@ -77,7 +77,7 @@ The system SHALL report missing source schemas and missing or extra target schem
 - **THEN** the report includes a hint about missing target schemas
 
 ### Requirement: OMS-ready missing TABLE/VIEW export
-The system SHALL export missing TABLE and VIEW mappings grouped by target schema under main_reports/tables_views_miss, using separate per-schema files for TABLE and VIEW.
+The system SHALL export missing TABLE and VIEW mappings grouped by target schema under main_reports/missed_tables_views_for_OMS, using separate per-schema files for TABLE and VIEW.
 
 #### Scenario: Missing table mapping
 - **WHEN** a TABLE is missing and not blacklisted
@@ -86,6 +86,10 @@ The system SHALL export missing TABLE and VIEW mappings grouped by target schema
 #### Scenario: Missing view mapping
 - **WHEN** a VIEW is missing
 - **THEN** the schema_V.txt file includes the missing view mapping
+
+#### Scenario: Unsupported mapping excluded
+- **WHEN** a missing TABLE or VIEW is marked UNSUPPORTED/BLOCKED
+- **THEN** it is excluded from missed_tables_views_for_OMS output
 
 ### Requirement: Blacklist report export
 The system SHALL export blacklisted tables to main_reports/blacklist_tables.txt grouped by schema with reasons and status details.
@@ -106,23 +110,34 @@ The system SHALL export blacklisted tables to main_reports/blacklist_tables.txt 
 - **WHEN** a blacklisted table is marked LONG/LONG RAW
 - **THEN** the report includes conversion status such as VERIFIED, MISSING_TABLE, MISSING_COLUMN, or TYPE_MISMATCH
 
-### Requirement: Trigger list mismatch export
-The system SHALL export trigger_list validation results to main_reports/trigger_miss.txt when trigger_list is configured, including fallback notes when the list is unusable.
+### Requirement: Trigger status report export
+The system SHALL export trigger_list validation results and trigger status differences to main_reports/trigger_status_report.txt when trigger_list is configured or trigger status differences exist.
 
 #### Scenario: Trigger list entries validated
 - **WHEN** trigger_list is configured
-- **THEN** trigger_miss.txt includes invalid entries, missing/selected entries, and non-missing entries
+- **THEN** trigger_status_report.txt includes invalid entries, missing/selected entries, and non-missing entries
 
 #### Scenario: Trigger list unreadable
 - **WHEN** trigger_list cannot be read or has no valid entries
-- **THEN** trigger_miss.txt records the fallback note and summary counts
+- **THEN** trigger_status_report.txt records the fallback note and summary counts
 
-### Requirement: Missing count adjustment for blacklist
-The system SHALL exclude blacklisted tables from TABLE missing counts and report a separate blacklist count.
+#### Scenario: Trigger status mismatch
+- **WHEN** a trigger differs in event, enabled status, or validity
+- **THEN** trigger_status_report.txt records the source/target status differences
 
-#### Scenario: Mixed missing tables
-- **WHEN** missing tables include both supported and blacklisted entries
-- **THEN** the summary shows TABLE missing without blacklisted entries and adds TABLE (BLACKLIST)
+### Requirement: Unsupported/blocked missing summary
+The system SHALL surface unsupported/blocked counts alongside missing totals for each object type.
+
+#### Scenario: Unsupported objects exist
+- **WHEN** missing objects include UNSUPPORTED or BLOCKED entries
+- **THEN** the summary includes unsupported/blocked counts per object type
+
+### Requirement: Split detail exports
+The system SHALL export detailed mismatch lists to *_detail_<timestamp>.txt files when report_detail_mode is set to split.
+
+#### Scenario: Split mode enabled
+- **WHEN** report_detail_mode is split
+- **THEN** the system writes missing_objects_detail_<timestamp>.txt and unsupported_objects_detail_<timestamp>.txt
 
 ### Requirement: Extra target objects listing
 The system SHALL list objects that exist in the target but are not expected by the mapping.

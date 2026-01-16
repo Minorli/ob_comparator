@@ -2499,6 +2499,11 @@ def main() -> None:
         only_dirs = [d.lower() for d in only_dirs] if only_dirs else []
     
     exclude_dirs = [d.lower() for d in exclude_dirs]
+    default_excludes = {"tables_unsupported", "unsupported"}
+    exclude_set = set(exclude_dirs) | default_excludes
+    if only_dirs:
+        exclude_set -= set(only_dirs)
+    exclude_dirs = sorted(exclude_set)
     
     # Load configuration
     try:

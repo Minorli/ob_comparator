@@ -55,7 +55,7 @@
 
 ### 2.3 触发器清单
 - `trigger_list`：仅生成清单内 TRIGGER
-- 缺失/非法条目会输出到 `main_reports/trigger_miss.txt`
+- 缺失/非法条目会输出到 `main_reports/trigger_status_report.txt`
 
 ---
 
@@ -151,4 +151,4 @@ A: 依赖指向多个 schema 或依赖缺失，请补充显式 remap。
 **Q3: 只检查 TABLE 时为何不生成 PACKAGE？**  
 A: `check_primary_types` 限制后，未包含的类型不会加载/推导/生成。
 
-更新时间：2026-01-08 (V0.9.7)
+更新时间：2026-01-09 (V0.9.8)
