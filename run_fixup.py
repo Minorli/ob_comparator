@@ -488,7 +488,7 @@ class ErrorReportEntry:
 
 def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, Path]:
     """Load OceanBase connection info and fixup directory from config.ini."""
-    parser = configparser.ConfigParser()
+    parser = configparser.ConfigParser(interpolation=None)
     if not config_path.exists():
         raise ConfigError(f"配置文件不存在: {config_path}")
 
@@ -507,7 +507,11 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
     ob_cfg["port"] = str(int(ob_cfg["port"]))
 
     try:
-        fixup_timeout = parser.getint("SETTINGS", "fixup_cli_timeout", fallback=DEFAULT_FIXUP_TIMEOUT)
+        fixup_raw = parser.get("SETTINGS", "fixup_cli_timeout", fallback="").strip()
+        if fixup_raw:
+            fixup_timeout = int(fixup_raw)
+        else:
+            fixup_timeout = parser.getint("SETTINGS", "obclient_timeout", fallback=DEFAULT_FIXUP_TIMEOUT)
         if fixup_timeout is None or fixup_timeout < 0:
             fixup_timeout = DEFAULT_FIXUP_TIMEOUT
     except Exception:

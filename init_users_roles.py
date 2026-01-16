@@ -71,7 +71,7 @@ log = logging.getLogger(__name__)
 
 
 def load_config(config_path: Path) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str], Path, int, Optional[int]]:
-    parser = configparser.ConfigParser()
+    parser = configparser.ConfigParser(interpolation=None)
     if not parser.read(config_path):
         raise ValueError(f"Config file not found or unreadable: {config_path}")
 
@@ -92,7 +92,11 @@ def load_config(config_path: Path) -> Tuple[Dict[str, str], Dict[str, str], Dict
         ob_timeout = DEFAULT_OBCLIENT_TIMEOUT
 
     try:
-        fixup_timeout = int(settings.get("fixup_cli_timeout", DEFAULT_FIXUP_TIMEOUT))
+        fixup_raw = (settings.get("fixup_cli_timeout") or "").strip()
+        if fixup_raw:
+            fixup_timeout = int(fixup_raw)
+        else:
+            fixup_timeout = int(settings.get("obclient_timeout", DEFAULT_FIXUP_TIMEOUT))
         if fixup_timeout < 0:
             fixup_timeout = DEFAULT_FIXUP_TIMEOUT
     except Exception:

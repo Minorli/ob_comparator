@@ -670,6 +670,8 @@ COMMENT_BATCH_SIZE = 200
 ORACLE_IN_BATCH_SIZE = 900
 # 授权规模提示阈值（对象权限条数）
 GRANT_WARN_THRESHOLD = 200000
+# 扩展校验使用多进程的表数量阈值（过大会导致内存翻倍）
+EXTRA_CHECK_PROCESS_MAX_TABLES = 2000
 
 # OceanBase 目标端自动生成且需在列对比中忽略的 OMS 列
 IGNORED_OMS_COLUMNS: Tuple[str, ...] = (
@@ -1682,7 +1684,7 @@ OB_ORACLE_HINT_ALLOWLIST: Set[str] = {
 def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
     """读取 config.ini 配置文件"""
     log.info(f"正在加载配置文件: {config_file}")
-    config = configparser.ConfigParser()
+    config = configparser.ConfigParser(interpolation=None)
     if not config.read(config_file):
         log.error(f"严重错误: 配置文件 {config_file} 未找到或无法读取。")
         sys.exit(1)
@@ -2036,7 +2038,7 @@ def run_config_wizard(config_path: Path) -> None:
         log.error("交互式向导需要可用的标准输入/终端。请在可交互环境运行或直接编辑 config.ini。")
         sys.exit(1)
 
-    cfg = configparser.ConfigParser()
+    cfg = configparser.ConfigParser(interpolation=None)
     if config_path.exists():
         cfg.read(config_path, encoding="utf-8")
         log.info("已加载现有配置，将检查缺失/无效项后写回: %s", config_path)
@@ -4826,9 +4828,16 @@ def obclient_run_sql(ob_cfg: ObConfig, sql_query: str) -> Tuple[bool, str, str]:
             timeout=OBC_TIMEOUT
         )
 
-        if result.returncode != 0 or (result.stderr and "Warning" not in result.stderr):
+        if result.returncode != 0:
             log.error(f"  [OBClient 错误] SQL: {sql_query.strip()} | 错误: {result.stderr.strip()}")
             return False, "", result.stderr.strip()
+        if result.stderr:
+            stderr_clean = result.stderr.strip()
+            if stderr_clean:
+                if re.search(r"warning|警告", stderr_clean, flags=re.IGNORECASE):
+                    log.debug("  [OBClient 警告] SQL: %s | 警告: %s", sql_query.strip(), stderr_clean)
+                else:
+                    log.warning("  [OBClient STDERR] SQL: %s | 输出: %s", sql_query.strip(), stderr_clean)
 
         return True, result.stdout.strip(), ""
 
@@ -4842,6 +4851,62 @@ def obclient_run_sql(ob_cfg: ObConfig, sql_query: str) -> Tuple[bool, str, str]:
     except Exception as e:
         log.error(f"严重错误: 执行 subprocess 时发生未知错误: {e}")
         return False, "", str(e)
+
+
+def obclient_query_by_owner_chunks(
+    ob_cfg: ObConfig,
+    sql_tpl: str,
+    owners: List[str],
+    *,
+    chunk_size: int = ORACLE_IN_BATCH_SIZE
+) -> Tuple[bool, List[str], str]:
+    """
+    将 OWNER IN (...) 拆分为多个 chunk 运行，避免 IN 列表过长或超过 1000 限制。
+    sql_tpl 需包含 {owners_in} 占位符。
+    返回 (ok, lines, err)。
+    """
+    if not owners:
+        return True, [], ""
+    lines: List[str] = []
+    for chunk in chunk_list(owners, chunk_size):
+        owners_in = ",".join(f"'{s}'" for s in chunk)
+        sql = sql_tpl.format(owners_in=owners_in)
+        ok, out, err = obclient_run_sql(ob_cfg, sql)
+        if not ok:
+            return False, [], err
+        if out:
+            lines.extend(out.splitlines())
+    return True, lines, ""
+
+
+def obclient_query_by_owner_pairs(
+    ob_cfg: ObConfig,
+    sql_tpl: str,
+    owners: List[str],
+    ref_owners: List[str],
+    *,
+    chunk_size: int = ORACLE_IN_BATCH_SIZE
+) -> Tuple[bool, List[str], str]:
+    """
+    双 OWNER 列表的嵌套分块查询，用于依赖等需要 owner/ref_owner 双过滤的场景。
+    sql_tpl 需包含 {owners_in} 与 {ref_owners_in} 占位符。
+    """
+    if not owners or not ref_owners:
+        return True, [], ""
+    lines: List[str] = []
+    owner_chunks = chunk_list(owners, chunk_size)
+    ref_chunks = chunk_list(ref_owners, chunk_size)
+    for owner_chunk in owner_chunks:
+        owners_in = ",".join(f"'{s}'" for s in owner_chunk)
+        for ref_chunk in ref_chunks:
+            ref_in = ",".join(f"'{s}'" for s in ref_chunk)
+            sql = sql_tpl.format(owners_in=owners_in, ref_owners_in=ref_in)
+            ok, out, err = obclient_run_sql(ob_cfg, sql)
+            if not ok:
+                return False, [], err
+            if out:
+                lines.extend(out.splitlines())
+    return True, lines, ""
 
 
 def dump_ob_metadata(
@@ -4881,11 +4946,9 @@ def dump_ob_metadata(
         )
 
     owners_in_list = sorted(target_schemas)
-    owners_in = ",".join(f"'{s}'" for s in owners_in_list)
     owners_in_objects_list = list(owners_in_list)
     if 'PUBLIC' in target_schemas and '__PUBLIC' not in owners_in_objects_list:
         owners_in_objects_list.append('__PUBLIC')
-    owners_in_objects = ",".join(f"'{s}'" for s in sorted(owners_in_objects_list))
 
     # --- 1. DBA_OBJECTS ---
     objects_by_type: Dict[str, Set[str]] = {}
@@ -4895,21 +4958,25 @@ def dump_ob_metadata(
         object_types_filter = {'TABLE'}
     object_types_clause = ",".join(f"'{obj}'" for obj in sorted(object_types_filter))
 
-    sql = f"""
+    sql_tpl = f"""
         SELECT OWNER, OBJECT_NAME, OBJECT_TYPE, STATUS
         FROM DBA_OBJECTS
-        WHERE UPPER(OWNER) IN ({owners_in_objects})
+        WHERE UPPER(OWNER) IN ({{owners_in}})
           AND OBJECT_TYPE IN (
               {object_types_clause}
           )
     """
-    ok, out, err = obclient_run_sql(ob_cfg, sql)
+    ok, lines, err = obclient_query_by_owner_chunks(
+        ob_cfg,
+        sql_tpl,
+        sorted(owners_in_objects_list)
+    )
     if not ok:
         log.error("无法从 OB 读取 DBA_OBJECTS，程序退出。")
         sys.exit(1)
 
-    if out:
-        for line in out.splitlines():
+    if lines:
+        for line in lines:
             parts = line.split('\t')
             if len(parts) < 3:
                 continue
@@ -4927,16 +4994,16 @@ def dump_ob_metadata(
     # 注意：DBA_TYPES.TYPECODE=OBJECT 仅表示对象类型，本身不代表存在 TYPE BODY，
     # 过去直接据此推断 TYPE BODY 会导致误报，因此这里只补 TYPE。
     if 'TYPE' in object_types_filter or 'TYPE BODY' in object_types_filter:
-        sql_types = f"""
+        sql_types_tpl = """
             SELECT OWNER, TYPE_NAME, TYPECODE
             FROM DBA_TYPES
             WHERE OWNER IN ({owners_in})
         """
-        ok, out, err = obclient_run_sql(ob_cfg, sql_types)
+        ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_types_tpl, owners_in_list)
         if not ok:
             log.warning("读取 DBA_TYPES 失败，TYPE 检查可能不完整: %s", err)
-        elif out:
-            for line in out.splitlines():
+        elif lines:
+            for line in lines:
                 parts = line.split('\t')
                 if len(parts) < 2:
                     continue
@@ -4946,18 +5013,18 @@ def dump_ob_metadata(
 
     # 仅在显式启用 TYPE BODY 检查时，通过 DBA_SOURCE 探测真实 TYPE BODY
     if 'TYPE BODY' in object_types_filter:
-        sql_type_body = f"""
+        sql_type_body_tpl = """
             SELECT OWNER, NAME
             FROM DBA_SOURCE
             WHERE OWNER IN ({owners_in})
               AND TYPE = 'TYPE BODY'
             GROUP BY OWNER, NAME
         """
-        ok, out, err = obclient_run_sql(ob_cfg, sql_type_body)
+        ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_type_body_tpl, owners_in_list)
         if not ok:
             log.warning("读取 DBA_SOURCE(TYPE BODY) 失败，将不补充 TYPE BODY 元数据: %s", err)
-        elif out:
-            for line in out.splitlines():
+        elif lines:
+            for line in lines:
                 parts = line.split('\t')
                 if len(parts) < 2:
                     continue
@@ -4968,22 +5035,22 @@ def dump_ob_metadata(
     package_errors: Dict[Tuple[str, str, str], PackageErrorInfo] = {}
     package_errors_complete = True
     if 'PACKAGE' in object_types_filter or 'PACKAGE BODY' in object_types_filter:
-        sql_pkg_err = f"""
+        sql_pkg_err_tpl = """
             SELECT OWNER, NAME, TYPE, LINE, POSITION, TEXT
             FROM DBA_ERRORS
             WHERE OWNER IN ({owners_in})
               AND TYPE IN ('PACKAGE', 'PACKAGE BODY')
             ORDER BY OWNER, NAME, TYPE, SEQUENCE
         """
-        ok, out, err = obclient_run_sql(ob_cfg, sql_pkg_err)
+        ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_pkg_err_tpl, owners_in_list)
         if not ok:
             package_errors_complete = False
             log.warning("读取 OB DBA_ERRORS 失败，包错误信息将为空: %s", err)
-        elif out:
+        elif lines:
             temp_errors: Dict[Tuple[str, str, str], Dict[str, object]] = defaultdict(
                 lambda: {"count": 0, "first_error": ""}
             )
-            for line in out.splitlines():
+            for line in lines:
                 parts = line.split('\t')
                 if len(parts) < 6:
                     continue
@@ -5008,13 +5075,13 @@ def dump_ob_metadata(
                 )
 
     # --- 2. DBA_TAB_COLUMNS ---
-    sql_cols_ext = f"""
+    sql_cols_ext_tpl = """
         SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHAR_LENGTH, NULLABLE,
                REPLACE(REPLACE(REPLACE(DATA_DEFAULT, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS DATA_DEFAULT
         FROM DBA_TAB_COLUMNS
         WHERE OWNER IN ({owners_in})
     """
-    sql_cols_basic = f"""
+    sql_cols_basic_tpl = """
         SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHAR_LENGTH, NULLABLE, DATA_DEFAULT
         FROM DBA_TAB_COLUMNS
         WHERE OWNER IN ({owners_in})
@@ -5022,16 +5089,16 @@ def dump_ob_metadata(
 
     tab_columns: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     if include_tab_columns:
-        ok, out, err = obclient_run_sql(ob_cfg, sql_cols_ext)
+        ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_cols_ext_tpl, owners_in_list)
         if not ok:
             log.warning("读取 OB DBA_TAB_COLUMNS(含默认值清洗)失败，将回退基础查询：%s", err)
-            ok, out, err = obclient_run_sql(ob_cfg, sql_cols_basic)
+            ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_cols_basic_tpl, owners_in_list)
             if not ok:
                 log.error("无法从 OB 读取 DBA_TAB_COLUMNS，程序退出。")
                 sys.exit(1)
 
-        if out:
-            for line in out.splitlines():
+        if lines:
+            for line in lines:
                 parts = line.split('\t')
                 if len(parts) < 7:
                     continue
@@ -5117,18 +5184,18 @@ def dump_ob_metadata(
     # --- 3. DBA_INDEXES ---
     indexes: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     if include_indexes:
-        sql = f"""
+        sql_tpl = """
             SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, UNIQUENESS
             FROM DBA_INDEXES
             WHERE TABLE_OWNER IN ({owners_in})
         """
-        ok, out, err = obclient_run_sql(ob_cfg, sql)
+        ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners_in_list)
         if not ok:
             log.error("无法从 OB 读取 DBA_INDEXES，程序退出。")
             sys.exit(1)
 
-        if out:
-            for line in out.splitlines():
+        if lines:
+            for line in lines:
                 parts = line.split('\t')
                 if len(parts) < 4:
                     continue
@@ -5145,19 +5212,19 @@ def dump_ob_metadata(
                 }
 
         # --- 4. DBA_IND_COLUMNS ---
-        sql = f"""
+        sql_tpl = """
             SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_NAME, COLUMN_POSITION
             FROM DBA_IND_COLUMNS
             WHERE TABLE_OWNER IN ({owners_in})
             ORDER BY TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_POSITION
         """
-        ok, out, err = obclient_run_sql(ob_cfg, sql)
+        ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners_in_list)
         if not ok:
             log.error("无法从 OB 读取 DBA_IND_COLUMNS，程序退出。")
             sys.exit(1)
 
-        if out:
-            for line in out.splitlines():
+        if lines:
+            for line in lines:
                 parts = line.split('\t')
                 if len(parts) < 5:
                     continue
@@ -5191,31 +5258,31 @@ def dump_ob_metadata(
     # --- 5. DBA_CONSTRAINTS (P/U/R) ---
     constraints: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     if include_constraints:
-        sql_ext = f"""
+        sql_ext_tpl = """
             SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME
             FROM DBA_CONSTRAINTS
             WHERE OWNER IN ({owners_in})
               AND CONSTRAINT_TYPE IN ('P','U','R')
               AND STATUS = 'ENABLED'
         """
-        ok, out, err = obclient_run_sql(ob_cfg, sql_ext)
+        ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_ext_tpl, owners_in_list)
         support_fk_ref = ok
         if not ok:
             log.warning("读取 OB DBA_CONSTRAINTS(含引用信息)失败，将回退为基础字段：%s", err)
-            sql = f"""
+            sql_tpl = """
                 SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE
                 FROM DBA_CONSTRAINTS
                 WHERE OWNER IN ({owners_in})
                   AND CONSTRAINT_TYPE IN ('P','U','R')
                   AND STATUS = 'ENABLED'
             """
-            ok, out, err = obclient_run_sql(ob_cfg, sql)
+            ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners_in_list)
             if not ok:
                 log.error("无法从 OB 读取 DBA_CONSTRAINTS，程序退出。")
                 sys.exit(1)
 
-        if out:
-            for line in out.splitlines():
+        if lines:
+            for line in lines:
                 parts = line.split('\t')
                 if len(parts) < 4:
                     continue
@@ -5234,19 +5301,19 @@ def dump_ob_metadata(
                 }
 
         # --- 6. DBA_CONS_COLUMNS ---
-        sql = f"""
+        sql_tpl = """
             SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME, POSITION
             FROM DBA_CONS_COLUMNS
             WHERE OWNER IN ({owners_in})
             ORDER BY OWNER, TABLE_NAME, CONSTRAINT_NAME, POSITION
         """
-        ok, out, err = obclient_run_sql(ob_cfg, sql)
+        ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners_in_list)
         if not ok:
             log.error("无法从 OB 读取 DBA_CONS_COLUMNS，程序退出。")
             sys.exit(1)
 
-        if out:
-            for line in out.splitlines():
+        if lines:
+            for line in lines:
                 parts = line.split('\t')
                 if len(parts) < 5:
                     continue
@@ -5304,18 +5371,18 @@ def dump_ob_metadata(
     # --- 7. DBA_TRIGGERS ---
     triggers: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     if include_triggers:
-        sql = f"""
+        sql_tpl = """
             SELECT OWNER, TABLE_OWNER, TABLE_NAME, TRIGGER_NAME, TRIGGERING_EVENT, STATUS
             FROM DBA_TRIGGERS
             WHERE TABLE_OWNER IN ({owners_in})
         """
-        ok, out, err = obclient_run_sql(ob_cfg, sql)
+        ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners_in_list)
         if not ok:
             log.error("无法从 OB 读取 DBA_TRIGGERS，程序退出。")
             sys.exit(1)
 
-        if out:
-            for line in out.splitlines():
+        if lines:
+            for line in lines:
                 parts = line.split('\t')
                 if len(parts) < 6:
                     continue
@@ -5336,18 +5403,18 @@ def dump_ob_metadata(
     sequences: Dict[str, Set[str]] = {}
     partition_key_columns: Dict[Tuple[str, str], List[str]] = {}
     if include_sequences:
-        sql = f"""
+        sql_tpl = """
             SELECT SEQUENCE_OWNER, SEQUENCE_NAME
             FROM DBA_SEQUENCES
             WHERE SEQUENCE_OWNER IN ({owners_in})
         """
-        ok, out, err = obclient_run_sql(ob_cfg, sql)
+        ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners_in_list)
         if not ok:
             log.error("无法从 OB 读取 DBA_SEQUENCES，程序退出。")
             sys.exit(1)
 
-        if out:
-            for line in out.splitlines():
+        if lines:
+            for line in lines:
                 parts = line.split('\t')
                 if len(parts) < 2:
                     continue
@@ -5368,21 +5435,21 @@ def dump_ob_metadata(
 
         def _load_ob_part_keys(view_name: str, with_object_type: bool = True) -> None:
             if with_object_type:
-                sql = f"""
+                sql_tpl = f"""
                     SELECT OWNER, NAME, COLUMN_NAME, COLUMN_POSITION
                     FROM {view_name}
-                    WHERE OWNER IN ({owners_in})
+                    WHERE OWNER IN ({{owners_in}})
                       AND OBJECT_TYPE = 'TABLE'
                     ORDER BY OWNER, NAME, COLUMN_POSITION
                 """
             else:
-                sql = f"""
+                sql_tpl = f"""
                     SELECT OWNER, NAME, COLUMN_NAME, COLUMN_POSITION
                     FROM {view_name}
-                    WHERE OWNER IN ({owners_in})
+                    WHERE OWNER IN ({{owners_in}})
                     ORDER BY OWNER, NAME, COLUMN_POSITION
                 """
-            ok, out, err = obclient_run_sql(ob_cfg, sql)
+            ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners_in_list)
             if not ok:
                 if with_object_type:
                     log.warning("读取 OB %s 失败，将尝试忽略 OBJECT_TYPE: %s", view_name, err)
@@ -5390,9 +5457,9 @@ def dump_ob_metadata(
                 else:
                     log.warning("读取 OB %s 失败，将跳过分区键列读取: %s", view_name, err)
                 return
-            if not out:
+            if not lines:
                 return
-            for line in out.splitlines():
+            for line in lines:
                 parts = line.split('\t')
                 if len(parts) < 3:
                     continue
@@ -6818,29 +6885,29 @@ def load_ob_dependencies(
     if not target_schemas:
         return set()
 
-    owners_in = ",".join(f"'{s}'" for s in sorted(target_schemas))
+    owners_list = sorted(target_schemas)
     enabled_types = {t.upper() for t in (object_types or set(ALL_TRACKED_OBJECT_TYPES))}
     enabled_types &= set(ALL_TRACKED_OBJECT_TYPES)
     if not enabled_types:
         return set()
     types_clause = ",".join(f"'{t}'" for t in sorted(enabled_types))
 
-    sql = f"""
+    sql_tpl = f"""
         SELECT OWNER, NAME, TYPE, REFERENCED_OWNER, REFERENCED_NAME, REFERENCED_TYPE
         FROM DBA_DEPENDENCIES
-        WHERE OWNER IN ({owners_in})
-          AND REFERENCED_OWNER IN ({owners_in})
+        WHERE OWNER IN ({{owners_in}})
+          AND REFERENCED_OWNER IN ({{ref_owners_in}})
           AND TYPE IN ({types_clause})
           AND REFERENCED_TYPE IN ({types_clause})
     """
-    ok, out, err = obclient_run_sql(ob_cfg, sql)
+    ok, lines, err = obclient_query_by_owner_pairs(ob_cfg, sql_tpl, owners_list, owners_list)
     if not ok:
         log.error("无法从 OB 读取 DBA_DEPENDENCIES，程序退出。")
         sys.exit(1)
 
     result: Set[Tuple[str, str, str, str]] = set()
-    if out:
-        for line in out.splitlines():
+    if lines:
+        for line in lines:
             parts = line.split('\t')
             if len(parts) < 6:
                 continue
@@ -9998,12 +10065,11 @@ def check_extra_objects(
     enabled_types = {t.upper() for t in (enabled_extra_types or set(EXTRA_OBJECT_CHECK_TYPES))}
     table_check_types = enabled_types & {"INDEX", "CONSTRAINT", "TRIGGER"}
 
-    if not master_list:
-        return extra_results
-
     if not enabled_types:
         log.info("已根据配置跳过扩展对象校验 (索引/约束/序列/触发器)。")
         return extra_results
+    if not master_list and table_check_types:
+        log.info("主校验清单为空，已跳过 INDEX/CONSTRAINT/TRIGGER 扩展校验，仅保留 SEQUENCE。")
 
     log_subsection("扩展对象校验 (索引/约束/序列/触发器)")
 
@@ -10080,27 +10146,53 @@ def check_extra_objects(
             trg_time_sum += result.trigger_time
 
         if worker_count > 1:
-            with ProcessPoolExecutor(
-                max_workers=worker_count,
-                initializer=_init_extra_check_worker,
-                initargs=(oracle_meta, ob_meta, full_object_mapping, table_check_types)
-            ) as executor:
-                for result in executor.map(
-                    _extra_check_worker,
-                    table_entries,
-                    chunksize=chunk_size
-                ):
-                    done_tables += 1
-                    _accumulate_result(result)
-                    now = time.monotonic()
-                    if done_tables == total_tables or (now - last_log) >= progress_interval:
-                        pct = done_tables * 100.0 / total_tables if total_tables else 100.0
-                        rate = done_tables / max(1e-6, now - start_ts)
-                        log.info(
-                            "扩展校验进度 %d/%d (%.1f%%, %.1f 表/秒)...",
-                            done_tables, total_tables, pct, rate
-                        )
-                        last_log = now
+            use_process_pool = total_tables <= EXTRA_CHECK_PROCESS_MAX_TABLES
+            if not use_process_pool:
+                log.info(
+                    "[EXTRA] 表数量=%d，禁用多进程以避免元数据复制过大，改用线程池。",
+                    total_tables
+                )
+            if use_process_pool:
+                with ProcessPoolExecutor(
+                    max_workers=worker_count,
+                    initializer=_init_extra_check_worker,
+                    initargs=(oracle_meta, ob_meta, full_object_mapping, table_check_types)
+                ) as executor:
+                    for result in executor.map(
+                        _extra_check_worker,
+                        table_entries,
+                        chunksize=chunk_size
+                    ):
+                        done_tables += 1
+                        _accumulate_result(result)
+                        now = time.monotonic()
+                        if done_tables == total_tables or (now - last_log) >= progress_interval:
+                            pct = done_tables * 100.0 / total_tables if total_tables else 100.0
+                            rate = done_tables / max(1e-6, now - start_ts)
+                            log.info(
+                                "扩展校验进度 %d/%d (%.1f%%, %.1f 表/秒)...",
+                                done_tables, total_tables, pct, rate
+                            )
+                            last_log = now
+            else:
+                with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    for result in executor.map(
+                        lambda entry: run_extra_check_for_table(
+                            entry, oracle_meta, ob_meta, full_object_mapping, table_check_types
+                        ),
+                        table_entries
+                    ):
+                        done_tables += 1
+                        _accumulate_result(result)
+                        now = time.monotonic()
+                        if done_tables == total_tables or (now - last_log) >= progress_interval:
+                            pct = done_tables * 100.0 / total_tables if total_tables else 100.0
+                            rate = done_tables / max(1e-6, now - start_ts)
+                            log.info(
+                                "扩展校验进度 %d/%d (%.1f%%, %.1f 表/秒)...",
+                                done_tables, total_tables, pct, rate
+                            )
+                            last_log = now
         else:
             for entry in table_entries:
                 result = run_extra_check_for_table(

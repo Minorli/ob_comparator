@@ -23,7 +23,7 @@ def scenario_paths(name: str):
 
 
 def load_config():
-    parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+    parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=("#", ";"))
     if not CONFIG_PATH.exists():
         raise FileNotFoundError(f"config.ini not found at {CONFIG_PATH}")
     parser.read(CONFIG_PATH)

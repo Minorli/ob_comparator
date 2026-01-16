@@ -4,6 +4,7 @@ import types
 import tempfile
 import json
 from pathlib import Path
+from typing import Dict, Set
 
 # schema_diff_reconciler 在 import 时强依赖 oracledb；
 # 单元测试只覆盖纯函数，因此用 dummy 模块兜底，避免环境未安装时退出。
@@ -16,6 +17,62 @@ import schema_diff_reconciler as sdr
 
 
 class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
+    def _make_oracle_meta(
+        self,
+        *,
+        sequences: Dict[str, Set[str]] = None,
+        indexes: Dict = None,
+        constraints: Dict = None,
+        triggers: Dict = None
+    ) -> sdr.OracleMetadata:
+        return sdr.OracleMetadata(
+            table_columns={},
+            indexes=indexes or {},
+            constraints=constraints or {},
+            triggers=triggers or {},
+            sequences=sequences or {},
+            table_comments={},
+            column_comments={},
+            comments_complete=True,
+            blacklist_tables={},
+            object_privileges=[],
+            sys_privileges=[],
+            role_privileges=[],
+            role_metadata={},
+            system_privilege_map=set(),
+            table_privilege_map=set(),
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False,
+            partition_key_columns={},
+            interval_partitions={}
+        )
+
+    def _make_ob_meta(
+        self,
+        *,
+        sequences: Dict[str, Set[str]] = None,
+        indexes: Dict = None,
+        constraints: Dict = None,
+        triggers: Dict = None
+    ) -> sdr.ObMetadata:
+        return sdr.ObMetadata(
+            objects_by_type={},
+            tab_columns={},
+            indexes=indexes or {},
+            constraints=constraints or {},
+            triggers=triggers or {},
+            sequences=sequences or {},
+            roles=set(),
+            table_comments={},
+            column_comments={},
+            comments_complete=True,
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False,
+            partition_key_columns={}
+        )
+
     def test_infer_dominant_schema_tables_only(self):
         remap_rules = {
             "A.T1": "X.T1",
@@ -242,6 +299,173 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(sdr.normalize_sequence_remap_policy("infer"), "infer")
         self.assertEqual(sdr.normalize_sequence_remap_policy("SOURCE"), "source_only")
         self.assertEqual(sdr.normalize_sequence_remap_policy("dominant"), "dominant_table")
+
+    def test_load_config_allows_percent_in_password(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "config.ini"
+            path.write_text(
+                "\n".join([
+                    "[ORACLE_SOURCE]",
+                    "user = scott",
+                    "password = ab%cd",
+                    "dsn = 127.0.0.1:1521/ORCL",
+                    "[OCEANBASE_TARGET]",
+                    "executable = /bin/obclient",
+                    "host = 127.0.0.1",
+                    "port = 2881",
+                    "user_string = root@sys",
+                    "password = p%w",
+                    "[SETTINGS]",
+                    "source_schemas = A",
+                ]) + "\n",
+                encoding="utf-8"
+            )
+            ora_cfg, ob_cfg, _settings = sdr.load_config(str(path))
+            self.assertEqual(ora_cfg["password"], "ab%cd")
+            self.assertEqual(ob_cfg["password"], "p%w")
+
+    def test_obclient_query_by_owner_chunks_splits(self):
+        calls = []
+        def fake_run(_cfg, sql):
+            calls.append(sql)
+            return True, sql, ""
+        orig = sdr.obclient_run_sql
+        sdr.obclient_run_sql = fake_run
+        try:
+            ok, lines, err = sdr.obclient_query_by_owner_chunks(
+                {},
+                "SELECT * FROM T WHERE OWNER IN ({owners_in})",
+                ["A", "B", "C"],
+                chunk_size=2
+            )
+            self.assertTrue(ok)
+            self.assertEqual(err, "")
+            self.assertEqual(len(lines), 2)
+            self.assertIn("OWNER IN ('A','B')", lines[0])
+            self.assertIn("OWNER IN ('C')", lines[1])
+        finally:
+            sdr.obclient_run_sql = orig
+
+    def test_obclient_query_by_owner_pairs_splits(self):
+        calls = []
+        def fake_run(_cfg, sql):
+            calls.append(sql)
+            return True, sql, ""
+        orig = sdr.obclient_run_sql
+        sdr.obclient_run_sql = fake_run
+        try:
+            ok, lines, err = sdr.obclient_query_by_owner_pairs(
+                {},
+                "SELECT * FROM D WHERE OWNER IN ({owners_in}) AND REFERENCED_OWNER IN ({ref_owners_in})",
+                ["A", "B", "C"],
+                ["X", "Y"],
+                chunk_size=2
+            )
+            self.assertTrue(ok)
+            self.assertEqual(err, "")
+            self.assertEqual(len(lines), 2)
+            self.assertIn("OWNER IN ('A','B')", lines[0])
+            self.assertIn("REFERENCED_OWNER IN ('X','Y')", lines[0])
+            self.assertIn("OWNER IN ('C')", lines[1])
+            self.assertIn("REFERENCED_OWNER IN ('X','Y')", lines[1])
+        finally:
+            sdr.obclient_run_sql = orig
+
+    def test_obclient_run_sql_warning_does_not_fail(self):
+        class Dummy:
+            def __init__(self):
+                self.returncode = 0
+                self.stdout = "OK"
+                self.stderr = "Warning: ignored"
+        def fake_run(*_args, **_kwargs):
+            return Dummy()
+        orig_run = sdr.subprocess.run
+        try:
+            sdr.subprocess.run = fake_run
+            ok, out, err = sdr.obclient_run_sql(
+                {
+                    "executable": "obclient",
+                    "host": "127.0.0.1",
+                    "port": "2881",
+                    "user_string": "root@sys",
+                    "password": "p"
+                },
+                "select 1 from dual"
+            )
+            self.assertTrue(ok)
+            self.assertEqual(out, "OK")
+            self.assertEqual(err, "")
+        finally:
+            sdr.subprocess.run = orig_run
+
+    def test_check_extra_objects_sequence_without_master_list(self):
+        oracle_meta = self._make_oracle_meta(sequences={"A": {"SEQ1", "SEQ2"}})
+        ob_meta = self._make_ob_meta(sequences={"A": {"SEQ2"}})
+        settings = {
+            "extra_check_workers": 1,
+            "extra_check_chunk_size": 50,
+            "extra_check_progress_interval": 1,
+        }
+        extra_results = sdr.check_extra_objects(
+            settings,
+            [],
+            ob_meta,
+            oracle_meta,
+            {},
+            enabled_extra_types={"SEQUENCE"}
+        )
+        self.assertEqual(len(extra_results["sequence_mismatched"]), 1)
+        mismatch = extra_results["sequence_mismatched"][0]
+        self.assertIn("SEQ1", mismatch.missing_sequences)
+
+    def test_check_extra_objects_large_table_uses_threadpool(self):
+        oracle_meta = self._make_oracle_meta()
+        ob_meta = self._make_ob_meta()
+        master_list = [
+            ("S.T1", "T.T1", "TABLE"),
+            ("S.T2", "T.T2", "TABLE"),
+            ("S.T3", "T.T3", "TABLE"),
+        ]
+        settings = {
+            "extra_check_workers": 2,
+            "extra_check_chunk_size": 1,
+            "extra_check_progress_interval": 1,
+        }
+        orig_pp = sdr.ProcessPoolExecutor
+        orig_run = sdr.run_extra_check_for_table
+        orig_max = sdr.EXTRA_CHECK_PROCESS_MAX_TABLES
+        try:
+            def raising_pp(*_args, **_kwargs):
+                raise AssertionError("ProcessPoolExecutor should not be used")
+            def stub_run(entry, _ora, _ob, _map, _types):
+                return sdr.ExtraTableResult(
+                    tgt_name=f"{entry[2]}.{entry[3]}",
+                    index_ok=True,
+                    index_mismatch=None,
+                    constraint_ok=None,
+                    constraint_mismatch=None,
+                    trigger_ok=None,
+                    trigger_mismatch=None,
+                    index_time=0.0,
+                    constraint_time=0.0,
+                    trigger_time=0.0
+                )
+            sdr.ProcessPoolExecutor = raising_pp
+            sdr.run_extra_check_for_table = stub_run
+            sdr.EXTRA_CHECK_PROCESS_MAX_TABLES = 2
+            extra_results = sdr.check_extra_objects(
+                settings,
+                master_list,
+                ob_meta,
+                oracle_meta,
+                {},
+                enabled_extra_types={"INDEX"}
+            )
+            self.assertEqual(len(extra_results["index_ok"]), 3)
+        finally:
+            sdr.ProcessPoolExecutor = orig_pp
+            sdr.run_extra_check_for_table = orig_run
+            sdr.EXTRA_CHECK_PROCESS_MAX_TABLES = orig_max
 
     def test_normalize_report_dir_layout(self):
         self.assertEqual(sdr.normalize_report_dir_layout(None), "per_run")

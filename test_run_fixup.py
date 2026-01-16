@@ -33,6 +33,32 @@ class TestViewChainParsing(unittest.TestCase):
         self.assertLess(order.index(("D.T2", "TABLE")), order.index(("A.V1", "VIEW")))
 
 
+class TestRunFixupConfig(unittest.TestCase):
+    def test_load_ob_config_percent_password_and_timeout_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "fixup_scripts").mkdir()
+            cfg_path = root / "config.ini"
+            cfg_path.write_text(
+                "\n".join([
+                    "[OCEANBASE_TARGET]",
+                    "executable = /bin/obclient",
+                    "host = 127.0.0.1",
+                    "port = 2881",
+                    "user_string = root@sys",
+                    "password = p%w",
+                    "[SETTINGS]",
+                    "fixup_dir = fixup_scripts",
+                    "obclient_timeout = 77",
+                ]) + "\n",
+                encoding="utf-8"
+            )
+            ob_cfg, fixup_path, _repo_root, _log_level, _report_path = rf.load_ob_config(cfg_path)
+            self.assertEqual(ob_cfg["password"], "p%w")
+            self.assertEqual(ob_cfg["timeout"], 77)
+            self.assertEqual(fixup_path, (root / "fixup_scripts").resolve())
+
+
 class TestGrantLookupPriority(unittest.TestCase):
     def test_grant_lookup_prefers_miss(self):
         entry_miss = rf.GrantEntry(
