@@ -16995,20 +16995,24 @@ def export_extra_mismatch_detail(
     output_path = Path(report_dir) / f"extra_mismatch_detail_{report_timestamp}.txt"
     header_fields = ["TYPE", "OBJECT", "MISSING", "EXTRA", "DETAIL"]
     rows: List[List[str]] = []
+    def _csv(values) -> str:
+        if not values:
+            return "-"
+        return ",".join(sorted(str(v) for v in values))
     for item in extra_results.get("index_mismatched", []):
         rows.append([
             "INDEX",
             item.table,
-            ",".join(sorted(item.missing_indexes)) if item.missing_indexes else "-",
-            ",".join(sorted(item.extra_indexes)) if item.extra_indexes else "-",
+            _csv(item.missing_indexes),
+            _csv(item.extra_indexes),
             ";".join(item.detail_mismatch) if item.detail_mismatch else "-"
         ])
     for item in extra_results.get("constraint_mismatched", []):
         rows.append([
             "CONSTRAINT",
             item.table,
-            ",".join(sorted(item.missing_constraints)) if item.missing_constraints else "-",
-            ",".join(sorted(item.extra_constraints)) if item.extra_constraints else "-",
+            _csv(item.missing_constraints),
+            _csv(item.extra_constraints),
             ";".join(item.detail_mismatch) if item.detail_mismatch else "-"
         ])
     for item in extra_results.get("sequence_mismatched", []):
@@ -17026,8 +17030,8 @@ def export_extra_mismatch_detail(
         rows.append([
             "TRIGGER",
             item.table,
-            ",".join(sorted(item.missing_triggers)) if item.missing_triggers else "-",
-            ",".join(sorted(item.extra_triggers)) if item.extra_triggers else "-",
+            _csv(item.missing_triggers),
+            _csv(item.extra_triggers),
             ";".join(item.detail_mismatch) if item.detail_mismatch else "-"
         ])
     if not rows:
