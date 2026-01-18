@@ -3,6 +3,12 @@
 本文件记录 OceanBase Comparator Toolkit 的重要变更。
 
 ## [未发布]
+### 新增
+- SQLcl DDL 格式化：可选启用对 fixup 输出进行格式化，支持多类型与批量控制。
+- DDL 格式化报告：新增 `ddl_format_report_<timestamp>.txt`，汇总格式化结果与跳过原因。
+
+### 变更
+- DDL 格式化报告使用 `|` 分隔，便于直接导入 Excel。
 
 ## [0.9.8] - 2026-01-09
 

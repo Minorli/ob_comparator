@@ -117,6 +117,24 @@ DDL 清洗
 - ddl_hint_denylist：强制删除的 hint（逗号分隔）。默认：空。
 - ddl_hint_allowlist_file：额外允许 hint 文件路径（每行一个）。默认：空。
 
+DDL 格式化 (SQLcl)
+- ddl_format_enable：是否启用 SQLcl 格式化（后处理，仅影响输出 DDL 可读性）。默认：false。
+  说明：格式化发生在全部清洗/替换完成之后，不影响校验与修补逻辑。
+- ddl_formatter：格式化器选择。默认：sqlcl。可选值：sqlcl / none。
+- ddl_format_types：需要格式化的对象类型列表。默认：空（当 ddl_format_enable=true 时默认 VIEW）。
+  可选值：TABLE, VIEW, MATERIALIZED VIEW, INDEX, SEQUENCE, SYNONYM, PROCEDURE, FUNCTION,
+           PACKAGE, PACKAGE BODY, TRIGGER, TYPE, TYPE BODY, CONSTRAINT, TABLE_ALTER, JOB, SCHEDULE。
+- sqlcl_bin：SQLcl 根目录或 bin/sql 可执行文件路径（开启格式化必填）。
+- sqlcl_profile_path：SQL Developer 格式化规则文件（可选）。不存在会告警并忽略。
+- ddl_format_fail_policy：格式化失败策略。默认：fallback。
+  可选值：fallback（失败保留原 DDL，不中断运行）/ error（失败抛错，保留原 DDL）。
+- ddl_format_batch_size：每批次格式化对象数量。默认：200（适当增大可减少 SQLcl 启动开销）。
+- ddl_format_timeout：每批次格式化超时（秒）。默认：60；0 表示不设超时。
+- ddl_format_max_lines：单个 DDL 最大行数（超过则跳过）。默认：30000；0 表示不限制。
+- ddl_format_max_bytes：单个 DDL 最大字节数（超过则跳过）。默认：2000000；0 表示不限制。
+  说明：格式化会自动去除 PL/SQL 的尾部 "/" 再执行 SQLcl，结束后恢复。
+  报告：main_reports/ddl_format_report_<timestamp>.txt。
+
 视图兼容性
 - view_compat_rules_path：视图兼容性规则 JSON 路径（可选）。默认：空（使用内置规则）。
 - view_dblink_policy：视图 DBLINK 处理策略。默认：block。

@@ -176,6 +176,26 @@ ddl_hint_allowlist      =
 ddl_hint_denylist       =
 # 额外允许 hint 文件（每行一个，# 开头视为注释）
 ddl_hint_allowlist_file =
+# 是否启用 SQLcl DDL 格式化（后处理，不影响校验/修补逻辑）
+ddl_format_enable      = false
+# 格式化器 (sqlcl/none)
+ddl_formatter          = sqlcl
+# 需要格式化的对象类型列表（逗号分隔，留空表示默认 VIEW）
+ddl_format_types       =
+# SQLcl 根目录或 bin/sql 路径（开启格式化必填）
+sqlcl_bin              =
+# SQLcl 格式化规则文件（可选）
+sqlcl_profile_path     =
+# 格式化失败策略：fallback/error
+ddl_format_fail_policy = fallback
+# SQLcl 批量格式化对象数
+ddl_format_batch_size  = 200
+# SQLcl 批次超时（秒，0 表示不设超时）
+ddl_format_timeout     = 60
+# 单个 DDL 最大行数（超过则跳过，0 表示不限制）
+ddl_format_max_lines   = 30000
+# 单个 DDL 最大字节数（超过则跳过，0 表示不限制）
+ddl_format_max_bytes   = 2000000
 # 视图兼容性规则 JSON 路径（可选，留空使用内置规则）
 view_compat_rules_path  =
 # 视图 DBLINK 处理策略：

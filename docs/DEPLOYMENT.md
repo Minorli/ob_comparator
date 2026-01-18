@@ -8,6 +8,7 @@
 - Oracle Instant Client（19c+）。
 - obclient（可连目标 OceanBase）。
 - JDK + dbcat（用于 DDL 批量提取）。
+- SQLcl（可选，用于 DDL 格式化）。
 - 输出目录可写（`fixup_scripts/`、`main_reports/`、`dbcat_output/`）。
 
 ## 1. 在构建机准备 wheelhouse

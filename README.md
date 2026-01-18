@@ -10,6 +10,7 @@
 - **Remap 推导**：支持显式规则、依附对象跟随、依赖推导、schema 回退策略。
 - **依赖与授权**：基于 DBA_DEPENDENCIES/DBA_*_PRIVS 生成缺失依赖与授权脚本。
 - **DDL 清洗与兼容**：VIEW DDL 走 DBMS_METADATA，PL/SQL 语法清洗与 Hint 过滤。
+- **DDL 输出格式化**：可选 SQLcl 格式化 fixup DDL（不影响校验与修补逻辑）。
 - **修补脚本执行器**：支持 smart-order、迭代重试、VIEW 链路自动修复、错误报告。
 - **报告体系**：Rich 控制台 + 纯文本快照 + 细节分拆报告（可配置）。
 - **不支持对象识别**：黑名单/依赖阻断对象单独统计与分流输出。
@@ -24,6 +25,7 @@
 - Oracle Instant Client 19c+（oracledb Thick Mode）
 - obclient（目标 OceanBase 可连接）
 - JDK + dbcat（DDL 批量提取）
+- SQLcl（可选，用于 DDL 格式化）
 - 运行账号需具备 DBA_* 视图访问权限（Oracle 与 OB）
 
 ## 快速开始

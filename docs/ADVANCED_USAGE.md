@@ -101,6 +101,14 @@
 - 修复拆分列名（需列元数据命中）
 - 版本感知：OB < 4.2.5.7 移除 `WITH CHECK OPTION`
 
+### 4.4 DDL 输出格式化（SQLcl，可选）
+- `ddl_format_enable=true` 启用 SQLcl 格式化，仅影响输出文件，不影响校验/修补逻辑。
+- 默认仅格式化 VIEW；通过 `ddl_format_types` 指定其他类型（TABLE/PLSQL/INDEX 等）。
+- 受 `ddl_format_max_lines` / `ddl_format_max_bytes` 限制，大对象会自动跳过。
+- 性能调优：`ddl_format_batch_size`、`ddl_format_timeout` 控制批量与超时。
+- 依赖：配置 `sqlcl_bin`；可选 `sqlcl_profile_path` 载入 SQL Developer 格式化规则。
+- 报告输出：`main_reports/ddl_format_report_<timestamp>.txt`。
+
 ---
 
 ## 5. run_fixup 高级执行

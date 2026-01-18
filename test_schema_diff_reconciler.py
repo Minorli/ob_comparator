@@ -1,8 +1,10 @@
 import unittest
+from unittest import mock
 import sys
 import types
 import tempfile
 import json
+import subprocess
 from pathlib import Path
 from typing import Dict, Set
 
@@ -1163,6 +1165,16 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn("--注释1\n", cleaned)
         self.assertIn("\n a.COL2", cleaned)
 
+    def test_sanitize_view_ddl_inline_comment_breaks_line_with_parens(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW A.V AS SELECT a.C1,--注释 (a.C2-a.C1) AS diff,"
+            " --注释2 decode(a.flag,'Y',1,0) AS x FROM T a"
+        )
+        cleaned = sdr.sanitize_view_ddl(ddl, set())
+        self.assertIn("--注释\n", cleaned)
+        self.assertIn("\n (a.C2", cleaned)
+        self.assertIn("\n decode", cleaned)
+
     def test_sanitize_view_ddl_repairs_split_identifier(self):
         ddl = "CREATE OR REPLACE VIEW A.V AS SELECT TOT_P ERM FROM T"
         cleaned = sdr.sanitize_view_ddl(ddl, {"TOT_PERM"})
@@ -1841,6 +1853,135 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertEqual(mapping["A.PKG"]["PACKAGE"], "A.PKG")
         self.assertEqual(mapping["A.PKG"]["PACKAGE BODY"], "A.PKG")
+
+    def test_parse_ddl_format_types_aliases(self):
+        parsed = sdr.parse_ddl_format_types("package_body,TYPE_BODY,mview,table_alter,unknown")
+        self.assertIn("PACKAGE BODY", parsed)
+        self.assertIn("TYPE BODY", parsed)
+        self.assertIn("MATERIALIZED VIEW", parsed)
+        self.assertIn("TABLE_ALTER", parsed)
+        self.assertNotIn("UNKNOWN", parsed)
+
+    def test_resolve_sqlcl_executable_dir(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            sql_path = bin_dir / "sql"
+            sql_path.write_text("#!/bin/sh\n", encoding="utf-8")
+            sql_path.chmod(0o755)
+            resolved = sdr.resolve_sqlcl_executable(str(root))
+            self.assertEqual(resolved, sql_path)
+
+    def test_strip_plsql_trailing_slash(self):
+        ddl = "CREATE OR REPLACE PACKAGE P AS\nBEGIN NULL;\nEND P;\n/\n"
+        cleaned, had_slash = sdr.strip_plsql_trailing_slash(ddl)
+        self.assertTrue(had_slash)
+        self.assertNotIn("\n/\n", cleaned)
+
+    def test_format_fixup_outputs_formats_selected_types_and_restores_slash(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            fixup_dir = Path(tmp_dir) / "fixup"
+            report_dir = Path(tmp_dir) / "reports"
+            (fixup_dir / "view").mkdir(parents=True)
+            (fixup_dir / "package").mkdir(parents=True)
+            (fixup_dir / "grants_all").mkdir(parents=True)
+            view_path = fixup_dir / "view" / "A.V1.sql"
+            pkg_path = fixup_dir / "package" / "A.P1.sql"
+            grant_path = fixup_dir / "grants_all" / "A.grants.sql"
+            view_path.write_text("CREATE VIEW V1 AS SELECT 1 FROM DUAL;\n", encoding="utf-8")
+            pkg_path.write_text(
+                "CREATE OR REPLACE PACKAGE P AS\nBEGIN NULL;\nEND P;\n/\n",
+                encoding="utf-8"
+            )
+            grant_path.write_text("GRANT SELECT ON A.T1 TO B;\n", encoding="utf-8")
+
+            sqlcl_path = Path(tmp_dir) / "sql"
+            sqlcl_path.write_text("#!/bin/sh\n", encoding="utf-8")
+            sqlcl_path.chmod(0o755)
+
+            settings = {
+                "ddl_format_enable": True,
+                "ddl_formatter": "sqlcl",
+                "ddl_format_type_set": {"VIEW", "PACKAGE"},
+                "ddl_format_batch_size": 10,
+                "ddl_format_timeout": 5,
+                "ddl_format_max_lines": 0,
+                "ddl_format_max_bytes": 0,
+                "ddl_format_fail_policy": "fallback",
+                "sqlcl_bin": str(sqlcl_path),
+                "sqlcl_profile_path": ""
+            }
+
+            def fake_run(cmd, capture_output, text, timeout, env):
+                script_arg = cmd[-1]
+                self.assertTrue(script_arg.startswith("@"))
+                script_path = Path(script_arg[1:])
+                lines = script_path.read_text(encoding="utf-8").splitlines()
+                for line in lines:
+                    if line.strip().upper().startswith("FORMAT FILE"):
+                        parts = line.split('"')
+                        in_path = parts[1]
+                        out_path = parts[3]
+                        content = Path(in_path).read_text(encoding="utf-8")
+                        Path(out_path).write_text("-- formatted\n" + content, encoding="utf-8")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            with mock.patch.object(sdr.subprocess, "run", side_effect=fake_run):
+                report_path = sdr.format_fixup_outputs(settings, fixup_dir, report_dir, "20240101")
+
+            self.assertTrue(report_path and report_path.exists())
+            view_text = view_path.read_text(encoding="utf-8")
+            pkg_text = pkg_path.read_text(encoding="utf-8")
+            grant_text = grant_path.read_text(encoding="utf-8")
+            self.assertIn("-- formatted", view_text)
+            self.assertIn("-- formatted", pkg_text)
+            self.assertTrue(pkg_text.rstrip().endswith("/"))
+            self.assertNotIn("-- formatted", grant_text)
+
+    def test_format_fixup_outputs_skips_large_file_and_reports(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            fixup_dir = Path(tmp_dir) / "fixup"
+            report_dir = Path(tmp_dir) / "reports"
+            (fixup_dir / "view").mkdir(parents=True)
+            view_path = fixup_dir / "view" / "A.V2.sql"
+            view_path.write_text("line1\nline2\n", encoding="utf-8")
+
+            sqlcl_path = Path(tmp_dir) / "sql"
+            sqlcl_path.write_text("#!/bin/sh\n", encoding="utf-8")
+            sqlcl_path.chmod(0o755)
+
+            settings = {
+                "ddl_format_enable": True,
+                "ddl_formatter": "sqlcl",
+                "ddl_format_type_set": {"VIEW"},
+                "ddl_format_batch_size": 10,
+                "ddl_format_timeout": 5,
+                "ddl_format_max_lines": 1,
+                "ddl_format_max_bytes": 0,
+                "ddl_format_fail_policy": "fallback",
+                "sqlcl_bin": str(sqlcl_path),
+                "sqlcl_profile_path": ""
+            }
+
+            with mock.patch.object(sdr.subprocess, "run") as mocked_run:
+                report_path = sdr.format_fixup_outputs(settings, fixup_dir, report_dir, "20240102")
+
+            self.assertTrue(report_path and report_path.exists())
+            self.assertFalse(mocked_run.called)
+            report_text = report_path.read_text(encoding="utf-8")
+            self.assertIn("size_lines>1", report_text)
+            self.assertNotIn("-- formatted", view_path.read_text(encoding="utf-8"))
+
+    def test_sanitize_view_ddl_repairs_inline_comment_collapse(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW V1 AS\n"
+            "SELECT a.col1, --说明 (a.col2 - a.col3) AS col2, a.col4\n"
+            "FROM t\n"
+        )
+        cleaned = sdr.sanitize_view_ddl(ddl, column_names={"COL1", "COL2", "COL3", "COL4"})
+        self.assertIn("--说明", cleaned)
+        self.assertIn("\n (a.col2 - a.col3)", cleaned)
 
 
 if __name__ == "__main__":

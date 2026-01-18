@@ -70,6 +70,7 @@ import logging
 import math
 import re
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 __version__ = "0.9.8"
 __author__ = "Minor Li"
@@ -383,6 +384,24 @@ class DdlHintCleanReportRow(NamedTuple):
     kept_samples: List[str]
     removed_samples: List[str]
     unknown_samples: List[str]
+
+
+class DdlFormatReportRow(NamedTuple):
+    obj_type: str
+    status: str
+    reason: str
+    size_bytes: int
+    line_count: int
+    path: str
+
+
+@dataclass
+class DdlFormatItem:
+    path: Path
+    obj_type: str
+    rel_dir: str
+    size_bytes: int
+    line_count: int = 0
 
 
 class HintFilterResult(NamedTuple):
@@ -916,6 +935,107 @@ def parse_type_list(
         log.warning("配置 %s 包含未知类型 %s，将被忽略。", label, sorted(unknown))
     return parsed & allowed
 
+
+def normalize_ddl_formatter(raw_value: Optional[str]) -> str:
+    value = (raw_value or "").strip().lower()
+    if not value:
+        return DDL_FORMATTER_SQLCL
+    if value not in DDL_FORMATTER_VALUES:
+        log.warning("ddl_formatter=%s 不在支持范围内，将回退为 %s。", raw_value, DDL_FORMATTER_SQLCL)
+        return DDL_FORMATTER_SQLCL
+    return value
+
+
+def normalize_ddl_format_fail_policy(raw_value: Optional[str]) -> str:
+    value = (raw_value or "").strip().lower()
+    if not value:
+        return DDL_FORMAT_FAIL_FALLBACK
+    if value not in DDL_FORMAT_FAIL_POLICIES:
+        log.warning("ddl_format_fail_policy=%s 不在支持范围内，将回退为 %s。", raw_value, DDL_FORMAT_FAIL_FALLBACK)
+        return DDL_FORMAT_FAIL_FALLBACK
+    return value
+
+
+def parse_ddl_format_types(raw_value: str, default_types: Optional[Set[str]] = None) -> Set[str]:
+    if not raw_value or not raw_value.strip():
+        return set(default_types or set())
+    parsed_raw = [item.strip().upper() for item in raw_value.split(',') if item.strip()]
+    normalized: Set[str] = set()
+    for item in parsed_raw:
+        key = item.replace(" ", "_")
+        key = DDL_FORMAT_TYPE_ALIASES.get(key, item)
+        normalized.add(key)
+    unknown = normalized - DDL_FORMAT_TYPES
+    if unknown:
+        log.warning("配置 ddl_format_types 包含未知类型 %s，将被忽略。", sorted(unknown))
+    return normalized & DDL_FORMAT_TYPES
+
+
+def resolve_sqlcl_executable(raw_path: str) -> Optional[Path]:
+    if not raw_path:
+        return None
+    path = Path(raw_path).expanduser()
+    if path.is_dir():
+        candidates = [
+            path / "sql",
+            path / "sql.exe",
+            path / "bin" / "sql",
+            path / "bin" / "sql.exe",
+        ]
+        for cand in candidates:
+            if cand.exists():
+                return cand
+        return None
+    if path.exists():
+        return path
+    return None
+
+
+def infer_format_type_from_subdir(subdir: str) -> Optional[str]:
+    if not subdir:
+        return None
+    parts = [p for p in subdir.replace("\\", "/").split("/") if p]
+    if not parts:
+        return None
+    head = parts[0].lower()
+    if head == "unsupported" and len(parts) > 1:
+        head = parts[1].lower()
+    if head in ("table_alter", "table-alter"):
+        return "TABLE_ALTER"
+    if head in ("tables_unsupported", "table"):
+        return "TABLE"
+    mapping = {
+        "view": "VIEW",
+        "materialized_view": "MATERIALIZED VIEW",
+        "procedure": "PROCEDURE",
+        "function": "FUNCTION",
+        "package": "PACKAGE",
+        "package_body": "PACKAGE BODY",
+        "synonym": "SYNONYM",
+        "job": "JOB",
+        "schedule": "SCHEDULE",
+        "type": "TYPE",
+        "type_body": "TYPE BODY",
+        "index": "INDEX",
+        "constraint": "CONSTRAINT",
+        "sequence": "SEQUENCE",
+        "trigger": "TRIGGER",
+    }
+    return mapping.get(head)
+
+
+def strip_plsql_trailing_slash(ddl: str) -> Tuple[str, bool]:
+    if not ddl:
+        return ddl, False
+    lines = ddl.rstrip().splitlines()
+    if not lines:
+        return ddl, False
+    idx = len(lines) - 1
+    while idx >= 0 and not lines[idx].strip():
+        idx -= 1
+    if idx >= 0 and lines[idx].strip() == "/":
+        return "\n".join(lines[:idx]).rstrip(), True
+    return ddl, False
 
 def parse_csv_set(raw_value: Optional[str]) -> Set[str]:
     """
@@ -1546,6 +1666,56 @@ DDL_HINT_POLICY_VALUES = {
 }
 DDL_HINT_POLICY_DEFAULT = DDL_HINT_POLICY_KEEP_SUPPORTED
 
+DDL_FORMATTER_SQLCL = "sqlcl"
+DDL_FORMATTER_NONE = "none"
+DDL_FORMATTER_VALUES = {DDL_FORMATTER_SQLCL, DDL_FORMATTER_NONE}
+
+DDL_FORMAT_FAIL_FALLBACK = "fallback"
+DDL_FORMAT_FAIL_ERROR = "error"
+DDL_FORMAT_FAIL_POLICIES = {DDL_FORMAT_FAIL_FALLBACK, DDL_FORMAT_FAIL_ERROR}
+
+DDL_FORMAT_TYPE_ALIASES = {
+    "MATERIALIZED_VIEW": "MATERIALIZED VIEW",
+    "MVIEW": "MATERIALIZED VIEW",
+    "PACKAGE_BODY": "PACKAGE BODY",
+    "PACKAGEBODY": "PACKAGE BODY",
+    "TYPE_BODY": "TYPE BODY",
+    "TYPEBODY": "TYPE BODY",
+    "TABLE_ALTER": "TABLE_ALTER",
+    "TABLE-ALTER": "TABLE_ALTER",
+    "TABLEALTER": "TABLE_ALTER",
+}
+
+DDL_FORMAT_TYPES: Set[str] = {
+    "TABLE",
+    "VIEW",
+    "MATERIALIZED VIEW",
+    "INDEX",
+    "SEQUENCE",
+    "SYNONYM",
+    "PROCEDURE",
+    "FUNCTION",
+    "PACKAGE",
+    "PACKAGE BODY",
+    "TRIGGER",
+    "TYPE",
+    "TYPE BODY",
+    "CONSTRAINT",
+    "TABLE_ALTER",
+    "JOB",
+    "SCHEDULE",
+}
+
+DDL_FORMAT_PLSQL_TYPES = {
+    "PROCEDURE",
+    "FUNCTION",
+    "PACKAGE",
+    "PACKAGE BODY",
+    "TRIGGER",
+    "TYPE",
+    "TYPE BODY",
+}
+
 OB_ORACLE_HINT_ALLOWLIST: Set[str] = {
     "AGGR_FIRST_UNNEST",
     "APPEND",
@@ -1757,6 +1927,16 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('ddl_hint_allowlist', '')
         settings.setdefault('ddl_hint_denylist', '')
         settings.setdefault('ddl_hint_allowlist_file', '')
+        settings.setdefault('ddl_format_enable', 'false')
+        settings.setdefault('ddl_format_types', '')
+        settings.setdefault('ddl_formatter', DDL_FORMATTER_SQLCL)
+        settings.setdefault('ddl_format_fail_policy', DDL_FORMAT_FAIL_FALLBACK)
+        settings.setdefault('ddl_format_batch_size', '200')
+        settings.setdefault('ddl_format_timeout', '60')
+        settings.setdefault('ddl_format_max_lines', '30000')
+        settings.setdefault('ddl_format_max_bytes', '2000000')
+        settings.setdefault('sqlcl_bin', '')
+        settings.setdefault('sqlcl_profile_path', '')
         settings.setdefault('view_compat_rules_path', '')
         settings.setdefault('view_dblink_policy', 'block')
         settings.setdefault('dbcat_chunk_size', '150')
@@ -1852,6 +2032,47 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings['ddl_hint_allowlist_file_set'] = load_hint_allowlist_file(
             settings.get('ddl_hint_allowlist_file', '')
         )
+        settings['ddl_format_enable'] = parse_bool_flag(
+            settings.get('ddl_format_enable', 'false'),
+            False
+        )
+        settings['ddl_formatter'] = normalize_ddl_formatter(
+            settings.get('ddl_formatter', DDL_FORMATTER_SQLCL)
+        )
+        settings['ddl_format_fail_policy'] = normalize_ddl_format_fail_policy(
+            settings.get('ddl_format_fail_policy', DDL_FORMAT_FAIL_FALLBACK)
+        )
+        try:
+            settings['ddl_format_batch_size'] = int(settings.get('ddl_format_batch_size', '200'))
+        except (TypeError, ValueError):
+            settings['ddl_format_batch_size'] = 200
+        if settings['ddl_format_batch_size'] <= 0:
+            settings['ddl_format_batch_size'] = 200
+        try:
+            settings['ddl_format_timeout'] = int(settings.get('ddl_format_timeout', '60'))
+        except (TypeError, ValueError):
+            settings['ddl_format_timeout'] = 60
+        if settings['ddl_format_timeout'] < 0:
+            settings['ddl_format_timeout'] = 60
+        try:
+            settings['ddl_format_max_lines'] = int(settings.get('ddl_format_max_lines', '30000'))
+        except (TypeError, ValueError):
+            settings['ddl_format_max_lines'] = 30000
+        if settings['ddl_format_max_lines'] < 0:
+            settings['ddl_format_max_lines'] = 0
+        try:
+            settings['ddl_format_max_bytes'] = int(settings.get('ddl_format_max_bytes', '2000000'))
+        except (TypeError, ValueError):
+            settings['ddl_format_max_bytes'] = 2000000
+        if settings['ddl_format_max_bytes'] < 0:
+            settings['ddl_format_max_bytes'] = 0
+        if settings['ddl_format_enable']:
+            settings['ddl_format_type_set'] = parse_ddl_format_types(
+                settings.get('ddl_format_types', ''),
+                default_types={'VIEW'}
+            )
+        else:
+            settings['ddl_format_type_set'] = set()
         settings['synonym_fixup_scope'] = normalize_synonym_fixup_scope(
             settings.get('synonym_fixup_scope', 'all')
         )
@@ -2010,6 +2231,22 @@ def validate_runtime_paths(settings: Dict, ob_cfg: ObConfig) -> None:
         elif not Path(java_home).expanduser().exists():
             warnings.append(f"JAVA_HOME 指向的目录不存在: {java_home}，请确认 JDK 路径。")
 
+    ddl_format_enabled = settings.get('ddl_format_enable', False) and settings.get('ddl_formatter') == DDL_FORMATTER_SQLCL
+    if ddl_format_enabled:
+        sqlcl_raw = settings.get('sqlcl_bin', '').strip()
+        sqlcl_exec = resolve_sqlcl_executable(sqlcl_raw)
+        if not sqlcl_raw:
+            errors.append("ddl_format_enable 已开启但未配置 sqlcl_bin；请提供 SQLcl 根目录或 bin/sql 可执行文件路径。")
+        elif not sqlcl_exec or not sqlcl_exec.exists():
+            errors.append(f"SQLcl 路径不可用: {sqlcl_raw}（未解析到 bin/sql）。")
+        elif not os.access(sqlcl_exec, os.X_OK):
+            warnings.append(f"SQLcl 路径存在但不可执行: {sqlcl_exec}，请检查权限。")
+        profile_path = settings.get('sqlcl_profile_path', '').strip()
+        if profile_path and not Path(profile_path).expanduser().exists():
+            warnings.append(f"sqlcl_profile_path 不存在: {profile_path}（将忽略格式化 profile）。")
+        if not generate_fixup_enabled:
+            warnings.append("ddl_format_enable 已开启但 generate_fixup=false，本次不会产生可格式化的 DDL。")
+
     # 提示输出目录
     for key in ('fixup_dir', 'report_dir', 'dbcat_output_dir'):
         val = settings.get(key, '').strip()
@@ -2089,11 +2326,25 @@ def run_config_wizard(config_path: Path) -> None:
             return False, "文件不可执行"
         return True, ""
 
+    def _validate_sqlcl_path(p: str) -> Tuple[bool, str]:
+        exec_path = resolve_sqlcl_executable(p.strip())
+        if not exec_path or not exec_path.exists():
+            return False, "未解析到 bin/sql"
+        if not os.access(exec_path, os.X_OK):
+            return False, "SQLcl 不可执行"
+        return True, ""
+
     def _validate_positive_int(val: str) -> Tuple[bool, str]:
         try:
             return int(val) > 0, "需要正整数"
         except ValueError:
             return False, "需要正整数"
+
+    def _validate_non_negative_int(val: str) -> Tuple[bool, str]:
+        try:
+            return int(val) >= 0, "需要非负整数"
+        except ValueError:
+            return False, "需要非负整数"
 
     def _validate_grant_scope(val: str) -> Tuple[bool, str]:
         v = val.strip().lower()
@@ -2139,6 +2390,13 @@ def run_config_wizard(config_path: Path) -> None:
         if val.strip().lower() in VIEW_DBLINK_POLICIES:
             return True, ""
         return False, "仅支持 block/allow"
+
+    def _validate_ddl_format_fail_policy(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        if val.strip().lower() in DDL_FORMAT_FAIL_POLICIES:
+            return True, ""
+        return False, "仅支持 fallback/error"
 
     def _bool_transform(val: str) -> str:
         v = val.strip().lower()
@@ -2413,6 +2671,72 @@ def run_config_wizard(config_path: Path) -> None:
         "视图兼容性规则 JSON 路径 (可选)",
         default=cfg.get("SETTINGS", "view_compat_rules_path", fallback=""),
     )
+
+    _prompt_field(
+        "SETTINGS",
+        "ddl_format_enable",
+        "是否启用 SQLcl DDL 格式化 (true/false)",
+        default=cfg.get("SETTINGS", "ddl_format_enable", fallback="false"),
+        transform=_bool_transform,
+    )
+    ddl_format_enabled = parse_bool_flag(cfg.get("SETTINGS", "ddl_format_enable", fallback="false"))
+    if ddl_format_enabled:
+        _prompt_field(
+            "SETTINGS",
+            "sqlcl_bin",
+            "SQLcl 根目录或 bin/sql 路径",
+            default=cfg.get("SETTINGS", "sqlcl_bin", fallback=""),
+            validator=_validate_sqlcl_path,
+            required=True,
+        )
+        _prompt_field(
+            "SETTINGS",
+            "sqlcl_profile_path",
+            "SQLcl 格式化规则文件 (可选)",
+            default=cfg.get("SETTINGS", "sqlcl_profile_path", fallback=""),
+        )
+        _prompt_field(
+            "SETTINGS",
+            "ddl_format_types",
+            "需要格式化的对象类型 (逗号分隔，默认 VIEW)",
+            default=cfg.get("SETTINGS", "ddl_format_types", fallback="VIEW"),
+        )
+        _prompt_field(
+            "SETTINGS",
+            "ddl_format_fail_policy",
+            "格式化失败策略 (fallback/error)",
+            default=cfg.get("SETTINGS", "ddl_format_fail_policy", fallback="fallback"),
+            validator=_validate_ddl_format_fail_policy,
+            transform=normalize_ddl_format_fail_policy,
+        )
+        _prompt_field(
+            "SETTINGS",
+            "ddl_format_batch_size",
+            "SQLcl 批量格式化对象数",
+            default=cfg.get("SETTINGS", "ddl_format_batch_size", fallback="200"),
+            validator=_validate_positive_int,
+        )
+        _prompt_field(
+            "SETTINGS",
+            "ddl_format_timeout",
+            "SQLcl 批处理超时（秒，0 为不超时）",
+            default=cfg.get("SETTINGS", "ddl_format_timeout", fallback="60"),
+            validator=_validate_non_negative_int,
+        )
+        _prompt_field(
+            "SETTINGS",
+            "ddl_format_max_lines",
+            "单个 DDL 最大行数（超过则跳过，0 表示不限制）",
+            default=cfg.get("SETTINGS", "ddl_format_max_lines", fallback="30000"),
+            validator=_validate_non_negative_int,
+        )
+        _prompt_field(
+            "SETTINGS",
+            "ddl_format_max_bytes",
+            "单个 DDL 最大字节数（超过则跳过，0 表示不限制）",
+            default=cfg.get("SETTINGS", "ddl_format_max_bytes", fallback="2000000"),
+            validator=_validate_non_negative_int,
+        )
 
     # 只有生成 fixup 时才校验 dbcat/JAVA_HOME
     gen_fixup_val = cfg.get("SETTINGS", "generate_fixup", fallback="true").lower()
@@ -11427,8 +11751,9 @@ def clean_view_ddl_for_oceanbase(ddl: str, ob_version: Optional[str] = None) -> 
     for pattern in patterns_to_remove:
         cleaned_ddl = re.sub(pattern, ' ', cleaned_ddl, flags=re.IGNORECASE)
     
-    # 清理多余的空格
-    cleaned_ddl = re.sub(r'\s+', ' ', cleaned_ddl)
+    # 清理多余的空格（保留换行，避免行注释吞行）
+    cleaned_ddl = re.sub(r'[ \t\r\f\v]+', ' ', cleaned_ddl)
+    cleaned_ddl = re.sub(r' *\n *', '\n', cleaned_ddl)
     cleaned_ddl = cleaned_ddl.strip()
     
     return cleaned_ddl
@@ -11586,13 +11911,26 @@ def _find_inline_comment_split(segment: str) -> Optional[int]:
     if not segment.startswith("--"):
         return None
     # Try to detect the next column token after a collapsed inline comment.
-    m = re.search(r"\s+(?:[A-Za-z_][A-Za-z0-9_#$]*|\"[^\"]+\")\.", segment)
-    if m:
-        return m.start()
-    m = re.search(r"\s+FROM\b", segment, flags=re.IGNORECASE)
-    if m:
-        return m.start()
-    return None
+    patterns = [
+        r"\s+\(\s*(?:[A-Za-z_][A-Za-z0-9_#$]*|\"[^\"]+\")\.",
+        r"\s+(?:[A-Za-z_][A-Za-z0-9_#$]*|\"[^\"]+\")\.",
+        r"\s+\(\s*(?:SELECT|WITH|CASE)\b",
+        (
+            r"\s+\b(?:SELECT|WITH|CASE|DECODE|NVL|COALESCE|TO_CHAR|TO_DATE|TRUNC|"
+            r"ROUND|SUBSTR|INSTR|REGEXP_SUBSTR|REGEXP_REPLACE|REGEXP_LIKE|"
+            r"COUNT|SUM|MIN|MAX|AVG)\b"
+        ),
+        r"\s+FROM\b\s+[A-Za-z_\"(]",
+    ]
+    best: Optional[int] = None
+    for pattern in patterns:
+        m = re.search(pattern, segment, flags=re.IGNORECASE)
+        if not m:
+            continue
+        idx = m.start()
+        if best is None or idx < best:
+            best = idx
+    return best
 
 
 def fix_inline_comment_collapse(ddl: str) -> str:
@@ -13818,6 +14156,325 @@ def write_fixup_file(
                 f.write(f"{grant_stmt}\n")
 
     log.info(f"[FIXUP] 生成目标端订正 SQL: {file_path}")
+
+
+def count_lines_with_limit(path: Path, max_lines: int) -> Tuple[int, bool]:
+    if max_lines <= 0:
+        return 0, False
+    count = 0
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                count += 1
+                if count > max_lines:
+                    return count, True
+    except OSError as exc:
+        log.warning("读取行数失败 %s: %s", path, exc)
+        return 0, False
+    return count, False
+
+
+def export_ddl_format_report(
+    rows: List[DdlFormatReportRow],
+    summary_by_type: Dict[str, Dict[str, int]],
+    report_dir: Path,
+    report_timestamp: Optional[str],
+    scanned_total: int,
+    skip_reasons: Dict[str, int]
+) -> Optional[Path]:
+    if not report_dir or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"ddl_format_report_{report_timestamp}.txt"
+    formatted_total = sum(int(v.get("formatted", 0) or 0) for v in summary_by_type.values())
+    skipped_total = sum(int(v.get("skipped", 0) or 0) for v in summary_by_type.values())
+    failed_total = sum(int(v.get("failed", 0) or 0) for v in summary_by_type.values())
+    known_total = sum(int(v.get("total", 0) or 0) for v in summary_by_type.values())
+    delimiter = "|"
+    detail_header = delimiter.join(["TYPE", "STATUS", "REASON", "SIZE_BYTES", "LINES", "PATH"])
+    lines: List[str] = [
+        "# DDL 格式化报告",
+        f"# timestamp={report_timestamp}",
+        f"# scanned_files={scanned_total}",
+        f"# known_type_files={known_total}",
+        f"# formatted={formatted_total} skipped={skipped_total} failed={failed_total}",
+        f"# 分隔符: {delimiter}",
+        f"# 字段说明: {detail_header}"
+    ]
+
+    if summary_by_type:
+        lines.append("")
+        lines.append("SUMMARY_BY_TYPE")
+        lines.append(delimiter.join(["TYPE", "TOTAL", "FORMATTED", "SKIPPED", "FAILED"]))
+        for obj_type, counts in sorted(summary_by_type.items()):
+            lines.append(
+                delimiter.join([
+                    obj_type,
+                    str(counts.get('total', 0)),
+                    str(counts.get('formatted', 0)),
+                    str(counts.get('skipped', 0)),
+                    str(counts.get('failed', 0))
+                ])
+            )
+
+    if skip_reasons:
+        lines.append("")
+        lines.append("SKIP_REASONS")
+        lines.append(delimiter.join(["REASON", "COUNT"]))
+        for reason, count in sorted(skip_reasons.items()):
+            lines.append(delimiter.join([reason, str(count)]))
+
+    if rows:
+        lines.append("")
+        lines.append("DETAIL")
+        lines.append(detail_header)
+        for row in sorted(rows, key=lambda r: (r.obj_type, r.status, r.path)):
+            lines.append(
+                delimiter.join([
+                    sanitize_pipe_field(row.obj_type),
+                    sanitize_pipe_field(row.status),
+                    sanitize_pipe_field(row.reason),
+                    str(row.size_bytes),
+                    str(row.line_count),
+                    sanitize_pipe_field(row.path)
+                ])
+            )
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        return output_path
+    except OSError as exc:
+        log.warning("写入 ddl_format 报告失败 %s: %s", output_path, exc)
+        return None
+
+
+def format_fixup_outputs(
+    settings: Dict,
+    fixup_dir: Path,
+    report_dir: Optional[Path],
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not settings.get('ddl_format_enable', False):
+        return None
+    if settings.get('ddl_formatter') != DDL_FORMATTER_SQLCL:
+        return None
+    ddl_format_types = set(settings.get('ddl_format_type_set', set()) or set())
+    if not ddl_format_types:
+        log.info("[DDL_FORMAT] ddl_format_enable=true 但 ddl_format_types 为空，已跳过格式化。")
+        return None
+    if not fixup_dir.exists():
+        log.warning("[DDL_FORMAT] fixup_dir 不存在，跳过格式化: %s", fixup_dir)
+        return None
+
+    fail_policy = settings.get('ddl_format_fail_policy', DDL_FORMAT_FAIL_FALLBACK)
+    sqlcl_raw = settings.get('sqlcl_bin', '').strip()
+    sqlcl_exec = resolve_sqlcl_executable(sqlcl_raw)
+    if not sqlcl_exec or not sqlcl_exec.exists():
+        msg = f"[DDL_FORMAT] SQLcl 路径不可用: {sqlcl_raw}"
+        if fail_policy == DDL_FORMAT_FAIL_ERROR:
+            raise RuntimeError(msg)
+        log.warning(msg)
+        return None
+    if not os.access(sqlcl_exec, os.X_OK):
+        log.warning("[DDL_FORMAT] SQLcl 路径不可执行: %s", sqlcl_exec)
+
+    profile_path = (settings.get('sqlcl_profile_path') or "").strip()
+    profile_file: Optional[Path] = None
+    if profile_path:
+        profile_file = Path(profile_path).expanduser()
+        if not profile_file.exists():
+            msg = f"[DDL_FORMAT] SQLcl profile 不存在: {profile_path}，将忽略该 profile。"
+            if fail_policy == DDL_FORMAT_FAIL_ERROR:
+                raise RuntimeError(msg)
+            log.warning(msg)
+            profile_file = None
+
+    max_lines = int(settings.get('ddl_format_max_lines', 0) or 0)
+    max_bytes = int(settings.get('ddl_format_max_bytes', 0) or 0)
+    batch_size = int(settings.get('ddl_format_batch_size', 200) or 200)
+    timeout_val = int(settings.get('ddl_format_timeout', 60) or 60)
+    timeout = timeout_val if timeout_val > 0 else None
+
+    items_to_format: List[DdlFormatItem] = []
+    report_rows: List[DdlFormatReportRow] = []
+    summary_by_type: Dict[str, Dict[str, int]] = defaultdict(lambda: {
+        "total": 0, "formatted": 0, "skipped": 0, "failed": 0
+    })
+    skip_reasons: Dict[str, int] = defaultdict(int)
+    scanned_total = 0
+
+    for path in sorted(fixup_dir.rglob("*.sql")):
+        if not path.is_file():
+            continue
+        scanned_total += 1
+        rel_dir = str(path.relative_to(fixup_dir).parent)
+        obj_type = infer_format_type_from_subdir(rel_dir) or ""
+        size_bytes = path.stat().st_size
+        line_count = 0
+        if not obj_type:
+            skip_reasons["unknown_type"] += 1
+            report_rows.append(DdlFormatReportRow(
+                "UNKNOWN",
+                "skipped",
+                "unknown_type",
+                size_bytes,
+                line_count,
+                str(path)
+            ))
+            continue
+        summary = summary_by_type[obj_type]
+        summary["total"] += 1
+        if obj_type not in ddl_format_types:
+            summary["skipped"] += 1
+            skip_reasons["type_filtered"] += 1
+            continue
+        if max_bytes > 0 and size_bytes > max_bytes:
+            summary["skipped"] += 1
+            skip_reasons["size_bytes"] += 1
+            report_rows.append(DdlFormatReportRow(
+                obj_type,
+                "skipped",
+                f"size_bytes>{max_bytes}",
+                size_bytes,
+                line_count,
+                str(path)
+            ))
+            continue
+        exceeded = False
+        if max_lines > 0:
+            line_count, exceeded = count_lines_with_limit(path, max_lines)
+        if exceeded:
+            summary["skipped"] += 1
+            skip_reasons["size_lines"] += 1
+            report_rows.append(DdlFormatReportRow(
+                obj_type,
+                "skipped",
+                f"size_lines>{max_lines}",
+                size_bytes,
+                line_count,
+                str(path)
+            ))
+            continue
+        items_to_format.append(DdlFormatItem(
+            path=path,
+            obj_type=obj_type,
+            rel_dir=rel_dir,
+            size_bytes=size_bytes,
+            line_count=line_count
+        ))
+
+    if not items_to_format:
+        if report_dir and report_timestamp:
+            return export_ddl_format_report(
+                report_rows,
+                summary_by_type,
+                report_dir,
+                report_timestamp,
+                scanned_total,
+                skip_reasons
+            )
+        return None
+
+    log.info(
+        "[DDL_FORMAT] 准备格式化 %d 个 DDL (types=%s)",
+        len(items_to_format),
+        ", ".join(sorted(ddl_format_types))
+    )
+    error_message = ""
+
+    def _short_sqlcl_error(proc: subprocess.CompletedProcess) -> str:
+        msg = proc.stderr or proc.stdout or ""
+        msg = normalize_error_text(msg)
+        if len(msg) > 240:
+            msg = msg[:240] + "..."
+        return msg
+
+    for idx in range(0, len(items_to_format), max(1, batch_size)):
+        batch = items_to_format[idx: idx + max(1, batch_size)]
+        with tempfile.TemporaryDirectory(prefix="sqlcl_fmt_") as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            script_lines: List[str] = []
+            if profile_file:
+                script_lines.append(f'FORMAT RULES "{profile_file}"')
+            io_map: List[Tuple[DdlFormatItem, Path, bool]] = []
+            for b_idx, item in enumerate(batch):
+                content = item.path.read_text(encoding="utf-8")
+                if item.line_count <= 0:
+                    item.line_count = content.count("\n") + (1 if content else 0)
+                needs_slash = False
+                if item.obj_type in DDL_FORMAT_PLSQL_TYPES:
+                    content, needs_slash = strip_plsql_trailing_slash(content)
+                input_path = tmp_path / f"in_{b_idx}.sql"
+                output_path = tmp_path / f"out_{b_idx}.sql"
+                input_path.write_text(content.rstrip() + "\n", encoding="utf-8")
+                script_lines.append(f'FORMAT FILE "{input_path}" "{output_path}"')
+                io_map.append((item, output_path, needs_slash))
+
+            script_lines.append("EXIT")
+            script_path = tmp_path / "format.sql"
+            script_path.write_text("\n".join(script_lines) + "\n", encoding="utf-8")
+
+            env = os.environ.copy()
+            env["JAVA_TOOL_OPTIONS"] = f"-Duser.home={tmp_path}"
+            try:
+                result = subprocess.run(
+                    [str(sqlcl_exec), "-S", "/nolog", f"@{script_path}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=env
+                )
+            except subprocess.TimeoutExpired:
+                error_message = "timeout"
+                for item, _out_path, _slash in io_map:
+                    summary_by_type[item.obj_type]["failed"] += 1
+                    report_rows.append(DdlFormatReportRow(
+                        item.obj_type,
+                        "failed",
+                        "timeout",
+                        item.size_bytes,
+                        item.line_count,
+                        str(item.path)
+                    ))
+                if fail_policy == DDL_FORMAT_FAIL_ERROR:
+                    raise RuntimeError("[DDL_FORMAT] SQLcl 超时，已停止格式化。")
+                continue
+
+            if result.returncode != 0:
+                error_message = _short_sqlcl_error(result) or "sqlcl_error"
+                log.warning("[DDL_FORMAT] SQLcl 返回非零状态: %s", error_message)
+
+            for item, out_path, needs_slash in io_map:
+                if not out_path.exists():
+                    summary_by_type[item.obj_type]["failed"] += 1
+                    report_rows.append(DdlFormatReportRow(
+                        item.obj_type,
+                        "failed",
+                        error_message or "no_output",
+                        item.size_bytes,
+                        item.line_count,
+                        str(item.path)
+                    ))
+                    continue
+                formatted = out_path.read_text(encoding="utf-8")
+                if needs_slash:
+                    formatted = formatted.rstrip() + "\n/\n"
+                item.path.write_text(formatted.rstrip() + "\n", encoding="utf-8")
+                summary_by_type[item.obj_type]["formatted"] += 1
+
+    failed_total = sum(int(v.get("failed", 0) or 0) for v in summary_by_type.values())
+    report_path = None
+    if report_dir and report_timestamp:
+        report_path = export_ddl_format_report(
+            report_rows,
+            summary_by_type,
+            report_dir,
+            report_timestamp,
+            scanned_total,
+            skip_reasons
+        )
+    if failed_total and fail_policy == DDL_FORMAT_FAIL_ERROR:
+        raise RuntimeError("[DDL_FORMAT] DDL 格式化失败，已按配置中断运行。")
+    return report_path
 
 
 def format_oracle_column_type(
@@ -16715,6 +17372,10 @@ def generate_fixup_scripts(
         if hint_report_path:
             log.info("[DDL_HINT] hint 清洗报告已输出: %s", hint_report_path)
 
+    format_report_path = format_fixup_outputs(settings, base_dir, report_dir, report_timestamp)
+    if format_report_path:
+        log.info("[DDL_FORMAT] DDL 格式化报告已输出: %s", format_report_path)
+
     if unsupported_types:
         log.warning(
             "[dbcat] 以下对象类型当前未集成自动导出，需人工处理: %s",
@@ -19098,6 +19759,10 @@ def parse_cli_args() -> argparse.Namespace:
             report_dir_layout       报告目录布局 (flat/per_run)
             view_compat_rules_path  VIEW 兼容规则 JSON (可选)
             view_dblink_policy      VIEW DBLINK 处理策略 (block/allow)
+            ddl_format_enable       true/false 启用 SQLcl DDL 格式化
+            ddl_format_types        DDL 格式化对象类型列表（逗号分隔）
+            sqlcl_bin               SQLcl 根目录或 bin/sql 路径
+            ddl_format_timeout      SQLcl 批次超时（秒，0 不超时）
             check_dependencies      true/false 控制依赖校验
             generate_grants         true/false 控制授权脚本生成
             grant_tab_privs_scope   owner/owner_or_grantee 控制 DBA_TAB_PRIVS 抽取范围
@@ -19118,6 +19783,7 @@ def parse_cli_args() -> argparse.Namespace:
           main_reports/run_<ts>/blacklist_tables.txt 黑名单表清单 (含 LONG 转换校验状态)
           main_reports/run_<ts>/trigger_status_report.txt  触发器状态/清单报告 (trigger_list 或触发器状态差异时生成)
           main_reports/run_<ts>/filtered_grants.txt 过滤掉的不兼容 GRANT 权限清单
+          main_reports/run_<ts>/ddl_format_report_<ts>.txt SQLcl DDL 格式化报告 (ddl_format_enable=true)
           main_reports/run_<ts>/missing_objects_detail_<ts>.txt 缺失对象支持性明细 (report_detail_mode=split)
           main_reports/run_<ts>/unsupported_objects_detail_<ts>.txt 不支持/阻断对象明细 (report_detail_mode=split)
           main_reports/run_<ts>/extra_mismatch_detail_<ts>.txt 扩展对象差异明细 (report_detail_mode=split)

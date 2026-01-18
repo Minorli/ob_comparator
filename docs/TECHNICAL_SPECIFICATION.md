@@ -24,12 +24,14 @@
 - Oracle Instant Client + `oracledb` Thick Mode
 - OceanBase `obclient`
 - JDK + `dbcat`
+- SQLcl（可选，用于 DDL 格式化）
 
 ### 2.3 可配置开关（核心）
 - `check_primary_types` / `check_extra_types`
 - `generate_fixup` / `generate_grants`
 - `check_dependencies` / `check_comments`
 - `infer_schema_mapping` / `ddl_punct_sanitize` / `ddl_hint_policy`
+- `ddl_format_enable` / `ddl_format_types` / `sqlcl_bin`（可选格式化）
 
 ---
 
