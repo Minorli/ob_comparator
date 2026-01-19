@@ -18,3 +18,6 @@ config.ini
 AGENTS.md
 docs/MIGRATION_PROPOSAL_1567_SCHEMAS.md
 .venv
+
+.gemini/
+gha-creds-*.json
