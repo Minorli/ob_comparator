@@ -286,47 +286,59 @@ for part in parts:
 
 ### P0 级（必须修复）
 
-| 编号 | 风险 | 根因 | 影响范围 |
-|-----|------|------|---------|
-| **P0-1** | 视图中公共同义词未替换 | `remap_view_dependencies()`不查询synonym_meta | 所有引用PUBLIC SYNONYM的VIEW |
-| **P0-2** | NUMBER精度未对比 | 类型对比逻辑缺失 | 所有NUMBER列 |
-| **P0-3** | LONG表被错误当作黑名单阻断依赖对象 | 未区分"黑名单"与"特殊规则" | 所有依赖LONG表的VIEW/TRIGGER/SYNONYM等 |
+| 编号 | 风险 | 根因 | 状态 |
+|-----|------|------|------|
+| **P0-1** | 视图中公共同义词未替换 | `remap_view_dependencies()`不查询synonym_meta | ✅ **已修复** (b8df9d4) |
+| **P0-2** | NUMBER精度未对比 | 类型对比逻辑缺失 | ✅ **已修复** (b8df9d4) |
+| **P0-3** | LONG表被错误当作黑名单阻断依赖对象 | 未区分"黑名单"与"特殊规则" | ❌ **未修复** |
 
 ### P1 级（应在2周内修复）
 
-| 编号 | 风险 | 根因 |
-|-----|------|------|
-| P1-1 | IDENTITY列未识别 | 元数据未收集 |
-| P1-2 | DDL缺乏幂等性 | 未加IF EXISTS |
-| P1-3 | SEQUENCE属性未详细对比 | 仅存在性检测 |
-| P1-4 | CHECK约束表达式未语义对比 | 未实现 |
+| 编号 | 风险 | 根因 | 状态 |
+|-----|------|------|------|
+| P1-1 | IDENTITY列未识别 | 元数据未收集 | ✅ **已修复** (b8df9d4) |
+| P1-2 | DDL缺乏幂等性 | 未加IF EXISTS | ⚠️ 待处理 |
+| P1-3 | SEQUENCE属性未详细对比 | 仅存在性检测 | ✅ **已修复** (b8df9d4) |
+| P1-4 | CHECK约束表达式未语义对比 | 未实现 | ⚠️ 待处理 |
+
+### 新增功能 (b8df9d4)
+
+| 功能 | 说明 | 代码位置 |
+|-----|------|---------|
+| PUBLIC同义词解析 | `_resolve_public_synonym()` 解析PUBLIC同义词到基表 | @13241-13251 |
+| 依赖Fallback | `view_dependency_map` 作为SQL提取的fallback | @13229-13233 |
+| NUMBER精度对比 | 检查`data_precision`和`data_scale` | @9521-9552 |
+| IDENTITY检测 | 检查`identity_missing` | @9446-9457 |
+| DEFAULT ON NULL检测 | 检查`default_on_null_missing` | @9459-9470 |
+| SEQUENCE属性对比 | 比较increment_by/min_value/max_value/cycle/order/cache | @10797-10803 |
 
 ---
 
 ## 八、修复建议
 
-### 8.1 公共同义词处理修复（P0-1）
+### 8.1 公共同义词处理修复（P0-1） ✅ 已完成
 
-**修改文件**: `schema_diff_reconciler.py`
+**状态**: 已在 commit b8df9d4 中修复
 
-**修改函数**: `remap_view_dependencies()`
+**实现方式**:
+- `remap_view_dependencies()` 新增 `synonym_meta` 参数
+- 新增 `_resolve_public_synonym()` 内部函数解析PUBLIC同义词
+- 当引用未找到映射时，自动查询 `synonym_meta` 解析基表
 
-**步骤**:
-1. 添加 `synonym_meta` 参数
-2. 对于未找到映射的引用，查询 `synonym_meta` 解析实际对象
-3. 在调用处传入 `synonym_metadata`
+### 8.2 NUMBER精度对比修复（P0-2） ✅ 已完成
 
-### 8.2 NUMBER精度对比修复（P0-2）
+**状态**: 已在 commit b8df9d4 中修复
 
-在 `check_primary_objects()` 的列对比逻辑中添加：
+**实现位置**: `@9521-9552`
+
+**实现逻辑**:
 ```python
-if src_dtype == 'NUMBER':
-    src_precision = src_info.get('data_precision')
-    src_scale = src_info.get('data_scale')
-    tgt_precision = tgt_info.get('data_precision')
-    tgt_scale = tgt_info.get('data_scale')
-    if (src_precision, src_scale) != (tgt_precision, tgt_scale):
-        type_mismatches.append(ColumnTypeIssue(...))
+if src_dtype in ("NUMBER", "DECIMAL", "NUMERIC"):
+    src_prec, src_scale = normalize_number_meta(src_info.get("data_precision"), src_info.get("data_scale"))
+    tgt_prec, tgt_scale = normalize_number_meta(tgt_info.get("data_precision"), tgt_info.get("data_scale"))
+    # 对比逻辑...
+    if mismatch:
+        type_mismatches.append(ColumnTypeIssue(..., "number_precision"))
 ```
 
 ### 8.3 LONG表黑名单逻辑修复（P0-3）
@@ -420,27 +432,37 @@ for (schema, table), entries in (oracle_meta.blacklist_tables or {}).items():
 
 ## 九、结论
 
-### 9.1 总体评价
+### 9.1 总体评价（更新于 2026-01-20 20:45）
 
 | 维度 | 评分 | 说明 |
 |-----|------|------|
 | Remap逻辑 | 8.5/10 | 完善，支持多种推导策略 |
-| 校验逻辑 | 7.5/10 | 覆盖主要对象，缺少精度级别验证 |
-| DDL生成 | 7.0/10 | 基础完善，**公共同义词是关键缺陷** |
+| 校验逻辑 | **8.5/10** ⬆️ | NUMBER精度/IDENTITY/SEQUENCE属性已覆盖 |
+| DDL生成 | **8.0/10** ⬆️ | PUBLIC同义词解析已实现 |
 | 代码质量 | 8.0/10 | 结构清晰，少量重复 |
 
-### 9.2 优先修复项
+### 9.2 修复进度
 
-1. **立即修复**: 视图中公共同义词替换 (P0-1)
-2. **立即修复**: LONG表黑名单逻辑修复 (P0-3)
-3. **本周内**: NUMBER精度对比 (P0-2)
-4. **两周内**: IDENTITY列处理、DDL幂等性
+| 编号 | 问题 | 状态 | Commit |
+|-----|------|------|--------|
+| P0-1 | 视图中公共同义词替换 | ✅ 已修复 | b8df9d4 |
+| P0-2 | NUMBER精度对比 | ✅ 已修复 | b8df9d4 |
+| P0-3 | LONG表黑名单逻辑 | ❌ **待修复** | - |
+| P1-1 | IDENTITY列识别 | ✅ 已修复 | b8df9d4 |
+| P1-3 | SEQUENCE属性对比 | ✅ 已修复 | b8df9d4 |
 
-### 9.3 工具定位建议
+### 9.3 仍需处理
+
+1. **P0-3**: LONG表黑名单逻辑修复（代码仍在@3411-3416）
+2. **P1-2**: DDL幂等性（IF EXISTS）
+3. **P1-4**: CHECK约束表达式语义对比
+
+### 9.4 工具定位建议
 
 - ✅ 适合用于**迁移评估**和**差异识别**
+- ✅ PUBLIC同义词在VIEW中已正确处理
+- ✅ NUMBER精度/IDENTITY/SEQUENCE属性已覆盖
 - ⚠️ 生成的DDL需**人工审核**后再执行
-- ⚠️ 引用PUBLIC SYNONYM的VIEW需**特别关注**
 - ⚠️ 依赖LONG表的对象可能被错误过滤，需**检查blacklist_tables.txt**
 
 ---
