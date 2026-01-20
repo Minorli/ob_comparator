@@ -631,6 +631,17 @@ NO_INFER_SCHEMA_TYPES: Set[str] = {
     'PACKAGE BODY'
 }
 
+INVALID_STATUS_TYPES: Set[str] = {
+    'VIEW',
+    'PROCEDURE',
+    'FUNCTION',
+    'PACKAGE',
+    'PACKAGE BODY',
+    'TYPE',
+    'TYPE BODY',
+    'TRIGGER'
+}
+
 BLACKLIST_REASON_BY_TYPE: Dict[str, str] = {
     'SPE': "表字段存在不支持的类型，不支持创建，不需要生成DDL",
     'TEMP_TABLE': "临时表，不支持创建，不需要生成DDL",
@@ -3195,7 +3206,8 @@ def build_trigger_list_report(
 def collect_trigger_status_rows(
     oracle_meta: OracleMetadata,
     ob_meta: ObMetadata,
-    full_object_mapping: FullObjectMapping
+    full_object_mapping: FullObjectMapping,
+    unsupported_table_keys: Optional[Set[Tuple[str, str]]] = None
 ) -> List[TriggerStatusReportRow]:
     """
     收集两端触发器的启用/有效性/事件差异明细。
@@ -3207,7 +3219,23 @@ def collect_trigger_status_rows(
     if not src_map or not tgt_map:
         return rows
 
+    unsupported_keys = {(s.upper(), t.upper()) for s, t in (unsupported_table_keys or set())}
+    trigger_parent_map: Dict[str, Tuple[str, str]] = {}
+    if unsupported_keys:
+        for (owner, table), trg_map in (oracle_meta.triggers or {}).items():
+            table_key = (owner.upper(), table.upper())
+            for trg_name, info in (trg_map or {}).items():
+                trg_owner = (info.get("owner") or owner).upper()
+                name_u = (trg_name or "").upper()
+                if not name_u:
+                    continue
+                trigger_parent_map[f"{trg_owner}.{name_u}"] = table_key
+
     for src_full, src_info in src_map.items():
+        if unsupported_keys:
+            parent_key = trigger_parent_map.get(src_full.upper())
+            if parent_key and parent_key in unsupported_keys:
+                continue
         mapped = get_mapped_target(full_object_mapping, src_full, 'TRIGGER') or src_full
         mapped_u = mapped.upper()
         tgt_info = tgt_map.get(mapped_u)
@@ -3319,6 +3347,8 @@ def classify_missing_objects(
     unsupported_view_keys: Set[Tuple[str, str]] = set()
 
     view_compat_map: Dict[Tuple[str, str], ViewCompatResult] = {}
+    invalid_nodes: Set[DependencyNode] = set()
+    invalid_full_types: Dict[str, Set[str]] = defaultdict(set)
 
     view_rules = settings.get("view_compat_rules") or {}
     dblink_policy = settings.get("view_dblink_policy", "block")
@@ -3361,6 +3391,18 @@ def classify_missing_objects(
             dblink_policy
         )
 
+    for (owner, name, obj_type), status in (oracle_meta.object_statuses or {}).items():
+        obj_type_u = (obj_type or "").upper()
+        if obj_type_u not in INVALID_STATUS_TYPES:
+            continue
+        if normalize_object_status(status) != "INVALID":
+            continue
+        full = f"{(owner or '').upper()}.{(name or '').upper()}"
+        if "." not in full:
+            continue
+        invalid_nodes.add((full, obj_type_u))
+        invalid_full_types[full].add(obj_type_u)
+
     unsupported_nodes: Set[DependencyNode] = set()
     unsupported_table_map: Dict[str, Tuple[str, str, str]] = {}
     for (schema, table), entries in (oracle_meta.blacklist_tables or {}).items():
@@ -3376,9 +3418,13 @@ def classify_missing_objects(
             unsupported_nodes.add((full, "VIEW"))
             unsupported_view_keys.add((schema.upper(), view_name.upper()))
 
+    block_source_nodes = set(unsupported_nodes)
+    if invalid_nodes:
+        block_source_nodes.update(invalid_nodes)
+
     blocked_by_map = build_blocked_dependency_map(
         dependency_graph,
-        unsupported_nodes,
+        block_source_nodes,
         source_objects=source_objects,
         object_parent_map=object_parent_map
     )
@@ -3398,7 +3444,13 @@ def classify_missing_objects(
         action = "FIXUP"
         detail = ""
 
-        if obj_type_u == "TABLE":
+        if (src_full, obj_type_u) in invalid_nodes:
+            support_state = SUPPORT_STATE_BLOCKED
+            reason_code = "SOURCE_INVALID"
+            reason = "源端对象无效"
+            dependency = "-"
+            action = "先修复源端"
+        elif obj_type_u == "TABLE":
             entries = oracle_meta.blacklist_tables.get((src_schema, src_obj))
             if entries:
                 black_type, reason, detail = summarize_blacklist_entries(entries)
@@ -3425,16 +3477,27 @@ def classify_missing_objects(
                     reason = "同义词指向不支持对象"
                     dependency = ref_full
                     action = "先改造依赖对象"
+                elif ref_full in invalid_full_types:
+                    support_state = SUPPORT_STATE_BLOCKED
+                    reason_code = "DEPENDENCY_INVALID"
+                    reason = "同义词指向无效对象"
+                    dependency = ref_full
+                    action = "先修复依赖对象"
 
         if support_state == SUPPORT_STATE_SUPPORTED:
             node = (src_full, obj_type_u)
             blocked_refs = blocked_by_map.get(node)
             if blocked_refs:
                 support_state = SUPPORT_STATE_BLOCKED
-                reason_code = "DEPENDENCY_UNSUPPORTED"
-                reason = "依赖不支持对象"
+                if any(ref in invalid_nodes for ref in blocked_refs):
+                    reason_code = "DEPENDENCY_INVALID"
+                    reason = "依赖源端 INVALID 对象"
+                    action = "先修复依赖对象"
+                else:
+                    reason_code = "DEPENDENCY_UNSUPPORTED"
+                    reason = "依赖不支持对象"
+                    action = "先改造依赖对象"
                 dependency = ",".join(sorted({n[0] for n in blocked_refs}))
-                action = "先改造依赖对象"
 
         row = ObjectSupportReportRow(
             obj_type=obj_type_u,
@@ -6615,6 +6678,11 @@ def dump_oracle_metadata(
                 (obj_type or "").upper() in PACKAGE_OBJECT_TYPES
                 for _, _, obj_type in master_list
             )
+            invalid_status_types = {
+                (obj_type or "").upper()
+                for _, _, obj_type in master_list
+                if (obj_type or "").upper() in INVALID_STATUS_TYPES
+            }
             include_partition_keys = include_constraints or include_interval_partitions
             if owners or need_package_status:
                 # 检测是否支持 HIDDEN_COLUMN 字段（部分低版本/权限受限环境不存在）
@@ -7082,6 +7150,8 @@ def dump_oracle_metadata(
                     status_types.add("TRIGGER")
                 if need_package_status:
                     status_types.update({"PACKAGE", "PACKAGE BODY"})
+                if invalid_status_types:
+                    status_types.update(invalid_status_types)
 
                 if status_types:
                     status_owners = sorted(source_schema_set | set(owners))
@@ -15527,6 +15597,20 @@ def generate_fixup_scripts(
     support_state_map = support_state_map or {}
     unsupported_table_keys = {(s.upper(), t.upper()) for s, t in (unsupported_table_keys or set())}
     view_compat_map = view_compat_map or {}
+    invalid_view_keys: Set[Tuple[str, str]] = set()
+    invalid_trigger_keys: Set[Tuple[str, str]] = set()
+    for (owner, name, obj_type), status in (oracle_meta.object_statuses or {}).items():
+        if normalize_object_status(status) != "INVALID":
+            continue
+        owner_u = (owner or "").upper()
+        name_u = (name or "").upper()
+        obj_type_u = (obj_type or "").upper()
+        if not owner_u or not name_u:
+            continue
+        if obj_type_u == "VIEW":
+            invalid_view_keys.add((owner_u, name_u))
+        elif obj_type_u == "TRIGGER":
+            invalid_trigger_keys.add((owner_u, name_u))
     if trigger_filter_enabled:
         log.info("[FIXUP] 已启用 trigger_list 过滤，清单条目数=%d。", len(trigger_filter_set))
         if not trigger_filter_set:
@@ -16367,6 +16451,16 @@ def generate_fixup_scripts(
                 queue_request(src_schema, 'TRIGGER', trg_name_u)
                 trigger_tasks.append((src_schema, trg_name_u, tgt_schema_final, tgt_obj, src_table, tgt_schema, tgt_table))
 
+    if invalid_trigger_keys:
+        before_count = len(trigger_tasks)
+        trigger_tasks = [
+            task for task in trigger_tasks
+            if (task[0].upper(), task[1].upper()) not in invalid_trigger_keys
+        ]
+        skipped = before_count - len(trigger_tasks)
+        if skipped:
+            log.info("[FIXUP] 跳过源端 INVALID 的 TRIGGER %d 个。", skipped)
+
     other_missing_summary: Dict[str, int] = defaultdict(int)
     for ot, _, _, _, _ in other_missing_supported:
         other_missing_summary[ot] += 1
@@ -16466,8 +16560,108 @@ def generate_fixup_scripts(
         else:
             non_view_missing_unsupported.append((obj_type, src_schema, src_obj, tgt_schema, tgt_obj, support_row))
 
+    if invalid_view_keys:
+        before_supported = len(view_missing_supported)
+        before_unsupported = len(view_missing_unsupported)
+        view_missing_supported = [
+            entry for entry in view_missing_supported
+            if (entry[0].upper(), entry[1].upper()) not in invalid_view_keys
+        ]
+        view_missing_unsupported = [
+            entry for entry in view_missing_unsupported
+            if (entry[0].upper(), entry[1].upper()) not in invalid_view_keys
+        ]
+        skipped = (before_supported - len(view_missing_supported)) + (before_unsupported - len(view_missing_unsupported))
+        if skipped:
+            log.info("[FIXUP] 跳过源端 INVALID 的 VIEW %d 个。", skipped)
+
     view_missing_objects = list(view_missing_supported)
     non_view_missing_objects = list(non_view_missing_supported)
+
+    def _order_package_fixups(
+        items: List[Tuple[str, str, str, str, str]]
+    ) -> List[Tuple[str, str, str, str, str]]:
+        pkg_items = [item for item in items if item[0].upper() in PACKAGE_OBJECT_TYPES]
+        if len(pkg_items) <= 1:
+            return items
+        node_lookup: Dict[Tuple[str, str], Tuple[str, str, str, str, str]] = {}
+        for obj_type, _src_schema, _src_obj, tgt_schema, tgt_obj in pkg_items:
+            node_lookup[(f"{tgt_schema}.{tgt_obj}".upper(), obj_type.upper())] = (
+                obj_type, _src_schema, _src_obj, tgt_schema, tgt_obj
+            )
+        graph: Dict[Tuple[str, str], Set[Tuple[str, str]]] = defaultdict(set)
+        if expected_dependency_pairs:
+            for dep_full, dep_type, ref_full, ref_type in expected_dependency_pairs:
+                dep_key = (dep_full.upper(), dep_type.upper())
+                ref_key = (ref_full.upper(), ref_type.upper())
+                if dep_key in node_lookup and ref_key in node_lookup and dep_key != ref_key:
+                    graph[dep_key].add(ref_key)
+        # 强制 PACKAGE BODY 依赖 PACKAGE
+        for obj_type, _src_schema, _src_obj, tgt_schema, tgt_obj in pkg_items:
+            if obj_type.upper() == "PACKAGE BODY":
+                tgt_full = f"{tgt_schema}.{tgt_obj}".upper()
+                body_key = (tgt_full, "PACKAGE BODY")
+                spec_key = (tgt_full, "PACKAGE")
+                if spec_key in node_lookup and body_key in node_lookup:
+                    graph[body_key].add(spec_key)
+
+        order: List[Tuple[str, str]] = []
+        visiting: Set[Tuple[str, str]] = set()
+        visited: Set[Tuple[str, str]] = set()
+        cycles: List[str] = []
+
+        def _dfs(node: Tuple[str, str], stack: List[str]) -> None:
+            if node in visited:
+                return
+            if node in visiting:
+                cycles.append(" -> ".join(stack + [f"{node[0]} ({node[1]})"]))
+                return
+            visiting.add(node)
+            for dep in graph.get(node, set()):
+                _dfs(dep, stack + [f"{node[0]} ({node[1]})"])
+            visiting.remove(node)
+            visited.add(node)
+            order.append(node)
+
+        for node in sorted(node_lookup.keys()):
+            _dfs(node, [])
+
+        if cycles:
+            log.warning("[FIXUP] 发现 PACKAGE 依赖环，将使用稳定顺序: %s", " | ".join(cycles))
+
+        ordered_pkg_items = [node_lookup[key] for key in order if key in node_lookup]
+        if len(ordered_pkg_items) != len(pkg_items):
+            return items
+
+        pkg_iter = iter(ordered_pkg_items)
+        reordered: List[Tuple[str, str, str, str, str]] = []
+        for entry in items:
+            if entry[0].upper() in PACKAGE_OBJECT_TYPES:
+                try:
+                    reordered.append(next(pkg_iter))
+                except StopIteration:
+                    reordered.append(entry)
+            else:
+                reordered.append(entry)
+        return reordered
+
+    non_view_missing_objects = _order_package_fixups(non_view_missing_objects)
+    if non_view_missing_unsupported:
+        support_lookup = {
+            (t.upper(), s.upper(), o.upper(), ts.upper(), to.upper()): row
+            for t, s, o, ts, to, row in non_view_missing_unsupported
+        }
+        ordered_items = _order_package_fixups(
+            [(t, s, o, ts, to) for (t, s, o, ts, to, _row) in non_view_missing_unsupported]
+        )
+        reordered_with_support: List[Tuple[str, str, str, str, str, ObjectSupportReportRow]] = []
+        for obj_type, src_schema, src_obj, tgt_schema, tgt_obj in ordered_items:
+            key = (obj_type.upper(), src_schema.upper(), src_obj.upper(), tgt_schema.upper(), tgt_obj.upper())
+            support_row = support_lookup.get(key)
+            if support_row:
+                reordered_with_support.append((obj_type, src_schema, src_obj, tgt_schema, tgt_obj, support_row))
+        if reordered_with_support:
+            non_view_missing_unsupported = reordered_with_support
 
     if report_dir and report_timestamp and view_missing_supported:
         view_targets = [f"{tgt_schema}.{tgt_obj}" for _, _, tgt_schema, tgt_obj in view_missing_supported]
@@ -16980,6 +17174,10 @@ def generate_fixup_scripts(
         log.info("[FIXUP] 正在生成 %d 个VIEW脚本...", len(view_missing_objects))
         for src_schema, src_obj, tgt_schema, tgt_obj in view_missing_objects:
             try:
+                if (src_schema.upper(), src_obj.upper()) in invalid_view_keys:
+                    log.info("[FIXUP] 跳过源端 INVALID 的 VIEW %s.%s。", src_schema, src_obj)
+                    mark_source('VIEW', 'invalid')
+                    continue
                 raw_ddl = None
                 ddl_source_label = "MISSING"
                 compat = view_compat_map.get((src_schema.upper(), src_obj.upper()))
@@ -17074,6 +17272,10 @@ def generate_fixup_scripts(
         )
         for src_schema, src_obj, tgt_schema, tgt_obj, support_row in view_missing_unsupported:
             try:
+                if (src_schema.upper(), src_obj.upper()) in invalid_view_keys:
+                    log.info("[FIXUP] 跳过源端 INVALID 的 VIEW %s.%s。", src_schema, src_obj)
+                    mark_source('VIEW', 'invalid')
+                    continue
                 raw_ddl = None
                 ddl_source_label = "MISSING"
                 compat = view_compat_map.get((src_schema.upper(), src_obj.upper()))
@@ -17592,6 +17794,10 @@ def generate_fixup_scripts(
             tt=tgt_table
         ):
             try:
+                if (ss.upper(), tn.upper()) in invalid_trigger_keys:
+                    log.info("[FIXUP] 跳过源端 INVALID 的 TRIGGER %s.%s。", ss, tn)
+                    mark_source('TRIGGER', 'invalid')
+                    return
                 fetch_result = fetch_ddl_with_timing(ss, 'TRIGGER', tn)
                 if len(fetch_result) != 3:
                     log.error("[FIXUP] TRIGGER fetch_ddl_with_timing 返回了 %d 个值，期望 3 个: %s", len(fetch_result), fetch_result)
@@ -20855,7 +21061,8 @@ def main():
         trigger_status_rows = collect_trigger_status_rows(
             oracle_meta,
             ob_meta,
-            full_object_mapping
+            full_object_mapping,
+            unsupported_table_keys=(support_summary.unsupported_table_keys if support_summary else None)
         )
 
     support_summary = classify_missing_objects(

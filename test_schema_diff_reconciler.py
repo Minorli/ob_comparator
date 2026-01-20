@@ -6,7 +6,7 @@ import tempfile
 import json
 import subprocess
 from pathlib import Path
-from typing import Dict, Set
+from typing import Dict, Set, List, Tuple
 
 # schema_diff_reconciler 在 import 时强依赖 oracledb；
 # 单元测试只覆盖纯函数，因此用 dummy 模块兜底，避免环境未安装时退出。
@@ -417,6 +417,280 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertEqual(filtered["trigger_mismatched"], [])
         self.assertEqual(filtered["trigger_ok"], ["TGT.T2"])
+
+    def test_collect_trigger_status_rows_skips_unsupported_tables(self):
+        oracle_meta = self._make_oracle_meta(triggers={
+            ("SRC", "T1"): {
+                "TR1": {"event": "INSERT", "status": "ENABLED", "owner": "SRC"}
+            }
+        })
+        ob_meta = self._make_ob_meta(triggers={
+            ("TGT", "T1"): {
+                "TR1": {"event": "UPDATE", "status": "ENABLED", "owner": "TGT"}
+            }
+        })
+        rows = sdr.collect_trigger_status_rows(
+            oracle_meta,
+            ob_meta,
+            {"SRC.TR1": {"TRIGGER": "TGT.TR1"}},
+            unsupported_table_keys={("SRC", "T1")}
+        )
+        self.assertEqual(rows, [])
+
+    def test_classify_missing_objects_marks_invalid_and_blocks_synonym(self):
+        tv_results = {
+            "missing": [
+                ("VIEW", "TGT.V1", "SRC.V1"),
+                ("SYNONYM", "TGT.S1", "SRC.S1"),
+            ],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": []
+        }
+        oracle_meta = self._make_oracle_meta()
+        oracle_meta = oracle_meta._replace(
+            object_statuses={
+                ("SRC", "V1", "VIEW"): "INVALID"
+            }
+        )
+        ob_meta = self._make_ob_meta()
+        full_mapping = {
+            "SRC.V1": {"VIEW": "TGT.V1"},
+            "SRC.S1": {"SYNONYM": "TGT.S1"},
+        }
+        source_objects = {
+            "SRC.V1": {"VIEW"},
+            "SRC.S1": {"SYNONYM"},
+        }
+        table_target_map = {}
+        synonym_meta = {
+            ("SRC", "S1"): sdr.SynonymMeta("SRC", "S1", "SRC", "V1", None)
+        }
+        settings = {"view_compat_rules": {}, "view_dblink_policy": "block"}
+        ora_cfg = {"user": "u", "password": "p", "dsn": "d"}
+        with mock.patch.object(sdr, "oracle_get_views_ddl_batch", return_value={("SRC", "V1"): "CREATE VIEW V1 AS SELECT 1 FROM DUAL"}):
+            summary = sdr.classify_missing_objects(
+                ora_cfg,
+                settings,
+                tv_results,
+                {
+                    "index_ok": [], "index_mismatched": [],
+                    "constraint_ok": [], "constraint_mismatched": [],
+                    "sequence_ok": [], "sequence_mismatched": [],
+                    "trigger_ok": [], "trigger_mismatched": [],
+                },
+                oracle_meta,
+                ob_meta,
+                full_mapping,
+                source_objects,
+                dependency_graph=None,
+                object_parent_map=None,
+                table_target_map=table_target_map,
+                synonym_meta_map=synonym_meta
+            )
+        view_row = next(row for row in summary.missing_detail_rows if row.src_full == "SRC.V1")
+        self.assertEqual(view_row.support_state, sdr.SUPPORT_STATE_BLOCKED)
+        self.assertEqual(view_row.reason_code, "SOURCE_INVALID")
+        syn_row = next(row for row in summary.missing_detail_rows if row.src_full == "SRC.S1")
+        self.assertEqual(syn_row.support_state, sdr.SUPPORT_STATE_BLOCKED)
+        self.assertEqual(syn_row.reason_code, "DEPENDENCY_INVALID")
+        self.assertEqual(syn_row.dependency, "SRC.V1")
+
+    def test_generate_fixup_skips_invalid_view_and_trigger(self):
+        tv_results = {
+            "missing": [("VIEW", "TGT.V1", "SRC.V1")],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": [],
+            "remap_conflicts": []
+        }
+        extra_results = {
+            "index_ok": [], "index_mismatched": [],
+            "constraint_ok": [], "constraint_mismatched": [],
+            "sequence_ok": [], "sequence_mismatched": [],
+            "trigger_ok": [],
+            "trigger_mismatched": [
+                sdr.TriggerMismatch(
+                    table="TGT.T1",
+                    missing_triggers={"TR1"},
+                    extra_triggers=set(),
+                    detail_mismatch=[],
+                    missing_mappings=None
+                )
+            ],
+        }
+        master_list = [
+            ("SRC.T1", "TGT.T1", "TABLE"),
+            ("SRC.V1", "TGT.V1", "VIEW"),
+        ]
+        oracle_meta = self._make_oracle_meta()
+        oracle_meta = oracle_meta._replace(
+            object_statuses={
+                ("SRC", "V1", "VIEW"): "INVALID",
+                ("SRC", "TR1", "TRIGGER"): "INVALID",
+            }
+        )
+        ob_meta = self._make_ob_meta()._replace(
+            objects_by_type={"VIEW": set(), "TRIGGER": set(), "TABLE": {"TGT.T1"}}
+        )
+        full_mapping = {
+            "SRC.T1": {"TABLE": "TGT.T1"},
+            "SRC.V1": {"VIEW": "TGT.V1"},
+            "SRC.TR1": {"TRIGGER": "TGT.TR1"},
+        }
+        settings = {
+            "fixup_dir": "",
+            "fixup_workers": 1,
+            "progress_log_interval": 999,
+            "fixup_type_set": {"VIEW", "TRIGGER"},
+            "fixup_schema_list": set(),
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings["fixup_dir"] = tmp_dir
+            with mock.patch.object(sdr, "fetch_dbcat_schema_objects", return_value=({}, {})), \
+                 mock.patch.object(sdr, "oracle_get_ddl_batch", return_value={}), \
+                 mock.patch.object(sdr, "get_oceanbase_version", return_value=None):
+                sdr.generate_fixup_scripts(
+                    {"user": "u", "password": "p", "dsn": "d"},
+                    {"executable": "obclient", "host": "h", "port": "1", "user_string": "u", "password": "p"},
+                    settings,
+                    tv_results,
+                    extra_results,
+                    master_list,
+                    oracle_meta,
+                    full_mapping,
+                    {},
+                    grant_plan=None,
+                    enable_grant_generation=False,
+                    dependency_report={"missing": [], "unexpected": [], "skipped": []},
+                    ob_meta=ob_meta,
+                    expected_dependency_pairs=set(),
+                    synonym_metadata={},
+                    trigger_filter_entries=None,
+                    trigger_filter_enabled=False,
+                    package_results=None,
+                    report_dir=None,
+                    report_timestamp=None,
+                    support_state_map={},
+                    unsupported_table_keys=set(),
+                    view_compat_map={}
+                )
+            self.assertFalse((Path(tmp_dir) / "view" / "TGT.V1.sql").exists())
+            self.assertFalse((Path(tmp_dir) / "trigger" / "TGT.TR1.sql").exists())
+
+    def test_generate_fixup_orders_packages_by_dependency(self):
+        tv_results = {
+            "missing": [
+                ("PACKAGE BODY", "TGT.PKG_A", "SRC.PKG_A"),
+                ("PACKAGE", "TGT.PKG_A", "SRC.PKG_A"),
+                ("PACKAGE BODY", "TGT.PKG_B", "SRC.PKG_B"),
+                ("PACKAGE", "TGT.PKG_B", "SRC.PKG_B"),
+            ],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": [],
+            "remap_conflicts": []
+        }
+        extra_results = {
+            "index_ok": [], "index_mismatched": [],
+            "constraint_ok": [], "constraint_mismatched": [],
+            "sequence_ok": [], "sequence_mismatched": [],
+            "trigger_ok": [], "trigger_mismatched": [],
+        }
+        master_list = [
+            ("SRC.PKG_A", "TGT.PKG_A", "PACKAGE"),
+            ("SRC.PKG_A", "TGT.PKG_A", "PACKAGE BODY"),
+            ("SRC.PKG_B", "TGT.PKG_B", "PACKAGE"),
+            ("SRC.PKG_B", "TGT.PKG_B", "PACKAGE BODY"),
+        ]
+        oracle_meta = self._make_oracle_meta()
+        ob_meta = self._make_ob_meta()._replace(
+            objects_by_type={"PACKAGE": set(), "PACKAGE BODY": set()}
+        )
+        full_mapping = {
+            "SRC.PKG_A": {"PACKAGE": "TGT.PKG_A", "PACKAGE BODY": "TGT.PKG_A"},
+            "SRC.PKG_B": {"PACKAGE": "TGT.PKG_B", "PACKAGE BODY": "TGT.PKG_B"},
+        }
+        expected_pairs = {
+            ("TGT.PKG_A", "PACKAGE", "TGT.PKG_B", "PACKAGE")
+        }
+        dbcat_data = {
+            "SRC": {
+                "PACKAGE": {
+                    "PKG_A": "CREATE OR REPLACE PACKAGE SRC.PKG_A AS END;",
+                    "PKG_B": "CREATE OR REPLACE PACKAGE SRC.PKG_B AS END;",
+                },
+                "PACKAGE BODY": {
+                    "PKG_A": "CREATE OR REPLACE PACKAGE BODY SRC.PKG_A AS END;",
+                    "PKG_B": "CREATE OR REPLACE PACKAGE BODY SRC.PKG_B AS END;",
+                }
+            }
+        }
+        dbcat_meta = {
+            ("SRC", "PACKAGE", "PKG_A"): ("cache", 0.01),
+            ("SRC", "PACKAGE", "PKG_B"): ("cache", 0.01),
+            ("SRC", "PACKAGE BODY", "PKG_A"): ("cache", 0.01),
+            ("SRC", "PACKAGE BODY", "PKG_B"): ("cache", 0.01),
+        }
+        settings = {
+            "fixup_dir": "",
+            "fixup_workers": 1,
+            "progress_log_interval": 999,
+            "fixup_type_set": {"PACKAGE", "PACKAGE BODY"},
+            "fixup_schema_list": set(),
+        }
+        recorded: List[Tuple[str, str]] = []
+        def fake_write_fixup_file(_base, subdir, filename, *_args, **_kwargs):
+            if subdir in ("package", "package_body"):
+                recorded.append((subdir, filename))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings["fixup_dir"] = tmp_dir
+            orig_write = sdr.write_fixup_file
+            orig_fetch = sdr.fetch_dbcat_schema_objects
+            orig_ver = sdr.get_oceanbase_version
+            try:
+                sdr.write_fixup_file = fake_write_fixup_file
+                sdr.fetch_dbcat_schema_objects = lambda *_a, **_k: (dbcat_data, dbcat_meta)
+                sdr.get_oceanbase_version = lambda *_a, **_k: None
+                sdr.generate_fixup_scripts(
+                    {"user": "u", "password": "p", "dsn": "d"},
+                    {"executable": "obclient", "host": "h", "port": "1", "user_string": "u", "password": "p"},
+                    settings,
+                    tv_results,
+                    extra_results,
+                    master_list,
+                    oracle_meta,
+                    full_mapping,
+                    {},
+                    grant_plan=None,
+                    enable_grant_generation=False,
+                    dependency_report={"missing": [], "unexpected": [], "skipped": []},
+                    ob_meta=ob_meta,
+                    expected_dependency_pairs=expected_pairs,
+                    synonym_metadata={},
+                    trigger_filter_entries=None,
+                    trigger_filter_enabled=False,
+                    package_results=None,
+                    report_dir=None,
+                    report_timestamp=None,
+                    support_state_map={},
+                    unsupported_table_keys=set(),
+                    view_compat_map={}
+                )
+            finally:
+                sdr.write_fixup_file = orig_write
+                sdr.fetch_dbcat_schema_objects = orig_fetch
+                sdr.get_oceanbase_version = orig_ver
+        order_index = {item: idx for idx, item in enumerate(recorded)}
+        self.assertLess(order_index.get(("package", "TGT.PKG_B.sql")), order_index.get(("package", "TGT.PKG_A.sql")))
+        self.assertLess(order_index.get(("package", "TGT.PKG_A.sql")), order_index.get(("package_body", "TGT.PKG_A.sql")))
+        self.assertLess(order_index.get(("package", "TGT.PKG_B.sql")), order_index.get(("package_body", "TGT.PKG_B.sql")))
 
     def test_supplement_missing_views_from_mapping(self):
         tv_results = {
