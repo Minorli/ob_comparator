@@ -31,9 +31,6 @@ obclient_timeout        = 120
 # run_fixup 执行 SQL 的超时（秒）；0 表示不设超时
 # 建议值：3600（视授权/视图规模调整）
 fixup_cli_timeout       = 3600
-# run_fixup 执行 SQL 的超时（秒）；0 表示不设超时
-# 建议值：3600（视授权/视图规模调整）
-fixup_cli_timeout       = 3600
 
 # 报告与修复脚本输出目录（可为相对路径或绝对路径）
 fixup_dir               = fixup_scripts
