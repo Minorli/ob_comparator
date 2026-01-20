@@ -33,6 +33,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             constraints=constraints or {},
             triggers=triggers or {},
             sequences=sequences or {},
+            sequence_attrs={},
             table_comments={},
             column_comments={},
             comments_complete=True,
@@ -65,6 +66,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             constraints=constraints or {},
             triggers=triggers or {},
             sequences=sequences or {},
+            sequence_attrs={},
             roles=set(),
             table_comments={},
             column_comments={},
@@ -82,6 +84,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             constraints={},
             triggers={},
             sequences={},
+            sequence_attrs={},
             table_comments={},
             column_comments={},
             comments_complete=True,
@@ -107,6 +110,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             constraints={},
             triggers={},
             sequences={},
+            sequence_attrs={},
             roles=set(),
             table_comments={},
             column_comments={},
@@ -239,6 +243,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             constraints={},
             triggers={},
             sequences={},
+            sequence_attrs={},
             roles=set(),
             table_comments={},
             column_comments={},
@@ -253,6 +258,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             constraints={},
             triggers={},
             sequences={},
+            sequence_attrs={},
             table_comments={},
             column_comments={},
             comments_complete=True,
@@ -277,6 +283,62 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertEqual(len(results["skipped"]), 1)
         self.assertEqual(results["missing"], [])
+
+    def test_check_primary_objects_identity_default_on_null_mismatch(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "ID": {
+                    "data_type": "NUMBER",
+                    "data_length": None,
+                    "data_precision": 10,
+                    "data_scale": 0,
+                    "nullable": "N",
+                    "data_default": None,
+                    "char_used": None,
+                    "char_length": None,
+                    "hidden": False,
+                    "virtual": False,
+                    "virtual_expr": None,
+                    "identity": True,
+                    "default_on_null": True,
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "ID": {
+                        "data_type": "NUMBER",
+                        "data_length": None,
+                        "data_precision": 10,
+                        "data_scale": 0,
+                        "nullable": "N",
+                        "data_default": None,
+                        "char_used": None,
+                        "char_length": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                        "identity": False,
+                        "default_on_null": False,
+                    }
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(len(results["mismatched"]), 1)
+        type_mismatches = results["mismatched"][0][5]
+        issues = {issue.issue for issue in type_mismatches}
+        self.assertIn("identity_missing", issues)
+        self.assertIn("default_on_null_missing", issues)
 
     def test_check_primary_objects_number_precision_mismatch(self):
         master_list = [("A.T1", "A.T1", "TABLE")]
@@ -712,6 +774,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             constraints={},
             triggers={},
             sequences={},
+            sequence_attrs={},
             roles=set(),
             table_comments={},
             column_comments={},
@@ -876,6 +939,50 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         mismatch = extra_results["sequence_mismatched"][0]
         self.assertIn("SEQ1", mismatch.missing_sequences)
 
+    def test_check_extra_objects_sequence_attribute_mismatch(self):
+        oracle_meta = self._make_oracle_meta(sequences={"A": {"SEQ1"}})
+        oracle_meta = oracle_meta._replace(sequence_attrs={
+            "A": {
+                "SEQ1": {
+                    "increment_by": 1,
+                    "min_value": 1,
+                    "max_value": 9999,
+                    "cycle_flag": "N",
+                    "order_flag": "N",
+                    "cache_size": 20,
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta(sequences={"X": {"SEQ1"}})
+        ob_meta = ob_meta._replace(sequence_attrs={
+            "X": {
+                "SEQ1": {
+                    "increment_by": 10,
+                    "min_value": 1,
+                    "max_value": 9999,
+                    "cycle_flag": "N",
+                    "order_flag": "N",
+                    "cache_size": 20,
+                }
+            }
+        })
+        settings = {
+            "extra_check_workers": 1,
+            "extra_check_chunk_size": 50,
+            "extra_check_progress_interval": 1,
+        }
+        extra_results = sdr.check_extra_objects(
+            settings,
+            [],
+            ob_meta,
+            oracle_meta,
+            {"A.SEQ1": {"SEQUENCE": "X.SEQ1"}},
+            enabled_extra_types={"SEQUENCE"}
+        )
+        self.assertEqual(len(extra_results["sequence_mismatched"]), 1)
+        mismatch = extra_results["sequence_mismatched"][0]
+        self.assertTrue(any("INCREMENT_BY" in item for item in (mismatch.detail_mismatch or [])))
+
     def test_check_extra_objects_large_table_uses_threadpool(self):
         oracle_meta = self._make_oracle_meta()
         ob_meta = self._make_ob_meta()
@@ -971,6 +1078,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             constraints={},
             triggers={},
             sequences={},
+            sequence_attrs={},
             table_comments={},
             column_comments={},
             comments_complete=True,
@@ -1000,6 +1108,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             constraints={},
             triggers={},
             sequences={},
+            sequence_attrs={},
             roles=set(),
             table_comments={},
             column_comments={},
@@ -1194,6 +1303,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             constraints={},
             triggers={},
             sequences={},
+            sequence_attrs={},
             table_comments={},
             column_comments={},
             comments_complete=True,
@@ -1215,6 +1325,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             constraints={},
             triggers={},
             sequences={},
+            sequence_attrs={},
             roles=set(),
             table_comments={},
             column_comments={},
@@ -1294,7 +1405,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         }
         master_list = [("A.P1", "A.P1", "PACKAGE")]
         oracle_meta = sdr.OracleMetadata(
-            table_columns={}, indexes={}, constraints={}, triggers={}, sequences={},
+            table_columns={}, indexes={}, constraints={}, triggers={}, sequences={}, sequence_attrs={},
             table_comments={}, column_comments={}, comments_complete=True,
             blacklist_tables={}, object_privileges=[], sys_privileges=[],
             role_privileges=[], role_metadata={}, system_privilege_map=set(),
@@ -1302,7 +1413,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         ob_meta = sdr.ObMetadata(
             objects_by_type={"PACKAGE": set(), "PACKAGE BODY": set()},
-            tab_columns={}, indexes={}, constraints={}, triggers={}, sequences={},
+            tab_columns={}, indexes={}, constraints={}, triggers={}, sequences={}, sequence_attrs={},
             roles=set(), table_comments={}, column_comments={}, comments_complete=True,
             object_statuses={}, package_errors={}, package_errors_complete=False, partition_key_columns={}
         )
@@ -1510,6 +1621,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             constraints={},
             triggers={},
             sequences={},
+            sequence_attrs={},
             roles=set(),
             table_comments={},
             column_comments={},
@@ -1563,6 +1675,16 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         deps = sdr.extract_view_dependencies(ddl, default_schema="A")
         self.assertEqual(deps, {"A.T1", "B.T2"})
 
+    def test_extract_view_dependencies_with_subquery(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW A.V AS\n"
+            "SELECT * FROM (SELECT * FROM T1) t\n"
+            "JOIN B.T2 b ON t.ID=b.ID\n"
+        )
+        deps = sdr.extract_view_dependencies(ddl, default_schema="A")
+        self.assertIn("A.T1", deps)
+        self.assertIn("B.T2", deps)
+
     def test_remap_view_dependencies_rewrites_qualified_and_unqualified(self):
         ddl = (
             "CREATE OR REPLACE VIEW A.V AS\n"
@@ -1574,9 +1696,45 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             "A.T1": {"TABLE": "X.T1"},
             "B.T2": {"TABLE": "Y.T2"},
         }
-        rewritten = sdr.remap_view_dependencies(ddl, "A", remap_rules, full_mapping)
+        rewritten = sdr.remap_view_dependencies(ddl, "A", "V", remap_rules, full_mapping)
         self.assertIn("X.T1", rewritten.upper())
         self.assertIn("Y.T2", rewritten.upper())
+
+    def test_remap_view_dependencies_resolves_public_synonym(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW A.V AS\n"
+            "SELECT * FROM SYN1\n"
+        )
+        full_mapping = {"SRC.T1": {"TABLE": "TGT.T1"}}
+        synonym_meta = {
+            ("PUBLIC", "SYN1"): sdr.SynonymMeta("PUBLIC", "SYN1", "SRC", "T1", None)
+        }
+        rewritten = sdr.remap_view_dependencies(
+            ddl,
+            "A",
+            "V",
+            {},
+            full_mapping,
+            synonym_meta=synonym_meta
+        )
+        self.assertIn("TGT.T1", rewritten.upper())
+
+    def test_remap_view_dependencies_fallback_uses_dependency_map(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW A.V AS\n"
+            "SELECT * FROM (SELECT * FROM (SELECT * FROM T1) t1) t2\n"
+        )
+        full_mapping = {"A.T1": {"TABLE": "X.T1"}}
+        view_dep_map = {("A", "V"): {"A.T1"}}
+        rewritten = sdr.remap_view_dependencies(
+            ddl,
+            "A",
+            "V",
+            {},
+            full_mapping,
+            view_dependency_map=view_dep_map
+        )
+        self.assertIn("X.T1", rewritten.upper())
 
     def test_clean_view_ddl_preserves_check_option_on_new_version(self):
         ddl = "CREATE OR REPLACE VIEW A.V AS SELECT 1 FROM DUAL WITH CHECK OPTION"
@@ -1790,6 +1948,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             constraints={},
             triggers={},
             sequences={},
+            sequence_attrs={},
             table_comments={},
             column_comments={},
             comments_complete=True,
@@ -1859,6 +2018,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             constraints={},
             triggers={},
             sequences={},
+            sequence_attrs={},
             table_comments={},
             column_comments={},
             comments_complete=True,
@@ -2012,6 +2172,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             constraints=oracle_constraints,
             triggers={},
             sequences={},
+            sequence_attrs={},
             table_comments={},
             column_comments={},
             comments_complete=True,
@@ -2033,6 +2194,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             constraints=ob_constraints,
             triggers={},
             sequences={},
+            sequence_attrs={},
             roles=set(),
             table_comments={},
             column_comments={},

@@ -428,6 +428,7 @@ class ObMetadata(NamedTuple):
     constraints: Dict[Tuple[str, str], Dict[str, Dict]]  # (OWNER, TABLE_NAME) -> {CONS_NAME: {type, columns[list]}}
     triggers: Dict[Tuple[str, str], Dict[str, Dict]]     # (OWNER, TABLE_NAME) -> {TRG_NAME: {event, status}}
     sequences: Dict[str, Set[str]]                       # SEQUENCE_OWNER -> {SEQUENCE_NAME}
+    sequence_attrs: Dict[str, Dict[str, Dict[str, object]]]  # OWNER -> {SEQUENCE_NAME: attrs}
     roles: Set[str]                                      # DBA_ROLES -> {ROLE}
     table_comments: Dict[Tuple[str, str], Optional[str]] # (OWNER, TABLE_NAME) -> COMMENT
     column_comments: Dict[Tuple[str, str], Dict[str, Optional[str]]]  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: COMMENT}
@@ -447,6 +448,7 @@ class OracleMetadata(NamedTuple):
     constraints: Dict[Tuple[str, str], Dict[str, Dict]]    # (OWNER, TABLE_NAME) -> 约束
     triggers: Dict[Tuple[str, str], Dict[str, Dict]]       # (OWNER, TABLE_NAME) -> 触发器
     sequences: Dict[str, Set[str]]                         # OWNER -> {SEQUENCE_NAME}
+    sequence_attrs: Dict[str, Dict[str, Dict[str, object]]]  # OWNER -> {SEQUENCE_NAME: attrs}
     table_comments: Dict[Tuple[str, str], Optional[str]]   # (OWNER, TABLE_NAME) -> COMMENT
     column_comments: Dict[Tuple[str, str], Dict[str, Optional[str]]]  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: COMMENT}
     comments_complete: bool                                # 注释元数据是否加载完成
@@ -1530,6 +1532,7 @@ class SequenceMismatch(NamedTuple):
     extra_sequences: Set[str]
     note: Optional[str] = None
     missing_mappings: Optional[List[Tuple[str, str]]] = None
+    detail_mismatch: Optional[List[str]] = None
 
 
 class TriggerMismatch(NamedTuple):
@@ -4385,6 +4388,33 @@ def build_dependency_graph(source_dependencies: Optional[SourceDependencySet]) -
     return dict(graph)
 
 
+def build_view_dependency_map(
+    source_dependencies: Optional[SourceDependencySet]
+) -> Dict[Tuple[str, str], Set[str]]:
+    """
+    预计算 VIEW -> 依赖对象集合，用于 VIEW DDL 重写的 fallback。
+    返回 {(VIEW_OWNER, VIEW_NAME): {REF_OWNER.REF_NAME, ...}}
+    """
+    if not source_dependencies:
+        return {}
+    allowed_refs = {"TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM", "FUNCTION", "PACKAGE"}
+    view_map: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+    for dep_owner, dep_name, dep_type, ref_owner, ref_name, ref_type in source_dependencies:
+        if (dep_type or "").upper() != "VIEW":
+            continue
+        ref_type_u = (ref_type or "").upper()
+        if ref_type_u not in allowed_refs:
+            continue
+        owner_u = (dep_owner or "").upper()
+        name_u = (dep_name or "").upper()
+        ref_owner_u = (ref_owner or "").upper()
+        ref_name_u = (ref_name or "").upper()
+        if not owner_u or not name_u or not ref_owner_u or not ref_name_u:
+            continue
+        view_map[(owner_u, name_u)].add(f"{ref_owner_u}.{ref_name_u}")
+    return dict(view_map)
+
+
 def precompute_transitive_table_cache(
     dependency_graph: DependencyGraph,
     *,
@@ -5483,6 +5513,7 @@ def dump_ob_metadata(
             constraints={},
             triggers={},
             sequences={},
+            sequence_attrs={},
             roles=set(),
             table_comments={},
             column_comments={},
@@ -5623,37 +5654,78 @@ def dump_ob_metadata(
                 )
 
     # --- 2. DBA_TAB_COLUMNS ---
-    sql_cols_ext_tpl = """
+    support_identity_col = False
+    support_default_on_null = False
+    if include_tab_columns:
+        def _probe_ob_dict_col(col_name: str) -> bool:
+            sql = (
+                "SELECT COUNT(*) FROM DBA_TAB_COLUMNS "
+                "WHERE OWNER='SYS' AND TABLE_NAME='DBA_TAB_COLUMNS' "
+                f"AND COLUMN_NAME='{col_name}'"
+            )
+            ok, out, err = obclient_run_sql(ob_cfg, sql)
+            if not ok:
+                log.info("OB 字典列探测失败 %s: %s", col_name, err)
+                return False
+            if not out:
+                return False
+            match = re.search(r"\d+", out)
+            return bool(match and int(match.group(0)) > 0)
+
+        support_identity_col = _probe_ob_dict_col("IDENTITY_COLUMN")
+        support_default_on_null = _probe_ob_dict_col("DEFAULT_ON_NULL")
+
+    identity_col = ", IDENTITY_COLUMN" if support_identity_col else ""
+    default_on_null_col = ", DEFAULT_ON_NULL" if support_default_on_null else ""
+    sql_cols_ext_tpl = f"""
         SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
                CHAR_LENGTH, DATA_LENGTH, DATA_PRECISION, DATA_SCALE, CHAR_USED, NULLABLE,
                REPLACE(REPLACE(REPLACE(DATA_DEFAULT, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS DATA_DEFAULT
+               {identity_col}{default_on_null_col}
         FROM DBA_TAB_COLUMNS
-        WHERE OWNER IN ({owners_in})
+        WHERE OWNER IN ({{owners_in}})
     """
-    sql_cols_mid_tpl = """
+    sql_cols_mid_tpl = f"""
         SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
                CHAR_LENGTH, DATA_LENGTH, DATA_PRECISION, DATA_SCALE, NULLABLE, DATA_DEFAULT
+               {identity_col}{default_on_null_col}
         FROM DBA_TAB_COLUMNS
-        WHERE OWNER IN ({owners_in})
+        WHERE OWNER IN ({{owners_in}})
     """
-    sql_cols_basic_tpl = """
+    sql_cols_basic_tpl = f"""
         SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHAR_LENGTH, NULLABLE, DATA_DEFAULT
+               {identity_col}{default_on_null_col}
         FROM DBA_TAB_COLUMNS
-        WHERE OWNER IN ({owners_in})
+        WHERE OWNER IN ({{owners_in}})
     """
 
     tab_columns: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     if include_tab_columns:
+        parse_mode = "ext"
         ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_cols_ext_tpl, owners_in_list)
         if not ok:
+            parse_mode = "mid"
             log.warning("读取 OB DBA_TAB_COLUMNS(含CHAR_USED)失败，将回退中间查询：%s", err)
             ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_cols_mid_tpl, owners_in_list)
         if not ok:
+            parse_mode = "basic"
             log.warning("读取 OB DBA_TAB_COLUMNS(中间查询)失败，将回退基础查询：%s", err)
             ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_cols_basic_tpl, owners_in_list)
         if not ok:
             log.error("无法从 OB 读取 DBA_TAB_COLUMNS，程序退出。")
             sys.exit(1)
+
+        def _normalize_flag(value: str) -> Optional[bool]:
+            if value is None:
+                return None
+            text = str(value).strip().upper()
+            if not text or text == "NULL":
+                return None
+            if text in ("YES", "Y", "TRUE", "1"):
+                return True
+            if text in ("NO", "N", "FALSE", "0"):
+                return False
+            return None
 
         if lines:
             for line in lines:
@@ -5671,22 +5743,35 @@ def dump_ob_metadata(
                 char_used = None
                 nullable = ""
                 default = ""
-                if len(parts) >= 11:
+                idx = 0
+                if parse_mode == "ext":
                     data_length = parts[5].strip()
                     data_precision = parts[6].strip()
                     data_scale = parts[7].strip()
                     char_used = parts[8].strip()
                     nullable = parts[9].strip()
-                    default = parts[10].strip()
-                elif len(parts) >= 10:
+                    default = parts[10].strip() if len(parts) > 10 else ""
+                    idx = 11
+                elif parse_mode == "mid":
                     data_length = parts[5].strip()
                     data_precision = parts[6].strip()
                     data_scale = parts[7].strip()
                     nullable = parts[8].strip()
-                    default = parts[9].strip()
+                    default = parts[9].strip() if len(parts) > 9 else ""
+                    idx = 10
                 else:
                     nullable = parts[5].strip()
-                    default = parts[6].strip()
+                    default = parts[6].strip() if len(parts) > 6 else ""
+                    idx = 7
+
+                identity_flag = None
+                default_on_null_flag = None
+                if support_identity_col and len(parts) > idx:
+                    identity_flag = _normalize_flag(parts[idx])
+                    idx += 1
+                if support_default_on_null and len(parts) > idx:
+                    default_on_null_flag = _normalize_flag(parts[idx])
+
                 key = (owner, table)
                 char_used_clean = char_used.strip().upper() if char_used else ""
                 if char_used_clean in ("", "NULL"):
@@ -5702,7 +5787,9 @@ def dump_ob_metadata(
                     "data_default": default,
                     "hidden": False,
                     "virtual": False,
-                    "virtual_expr": None
+                    "virtual_expr": None,
+                    "identity": identity_flag,
+                    "default_on_null": default_on_null_flag
                 }
 
     # --- 2.b 注释 (DBA_TAB_COMMENTS / DBA_COL_COMMENTS) ---
@@ -6052,6 +6139,8 @@ def dump_ob_metadata(
 
     # --- 8. DBA_SEQUENCES ---
     sequences: Dict[str, Set[str]] = {}
+    sequence_attrs: Dict[str, Dict[str, Dict[str, object]]] = {}
+    sequence_attrs: Dict[str, Dict[str, Dict[str, object]]] = {}
     partition_key_columns: Dict[Tuple[str, str], List[str]] = {}
     if include_sequences:
         sql_tpl = """
@@ -6071,6 +6160,39 @@ def dump_ob_metadata(
                     continue
                 owner, seq_name = parts[0].strip().upper(), parts[1].strip().upper()
                 sequences.setdefault(owner, set()).add(seq_name)
+
+        sql_attr_tpl = """
+            SELECT SEQUENCE_OWNER, SEQUENCE_NAME,
+                   INCREMENT_BY, MIN_VALUE, MAX_VALUE, CYCLE_FLAG, ORDER_FLAG, CACHE_SIZE
+            FROM DBA_SEQUENCES
+            WHERE SEQUENCE_OWNER IN ({owners_in})
+        """
+        ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_attr_tpl, owners_in_list)
+        if not ok:
+            log.warning("读取 OB DBA_SEQUENCES(属性)失败，将跳过序列属性对比: %s", err)
+        elif lines:
+            for line in lines:
+                parts = line.split('\t')
+                if len(parts) < 8:
+                    continue
+                owner = parts[0].strip().upper()
+                name = parts[1].strip().upper()
+                if not owner or not name:
+                    continue
+                def _as_int(val: str) -> Optional[int]:
+                    try:
+                        return int(val)
+                    except (TypeError, ValueError):
+                        return None
+                seq_info = {
+                    "increment_by": _as_int(parts[2].strip()),
+                    "min_value": _as_int(parts[3].strip()),
+                    "max_value": _as_int(parts[4].strip()),
+                    "cycle_flag": (parts[5] or "").strip().upper(),
+                    "order_flag": (parts[6] or "").strip().upper(),
+                    "cache_size": _as_int(parts[7].strip())
+                }
+                sequence_attrs.setdefault(owner, {})[name] = seq_info
 
     # --- 8.5. DBA_PART_KEY_COLUMNS / DBA_SUBPART_KEY_COLUMNS ---
     if include_constraints:
@@ -6148,6 +6270,7 @@ def dump_ob_metadata(
         constraints=constraints,
         triggers=triggers,
         sequences=sequences,
+        sequence_attrs=sequence_attrs,
         roles=roles,
         table_comments=table_comments,
         column_comments=column_comments,
@@ -6618,6 +6741,7 @@ def dump_oracle_metadata(
             constraints={},
             triggers={},
             sequences={},
+            sequence_attrs={},
             table_comments={},
             column_comments={},
             comments_complete=False,
@@ -6688,6 +6812,8 @@ def dump_oracle_metadata(
                 # 检测是否支持 HIDDEN_COLUMN 字段（部分低版本/权限受限环境不存在）
                 support_hidden_col = False
                 support_virtual_col = False
+                support_identity_col = False
+                support_default_on_null = False
                 try:
                     with ora_conn.cursor() as cursor:
                         cursor.execute("""
@@ -6716,27 +6842,84 @@ def dump_oracle_metadata(
                 except oracledb.Error as e:
                     log.info("无法探测 VIRTUAL_COLUMN 支持，默认不读取 virtual 标记：%s", e)
                     support_virtual_col = False
+                try:
+                    with ora_conn.cursor() as cursor:
+                        cursor.execute("""
+                            SELECT COUNT(*)
+                            FROM DBA_TAB_COLUMNS
+                            WHERE OWNER = 'SYS'
+                              AND TABLE_NAME = 'DBA_TAB_COLUMNS'
+                              AND COLUMN_NAME = 'IDENTITY_COLUMN'
+                        """)
+                        count_row = cursor.fetchone()
+                        support_identity_col = bool(count_row and count_row[0] and int(count_row[0]) > 0)
+                except oracledb.Error as e:
+                    log.info("无法探测 IDENTITY_COLUMN 支持，默认不读取 identity 标记：%s", e)
+                    support_identity_col = False
+                try:
+                    with ora_conn.cursor() as cursor:
+                        cursor.execute("""
+                            SELECT COUNT(*)
+                            FROM DBA_TAB_COLUMNS
+                            WHERE OWNER = 'SYS'
+                              AND TABLE_NAME = 'DBA_TAB_COLUMNS'
+                              AND COLUMN_NAME = 'DEFAULT_ON_NULL'
+                        """)
+                        count_row = cursor.fetchone()
+                        support_default_on_null = bool(count_row and count_row[0] and int(count_row[0]) > 0)
+                except oracledb.Error as e:
+                    log.info("无法探测 DEFAULT_ON_NULL 支持，默认不读取 default_on_null 标记：%s", e)
+                    support_default_on_null = False
 
                 # 列定义
-                def _load_ora_tab_columns_sql(include_hidden: bool, include_virtual: bool) -> str:
-                    hidden_col = ", NVL(TO_CHAR(HIDDEN_COLUMN),'NO') AS HIDDEN_COLUMN" if include_hidden else ""
-                    virtual_col = ", NVL(TO_CHAR(VIRTUAL_COLUMN),'NO') AS VIRTUAL_COLUMN" if include_virtual else ""
+                def _load_ora_tab_columns_sql(
+                    include_hidden: bool,
+                    include_virtual: bool,
+                    include_identity: bool,
+                    include_default_on_null: bool
+                ) -> str:
+                    select_cols = [
+                        "OWNER", "TABLE_NAME", "COLUMN_NAME", "DATA_TYPE",
+                        "DATA_LENGTH", "DATA_PRECISION", "DATA_SCALE",
+                        "NULLABLE", "DATA_DEFAULT", "CHAR_USED", "CHAR_LENGTH"
+                    ]
+                    if include_hidden:
+                        select_cols.append("NVL(TO_CHAR(HIDDEN_COLUMN),'NO') AS HIDDEN_COLUMN")
+                    if include_virtual:
+                        select_cols.append("NVL(TO_CHAR(VIRTUAL_COLUMN),'NO') AS VIRTUAL_COLUMN")
+                    if include_identity:
+                        select_cols.append("NVL(TO_CHAR(IDENTITY_COLUMN),'NO') AS IDENTITY_COLUMN")
+                    if include_default_on_null:
+                        select_cols.append("NVL(TO_CHAR(DEFAULT_ON_NULL),'NO') AS DEFAULT_ON_NULL")
                     return f"""
-                        SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
-                               DATA_LENGTH, DATA_PRECISION, DATA_SCALE,
-                               NULLABLE, DATA_DEFAULT, CHAR_USED, CHAR_LENGTH{hidden_col}
-                               {virtual_col}
+                        SELECT {", ".join(select_cols)}
                         FROM DBA_TAB_COLUMNS
                         WHERE OWNER IN ({{owners_clause}})
                     """
 
-                def _parse_tab_column_row(row, include_hidden: bool, include_virtual: bool) -> Dict:
+                def _parse_tab_column_row(
+                    row,
+                    include_hidden: bool,
+                    include_virtual: bool,
+                    include_identity: bool,
+                    include_default_on_null: bool
+                ) -> Dict:
+                    idx = 11
+                    hidden_flag = False
                     virtual_flag = False
-                    pos = 11
-                    if include_hidden:
-                        pos += 1
-                    if include_virtual and len(row) > pos:
-                        virtual_flag = (row[pos] or "").strip().upper() == "YES"
+                    identity_flag = None
+                    default_on_null_flag = None
+                    if include_hidden and len(row) > idx:
+                        hidden_flag = (row[idx] or "").strip().upper() == "YES"
+                        idx += 1
+                    if include_virtual and len(row) > idx:
+                        virtual_flag = (row[idx] or "").strip().upper() == "YES"
+                        idx += 1
+                    if include_identity and len(row) > idx:
+                        identity_flag = (row[idx] or "").strip().upper() == "YES"
+                        idx += 1
+                    if include_default_on_null and len(row) > idx:
+                        default_on_null_flag = (row[idx] or "").strip().upper() == "YES"
                     return {
                         "data_type": row[3],
                         "data_length": row[4],
@@ -6746,15 +6929,19 @@ def dump_oracle_metadata(
                         "data_default": row[8],
                         "char_used": row[9],
                         "char_length": row[10],
-                        "hidden": (row[11] if include_hidden and len(row) > 11 else "NO") == "YES" if include_hidden else False,
+                        "hidden": hidden_flag if include_hidden else False,
                         "virtual": virtual_flag,
-                        "virtual_expr": row[8] if virtual_flag else None
+                        "virtual_expr": row[8] if virtual_flag else None,
+                        "identity": identity_flag,
+                        "default_on_null": default_on_null_flag
                     }
 
                 try:
                     sql_tpl = _load_ora_tab_columns_sql(
                         include_hidden=support_hidden_col,
-                        include_virtual=support_virtual_col
+                        include_virtual=support_virtual_col,
+                        include_identity=support_identity_col,
+                        include_default_on_null=support_default_on_null
                     )
                     with ora_conn.cursor() as cursor:
                         for owner_chunk in owner_chunks:
@@ -6773,14 +6960,23 @@ def dump_oracle_metadata(
                                 table_columns.setdefault(key, {})[col] = _parse_tab_column_row(
                                     row,
                                     support_hidden_col,
-                                    support_virtual_col
+                                    support_virtual_col,
+                                    support_identity_col,
+                                    support_default_on_null
                                 )
                 except oracledb.Error as e:
-                    if support_hidden_col or support_virtual_col:
+                    if support_hidden_col or support_virtual_col or support_identity_col or support_default_on_null:
                         log.info("读取 DBA_TAB_COLUMNS(含 hidden/virtual) 失败，尝试降级：%s", e)
                         support_hidden_col = False
                         support_virtual_col = False
-                        sql_tpl = _load_ora_tab_columns_sql(include_hidden=False, include_virtual=False)
+                        support_identity_col = False
+                        support_default_on_null = False
+                        sql_tpl = _load_ora_tab_columns_sql(
+                            include_hidden=False,
+                            include_virtual=False,
+                            include_identity=False,
+                            include_default_on_null=False
+                        )
                         with ora_conn.cursor() as cursor:
                             for owner_chunk in owner_chunks:
                                 owners_clause = build_bind_placeholders(len(owner_chunk))
@@ -6795,7 +6991,13 @@ def dump_oracle_metadata(
                                     key = (owner, table)
                                     if key not in table_pairs:
                                         continue
-                                    table_columns.setdefault(key, {})[col] = _parse_tab_column_row(row, False, False)
+                                    table_columns.setdefault(key, {})[col] = _parse_tab_column_row(
+                                        row,
+                                        False,
+                                        False,
+                                        False,
+                                        False
+                                    )
                     else:
                         raise
 
@@ -7460,7 +7662,8 @@ def dump_oracle_metadata(
             if seq_owners and include_sequences:
                 with ora_conn.cursor() as cursor:
                     sql_seq_tpl = """
-                        SELECT SEQUENCE_OWNER, SEQUENCE_NAME
+                        SELECT SEQUENCE_OWNER, SEQUENCE_NAME,
+                               INCREMENT_BY, MIN_VALUE, MAX_VALUE, CYCLE_FLAG, ORDER_FLAG, CACHE_SIZE
                         FROM DBA_SEQUENCES
                         WHERE SEQUENCE_OWNER IN ({owners_clause})
                     """
@@ -7474,6 +7677,20 @@ def dump_oracle_metadata(
                             if not owner or not seq_name:
                                 continue
                             sequences.setdefault(owner, set()).add(seq_name)
+                            def _as_int(value) -> Optional[int]:
+                                try:
+                                    return int(value)
+                                except (TypeError, ValueError):
+                                    return None
+                            seq_info = {
+                                "increment_by": _as_int(row[2]),
+                                "min_value": _as_int(row[3]),
+                                "max_value": _as_int(row[4]),
+                                "cycle_flag": _safe_upper(row[5]) or "",
+                                "order_flag": _safe_upper(row[6]) or "",
+                                "cache_size": _as_int(row[7])
+                            }
+                            sequence_attrs.setdefault(owner, {})[seq_name] = seq_info
 
     except oracledb.Error as e:
         log.error(f"严重错误: 批量获取 Oracle 元数据失败: {e}")
@@ -7496,6 +7713,7 @@ def dump_oracle_metadata(
         constraints=constraints,
         triggers=triggers,
         sequences=sequences,
+        sequence_attrs=sequence_attrs,
         table_comments=table_comments,
         column_comments=column_comments,
         comments_complete=comments_complete,
@@ -9218,6 +9436,39 @@ def check_primary_objects(
                         )
                         continue
 
+                def _is_true_flag(value: Optional[object]) -> bool:
+                    if value is True:
+                        return True
+                    if value is False or value is None:
+                        return False
+                    return str(value).strip().upper() in ("YES", "Y", "TRUE", "1")
+
+                src_identity = _is_true_flag(src_info.get("identity"))
+                tgt_identity = _is_true_flag(tgt_info.get("identity"))
+                if src_identity and not tgt_identity:
+                    type_mismatches.append(
+                        ColumnTypeIssue(
+                            col_name,
+                            format_oracle_column_type(src_info, prefer_ob_varchar=True),
+                            format_oracle_column_type(tgt_info, prefer_ob_varchar=True),
+                            "IDENTITY",
+                            "identity_missing"
+                        )
+                    )
+
+                src_default_on_null = _is_true_flag(src_info.get("default_on_null"))
+                tgt_default_on_null = _is_true_flag(tgt_info.get("default_on_null"))
+                if src_default_on_null and not tgt_default_on_null:
+                    type_mismatches.append(
+                        ColumnTypeIssue(
+                            col_name,
+                            format_oracle_column_type(src_info, prefer_ob_varchar=True),
+                            format_oracle_column_type(tgt_info, prefer_ob_varchar=True),
+                            "DEFAULT ON NULL",
+                            "default_on_null_missing"
+                        )
+                    )
+
                 if is_long_type(src_dtype):
                     expected_type = map_long_type_to_ob(src_dtype)
                     if (tgt_dtype or "UNKNOWN") != expected_type:
@@ -10527,6 +10778,42 @@ def compare_sequences_for_schema(
     src_schema: str,
     tgt_schema: str
 ) -> Tuple[bool, Optional[SequenceMismatch]]:
+    def _norm_flag(value: Optional[object]) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip().upper()
+        if not text:
+            return None
+        if text in ("YES", "Y", "TRUE", "1"):
+            return "Y"
+        if text in ("NO", "N", "FALSE", "0"):
+            return "N"
+        return text
+
+    def _compare_attrs(src_attrs: Optional[Dict[str, object]], tgt_attrs: Optional[Dict[str, object]]) -> List[str]:
+        if not src_attrs or not tgt_attrs:
+            return []
+        diffs: List[str] = []
+        pairs = [
+            ("increment_by", "INCREMENT_BY", False),
+            ("min_value", "MIN_VALUE", False),
+            ("max_value", "MAX_VALUE", False),
+            ("cycle_flag", "CYCLE_FLAG", True),
+            ("order_flag", "ORDER_FLAG", True),
+            ("cache_size", "CACHE_SIZE", False),
+        ]
+        for key, label, is_flag in pairs:
+            s_val = src_attrs.get(key)
+            t_val = tgt_attrs.get(key)
+            if is_flag:
+                s_val = _norm_flag(s_val)
+                t_val = _norm_flag(t_val)
+            if s_val is None or t_val is None:
+                continue
+            if str(s_val) != str(t_val):
+                diffs.append(f"{label}: {s_val}->{t_val}")
+        return diffs
+
     src_seqs = oracle_meta.sequences.get(src_schema.upper())
     if src_seqs is None:
         log.warning(f"[序列检查] 未找到 {src_schema} 的 Oracle 序列元数据。")
@@ -10585,7 +10872,8 @@ def compare_sequences_for_schema(
                 missing_sequences=set(),
                 extra_sequences=tgt_seqs_snapshot,
                 note=note,
-                missing_mappings=[]
+                missing_mappings=[],
+                detail_mismatch=[]
             )
         else:
             # 双方都没有序列，认为一致
@@ -10596,7 +10884,16 @@ def compare_sequences_for_schema(
 
     missing = src_seqs - tgt_seqs
     extra = tgt_seqs - src_seqs
-    all_good = (not missing) and (not extra)
+    detail_mismatch: List[str] = []
+    common = src_seqs & tgt_seqs
+    if common:
+        src_attrs_map = oracle_meta.sequence_attrs.get(src_schema.upper(), {})
+        tgt_attrs_map = ob_meta.sequence_attrs.get(tgt_schema.upper(), {})
+        for seq_name in sorted(common):
+            diffs = _compare_attrs(src_attrs_map.get(seq_name), tgt_attrs_map.get(seq_name))
+            if diffs:
+                detail_mismatch.append(f"{seq_name}: " + "; ".join(diffs))
+    all_good = (not missing) and (not extra) and (not detail_mismatch)
     if all_good:
         return True, None
     else:
@@ -10609,7 +10906,8 @@ def compare_sequences_for_schema(
             missing_mappings=[
                 (f"{src_schema.upper()}.{seq}", f"{tgt_schema.upper()}.{seq}")
                 for seq in sorted(missing)
-            ]
+            ],
+            detail_mismatch=detail_mismatch
         )
 
 
@@ -11152,9 +11450,55 @@ def check_extra_objects(
                 if tgt_name not in actual_tgt_names
             }
             extra_tgt = actual_tgt_names - all_expected_for_tgt
+            detail_mismatch: List[str] = []
+
+            src_attrs_map = oracle_meta.sequence_attrs.get(src_schema_u, {})
+            tgt_attrs_map = ob_meta.sequence_attrs.get(tgt_schema_u, {})
+            def _norm_flag(value: Optional[object]) -> Optional[str]:
+                if value is None:
+                    return None
+                text = str(value).strip().upper()
+                if not text:
+                    return None
+                if text in ("YES", "Y", "TRUE", "1"):
+                    return "Y"
+                if text in ("NO", "N", "FALSE", "0"):
+                    return "N"
+                return text
+
+            def _compare_attrs(src_attrs: Optional[Dict[str, object]], tgt_attrs: Optional[Dict[str, object]]) -> List[str]:
+                if not src_attrs or not tgt_attrs:
+                    return []
+                diffs: List[str] = []
+                pairs = [
+                    ("increment_by", "INCREMENT_BY", False),
+                    ("min_value", "MIN_VALUE", False),
+                    ("max_value", "MAX_VALUE", False),
+                    ("cycle_flag", "CYCLE_FLAG", True),
+                    ("order_flag", "ORDER_FLAG", True),
+                    ("cache_size", "CACHE_SIZE", False),
+                ]
+                for key, label, is_flag in pairs:
+                    s_val = src_attrs.get(key)
+                    t_val = tgt_attrs.get(key)
+                    if is_flag:
+                        s_val = _norm_flag(s_val)
+                        t_val = _norm_flag(t_val)
+                    if s_val is None or t_val is None:
+                        continue
+                    if str(s_val) != str(t_val):
+                        diffs.append(f"{label}: {s_val}->{t_val}")
+                return diffs
+
+            for src_name, tgt_name in entries:
+                if tgt_name not in actual_tgt_names:
+                    continue
+                diffs = _compare_attrs(src_attrs_map.get(src_name), tgt_attrs_map.get(tgt_name))
+                if diffs:
+                    detail_mismatch.append(f"{src_schema_u}.{src_name}->{tgt_schema_u}.{tgt_name}: " + "; ".join(diffs))
 
             mapping_label = f"{src_schema_u}->{tgt_schema_u}"
-            if not missing_src and not extra_tgt:
+            if not missing_src and not extra_tgt and not detail_mismatch:
                 extra_results["sequence_ok"].append(mapping_label)
             else:
                 missing_map = [
@@ -11168,7 +11512,8 @@ def check_extra_objects(
                     missing_sequences=missing_src,
                     extra_sequences=extra_tgt,
                     note=None,
-                    missing_mappings=missing_map
+                    missing_mappings=missing_map,
+                    detail_mismatch=detail_mismatch
                 ))
 
     return extra_results
@@ -12759,7 +13104,11 @@ def analyze_view_compatibility(
     )
 
 
-def extract_view_dependencies(ddl: str, default_schema: Optional[str] = None) -> Set[str]:
+def extract_view_dependencies(
+    ddl: str,
+    default_schema: Optional[str] = None,
+    max_depth: int = 1
+) -> Set[str]:
     """
     从 VIEW DDL 中提取依赖的对象名（表/视图/同义词等）。
     改进版：
@@ -12812,12 +13161,26 @@ def extract_view_dependencies(ddl: str, default_schema: Optional[str] = None) ->
         for part in parts:
             part = part.strip()
             # 简单过滤：忽略括号开头的子查询
-            if not part or part.startswith('('):
+            if not part:
+                continue
+            if part.startswith('('):
+                if max_depth <= 0:
+                    continue
+                inner = part
+                if ')' in inner:
+                    inner = inner[1:inner.rfind(')')]
+                else:
+                    inner = inner[1:]
+                if re.search(r'\bSELECT\b', inner, re.IGNORECASE):
+                    dependencies.update(
+                        extract_view_dependencies(inner, default_schema=default_schema, max_depth=max_depth - 1)
+                    )
                 continue
                 
             # 取第一个 token (忽略别名)
             first_token = part.split()[0]
             candidate = first_token.replace('"', '').upper()
+            candidate = re.sub(r'[^A-Z0-9_\$#\.]+$', '', candidate)
             
             if '@' in candidate:
                 candidate = candidate.split('@')[0]
@@ -12845,38 +13208,75 @@ def extract_view_dependencies(ddl: str, default_schema: Optional[str] = None) ->
 def remap_view_dependencies(
     ddl: str, 
     view_schema: str,
+    view_name: str,
     remap_rules: RemapRules,
-    full_object_mapping: FullObjectMapping
+    full_object_mapping: FullObjectMapping,
+    synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]] = None,
+    view_dependency_map: Optional[Dict[Tuple[str, str], Set[str]]] = None
 ) -> str:
     """
     根据remap规则重写VIEW DDL中的依赖对象引用
-    改进：使用 SqlMasker 确保只替换 SQL 代码，不替换注释/字符串
+    改进：
+    - 使用 SqlMasker 确保只替换 SQL 代码，不替换注释/字符串
+    - 支持 PUBLIC 同义词解析到基表后再 remap
+    - 当 SQL 提取不足时可使用依赖元数据 fallback
     """
     if not ddl:
         return ddl
     
     # 提取依赖对象（无 schema 的引用按 view_schema 兜底）
     dependencies = extract_view_dependencies(ddl, default_schema=view_schema)
+    if view_dependency_map:
+        dep_key = ((view_schema or "").upper(), (view_name or "").upper())
+        fallback_deps = view_dependency_map.get(dep_key)
+        if fallback_deps:
+            dependencies |= {d.upper() for d in fallback_deps}
 
     # 构建替换映射（既替换全名，也替换同 schema 下无前缀引用）
     replacements: Dict[str, str] = {}
     view_schema_u = (view_schema or "").upper()
-    for dep in dependencies:
-        tgt_name = find_mapped_target_any_type(
+    synonym_meta = synonym_meta or {}
+    preferred_types = ("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM", "FUNCTION")
+
+    def _resolve_public_synonym(dep_obj: str) -> Optional[str]:
+        meta = synonym_meta.get(("PUBLIC", dep_obj))
+        if not meta or meta.db_link:
+            return None
+        base_full = f"{meta.table_owner}.{meta.table_name}"
+        mapped = find_mapped_target_any_type(
             full_object_mapping,
-            dep,
-            preferred_types=("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM", "FUNCTION")
-        ) or remap_rules.get(dep)
-        if not tgt_name:
-            continue
+            base_full,
+            preferred_types=preferred_types
+        ) or remap_rules.get(base_full)
+        return (mapped or base_full).upper()
+
+    for dep in dependencies:
         dep_u = dep.upper()
-        tgt_u = tgt_name.upper()
-        replacements[dep_u] = tgt_u
+        if not dep_u:
+            continue
+        dep_schema = view_schema_u
+        dep_obj = dep_u
         if '.' in dep_u:
             dep_schema, dep_obj = dep_u.split('.', 1)
-            if dep_schema == view_schema_u:
-                # 无前缀引用也替换为全名(或目标名)，避免跨 schema 迁移后失效
-                replacements.setdefault(dep_obj, tgt_u)
+
+        mapped_target: Optional[str] = None
+        if dep_schema == "PUBLIC":
+            mapped_target = _resolve_public_synonym(dep_obj)
+        else:
+            mapped_target = find_mapped_target_any_type(
+                full_object_mapping,
+                dep_u,
+                preferred_types=preferred_types
+            ) or remap_rules.get(dep_u)
+            if not mapped_target and dep_schema == view_schema_u:
+                mapped_target = _resolve_public_synonym(dep_obj)
+        if not mapped_target:
+            continue
+        tgt_u = mapped_target.upper()
+        replacements[dep_u] = tgt_u
+        if dep_schema == view_schema_u:
+            # 无前缀引用也替换为全名(或目标名)，避免跨 schema 迁移后失效
+            replacements.setdefault(dep_obj, tgt_u)
 
     if not replacements:
         return ddl
@@ -15405,6 +15805,10 @@ def generate_alter_for_table_columns(
                 lines.append(
                     f"-- WARNING: {col_name.upper()} 为虚拟列差异 ({issue_type})，请人工处理。"
                 )
+            elif issue_type in ("identity_missing", "default_on_null_missing"):
+                lines.append(
+                    f"-- WARNING: {col_name.upper()} 缺失 {expected_type} 特性，请人工处理。"
+                )
             else:
                 lines.append(
                     f"-- WARNING: {col_name.upper()} 类型差异未自动修复 (源={src_type}, 目标={tgt_type})。"
@@ -15570,7 +15974,8 @@ def generate_fixup_scripts(
     fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None,
     support_state_map: Optional[Dict[Tuple[str, str], ObjectSupportReportRow]] = None,
     unsupported_table_keys: Optional[Set[Tuple[str, str]]] = None,
-    view_compat_map: Optional[Dict[Tuple[str, str], ViewCompatResult]] = None
+    view_compat_map: Optional[Dict[Tuple[str, str], ViewCompatResult]] = None,
+    view_dependency_map: Optional[Dict[Tuple[str, str], Set[str]]] = None
 ):
     """
     基于校验结果生成 fixup_scripts DDL 脚本，并按依赖顺序排列：
@@ -15593,6 +15998,7 @@ def generate_fixup_scripts(
         progress_log_interval = 10.0
     progress_log_interval = max(1.0, progress_log_interval)
     synonym_meta_map = synonym_metadata or {}
+    view_dependency_map = view_dependency_map or {}
     trigger_filter_set = {t.upper() for t in (trigger_filter_entries or set())}
     support_state_map = support_state_map or {}
     unsupported_table_keys = {(s.upper(), t.upper()) for s, t in (unsupported_table_keys or set())}
@@ -17122,6 +17528,11 @@ def generate_fixup_scripts(
                     # Extract dependencies
                     try:
                         dependencies = extract_view_dependencies(ddl, src_schema)
+                        if view_dependency_map:
+                            dep_key = (src_schema.upper(), src_obj.upper())
+                            fallback_deps = view_dependency_map.get(dep_key)
+                            if fallback_deps:
+                                dependencies |= {d.upper() for d in fallback_deps}
                         for dep in dependencies:
                             dep_upper = dep.upper()
                             # Check if this dependency is another VIEW in our list
@@ -17214,8 +17625,11 @@ def generate_fixup_scripts(
                 remapped_ddl = remap_view_dependencies(
                     cleaned_ddl,
                     src_schema,
+                    src_obj,
                     remap_rules,
-                    full_object_mapping
+                    full_object_mapping,
+                    synonym_meta=synonym_meta_map,
+                    view_dependency_map=view_dependency_map
                 )
                 
                 # 调整schema和对象名
@@ -17307,8 +17721,11 @@ def generate_fixup_scripts(
                 remapped_ddl = remap_view_dependencies(
                     cleaned_ddl,
                     src_schema,
+                    src_obj,
                     remap_rules,
-                    full_object_mapping
+                    full_object_mapping,
+                    synonym_meta=synonym_meta_map,
+                    view_dependency_map=view_dependency_map
                 )
                 final_ddl = adjust_ddl_for_object(
                     remapped_ddl,
@@ -18522,7 +18939,12 @@ def export_extra_mismatch_detail(
     for item in extra_results.get("sequence_mismatched", []):
         missing = ",".join(sorted(item.missing_sequences)) if item.missing_sequences else "-"
         extra = ",".join(sorted(item.extra_sequences)) if item.extra_sequences else "-"
-        note = item.note or "-"
+        detail_parts: List[str] = []
+        if item.note:
+            detail_parts.append(item.note)
+        if item.detail_mismatch:
+            detail_parts.extend(item.detail_mismatch)
+        note = ";".join(detail_parts) if detail_parts else "-"
         rows.append([
             "SEQUENCE",
             f"{item.src_schema}->{item.tgt_schema}",
@@ -20240,6 +20662,10 @@ def print_final_report(
                 if item.extra_sequences else Text("")
             )
             + (Text(f"* {item.note}\n", style="missing") if item.note else Text(""))
+            + (
+                Text("".join([f"* {d}\n" for d in item.detail_mismatch]), style="mismatch")
+                if item.detail_mismatch else Text("")
+            )
         )
     )
     print_ext_mismatch_table(
@@ -20706,6 +21132,9 @@ def main():
                     for dep in oracle_dependencies_internal
                 }
         dependency_graph: DependencyGraph = build_dependency_graph(source_dependencies_set) if source_dependencies_set else {}
+        view_dependency_map: Dict[Tuple[str, str], Set[str]] = build_view_dependency_map(
+            source_dependencies_set
+        ) if source_dependencies_set else {}
         # 4.2.b) 预计算递归依赖表集合（性能优化：避免每对象 DFS）
         transitive_table_cache: Optional[TransitiveTableCache] = None
         if settings.get("enable_schema_mapping_infer") and dependency_graph:
@@ -21244,12 +21673,12 @@ def main():
                 log.info("[GRANT] generate_grants=false，授权脚本生成已关闭。")
                 grant_plan = None
 
-            view_chain_file = generate_fixup_scripts(
-                ora_cfg,
-                ob_cfg,
-                settings,
-                tv_results,
-                extra_results,
+                view_chain_file = generate_fixup_scripts(
+                    ora_cfg,
+                    ob_cfg,
+                    settings,
+                    tv_results,
+                    extra_results,
                 master_list,
                 oracle_meta,
                 full_object_mapping,
@@ -21265,11 +21694,12 @@ def main():
                 package_results=package_results,
                 report_dir=report_dir,
                 report_timestamp=timestamp,
-                fixup_skip_summary=fixup_skip_summary,
-                support_state_map=support_summary.support_state_map,
-                unsupported_table_keys=support_summary.unsupported_table_keys,
-                view_compat_map=support_summary.view_compat_map
-            )
+                    fixup_skip_summary=fixup_skip_summary,
+                    support_state_map=support_summary.support_state_map,
+                    unsupported_table_keys=support_summary.unsupported_table_keys,
+                    view_compat_map=support_summary.view_compat_map,
+                    view_dependency_map=view_dependency_map
+                )
     else:
         log.info('已根据配置跳过修补脚本生成，仅打印对比报告。')
         if enable_grant_generation:
