@@ -75,6 +75,48 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             partition_key_columns={}
         )
 
+    def _make_oracle_meta_with_columns(self, table_columns: Dict) -> sdr.OracleMetadata:
+        return sdr.OracleMetadata(
+            table_columns=table_columns,
+            indexes={},
+            constraints={},
+            triggers={},
+            sequences={},
+            table_comments={},
+            column_comments={},
+            comments_complete=True,
+            blacklist_tables={},
+            object_privileges=[],
+            sys_privileges=[],
+            role_privileges=[],
+            role_metadata={},
+            system_privilege_map=set(),
+            table_privilege_map=set(),
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False,
+            partition_key_columns={},
+            interval_partitions={}
+        )
+
+    def _make_ob_meta_with_columns(self, objects_by_type: Dict, tab_columns: Dict) -> sdr.ObMetadata:
+        return sdr.ObMetadata(
+            objects_by_type=objects_by_type,
+            tab_columns=tab_columns,
+            indexes={},
+            constraints={},
+            triggers={},
+            sequences={},
+            roles=set(),
+            table_comments={},
+            column_comments={},
+            comments_complete=True,
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False,
+            partition_key_columns={}
+        )
+
     def test_infer_dominant_schema_tables_only(self):
         remap_rules = {
             "A.T1": "X.T1",
@@ -235,6 +277,114 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertEqual(len(results["skipped"]), 1)
         self.assertEqual(results["missing"], [])
+
+    def test_check_primary_objects_number_precision_mismatch(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "C1": {
+                    "data_type": "NUMBER",
+                    "data_precision": 10,
+                    "data_scale": 2,
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "NUMBER",
+                        "data_precision": 8,
+                        "data_scale": 2,
+                    }
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(len(results["mismatched"]), 1)
+        type_mismatches = results["mismatched"][0][5]
+        self.assertEqual(len(type_mismatches), 1)
+        self.assertEqual(type_mismatches[0].issue, "number_precision")
+        self.assertEqual(type_mismatches[0].expected_type, "NUMBER(10,2)")
+
+    def test_check_primary_objects_char_semantics_mismatch(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "C1": {
+                    "data_type": "VARCHAR2",
+                    "char_length": 10,
+                    "data_length": 10,
+                    "char_used": "C",
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "VARCHAR2",
+                        "char_length": 10,
+                        "data_length": 10,
+                        "char_used": "B",
+                    }
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(len(results["mismatched"]), 1)
+        length_mismatches = results["mismatched"][0][4]
+        self.assertEqual(len(length_mismatches), 1)
+        self.assertEqual(length_mismatches[0].issue, "char_mismatch")
+        self.assertEqual(length_mismatches[0].limit_length, 10)
+
+    def test_check_primary_objects_virtual_column_mismatch(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "C1": {
+                    "data_type": "NUMBER",
+                    "virtual": True,
+                    "virtual_expr": "COL0 + 1",
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "NUMBER",
+                        "virtual": False,
+                    }
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(len(results["mismatched"]), 1)
+        type_mismatches = results["mismatched"][0][5]
+        self.assertEqual(len(type_mismatches), 1)
+        self.assertEqual(type_mismatches[0].issue, "virtual_missing")
 
     def test_supplement_missing_views_from_mapping(self):
         tv_results = {
@@ -1596,6 +1746,114 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             "X",
             "T1",
             full_mapping,
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(mismatch)
+
+    def test_compare_constraints_for_table_check_expr_match(self):
+        oracle_constraints = {
+            ("A", "T1"): {
+                "CK_SRC": {
+                    "type": "C",
+                    "columns": ["C1"],
+                    "search_condition": "C1>0",
+                },
+                "SYS_123": {
+                    "type": "C",
+                    "columns": ["C1"],
+                    "search_condition": "C1 IS NOT NULL",
+                },
+            }
+        }
+        ob_constraints = {
+            ("A", "T1"): {
+                "CK_TGT": {
+                    "type": "C",
+                    "columns": ["C1"],
+                    "search_condition": "C1>0",
+                }
+            }
+        }
+        oracle_meta = self._make_oracle_meta(constraints=oracle_constraints)
+        ob_meta = self._make_ob_meta(constraints=ob_constraints)
+        ok, mismatch = sdr.compare_constraints_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+            {}
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(mismatch)
+
+    def test_compare_constraints_for_table_fk_delete_rule_mismatch(self):
+        oracle_constraints = {
+            ("A", "T1"): {
+                "FK_SRC": {
+                    "type": "R",
+                    "columns": ["C1"],
+                    "ref_table_owner": "A",
+                    "ref_table_name": "P1",
+                    "delete_rule": "CASCADE",
+                }
+            }
+        }
+        ob_constraints = {
+            ("A", "T1"): {
+                "FK_TGT": {
+                    "type": "R",
+                    "columns": ["C1"],
+                    "ref_table_owner": "A",
+                    "ref_table_name": "P1",
+                    "delete_rule": "NO ACTION",
+                }
+            }
+        }
+        oracle_meta = self._make_oracle_meta(constraints=oracle_constraints)
+        ob_meta = self._make_ob_meta(constraints=ob_constraints)
+        ok, mismatch = sdr.compare_constraints_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+            {}
+        )
+        self.assertFalse(ok)
+        self.assertIsNotNone(mismatch)
+        self.assertTrue(any("DELETE_RULE" in item for item in mismatch.detail_mismatch))
+
+    def test_compare_indexes_expression_sys_nc_match(self):
+        oracle_indexes = {
+            ("A", "T1"): {
+                "IDX1": {
+                    "columns": ["SYS_NC00004$"],
+                    "expressions": {1: "UPPER(NAME)"},
+                    "uniqueness": "NONUNIQUE",
+                }
+            }
+        }
+        ob_indexes = {
+            ("A", "T1"): {
+                "IDX1": {
+                    "columns": ["SYS_NC00004$"],
+                    "expressions": {},
+                    "uniqueness": "NONUNIQUE",
+                }
+            }
+        }
+        oracle_meta = self._make_oracle_meta(indexes=oracle_indexes)
+        ob_meta = self._make_ob_meta(indexes=ob_indexes)
+        ok, mismatch = sdr.compare_indexes_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
         )
         self.assertTrue(ok)
         self.assertIsNone(mismatch)

@@ -574,6 +574,7 @@ class ColumnTypeIssue(NamedTuple):
     src_type: str
     tgt_type: str
     expected_type: str
+    issue: str
 
 
 class PackageErrorInfo(NamedTuple):
@@ -894,6 +895,108 @@ def is_ob_notnull_constraint(name: Optional[str]) -> bool:
     这些约束用于保证 PK 列非空，Oracle 侧不会显式出现，报告统计应忽略以避免误判“多余约束”。
     """
     return "OBNOTNULL" in (name or "").upper()
+
+
+def strip_wrapping_parentheses(text: str) -> str:
+    if not text or not text.startswith("(") or not text.endswith(")"):
+        return text
+    depth = 0
+    for idx, ch in enumerate(text):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0 and idx != len(text) - 1:
+                return text
+    if depth != 0:
+        return text
+    return text[1:-1].strip()
+
+
+def normalize_sql_expression(expr: Optional[str]) -> str:
+    if expr is None:
+        return ""
+    text = str(expr).strip()
+    if not text:
+        return ""
+    text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    if text.endswith(";"):
+        text = text[:-1].strip()
+    text = re.sub(r'"([A-Za-z0-9_#$]+)"', r'\1', text)
+    while True:
+        stripped = strip_wrapping_parentheses(text)
+        if stripped == text:
+            break
+        text = stripped
+    return text
+
+
+def is_system_notnull_check(cons_name: Optional[str], search_condition: Optional[str]) -> bool:
+    if not cons_name or not search_condition:
+        return False
+    name_u = cons_name.upper()
+    if not name_u.startswith("SYS_"):
+        return False
+    cond = normalize_sql_expression(search_condition)
+    if not cond:
+        return False
+    cond_u = cond.upper()
+    return bool(re.match(r"^[A-Z0-9_#$]+\s+IS\s+NOT\s+NULL$", cond_u))
+
+
+def normalize_delete_rule(value: Optional[str]) -> str:
+    rule = (value or "").strip().upper()
+    if not rule or rule == "NO ACTION":
+        return ""
+    return rule
+
+
+def is_index_expression_token(token: Optional[str]) -> bool:
+    if not token:
+        return False
+    return bool(re.search(r"[()\s'\"+\-*/]|\\bCASE\\b", token, flags=re.IGNORECASE))
+
+
+def normalize_number_meta(prec: Optional[object], scale: Optional[object]) -> Tuple[Optional[int], Optional[int]]:
+    prec_int: Optional[int]
+    scale_int: Optional[int]
+    try:
+        prec_int = int(prec) if prec is not None else None
+    except (TypeError, ValueError):
+        prec_int = None
+    try:
+        scale_int = int(scale) if scale is not None else None
+    except (TypeError, ValueError):
+        scale_int = None
+    if prec_int is not None and scale_int is None:
+        scale_int = 0
+    return prec_int, scale_int
+
+
+def format_number_type_literal(data_type: str, precision: Optional[int], scale: Optional[int]) -> str:
+    dt = (data_type or "").strip().upper() or "NUMBER"
+    if precision is None:
+        return dt
+    if scale is None:
+        return f"{dt}({int(precision)})"
+    return f"{dt}({int(precision)},{int(scale)})"
+
+
+def build_number_fixup_type(src_info: Dict, tgt_info: Dict) -> str:
+    src_prec, src_scale = normalize_number_meta(
+        src_info.get("data_precision"), src_info.get("data_scale")
+    )
+    tgt_prec, _tgt_scale = normalize_number_meta(
+        tgt_info.get("data_precision"), tgt_info.get("data_scale")
+    )
+    if src_prec is None:
+        return format_number_type_literal(src_info.get("data_type") or "NUMBER", None, None)
+    expected_prec = src_prec
+    if tgt_prec is not None and tgt_prec > expected_prec:
+        expected_prec = tgt_prec
+    expected_scale = src_scale if src_scale is not None else 0
+    return format_number_type_literal(src_info.get("data_type") or "NUMBER", expected_prec, expected_scale)
 
 OBJECT_COUNT_TYPES: Tuple[str, ...] = (
     'TABLE',
@@ -1460,7 +1563,8 @@ TableEntry = Tuple[str, str, str, str]  # (SRC_SCHEMA, SRC_TABLE, TGT_SCHEMA, TG
 class ConstraintSignature(NamedTuple):
     pk: Set[Tuple[str, ...]]
     uk: Set[Tuple[str, ...]]
-    fk: Set[Tuple[Tuple[str, ...], Optional[str]]]
+    fk: Set[Tuple[Tuple[str, ...], Optional[str], str]]
+    ck: Set[str]
 
 
 class IndexCompareCache(NamedTuple):
@@ -1515,6 +1619,27 @@ def normalize_column_sequence(columns: Optional[List[str]]) -> Tuple[str, ...]:
             continue
         seen.add(col_u)
         normalized.append(col_u)
+    return tuple(normalized)
+
+
+def normalize_index_columns(
+    columns: List[str],
+    expr_map: Optional[Dict[int, str]] = None
+) -> Tuple[str, ...]:
+    if not columns:
+        return tuple()
+    expr_map = expr_map or {}
+    seen: Set[str] = set()
+    normalized: List[str] = []
+    for idx, col in enumerate(columns, start=1):
+        expr = expr_map.get(idx)
+        token = normalize_sql_expression(expr) if expr else (col or "").upper()
+        if not token:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        normalized.append(token)
     return tuple(normalized)
 
 
@@ -5400,8 +5525,15 @@ def dump_ob_metadata(
 
     # --- 2. DBA_TAB_COLUMNS ---
     sql_cols_ext_tpl = """
-        SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHAR_LENGTH, NULLABLE,
+        SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
+               CHAR_LENGTH, DATA_LENGTH, DATA_PRECISION, DATA_SCALE, CHAR_USED, NULLABLE,
                REPLACE(REPLACE(REPLACE(DATA_DEFAULT, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS DATA_DEFAULT
+        FROM DBA_TAB_COLUMNS
+        WHERE OWNER IN ({owners_in})
+    """
+    sql_cols_mid_tpl = """
+        SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
+               CHAR_LENGTH, DATA_LENGTH, DATA_PRECISION, DATA_SCALE, NULLABLE, DATA_DEFAULT
         FROM DBA_TAB_COLUMNS
         WHERE OWNER IN ({owners_in})
     """
@@ -5415,11 +5547,14 @@ def dump_ob_metadata(
     if include_tab_columns:
         ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_cols_ext_tpl, owners_in_list)
         if not ok:
-            log.warning("读取 OB DBA_TAB_COLUMNS(含默认值清洗)失败，将回退基础查询：%s", err)
+            log.warning("读取 OB DBA_TAB_COLUMNS(含CHAR_USED)失败，将回退中间查询：%s", err)
+            ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_cols_mid_tpl, owners_in_list)
+        if not ok:
+            log.warning("读取 OB DBA_TAB_COLUMNS(中间查询)失败，将回退基础查询：%s", err)
             ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_cols_basic_tpl, owners_in_list)
-            if not ok:
-                log.error("无法从 OB 读取 DBA_TAB_COLUMNS，程序退出。")
-                sys.exit(1)
+        if not ok:
+            log.error("无法从 OB 读取 DBA_TAB_COLUMNS，程序退出。")
+            sys.exit(1)
 
         if lines:
             for line in lines:
@@ -5431,15 +5566,44 @@ def dump_ob_metadata(
                 col = parts[2].strip().upper()
                 dtype = parts[3].strip().upper()
                 char_len = parts[4].strip()
-                nullable = parts[5].strip()
-                default = parts[6].strip()
+                data_length = None
+                data_precision = None
+                data_scale = None
+                char_used = None
+                nullable = ""
+                default = ""
+                if len(parts) >= 11:
+                    data_length = parts[5].strip()
+                    data_precision = parts[6].strip()
+                    data_scale = parts[7].strip()
+                    char_used = parts[8].strip()
+                    nullable = parts[9].strip()
+                    default = parts[10].strip()
+                elif len(parts) >= 10:
+                    data_length = parts[5].strip()
+                    data_precision = parts[6].strip()
+                    data_scale = parts[7].strip()
+                    nullable = parts[8].strip()
+                    default = parts[9].strip()
+                else:
+                    nullable = parts[5].strip()
+                    default = parts[6].strip()
                 key = (owner, table)
+                char_used_clean = char_used.strip().upper() if char_used else ""
+                if char_used_clean in ("", "NULL"):
+                    char_used_clean = ""
                 tab_columns.setdefault(key, {})[col] = {
                     "data_type": dtype,
                     "char_length": int(char_len) if char_len.isdigit() else None,
+                    "data_length": int(data_length) if (data_length or "").isdigit() else None,
+                    "data_precision": int(data_precision) if (data_precision or "").isdigit() else None,
+                    "data_scale": int(data_scale) if (data_scale or "").isdigit() else None,
+                    "char_used": char_used_clean or None,
                     "nullable": nullable,
                     "data_default": default,
-                    "hidden": False
+                    "hidden": False,
+                    "virtual": False,
+                    "virtual_expr": None
                 }
 
     # --- 2.b 注释 (DBA_TAB_COMMENTS / DBA_COL_COMMENTS) ---
@@ -5532,7 +5696,8 @@ def dump_ob_metadata(
                 key = (t_owner, t_name)
                 indexes.setdefault(key, {})[idx_name] = {
                     "uniqueness": uniq,
-                    "columns": []
+                    "columns": [],
+                    "expressions": {}
                 }
 
         # --- 4. DBA_IND_COLUMNS ---
@@ -5566,6 +5731,39 @@ def dump_ob_metadata(
                     continue
                 idx_info["columns"].append(col_name)
 
+        # 尝试读取函数索引表达式（可能在部分 OB 版本不可用）
+        sql_expr_tpl = """
+            SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_POSITION, COLUMN_EXPRESSION
+            FROM DBA_IND_EXPRESSIONS
+            WHERE TABLE_OWNER IN ({owners_in})
+            ORDER BY TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_POSITION
+        """
+        ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_expr_tpl, owners_in_list)
+        if ok and lines:
+            for line in lines:
+                parts = line.split('\t')
+                if len(parts) < 5:
+                    continue
+                t_owner, t_name, idx_name = (
+                    parts[0].strip().upper(),
+                    parts[1].strip().upper(),
+                    parts[2].strip().upper()
+                )
+                try:
+                    pos = int(parts[3]) if parts[3] else None
+                except (TypeError, ValueError):
+                    pos = None
+                expr = parts[4].strip() if len(parts) >= 5 else ""
+                if not t_owner or not t_name or not idx_name or pos is None or not expr:
+                    continue
+                key = (t_owner, t_name)
+                idx_info = indexes.get(key, {}).get(idx_name)
+                if idx_info is None:
+                    continue
+                idx_info.setdefault("expressions", {})[pos] = expr
+        elif err:
+            log.info("OB 未支持 DBA_IND_EXPRESSIONS，函数索引表达式将不参与对比: %s", err)
+
         # 过滤 OMS_* 自动索引
         for key in list(indexes.keys()):
             pruned = {}
@@ -5579,25 +5777,44 @@ def dump_ob_metadata(
             else:
                 del indexes[key]
 
-    # --- 5. DBA_CONSTRAINTS (P/U/R) ---
+    # --- 5. DBA_CONSTRAINTS (P/U/R/C) ---
     constraints: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     if include_constraints:
         sql_ext_tpl = """
-            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME
+            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME,
+                   DELETE_RULE,
+                   REPLACE(REPLACE(REPLACE(SEARCH_CONDITION, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS SEARCH_CONDITION
             FROM DBA_CONSTRAINTS
             WHERE OWNER IN ({owners_in})
-              AND CONSTRAINT_TYPE IN ('P','U','R')
+              AND CONSTRAINT_TYPE IN ('P','U','R','C')
               AND STATUS = 'ENABLED'
         """
         ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_ext_tpl, owners_in_list)
-        support_fk_ref = ok
+        support_fk_ref = False
+        support_search_condition = False
+        if ok:
+            support_fk_ref = True
+            support_search_condition = True
+        if not ok:
+            log.warning("读取 OB DBA_CONSTRAINTS(含条件)失败，将回退为中间字段：%s", err)
+            sql_mid_tpl = """
+                SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME, DELETE_RULE
+                FROM DBA_CONSTRAINTS
+                WHERE OWNER IN ({owners_in})
+                  AND CONSTRAINT_TYPE IN ('P','U','R','C')
+                  AND STATUS = 'ENABLED'
+            """
+            ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_mid_tpl, owners_in_list)
+            if ok:
+                support_fk_ref = True
+                support_search_condition = False
         if not ok:
             log.warning("读取 OB DBA_CONSTRAINTS(含引用信息)失败，将回退为基础字段：%s", err)
             sql_tpl = """
                 SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE
                 FROM DBA_CONSTRAINTS
                 WHERE OWNER IN ({owners_in})
-                  AND CONSTRAINT_TYPE IN ('P','U','R')
+                  AND CONSTRAINT_TYPE IN ('P','U','R','C')
                   AND STATUS = 'ENABLED'
             """
             ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners_in_list)
@@ -5616,12 +5833,16 @@ def dump_ob_metadata(
                 ctype = parts[3].strip().upper()
                 r_owner = parts[4].strip().upper() if support_fk_ref and len(parts) >= 5 else None
                 r_cons = parts[5].strip().upper() if support_fk_ref and len(parts) >= 6 else None
+                delete_rule = parts[6].strip().upper() if support_fk_ref and len(parts) >= 7 else None
+                search_condition = parts[7].strip() if support_search_condition and len(parts) >= 8 else None
                 key = (owner, table)
                 constraints.setdefault(key, {})[cons_name] = {
                     "type": ctype,
                     "columns": [],
                     "r_owner": r_owner if ctype == "R" else None,
                     "r_constraint": r_cons if ctype == "R" else None,
+                    "delete_rule": delete_rule if ctype == "R" else None,
+                    "search_condition": search_condition if ctype == "C" else None,
                 }
 
         # --- 6. DBA_CONS_COLUMNS ---
@@ -5651,7 +5872,14 @@ def dump_ob_metadata(
                 if key not in constraints:
                     constraints[key] = {}
                 if cons_name not in constraints[key]:
-                    constraints[key][cons_name] = {"type": "UNKNOWN", "columns": [], "r_owner": None, "r_constraint": None}
+                    constraints[key][cons_name] = {
+                        "type": "UNKNOWN",
+                        "columns": [],
+                        "r_owner": None,
+                        "r_constraint": None,
+                        "delete_rule": None,
+                        "search_condition": None,
+                    }
                 constraints[key][cons_name]["columns"].append(col_name)
 
         # 为外键补齐被引用表信息（若 OB 提供 R_OWNER/R_CONSTRAINT_NAME）
@@ -6355,6 +6583,7 @@ def dump_oracle_metadata(
             if owners or need_package_status:
                 # 检测是否支持 HIDDEN_COLUMN 字段（部分低版本/权限受限环境不存在）
                 support_hidden_col = False
+                support_virtual_col = False
                 try:
                     with ora_conn.cursor() as cursor:
                         cursor.execute("""
@@ -6369,19 +6598,41 @@ def dump_oracle_metadata(
                 except oracledb.Error as e:
                     log.info("无法探测 HIDDEN_COLUMN 支持，默认不读取 hidden 标记：%s", e)
                     support_hidden_col = False
+                try:
+                    with ora_conn.cursor() as cursor:
+                        cursor.execute("""
+                            SELECT COUNT(*)
+                            FROM DBA_TAB_COLUMNS
+                            WHERE OWNER = 'SYS'
+                              AND TABLE_NAME = 'DBA_TAB_COLUMNS'
+                              AND COLUMN_NAME = 'VIRTUAL_COLUMN'
+                        """)
+                        count_row = cursor.fetchone()
+                        support_virtual_col = bool(count_row and count_row[0] and int(count_row[0]) > 0)
+                except oracledb.Error as e:
+                    log.info("无法探测 VIRTUAL_COLUMN 支持，默认不读取 virtual 标记：%s", e)
+                    support_virtual_col = False
 
                 # 列定义
-                def _load_ora_tab_columns_sql(include_hidden: bool) -> str:
+                def _load_ora_tab_columns_sql(include_hidden: bool, include_virtual: bool) -> str:
                     hidden_col = ", NVL(TO_CHAR(HIDDEN_COLUMN),'NO') AS HIDDEN_COLUMN" if include_hidden else ""
+                    virtual_col = ", NVL(TO_CHAR(VIRTUAL_COLUMN),'NO') AS VIRTUAL_COLUMN" if include_virtual else ""
                     return f"""
                         SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
                                DATA_LENGTH, DATA_PRECISION, DATA_SCALE,
                                NULLABLE, DATA_DEFAULT, CHAR_USED, CHAR_LENGTH{hidden_col}
+                               {virtual_col}
                         FROM DBA_TAB_COLUMNS
                         WHERE OWNER IN ({{owners_clause}})
                     """
 
-                def _parse_tab_column_row(row, include_hidden: bool) -> Dict:
+                def _parse_tab_column_row(row, include_hidden: bool, include_virtual: bool) -> Dict:
+                    virtual_flag = False
+                    pos = 11
+                    if include_hidden:
+                        pos += 1
+                    if include_virtual and len(row) > pos:
+                        virtual_flag = (row[pos] or "").strip().upper() == "YES"
                     return {
                         "data_type": row[3],
                         "data_length": row[4],
@@ -6391,11 +6642,16 @@ def dump_oracle_metadata(
                         "data_default": row[8],
                         "char_used": row[9],
                         "char_length": row[10],
-                        "hidden": (row[11] if include_hidden and len(row) > 11 else "NO") == "YES" if include_hidden else False
+                        "hidden": (row[11] if include_hidden and len(row) > 11 else "NO") == "YES" if include_hidden else False,
+                        "virtual": virtual_flag,
+                        "virtual_expr": row[8] if virtual_flag else None
                     }
 
                 try:
-                    sql_tpl = _load_ora_tab_columns_sql(include_hidden=support_hidden_col)
+                    sql_tpl = _load_ora_tab_columns_sql(
+                        include_hidden=support_hidden_col,
+                        include_virtual=support_virtual_col
+                    )
                     with ora_conn.cursor() as cursor:
                         for owner_chunk in owner_chunks:
                             owners_clause = build_bind_placeholders(len(owner_chunk))
@@ -6410,12 +6666,17 @@ def dump_oracle_metadata(
                                 key = (owner, table)
                                 if key not in table_pairs:
                                     continue
-                                table_columns.setdefault(key, {})[col] = _parse_tab_column_row(row, support_hidden_col)
+                                table_columns.setdefault(key, {})[col] = _parse_tab_column_row(
+                                    row,
+                                    support_hidden_col,
+                                    support_virtual_col
+                                )
                 except oracledb.Error as e:
-                    if support_hidden_col:
-                        log.info("读取 DBA_TAB_COLUMNS(含 hidden) 失败，尝试不含 hidden：%s", e)
+                    if support_hidden_col or support_virtual_col:
+                        log.info("读取 DBA_TAB_COLUMNS(含 hidden/virtual) 失败，尝试降级：%s", e)
                         support_hidden_col = False
-                        sql_tpl = _load_ora_tab_columns_sql(include_hidden=False)
+                        support_virtual_col = False
+                        sql_tpl = _load_ora_tab_columns_sql(include_hidden=False, include_virtual=False)
                         with ora_conn.cursor() as cursor:
                             for owner_chunk in owner_chunks:
                                 owners_clause = build_bind_placeholders(len(owner_chunk))
@@ -6430,7 +6691,7 @@ def dump_oracle_metadata(
                                     key = (owner, table)
                                     if key not in table_pairs:
                                         continue
-                                    table_columns.setdefault(key, {})[col] = _parse_tab_column_row(row, False)
+                                    table_columns.setdefault(key, {})[col] = _parse_tab_column_row(row, False, False)
                     else:
                         raise
 
@@ -6459,7 +6720,8 @@ def dump_oracle_metadata(
                                     continue
                                 indexes.setdefault(key, {})[idx_name] = {
                                     "uniqueness": (row[3] or "").upper(),
-                                    "columns": []
+                                    "columns": [],
+                                    "expressions": {}
                                 }
 
                     sql_idx_cols_tpl = """
@@ -6486,16 +6748,55 @@ def dump_oracle_metadata(
                                 if not idx_name or not col_name:
                                     continue
                                 indexes.setdefault(key, {}).setdefault(
-                                    idx_name, {"uniqueness": "UNKNOWN", "columns": []}
+                                    idx_name, {"uniqueness": "UNKNOWN", "columns": [], "expressions": {}}
                                 )["columns"].append(col_name)
+
+                    # 读取函数索引表达式
+                    sql_idx_expr_tpl = """
+                        SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_POSITION, COLUMN_EXPRESSION
+                        FROM DBA_IND_EXPRESSIONS
+                        WHERE TABLE_OWNER IN ({owners_clause})
+                        ORDER BY TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_POSITION
+                    """
+                    try:
+                        with ora_conn.cursor() as cursor:
+                            for owner_chunk in owner_chunks:
+                                owners_clause = build_bind_placeholders(len(owner_chunk))
+                                sql_idx_expr = sql_idx_expr_tpl.format(owners_clause=owners_clause)
+                                cursor.execute(sql_idx_expr, owner_chunk)
+                                for row in cursor:
+                                    owner = _safe_upper(row[0])
+                                    table = _safe_upper(row[1])
+                                    if not owner or not table:
+                                        continue
+                                    key = (owner, table)
+                                    if key not in table_pairs:
+                                        continue
+                                    idx_name = _safe_upper(row[2])
+                                    if not idx_name:
+                                        continue
+                                    try:
+                                        pos = int(row[3]) if row[3] is not None else None
+                                    except (TypeError, ValueError):
+                                        pos = None
+                                    expr = str(row[4]) if row[4] is not None else None
+                                    if pos is None or not expr:
+                                        continue
+                                    idx_info = indexes.get(key, {}).get(idx_name)
+                                    if idx_info is None:
+                                        continue
+                                    idx_info.setdefault("expressions", {})[pos] = expr
+                    except oracledb.Error as e:
+                        log.info("读取 DBA_IND_EXPRESSIONS 失败，函数索引表达式将不参与对比: %s", e)
 
                 # 约束
                 if include_constraints:
                     sql_cons_tpl = """
-                        SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME
+                        SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME,
+                               DELETE_RULE, SEARCH_CONDITION
                         FROM DBA_CONSTRAINTS
                         WHERE OWNER IN ({owners_clause})
-                          AND CONSTRAINT_TYPE IN ('P','U','R')
+                          AND CONSTRAINT_TYPE IN ('P','U','R','C')
                           AND STATUS = 'ENABLED'
                     """
                     with ora_conn.cursor() as cursor:
@@ -6519,6 +6820,8 @@ def dump_oracle_metadata(
                                     "columns": [],
                                     "r_owner": _safe_upper(row[4]) if row[4] else None,
                                     "r_constraint": _safe_upper(row[5]) if row[5] else None,
+                                    "delete_rule": (row[6] or "").strip().upper() if len(row) > 6 else None,
+                                    "search_condition": str(row[7]) if len(row) > 7 and row[7] is not None else None,
                                 }
 
                     sql_cons_cols_tpl = """
@@ -6545,7 +6848,15 @@ def dump_oracle_metadata(
                                 if not cons_name or not col_name:
                                     continue
                                 constraints.setdefault(key, {}).setdefault(
-                                    cons_name, {"type": "UNKNOWN", "columns": []}
+                                    cons_name,
+                                    {
+                                        "type": "UNKNOWN",
+                                        "columns": [],
+                                        "r_owner": None,
+                                        "r_constraint": None,
+                                        "delete_rule": None,
+                                        "search_condition": None,
+                                    }
                                 )["columns"].append(col_name)
 
                     # 为外键补齐被引用表信息 (基于约束引用)
@@ -8762,6 +9073,45 @@ def check_primary_objects(
                 src_dtype = (src_info.get("data_type") or "").upper()
                 tgt_dtype = (tgt_info.get("data_type") or "").upper()
 
+                src_virtual = bool(src_info.get("virtual"))
+                tgt_virtual = bool(tgt_info.get("virtual"))
+                if src_virtual:
+                    src_expr_norm = normalize_sql_expression(src_info.get("virtual_expr"))
+                    tgt_expr_norm = normalize_sql_expression(tgt_info.get("virtual_expr"))
+                    if not tgt_virtual:
+                        type_mismatches.append(
+                            ColumnTypeIssue(
+                                col_name,
+                                format_oracle_column_type(src_info, prefer_ob_varchar=True),
+                                format_oracle_column_type(tgt_info, prefer_ob_varchar=True),
+                                f"VIRTUAL({src_expr_norm})" if src_expr_norm else "VIRTUAL",
+                                "virtual_missing"
+                            )
+                        )
+                        continue
+                    if src_expr_norm and tgt_expr_norm and src_expr_norm != tgt_expr_norm:
+                        type_mismatches.append(
+                            ColumnTypeIssue(
+                                col_name,
+                                format_oracle_column_type(src_info, prefer_ob_varchar=True),
+                                format_oracle_column_type(tgt_info, prefer_ob_varchar=True),
+                                f"VIRTUAL({src_expr_norm})",
+                                "virtual_expr_mismatch"
+                            )
+                        )
+                        continue
+                    if src_expr_norm and not tgt_expr_norm:
+                        type_mismatches.append(
+                            ColumnTypeIssue(
+                                col_name,
+                                format_oracle_column_type(src_info, prefer_ob_varchar=True),
+                                format_oracle_column_type(tgt_info, prefer_ob_varchar=True),
+                                f"VIRTUAL({src_expr_norm})",
+                                "virtual_expr_mismatch"
+                            )
+                        )
+                        continue
+
                 if is_long_type(src_dtype):
                     expected_type = map_long_type_to_ob(src_dtype)
                     if (tgt_dtype or "UNKNOWN") != expected_type:
@@ -8770,7 +9120,8 @@ def check_primary_objects(
                                 col_name,
                                 src_dtype or "UNKNOWN",
                                 tgt_dtype or "UNKNOWN",
-                                expected_type
+                                expected_type,
+                                "long_type"
                             )
                         )
                     continue
@@ -8785,12 +9136,15 @@ def check_primary_objects(
                     except (TypeError, ValueError):
                         continue
 
-                    # 区分BYTE和CHAR语义：CHAR_USED='C'表示CHAR语义，其他为BYTE语义
+                    # 区分BYTE和CHAR语义：CHAR_USED='C'表示CHAR语义
                     src_char_used = (src_info.get("char_used") or "").strip().upper()
+                    tgt_char_used = (tgt_info.get("char_used") or "").strip().upper()
+                    if not tgt_char_used:
+                        tgt_char_used = "B"
                     
                     if src_char_used == 'C':
                         # CHAR语义：要求长度完全一致
-                        if tgt_len_int != src_len_int:
+                        if tgt_char_used != 'C' or tgt_len_int != src_len_int:
                             length_mismatches.append(
                                 ColumnLengthIssue(col_name, src_len_int, tgt_len_int, src_len_int, 'char_mismatch')
                             )
@@ -8806,6 +9160,39 @@ def check_primary_objects(
                             length_mismatches.append(
                                 ColumnLengthIssue(col_name, src_len_int, tgt_len_int, oversize_cap_len, 'oversize')
                             )
+                    continue
+
+                if src_dtype in ("NUMBER", "DECIMAL", "NUMERIC"):
+                    src_prec, src_scale = normalize_number_meta(
+                        src_info.get("data_precision"),
+                        src_info.get("data_scale")
+                    )
+                    tgt_prec, tgt_scale = normalize_number_meta(
+                        tgt_info.get("data_precision"),
+                        tgt_info.get("data_scale")
+                    )
+                    mismatch = False
+                    if src_prec is None:
+                        if tgt_prec is not None:
+                            mismatch = True
+                    else:
+                        if tgt_prec is not None:
+                            if tgt_prec < src_prec:
+                                mismatch = True
+                            if tgt_scale != src_scale:
+                                mismatch = True
+                        # tgt_prec is None implies unbounded, treat as compatible
+                    if mismatch:
+                        expected_type = build_number_fixup_type(src_info, tgt_info)
+                        type_mismatches.append(
+                            ColumnTypeIssue(
+                                col_name,
+                                format_oracle_column_type(src_info, prefer_ob_varchar=True),
+                                format_oracle_column_type(tgt_info, prefer_ob_varchar=True),
+                                expected_type,
+                                "number_precision"
+                            )
+                        )
 
             if not missing_in_tgt and not extra_in_tgt and not length_mismatches and not type_mismatches:
                 results['ok'].append(('TABLE', full_tgt))
@@ -8993,7 +9380,8 @@ def compare_package_objects(
 def build_index_map(entries: Dict[str, Dict]) -> Dict[Tuple[str, ...], Dict[str, Set[str]]]:
     result: Dict[Tuple[str, ...], Dict[str, Set[str]]] = {}
     for name, info in (entries or {}).items():
-        cols = normalize_column_sequence(info.get("columns"))
+        expr_map = info.get("expressions") or {}
+        cols = normalize_index_columns(info.get("columns") or [], expr_map)
         if not cols:
             continue
         uniq = (info.get("uniqueness") or "").upper()
@@ -9023,7 +9411,8 @@ def build_constraint_signature(
 ) -> ConstraintSignature:
     pk: Set[Tuple[str, ...]] = set()
     uk: Set[Tuple[str, ...]] = set()
-    fk: Set[Tuple[Tuple[str, ...], Optional[str]]] = set()
+    fk: Set[Tuple[Tuple[str, ...], Optional[str], str]] = set()
+    ck: Set[str] = set()
     for name, cons in (cons_dict or {}).items():
         ctype = (cons.get("type") or "").upper()
         cols = norm_cols.get(name) or normalize_column_sequence(cons.get("columns"))
@@ -9035,6 +9424,7 @@ def build_constraint_signature(
             ref_full: Optional[str] = None
             ref_owner = cons.get("ref_table_owner")
             ref_name = cons.get("ref_table_name")
+            delete_rule = normalize_delete_rule(cons.get("delete_rule"))
             if ref_owner and ref_name:
                 ref_full_raw = f"{str(ref_owner).upper()}.{str(ref_name).upper()}"
                 if is_source:
@@ -9042,8 +9432,14 @@ def build_constraint_signature(
                     ref_full = (mapped or ref_full_raw).upper()
                 else:
                     ref_full = ref_full_raw.upper()
-            fk.add((cols, ref_full))
-    return ConstraintSignature(pk=pk, uk=uk, fk=fk)
+            fk.add((cols, ref_full, delete_rule))
+        elif ctype == "C":
+            if is_system_notnull_check(name, cons.get("search_condition")):
+                continue
+            expr = normalize_sql_expression(cons.get("search_condition"))
+            if expr:
+                ck.add(expr)
+    return ConstraintSignature(pk=pk, uk=uk, fk=fk, ck=ck)
 
 
 def build_index_cache_for_table(
@@ -9260,10 +9656,19 @@ def compare_index_maps(
     def is_sys_nc_only_diff(src_cols: Tuple[str, ...], tgt_cols: Tuple[str, ...]) -> bool:
         return normalize_sys_nc_columns(src_cols) == normalize_sys_nc_columns(tgt_cols)
 
+    def has_sys_nc(cols: Tuple[str, ...]) -> bool:
+        return any(re.match(r'^SYS_NC', col) or col == 'SYS_NC$' for col in cols)
+
+    def has_expression(cols: Tuple[str, ...]) -> bool:
+        return any(is_index_expression_token(col) for col in cols)
+
+    def is_expr_sys_nc_match(src_cols: Tuple[str, ...], tgt_cols: Tuple[str, ...]) -> bool:
+        return (has_expression(src_cols) and has_sys_nc(tgt_cols)) or (has_expression(tgt_cols) and has_sys_nc(src_cols))
+
     for src_cols in list(missing_cols):
         for tgt_cols in list(extra_cols):
             if (has_same_named_index(src_cols, tgt_cols) and
-                is_sys_nc_only_diff(src_cols, tgt_cols)):
+                (is_sys_nc_only_diff(src_cols, tgt_cols) or is_expr_sys_nc_match(src_cols, tgt_cols))):
                 missing_cols.discard(src_cols)
                 extra_cols.discard(tgt_cols)
                 break
@@ -9771,8 +10176,8 @@ def compare_constraints_for_table(
         cons_dict: Dict[str, Dict],
         *,
         is_source: bool
-    ) -> List[Tuple[Tuple[str, ...], str, Optional[str]]]:
-        entries: List[Tuple[Tuple[str, ...], str, Optional[str]]] = []
+    ) -> List[Tuple[Tuple[str, ...], str, Optional[str], str]]:
+        entries: List[Tuple[Tuple[str, ...], str, Optional[str], str]] = []
         for name, cons in cons_dict.items():
             ctype = (cons.get("type") or "").upper()
             if ctype != 'R':
@@ -9781,6 +10186,7 @@ def compare_constraints_for_table(
             ref_full: Optional[str] = None
             ref_owner = cons.get("ref_table_owner")
             ref_name = cons.get("ref_table_name")
+            delete_rule = normalize_delete_rule(cons.get("delete_rule"))
             if ref_owner and ref_name:
                 ref_full_raw = f"{str(ref_owner).upper()}.{str(ref_name).upper()}"
                 if is_source:
@@ -9790,13 +10196,30 @@ def compare_constraints_for_table(
                 else:
                     # 目标端FK引用：使用原始名称（目标端已经是remapped之后的名称）
                     ref_full = ref_full_raw.upper()
-            entries.append((cols, name, ref_full))
+            entries.append((cols, name, ref_full, delete_rule))
+        return entries
+
+    def bucket_check(cons_dict: Dict[str, Dict]) -> List[Tuple[str, str, str]]:
+        entries: List[Tuple[str, str, str]] = []
+        for name, cons in cons_dict.items():
+            ctype = (cons.get("type") or "").upper()
+            if ctype != "C":
+                continue
+            raw_expr = cons.get("search_condition")
+            if is_system_notnull_check(name, raw_expr):
+                continue
+            expr_norm = normalize_sql_expression(raw_expr)
+            if not expr_norm:
+                continue
+            entries.append((expr_norm, name, str(raw_expr)))
         return entries
 
     grouped_src_pkuk = bucket_pk_uk(src_cons)
     grouped_tgt_pkuk = bucket_pk_uk(tgt_cons)
     grouped_src_fk = bucket_fk(src_cons, is_source=True)
     grouped_tgt_fk = bucket_fk(tgt_cons, is_source=False)
+    grouped_src_ck = bucket_check(src_cons)
+    grouped_tgt_ck = bucket_check(tgt_cons)
 
     src_pk_list = grouped_src_pkuk.get('P', [])
     src_uk_list = grouped_src_pkuk.get('U', [])
@@ -9855,17 +10278,17 @@ def compare_constraints_for_table(
             )
 
     def match_foreign_keys(
-        src_list: List[Tuple[Tuple[str, ...], str, Optional[str]]],
-        tgt_list: List[Tuple[Tuple[str, ...], str, Optional[str]]]
+        src_list: List[Tuple[Tuple[str, ...], str, Optional[str], str]],
+        tgt_list: List[Tuple[Tuple[str, ...], str, Optional[str], str]]
     ) -> None:
         tgt_used = [False] * len(tgt_list)
         tgt_by_cols: Dict[Tuple[str, ...], Set[Optional[str]]] = defaultdict(set)
-        for cols, _name, ref in tgt_list:
+        for cols, _name, ref, _rule in tgt_list:
             tgt_by_cols[cols].add(ref)
 
-        for cols, name, src_ref in src_list:
+        for cols, name, src_ref, src_rule in src_list:
             found_idx = None
-            for idx, (t_cols, _t_name, t_ref) in enumerate(tgt_list):
+            for idx, (t_cols, _t_name, t_ref, t_rule) in enumerate(tgt_list):
                 if tgt_used[idx]:
                     continue
                 if cols != t_cols:
@@ -9885,19 +10308,66 @@ def compare_constraints_for_table(
                     detail_mismatch.append(
                         f"FOREIGN KEY: 源约束 {name} (列 {list(cols)}) 在目标端未找到。"
                     )
+            else:
+                tgt_rule = tgt_list[found_idx][3]
+                src_rule_norm = normalize_delete_rule(src_rule)
+                tgt_rule_norm = normalize_delete_rule(tgt_rule)
+                if src_rule_norm != tgt_rule_norm:
+                    detail_mismatch.append(
+                        f"FOREIGN KEY: 源约束 {name} DELETE_RULE={src_rule_norm or 'NO ACTION'}，"
+                        f"目标端 DELETE_RULE={tgt_rule_norm or 'NO ACTION'}。"
+                    )
 
         for idx, used in enumerate(tgt_used):
             if not used:
-                extra_name, extra_cols, extra_ref = tgt_list[idx]
+                extra_name, extra_cols, extra_ref, extra_rule = tgt_list[idx]
                 if extra_cols in source_all_cols:
                     continue
                 if "_OMS_ROWID" in (extra_name or ""):
                     continue
                 extra.add(extra_name)
                 ref_note = f" 引用 {extra_ref}" if extra_ref else ""
+                rule_note = f" DELETE_RULE={normalize_delete_rule(extra_rule) or 'NO ACTION'}"
                 detail_mismatch.append(
-                    f"FOREIGN KEY: 目标端存在额外约束 {extra_name} (列 {list(extra_cols)}){ref_note}。"
+                    f"FOREIGN KEY: 目标端存在额外约束 {extra_name} (列 {list(extra_cols)}){ref_note}{rule_note}。"
                 )
+
+    def match_check_constraints(
+        src_list: List[Tuple[str, str, str]],
+        tgt_list: List[Tuple[str, str, str]]
+    ) -> None:
+        tgt_by_expr: Dict[str, List[str]] = defaultdict(list)
+        tgt_by_name: Dict[str, Tuple[str, str]] = {}
+        for expr_norm, name, raw_expr in tgt_list:
+            tgt_by_expr[expr_norm].append(name)
+            tgt_by_name[name] = (expr_norm, raw_expr)
+
+        used: Set[str] = set()
+        for expr_norm, name, raw_expr in src_list:
+            if name in tgt_by_name:
+                used.add(name)
+                tgt_expr_norm, tgt_expr_raw = tgt_by_name.get(name, ("", ""))
+                if tgt_expr_norm != expr_norm:
+                    detail_mismatch.append(
+                        f"CHECK: 源约束 {name} 条件不一致 (源={raw_expr}, 目标={tgt_expr_raw})。"
+                    )
+                continue
+            if expr_norm in tgt_by_expr and tgt_by_expr[expr_norm]:
+                matched_name = tgt_by_expr[expr_norm].pop()
+                used.add(matched_name)
+                continue
+            missing.add(name)
+            detail_mismatch.append(
+                f"CHECK: 源约束 {name} (条件 {raw_expr}) 在目标端未找到。"
+            )
+
+        for expr_norm, name, raw_expr in tgt_list:
+            if name in used:
+                continue
+            extra.add(name)
+            detail_mismatch.append(
+                f"CHECK: 目标端存在额外约束 {name} (条件 {raw_expr})。"
+            )
 
     match_constraints("PRIMARY KEY", src_pk_inclusive, tgt_pk_list, tgt_pk_used)
 
@@ -9930,6 +10400,7 @@ def compare_constraints_for_table(
     mark_extra_constraints("PRIMARY KEY", tgt_pk_list, tgt_pk_used)
     mark_extra_constraints("UNIQUE KEY", tgt_uk_list, tgt_uk_used)
     match_foreign_keys(grouped_src_fk, grouped_tgt_fk)
+    match_check_constraints(grouped_src_ck, grouped_tgt_ck)
 
     all_good = (not missing) and (not extra) and (not detail_mismatch)
     if all_good:
@@ -14685,7 +15156,7 @@ def generate_alter_for_table_columns(
       - 对 missing_cols 生成 ADD COLUMN
       - 对 extra_cols 生成注释掉的 DROP COLUMN 建议
       - 对 length_mismatches 生成 MODIFY COLUMN
-      - 对 type_mismatches (LONG/LONG RAW) 生成 MODIFY COLUMN
+      - 对 type_mismatches (LONG/LONG RAW、NUMBER 精度等) 生成 MODIFY COLUMN
     """
     if not missing_cols and not extra_cols and not length_mismatches and not type_mismatches:
         return None
@@ -14709,6 +15180,8 @@ def generate_alter_for_table_columns(
                 continue
 
             col_u = col.upper()
+            is_virtual = bool(info.get("virtual"))
+            virtual_expr = info.get("virtual_expr") if is_virtual else None
             override_len = None
             dtype = (info.get("data_type") or "").upper()
             if dtype in ("VARCHAR2", "VARCHAR"):
@@ -14726,16 +15199,25 @@ def generate_alter_for_table_columns(
             )
             default_clause = ""
             default_val = info.get("data_default")
-            if default_val is not None:
+            if not is_virtual and default_val is not None:
                 default_str = str(default_val).strip()
                 if default_str:
                     default_clause = f" DEFAULT {default_str}"
 
-            nullable_clause = " NOT NULL" if (info.get("nullable") == "N") else ""
+            nullable_clause = ""
+            if not is_virtual:
+                nullable_clause = " NOT NULL" if (info.get("nullable") == "N") else ""
+
+            virtual_clause = ""
+            if is_virtual:
+                if virtual_expr:
+                    virtual_clause = f" GENERATED ALWAYS AS ({virtual_expr}) VIRTUAL"
+                else:
+                    lines.append(f"-- WARNING: 虚拟列 {col_u} 未获取表达式，需手工补充。")
 
             lines.append(
                 f"ALTER TABLE {tgt_schema_u}.{tgt_table_u} "
-                f"ADD ({col_u} {col_type}{default_clause}{nullable_clause});"
+                f"ADD ({col_u} {col_type}{virtual_clause}{default_clause}{nullable_clause});"
             )
 
     # 为新增列生成注释语句（过滤OMS列）
@@ -14798,20 +15280,29 @@ def generate_alter_for_table_columns(
                     f"建议上限={limit_len})，请人工评估是否需要收敛。"
                 )
 
-    # 类型不匹配：MODIFY (LONG/LONG RAW -> CLOB/BLOB)
+    # 类型不匹配：MODIFY (LONG/LONG RAW、NUMBER 精度等)
     if type_mismatches:
         lines.append("")
-        lines.append("-- 列类型不匹配 (LONG/LONG RAW)：")
+        lines.append("-- 列类型不匹配：")
         for issue in type_mismatches:
-            col_name, src_type, tgt_type, expected_type = issue
+            col_name, src_type, tgt_type, expected_type, issue_type = issue
             info = col_details.get(col_name)
             if not info:
                 continue
-            lines.append(
-                f"ALTER TABLE {tgt_schema_u}.{tgt_table_u} "
-                f"MODIFY ({col_name.upper()} {expected_type}); "
-                f"-- 源类型: {src_type}, 目标类型: {tgt_type}"
-            )
+            if issue_type in ("long_type", "number_precision"):
+                lines.append(
+                    f"ALTER TABLE {tgt_schema_u}.{tgt_table_u} "
+                    f"MODIFY ({col_name.upper()} {expected_type}); "
+                    f"-- 源类型: {src_type}, 目标类型: {tgt_type}"
+                )
+            elif issue_type.startswith("virtual"):
+                lines.append(
+                    f"-- WARNING: {col_name.upper()} 为虚拟列差异 ({issue_type})，请人工处理。"
+                )
+            else:
+                lines.append(
+                    f"-- WARNING: {col_name.upper()} 类型差异未自动修复 (源={src_type}, 目标={tgt_type})。"
+                )
 
     # 多余列：DROP（注释掉，供人工评估）
     if extra_cols:
@@ -16067,10 +16558,15 @@ def generate_fixup_scripts(
         if not meta:
             return None
         cols = meta.get("columns") or []
+        expr_map = meta.get("expressions") or {}
         if not cols:
             return None
         uniq = (meta.get("uniqueness") or "").upper() == "UNIQUE"
-        col_list = ", ".join(cols)
+        ddl_cols: List[str] = []
+        for pos, col in enumerate(cols, start=1):
+            expr = expr_map.get(pos)
+            ddl_cols.append(expr if expr else col)
+        col_list = ", ".join(ddl_cols)
         prefix = "UNIQUE " if uniq else ""
         return f"CREATE {prefix}INDEX {tgt_schema.upper()}.{idx_name.upper()} ON {tgt_schema.upper()}.{tgt_table.upper()} ({col_list});"
 
@@ -16966,10 +17462,13 @@ def generate_fixup_scripts(
                                     ref_tgt_schema, ref_tgt_table = ref_tgt_full.split('.', 1)
                                 else:
                                     ref_tgt_schema, ref_tgt_table = ref_owner.upper(), ref_table.upper()
+                                delete_rule = normalize_delete_rule(cons_meta.get("delete_rule"))
+                                delete_clause = f" ON DELETE {delete_rule}" if delete_rule else ""
                                 stmt = (
                                     f"ALTER TABLE {ts}.{tt} "
                                     f"ADD CONSTRAINT {cons_name_u} FOREIGN KEY ({', '.join(cols)}) "
                                     f"REFERENCES {ref_tgt_schema}.{ref_tgt_table} ({', '.join(ref_cols)})"
+                                    f"{delete_clause}"
                                 )
                                 statements = [stmt]
                                 mark_source('CONSTRAINT', 'fallback')
@@ -16983,6 +17482,16 @@ def generate_fixup_scripts(
                                             ts,
                                             ObjectGrantEntry("REFERENCES", ref_full.upper(), False)
                                         ))
+                        elif cons_meta and ctype == 'C':
+                            search_condition = cons_meta.get("search_condition")
+                            if search_condition and not is_system_notnull_check(cons_name_u, search_condition):
+                                stmt = (
+                                    f"ALTER TABLE {ts}.{tt} "
+                                    f"ADD CONSTRAINT {cons_name_u} CHECK ({search_condition})"
+                                )
+                                statements = [stmt]
+                                mark_source('CONSTRAINT', 'fallback')
+                                source_label = "META"
                         elif cons_meta:
                             log.warning(
                                 "[FIXUP] 约束 %s 类型为 %s，无内联 DDL 可用，无法自动重建。",
@@ -17699,8 +18208,8 @@ def export_mismatched_tables_detail(
         for col, src_len, tgt_len, limit_len, issue_type in length_mismatches:
             length_parts.append(f"{col}:{src_len}->{tgt_len}({issue_type}:{limit_len})")
         type_parts = []
-        for col, src_type, tgt_type, expected_type in type_mismatches:
-            type_parts.append(f"{col}:{src_type}->{tgt_type}({expected_type})")
+        for col, src_type, tgt_type, expected_type, issue_type in type_mismatches:
+            type_parts.append(f"{col}:{src_type}->{tgt_type}({issue_type}:{expected_type})")
         rows.append([
             tgt_name,
             ",".join(sorted(missing)) if missing else "-",
@@ -19376,11 +19885,11 @@ def print_final_report(
                 if extra:
                     details.append(f"+ 多余列: {sorted(list(extra))}\n", style="mismatch")
                 if type_mismatches:
-                    details.append("* 类型不匹配 (LONG/LONG RAW):\n", style="mismatch")
+                    details.append("* 类型不匹配:\n", style="mismatch")
                     for issue in type_mismatches:
-                        col, src_type, tgt_type, expected_type = issue
+                        col, src_type, tgt_type, expected_type, issue_type = issue
                         details.append(
-                            f"    - {col}: 源={src_type}, 目标={tgt_type}, 期望={expected_type}\n"
+                            f"    - {col}: 源={src_type}, 目标={tgt_type}, 期望={expected_type} ({issue_type})\n"
                         )
                 if length_mismatches:
                     details.append("* 长度不匹配 (VARCHAR/2):\n", style="mismatch")

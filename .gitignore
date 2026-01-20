@@ -21,3 +21,5 @@ docs/MIGRATION_PROPOSAL_1567_SCHEMAS.md
 
 .gemini/
 gha-creds-*.json
+.github/
+compatibility_suite/
