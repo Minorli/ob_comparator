@@ -386,6 +386,38 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(len(type_mismatches), 1)
         self.assertEqual(type_mismatches[0].issue, "virtual_missing")
 
+    def test_filter_trigger_results_for_unsupported_tables(self):
+        extra_results = {
+            "index_ok": [],
+            "index_mismatched": [],
+            "constraint_ok": [],
+            "constraint_mismatched": [],
+            "sequence_ok": [],
+            "sequence_mismatched": [],
+            "trigger_ok": ["TGT.T1", "TGT.T2"],
+            "trigger_mismatched": [
+                sdr.TriggerMismatch(
+                    table="TGT.T1",
+                    missing_triggers={"TR1"},
+                    extra_triggers=set(),
+                    detail_mismatch=["missing"],
+                    missing_mappings=None
+                )
+            ],
+        }
+        unsupported_table_keys = {("SRC", "T1")}
+        table_target_map = {
+            ("SRC", "T1"): ("TGT", "T1"),
+            ("SRC", "T2"): ("TGT", "T2"),
+        }
+        filtered = sdr.filter_trigger_results_for_unsupported_tables(
+            extra_results,
+            unsupported_table_keys,
+            table_target_map
+        )
+        self.assertEqual(filtered["trigger_mismatched"], [])
+        self.assertEqual(filtered["trigger_ok"], ["TGT.T2"])
+
     def test_supplement_missing_views_from_mapping(self):
         tv_results = {
             "missing": [],

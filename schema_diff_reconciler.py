@@ -5040,6 +5040,42 @@ def build_table_target_map(master_list: MasterCheckList) -> Dict[Tuple[str, str]
     return mapping
 
 
+def filter_trigger_results_for_unsupported_tables(
+    extra_results: ExtraCheckResults,
+    unsupported_table_keys: Optional[Set[Tuple[str, str]]],
+    table_target_map: Optional[Dict[Tuple[str, str], Tuple[str, str]]]
+) -> ExtraCheckResults:
+    """
+    将黑名单 TABLE 相关的触发器差异从扩展校验结果中剔除，避免误报。
+    """
+    if not extra_results or not unsupported_table_keys or not table_target_map:
+        return extra_results
+
+    unsupported_keys = {(s.upper(), t.upper()) for s, t in unsupported_table_keys}
+    table_map = {
+        f"{tgt_schema.upper()}.{tgt_table.upper()}": (src_schema.upper(), src_table.upper())
+        for (src_schema, src_table), (tgt_schema, tgt_table) in table_target_map.items()
+    }
+
+    def _is_unsupported_table(table_name: str) -> bool:
+        if not table_name:
+            return False
+        table_key = table_name.split()[0].upper()
+        src_key = table_map.get(table_key)
+        return bool(src_key and src_key in unsupported_keys)
+
+    filtered = dict(extra_results)
+    filtered["trigger_mismatched"] = [
+        item for item in (extra_results.get("trigger_mismatched", []) or [])
+        if not _is_unsupported_table(item.table)
+    ]
+    filtered["trigger_ok"] = [
+        name for name in (extra_results.get("trigger_ok", []) or [])
+        if not _is_unsupported_table(name)
+    ]
+    return filtered
+
+
 def build_schema_mapping(master_list: MasterCheckList) -> Dict[str, str]:
     """
     基于 master_list 中 TABLE 映射，推导 schema 映射：
@@ -20837,6 +20873,12 @@ def main():
         synonym_meta
     )
 
+    extra_results_for_report = filter_trigger_results_for_unsupported_tables(
+        extra_results,
+        support_summary.unsupported_table_keys if support_summary else None,
+        table_target_map
+    )
+
     trigger_list_summary: Optional[Dict[str, object]] = None
     trigger_list_rows: Optional[List[TriggerListReportRow]] = None
     trigger_filter_entries: Optional[Set[str]] = None
@@ -20851,7 +20893,7 @@ def main():
             duplicate_entries,
             total_lines,
             read_error,
-            extra_results,
+            extra_results_for_report,
             oracle_meta,
             ob_meta,
             full_object_mapping,
@@ -21054,7 +21096,7 @@ def main():
     run_summary = print_final_report(
         tv_results,
         total_checked,
-        extra_results,
+        extra_results_for_report,
         comment_results,
         dependency_report,
         report_path,
