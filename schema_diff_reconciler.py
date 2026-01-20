@@ -21057,6 +21057,7 @@ def main():
         )
 
     trigger_status_rows: List[TriggerStatusReportRow] = []
+    support_summary: Optional[ObjectSupportSummary] = None
     if 'TRIGGER' in enabled_extra_types:
         trigger_status_rows = collect_trigger_status_rows(
             oracle_meta,
