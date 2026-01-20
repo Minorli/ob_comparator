@@ -2,11 +2,123 @@
 
 **工具版本**: V0.9.8  
 **分析日期**: 2026-01-20  
+**审查方法**: 场景化交叉验证深度审查  
 **分析范围**: 基于实际代码的生产环境适用性深度审查
+
+> **审查方法升级**: 本次审查采用**场景化交叉验证**方法，系统性推演各种功能组合和边界条件，避免浮于表面的功能点检查。详细审查清单见 `DEEP_AUDIT_SCENARIO_MATRIX.md` 和 `DEEP_AUDIT_FINDINGS.md`。
 
 ---
 
-## 🚨 严重风险 (P0 - 必须解决)
+## 严重风险 (P0 - 必须解决)
+
+### 0. 触发器状态检查未过滤黑名单表依赖 
+
+**代码位置**: lines 3070-3120
+
+**问题场景**: 触发器依赖黑名单表 × 状态差异报告
+
+**问题描述**:
+```python
+# collect_trigger_status_rows 函数
+def collect_trigger_status_rows(...):
+    for src_full, src_info in src_map.items():
+        s_valid = lookup_trigger_validity(oracle_meta, src_owner, src_name)
+        t_valid = lookup_trigger_validity(ob_meta, tgt_owner, tgt_name)
+        
+        if s_valid != t_valid:  # ❌ 未检查表是否在黑名单
+            diffs.append("VALID")
+```
+
+**影响**:
+- ❌ 黑名单表未迁移，依赖该表的触发器在 OB 端必然 INVALID
+- ❌ 程序将此误报为异常，运维人员困惑
+- ❌ 触发器状态报告中出现大量"假异常"
+
+**修复建议**:
+```python
+# 1. 获取触发器依赖的表
+trigger_to_table = {}  # 从 oracle_meta.triggers 构建映射
+table_key = trigger_to_table.get(src_full.upper())
+
+# 2. 如果表在黑名单，跳过状态检查
+if table_key and table_key in oracle_meta.blacklist_tables:
+    continue  # OB 端 INVALID 是正常的
+```
+
+**风险等级**: P0 - 立即修复
+
+---
+
+### 0a. INVALID 视图生成无效 DDL 🆕
+
+**代码位置**: lines 16449-16536
+
+**问题场景**: 源端 INVALID VIEW × DDL 生成
+
+**问题描述**:
+```python
+# VIEW DDL 生成未检查 INVALID 状态
+for src_schema, src_obj, tgt_schema, tgt_obj in view_missing_objects:
+    raw_ddl = ...  # ❌ 未检查源端 VIEW 是否 INVALID
+    # 直接生成 DDL
+```
+
+**对比 PACKAGE 正确处理**:
+```python
+# lines 15723-15727 (PACKAGE 有正确的过滤)
+if row.src_status == "INVALID":
+    log.info("[FIXUP] 跳过源端 INVALID 的 %s %s (不生成 DDL)。", ...)
+    continue
+```
+
+**影响**:
+- ❌ 源端 INVALID VIEW 可能因权限、依赖缺失等原因无法编译
+- ❌ 生成的 DDL 在 OB 端执行失败
+- ❌ 用户不清楚失败根因
+
+**修复建议**:
+```python
+src_status = oracle_meta.object_statuses.get(
+    (src_schema.upper(), src_obj.upper(), "VIEW")
+)
+if normalize_object_status(src_status) == "INVALID":
+    log.info("[FIXUP] 跳过源端 INVALID 的 VIEW %s.%s", src_schema, src_obj)
+    continue
+```
+
+**风险等级**: P0 - 立即修复
+
+---
+
+### 0b. INVALID 触发器生成无效 DDL 🆕
+
+**代码位置**: TRIGGER DDL 生成逻辑（未找到专门过滤）
+
+**问题场景**: 源端 INVALID TRIGGER × DDL 生成
+
+**问题描述**:
+- 与 P0-0a 类似，TRIGGER 也未检查 INVALID 状态
+- INVALID TRIGGER 的 DDL 可能无法编译
+- TRIGGER 使用通用的 `fetch_ddl_with_timing`，无专门过滤
+
+**影响**:
+- ❌ 生成无法编译的 TRIGGER DDL
+- ❌ 增加运维工作量
+
+**修复建议**:
+```python
+# 在 TRIGGER DDL 生成前添加
+src_status = oracle_meta.object_statuses.get(
+    (src_schema.upper(), trg_name.upper(), "TRIGGER")
+)
+if normalize_object_status(src_status) == "INVALID":
+    log.info("[FIXUP] 跳过源端 INVALID 的 TRIGGER %s.%s", src_schema, trg_name)
+    continue
+```
+
+**风险等级**: P0 - 立即修复
+
+---
 
 ### 1. CHECK 约束完全缺失
 
@@ -59,7 +171,7 @@ FROM DBA_CONSTRAINTS
 
 ---
 
-### 2. 外键级联规则 (ON DELETE/UPDATE) 缺失
+### 2. 外键级联规则 (DELETE_RULE) 缺失
 
 **代码位置**: lines 6494-6522, 5586-5607
 
