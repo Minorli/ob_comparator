@@ -2821,15 +2821,20 @@ def run_view_chain_autofix(
             [(0, path) for path in done_files]
         )
 
+    # 根据用户 --only-dirs 决定使用哪些 grant 目录
+    only_dirs_set = set(only_dirs) if only_dirs else set()
+    use_grants_miss = not only_dirs_set or "grants_miss" in only_dirs_set or "grants" in only_dirs_set
+    use_grants_all = not only_dirs_set or "grants_all" in only_dirs_set
+    
     grant_index_miss = build_grant_index(
         fixup_dir,
         set(exclude_dirs),
-        include_dirs={"grants_miss"}
+        include_dirs={"grants_miss"} if use_grants_miss else set()
     )
     grant_index_all = build_grant_index(
         fixup_dir,
         set(exclude_dirs),
-        include_dirs={"grants_all"}
+        include_dirs={"grants_all"} if use_grants_all else set()
     )
 
     plan_dir = fixup_dir / "view_chain_plans"
