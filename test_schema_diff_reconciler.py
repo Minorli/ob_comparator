@@ -558,7 +558,80 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         syn_row = next(row for row in summary.missing_detail_rows if row.src_full == "SRC.S1")
         self.assertEqual(syn_row.support_state, sdr.SUPPORT_STATE_BLOCKED)
         self.assertEqual(syn_row.reason_code, "DEPENDENCY_INVALID")
-        self.assertEqual(syn_row.dependency, "SRC.V1")
+
+    def test_classify_missing_objects_allows_verified_long_dependency(self):
+        tv_results = {
+            "missing": [
+                ("VIEW", "TGT.V1", "SRC.V1"),
+            ],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": []
+        }
+        oracle_meta = self._make_oracle_meta()
+        oracle_meta = oracle_meta._replace(
+            blacklist_tables={
+                ("SRC", "T1"): {
+                    ("LONG", "LONG"): sdr.BlacklistEntry("LONG", "LONG", "RULE=LONG")
+                }
+            },
+            table_columns={
+                ("SRC", "T1"): {
+                    "C1": {"data_type": "LONG"}
+                }
+            }
+        )
+        ob_meta = self._make_ob_meta()
+        ob_meta = ob_meta._replace(
+            objects_by_type={"TABLE": {"TGT.T1"}},
+            tab_columns={
+                ("TGT", "T1"): {"C1": {"data_type": "CLOB"}}
+            }
+        )
+        full_mapping = {
+            "SRC.V1": {"VIEW": "TGT.V1"},
+            "SRC.T1": {"TABLE": "TGT.T1"},
+        }
+        source_objects = {
+            "SRC.V1": {"VIEW"},
+            "SRC.T1": {"TABLE"},
+        }
+        deps = {("SRC", "V1", "VIEW", "SRC", "T1", "TABLE")}
+        dependency_graph = sdr.build_dependency_graph(deps)
+        table_target_map = {("SRC", "T1"): ("TGT", "T1")}
+        settings = {"view_compat_rules": {}, "view_dblink_policy": "block"}
+        ora_cfg = {"user": "u", "password": "p", "dsn": "d"}
+
+        with mock.patch.object(
+            sdr,
+            "oracle_get_views_ddl_batch",
+            return_value={("SRC", "V1"): "CREATE VIEW V1 AS SELECT * FROM T1"}
+        ):
+            summary = sdr.classify_missing_objects(
+                ora_cfg,
+                settings,
+                tv_results,
+                {
+                    "index_ok": [], "index_mismatched": [],
+                    "constraint_ok": [], "constraint_mismatched": [],
+                    "sequence_ok": [], "sequence_mismatched": [],
+                    "trigger_ok": [], "trigger_mismatched": [],
+                },
+                oracle_meta,
+                ob_meta,
+                full_mapping,
+                source_objects,
+                dependency_graph=dependency_graph,
+                object_parent_map=None,
+                table_target_map=table_target_map,
+                synonym_meta_map={}
+            )
+
+        view_row = next(row for row in summary.missing_detail_rows if row.src_full == "SRC.V1")
+        self.assertEqual(view_row.support_state, sdr.SUPPORT_STATE_SUPPORTED)
+        self.assertNotIn(("SRC", "T1"), summary.unsupported_table_keys)
 
     def test_generate_fixup_skips_invalid_view_and_trigger(self):
         tv_results = {

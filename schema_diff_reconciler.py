@@ -3409,11 +3409,41 @@ def classify_missing_objects(
     unsupported_nodes: Set[DependencyNode] = set()
     unsupported_table_map: Dict[str, Tuple[str, str, str]] = {}
     for (schema, table), entries in (oracle_meta.blacklist_tables or {}).items():
+        schema_u = (schema or "").upper()
+        table_u = (table or "").upper()
+        if not schema_u or not table_u:
+            continue
+        full = f"{schema_u}.{table_u}"
+
+        long_only = True
+        for (black_type, data_type), entry in (entries or {}).items():
+            bt = (black_type or "").strip().upper()
+            dt = (data_type or "").strip().upper()
+            if bt != "LONG" and not is_long_type(dt):
+                long_only = False
+                break
+            if entry and entry.black_type and entry.black_type.upper() != "LONG" and not is_long_type(entry.data_type):
+                long_only = False
+                break
+
+        if long_only:
+            tgt_schema_u, tgt_table_u = table_target_map.get((schema_u, table_u), (schema_u, table_u))
+            _status, _detail, verified = evaluate_long_conversion_status(
+                oracle_meta,
+                ob_meta,
+                schema_u,
+                table_u,
+                tgt_schema_u,
+                tgt_table_u
+            )
+            if verified:
+                log.info("[BLACKLIST] LONG 表 %s 已校验转换，依赖不再阻断。", full)
+                continue
+
         black_type, reason, detail = summarize_blacklist_entries(entries)
-        full = f"{schema.upper()}.{table.upper()}"
         unsupported_nodes.add((full, "TABLE"))
         unsupported_table_map[full] = (black_type, reason, detail)
-        unsupported_table_keys.add((schema.upper(), table.upper()))
+        unsupported_table_keys.add((schema_u, table_u))
 
     for (schema, view_name), compat in view_compat_map.items():
         if compat.support_state != SUPPORT_STATE_SUPPORTED:
