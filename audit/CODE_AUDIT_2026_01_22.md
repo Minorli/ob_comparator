@@ -200,6 +200,8 @@
 | P2-1 | `run_view_chain_autofix` 忽略 `--only-dirs` 参数 | run_fixup.py:2824-2833 | **已修复** (commit 1d54b44) |
 | P2-2 | 密码通过命令行传递可见 | obclient 调用 | 使用 `--password-stdin` 或环境变量 |
 | P2-3 | 异常处理过于宽泛 | 多处 `except Exception` | 细化异常类型 |
+| P2-4 | 约束统计遗漏 CHECK 约束 | 第 5488 行 `_count_pkukfk()` | 添加 `'C'` 到条件 |
+| P2-5 | `GRANT_PRIVILEGE_BY_TYPE` 遗漏对象类型 | 第 1760-1772 行 | 补充 TRIGGER/JOB/SCHEDULE/INDEX |
 
 ### P3 级 (建议改进)
 
@@ -208,12 +210,109 @@
 | P3-1 | 单文件过大 | schema_diff_reconciler.py | 拆分为多个模块 |
 | P3-2 | 日志代码重复 | 两个主文件 | 提取共享模块 |
 | P3-3 | 缺少 run_fixup.py 测试 | test_run_fixup.py | 扩展测试覆盖 |
+| P3-4 | 文档/注释遗漏 CHECK 约束 | 第 26/11479/21274 行 | 改为 `(PK/UK/FK/CK)` |
 
 ---
 
-## 8. 架构建议
+## 8. 对象类型覆盖深度审查
 
-### 8.1 模块化拆分建议
+### 8.1 约束类型 (CONSTRAINT) 遗漏分析
+
+#### 发现问题
+
+| 位置 | 问题 | 影响 |
+|------|------|------|
+| 第 5488 行 | `_count_pkukfk()` 只统计 `('P', 'U', 'R')`，遗漏 `'C'` | 报告中约束数量统计不完整 |
+| 第 26 行 | 文档写 `CONSTRAINT (PK/UK/FK)` | 文档不准确 |
+| 第 11479 行 | 注释写 `约束 (PK/UK/FK)` | 文档不准确 |
+| 第 21274 行 | 报告标题写 `6. 约束 (PK/UK/FK) 一致性检查` | 报告标题不准确 |
+
+#### 已正确实现
+
+| 位置 | 说明 |
+|------|------|
+| SQL 查询 (6130/6145/6158/7294 行) | `CONSTRAINT_TYPE IN ('P','U','R','C')` ✅ |
+| `bucket_check()` (10790 行) | 正确处理 `ctype == "C"` ✅ |
+| `match_check_constraints()` (10923 行) | CHECK 约束匹配逻辑完整 ✅ |
+| 修复脚本生成 (18742-18750 行) | `ADD CONSTRAINT ... CHECK (...)` ✅ |
+
+### 8.2 权限映射 (GRANT_PRIVILEGE_BY_TYPE) 遗漏分析
+
+#### 当前定义 (第 1760-1772 行)
+
+```python
+GRANT_PRIVILEGE_BY_TYPE: Dict[str, str] = {
+    'TABLE': 'SELECT',
+    'VIEW': 'SELECT',
+    'MATERIALIZED VIEW': 'SELECT',
+    'SYNONYM': 'SELECT',
+    'SEQUENCE': 'SELECT',
+    'TYPE': 'EXECUTE',
+    'TYPE BODY': 'EXECUTE',
+    'PROCEDURE': 'EXECUTE',
+    'FUNCTION': 'EXECUTE',
+    'PACKAGE': 'EXECUTE',
+    'PACKAGE BODY': 'EXECUTE'
+}
+```
+
+#### 遗漏的对象类型
+
+| 对象类型 | 建议权限 | 影响 |
+|----------|----------|------|
+| `TRIGGER` | 无需单独授权（跟随父表） | 低 - 代码已特殊处理 |
+| `INDEX` | 无需单独授权（跟随父表） | 低 |
+| `JOB` | `EXECUTE` 或无 | 中 - 跨 schema JOB 可能需要 |
+| `SCHEDULE` | `EXECUTE` 或无 | 中 - 跨 schema SCHEDULE 可能需要 |
+
+**评估**：TRIGGER 和 INDEX 的授权已在代码中特殊处理（使用父表的 SELECT 权限），JOB/SCHEDULE 的跨 schema 授权场景较少见，影响有限。
+
+### 8.3 INVALID 状态类型 (INVALID_STATUS_TYPES) 审查
+
+#### 当前定义 (第 638-647 行)
+
+```python
+INVALID_STATUS_TYPES: Set[str] = {
+    'VIEW', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY',
+    'TYPE', 'TYPE BODY', 'TRIGGER'
+}
+```
+
+#### 审查结论
+
+- ✅ 覆盖了所有可能出现 INVALID 状态的 PL/SQL 对象
+- ⚠️ `MATERIALIZED VIEW` 也可能有 INVALID 状态，但当前标记为 `PRINT_ONLY`，不参与校验
+
+### 8.4 对象类型常量统一性审查
+
+#### 常量定义完整性
+
+| 常量 | 定义位置 | 完整性 |
+|------|----------|--------|
+| `PRIMARY_OBJECT_TYPES` | 第 601-614 行 | ✅ 完整 |
+| `EXTRA_OBJECT_CHECK_TYPES` | 第 695-700 行 | ✅ 完整 |
+| `ALL_TRACKED_OBJECT_TYPES` | 第 691-693 行 | ✅ 自动合并 |
+| `OBJECT_COUNT_TYPES` | 第 1030-1047 行 | ✅ 完整 |
+| `GRANT_PRIVILEGE_BY_TYPE` | 第 1760-1772 行 | ⚠️ 缺少 JOB/SCHEDULE |
+
+### 8.5 根因分析
+
+**问题根源**：开发时对某些对象特性认知不完整，导致硬编码列表遗漏。
+
+**典型模式**：
+1. 约束只考虑了 PK/UK/FK，遗漏了 CK
+2. 权限映射只考虑了常见对象，遗漏了 JOB/SCHEDULE
+
+**改进建议**：
+1. 建立对象类型枚举常量，避免多处硬编码
+2. 添加单元测试覆盖所有对象类型
+3. 代码审查时关注"列表完整性"
+
+---
+
+## 9. 架构建议
+
+### 9.1 模块化拆分建议
 
 ```
 schema_diff_reconciler/
@@ -229,7 +328,7 @@ schema_diff_reconciler/
 └── utils.py           # 工具函数
 ```
 
-### 8.2 测试增强建议
+### 9.2 测试增强建议
 
 1. 添加 `run_fixup.py` 单元测试
 2. 添加端到端测试 (使用 Docker Compose 启动测试数据库)
@@ -237,7 +336,7 @@ schema_diff_reconciler/
 
 ---
 
-## 9. 总结
+## 10. 总结
 
 ### 整体评价
 
@@ -253,10 +352,23 @@ schema_diff_reconciler/
 ### 优先修复项
 
 1. ✅ **已修复**: `--only-dirs` 参数被忽略问题
-2. 🔶 **建议修复**: 密码传递方式改进
-3. 🔶 **建议改进**: 代码模块化拆分
+2. 🔶 **P2-4**: 约束统计函数遗漏 CHECK 约束
+3. 🔶 **P2-5**: 权限映射遗漏 JOB/SCHEDULE
+4. 🔶 **建议修复**: 密码传递方式改进
+5. 🔶 **建议改进**: 代码模块化拆分
+
+### 本次审查新增发现
+
+| 类别 | 发现数量 | 说明 |
+|------|----------|------|
+| 约束类型遗漏 | 4 处 | CHECK 约束在统计和文档中被遗漏 |
+| 权限映射遗漏 | 2 处 | JOB/SCHEDULE 未定义默认权限 |
+| 文档不准确 | 3 处 | 约束类型描述不完整 |
+
+**根因**：开发时对某些对象特性认知不完整，导致硬编码列表遗漏。建议建立对象类型枚举常量，避免多处硬编码。
 
 ---
 
 *审核人: Cascade AI*  
-*审核工具版本: 2026.01*
+*审核工具版本: 2026.01*  
+*更新时间: 2026-01-22 15:20*
