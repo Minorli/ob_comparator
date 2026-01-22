@@ -424,6 +424,7 @@ class ObMetadata(NamedTuple):
     """
     objects_by_type: Dict[str, Set[str]]                 # OBJECT_TYPE -> {OWNER.OBJ}
     tab_columns: Dict[Tuple[str, str], Dict[str, Dict]]   # (OWNER, TABLE_NAME) -> {COLUMN_NAME: {type, length, etc.}}
+    invisible_column_supported: bool                     # 是否支持读取 INVISIBLE_COLUMN 元数据
     indexes: Dict[Tuple[str, str], Dict[str, Dict]]      # (OWNER, TABLE_NAME) -> {INDEX_NAME: {uniqueness, columns[list]}}
     constraints: Dict[Tuple[str, str], Dict[str, Dict]]  # (OWNER, TABLE_NAME) -> {CONS_NAME: {type, columns[list]}}
     triggers: Dict[Tuple[str, str], Dict[str, Dict]]     # (OWNER, TABLE_NAME) -> {TRG_NAME: {event, status}}
@@ -444,6 +445,7 @@ class OracleMetadata(NamedTuple):
     源端 Oracle 的元数据缓存，避免在循环中重复查询。
     """
     table_columns: Dict[Tuple[str, str], Dict[str, Dict]]   # (OWNER, TABLE_NAME) -> 列定义
+    invisible_column_supported: bool                        # 是否支持读取 INVISIBLE_COLUMN 元数据
     indexes: Dict[Tuple[str, str], Dict[str, Dict]]        # (OWNER, TABLE_NAME) -> 索引
     constraints: Dict[Tuple[str, str], Dict[str, Dict]]    # (OWNER, TABLE_NAME) -> 约束
     triggers: Dict[Tuple[str, str], Dict[str, Dict]]       # (OWNER, TABLE_NAME) -> 触发器
@@ -696,6 +698,20 @@ EXTRA_OBJECT_CHECK_TYPES: Tuple[str, ...] = (
     'SEQUENCE',
     'TRIGGER'
 )
+
+FIXUP_CREATE_REPLACE_TYPES: Set[str] = {
+    'VIEW',
+    'PROCEDURE',
+    'FUNCTION',
+    'PACKAGE',
+    'PACKAGE BODY',
+    'TRIGGER',
+    'TYPE',
+    'TYPE BODY',
+    'SYNONYM',
+}
+
+FIXUP_IDEMPOTENT_DEFAULT_TYPES: Set[str] = set(FIXUP_CREATE_REPLACE_TYPES)
 
 # 注释比对时批量 IN 子句的大小，避免 ORA-01795
 COMMENT_BATCH_SIZE = 200
@@ -1401,6 +1417,49 @@ def normalize_report_detail_mode(raw_value: Optional[str]) -> str:
     return value
 
 
+FIXUP_IDEMPOTENT_MODE_VALUES = {"off", "guard", "replace", "drop_create"}
+FIXUP_IDEMPOTENT_MODE_ALIASES = {
+    "none": "off",
+    "false": "off",
+    "0": "off",
+    "skip": "guard",
+    "replace_only": "replace",
+    "drop-create": "drop_create",
+    "dropcreate": "drop_create",
+}
+
+
+def normalize_fixup_idempotent_mode(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "off"
+    value = str(raw_value).strip().lower()
+    value = FIXUP_IDEMPOTENT_MODE_ALIASES.get(value, value)
+    if value not in FIXUP_IDEMPOTENT_MODE_VALUES:
+        log.warning("fixup_idempotent_mode=%s 不在支持范围内，将回退为 off。", raw_value)
+        return "off"
+    return value
+
+
+COLUMN_VISIBILITY_POLICY_VALUES = {"auto", "enforce", "ignore"}
+COLUMN_VISIBILITY_POLICY_ALIASES = {
+    "on": "enforce",
+    "true": "enforce",
+    "off": "ignore",
+    "false": "ignore",
+}
+
+
+def normalize_column_visibility_policy(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "auto"
+    value = str(raw_value).strip().lower()
+    value = COLUMN_VISIBILITY_POLICY_ALIASES.get(value, value)
+    if value not in COLUMN_VISIBILITY_POLICY_VALUES:
+        log.warning("column_visibility_policy=%s 不在支持范围内，将回退为 auto。", raw_value)
+        return "auto"
+    return value
+
+
 def normalize_view_dblink_policy(raw_value: Optional[str]) -> str:
     if not raw_value or not str(raw_value).strip():
         return "block"
@@ -2035,6 +2094,8 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         # fixup 定向生成选项
         settings.setdefault('fixup_schemas', '')
         settings.setdefault('fixup_types', '')
+        settings.setdefault('fixup_idempotent_mode', 'off')
+        settings.setdefault('fixup_idempotent_types', '')
         settings.setdefault('synonym_fixup_scope', 'all')
         settings.setdefault('trigger_list', '')
         settings.setdefault('trigger_qualify_schema', 'true')
@@ -2078,6 +2139,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('sqlcl_profile_path', '')
         settings.setdefault('view_compat_rules_path', '')
         settings.setdefault('view_dblink_policy', 'block')
+        settings.setdefault('column_visibility_policy', 'auto')
         settings.setdefault('dbcat_chunk_size', '150')
         settings.setdefault('fixup_workers', '')
         settings.setdefault('progress_log_interval', '10')
@@ -2229,6 +2291,22 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         )
         settings['sequence_remap_policy'] = normalize_sequence_remap_policy(
             settings.get('sequence_remap_policy', 'source_only')
+        )
+        settings['fixup_idempotent_mode'] = normalize_fixup_idempotent_mode(
+            settings.get('fixup_idempotent_mode', 'off')
+        )
+        idempotent_allowed = set(ALL_TRACKED_OBJECT_TYPES) | set(EXTRA_OBJECT_CHECK_TYPES)
+        idempotent_types = parse_type_list(
+            settings.get('fixup_idempotent_types', ''),
+            idempotent_allowed,
+            'fixup_idempotent_types',
+            default_all=False
+        )
+        if not idempotent_types:
+            idempotent_types = set(FIXUP_IDEMPOTENT_DEFAULT_TYPES)
+        settings['fixup_idempotent_types_set'] = idempotent_types
+        settings['column_visibility_policy'] = normalize_column_visibility_policy(
+            settings.get('column_visibility_policy', 'auto')
         )
         settings['trigger_qualify_schema'] = parse_bool_flag(
             settings.get('trigger_qualify_schema', 'true'),
@@ -2507,6 +2585,22 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "仅支持 infer/source_only/dominant_table"
 
+    def _validate_fixup_idempotent_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = FIXUP_IDEMPOTENT_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in FIXUP_IDEMPOTENT_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 off/guard/replace/drop_create"
+
+    def _validate_column_visibility_policy(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = COLUMN_VISIBILITY_POLICY_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in COLUMN_VISIBILITY_POLICY_VALUES:
+            return True, ""
+        return False, "仅支持 auto/enforce/ignore"
+
     def _validate_report_dir_layout(val: str) -> Tuple[bool, str]:
         if not val.strip():
             return True, ""
@@ -2678,6 +2772,14 @@ def run_config_wizard(config_path: Path) -> None:
     )
     _prompt_field(
         "SETTINGS",
+        "column_visibility_policy",
+        "列可见性(INVISIBLE)处理策略 (auto/enforce/ignore)",
+        default=cfg.get("SETTINGS", "column_visibility_policy", fallback="auto"),
+        validator=_validate_column_visibility_policy,
+        transform=normalize_column_visibility_policy,
+    )
+    _prompt_field(
+        "SETTINGS",
         "infer_schema_mapping",
         "是否自动推导 schema 映射 (true/false，默认 false，建议保持 false)",
         default=cfg.get("SETTINGS", "infer_schema_mapping", fallback="true"),
@@ -2740,6 +2842,20 @@ def run_config_wizard(config_path: Path) -> None:
         "fixup_types",
         "限定生成订正 SQL 的对象类型 (留空为全部，如 TABLE,VIEW,TRIGGER)",
         default=cfg.get("SETTINGS", "fixup_types", fallback=""),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "fixup_idempotent_mode",
+        "修补脚本幂等模式 (off/guard/replace/drop_create)",
+        default=cfg.get("SETTINGS", "fixup_idempotent_mode", fallback="off"),
+        validator=_validate_fixup_idempotent_mode,
+        transform=normalize_fixup_idempotent_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "fixup_idempotent_types",
+        "幂等模式作用对象类型 (逗号分隔，留空用默认)",
+        default=cfg.get("SETTINGS", "fixup_idempotent_types", fallback=""),
     )
     _prompt_field(
         "SETTINGS",
@@ -5539,6 +5655,7 @@ def dump_ob_metadata(
         return ObMetadata(
             objects_by_type={},
             tab_columns={},
+            invisible_column_supported=False,
             indexes={},
             constraints={},
             triggers={},
@@ -5686,6 +5803,7 @@ def dump_ob_metadata(
     # --- 2. DBA_TAB_COLUMNS ---
     support_identity_col = False
     support_default_on_null = False
+    support_invisible_col = False
     if include_tab_columns:
         def _probe_ob_dict_col(col_name: str) -> bool:
             sql = (
@@ -5704,27 +5822,29 @@ def dump_ob_metadata(
 
         support_identity_col = _probe_ob_dict_col("IDENTITY_COLUMN")
         support_default_on_null = _probe_ob_dict_col("DEFAULT_ON_NULL")
+        support_invisible_col = _probe_ob_dict_col("INVISIBLE_COLUMN")
 
     identity_col = ", IDENTITY_COLUMN" if support_identity_col else ""
     default_on_null_col = ", DEFAULT_ON_NULL" if support_default_on_null else ""
+    invisible_col = ", INVISIBLE_COLUMN" if support_invisible_col else ""
     sql_cols_ext_tpl = f"""
         SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
                CHAR_LENGTH, DATA_LENGTH, DATA_PRECISION, DATA_SCALE, CHAR_USED, NULLABLE,
                REPLACE(REPLACE(REPLACE(DATA_DEFAULT, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS DATA_DEFAULT
-               {identity_col}{default_on_null_col}
+               {identity_col}{default_on_null_col}{invisible_col}
         FROM DBA_TAB_COLUMNS
         WHERE OWNER IN ({{owners_in}})
     """
     sql_cols_mid_tpl = f"""
         SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
                CHAR_LENGTH, DATA_LENGTH, DATA_PRECISION, DATA_SCALE, NULLABLE, DATA_DEFAULT
-               {identity_col}{default_on_null_col}
+               {identity_col}{default_on_null_col}{invisible_col}
         FROM DBA_TAB_COLUMNS
         WHERE OWNER IN ({{owners_in}})
     """
     sql_cols_basic_tpl = f"""
         SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHAR_LENGTH, NULLABLE, DATA_DEFAULT
-               {identity_col}{default_on_null_col}
+               {identity_col}{default_on_null_col}{invisible_col}
         FROM DBA_TAB_COLUMNS
         WHERE OWNER IN ({{owners_in}})
     """
@@ -5796,11 +5916,15 @@ def dump_ob_metadata(
 
                 identity_flag = None
                 default_on_null_flag = None
+                invisible_flag = None
                 if support_identity_col and len(parts) > idx:
                     identity_flag = _normalize_flag(parts[idx])
                     idx += 1
                 if support_default_on_null and len(parts) > idx:
                     default_on_null_flag = _normalize_flag(parts[idx])
+                    idx += 1
+                if support_invisible_col and len(parts) > idx:
+                    invisible_flag = _normalize_flag(parts[idx])
 
                 key = (owner, table)
                 char_used_clean = char_used.strip().upper() if char_used else ""
@@ -5819,7 +5943,8 @@ def dump_ob_metadata(
                     "virtual": False,
                     "virtual_expr": None,
                     "identity": identity_flag,
-                    "default_on_null": default_on_null_flag
+                    "default_on_null": default_on_null_flag,
+                    "invisible": invisible_flag if support_invisible_col else None
                 }
 
     # --- 2.b 注释 (DBA_TAB_COMMENTS / DBA_COL_COMMENTS) ---
@@ -6296,6 +6421,7 @@ def dump_ob_metadata(
     return ObMetadata(
         objects_by_type=objects_by_type,
         tab_columns=tab_columns,
+        invisible_column_supported=support_invisible_col,
         indexes=indexes,
         constraints=constraints,
         triggers=triggers,
@@ -6767,6 +6893,7 @@ def dump_oracle_metadata(
         log.warning("未检测到需要加载的 Oracle schema，返回空元数据。")
         return OracleMetadata(
             table_columns={},
+            invisible_column_supported=False,
             indexes={},
             constraints={},
             triggers={},
@@ -6811,6 +6938,7 @@ def dump_oracle_metadata(
     package_errors_complete = True
     partition_key_columns: Dict[Tuple[str, str], List[str]] = {}
     interval_partitions: Dict[Tuple[str, str], IntervalPartitionInfo] = {}
+    invisible_column_supported = False
 
     def _safe_upper(value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -6844,6 +6972,7 @@ def dump_oracle_metadata(
                 support_virtual_col = False
                 support_identity_col = False
                 support_default_on_null = False
+                support_invisible_col = False
                 try:
                     with ora_conn.cursor() as cursor:
                         cursor.execute("""
@@ -6900,13 +7029,29 @@ def dump_oracle_metadata(
                 except oracledb.Error as e:
                     log.info("无法探测 DEFAULT_ON_NULL 支持，默认不读取 default_on_null 标记：%s", e)
                     support_default_on_null = False
+                try:
+                    with ora_conn.cursor() as cursor:
+                        cursor.execute("""
+                            SELECT COUNT(*)
+                            FROM DBA_TAB_COLUMNS
+                            WHERE OWNER = 'SYS'
+                              AND TABLE_NAME = 'DBA_TAB_COLUMNS'
+                              AND COLUMN_NAME = 'INVISIBLE_COLUMN'
+                        """)
+                        count_row = cursor.fetchone()
+                        support_invisible_col = bool(count_row and count_row[0] and int(count_row[0]) > 0)
+                except oracledb.Error as e:
+                    log.info("无法探测 INVISIBLE_COLUMN 支持，默认不读取 invisible 标记：%s", e)
+                    support_invisible_col = False
+                invisible_column_supported = support_invisible_col
 
                 # 列定义
                 def _load_ora_tab_columns_sql(
                     include_hidden: bool,
                     include_virtual: bool,
                     include_identity: bool,
-                    include_default_on_null: bool
+                    include_default_on_null: bool,
+                    include_invisible: bool
                 ) -> str:
                     select_cols = [
                         "OWNER", "TABLE_NAME", "COLUMN_NAME", "DATA_TYPE",
@@ -6921,6 +7066,8 @@ def dump_oracle_metadata(
                         select_cols.append("NVL(TO_CHAR(IDENTITY_COLUMN),'NO') AS IDENTITY_COLUMN")
                     if include_default_on_null:
                         select_cols.append("NVL(TO_CHAR(DEFAULT_ON_NULL),'NO') AS DEFAULT_ON_NULL")
+                    if include_invisible:
+                        select_cols.append("NVL(TO_CHAR(INVISIBLE_COLUMN),'NO') AS INVISIBLE_COLUMN")
                     return f"""
                         SELECT {", ".join(select_cols)}
                         FROM DBA_TAB_COLUMNS
@@ -6932,13 +7079,15 @@ def dump_oracle_metadata(
                     include_hidden: bool,
                     include_virtual: bool,
                     include_identity: bool,
-                    include_default_on_null: bool
+                    include_default_on_null: bool,
+                    include_invisible: bool
                 ) -> Dict:
                     idx = 11
                     hidden_flag = False
                     virtual_flag = False
                     identity_flag = None
                     default_on_null_flag = None
+                    invisible_flag = None
                     if include_hidden and len(row) > idx:
                         hidden_flag = (row[idx] or "").strip().upper() == "YES"
                         idx += 1
@@ -6950,6 +7099,9 @@ def dump_oracle_metadata(
                         idx += 1
                     if include_default_on_null and len(row) > idx:
                         default_on_null_flag = (row[idx] or "").strip().upper() == "YES"
+                        idx += 1
+                    if include_invisible and len(row) > idx:
+                        invisible_flag = (row[idx] or "").strip().upper() == "YES"
                     return {
                         "data_type": row[3],
                         "data_length": row[4],
@@ -6963,7 +7115,8 @@ def dump_oracle_metadata(
                         "virtual": virtual_flag,
                         "virtual_expr": row[8] if virtual_flag else None,
                         "identity": identity_flag,
-                        "default_on_null": default_on_null_flag
+                        "default_on_null": default_on_null_flag,
+                        "invisible": invisible_flag if include_invisible else None
                     }
 
                 try:
@@ -6971,7 +7124,8 @@ def dump_oracle_metadata(
                         include_hidden=support_hidden_col,
                         include_virtual=support_virtual_col,
                         include_identity=support_identity_col,
-                        include_default_on_null=support_default_on_null
+                        include_default_on_null=support_default_on_null,
+                        include_invisible=support_invisible_col
                     )
                     with ora_conn.cursor() as cursor:
                         for owner_chunk in owner_chunks:
@@ -6992,20 +7146,23 @@ def dump_oracle_metadata(
                                     support_hidden_col,
                                     support_virtual_col,
                                     support_identity_col,
-                                    support_default_on_null
+                                    support_default_on_null,
+                                    support_invisible_col
                                 )
                 except oracledb.Error as e:
-                    if support_hidden_col or support_virtual_col or support_identity_col or support_default_on_null:
+                    if support_hidden_col or support_virtual_col or support_identity_col or support_default_on_null or support_invisible_col:
                         log.info("读取 DBA_TAB_COLUMNS(含 hidden/virtual) 失败，尝试降级：%s", e)
                         support_hidden_col = False
                         support_virtual_col = False
                         support_identity_col = False
                         support_default_on_null = False
+                        support_invisible_col = False
                         sql_tpl = _load_ora_tab_columns_sql(
                             include_hidden=False,
                             include_virtual=False,
                             include_identity=False,
-                            include_default_on_null=False
+                            include_default_on_null=False,
+                            include_invisible=False
                         )
                         with ora_conn.cursor() as cursor:
                             for owner_chunk in owner_chunks:
@@ -7023,6 +7180,7 @@ def dump_oracle_metadata(
                                         continue
                                     table_columns.setdefault(key, {})[col] = _parse_tab_column_row(
                                         row,
+                                        False,
                                         False,
                                         False,
                                         False,
@@ -7739,6 +7897,7 @@ def dump_oracle_metadata(
 
     return OracleMetadata(
         table_columns=table_columns,
+        invisible_column_supported=invisible_column_supported,
         indexes=indexes,
         constraints=constraints,
         triggers=triggers,
@@ -9314,7 +9473,8 @@ def check_primary_objects(
     ob_meta: ObMetadata,
     oracle_meta: OracleMetadata,
     enabled_primary_types: Optional[Set[str]] = None,
-    print_only_types: Optional[Set[str]] = None
+    print_only_types: Optional[Set[str]] = None,
+    settings: Optional[Dict] = None
 ) -> ReportResults:
     """
     核心主对象校验：
@@ -9332,6 +9492,22 @@ def check_primary_objects(
         "extraneous": extraneous_rules,
         "extra_targets": []
     }
+
+    visibility_policy = normalize_column_visibility_policy(
+        (settings or {}).get("column_visibility_policy", "auto")
+    )
+    visibility_enabled = False
+    if visibility_policy == "enforce":
+        visibility_enabled = True
+        if not oracle_meta.invisible_column_supported:
+            log.info("[CHECK] 源端未提供 INVISIBLE_COLUMN 元数据，列可见性校验可能不完整。")
+        if not ob_meta.invisible_column_supported:
+            log.info("[CHECK] 目标端未提供 INVISIBLE_COLUMN 元数据，列可见性校验可能不完整。")
+    elif visibility_policy == "auto":
+        if oracle_meta.invisible_column_supported and ob_meta.invisible_column_supported:
+            visibility_enabled = True
+        else:
+            log.info("[CHECK] 列可见性校验已跳过 (column_visibility_policy=auto 且元数据不完整)。")
 
     if not master_list:
         log.info("主校验清单为空，没有需要校验的对象。")
@@ -9498,6 +9674,30 @@ def check_primary_objects(
                             "default_on_null_missing"
                         )
                     )
+
+                if visibility_enabled:
+                    src_invisible = src_info.get("invisible")
+                    tgt_invisible = tgt_info.get("invisible")
+                    if src_invisible is True and tgt_invisible is not True:
+                        type_mismatches.append(
+                            ColumnTypeIssue(
+                                col_name,
+                                "INVISIBLE",
+                                "VISIBLE" if tgt_invisible is False else "UNKNOWN",
+                                "INVISIBLE",
+                                "visibility_mismatch"
+                            )
+                        )
+                    elif src_invisible is False and tgt_invisible is True:
+                        type_mismatches.append(
+                            ColumnTypeIssue(
+                                col_name,
+                                "VISIBLE",
+                                "INVISIBLE",
+                                "VISIBLE",
+                                "visibility_mismatch"
+                            )
+                        )
 
                 if is_long_type(src_dtype):
                     expected_type = map_long_type_to_ob(src_dtype)
@@ -15101,6 +15301,226 @@ def split_ddl_statements(ddl: str) -> List[str]:
     return statements
 
 
+def _split_set_schema_prefix(ddl: str) -> Tuple[str, str]:
+    if not ddl:
+        return "", ""
+    lines = ddl.splitlines()
+    idx = 0
+    prefix_lines: List[str] = []
+    if lines and lines[0].strip().upper().startswith("ALTER SESSION SET CURRENT_SCHEMA"):
+        prefix_lines.append(lines[0])
+        idx = 1
+        while idx < len(lines) and not lines[idx].strip():
+            prefix_lines.append(lines[idx])
+            idx += 1
+    if not prefix_lines:
+        return "", ddl
+    prefix = "\n".join(prefix_lines).rstrip()
+    body = "\n".join(lines[idx:]).lstrip("\n")
+    return prefix, body
+
+
+def _strip_trailing_ddl_delimiters(ddl: str) -> str:
+    if not ddl:
+        return ""
+    lines = ddl.strip().splitlines()
+    while lines and lines[-1].strip() == "/":
+        lines.pop()
+    text = "\n".join(lines).rstrip()
+    while text.endswith(";"):
+        text = text[:-1].rstrip()
+    return text.strip()
+
+
+def _ensure_statement_terminated(ddl: str) -> str:
+    if not ddl:
+        return ddl
+    stripped = ddl.rstrip()
+    if stripped.endswith(";") or stripped.endswith("/"):
+        return stripped
+    return stripped + ";"
+
+
+def _ensure_create_or_replace(ddl: str) -> str:
+    if not ddl:
+        return ddl
+    return re.sub(
+        r'^\s*CREATE\s+(?!OR\s+REPLACE\b)',
+        'CREATE OR REPLACE ',
+        ddl,
+        count=1,
+        flags=re.IGNORECASE
+    )
+
+
+def _escape_sql_literal(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def _build_q_quote_literal(text: str) -> str:
+    if text is None:
+        return "''"
+    for delim in ("~", "^", "|", "!", "#", "%", "@", "+", "?", "`", ":"):
+        if delim not in text:
+            return f"q'{delim}{text}{delim}'"
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _build_exist_check_sql(obj_type: str, schema: str, name: str) -> Optional[str]:
+    obj_type_u = (obj_type or "").upper()
+    schema_u = _escape_sql_literal(schema.upper())
+    name_u = _escape_sql_literal(name.upper())
+    if obj_type_u == "TABLE":
+        return f"SELECT COUNT(*) INTO v_count FROM ALL_TABLES WHERE OWNER='{schema_u}' AND TABLE_NAME='{name_u}'"
+    if obj_type_u == "VIEW":
+        return f"SELECT COUNT(*) INTO v_count FROM ALL_VIEWS WHERE OWNER='{schema_u}' AND VIEW_NAME='{name_u}'"
+    if obj_type_u == "MATERIALIZED VIEW":
+        return (
+            "SELECT COUNT(*) INTO v_count FROM ALL_OBJECTS "
+            f"WHERE OWNER='{schema_u}' AND OBJECT_NAME='{name_u}' AND OBJECT_TYPE='MATERIALIZED VIEW'"
+        )
+    if obj_type_u == "SEQUENCE":
+        return f"SELECT COUNT(*) INTO v_count FROM ALL_SEQUENCES WHERE SEQUENCE_OWNER='{schema_u}' AND SEQUENCE_NAME='{name_u}'"
+    if obj_type_u == "INDEX":
+        return f"SELECT COUNT(*) INTO v_count FROM ALL_INDEXES WHERE OWNER='{schema_u}' AND INDEX_NAME='{name_u}'"
+    if obj_type_u == "CONSTRAINT":
+        return f"SELECT COUNT(*) INTO v_count FROM ALL_CONSTRAINTS WHERE OWNER='{schema_u}' AND CONSTRAINT_NAME='{name_u}'"
+    if obj_type_u == "TRIGGER":
+        return f"SELECT COUNT(*) INTO v_count FROM ALL_TRIGGERS WHERE OWNER='{schema_u}' AND TRIGGER_NAME='{name_u}'"
+    if obj_type_u == "SYNONYM":
+        return f"SELECT COUNT(*) INTO v_count FROM ALL_SYNONYMS WHERE OWNER='{schema_u}' AND SYNONYM_NAME='{name_u}'"
+    if obj_type_u == "JOB":
+        return f"SELECT COUNT(*) INTO v_count FROM ALL_SCHEDULER_JOBS WHERE OWNER='{schema_u}' AND JOB_NAME='{name_u}'"
+    if obj_type_u == "SCHEDULE":
+        return f"SELECT COUNT(*) INTO v_count FROM ALL_SCHEDULER_SCHEDULES WHERE OWNER='{schema_u}' AND SCHEDULE_NAME='{name_u}'"
+    if obj_type_u in ("PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE BODY", "TYPE", "TYPE BODY"):
+        return (
+            "SELECT COUNT(*) INTO v_count FROM ALL_OBJECTS "
+            f"WHERE OWNER='{schema_u}' AND OBJECT_NAME='{name_u}' AND OBJECT_TYPE='{obj_type_u}'"
+        )
+    return None
+
+
+def _build_drop_statement(obj_type: str, schema: str, name: str, parent_table: Optional[str] = None) -> Optional[str]:
+    obj_type_u = (obj_type or "").upper()
+    schema_u = schema.upper()
+    name_u = name.upper()
+    if obj_type_u == "CONSTRAINT":
+        if not parent_table:
+            return None
+        return f"ALTER TABLE {schema_u}.{parent_table.upper()} DROP CONSTRAINT {name_u}"
+    if obj_type_u == "PACKAGE BODY":
+        return None
+    if obj_type_u == "TYPE BODY":
+        return None
+    if obj_type_u in ("TABLE", "VIEW", "MATERIALIZED VIEW", "SEQUENCE", "INDEX", "TRIGGER",
+                      "PROCEDURE", "FUNCTION", "PACKAGE", "TYPE", "SYNONYM", "JOB", "SCHEDULE"):
+        return f"DROP {obj_type_u} {schema_u}.{name_u}"
+    return None
+
+
+def _build_guard_block(obj_type: str, schema: str, name: str, ddl: str) -> str:
+    exist_sql = _build_exist_check_sql(obj_type, schema, name)
+    ddl_body = _strip_trailing_ddl_delimiters(ddl)
+    if not exist_sql or not ddl_body:
+        return ddl
+    ddl_literal = _build_q_quote_literal(ddl_body)
+    return (
+        "DECLARE\n"
+        "  v_count NUMBER := 0;\n"
+        "BEGIN\n"
+        "  BEGIN\n"
+        f"    {exist_sql};\n"
+        "  EXCEPTION WHEN OTHERS THEN\n"
+        "    v_count := 0;\n"
+        "  END;\n"
+        "  IF v_count = 0 THEN\n"
+        f"    EXECUTE IMMEDIATE {ddl_literal};\n"
+        "  END IF;\n"
+        "END;\n"
+        "/"
+    )
+
+
+def _build_drop_block(
+    obj_type: str,
+    schema: str,
+    name: str,
+    *,
+    parent_table: Optional[str] = None
+) -> Optional[str]:
+    drop_stmt = _build_drop_statement(obj_type, schema, name, parent_table=parent_table)
+    exist_sql = _build_exist_check_sql(obj_type, schema, name)
+    if not drop_stmt or not exist_sql:
+        return None
+    drop_literal = _build_q_quote_literal(drop_stmt)
+    return (
+        "DECLARE\n"
+        "  v_count NUMBER := 0;\n"
+        "BEGIN\n"
+        "  BEGIN\n"
+        f"    {exist_sql};\n"
+        "  EXCEPTION WHEN OTHERS THEN\n"
+        "    v_count := 0;\n"
+        "  END;\n"
+        "  IF v_count > 0 THEN\n"
+        f"    EXECUTE IMMEDIATE {drop_literal};\n"
+        "  END IF;\n"
+        "END;\n"
+        "/"
+    )
+
+
+def apply_fixup_idempotency(
+    ddl: str,
+    obj_type: str,
+    schema: str,
+    name: str,
+    settings: Dict,
+    stats: Optional[Dict[str, int]] = None,
+    *,
+    parent_table: Optional[str] = None
+) -> str:
+    if not ddl:
+        return ddl
+    obj_type_u = (obj_type or "").upper()
+    mode = normalize_fixup_idempotent_mode(settings.get("fixup_idempotent_mode", "off"))
+    types_set = settings.get("fixup_idempotent_types_set") or set()
+    if mode == "off" or obj_type_u not in types_set:
+        return ddl
+
+    prefix, body = _split_set_schema_prefix(ddl)
+    if obj_type_u in FIXUP_CREATE_REPLACE_TYPES:
+        body = _ensure_create_or_replace(body)
+
+    if mode == "replace":
+        if stats is not None:
+            stats["replaced"] = stats.get("replaced", 0) + 1
+        parts = [p for p in (prefix, body) if p]
+        return "\n".join(parts)
+
+    if mode == "guard" and obj_type_u not in FIXUP_CREATE_REPLACE_TYPES:
+        statements = split_ddl_statements(body)
+        if statements:
+            guarded = _build_guard_block(obj_type_u, schema, name, statements[0])
+            remainder = "\n\n".join(stmt for stmt in statements[1:] if stmt.strip())
+            body = guarded + (f"\n\n{remainder}" if remainder else "")
+        else:
+            body = _build_guard_block(obj_type_u, schema, name, body)
+        if stats is not None:
+            stats["guarded"] = stats.get("guarded", 0) + 1
+
+    if mode == "drop_create":
+        drop_block = _build_drop_block(obj_type_u, schema, name, parent_table=parent_table)
+        if drop_block and stats is not None:
+            stats["drop_create"] = stats.get("drop_create", 0) + 1
+        parts = [p for p in (prefix, drop_block, body) if p]
+        return "\n".join(parts)
+
+    parts = [p for p in (prefix, body) if p]
+    return "\n".join(parts)
+
+
 def extract_statements_for_names(
     ddl: str,
     names: Set[str],
@@ -15839,6 +16259,23 @@ def generate_alter_for_table_columns(
                 lines.append(
                     f"-- WARNING: {col_name.upper()} 缺失 {expected_type} 特性，请人工处理。"
                 )
+            elif issue_type == "visibility_mismatch":
+                if expected_type.upper() == "INVISIBLE":
+                    lines.append(
+                        f"ALTER TABLE {tgt_schema_u}.{tgt_table_u} "
+                        f"MODIFY {col_name.upper()} INVISIBLE; "
+                        f"-- 列可见性需要与源端一致"
+                    )
+                elif expected_type.upper() == "VISIBLE":
+                    lines.append(
+                        f"ALTER TABLE {tgt_schema_u}.{tgt_table_u} "
+                        f"MODIFY {col_name.upper()} VISIBLE; "
+                        f"-- 列可见性需要与源端一致"
+                    )
+                else:
+                    lines.append(
+                        f"-- WARNING: {col_name.upper()} 列可见性差异，请人工处理。"
+                    )
             else:
                 lines.append(
                     f"-- WARNING: {col_name.upper()} 类型差异未自动修复 (源={src_type}, 目标={tgt_type})。"
@@ -15855,6 +16292,35 @@ def generate_alter_for_table_columns(
                 f"DROP COLUMN {col_u};"
             )
 
+    return "\n".join(lines) if lines else None
+
+
+def build_invisible_column_alter_sql(
+    oracle_meta: OracleMetadata,
+    src_schema: str,
+    src_table: str,
+    tgt_schema: str,
+    tgt_table: str,
+    visibility_enabled: bool
+) -> Optional[str]:
+    if not visibility_enabled:
+        return None
+    src_schema_u = src_schema.upper()
+    src_table_u = src_table.upper()
+    tgt_schema_u = tgt_schema.upper()
+    tgt_table_u = tgt_table.upper()
+    col_details = oracle_meta.table_columns.get((src_schema_u, src_table_u), {})
+    if not col_details:
+        return None
+    lines: List[str] = []
+    for col_name, meta in col_details.items():
+        if is_ignored_source_column(col_name, meta):
+            continue
+        if meta.get("invisible") is True:
+            lines.append(
+                f"ALTER TABLE {tgt_schema_u}.{tgt_table_u} "
+                f"MODIFY {col_name.upper()} INVISIBLE;"
+            )
     return "\n".join(lines) if lines else None
 
 
@@ -16056,7 +16522,42 @@ def generate_fixup_scripts(
 
     base_dir = Path(settings.get('fixup_dir', 'fixup_scripts')).expanduser()
     log.info("[FIXUP] 准备生成修补脚本，目标目录=%s", base_dir.resolve())
+    idempotent_stats: Dict[str, int] = {}
+    idempotent_mode = settings.get("fixup_idempotent_mode", "off")
+    idempotent_types = settings.get("fixup_idempotent_types_set") or set()
+    if idempotent_mode and normalize_fixup_idempotent_mode(idempotent_mode) != "off":
+        log.info(
+            "[FIXUP] 幂等模式=%s, types=%s",
+            normalize_fixup_idempotent_mode(idempotent_mode),
+            ",".join(sorted(idempotent_types)) if idempotent_types else "-"
+        )
     view_chain_file: Optional[Path] = None
+    visibility_policy = normalize_column_visibility_policy(
+        settings.get("column_visibility_policy", "auto")
+    )
+    visibility_fixup_enabled = False
+    ob_visibility_supported = bool(ob_meta and ob_meta.invisible_column_supported)
+    if visibility_policy == "enforce":
+        if oracle_meta.invisible_column_supported:
+            visibility_fixup_enabled = True
+            if not ob_visibility_supported:
+                log.warning(
+                    "[FIXUP] column_visibility_policy=enforce，但目标端未暴露 INVISIBLE_COLUMN 元数据，"
+                    "生成的 INVISIBLE DDL 可能无法执行。"
+                )
+        else:
+            log.warning(
+                "[FIXUP] column_visibility_policy=enforce，但源端未提供 INVISIBLE_COLUMN 元数据，"
+                "已跳过 INVISIBLE 修复。"
+            )
+    elif visibility_policy == "auto":
+        if oracle_meta.invisible_column_supported and ob_visibility_supported:
+            visibility_fixup_enabled = True
+        else:
+            log.info(
+                "[FIXUP] column_visibility_policy=auto，INVISIBLE_COLUMN 元数据不完整，"
+                "已跳过 INVISIBLE 修复。"
+            )
 
     if not master_list:
         log.info("[FIXUP] master_list 为空，未生成目标端订正 SQL。")
@@ -17298,6 +17799,14 @@ def generate_fixup_scripts(
                 ddl_adj = apply_hint_filter('SEQUENCE', obj_full, ddl_adj)
                 ddl_adj = apply_ddl_cleanup_rules(ddl_adj, 'SEQUENCE')
                 ddl_adj = strip_constraint_enable(ddl_adj)
+                ddl_adj = apply_fixup_idempotency(
+                    ddl_adj,
+                    'SEQUENCE',
+                    ts,
+                    tn,
+                    settings,
+                    idempotent_stats
+                )
                 filename = f"{ts}.{tn}.sql"
                 header = f"修补缺失的 SEQUENCE {obj_full} (源: {ss}.{sn})"
                 grants_for_seq = collect_grants_for_object(obj_full)
@@ -17378,6 +17887,29 @@ def generate_fixup_scripts(
                 ddl_adj = apply_ddl_cleanup_rules(ddl_adj, 'TABLE')
                 ddl_adj = strip_constraint_enable(ddl_adj)
                 ddl_adj = strip_enable_novalidate(ddl_adj)
+                invisible_sql = build_invisible_column_alter_sql(
+                    oracle_meta,
+                    ss,
+                    st,
+                    ts,
+                    tt,
+                    visibility_fixup_enabled
+                )
+                if invisible_sql:
+                    ddl_adj = _ensure_statement_terminated(ddl_adj)
+                    ddl_adj = (
+                        ddl_adj.rstrip()
+                        + "\n\n-- APPLY INVISIBLE COLUMNS\n"
+                        + invisible_sql
+                    )
+                ddl_adj = apply_fixup_idempotency(
+                    ddl_adj,
+                    'TABLE',
+                    ts,
+                    tt,
+                    settings,
+                    idempotent_stats
+                )
                 filename = f"{ts}.{tt}.sql"
                 header = f"修补缺失的 TABLE {obj_full} (源: {ss}.{st})"
                 grants_for_table = collect_grants_for_object(obj_full)
@@ -17448,6 +17980,21 @@ def generate_fixup_scripts(
                     ddl_adj = apply_ddl_cleanup_rules(ddl_adj, 'TABLE')
                     ddl_adj = strip_constraint_enable(ddl_adj)
                     ddl_adj = strip_enable_novalidate(ddl_adj)
+                    invisible_sql = build_invisible_column_alter_sql(
+                        oracle_meta,
+                        ss,
+                        st,
+                        ts,
+                        tt,
+                        visibility_fixup_enabled
+                    )
+                    if invisible_sql:
+                        ddl_adj = _ensure_statement_terminated(ddl_adj)
+                        ddl_adj = (
+                            ddl_adj.rstrip()
+                            + "\n\n-- APPLY INVISIBLE COLUMNS\n"
+                            + invisible_sql
+                        )
                     filename = f"{ts}.{tt}.sql"
                     header = f"不支持 TABLE DDL {obj_full} (源: {ss}.{st})"
                     subdir = "tables_unsupported/temporary" if is_temporary_support_row(sr) else "tables_unsupported"
@@ -17686,6 +18233,14 @@ def generate_fixup_scripts(
                 # 确保DDL以分号结尾
                 if not final_ddl.rstrip().endswith(';'):
                     final_ddl = final_ddl.rstrip() + ';'
+                final_ddl = apply_fixup_idempotency(
+                    final_ddl,
+                    'VIEW',
+                    tgt_schema,
+                    tgt_obj,
+                    settings,
+                    idempotent_stats
+                )
                 
                 # 写入文件
                 filename = f"{tgt_schema}.{tgt_obj}.sql"
@@ -17865,6 +18420,14 @@ def generate_fixup_scripts(
                         clean_notes = [f"DDL_CLEAN: 全角标点清洗 {replaced} 处。{suffix}"]
                 ddl_adj = strip_constraint_enable(ddl_adj)
                 ddl_adj = enforce_schema_for_ddl(ddl_adj, ts, ot)
+                ddl_adj = apply_fixup_idempotency(
+                    ddl_adj,
+                    ot,
+                    ts,
+                    to,
+                    settings,
+                    idempotent_stats
+                )
                 
                 # --- Find and prepare grants for this object ---
                 grants_for_this_object = collect_grants_for_object(obj_full)
@@ -18027,7 +18590,15 @@ def generate_fixup_scripts(
                             obj_type='INDEX'
                         )
                         ddl_adj = normalize_ddl_for_ob(ddl_adj)
-                        ddl_lines.append(ddl_adj if ddl_adj.endswith(';') else ddl_adj + ';')
+                        ddl_adj = apply_fixup_idempotency(
+                            ddl_adj,
+                            'INDEX',
+                            ts,
+                            idx_name_u,
+                            settings,
+                            idempotent_stats
+                        )
+                        ddl_lines.append(_ensure_statement_terminated(ddl_adj))
                     content = prepend_set_schema("\n".join(ddl_lines), ts)
                     filename = f"{ts}.{idx_name_u}.sql"
                     header = f"修补缺失的 INDEX {idx_name_u} (表: {ts}.{tt})"
@@ -18205,7 +18776,16 @@ def generate_fixup_scripts(
                         ddl_adj = normalize_ddl_for_ob(ddl_adj)
                         ddl_adj = strip_constraint_enable(ddl_adj)
                         ddl_adj = strip_enable_novalidate(ddl_adj)
-                        ddl_lines.append(ddl_adj if ddl_adj.endswith(';') else ddl_adj + ';')
+                        ddl_adj = apply_fixup_idempotency(
+                            ddl_adj,
+                            'CONSTRAINT',
+                            ts,
+                            cons_name_u,
+                            settings,
+                            idempotent_stats,
+                            parent_table=tt
+                        )
+                        ddl_lines.append(_ensure_statement_terminated(ddl_adj))
                     content = prepend_set_schema("\n".join(ddl_lines), ts)
                     filename = f"{ts}.{cons_name_u}.sql"
                     header = f"修补缺失的约束 {cons_name_u} (表: {ts}.{tt})"
@@ -18321,6 +18901,14 @@ def generate_fixup_scripts(
                         clean_notes = [f"DDL_CLEAN: 全角标点清洗 {replaced} 处。{suffix}"]
                 ddl_adj = strip_constraint_enable(ddl_adj)
                 ddl_adj = enforce_schema_for_ddl(ddl_adj, ts, 'TRIGGER')
+                ddl_adj = apply_fixup_idempotency(
+                    ddl_adj,
+                    'TRIGGER',
+                    ts,
+                    to,
+                    settings,
+                    idempotent_stats
+                )
                 grants_for_trigger: Set[str] = set()
                 if tts and tt and ts and tts.upper() != ts.upper():
                     table_full = f"{tts}.{tt}"
@@ -18549,6 +19137,14 @@ def generate_fixup_scripts(
                 summary_lines.append(f"{obj_type}: " + ", ".join(parts))
         if summary_lines:
             log.info("[FIXUP] DDL 来源统计: %s", " | ".join(summary_lines))
+
+    if idempotent_stats and normalize_fixup_idempotent_mode(idempotent_mode) != "off":
+        log.info(
+            "[FIXUP] 幂等处理统计: replace=%d guard=%d drop_create=%d",
+            idempotent_stats.get("replaced", 0),
+            idempotent_stats.get("guarded", 0),
+            idempotent_stats.get("drop_create", 0)
+        )
 
     if ddl_clean_records and report_dir and report_timestamp:
         clean_report_path = export_ddl_clean_report(ddl_clean_records, report_dir, report_timestamp)
@@ -20958,6 +21554,8 @@ def parse_cli_args() -> argparse.Namespace:
             extra_check_progress_interval 扩展对象校验进度日志间隔（秒）
             fixup_schemas           仅对指定目标 schema 生成订正 SQL（逗号分隔，留空为全部）
             fixup_types             仅生成指定对象类型的订正 SQL（留空为全部，例如 TABLE,TRIGGER）
+            fixup_idempotent_mode   修补脚本幂等模式 (off/guard/replace/drop_create)
+            fixup_idempotent_types  幂等模式作用对象类型（逗号分隔，留空用默认）
             synonym_fixup_scope     同义词修补范围 (all/public_only，默认 all)
             trigger_list            仅生成指定触发器清单 (每行 SCHEMA.TRIGGER_NAME)
             trigger_qualify_schema  触发器 DDL 是否强制补全 schema 前缀 (true/false)
@@ -20966,6 +21564,7 @@ def parse_cli_args() -> argparse.Namespace:
             report_dir_layout       报告目录布局 (flat/per_run)
             view_compat_rules_path  VIEW 兼容规则 JSON (可选)
             view_dblink_policy      VIEW DBLINK 处理策略 (block/allow)
+            column_visibility_policy 列可见性(INVISIBLE)处理策略 (auto/enforce/ignore)
             ddl_format_enable       true/false 启用 SQLcl DDL 格式化
             ddl_format_types        DDL 格式化对象类型列表（逗号分隔）
             sqlcl_bin               SQLcl 根目录或 bin/sql 路径
@@ -21468,7 +22067,8 @@ def main():
             ob_meta,
             oracle_meta,
             enabled_primary_types,
-            print_only_types
+            print_only_types,
+            settings=settings
         )
         supplement_missing_views_from_mapping(
             tv_results,

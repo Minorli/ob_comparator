@@ -104,6 +104,15 @@ grant_include_oracle_maintained_roles = false
 # 示例：fixup_types=TABLE,TRIGGER
 fixup_schemas           = 
 fixup_types             = 
+# 修补脚本幂等模式（避免重复执行失败）
+#   off         -> 不处理（默认）
+#   replace     -> 对支持的对象类型使用 CREATE OR REPLACE
+#   guard       -> 对不支持 REPLACE 的对象，存在则跳过创建
+#   drop_create -> 先判断存在则 DROP，再执行 CREATE
+fixup_idempotent_mode   = off
+# 幂等模式作用对象类型（逗号分隔，留空使用默认安全集合）
+# 示例：fixup_idempotent_types=TABLE,INDEX,CONSTRAINT
+fixup_idempotent_types  =
 # 同义词修补范围：
 #   all         -> 生成 PUBLIC + 私有同义词（默认）
 #   public_only -> 仅生成 PUBLIC 同义词
@@ -136,6 +145,11 @@ print_dependency_chains = true
 # 是否比对表/列注释 (DBA_TAB_COMMENTS / DBA_COL_COMMENTS)，若元数据权限不足可设为 false
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 check_comments          = true
+# 列可见性(INVISIBLE)处理策略
+#   auto    -> 元数据可用时校验并生成修补（默认）
+#   enforce -> 强制校验/生成修补（即使元数据不完整）
+#   ignore  -> 不校验列可见性
+column_visibility_policy = auto
 # 黑名单规则来源：
 #   auto       -> TMP_BLACK_TABLE + 规则文件（默认）
 #   table_only -> 仅使用 TMP_BLACK_TABLE

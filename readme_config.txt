@@ -63,6 +63,8 @@
   说明：开启后生成 dependency_chains_*.txt 与 dependency_detail_*.txt。
 - check_comments：是否比对表/列注释。默认：true。
   说明：依赖 DBA_TAB_COMMENTS / DBA_COL_COMMENTS。
+- column_visibility_policy：列可见性(INVISIBLE)处理策略。默认：auto。
+  可选值：auto（元数据可用时校验并生成修补）、enforce（强制校验/修补）、ignore（跳过可见性校验）。
 - infer_schema_mapping：是否启用 schema 推导（多对一/一对多场景）。默认：true。
   说明：用于 remap 未显式覆盖对象的目标 schema 推导。
 - sequence_remap_policy：SEQUENCE 目标 schema 推导策略。默认：source_only。
@@ -88,6 +90,10 @@
   可选值：TABLE, VIEW, MATERIALIZED VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY,
            SYNONYM, JOB, SCHEDULE, TYPE, TYPE BODY, SEQUENCE, TRIGGER, INDEX, CONSTRAINT。
   注意：fixup_types 包含 INDEX/CONSTRAINT/TRIGGER 时，需要 check_primary_types 含 TABLE 才能生成。
+- fixup_idempotent_mode：修补脚本幂等模式。默认：off。
+  可选值：off（不处理）、replace（CREATE OR REPLACE）、guard（存在则跳过创建）、drop_create（存在则 DROP 再创建）。
+- fixup_idempotent_types：幂等模式作用对象类型（逗号分隔）。默认：空（使用安全默认集）。
+  默认集：VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, TRIGGER, TYPE, TYPE BODY, SYNONYM。
 - fixup_workers：修补脚本生成并发数。默认：min(12, CPU)。
 - progress_log_interval：修补生成进度日志间隔（秒）。默认：10；最小 1。
 

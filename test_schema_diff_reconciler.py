@@ -25,10 +25,12 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         sequences: Dict[str, Set[str]] = None,
         indexes: Dict = None,
         constraints: Dict = None,
-        triggers: Dict = None
+        triggers: Dict = None,
+        invisible_supported: bool = False
     ) -> sdr.OracleMetadata:
         return sdr.OracleMetadata(
             table_columns={},
+            invisible_column_supported=invisible_supported,
             indexes=indexes or {},
             constraints=constraints or {},
             triggers=triggers or {},
@@ -57,11 +59,13 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         sequences: Dict[str, Set[str]] = None,
         indexes: Dict = None,
         constraints: Dict = None,
-        triggers: Dict = None
+        triggers: Dict = None,
+        invisible_supported: bool = False
     ) -> sdr.ObMetadata:
         return sdr.ObMetadata(
             objects_by_type={},
             tab_columns={},
+            invisible_column_supported=invisible_supported,
             indexes=indexes or {},
             constraints=constraints or {},
             triggers=triggers or {},
@@ -77,9 +81,15 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             partition_key_columns={}
         )
 
-    def _make_oracle_meta_with_columns(self, table_columns: Dict) -> sdr.OracleMetadata:
+    def _make_oracle_meta_with_columns(
+        self,
+        table_columns: Dict,
+        *,
+        invisible_supported: bool = False
+    ) -> sdr.OracleMetadata:
         return sdr.OracleMetadata(
             table_columns=table_columns,
+            invisible_column_supported=invisible_supported,
             indexes={},
             constraints={},
             triggers={},
@@ -102,10 +112,17 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             interval_partitions={}
         )
 
-    def _make_ob_meta_with_columns(self, objects_by_type: Dict, tab_columns: Dict) -> sdr.ObMetadata:
+    def _make_ob_meta_with_columns(
+        self,
+        objects_by_type: Dict,
+        tab_columns: Dict,
+        *,
+        invisible_supported: bool = False
+    ) -> sdr.ObMetadata:
         return sdr.ObMetadata(
             objects_by_type=objects_by_type,
             tab_columns=tab_columns,
+            invisible_column_supported=invisible_supported,
             indexes={},
             constraints={},
             triggers={},
@@ -239,6 +256,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
                 "PACKAGE": set()
             },
             tab_columns={},
+            invisible_column_supported=False,
             indexes={},
             constraints={},
             triggers={},
@@ -254,6 +272,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         oracle_meta = sdr.OracleMetadata(
             table_columns={},
+            invisible_column_supported=False,
             indexes={},
             constraints={},
             triggers={},
@@ -447,6 +466,190 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         type_mismatches = results["mismatched"][0][5]
         self.assertEqual(len(type_mismatches), 1)
         self.assertEqual(type_mismatches[0].issue, "virtual_missing")
+
+    def test_check_primary_objects_visibility_mismatch(self):
+        master_list = [("SRC.T1", "TGT.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns(
+            {
+                ("SRC", "T1"): {
+                    "C1": {
+                        "data_type": "VARCHAR2",
+                        "data_length": 10,
+                        "char_length": 10,
+                        "char_used": "C",
+                        "nullable": "Y",
+                        "data_default": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                        "identity": False,
+                        "default_on_null": False,
+                        "invisible": True,
+                    }
+                }
+            },
+            invisible_supported=True
+        )
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"TGT.T1"}},
+            {
+                ("TGT", "T1"): {
+                    "C1": {
+                        "data_type": "VARCHAR2",
+                        "data_length": 10,
+                        "char_length": 10,
+                        "char_used": "C",
+                        "nullable": "Y",
+                        "data_default": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                        "identity": False,
+                        "default_on_null": False,
+                        "invisible": False,
+                    }
+                }
+            },
+            invisible_supported=True
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+            settings={"column_visibility_policy": "auto"}
+        )
+        self.assertEqual(len(results["mismatched"]), 1)
+        type_mismatches = results["mismatched"][0][5]
+        self.assertEqual(len(type_mismatches), 1)
+        self.assertEqual(type_mismatches[0].issue, "visibility_mismatch")
+        self.assertEqual(type_mismatches[0].expected_type, "INVISIBLE")
+
+    def test_check_primary_objects_visibility_ignored(self):
+        master_list = [("SRC.T1", "TGT.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns(
+            {
+                ("SRC", "T1"): {
+                    "C1": {
+                        "data_type": "VARCHAR2",
+                        "data_length": 10,
+                        "char_length": 10,
+                        "char_used": "C",
+                        "nullable": "Y",
+                        "data_default": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                        "identity": False,
+                        "default_on_null": False,
+                        "invisible": True,
+                    }
+                }
+            },
+            invisible_supported=True
+        )
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"TGT.T1"}},
+            {
+                ("TGT", "T1"): {
+                    "C1": {
+                        "data_type": "VARCHAR2",
+                        "data_length": 10,
+                        "char_length": 10,
+                        "char_used": "C",
+                        "nullable": "Y",
+                        "data_default": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                        "identity": False,
+                        "default_on_null": False,
+                        "invisible": False,
+                    }
+                }
+            },
+            invisible_supported=True
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+            settings={"column_visibility_policy": "ignore"}
+        )
+        self.assertEqual(results["mismatched"], [])
+        self.assertEqual(len(results["ok"]), 1)
+
+    def test_build_invisible_column_alter_sql(self):
+        oracle_meta = self._make_oracle_meta_with_columns(
+            {
+                ("SRC", "T1"): {
+                    "C1": {
+                        "data_type": "VARCHAR2",
+                        "data_length": 10,
+                        "char_length": 10,
+                        "char_used": "B",
+                        "hidden": False,
+                        "virtual": False,
+                        "invisible": True,
+                    }
+                }
+            },
+            invisible_supported=True
+        )
+        sql = sdr.build_invisible_column_alter_sql(
+            oracle_meta,
+            "SRC",
+            "T1",
+            "TGT",
+            "T1",
+            True
+        )
+        self.assertIsNotNone(sql)
+        self.assertIn("ALTER TABLE TGT.T1 MODIFY C1 INVISIBLE;", sql)
+
+    def test_generate_alter_for_table_columns_visibility_mismatch(self):
+        oracle_meta = self._make_oracle_meta_with_columns(
+            {
+                ("SRC", "T1"): {
+                    "C1": {
+                        "data_type": "VARCHAR2",
+                        "data_length": 10,
+                        "char_length": 10,
+                        "char_used": "B",
+                        "nullable": "Y",
+                        "hidden": False,
+                        "virtual": False,
+                        "identity": False,
+                        "default_on_null": False,
+                    }
+                }
+            }
+        )
+        type_mismatches = [
+            sdr.ColumnTypeIssue(
+                "C1",
+                "VISIBLE",
+                "INVISIBLE",
+                "INVISIBLE",
+                "visibility_mismatch"
+            )
+        ]
+        sql = sdr.generate_alter_for_table_columns(
+            oracle_meta,
+            "SRC",
+            "T1",
+            "TGT",
+            "T1",
+            missing_cols=set(),
+            extra_cols=set(),
+            length_mismatches=[],
+            type_mismatches=type_mismatches
+        )
+        self.assertIsNotNone(sql)
+        self.assertIn("MODIFY C1 INVISIBLE", sql)
 
     def test_filter_trigger_results_for_unsupported_tables(self):
         extra_results = {
@@ -843,6 +1046,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         ob_meta = sdr.ObMetadata(
             objects_by_type={"VIEW": {"A.V1"}},
             tab_columns={},
+            invisible_column_supported=False,
             indexes={},
             constraints={},
             triggers={},
@@ -1147,6 +1351,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         ]
         oracle_meta = sdr.OracleMetadata(
             table_columns={},
+            invisible_column_supported=False,
             indexes={},
             constraints={},
             triggers={},
@@ -1177,6 +1382,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
                 "PACKAGE BODY": {"A.P2"}
             },
             tab_columns={},
+            invisible_column_supported=False,
             indexes={},
             constraints={},
             triggers={},
@@ -1372,6 +1578,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         master_list = [("A.P1", "A.P1", "PACKAGE")]
         oracle_meta = sdr.OracleMetadata(
             table_columns={},
+            invisible_column_supported=False,
             indexes={},
             constraints={},
             triggers={},
@@ -1394,6 +1601,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         ob_meta = sdr.ObMetadata(
             objects_by_type={"PACKAGE": set(), "PACKAGE BODY": set()},
             tab_columns={},
+            invisible_column_supported=False,
             indexes={},
             constraints={},
             triggers={},
@@ -1478,7 +1686,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         }
         master_list = [("A.P1", "A.P1", "PACKAGE")]
         oracle_meta = sdr.OracleMetadata(
-            table_columns={}, indexes={}, constraints={}, triggers={}, sequences={}, sequence_attrs={},
+            table_columns={}, invisible_column_supported=False, indexes={}, constraints={}, triggers={}, sequences={}, sequence_attrs={},
             table_comments={}, column_comments={}, comments_complete=True,
             blacklist_tables={}, object_privileges=[], sys_privileges=[],
             role_privileges=[], role_metadata={}, system_privilege_map=set(),
@@ -1486,7 +1694,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         ob_meta = sdr.ObMetadata(
             objects_by_type={"PACKAGE": set(), "PACKAGE BODY": set()},
-            tab_columns={}, indexes={}, constraints={}, triggers={}, sequences={}, sequence_attrs={},
+            tab_columns={}, invisible_column_supported=False, indexes={}, constraints={}, triggers={}, sequences={}, sequence_attrs={},
             roles=set(), table_comments={}, column_comments={}, comments_complete=True,
             object_statuses={}, package_errors={}, package_errors_complete=False, partition_key_columns={}
         )
@@ -1612,6 +1820,43 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(len(stmts), 1)
         self.assertIn("EXECUTE IMMEDIATE", stmts[0].upper())
 
+    def test_apply_fixup_idempotency_replace(self):
+        ddl = "CREATE VIEW V1 AS SELECT 1 FROM DUAL;"
+        settings = {
+            "fixup_idempotent_mode": "replace",
+            "fixup_idempotent_types_set": {"VIEW"},
+        }
+        out = sdr.apply_fixup_idempotency(ddl, "VIEW", "SCHEMA", "V1", settings)
+        self.assertIn("CREATE OR REPLACE VIEW", out.upper())
+
+    def test_apply_fixup_idempotency_guard_with_remainder(self):
+        ddl = "CREATE TABLE T1 (ID NUMBER);\nCOMMENT ON TABLE T1 IS 'X';"
+        settings = {
+            "fixup_idempotent_mode": "guard",
+            "fixup_idempotent_types_set": {"TABLE"},
+        }
+        out = sdr.apply_fixup_idempotency(ddl, "TABLE", "SCHEMA", "T1", settings)
+        self.assertIn("DECLARE", out)
+        self.assertIn("EXECUTE IMMEDIATE", out)
+        self.assertIn("COMMENT ON TABLE", out.upper())
+
+    def test_apply_fixup_idempotency_drop_create_constraint(self):
+        ddl = "ALTER TABLE S.T1 ADD CONSTRAINT C1 PRIMARY KEY (ID);"
+        settings = {
+            "fixup_idempotent_mode": "drop_create",
+            "fixup_idempotent_types_set": {"CONSTRAINT"},
+        }
+        out = sdr.apply_fixup_idempotency(
+            ddl,
+            "CONSTRAINT",
+            "S",
+            "C1",
+            settings,
+            parent_table="T1"
+        )
+        self.assertIn("DROP CONSTRAINT C1", out.upper())
+        self.assertIn("ALTER TABLE S.T1 ADD CONSTRAINT C1", out.upper())
+
     def test_parse_trigger_list_file(self):
         content = "\n".join([
             "# comment",
@@ -1690,6 +1935,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
                 "TABLE": {"C.T1"},
             },
             tab_columns={},
+            invisible_column_supported=False,
             indexes={},
             constraints={},
             triggers={},
@@ -2017,6 +2263,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
     def test_dependency_grants_add_grantable_for_view_owner(self):
         oracle_meta = sdr.OracleMetadata(
             table_columns={},
+            invisible_column_supported=False,
             indexes={},
             constraints={},
             triggers={},
@@ -2087,6 +2334,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
     def test_build_grant_plan_filters_missing_grantees(self):
         oracle_meta = sdr.OracleMetadata(
             table_columns={},
+            invisible_column_supported=False,
             indexes={},
             constraints={},
             triggers={},
@@ -2241,6 +2489,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         }
         oracle_meta = sdr.OracleMetadata(
             table_columns={},
+            invisible_column_supported=False,
             indexes={},
             constraints=oracle_constraints,
             triggers={},
@@ -2263,6 +2512,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         ob_meta = sdr.ObMetadata(
             objects_by_type={},
             tab_columns={},
+            invisible_column_supported=False,
             indexes={},
             constraints=ob_constraints,
             triggers={},
