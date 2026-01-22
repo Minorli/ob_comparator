@@ -22223,6 +22223,7 @@ def main():
         fixup_dir_label = settings.get('fixup_dir', 'fixup_scripts') or 'fixup_scripts'
         log.info('已开启修补脚本生成，开始写入 %s 目录...', fixup_dir_label)
         with phase_timer("修补脚本生成", phase_durations):
+            grant_plan = None
             if enable_grant_generation:
                 try:
                     grant_progress_interval = float(settings.get('progress_log_interval', 10))
@@ -22302,14 +22303,13 @@ def main():
                     )
             else:
                 log.info("[GRANT] generate_grants=false，授权脚本生成已关闭。")
-                grant_plan = None
 
-                view_chain_file = generate_fixup_scripts(
-                    ora_cfg,
-                    ob_cfg,
-                    settings,
-                    tv_results,
-                    extra_results,
+            view_chain_file = generate_fixup_scripts(
+                ora_cfg,
+                ob_cfg,
+                settings,
+                tv_results,
+                extra_results,
                 master_list,
                 oracle_meta,
                 full_object_mapping,
@@ -22325,12 +22325,12 @@ def main():
                 package_results=package_results,
                 report_dir=report_dir,
                 report_timestamp=timestamp,
-                    fixup_skip_summary=fixup_skip_summary,
-                    support_state_map=support_summary.support_state_map,
-                    unsupported_table_keys=support_summary.unsupported_table_keys,
-                    view_compat_map=support_summary.view_compat_map,
-                    view_dependency_map=view_dependency_map
-                )
+                fixup_skip_summary=fixup_skip_summary,
+                support_state_map=support_summary.support_state_map,
+                unsupported_table_keys=support_summary.unsupported_table_keys,
+                view_compat_map=support_summary.view_compat_map,
+                view_dependency_map=view_dependency_map
+            )
     else:
         log.info('已根据配置跳过修补脚本生成，仅打印对比报告。')
         if enable_grant_generation:
