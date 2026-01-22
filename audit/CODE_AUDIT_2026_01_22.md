@@ -310,9 +310,252 @@ INVALID_STATUS_TYPES: Set[str] = {
 
 ---
 
-## 9. 架构建议
+## 9. 依赖链处理深度审查
 
-### 9.1 模块化拆分建议
+### 9.1 当前实现概述
+
+程序对不同对象类型的依赖链处理存在差异：
+
+| 对象类型 | 依赖链处理 | 拓扑排序 | 授权联动 | 评估 |
+|----------|------------|----------|----------|------|
+| **VIEW** | ✅ 完整 | ✅ `topo_sort_nodes` | ✅ `build_view_chain_plan` | 优秀 |
+| **PACKAGE/BODY** | ✅ 有 | ✅ `_order_package_fixups` | ❌ 无 | 良好 |
+| **TYPE/BODY** | ❌ **遗漏** | ❌ 应复用 PACKAGE 逻辑 | ❌ 无 | **需修复** |
+| **PROCEDURE** | ❌ 无 | ❌ 仅静态层级 | ❌ 无 | 需改进 |
+| **FUNCTION** | ❌ 无 | ❌ 仅静态层级 | ❌ 无 | 需改进 |
+| **TRIGGER** | ❌ 无 | ❌ 仅静态层级 | ❌ 无 | 需改进 |
+
+### 9.2 VIEW 依赖链处理 (正面案例)
+
+**实现位置**：
+- `schema_diff_reconciler.py:8298` - `build_view_fixup_chains()`
+- `run_fixup.py:906` - `topo_sort_nodes()`
+- `run_fixup.py:1337` - `build_view_chain_plan()`
+- `run_fixup.py:2775` - `run_view_chain_autofix()`
+
+**核心逻辑**：
+1. 从 `DBA_DEPENDENCIES` 构建依赖图
+2. 对缺失 VIEW 进行拓扑排序（依赖对象先创建）
+3. 自动规划授权语句（跨 schema 访问）
+4. 按正确顺序执行 DDL
+
+```
+VIEW_A -> TABLE_B -> GRANT -> CREATE VIEW_A
+         VIEW_C  -> GRANT -> CREATE VIEW_C -> CREATE VIEW_A
+```
+
+### 9.3 发现的问题
+
+#### P1-1: DEPENDENCY_LAYERS 顺序错误 (严重)
+
+**位置**: `run_fixup.py:309-322`
+
+```python
+DEPENDENCY_LAYERS = [
+    ...
+    ["procedure", "function"],    # Layer 6
+    ["package", "type"],          # Layer 7  ← TYPE 在 FUNCTION 之后!
+    ["package_body", "type_body"], # Layer 8
+    ...
+]
+```
+
+**问题**: FUNCTION 可能依赖 TYPE，但 TYPE 在 Layer 7，执行顺序晚于 FUNCTION (Layer 6)。
+
+**场景示例**:
+```sql
+-- 缺失对象1: TYPE user_type
+CREATE TYPE user_type AS OBJECT (...);
+
+-- 缺失对象2: FUNCTION get_user (依赖 user_type)
+CREATE FUNCTION get_user RETURN user_type IS ...
+```
+
+**当前行为**: FUNCTION 先执行，因 TYPE 不存在而失败。
+
+**修复建议**: 调整层级顺序或实现全对象拓扑排序。
+
+#### P2-6: TYPE/TYPE BODY 遗漏拓扑排序 (与 PACKAGE 同类问题)
+
+**位置**: `schema_diff_reconciler.py:624-627` 和 `17519-17584`
+
+**问题**: `_order_package_fixups` 只处理 `PACKAGE_OBJECT_TYPES`，不包含 TYPE：
+
+```python
+PACKAGE_OBJECT_TYPES: Tuple[str, ...] = (
+    'PACKAGE',
+    'PACKAGE BODY'
+)  # ← 遗漏了 'TYPE', 'TYPE BODY'
+```
+
+**场景示例**:
+```sql
+-- TYPE A 依赖 TYPE B
+CREATE TYPE type_a AS OBJECT (ref type_b);
+CREATE TYPE type_b AS OBJECT (...);
+```
+
+**修复建议**: 扩展常量或创建独立的 `_order_type_fixups` 函数。
+
+#### P2-7: PROCEDURE/FUNCTION/TRIGGER 缺少层内拓扑排序
+
+**影响对象**: PROCEDURE, FUNCTION, TRIGGER
+
+**问题**: 同一层级内的对象按字母序执行，不考虑相互依赖。
+
+**场景示例**:
+```sql
+-- PROCEDURE A 依赖 PROCEDURE B
+CREATE PROCEDURE proc_a AS BEGIN proc_b; END;
+CREATE PROCEDURE proc_b AS BEGIN NULL; END;
+```
+
+**当前行为**: `proc_a` 先执行（字母序），因 `proc_b` 不存在而失败。
+
+**缓解措施**: 使用 `--iterative` 模式可多轮重试，但效率低。
+
+#### P2-8: 非 VIEW 对象缺少授权联动
+
+**问题**: VIEW 的 `build_view_chain_plan` 会自动规划授权，但其他对象没有。
+
+**场景示例**:
+```sql
+-- SCHEMA_A.PROC_A 调用 SCHEMA_B.PROC_B
+-- 需要: GRANT EXECUTE ON SCHEMA_B.PROC_B TO SCHEMA_A
+```
+
+**当前行为**: 需手动执行 `grants_miss` 目录下的授权脚本。
+
+### 9.4 缓解机制评估
+
+| 机制 | 描述 | 有效性 |
+|------|------|--------|
+| `--iterative` | 多轮重试失败脚本 | ⚠️ 可行但低效 |
+| `--smart-order` | 启用依赖层级排序 | ⚠️ 仅解决跨类型问题 |
+| `--recompile` | 自动重编译 INVALID 对象 | ⚠️ 仅处理已存在对象 |
+| `--view-chain-autofix` | VIEW 专用拓扑排序 | ✅ 仅限 VIEW |
+
+### 9.5 改进建议
+
+1. **短期**: 调整 `DEPENDENCY_LAYERS` 顺序，将 TYPE 移至 FUNCTION 之前
+2. **中期**: 为 PROCEDURE/FUNCTION/TYPE 实现类似 VIEW 的拓扑排序
+3. **长期**: 统一所有对象类型的依赖链处理框架
+
+**建议的层级顺序调整**:
+```python
+DEPENDENCY_LAYERS = [
+    ["sequence"],                    # Layer 0
+    ["table"],                       # Layer 1
+    ["table_alter"],                 # Layer 2
+    ["grants"],                      # Layer 3
+    ["type"],                        # Layer 4: TYPE 先于 FUNCTION
+    ["view", "synonym"],             # Layer 5
+    ["materialized_view"],           # Layer 6
+    ["procedure", "function"],       # Layer 7
+    ["package"],                     # Layer 8
+    ["package_body", "type_body"],   # Layer 9
+    ["constraint", "index"],         # Layer 10
+    ["trigger"],                     # Layer 11
+    ["job", "schedule"],             # Layer 12
+]
+```
+
+---
+
+## 10. Autofix 机制审查
+
+### 10.1 view_chain_autofix 实现审查
+
+**位置**: `run_fixup.py:1337-1480` `build_view_chain_plan()`
+
+**审查结论**: ✅ 实现正确
+
+| 功能点 | 实现 | 评估 |
+|--------|------|------|
+| 拓扑排序 | `topo_sort_nodes()` | ✅ 正确 |
+| 循环检测 | 检测并阻止执行 | ✅ 正确 |
+| 授权规划 | 自动生成跨 schema GRANT | ✅ 正确 |
+| GRANT OPTION | 处理级联授权场景 | ✅ 正确 |
+| DDL 收集 | 按依赖顺序收集 | ✅ 正确 |
+
+### 10.2 其他对象类型 autofix 可行性
+
+| 对象类型 | 可行性 | 复杂度 | 建议 |
+|----------|--------|--------|------|
+| PROCEDURE/FUNCTION | ✅ 高 | 中 | 复用 VIEW 拓扑排序框架 |
+| PACKAGE/BODY | ✅ 高 | 低 | 已有 `_order_package_fixups`，可扩展 |
+| TYPE/BODY | ✅ 高 | 低 | 与 PACKAGE 逻辑相同，可复用 |
+| TRIGGER | ⚠️ 中 | 低 | 依赖表，通常表已存在 |
+| SYNONYM | ⚠️ 中 | 中 | 需处理 PUBLIC 特殊情况 |
+
+### 10.3 统一 autofix 框架建议
+
+```python
+def run_plsql_chain_autofix(
+    object_type: str,  # 'PROCEDURE', 'FUNCTION', 'TYPE', 'PACKAGE'
+    chains: List[List[Tuple[str, str]]],
+    ...
+) -> None:
+    # 1. 解析依赖链文件
+    # 2. 构建依赖图 (复用 build_view_dependency_graph)
+    # 3. 拓扑排序 (复用 topo_sort_nodes)
+    # 4. 规划授权 (EXECUTE 权限)
+    # 5. 按序执行 DDL
+```
+
+---
+
+## 11. PUBLIC 同义词处理审查
+
+### 11.1 预期行为
+
+PUBLIC 同义词 DDL 应不含 schema 前缀:
+```sql
+-- 正确
+CREATE OR REPLACE PUBLIC SYNONYM MY_SYN FOR SCHEMA_A.TABLE_A;
+
+-- 错误
+CREATE OR REPLACE PUBLIC SYNONYM PUBLIC.MY_SYN FOR SCHEMA_A.TABLE_A;
+```
+
+### 11.2 代码审查结果
+
+**已有保护机制**:
+
+1. **META_SYN 路径** (`schema_diff_reconciler.py:16811-16812`):
+   ```python
+   if syn_meta.owner == 'PUBLIC':
+       ddl = f"CREATE OR REPLACE PUBLIC SYNONYM {syn_name} FOR {target};"
+   ```
+   ✅ 正确生成，无 schema 前缀
+
+2. **adjust_ddl_for_object** (`schema_diff_reconciler.py:14043-14046`):
+   ```python
+   if obj_type.upper() == 'SYNONYM' and tgt_schema_u == 'PUBLIC':
+       return result  # 跳过 qualify_main_object_creation
+   ```
+   ✅ 跳过添加 schema 前缀
+
+3. **normalize_public_synonym_name** (`schema_diff_reconciler.py:13582-13598`):
+   ```python
+   # 移除 DDL 中可能存在的 schema 前缀
+   pattern = r'(CREATE\s+(?:OR\s+REPLACE\s+)?PUBLIC\s+SYNONYM\s+)(?:"?[A-Z0-9_\$#]+"?\s*\.)?"?...'
+   ```
+   ✅ 作为兜底清理
+
+### 11.3 潜在问题点
+
+**待确认**: 用户报告的问题可能来自以下场景:
+- 文件名格式 `PUBLIC.SYNONYM_NAME.sql` (这是正确的文件命名)
+- 或特定 DBMS_METADATA 返回格式未被 `normalize_public_synonym_name` 正则覆盖
+
+**建议**: 如遇到具体问题文件，请提供 DDL 内容以便精确定位。
+
+---
+
+## 12. 架构建议
+
+### 12.1 模块化拆分建议
 
 ```
 schema_diff_reconciler/
@@ -328,7 +571,7 @@ schema_diff_reconciler/
 └── utils.py           # 工具函数
 ```
 
-### 9.2 测试增强建议
+### 12.2 测试增强建议
 
 1. 添加 `run_fixup.py` 单元测试
 2. 添加端到端测试 (使用 Docker Compose 启动测试数据库)
@@ -336,7 +579,202 @@ schema_diff_reconciler/
 
 ---
 
-## 10. 总结
+## 13. 深度模块审查
+
+### 13.1 配置加载模块 (`load_config`)
+
+**位置**: `schema_diff_reconciler.py:2052-2394`
+
+**审查结论**: ✅ 实现良好
+
+| 检查项 | 状态 | 说明 |
+|--------|------|------|
+| 默认值设置 | ✅ | 100+ 配置项有合理默认值 |
+| 类型转换 | ✅ | int/bool 转换均有 try/except 保护 |
+| 路径验证 | ✅ | `validate_runtime_paths` 全面检查 |
+| 必填项检查 | ✅ | `source_schemas` 等关键项有校验 |
+
+**改进建议**: 考虑使用 Pydantic 或 dataclass 进行配置模型化。
+
+### 13.2 错误处理模式
+
+**审查结论**: ✅ 一致性良好
+
+```python
+# 标准模式
+try:
+    value = int(settings.get('key', 'default'))
+except (TypeError, ValueError):
+    value = default_value
+if value <= 0:
+    value = default_value
+```
+
+**统计**:
+- `try/except` 块: 200+ 处
+- `sys.exit(1)` 严重错误退出: 20+ 处
+- 日志级别使用: `log.error` / `log.warning` / `log.info` / `log.debug` 分层清晰
+
+### 13.3 DDL 清理模块
+
+**位置**: 多个函数分布在 `schema_diff_reconciler.py`
+
+| 函数 | 功能 | 评估 |
+|------|------|------|
+| `sanitize_plsql_punctuation` | 全角→半角标点 | ✅ 正确，保护字符串字面量 |
+| `cleanup_dbcat_wrappers` | 移除 DELIMITER/$$ | ✅ 正确 |
+| `prepend_set_schema` | 添加 ALTER SESSION | ✅ 防重复 |
+| `normalize_public_synonym_name` | 移除 PUBLIC SYNONYM schema 前缀 | ✅ 正确 |
+| `fix_inline_comment_collapse` | 修复行内注释吞行 | ✅ 正确 |
+| `clean_plsql_ending` | 清理 PL/SQL 结尾语法 | ✅ 正确 |
+
+### 13.4 并发模块
+
+**审查结论**: ✅ 实现正确，无明显竞态条件
+
+**使用模式**:
+```python
+# 标准并发模式
+results_lock = threading.Lock()
+with ThreadPoolExecutor(max_workers=worker_count) as executor:
+    for result in executor.map(task_func, tasks):
+        with results_lock:
+            shared_data.update(result)
+```
+
+**锁使用统计**:
+- `threading.Lock()`: 10+ 处，保护共享数据
+- `threading.Event()`: 1 处，用于错误信号
+- 所有 `ThreadPoolExecutor` 使用 `with` 语句确保资源释放
+
+### 13.5 安全审查
+
+#### P3-1: 密码命令行传递 (低风险)
+
+**位置**: `schema_diff_reconciler.py:5540`, `run_fixup.py`
+
+```python
+'-p' + ob_cfg['password'],  # 密码直接拼接到命令行
+```
+
+**风险**: 
+- 进程列表 (`ps aux`) 可能暴露密码
+- 日志可能记录命令行
+
+**建议**: 使用环境变量或临时配置文件传递敏感信息。
+
+#### P3-2: 无输入校验的 SQL 拼接
+
+**位置**: 多处动态 SQL 构建
+
+**风险**: 低（仅内部使用，无外部输入）
+
+**现状**: 使用 bind placeholders 的场景已正确处理。
+
+### 13.6 OceanBase 元数据加载模块
+
+**位置**: `schema_diff_reconciler.py:5636-6421` `dump_ob_metadata()`
+
+**审查结论**: ✅ 实现良好
+
+| 检查项 | 状态 | 说明 |
+|--------|------|------|
+| 空 schema 处理 | ✅ | 返回空 `ObMetadata` 结构 |
+| PUBLIC 同义词处理 | ✅ | `__PUBLIC` → `PUBLIC` 转换 |
+| TYPE/TYPE BODY 补充 | ✅ | 通过 DBA_TYPES 和 DBA_SOURCE 补充 |
+| 查询失败处理 | ✅ | 关键视图失败则 `sys.exit(1)` |
+| 分块查询 | ✅ | `obclient_query_by_owner_chunks` 防止 SQL 过长 |
+
+### 13.7 报告生成模块
+
+**位置**: `schema_diff_reconciler.py:20614-21000+` `print_final_report()`
+
+**审查结论**: ✅ 实现良好
+
+| 检查项 | 状态 | 说明 |
+|--------|------|------|
+| 参数默认值 | ✅ | 所有 Optional 参数有默认空结构 |
+| 报告宽度 | ✅ | 可配置 `report_width`，避免 nohup 截断 |
+| 详情模式 | ✅ | 支持 `full`/`split` 两种模式 |
+| Rich Console | ✅ | 使用 `record=True` 支持文件输出 |
+
+### 13.8 dbcat 集成模块
+
+**位置**: `schema_diff_reconciler.py:12500-12800` `fetch_dbcat_schema_objects()`
+
+**审查结论**: ✅ 实现良好
+
+| 检查项 | 状态 | 说明 |
+|--------|------|------|
+| 并行导出 | ✅ | `ThreadPoolExecutor` + 可配置 workers |
+| 超时处理 | ✅ | `cli_timeout` 可配置，超时后 `proc.kill()` |
+| 错误传播 | ✅ | `error_occurred` Event 终止其他任务 |
+| 分块处理 | ✅ | `dbcat_chunk_size` 防止命令行过长 |
+| MVIEW 跳过 | ✅ | 明确日志提示 dbcat 不支持 |
+
+### 13.9 边界情况处理
+
+**审查结论**: ✅ 整体良好
+
+| 场景 | 处理方式 | 评估 |
+|------|----------|------|
+| 空列表 | `if not items: return` | ✅ |
+| None 值 | `value or ""`, `if value is None` | ✅ |
+| 空字符串 | `if not raw_value.strip()` | ✅ |
+| 超时 | `TimeoutExpired` 异常捕获 | ✅ |
+| OB 特殊约束 | `is_ob_notnull_constraint` 过滤 | ✅ |
+| OMS 迁移列 | `is_oms_hidden_column` 忽略 | ✅ |
+
+**潜在改进点**:
+- 部分 `split('.')` 未检查结果长度，建议使用 `split('.', 1)` + 解构检查
+
+### 13.10 Oracle 元数据加载模块
+
+**位置**: `schema_diff_reconciler.py:6868-7900+` `dump_oracle_metadata()`
+
+**审查结论**: ✅ 实现良好
+
+| 检查项 | 状态 | 说明 |
+|--------|------|------|
+| 空 schema 处理 | ✅ | 返回空 `OracleMetadata` 结构 |
+| 字段探测 | ✅ | 动态检测 HIDDEN_COLUMN/VIRTUAL_COLUMN 等 |
+| 分块查询 | ✅ | `ORACLE_IN_BATCH_SIZE` 防止 IN 子句过长 |
+| 连接复用 | ✅ | 单连接内执行所有查询 |
+| 特性版本兼容 | ✅ | 低版本 Oracle 自动跳过不支持字段 |
+
+### 13.11 分区表处理模块
+
+**位置**: `schema_diff_reconciler.py:10580-10700+` `generate_interval_partition_statements()`
+
+**审查结论**: ✅ 实现良好
+
+| 检查项 | 状态 | 说明 |
+|--------|------|------|
+| RANGE 分区校验 | ✅ | 非 RANGE 类型跳过 |
+| 单列分区键校验 | ✅ | 多列分区键跳过 |
+| 分区名冲突 | ✅ | 自动添加后缀避免重名 |
+| 迭代上限 | ✅ | `max_iters=10000` 防止无限循环 |
+| 日期/数值双模式 | ✅ | 支持 DATE 和 NUMBER 两种分区类型 |
+
+### 13.12 约束和索引处理
+
+**审查结论**: ✅ 实现良好
+
+| 约束类型 | 处理状态 | 说明 |
+|----------|----------|------|
+| PRIMARY KEY (P) | ✅ | 正确识别和处理 |
+| UNIQUE (U) | ✅ | 正确识别和处理 |
+| FOREIGN KEY (R) | ✅ | 支持 DELETE RULE 对比 |
+| CHECK (C) | ✅ | 支持，过滤系统 NOT NULL 约束 |
+| OB NOTNULL | ✅ | `is_ob_notnull_constraint` 自动过滤 |
+
+**索引处理**:
+- 支持普通索引、唯一索引、位图索引
+- `is_oms_unique_index` 过滤 OMS 迁移工具索引
+
+---
+
+## 14. 总结
 
 ### 整体评价
 
@@ -352,23 +790,30 @@ schema_diff_reconciler/
 ### 优先修复项
 
 1. ✅ **已修复**: `--only-dirs` 参数被忽略问题
-2. 🔶 **P2-4**: 约束统计函数遗漏 CHECK 约束
-3. 🔶 **P2-5**: 权限映射遗漏 JOB/SCHEDULE
-4. 🔶 **建议修复**: 密码传递方式改进
-5. 🔶 **建议改进**: 代码模块化拆分
+2. 🔴 **P1-1**: `DEPENDENCY_LAYERS` 顺序错误 (TYPE 应在 FUNCTION 之前)
+3. 🔶 **P2-4**: 约束统计函数遗漏 CHECK 约束
+4. 🔶 **P2-5**: 权限映射遗漏 JOB/SCHEDULE
+5. 🔶 **P2-6**: TYPE/TYPE BODY 遗漏拓扑排序 (PACKAGE 有但 TYPE 没有)
+6. 🔶 **P2-7**: PROCEDURE/FUNCTION/TRIGGER 缺少层内拓扑排序
+7. 🔶 **P2-8**: 非 VIEW 对象缺少授权联动
+8. 🔶 **建议修复**: 密码传递方式改进
+9. 🔶 **建议改进**: 代码模块化拆分
 
 ### 本次审查新增发现
 
 | 类别 | 发现数量 | 说明 |
 |------|----------|------|
+| 依赖链处理缺陷 | 3 处 | TYPE/FUNCTION 顺序错误、非VIEW缺少拓扑排序、缺少授权联动 |
 | 约束类型遗漏 | 4 处 | CHECK 约束在统计和文档中被遗漏 |
 | 权限映射遗漏 | 2 处 | JOB/SCHEDULE 未定义默认权限 |
 | 文档不准确 | 3 处 | 约束类型描述不完整 |
 
-**根因**：开发时对某些对象特性认知不完整，导致硬编码列表遗漏。建议建立对象类型枚举常量，避免多处硬编码。
+**根因分析**：
+1. **依赖链问题**: VIEW 实现了完整的拓扑排序，但其他 PL/SQL 对象未复用此机制
+2. **类型遗漏问题**: 开发时对某些对象特性认知不完整，导致硬编码列表遗漏
 
 ---
 
 *审核人: Cascade AI*  
 *审核工具版本: 2026.01*  
-*更新时间: 2026-01-22 15:20*
+*更新时间: 2026-01-22 16:15*
