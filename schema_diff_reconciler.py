@@ -6922,6 +6922,7 @@ def dump_oracle_metadata(
     constraints: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     triggers: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     sequences: Dict[str, Set[str]] = {}
+    sequence_attrs: Dict[str, Dict[str, Dict]] = {}
     roles: Set[str] = set()
     table_comments: Dict[Tuple[str, str], Optional[str]] = {}
     column_comments: Dict[Tuple[str, str], Dict[str, Optional[str]]] = {}
