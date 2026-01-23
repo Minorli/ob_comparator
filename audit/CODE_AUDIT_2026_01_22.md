@@ -1237,7 +1237,118 @@ def test_clean_for_loop_collection_attr_range():
 | 🔶 需新增检查 (仅报告) | **1 类** | 列顺序 |
 | ➖ 业务不关心 | **1 类** | 字符集 |
 
-### 15.12 CHECK 约束比对逻辑问题 🔴
+### 15.12 映射场景术语描述不严谨 🟡
+
+**用户反馈**: 程序提示"1:1或一对多场景"这样矛盾的描述
+
+**位置**: 多处日志和注释
+
+#### 问题实例
+
+| 位置 | 原文 | 问题 |
+|------|------|------|
+| 第 5508 行 | `"1:1或一对多场景"` | **矛盾**: 1:1 和一对多是互斥的 |
+| 第 4837 行 | `"多对一、一对一场景"` | 术语混用，不清晰 |
+| 第 5018 行 | `"适用于多对一、一对一场景"` | 同上 |
+
+#### 术语定义建议
+
+| 场景 | 定义 | 示例 |
+|------|------|------|
+| **1:1 (一对一)** | 源 schema 映射到同名目标 schema | `SCHEMA_A` → `SCHEMA_A` |
+| **N:1 (多对一/合并)** | 多个源 schema 合并到同一目标 | `SCHEMA_A`, `SCHEMA_B` → `TARGET` |
+| **1:N (一对多/拆分)** | 一个源 schema 的对象分散到多个目标 | `SCHEMA_A.T1` → `TGT_A.T1`, `SCHEMA_A.T2` → `TGT_B.T2` |
+
+#### 第 5508 行问题分析
+
+```python
+# schema_diff_reconciler.py:5507-5508
+if src_s == tgt_s:
+    log.info("  %s -> %s (1:1或一对多场景)", src_s, tgt_s)
+```
+
+当 `src_s == tgt_s` 时，实际有两种情况：
+1. **真正的 1:1**: 源 schema 自然映射到自身
+2. **一对多回退**: 源 schema 的表分散到多个目标，无法确定单一目标，回退为保持原 schema
+
+**修复建议**:
+
+```python
+if src_s == tgt_s:
+    if (src_s, tgt_set) in one_to_many_schemas:
+        log.info("  %s -> %s (一对多场景，schema 级别回退为 1:1)", src_s, tgt_s)
+    else:
+        log.info("  %s -> %s (1:1)", src_s, tgt_s)
+```
+
+或统一术语为更清晰的表述：
+- `"保持原 schema (1:1 或一对多回退)"`
+- `"schema 级别无法确定唯一目标，按对象级别单独处理"`
+
+### 15.13 同义词 Remap 在 1:1 场景下误判为多对一 🔴
+
+**用户反馈**: 在 1:1 场景下，提示"检测到多对一映射的同义词"并回退到 1:1
+
+**位置**: `resolve_remap_target()` (第 4879-4896 行)
+
+#### 根本原因
+
+```python
+# schema_diff_reconciler.py:4879-4896
+if obj_type_u == 'SYNONYM' and '.' in src_name:
+    src_schema, src_obj = src_name.split('.', 1)
+    inferred_schema, conflict = infer_target_schema_from_direct_dependencies(...)
+    if inferred_schema:
+        return f"{inferred_schema}.{src_obj}"  # ← 使用同义词指向对象的 schema，而非同义词自身的 schema！
+```
+
+同义词的目标 schema 是根据**同义词指向的对象**推导的，而非保持同义词**自身的 schema**。
+
+#### 问题场景
+
+```
+1:1 映射配置:
+  SCHEMA_A → SCHEMA_A
+  SCHEMA_B → SCHEMA_B
+
+源端同义词:
+  SCHEMA_A.MY_SYN → 指向 SCHEMA_B.MY_TABLE
+  SCHEMA_B.MY_SYN → 指向 SCHEMA_B.ANOTHER_TABLE
+
+当前行为:
+  SCHEMA_A.MY_SYN → infer_target_schema_from_direct_dependencies → SCHEMA_B
+                  → 返回 SCHEMA_B.MY_SYN ❌
+  SCHEMA_B.MY_SYN → 返回 SCHEMA_B.MY_SYN
+  
+  两个源映射到同一目标 → 触发"多对一映射"警告！
+
+期望行为 (1:1):
+  SCHEMA_A.MY_SYN → SCHEMA_A.MY_SYN ✓
+  SCHEMA_B.MY_SYN → SCHEMA_B.MY_SYN ✓
+```
+
+#### 修复建议
+
+在 1:1 场景下，同义词应**保持原 schema**，不应跟随其指向对象的 schema：
+
+```python
+if obj_type_u == 'SYNONYM' and '.' in src_name:
+    src_schema, src_obj = src_name.split('.', 1)
+    
+    # 1:1 场景检测：如果 schema_mapping 存在且 src_schema 映射到自身，直接返回 1:1
+    if schema_mapping:
+        tgt_schema = schema_mapping.get(src_schema.upper())
+        if tgt_schema and tgt_schema.upper() == src_schema.upper():
+            return src_name_u  # 保持 1:1
+    
+    # 非 1:1 场景才走依赖推导
+    inferred_schema, conflict = infer_target_schema_from_direct_dependencies(...)
+    ...
+```
+
+或者提供配置项 `synonym_remap_policy=source_only|infer`，类似 `sequence_remap_policy`。
+
+### 15.13 CHECK 约束比对逻辑问题 🔴
 
 **用户反馈**: CHECK 约束检查要求约束名完全一样不合理，约束的功能存在即可，名字可以不同
 
@@ -1365,6 +1476,8 @@ safe_to_clean = (not base_dir.is_absolute()) or (run_root == base_resolved or ru
 
 | ID | 级别 | 问题 | 影响 | 建议 |
 |----|------|------|------|------|
+| P3-17 | P3 | 映射术语描述矛盾 | 用户困惑 | 统一术语，区分场景 |
+| P2-16 | P2 | 同义词 1:1 场景误判为多对一 | 无谓警告，用户困惑 | 1:1 场景保持原 schema |
 | P2-15 | P2 | CHECK 约束优先按名称匹配 | 重命名约束误报不一致 | 改为表达式优先匹配 |
 | P1-2 | P1 | master_list 为空时不清理 fixup 目录 | 旧脚本残留误导用户 | 调整清理逻辑顺序 |
 | P2-9 | P3 | extra_results 重复调用 | 代码冗余 | 重构条件逻辑 |
@@ -1403,19 +1516,21 @@ safe_to_clean = (not base_dir.is_absolute()) or (run_root == base_resolved or ru
 
 ### 优先修复项更新
 
-1. 🔴 **P2-15**: **CHECK 约束比对逻辑** - 优先按名称匹配不合理，应按表达式匹配 (用户反馈，详见 15.12)
-2. 🔴 **P1-2**: **Fixup 目录清理问题** - master_list 为空时不清理旧脚本 (用户反馈，详见 15.13)
-3. ✅ **已修复**: `generate_fixup_scripts` 缩进问题
-4. ✅ **已增强**: CHECK 约束 DEFERRABLE/DEFERRED 支持 (但 OB 侧数据缺失)
-5. 🔴 **P2-13**: fixup 文件删除无异常处理 (新发现)
-6. 🔴 **P2-12**: FOR LOOP 集合属性范围语法清洗规则缺失 (新发现，详见 15.10)
-7. 🔴 **P2-11**: OB 元数据未读取 DEFERRABLE/DEFERRED 字段 (新发现)
-8. 🔴 **P2-10**: `support_summary` 使用前未初始化 (新发现)
-9. 🔴 **P1-1**: `DEPENDENCY_LAYERS` 顺序错误 (待修复)
-10. 🔶 其他之前发现的问题 (参见第 7 节)
+1. � **P3-17**: **映射术语描述矛盾** - "1:1或一对多场景"等矛盾表述 (用户反馈，详见 15.12)
+2. �🔴 **P2-16**: **同义词 1:1 场景误判** - 跨 schema 同义词被错误推导到目标 schema (用户反馈，详见 15.13)
+3. 🔴 **P2-15**: **CHECK 约束比对逻辑** - 优先按名称匹配不合理，应按表达式匹配 (用户反馈，详见 15.14)
+4. 🔴 **P1-2**: **Fixup 目录清理问题** - master_list 为空时不清理旧脚本 (用户反馈，详见 15.15)
+5. ✅ **已修复**: `generate_fixup_scripts` 缩进问题
+6. ✅ **已增强**: CHECK 约束 DEFERRABLE/DEFERRED 支持 (但 OB 侧数据缺失)
+7. 🔴 **P2-13**: fixup 文件删除无异常处理 (新发现)
+8. 🔴 **P2-12**: FOR LOOP 集合属性范围语法清洗规则缺失 (新发现，详见 15.10)
+9. 🔴 **P2-11**: OB 元数据未读取 DEFERRABLE/DEFERRED 字段 (新发现)
+10. 🔴 **P2-10**: `support_summary` 使用前未初始化 (新发现)
+11. 🔴 **P1-1**: `DEPENDENCY_LAYERS` 顺序错误 (待修复)
+12. 🔶 其他之前发现的问题 (参见第 7 节)
 
 ---
 
 *审核人: Cascade AI*  
 *审核工具版本: 2026.01*  
-*更新时间: 2026-01-23 10:36*
+*更新时间: 2026-01-23 15:40*
