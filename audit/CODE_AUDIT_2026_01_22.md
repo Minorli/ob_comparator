@@ -1237,7 +1237,62 @@ def test_clean_for_loop_collection_attr_range():
 | 🔶 需新增检查 (仅报告) | **1 类** | 列顺序 |
 | ➖ 业务不关心 | **1 类** | 字符集 |
 
-### 15.12 Fixup 目录清理问题 🔴
+### 15.12 CHECK 约束比对逻辑问题 🔴
+
+**用户反馈**: CHECK 约束检查要求约束名完全一样不合理，约束的功能存在即可，名字可以不同
+
+**位置**: `match_check_constraints()` (第 11150-11196 行)
+
+#### 当前逻辑
+
+```python
+# schema_diff_reconciler.py:11161-11184
+for expr_key, name, ... in src_list:
+    if name in tgt_by_name:           # ← 优先按名称匹配
+        if tgt_expr_key != expr_key:  # 名称相同但表达式不同 → 报不一致
+            detail_mismatch.append(...)
+        continue                       # ← 不再尝试按表达式匹配！
+    if expr_key in tgt_by_expr:       # ← 只有名称不匹配时才按表达式匹配
+        ...
+```
+
+#### 问题场景
+
+| 源端 | 目标端 | 当前行为 | 期望行为 |
+|------|--------|----------|----------|
+| `CHK_A: X > 0` | `CHK_B: X > 0` | ✅ 匹配 | ✅ 匹配 |
+| `CHK_A: X > 0` | `CHK_A: Y > 0`, `CHK_C: X > 0` | ❌ 报名称匹配但表达式不同 | ✅ 应匹配 `CHK_C` |
+| `CHK_A: X > 0` | `CHK_A: X > 0` | ✅ 匹配 | ✅ 匹配 |
+
+**影响**: 当目标端约束被重命名或重建时，即使功能完全相同也会误报不一致。
+
+#### 修复建议
+
+将匹配策略改为**表达式优先**:
+
+```python
+def match_check_constraints(src_list, tgt_list):
+    tgt_by_expr: Dict[str, List[str]] = defaultdict(list)
+    for expr_key, name, ... in tgt_list:
+        tgt_by_expr[expr_key].append(name)
+    
+    used: Set[str] = set()
+    for expr_key, name, ... in src_list:
+        # 优先按表达式匹配，不再优先按名称
+        if expr_key in tgt_by_expr and tgt_by_expr[expr_key]:
+            matched_name = tgt_by_expr[expr_key].pop()
+            used.add(matched_name)
+            continue
+        missing.add(name)
+        detail_mismatch.append(f"CHECK: 源约束 {name} (...) 在目标端未找到。")
+    
+    # 标记目标端多余约束
+    for expr_key, name, ... in tgt_list:
+        if name not in used:
+            extra.add(name)
+```
+
+### 15.13 Fixup 目录清理问题 🔴
 
 **用户反馈**: 进入 fixup 逻辑后不会清空之前的 fixup 目录，导致新的 fixup 无法生成
 
@@ -1310,6 +1365,7 @@ safe_to_clean = (not base_dir.is_absolute()) or (run_root == base_resolved or ru
 
 | ID | 级别 | 问题 | 影响 | 建议 |
 |----|------|------|------|------|
+| P2-15 | P2 | CHECK 约束优先按名称匹配 | 重命名约束误报不一致 | 改为表达式优先匹配 |
 | P1-2 | P1 | master_list 为空时不清理 fixup 目录 | 旧脚本残留误导用户 | 调整清理逻辑顺序 |
 | P2-9 | P3 | extra_results 重复调用 | 代码冗余 | 重构条件逻辑 |
 | P2-10 | P2 | support_summary 使用前未初始化 | trigger 过滤不准确 | 调整调用顺序 |
@@ -1347,18 +1403,19 @@ safe_to_clean = (not base_dir.is_absolute()) or (run_root == base_resolved or ru
 
 ### 优先修复项更新
 
-1. 🔴 **P1-2**: **Fixup 目录清理问题** - master_list 为空时不清理旧脚本 (用户反馈，详见 15.12)
-2. ✅ **已修复**: `generate_fixup_scripts` 缩进问题
-3. ✅ **已增强**: CHECK 约束 DEFERRABLE/DEFERRED 支持 (但 OB 侧数据缺失)
-4. 🔴 **P2-13**: fixup 文件删除无异常处理 (新发现)
-5. 🔴 **P2-12**: FOR LOOP 集合属性范围语法清洗规则缺失 (新发现，详见 15.10)
-6. 🔴 **P2-11**: OB 元数据未读取 DEFERRABLE/DEFERRED 字段 (新发现)
-7. 🔴 **P2-10**: `support_summary` 使用前未初始化 (新发现)
-8. 🔴 **P1-1**: `DEPENDENCY_LAYERS` 顺序错误 (待修复)
-9. 🔶 其他之前发现的问题 (参见第 7 节)
+1. 🔴 **P2-15**: **CHECK 约束比对逻辑** - 优先按名称匹配不合理，应按表达式匹配 (用户反馈，详见 15.12)
+2. 🔴 **P1-2**: **Fixup 目录清理问题** - master_list 为空时不清理旧脚本 (用户反馈，详见 15.13)
+3. ✅ **已修复**: `generate_fixup_scripts` 缩进问题
+4. ✅ **已增强**: CHECK 约束 DEFERRABLE/DEFERRED 支持 (但 OB 侧数据缺失)
+5. 🔴 **P2-13**: fixup 文件删除无异常处理 (新发现)
+6. 🔴 **P2-12**: FOR LOOP 集合属性范围语法清洗规则缺失 (新发现，详见 15.10)
+7. 🔴 **P2-11**: OB 元数据未读取 DEFERRABLE/DEFERRED 字段 (新发现)
+8. 🔴 **P2-10**: `support_summary` 使用前未初始化 (新发现)
+9. 🔴 **P1-1**: `DEPENDENCY_LAYERS` 顺序错误 (待修复)
+10. 🔶 其他之前发现的问题 (参见第 7 节)
 
 ---
 
 *审核人: Cascade AI*  
 *审核工具版本: 2026.01*  
-*更新时间: 2026-01-23 09:40*
+*更新时间: 2026-01-23 10:36*
