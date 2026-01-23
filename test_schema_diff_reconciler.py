@@ -60,7 +60,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         indexes: Dict = None,
         constraints: Dict = None,
         triggers: Dict = None,
-        invisible_supported: bool = False
+        invisible_supported: bool = False,
+        constraint_deferrable_supported: bool = False
     ) -> sdr.ObMetadata:
         return sdr.ObMetadata(
             objects_by_type={},
@@ -78,7 +79,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             object_statuses={},
             package_errors={},
             package_errors_complete=False,
-            partition_key_columns={}
+            partition_key_columns={},
+            constraint_deferrable_supported=constraint_deferrable_supported
         )
 
     def _make_oracle_meta_with_columns(
@@ -117,7 +119,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         objects_by_type: Dict,
         tab_columns: Dict,
         *,
-        invisible_supported: bool = False
+        invisible_supported: bool = False,
+        constraint_deferrable_supported: bool = False
     ) -> sdr.ObMetadata:
         return sdr.ObMetadata(
             objects_by_type=objects_by_type,
@@ -135,7 +138,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             object_statuses={},
             package_errors={},
             package_errors_complete=False,
-            partition_key_columns={}
+            partition_key_columns={},
+            constraint_deferrable_supported=constraint_deferrable_supported
         )
 
     def test_infer_dominant_schema_tables_only(self):
@@ -268,7 +272,9 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             comments_complete=True,
             object_statuses={},
             package_errors={},
-            package_errors_complete=False, partition_key_columns={}
+            package_errors_complete=False,
+            partition_key_columns={},
+            constraint_deferrable_supported=False
         )
         oracle_meta = sdr.OracleMetadata(
             table_columns={},
@@ -1030,6 +1036,174 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertLess(order_index.get(("package", "TGT.PKG_A.sql")), order_index.get(("package_body", "TGT.PKG_A.sql")))
         self.assertLess(order_index.get(("package", "TGT.PKG_B.sql")), order_index.get(("package_body", "TGT.PKG_B.sql")))
 
+    def test_generate_fixup_orders_types_before_routines(self):
+        tv_results = {
+            "missing": [
+                ("TYPE BODY", "TGT.TYP1", "SRC.TYP1"),
+                ("TYPE", "TGT.TYP1", "SRC.TYP1"),
+                ("FUNCTION", "TGT.F1", "SRC.F1"),
+                ("PROCEDURE", "TGT.P1", "SRC.P1"),
+            ],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": [],
+            "remap_conflicts": []
+        }
+        extra_results = {
+            "index_ok": [], "index_mismatched": [],
+            "constraint_ok": [], "constraint_mismatched": [],
+            "sequence_ok": [], "sequence_mismatched": [],
+            "trigger_ok": [], "trigger_mismatched": [],
+        }
+        master_list = [
+            ("SRC.TYP1", "TGT.TYP1", "TYPE"),
+            ("SRC.TYP1", "TGT.TYP1", "TYPE BODY"),
+            ("SRC.F1", "TGT.F1", "FUNCTION"),
+            ("SRC.P1", "TGT.P1", "PROCEDURE"),
+        ]
+        oracle_meta = self._make_oracle_meta()
+        ob_meta = self._make_ob_meta()._replace(
+            objects_by_type={"TYPE": set(), "TYPE BODY": set(), "FUNCTION": set(), "PROCEDURE": set()}
+        )
+        full_mapping = {
+            "SRC.TYP1": {"TYPE": "TGT.TYP1", "TYPE BODY": "TGT.TYP1"},
+            "SRC.F1": {"FUNCTION": "TGT.F1"},
+            "SRC.P1": {"PROCEDURE": "TGT.P1"},
+        }
+        expected_pairs = {
+            ("TGT.F1", "FUNCTION", "TGT.TYP1", "TYPE"),
+            ("TGT.P1", "PROCEDURE", "TGT.TYP1", "TYPE"),
+        }
+        dbcat_data = {
+            "SRC": {
+                "TYPE": {"TYP1": "CREATE OR REPLACE TYPE SRC.TYP1 AS OBJECT (C1 NUMBER);"},
+                "TYPE BODY": {"TYP1": "CREATE OR REPLACE TYPE BODY SRC.TYP1 AS END;"},
+                "FUNCTION": {"F1": "CREATE OR REPLACE FUNCTION SRC.F1 RETURN NUMBER AS BEGIN RETURN 1; END;"},
+                "PROCEDURE": {"P1": "CREATE OR REPLACE PROCEDURE SRC.P1 AS BEGIN NULL; END;"},
+            }
+        }
+        dbcat_meta = {
+            ("SRC", "TYPE", "TYP1"): ("cache", 0.01),
+            ("SRC", "TYPE BODY", "TYP1"): ("cache", 0.01),
+            ("SRC", "FUNCTION", "F1"): ("cache", 0.01),
+            ("SRC", "PROCEDURE", "P1"): ("cache", 0.01),
+        }
+        settings = {
+            "fixup_dir": "",
+            "fixup_workers": 1,
+            "progress_log_interval": 999,
+            "fixup_type_set": {"TYPE", "TYPE BODY", "FUNCTION", "PROCEDURE"},
+            "fixup_schema_list": set(),
+        }
+        recorded: List[Tuple[str, str]] = []
+
+        def fake_write_fixup_file(_base, subdir, filename, *_args, **_kwargs):
+            if subdir in ("type", "type_body", "function", "procedure"):
+                recorded.append((subdir, filename))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings["fixup_dir"] = tmp_dir
+            orig_write = sdr.write_fixup_file
+            orig_fetch = sdr.fetch_dbcat_schema_objects
+            orig_ver = sdr.get_oceanbase_version
+            try:
+                sdr.write_fixup_file = fake_write_fixup_file
+                sdr.fetch_dbcat_schema_objects = lambda *_a, **_k: (dbcat_data, dbcat_meta)
+                sdr.get_oceanbase_version = lambda *_a, **_k: None
+                sdr.generate_fixup_scripts(
+                    {"user": "u", "password": "p", "dsn": "d"},
+                    {"executable": "obclient", "host": "h", "port": "1", "user_string": "u", "password": "p"},
+                    settings,
+                    tv_results,
+                    extra_results,
+                    master_list,
+                    oracle_meta,
+                    full_mapping,
+                    {},
+                    grant_plan=None,
+                    enable_grant_generation=False,
+                    dependency_report={"missing": [], "unexpected": [], "skipped": []},
+                    ob_meta=ob_meta,
+                    expected_dependency_pairs=expected_pairs,
+                    synonym_metadata={},
+                    trigger_filter_entries=None,
+                    trigger_filter_enabled=False,
+                    package_results=None,
+                    report_dir=None,
+                    report_timestamp=None,
+                    support_state_map={},
+                    unsupported_table_keys=set(),
+                    view_compat_map={}
+                )
+            finally:
+                sdr.write_fixup_file = orig_write
+                sdr.fetch_dbcat_schema_objects = orig_fetch
+                sdr.get_oceanbase_version = orig_ver
+        order_index = {item: idx for idx, item in enumerate(recorded)}
+        self.assertLess(order_index.get(("type", "TGT.TYP1.sql")), order_index.get(("function", "TGT.F1.sql")))
+        self.assertLess(order_index.get(("type", "TGT.TYP1.sql")), order_index.get(("procedure", "TGT.P1.sql")))
+        self.assertLess(order_index.get(("type", "TGT.TYP1.sql")), order_index.get(("type_body", "TGT.TYP1.sql")))
+
+    def test_generate_fixup_cleans_dir_when_master_list_empty(self):
+        tv_results = {
+            "missing": [],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": [],
+            "remap_conflicts": []
+        }
+        extra_results = {
+            "index_ok": [], "index_mismatched": [],
+            "constraint_ok": [], "constraint_mismatched": [],
+            "sequence_ok": [], "sequence_mismatched": [],
+            "trigger_ok": [], "trigger_mismatched": [],
+        }
+        oracle_meta = self._make_oracle_meta()
+        ob_meta = self._make_ob_meta()
+        settings = {
+            "fixup_dir": "",
+            "fixup_force_clean": "true",
+            "fixup_workers": 1,
+            "progress_log_interval": 999,
+            "fixup_type_set": set(),
+            "fixup_schema_list": set(),
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            fixup_dir = Path(tmp_dir)
+            dummy_path = fixup_dir / "old.sql"
+            dummy_path.write_text("SELECT 1;\n", encoding="utf-8")
+            settings["fixup_dir"] = str(fixup_dir)
+            sdr.generate_fixup_scripts(
+                {"user": "u", "password": "p", "dsn": "d"},
+                {"executable": "obclient", "host": "h", "port": "1", "user_string": "u", "password": "p"},
+                settings,
+                tv_results,
+                extra_results,
+                [],
+                oracle_meta,
+                {},
+                {},
+                grant_plan=None,
+                enable_grant_generation=False,
+                dependency_report={"missing": [], "unexpected": [], "skipped": []},
+                ob_meta=ob_meta,
+                expected_dependency_pairs=set(),
+                synonym_metadata={},
+                trigger_filter_entries=None,
+                trigger_filter_enabled=False,
+                package_results=None,
+                report_dir=None,
+                report_timestamp=None,
+                support_state_map={},
+                unsupported_table_keys=set(),
+                view_compat_map={}
+            )
+            self.assertFalse(dummy_path.exists())
+
     def test_supplement_missing_views_from_mapping(self):
         tv_results = {
             "missing": [],
@@ -1085,6 +1259,17 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         ddl = "BEGIN FOR i IN 7.v_tablen LOOP NULL; END LOOP; END;"
         cleaned = sdr.clean_for_loop_single_dot_range(ddl)
         self.assertIn("IN 7..v_tablen", cleaned)
+
+    def test_clean_for_loop_collection_attr_range(self):
+        ddl = "BEGIN FOR i IN v_list.FIRST.v_list.LAST LOOP NULL; END LOOP; END;"
+        cleaned = sdr.clean_for_loop_collection_attr_range(ddl)
+        self.assertIn("v_list.FIRST..v_list.LAST", cleaned)
+        ddl = "BEGIN FOR i IN arr.COUNT.10 LOOP NULL; END LOOP; END;"
+        cleaned = sdr.clean_for_loop_collection_attr_range(ddl)
+        self.assertIn("arr.COUNT..10", cleaned)
+        ddl = "BEGIN FOR i IN v_list.FIRST..v_list.LAST LOOP NULL; END LOOP; END;"
+        cleaned = sdr.clean_for_loop_collection_attr_range(ddl)
+        self.assertIn("v_list.FIRST..v_list.LAST", cleaned)
 
     def test_normalize_synonym_fixup_scope(self):
         self.assertEqual(sdr.normalize_synonym_fixup_scope(None), "all")
@@ -2627,7 +2812,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             }
         }
         oracle_meta = self._make_oracle_meta(constraints=oracle_constraints)
-        ob_meta = self._make_ob_meta(constraints=ob_constraints)
+        ob_meta = self._make_ob_meta(constraints=ob_constraints, constraint_deferrable_supported=True)
         ok, mismatch = sdr.compare_constraints_for_table(
             oracle_meta,
             ob_meta,
@@ -2640,6 +2825,82 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIsNotNone(mismatch)
         self.assertTrue(any("DEFERRABLE" in msg for msg in mismatch.detail_mismatch))
+
+    def test_compare_constraints_for_table_check_deferrable_unknown_target(self):
+        oracle_constraints = {
+            ("A", "T1"): {
+                "CK_SRC": {
+                    "type": "C",
+                    "columns": ["C1"],
+                    "search_condition": "C1>0",
+                    "deferrable": "DEFERRABLE",
+                    "deferred": "DEFERRED",
+                }
+            }
+        }
+        ob_constraints = {
+            ("A", "T1"): {
+                "CK_SRC": {
+                    "type": "C",
+                    "columns": ["C1"],
+                    "search_condition": "C1>0",
+                }
+            }
+        }
+        oracle_meta = self._make_oracle_meta(constraints=oracle_constraints)
+        ob_meta = self._make_ob_meta(constraints=ob_constraints, constraint_deferrable_supported=False)
+        ok, mismatch = sdr.compare_constraints_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+            {}
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(mismatch)
+
+    def test_compare_constraints_for_table_check_expr_first_name_mismatch(self):
+        oracle_constraints = {
+            ("A", "T1"): {
+                "CK_A": {
+                    "type": "C",
+                    "columns": ["C1"],
+                    "search_condition": "C1 > 0",
+                }
+            }
+        }
+        ob_constraints = {
+            ("A", "T1"): {
+                "CK_A": {
+                    "type": "C",
+                    "columns": ["C1"],
+                    "search_condition": "C1 > 1",
+                },
+                "CK_B": {
+                    "type": "C",
+                    "columns": ["C1"],
+                    "search_condition": "C1 > 0",
+                },
+            }
+        }
+        oracle_meta = self._make_oracle_meta(constraints=oracle_constraints)
+        ob_meta = self._make_ob_meta(constraints=ob_constraints)
+        ok, mismatch = sdr.compare_constraints_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+            {}
+        )
+        self.assertFalse(ok)
+        self.assertIsNotNone(mismatch)
+        self.assertEqual(mismatch.missing_constraints, set())
+        self.assertIn("CK_A", mismatch.extra_constraints)
+        self.assertTrue(any("条件不一致" in item for item in mismatch.detail_mismatch))
 
     def test_classify_unsupported_check_constraints(self):
         oracle_constraints = {
@@ -2737,6 +2998,70 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             ("A", "T1"): {
                 "IDX1": {
                     "columns": ["SYS_NC00004$"],
+                    "expressions": {},
+                    "uniqueness": "NONUNIQUE",
+                }
+            }
+        }
+        oracle_meta = self._make_oracle_meta(indexes=oracle_indexes)
+        ob_meta = self._make_ob_meta(indexes=ob_indexes)
+        ok, mismatch = sdr.compare_indexes_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(mismatch)
+
+    def test_compare_indexes_sys_nc_name_mismatch(self):
+        oracle_indexes = {
+            ("A", "T1"): {
+                "IDX_SRC": {
+                    "columns": ["SYS_NC00001$"],
+                    "expressions": {},
+                    "uniqueness": "NONUNIQUE",
+                }
+            }
+        }
+        ob_indexes = {
+            ("A", "T1"): {
+                "IDX_TGT": {
+                    "columns": ["SYS_NC00002$"],
+                    "expressions": {},
+                    "uniqueness": "NONUNIQUE",
+                }
+            }
+        }
+        oracle_meta = self._make_oracle_meta(indexes=oracle_indexes)
+        ob_meta = self._make_ob_meta(indexes=ob_indexes)
+        ok, mismatch = sdr.compare_indexes_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(mismatch)
+
+    def test_compare_indexes_expression_sys_nc_name_mismatch(self):
+        oracle_indexes = {
+            ("A", "T1"): {
+                "IDX_SRC": {
+                    "columns": ["SYS_NC00004$"],
+                    "expressions": {1: "UPPER(NAME)"},
+                    "uniqueness": "NONUNIQUE",
+                }
+            }
+        }
+        ob_indexes = {
+            ("A", "T1"): {
+                "IDX_TGT": {
+                    "columns": ["SYS_NC00005$"],
                     "expressions": {},
                     "uniqueness": "NONUNIQUE",
                 }

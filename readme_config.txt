@@ -42,6 +42,8 @@
   说明：split 模式下的明细文件采用 `|` 分隔并包含 `# total/# 字段说明` 头，格式与 package_compare 相同，便于 Excel 直接分隔导入。
   说明：若存在不支持的 CHECK 约束，会额外输出 constraints_unsupported_detail_<timestamp>.txt（不受 report_detail_mode 影响）。
 - fixup_dir：修补脚本输出目录。默认：fixup_scripts。
+- fixup_force_clean：强制清理 fixup_dir（即使为项目外绝对路径）。默认：false。
+  说明：开启后会删除 fixup_dir 下旧脚本；请确保路径配置正确，避免误删。
 - log_dir：运行日志目录。默认：logs。
 - log_level：控制台日志级别。默认：INFO。可选：DEBUG/INFO/WARNING/ERROR/CRITICAL。
 - report_width：报告宽度（字符数）。默认：160。

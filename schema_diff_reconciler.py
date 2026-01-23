@@ -69,7 +69,7 @@ import sys
 import logging
 import math
 import re
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 
 __version__ = "0.9.8"
@@ -438,6 +438,7 @@ class ObMetadata(NamedTuple):
     package_errors: Dict[Tuple[str, str, str], "PackageErrorInfo"]  # (OWNER, NAME, TYPE) -> error summary
     package_errors_complete: bool                        # 目标端错误信息是否完整
     partition_key_columns: Dict[Tuple[str, str], List[str]]  # (OWNER, TABLE_NAME) -> [PARTITION_COLS...]
+    constraint_deferrable_supported: bool = False         # 是否支持读取 DEFERRABLE/DEFERRED 元数据
 
 
 class OracleMetadata(NamedTuple):
@@ -625,6 +626,26 @@ PACKAGE_OBJECT_TYPES: Tuple[str, ...] = (
     'PACKAGE',
     'PACKAGE BODY'
 )
+
+PLSQL_ORDER_TYPES: Tuple[str, ...] = (
+    'TYPE',
+    'TYPE BODY',
+    'PACKAGE',
+    'PACKAGE BODY',
+    'PROCEDURE',
+    'FUNCTION',
+    'TRIGGER'
+)
+
+PLSQL_ORDER_PRIORITY: Dict[str, int] = {
+    'TYPE': 0,
+    'PACKAGE': 1,
+    'PROCEDURE': 2,
+    'FUNCTION': 3,
+    'TRIGGER': 4,
+    'TYPE BODY': 5,
+    'PACKAGE BODY': 6,
+}
 
 # 这些类型不参与 schema 推导（除非显式 remap）
 NO_INFER_SCHEMA_TYPES: Set[str] = {
@@ -999,15 +1020,23 @@ def normalize_deferred_flag(value: Optional[object]) -> str:
     return "IMMEDIATE"
 
 
+def normalize_check_constraint_expression(
+    expr: Optional[str],
+    cons_name: Optional[str]
+) -> str:
+    expr_norm = normalize_sql_expression(expr)
+    name_u = (cons_name or "").upper()
+    if not expr_norm:
+        return f"__NO_EXPR__:{name_u}"
+    return expr_norm
+
+
 def normalize_check_constraint_signature(
     expr: Optional[str],
     cons_name: Optional[str],
     cons_meta: Optional[Dict]
 ) -> str:
-    expr_norm = normalize_sql_expression(expr)
-    name_u = (cons_name or "").upper()
-    if not expr_norm:
-        expr_norm = f"__NO_EXPR__:{name_u}"
+    expr_norm = normalize_check_constraint_expression(expr, cons_name)
     deferrable = normalize_deferrable_flag((cons_meta or {}).get("deferrable"))
     deferred = normalize_deferred_flag((cons_meta or {}).get("deferred"))
     return f"{expr_norm}||DEFERRABLE={deferrable}||DEFERRED={deferred}"
@@ -1832,12 +1861,16 @@ GRANT_PRIVILEGE_BY_TYPE: Dict[str, str] = {
     'MATERIALIZED VIEW': 'SELECT',
     'SYNONYM': 'SELECT',
     'SEQUENCE': 'SELECT',
+    'INDEX': 'SELECT',
     'TYPE': 'EXECUTE',
     'TYPE BODY': 'EXECUTE',
     'PROCEDURE': 'EXECUTE',
     'FUNCTION': 'EXECUTE',
     'PACKAGE': 'EXECUTE',
-    'PACKAGE BODY': 'EXECUTE'
+    'PACKAGE BODY': 'EXECUTE',
+    'TRIGGER': 'EXECUTE',
+    'JOB': 'EXECUTE',
+    'SCHEDULE': 'EXECUTE'
 }
 
 # OceanBase Oracle 模式下常用对象权限（缺省白名单，可在配置中覆盖）
@@ -2143,6 +2176,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
 
         # fixup 脚本目录
         settings.setdefault('fixup_dir', 'fixup_scripts')
+        settings.setdefault('fixup_force_clean', 'false')
         # obclient 超时时间 (秒)
         settings.setdefault('obclient_timeout', '60')
         # 报告输出目录
@@ -2899,6 +2933,13 @@ def run_config_wizard(config_path: Path) -> None:
         "fixup_dir",
         "订正 SQL 输出目录",
         default=cfg.get("SETTINGS", "fixup_dir", fallback="fixup_scripts"),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "fixup_force_clean",
+        "是否强制清理 fixup_dir（即使目录在项目外）(true/false)",
+        default=cfg.get("SETTINGS", "fixup_force_clean", fallback="false"),
+        transform=_bool_transform,
     )
     _prompt_field(
         "SETTINGS",
@@ -5848,13 +5889,16 @@ def dump_ob_metadata(
             object_statuses={},
             package_errors={},
             package_errors_complete=False,
-            partition_key_columns={}
+            partition_key_columns={},
+            constraint_deferrable_supported=False
         )
 
     owners_in_list = sorted(target_schemas)
     owners_in_objects_list = list(owners_in_list)
     if 'PUBLIC' in target_schemas and '__PUBLIC' not in owners_in_objects_list:
         owners_in_objects_list.append('__PUBLIC')
+
+    constraint_deferrable_supported = False
 
     # --- 1. DBA_OBJECTS ---
     objects_by_type: Dict[str, Set[str]] = {}
@@ -6301,25 +6345,34 @@ def dump_ob_metadata(
     # --- 5. DBA_CONSTRAINTS (P/U/R/C) ---
     constraints: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     if include_constraints:
-        sql_ext_tpl_vc = """
+        use_search_condition_vc = ob_has_dba_column(ob_cfg, "DBA_CONSTRAINTS", "SEARCH_CONDITION_VC")
+        deferrable_supported = (
+            ob_has_dba_column(ob_cfg, "DBA_CONSTRAINTS", "DEFERRABLE")
+            and ob_has_dba_column(ob_cfg, "DBA_CONSTRAINTS", "DEFERRED")
+        )
+        constraint_deferrable_supported = deferrable_supported
+        deferrable_select = ", DEFERRABLE, DEFERRED" if deferrable_supported else ""
+
+        sql_ext_tpl_vc = f"""
             SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME,
                    DELETE_RULE,
                    REPLACE(REPLACE(REPLACE(SEARCH_CONDITION_VC, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS SEARCH_CONDITION
+                   {deferrable_select}
             FROM DBA_CONSTRAINTS
-            WHERE OWNER IN ({owners_in})
+            WHERE OWNER IN ({{owners_in}})
               AND CONSTRAINT_TYPE IN ('P','U','R','C')
               AND STATUS = 'ENABLED'
         """
-        sql_ext_tpl = """
+        sql_ext_tpl = f"""
             SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME,
                    DELETE_RULE,
                    REPLACE(REPLACE(REPLACE(SEARCH_CONDITION, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS SEARCH_CONDITION
+                   {deferrable_select}
             FROM DBA_CONSTRAINTS
-            WHERE OWNER IN ({owners_in})
+            WHERE OWNER IN ({{owners_in}})
               AND CONSTRAINT_TYPE IN ('P','U','R','C')
               AND STATUS = 'ENABLED'
         """
-        use_search_condition_vc = ob_has_dba_column(ob_cfg, "DBA_CONSTRAINTS", "SEARCH_CONDITION_VC")
         ok = False
         lines: List[str] = []
         err = ""
@@ -6339,10 +6392,11 @@ def dump_ob_metadata(
                 support_search_condition = True
         if not ok:
             log.warning("读取 OB DBA_CONSTRAINTS(含条件)失败，将回退为中间字段：%s", err)
-            sql_mid_tpl = """
+            sql_mid_tpl = f"""
                 SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME, DELETE_RULE
+                       {deferrable_select}
                 FROM DBA_CONSTRAINTS
-                WHERE OWNER IN ({owners_in})
+                WHERE OWNER IN ({{owners_in}})
                   AND CONSTRAINT_TYPE IN ('P','U','R','C')
                   AND STATUS = 'ENABLED'
             """
@@ -6352,10 +6406,11 @@ def dump_ob_metadata(
                 support_search_condition = False
         if not ok:
             log.warning("读取 OB DBA_CONSTRAINTS(含引用信息)失败，将回退为基础字段：%s", err)
-            sql_tpl = """
+            sql_tpl = f"""
                 SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE
+                       {deferrable_select}
                 FROM DBA_CONSTRAINTS
-                WHERE OWNER IN ({owners_in})
+                WHERE OWNER IN ({{owners_in}})
                   AND CONSTRAINT_TYPE IN ('P','U','R','C')
                   AND STATUS = 'ENABLED'
             """
@@ -6369,14 +6424,33 @@ def dump_ob_metadata(
                 parts = line.split('\t')
                 if len(parts) < 4:
                     continue
-                owner = parts[0].strip().upper()
-                table = parts[1].strip().upper()
-                cons_name = parts[2].strip().upper()
-                ctype = parts[3].strip().upper()
-                r_owner = parts[4].strip().upper() if support_fk_ref and len(parts) >= 5 else None
-                r_cons = parts[5].strip().upper() if support_fk_ref and len(parts) >= 6 else None
-                delete_rule = parts[6].strip().upper() if support_fk_ref and len(parts) >= 7 else None
-                search_condition = parts[7].strip() if support_search_condition and len(parts) >= 8 else None
+                idx = 0
+                owner = parts[idx].strip().upper()
+                idx += 1
+                table = parts[idx].strip().upper()
+                idx += 1
+                cons_name = parts[idx].strip().upper()
+                idx += 1
+                ctype = parts[idx].strip().upper()
+                idx += 1
+                r_owner = r_cons = delete_rule = None
+                if support_fk_ref:
+                    r_owner = parts[idx].strip().upper() if len(parts) > idx else None
+                    idx += 1
+                    r_cons = parts[idx].strip().upper() if len(parts) > idx else None
+                    idx += 1
+                    delete_rule = parts[idx].strip().upper() if len(parts) > idx else None
+                    idx += 1
+                search_condition = None
+                if support_search_condition and len(parts) > idx:
+                    search_condition = parts[idx].strip()
+                    idx += 1
+                deferrable = deferred = None
+                if constraint_deferrable_supported and len(parts) > idx:
+                    deferrable = parts[idx].strip() if len(parts) > idx else None
+                    idx += 1
+                    deferred = parts[idx].strip() if len(parts) > idx else None
+                    idx += 1
                 key = (owner, table)
                 constraints.setdefault(key, {})[cons_name] = {
                     "type": ctype,
@@ -6385,8 +6459,8 @@ def dump_ob_metadata(
                     "r_constraint": r_cons if ctype == "R" else None,
                     "delete_rule": delete_rule if ctype == "R" else None,
                     "search_condition": search_condition if ctype == "C" else None,
-                    "deferrable": None,
-                    "deferred": None,
+                    "deferrable": deferrable,
+                    "deferred": deferred,
                 }
 
         # --- 6. DBA_CONS_COLUMNS ---
@@ -6639,7 +6713,8 @@ def dump_ob_metadata(
         object_statuses=object_statuses,
         package_errors=package_errors,
         package_errors_complete=package_errors_complete,
-        partition_key_columns=partition_key_columns
+        partition_key_columns=partition_key_columns,
+        constraint_deferrable_supported=constraint_deferrable_supported
     )
 
 
@@ -8685,7 +8760,8 @@ def check_dependencies_against_ob(
     expected_pairs: Set[Tuple[str, str, str, str]],
     actual_pairs: Set[Tuple[str, str, str, str]],
     skipped: List[DependencyIssue],
-    ob_meta: ObMetadata
+    ob_meta: ObMetadata,
+    ob_grant_catalog: Optional[ObGrantCatalog] = None
 ) -> DependencyReport:
     """
     对比目标端依赖关系，返回缺失/多余/跳过的依赖项。
@@ -8698,6 +8774,32 @@ def check_dependencies_against_ob(
 
     def object_exists(full_name: str, obj_type: str) -> bool:
         return full_name in ob_meta.objects_by_type.get(obj_type.upper(), set())
+
+    def resolve_grant_status(
+        dep_name: str,
+        ref_name: str,
+        ref_type: str
+    ) -> Tuple[str, str]:
+        if not ob_grant_catalog:
+            return "GRANT_UNKNOWN", "未加载权限目录"
+        if "." not in dep_name or "." not in ref_name:
+            return "GRANT_UNKNOWN", "对象名格式异常"
+        dep_schema = dep_name.split('.', 1)[0].upper()
+        ref_schema = ref_name.split('.', 1)[0].upper()
+        if dep_schema == ref_schema:
+            return "GRANT_OK", ""
+        required_priv = GRANT_PRIVILEGE_BY_TYPE.get(ref_type.upper())
+        if not required_priv:
+            return "GRANT_UNKNOWN", "未定义权限映射"
+        obj_key = (dep_schema, required_priv, ref_name.upper())
+        if obj_key in ob_grant_catalog.object_privs or obj_key in ob_grant_catalog.object_privs_grantable:
+            return "GRANT_OK", ""
+        implied = SYS_PRIV_IMPLICATIONS.get(required_priv, set())
+        for sys_priv in implied:
+            sys_key = (dep_schema, sys_priv)
+            if sys_key in ob_grant_catalog.sys_privs or sys_key in ob_grant_catalog.sys_privs_admin:
+                return "GRANT_OK", ""
+        return "GRANT_MISSING", ""
 
     def build_missing_reason(dep_name: str, dep_type: str, ref_name: str, ref_type: str) -> str:
         dep_obj = f"{dep_name} ({dep_type})"
@@ -8769,6 +8871,15 @@ def check_dependencies_against_ob(
             reason = f"被依赖对象 {ref_obj} 在目标端缺失，请先创建/迁移该对象，再重新部署 {dep_obj}。"
         else:
             reason = build_missing_reason(dep_name, dep_type, ref_name, ref_type)
+            if ob_grant_catalog and "." in dep_name and "." in ref_name:
+                dep_schema = dep_name.split('.', 1)[0]
+                ref_schema = ref_name.split('.', 1)[0]
+                if dep_schema != ref_schema:
+                    grant_status, grant_note = resolve_grant_status(dep_name, ref_name, ref_type)
+                    if grant_status != "GRANT_OK" or grant_note:
+                        reason += f" 授权检查={grant_status}"
+                        if grant_note:
+                            reason += f"({grant_note})"
         report["missing"].append(DependencyIssue(
             dependent=dep_name,
             dependent_type=dep_type,
@@ -10218,7 +10329,8 @@ def build_constraint_signature(
     norm_cols: Dict[str, Tuple[str, ...]],
     full_object_mapping: FullObjectMapping,
     *,
-    is_source: bool
+    is_source: bool,
+    include_deferrable: bool = True
 ) -> ConstraintSignature:
     pk: Set[Tuple[str, ...]] = set()
     uk: Set[Tuple[str, ...]] = set()
@@ -10247,11 +10359,13 @@ def build_constraint_signature(
         elif ctype == "C":
             if is_system_notnull_check(name, cons.get("search_condition")):
                 continue
-            expr_key = normalize_check_constraint_signature(
-                cons.get("search_condition"),
-                name,
-                cons
-            )
+            expr_norm = normalize_check_constraint_expression(cons.get("search_condition"), name)
+            if include_deferrable:
+                deferrable = normalize_deferrable_flag(cons.get("deferrable"))
+                deferred = normalize_deferred_flag(cons.get("deferred"))
+                expr_key = f"{expr_norm}||DEFERRABLE={deferrable}||DEFERRED={deferred}"
+            else:
+                expr_key = expr_norm
             if expr_key:
                 ck.add(expr_key)
     return ConstraintSignature(pk=pk, uk=uk, fk=fk, ck=ck)
@@ -10305,6 +10419,7 @@ def build_constraint_cache_for_table(
     if src_cons is None:
         src_cons = {}
     tgt_cons = ob_meta.constraints.get(tgt_key, {})
+    include_deferrable = bool(getattr(ob_meta, "constraint_deferrable_supported", False))
     src_norm_cols = {
         name: normalize_column_sequence(cons.get("columns"))
         for name, cons in src_cons.items()
@@ -10314,10 +10429,10 @@ def build_constraint_cache_for_table(
         for name, cons in tgt_cons.items()
     }
     src_sig = build_constraint_signature(
-        src_cons, src_norm_cols, full_object_mapping, is_source=True
+        src_cons, src_norm_cols, full_object_mapping, is_source=True, include_deferrable=include_deferrable
     )
     tgt_sig = build_constraint_signature(
-        tgt_cons, tgt_norm_cols, full_object_mapping, is_source=False
+        tgt_cons, tgt_norm_cols, full_object_mapping, is_source=False, include_deferrable=include_deferrable
     )
     source_all_cols: Set[Tuple[str, ...]] = set(src_norm_cols.values())
     partition_key_set = get_partition_key_set(oracle_meta, src_schema, src_table)
@@ -10463,11 +10578,6 @@ def compare_index_maps(
                 normalized.append(col)
         return tuple(normalized)
 
-    def has_same_named_index(src_cols: Tuple[str, ...], tgt_cols: Tuple[str, ...]) -> bool:
-        src_names = src_map.get(src_cols, {}).get("names", set())
-        tgt_names = tgt_map.get(tgt_cols, {}).get("names", set())
-        return bool(src_names & tgt_names)
-
     def is_sys_nc_only_diff(src_cols: Tuple[str, ...], tgt_cols: Tuple[str, ...]) -> bool:
         return normalize_sys_nc_columns(src_cols) == normalize_sys_nc_columns(tgt_cols)
 
@@ -10482,8 +10592,7 @@ def compare_index_maps(
 
     for src_cols in list(missing_cols):
         for tgt_cols in list(extra_cols):
-            if (has_same_named_index(src_cols, tgt_cols) and
-                (is_sys_nc_only_diff(src_cols, tgt_cols) or is_expr_sys_nc_match(src_cols, tgt_cols))):
+            if is_sys_nc_only_diff(src_cols, tgt_cols) or is_expr_sys_nc_match(src_cols, tgt_cols):
                 missing_cols.discard(src_cols)
                 extra_cols.discard(tgt_cols)
                 break
@@ -10940,6 +11049,7 @@ def compare_constraints_for_table(
     full_object_mapping: FullObjectMapping,
     cache: Optional[ConstraintCompareCache] = None
 ) -> Tuple[bool, Optional[ConstraintMismatch]]:
+    include_deferrable = bool(getattr(ob_meta, "constraint_deferrable_supported", False))
     if cache:
         src_cons = cache.src_cons
         tgt_cons = cache.tgt_cons
@@ -11014,7 +11124,11 @@ def compare_constraints_for_table(
             entries.append((cols, name, ref_full, delete_rule))
         return entries
 
-    def bucket_check(cons_dict: Dict[str, Dict]) -> List[Tuple[str, str, str, str, str]]:
+    def bucket_check(
+        cons_dict: Dict[str, Dict],
+        *,
+        include_deferrable: bool
+    ) -> List[Tuple[str, str, str, str, str]]:
         entries: List[Tuple[str, str, str, str, str]] = []
         for name, cons in cons_dict.items():
             ctype = (cons.get("type") or "").upper()
@@ -11023,9 +11137,15 @@ def compare_constraints_for_table(
             raw_expr = cons.get("search_condition")
             if is_system_notnull_check(name, raw_expr):
                 continue
-            expr_key = normalize_check_constraint_signature(raw_expr, name, cons)
-            deferrable = normalize_deferrable_flag(cons.get("deferrable"))
-            deferred = normalize_deferred_flag(cons.get("deferred"))
+            expr_norm = normalize_check_constraint_expression(raw_expr, name)
+            if include_deferrable:
+                deferrable = normalize_deferrable_flag(cons.get("deferrable"))
+                deferred = normalize_deferred_flag(cons.get("deferred"))
+                expr_key = f"{expr_norm}||DEFERRABLE={deferrable}||DEFERRED={deferred}"
+            else:
+                deferrable = ""
+                deferred = ""
+                expr_key = expr_norm
             entries.append((expr_key, name, str(raw_expr or ""), deferrable, deferred))
         return entries
 
@@ -11033,8 +11153,8 @@ def compare_constraints_for_table(
     grouped_tgt_pkuk = bucket_pk_uk(tgt_cons)
     grouped_src_fk = bucket_fk(src_cons, is_source=True)
     grouped_tgt_fk = bucket_fk(tgt_cons, is_source=False)
-    grouped_src_ck = bucket_check(src_cons)
-    grouped_tgt_ck = bucket_check(tgt_cons)
+    grouped_src_ck = bucket_check(src_cons, include_deferrable=include_deferrable)
+    grouped_tgt_ck = bucket_check(tgt_cons, include_deferrable=include_deferrable)
 
     src_pk_list = grouped_src_pkuk.get('P', [])
     src_uk_list = grouped_src_pkuk.get('U', [])
@@ -11160,26 +11280,35 @@ def compare_constraints_for_table(
         used: Set[str] = set()
         for expr_key, name, raw_expr, deferrable, deferred in src_list:
             if name in tgt_by_name:
-                used.add(name)
                 tgt_expr_key, tgt_expr_raw, tgt_deferrable, tgt_deferred = tgt_by_name.get(
                     name, ("", "", "", "")
                 )
                 if tgt_expr_key != expr_key:
-                    detail_mismatch.append(
-                        "CHECK: 源约束 %s 条件/延迟属性不一致 (源=%s [DEFERRABLE=%s,DEFERRED=%s], "
-                        "目标=%s [DEFERRABLE=%s,DEFERRED=%s])。" % (
-                            name,
-                            raw_expr,
-                            deferrable,
-                            deferred,
-                            tgt_expr_raw,
-                            tgt_deferrable,
-                            tgt_deferred
+                    if include_deferrable:
+                        detail_mismatch.append(
+                            "CHECK: 源约束 %s 条件/延迟属性不一致 (源=%s [DEFERRABLE=%s,DEFERRED=%s], "
+                            "目标=%s [DEFERRABLE=%s,DEFERRED=%s])。" % (
+                                name,
+                                raw_expr,
+                                deferrable,
+                                deferred,
+                                tgt_expr_raw,
+                                tgt_deferrable,
+                                tgt_deferred
+                            )
                         )
-                    )
-                continue
-            if expr_key in tgt_by_expr and tgt_by_expr[expr_key]:
-                matched_name = tgt_by_expr[expr_key].pop()
+                    else:
+                        detail_mismatch.append(
+                            "CHECK: 源约束 %s 条件不一致 (源=%s, 目标=%s)。"
+                            % (name, raw_expr, tgt_expr_raw)
+                        )
+            expr_matches = tgt_by_expr.get(expr_key)
+            if expr_matches:
+                if name in expr_matches:
+                    expr_matches.remove(name)
+                    matched_name = name
+                else:
+                    matched_name = expr_matches.pop()
                 used.add(matched_name)
                 continue
             missing.add(name)
@@ -14417,6 +14546,21 @@ def clean_for_loop_single_dot_range(ddl: str) -> str:
     return FOR_LOOP_RANGE_SINGLE_DOT_PATTERN.sub(r"\1..\2", ddl)
 
 
+FOR_LOOP_COLLECTION_ATTR_PATTERN = re.compile(
+    r'(\.(?:FIRST|LAST|COUNT))\s*\.(?!\.)(\s*(?:[A-Z_][A-Z0-9_$#]*|\d+))',
+    re.IGNORECASE
+)
+
+
+def clean_for_loop_collection_attr_range(ddl: str) -> str:
+    """
+    修复 FOR ... IN collection.FIRST.collection.LAST 这种写法为 collection.FIRST..collection.LAST。
+    """
+    if not ddl:
+        return ddl
+    return FOR_LOOP_COLLECTION_ATTR_PATTERN.sub(r"\1..\2", ddl)
+
+
 def clean_extra_semicolons(ddl: str) -> str:
     """
     清理多余的分号
@@ -15247,6 +15391,7 @@ DDL_CLEANUP_RULES = {
         'rules': [
             clean_end_schema_prefix,
             clean_for_loop_single_dot_range,
+            clean_for_loop_collection_attr_range,
             clean_plsql_ending,
             clean_semicolon_before_slash,
             clean_pragma_statements,
@@ -16769,6 +16914,7 @@ def generate_fixup_scripts(
 
     base_dir = Path(settings.get('fixup_dir', 'fixup_scripts')).expanduser()
     log.info("[FIXUP] 准备生成修补脚本，目标目录=%s", base_dir.resolve())
+    fixup_force_clean = parse_bool_flag(settings.get("fixup_force_clean", "false"), False)
     idempotent_stats: Dict[str, int] = {}
     idempotent_mode = settings.get("fixup_idempotent_mode", "off")
     idempotent_types = settings.get("fixup_idempotent_types_set") or set()
@@ -16806,10 +16952,6 @@ def generate_fixup_scripts(
                 "已跳过 INVISIBLE 修复。"
             )
 
-    if not master_list:
-        log.info("[FIXUP] master_list 为空，未生成目标端订正 SQL。")
-        return None
-
     ensure_dir(base_dir)
     safe_to_clean = False
     try:
@@ -16818,24 +16960,42 @@ def generate_fixup_scripts(
         safe_to_clean = (not base_dir.is_absolute()) or (run_root == base_resolved or run_root in base_resolved.parents)
     except Exception:
         safe_to_clean = not base_dir.is_absolute()
+    if fixup_force_clean:
+        if not safe_to_clean:
+            log.warning("[FIXUP] fixup_force_clean=true，将强制清理 %s。", base_dir.resolve())
+        safe_to_clean = True
 
     if safe_to_clean:
         removed_files = 0
         removed_dirs = 0
+        failed = 0
         log.info("[FIXUP] 正在清理旧脚本目录: %s", base_dir.resolve())
         for child in base_dir.iterdir():
-            if child.is_file():
-                child.unlink()
-                removed_files += 1
-            elif child.is_dir():
-                shutil.rmtree(child, ignore_errors=True)
-                removed_dirs += 1
-        log.info("[FIXUP] 旧脚本清理完成: files=%d, dirs=%d", removed_files, removed_dirs)
+            try:
+                if child.is_file():
+                    child.unlink()
+                    removed_files += 1
+                elif child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                    removed_dirs += 1
+            except OSError as exc:
+                failed += 1
+                log.warning("[FIXUP] 无法删除 %s: %s", child, exc)
+        log.info(
+            "[FIXUP] 旧脚本清理完成: files=%d, dirs=%d, failed=%d",
+            removed_files,
+            removed_dirs,
+            failed
+        )
     else:
         log.warning(
             "[FIXUP] fixup_dir=%s 位于运行目录之外，已跳过自动清理以避免误删。",
             base_dir.resolve()
         )
+
+    if not master_list:
+        log.info("[FIXUP] master_list 为空，目录已清理，无新增订正 SQL。")
+        return None
 
     log.info(f"[FIXUP] 目标端订正 SQL 将生成到目录: {base_dir.resolve()}")
     if not settings.get('enable_ddl_punct_sanitize', True):
@@ -17762,14 +17922,14 @@ def generate_fixup_scripts(
     view_missing_objects = list(view_missing_supported)
     non_view_missing_objects = list(non_view_missing_supported)
 
-    def _order_package_fixups(
+    def _order_plsql_fixups(
         items: List[Tuple[str, str, str, str, str]]
     ) -> List[Tuple[str, str, str, str, str]]:
-        pkg_items = [item for item in items if item[0].upper() in PACKAGE_OBJECT_TYPES]
-        if len(pkg_items) <= 1:
+        plsql_items = [item for item in items if item[0].upper() in PLSQL_ORDER_TYPES]
+        if len(plsql_items) <= 1:
             return items
         node_lookup: Dict[Tuple[str, str], Tuple[str, str, str, str, str]] = {}
-        for obj_type, _src_schema, _src_obj, tgt_schema, tgt_obj in pkg_items:
+        for obj_type, _src_schema, _src_obj, tgt_schema, tgt_obj in plsql_items:
             node_lookup[(f"{tgt_schema}.{tgt_obj}".upper(), obj_type.upper())] = (
                 obj_type, _src_schema, _src_obj, tgt_schema, tgt_obj
             )
@@ -17780,14 +17940,19 @@ def generate_fixup_scripts(
                 ref_key = (ref_full.upper(), ref_type.upper())
                 if dep_key in node_lookup and ref_key in node_lookup and dep_key != ref_key:
                     graph[dep_key].add(ref_key)
-        # 强制 PACKAGE BODY 依赖 PACKAGE
-        for obj_type, _src_schema, _src_obj, tgt_schema, tgt_obj in pkg_items:
-            if obj_type.upper() == "PACKAGE BODY":
+        # 强制 BODY 依赖 SPEC
+        for obj_type, _src_schema, _src_obj, tgt_schema, tgt_obj in plsql_items:
+            obj_type_u = obj_type.upper()
+            if obj_type_u in ("PACKAGE BODY", "TYPE BODY"):
                 tgt_full = f"{tgt_schema}.{tgt_obj}".upper()
-                body_key = (tgt_full, "PACKAGE BODY")
-                spec_key = (tgt_full, "PACKAGE")
+                body_key = (tgt_full, obj_type_u)
+                spec_type = "PACKAGE" if obj_type_u == "PACKAGE BODY" else "TYPE"
+                spec_key = (tgt_full, spec_type)
                 if spec_key in node_lookup and body_key in node_lookup:
                     graph[body_key].add(spec_key)
+
+        def _node_sort_key(node: Tuple[str, str]) -> Tuple[int, str, str]:
+            return (PLSQL_ORDER_PRIORITY.get(node[1], 99), node[0], node[1])
 
         order: List[Tuple[str, str]] = []
         visiting: Set[Tuple[str, str]] = set()
@@ -17801,41 +17966,41 @@ def generate_fixup_scripts(
                 cycles.append(" -> ".join(stack + [f"{node[0]} ({node[1]})"]))
                 return
             visiting.add(node)
-            for dep in graph.get(node, set()):
+            for dep in sorted(graph.get(node, set()), key=_node_sort_key):
                 _dfs(dep, stack + [f"{node[0]} ({node[1]})"])
             visiting.remove(node)
             visited.add(node)
             order.append(node)
 
-        for node in sorted(node_lookup.keys()):
+        for node in sorted(node_lookup.keys(), key=_node_sort_key):
             _dfs(node, [])
 
         if cycles:
-            log.warning("[FIXUP] 发现 PACKAGE 依赖环，将使用稳定顺序: %s", " | ".join(cycles))
+            log.warning("[FIXUP] 发现 PLSQL 依赖环，将使用稳定顺序: %s", " | ".join(cycles))
 
-        ordered_pkg_items = [node_lookup[key] for key in order if key in node_lookup]
-        if len(ordered_pkg_items) != len(pkg_items):
+        ordered_items = [node_lookup[key] for key in order if key in node_lookup]
+        if len(ordered_items) != len(plsql_items):
             return items
 
-        pkg_iter = iter(ordered_pkg_items)
+        plsql_iter = iter(ordered_items)
         reordered: List[Tuple[str, str, str, str, str]] = []
         for entry in items:
-            if entry[0].upper() in PACKAGE_OBJECT_TYPES:
+            if entry[0].upper() in PLSQL_ORDER_TYPES:
                 try:
-                    reordered.append(next(pkg_iter))
+                    reordered.append(next(plsql_iter))
                 except StopIteration:
                     reordered.append(entry)
             else:
                 reordered.append(entry)
         return reordered
 
-    non_view_missing_objects = _order_package_fixups(non_view_missing_objects)
+    non_view_missing_objects = _order_plsql_fixups(non_view_missing_objects)
     if non_view_missing_unsupported:
         support_lookup = {
             (t.upper(), s.upper(), o.upper(), ts.upper(), to.upper()): row
             for t, s, o, ts, to, row in non_view_missing_unsupported
         }
-        ordered_items = _order_package_fixups(
+        ordered_items = _order_plsql_fixups(
             [(t, s, o, ts, to) for (t, s, o, ts, to, _row) in non_view_missing_unsupported]
         )
         reordered_with_support: List[Tuple[str, str, str, str, str, ObjectSupportReportRow]] = []
@@ -22403,17 +22568,8 @@ def main():
         )
 
     # 8) 扩展对象校验 (索引/约束/序列/触发器)
-    if enabled_extra_types:
-        with phase_timer("扩展对象校验", phase_durations):
-            extra_results = check_extra_objects(
-                settings,
-                master_list,
-                ob_meta,
-                oracle_meta,
-                full_object_mapping,
-                enabled_extra_types
-            )
-    else:
+    extra_check_ctx = phase_timer("扩展对象校验", phase_durations) if enabled_extra_types else nullcontext()
+    with extra_check_ctx:
         extra_results = check_extra_objects(
             settings,
             master_list,
@@ -22421,16 +22577,6 @@ def main():
             oracle_meta,
             full_object_mapping,
             enabled_extra_types
-        )
-
-    trigger_status_rows: List[TriggerStatusReportRow] = []
-    support_summary: Optional[ObjectSupportSummary] = None
-    if 'TRIGGER' in enabled_extra_types:
-        trigger_status_rows = collect_trigger_status_rows(
-            oracle_meta,
-            ob_meta,
-            full_object_mapping,
-            unsupported_table_keys=(support_summary.unsupported_table_keys if support_summary else None)
         )
 
     support_summary = classify_missing_objects(
@@ -22453,6 +22599,15 @@ def main():
         support_summary.unsupported_table_keys if support_summary else None,
         table_target_map
     )
+
+    trigger_status_rows: List[TriggerStatusReportRow] = []
+    if 'TRIGGER' in enabled_extra_types:
+        trigger_status_rows = collect_trigger_status_rows(
+            oracle_meta,
+            ob_meta,
+            full_object_mapping,
+            unsupported_table_keys=(support_summary.unsupported_table_keys if support_summary else None)
+        )
 
     trigger_list_summary: Optional[Dict[str, object]] = None
     trigger_list_rows: Optional[List[TriggerListReportRow]] = None
@@ -22495,11 +22650,29 @@ def main():
 
     if enable_dependencies_check:
         with phase_timer("依赖/授权校验", phase_durations):
+            dependency_grant_catalog: Optional[ObGrantCatalog] = None
+            if expected_dependency_pairs:
+                dependency_grantees: Set[str] = set()
+                for dep_full, _dep_type, ref_full, ref_type in expected_dependency_pairs:
+                    if "." not in dep_full or "." not in ref_full:
+                        continue
+                    dep_schema = dep_full.split(".", 1)[0].upper()
+                    ref_schema = ref_full.split(".", 1)[0].upper()
+                    if dep_schema == ref_schema:
+                        continue
+                    if not GRANT_PRIVILEGE_BY_TYPE.get((ref_type or "").upper()):
+                        continue
+                    dependency_grantees.add(dep_schema)
+                if dependency_grantees:
+                    dependency_grant_catalog = load_ob_grant_catalog(ob_cfg, dependency_grantees)
+                    if dependency_grant_catalog is None:
+                        log.warning("[DEPENDENCY] 读取 OB 授权目录失败，将跳过依赖授权评估。")
             dependency_report = check_dependencies_against_ob(
                 expected_dependency_pairs,
                 ob_dependencies,
                 skipped_dependency_pairs,
-                ob_meta
+                ob_meta,
+                ob_grant_catalog=dependency_grant_catalog
             )
             if settings.get("print_dependency_chains", True):
                 dep_chain_path = report_dir / f"dependency_chains_{timestamp}.txt"

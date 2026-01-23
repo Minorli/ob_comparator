@@ -313,12 +313,13 @@ DEPENDENCY_LAYERS = [
     ["grants"],                                      # Layer 3: Grants BEFORE dependent objects
     ["view", "synonym"],                             # Layer 4: Simple dependent objects
     ["materialized_view"],                           # Layer 5: MVIEWs
-    ["procedure", "function"],                       # Layer 6: Standalone routines
-    ["package", "type"],                             # Layer 7: Package specs and types
-    ["package_body", "type_body"],                   # Layer 8: Package/type bodies
-    ["constraint", "index"],                         # Layer 9: Constraints and indexes
-    ["trigger"],                                     # Layer 10: Triggers (last)
-    ["job", "schedule"],                             # Layer 11: Jobs
+    ["type"],                                        # Layer 6: Types (specs)
+    ["package"],                                     # Layer 7: Package specs
+    ["procedure", "function"],                       # Layer 8: Standalone routines
+    ["type_body", "package_body"],                   # Layer 9: Type/package bodies
+    ["constraint", "index"],                         # Layer 10: Constraints and indexes
+    ["trigger"],                                     # Layer 11: Triggers (last)
+    ["job", "schedule"],                             # Layer 12: Jobs
 ]
 
 GRANT_DIRS = {"grants", "grants_miss", "grants_all"}
@@ -329,12 +330,16 @@ GRANT_PRIVILEGE_BY_TYPE = {
     "MATERIALIZED VIEW": "SELECT",
     "SYNONYM": "SELECT",
     "SEQUENCE": "SELECT",
+    "INDEX": "SELECT",
     "TYPE": "EXECUTE",
     "TYPE BODY": "EXECUTE",
     "PROCEDURE": "EXECUTE",
     "FUNCTION": "EXECUTE",
     "PACKAGE": "EXECUTE",
     "PACKAGE BODY": "EXECUTE",
+    "TRIGGER": "EXECUTE",
+    "JOB": "EXECUTE",
+    "SCHEDULE": "EXECUTE",
 }
 
 GRANT_OPTION_TYPES = {"VIEW", "MATERIALIZED VIEW"}
