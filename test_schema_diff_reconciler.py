@@ -2579,6 +2579,112 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIsNone(mismatch)
 
+    def test_compare_constraints_for_table_check_missing_without_expr(self):
+        oracle_constraints = {
+            ("A", "T1"): {
+                "CK_SRC": {
+                    "type": "C",
+                    "columns": ["C1"],
+                    "search_condition": None,
+                },
+            }
+        }
+        ob_constraints = {}
+        oracle_meta = self._make_oracle_meta(constraints=oracle_constraints)
+        ob_meta = self._make_ob_meta(constraints=ob_constraints)
+        ok, mismatch = sdr.compare_constraints_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+            {}
+        )
+        self.assertFalse(ok)
+        self.assertIsNotNone(mismatch)
+        self.assertIn("CK_SRC", mismatch.missing_constraints)
+
+    def test_compare_constraints_for_table_check_deferrable_mismatch(self):
+        oracle_constraints = {
+            ("A", "T1"): {
+                "CK_SRC": {
+                    "type": "C",
+                    "columns": ["C1"],
+                    "search_condition": "C1>0",
+                    "deferrable": "DEFERRABLE",
+                    "deferred": "DEFERRED",
+                }
+            }
+        }
+        ob_constraints = {
+            ("A", "T1"): {
+                "CK_SRC": {
+                    "type": "C",
+                    "columns": ["C1"],
+                    "search_condition": "C1>0",
+                }
+            }
+        }
+        oracle_meta = self._make_oracle_meta(constraints=oracle_constraints)
+        ob_meta = self._make_ob_meta(constraints=ob_constraints)
+        ok, mismatch = sdr.compare_constraints_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+            {}
+        )
+        self.assertFalse(ok)
+        self.assertIsNotNone(mismatch)
+        self.assertTrue(any("DEFERRABLE" in msg for msg in mismatch.detail_mismatch))
+
+    def test_classify_unsupported_check_constraints(self):
+        oracle_constraints = {
+            ("SRC", "T1"): {
+                "CK_SYS": {
+                    "type": "C",
+                    "columns": ["C1"],
+                    "search_condition": "SYS_CONTEXT('USERENV','CURRENT_USER') IS NOT NULL",
+                },
+                "CK_DEF": {
+                    "type": "C",
+                    "columns": ["C1"],
+                    "search_condition": "C1 > 0",
+                    "deferrable": "DEFERRABLE",
+                    "deferred": "DEFERRED",
+                },
+            }
+        }
+        oracle_meta = self._make_oracle_meta(constraints=oracle_constraints)
+        extra_results = {
+            "constraint_ok": [],
+            "constraint_mismatched": [
+                sdr.ConstraintMismatch(
+                    table="TGT.T1",
+                    missing_constraints={"CK_SYS", "CK_DEF"},
+                    extra_constraints=set(),
+                    detail_mismatch=[
+                        "CHECK: 源约束 CK_SYS (条件 SYS_CONTEXT('USERENV','CURRENT_USER')) 在目标端未找到。",
+                        "CHECK: 源约束 CK_DEF (条件 C1 > 0) 在目标端未找到。",
+                    ],
+                    downgraded_pk_constraints=set()
+                )
+            ]
+        }
+        table_target_map = {("SRC", "T1"): ("TGT", "T1")}
+        rows = sdr.classify_unsupported_check_constraints(
+            extra_results,
+            oracle_meta,
+            table_target_map
+        )
+        reason_codes = {row.reason_code for row in rows}
+        self.assertEqual(reason_codes, {"CHECK_SYS_CONTEXT", "CHECK_DEFERRABLE"})
+        self.assertEqual(extra_results["constraint_mismatched"], [])
+        self.assertIn("TGT.T1", extra_results["constraint_ok"])
+
     def test_compare_constraints_for_table_fk_delete_rule_mismatch(self):
         oracle_constraints = {
             ("A", "T1"): {

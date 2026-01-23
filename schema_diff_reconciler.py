@@ -23,7 +23,7 @@
    - TABLE, VIEW, MATERIALIZED VIEW
    - PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, SYNONYM
    - JOB, SCHEDULE, TYPE, TYPE BODY
-   - INDEX, CONSTRAINT (PK/UK/FK)
+   - INDEX, CONSTRAINT (PK/UK/FK/CHECK)
    - SEQUENCE, TRIGGER
 
 2. 对比规则：
@@ -974,6 +974,66 @@ def is_system_notnull_check(cons_name: Optional[str], search_condition: Optional
     return bool(re.match(r"^[A-Z0-9_#$]+\s+IS\s+NOT\s+NULL$", cond_u))
 
 
+CHECK_SYS_CONTEXT_USERENV_RE = re.compile(r"SYS_CONTEXT\s*\(\s*['\"]USERENV['\"]", flags=re.IGNORECASE)
+
+
+def normalize_deferrable_flag(value: Optional[object]) -> str:
+    text = str(value).strip().upper() if value is not None else ""
+    if text in ("DEFERRABLE", "Y", "YES", "TRUE", "1"):
+        return "DEFERRABLE"
+    if text in ("NOT DEFERRABLE", "NOT_DEFERRABLE", "N", "NO", "FALSE", "0"):
+        return "NOT DEFERRABLE"
+    if text:
+        return text
+    return "NOT DEFERRABLE"
+
+
+def normalize_deferred_flag(value: Optional[object]) -> str:
+    text = str(value).strip().upper() if value is not None else ""
+    if text in ("DEFERRED", "Y", "YES", "TRUE", "1"):
+        return "DEFERRED"
+    if text in ("IMMEDIATE", "NOT DEFERRED", "NOT_DEFERRED", "N", "NO", "FALSE", "0"):
+        return "IMMEDIATE"
+    if text:
+        return text
+    return "IMMEDIATE"
+
+
+def normalize_check_constraint_signature(
+    expr: Optional[str],
+    cons_name: Optional[str],
+    cons_meta: Optional[Dict]
+) -> str:
+    expr_norm = normalize_sql_expression(expr)
+    name_u = (cons_name or "").upper()
+    if not expr_norm:
+        expr_norm = f"__NO_EXPR__:{name_u}"
+    deferrable = normalize_deferrable_flag((cons_meta or {}).get("deferrable"))
+    deferred = normalize_deferred_flag((cons_meta or {}).get("deferred"))
+    return f"{expr_norm}||DEFERRABLE={deferrable}||DEFERRED={deferred}"
+
+
+def classify_unsupported_check_constraint(cons_meta: Optional[Dict]) -> Optional[Tuple[str, str, str]]:
+    if not cons_meta:
+        return None
+    deferrable = normalize_deferrable_flag(cons_meta.get("deferrable"))
+    deferred = normalize_deferred_flag(cons_meta.get("deferred"))
+    if deferrable == "DEFERRABLE" or deferred == "DEFERRED":
+        return (
+            "CHECK_DEFERRABLE",
+            "CHECK 约束为 DEFERRABLE/DEFERRED，OceanBase 不支持。",
+            "ORA-00900"
+        )
+    expr = cons_meta.get("search_condition") or ""
+    if expr and CHECK_SYS_CONTEXT_USERENV_RE.search(str(expr)):
+        return (
+            "CHECK_SYS_CONTEXT",
+            "CHECK 约束包含 SYS_CONTEXT('USERENV', ...)，OceanBase 不支持。",
+            "ORA-02436"
+        )
+    return None
+
+
 def normalize_delete_rule(value: Optional[str]) -> str:
     rule = (value or "").strip().upper()
     if not rule or rule == "NO ACTION":
@@ -1617,6 +1677,15 @@ class TriggerStatusReportRow(NamedTuple):
     src_valid: str
     tgt_valid: str
     detail: str
+
+
+class ConstraintUnsupportedDetail(NamedTuple):
+    table_full: str
+    constraint_name: str
+    search_condition: str
+    reason_code: str
+    reason: str
+    ob_error_hint: str
 
 
 class CommentMismatch(NamedTuple):
@@ -5315,6 +5384,94 @@ def filter_trigger_results_for_unsupported_tables(
     return filtered
 
 
+def classify_unsupported_check_constraints(
+    extra_results: ExtraCheckResults,
+    oracle_meta: OracleMetadata,
+    table_target_map: Optional[Dict[Tuple[str, str], Tuple[str, str]]]
+) -> List[ConstraintUnsupportedDetail]:
+    """
+    标记 Oracle->OB 不支持的 CHECK 约束，并从缺失列表中移除。
+    """
+    if not extra_results:
+        return []
+    constraint_items = list(extra_results.get("constraint_mismatched", []) or [])
+    if not constraint_items or not table_target_map:
+        return []
+
+    table_map = {
+        f"{tgt_schema.upper()}.{tgt_table.upper()}": (src_schema.upper(), src_table.upper())
+        for (src_schema, src_table), (tgt_schema, tgt_table) in table_target_map.items()
+    }
+    unsupported_rows: List[ConstraintUnsupportedDetail] = []
+    updated_mismatches: List[ConstraintMismatch] = []
+    ok_tables: Set[str] = set(extra_results.get("constraint_ok", []) or [])
+
+    def _filter_detail_lines(lines: List[str], names: Set[str]) -> List[str]:
+        if not lines or not names:
+            return lines
+        names_u = {n.upper() for n in names}
+        filtered: List[str] = []
+        for line in lines:
+            line_u = line.upper()
+            if "CHECK" in line_u and any(name in line_u for name in names_u):
+                continue
+            filtered.append(line)
+        return filtered
+
+    for item in constraint_items:
+        table_str = (item.table or "").split()[0].upper()
+        src_pair = table_map.get(table_str)
+        if not src_pair:
+            updated_mismatches.append(item)
+            continue
+        src_schema, src_table = src_pair
+        cons_map = oracle_meta.constraints.get((src_schema, src_table), {})
+        unsupported_names: Set[str] = set()
+        for cons_name in item.missing_constraints:
+            cons_meta = cons_map.get(cons_name.upper()) or cons_map.get(cons_name)
+            if not cons_meta:
+                continue
+            if (cons_meta.get("type") or "").upper() != "C":
+                continue
+            if is_system_notnull_check(cons_name, cons_meta.get("search_condition")):
+                continue
+            reason = classify_unsupported_check_constraint(cons_meta)
+            if not reason:
+                continue
+            reason_code, reason_text, ob_hint = reason
+            unsupported_names.add(cons_name)
+            unsupported_rows.append(ConstraintUnsupportedDetail(
+                table_full=f"{src_schema}.{src_table}",
+                constraint_name=cons_name.upper(),
+                search_condition=str(cons_meta.get("search_condition") or "-"),
+                reason_code=reason_code,
+                reason=reason_text,
+                ob_error_hint=ob_hint
+            ))
+
+        if not unsupported_names:
+            updated_mismatches.append(item)
+            continue
+
+        new_missing = set(item.missing_constraints) - unsupported_names
+        new_detail = _filter_detail_lines(item.detail_mismatch, unsupported_names)
+        if not new_missing and not item.extra_constraints and not new_detail:
+            ok_tables.add(item.table)
+            continue
+
+        updated_mismatches.append(ConstraintMismatch(
+            table=item.table,
+            missing_constraints=new_missing,
+            extra_constraints=item.extra_constraints,
+            detail_mismatch=new_detail,
+            downgraded_pk_constraints=item.downgraded_pk_constraints
+        ))
+
+    extra_results["constraint_mismatched"] = updated_mismatches
+    extra_results["constraint_ok"] = sorted(ok_tables)
+    return unsupported_rows
+
+
 def build_schema_mapping(master_list: MasterCheckList) -> Dict[str, str]:
     """
     基于 master_list 中 TABLE 映射，推导 schema 映射：
@@ -5485,7 +5642,7 @@ def compute_object_counts(
                     for cons_map in cons_maps.values():
                         for info in cons_map.values():
                             ctype = (info.get("type") or "").upper()
-                            if ctype in ('P', 'U', 'R'):
+                            if ctype in ('P', 'U', 'R', 'C'):
                                 cnt += 1
                     return cnt
 
@@ -5601,6 +5758,29 @@ def obclient_query_by_owner_chunks(
         if out:
             lines.extend(out.splitlines())
     return True, lines, ""
+
+
+def ob_has_dba_column(
+    ob_cfg: ObConfig,
+    table_name: str,
+    column_name: str,
+    owner: str = "SYS"
+) -> bool:
+    table_u = (table_name or "").upper()
+    column_u = (column_name or "").upper()
+    owner_u = (owner or "SYS").upper()
+    if not table_u or not column_u or not owner_u:
+        return False
+    sql = (
+        "SELECT 1 FROM DBA_TAB_COLUMNS "
+        f"WHERE OWNER='{owner_u}' AND TABLE_NAME='{table_u}' AND COLUMN_NAME='{column_u}' "
+        "AND ROWNUM = 1"
+    )
+    ok, out, err = obclient_run_sql(ob_cfg, sql)
+    if not ok:
+        log.warning("读取 OB DBA_TAB_COLUMNS 失败，无法判断字段存在性: %s", err)
+        return False
+    return bool((out or "").strip())
 
 
 def obclient_query_by_owner_pairs(
@@ -6121,6 +6301,15 @@ def dump_ob_metadata(
     # --- 5. DBA_CONSTRAINTS (P/U/R/C) ---
     constraints: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     if include_constraints:
+        sql_ext_tpl_vc = """
+            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME,
+                   DELETE_RULE,
+                   REPLACE(REPLACE(REPLACE(SEARCH_CONDITION_VC, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS SEARCH_CONDITION
+            FROM DBA_CONSTRAINTS
+            WHERE OWNER IN ({owners_in})
+              AND CONSTRAINT_TYPE IN ('P','U','R','C')
+              AND STATUS = 'ENABLED'
+        """
         sql_ext_tpl = """
             SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME,
                    DELETE_RULE,
@@ -6130,12 +6319,24 @@ def dump_ob_metadata(
               AND CONSTRAINT_TYPE IN ('P','U','R','C')
               AND STATUS = 'ENABLED'
         """
-        ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_ext_tpl, owners_in_list)
+        use_search_condition_vc = ob_has_dba_column(ob_cfg, "DBA_CONSTRAINTS", "SEARCH_CONDITION_VC")
+        ok = False
+        lines: List[str] = []
+        err = ""
+        if use_search_condition_vc:
+            ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_ext_tpl_vc, owners_in_list)
         support_fk_ref = False
         support_search_condition = False
         if ok:
             support_fk_ref = True
             support_search_condition = True
+        if not ok:
+            if err:
+                log.warning("读取 OB DBA_CONSTRAINTS(含 SEARCH_CONDITION_VC)失败，将尝试 SEARCH_CONDITION: %s", err)
+            ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_ext_tpl, owners_in_list)
+            if ok:
+                support_fk_ref = True
+                support_search_condition = True
         if not ok:
             log.warning("读取 OB DBA_CONSTRAINTS(含条件)失败，将回退为中间字段：%s", err)
             sql_mid_tpl = """
@@ -6184,6 +6385,8 @@ def dump_ob_metadata(
                     "r_constraint": r_cons if ctype == "R" else None,
                     "delete_rule": delete_rule if ctype == "R" else None,
                     "search_condition": search_condition if ctype == "C" else None,
+                    "deferrable": None,
+                    "deferred": None,
                 }
 
         # --- 6. DBA_CONS_COLUMNS ---
@@ -6220,6 +6423,8 @@ def dump_ob_metadata(
                         "r_constraint": None,
                         "delete_rule": None,
                         "search_condition": None,
+                        "deferrable": None,
+                        "deferred": None,
                     }
                 constraints[key][cons_name]["columns"].append(col_name)
 
@@ -7286,15 +7491,29 @@ def dump_oracle_metadata(
 
                 # 约束
                 if include_constraints:
-                    sql_cons_tpl = """
+                    search_condition_col = "SEARCH_CONDITION"
+                    try:
+                        with ora_conn.cursor() as cursor:
+                            cursor.execute(
+                                "SELECT SEARCH_CONDITION_VC FROM DBA_CONSTRAINTS WHERE ROWNUM = 1"
+                            )
+                            search_condition_col = "SEARCH_CONDITION_VC"
+                    except oracledb.Error:
+                        search_condition_col = "SEARCH_CONDITION"
+                    sql_cons_tpl = f"""
                         SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME,
-                               DELETE_RULE, SEARCH_CONDITION
+                               DELETE_RULE, {search_condition_col}, DEFERRABLE, DEFERRED
                         FROM DBA_CONSTRAINTS
-                        WHERE OWNER IN ({owners_clause})
+                        WHERE OWNER IN ({{owners_clause}})
                           AND CONSTRAINT_TYPE IN ('P','U','R','C')
                           AND STATUS = 'ENABLED'
                     """
                     with ora_conn.cursor() as cursor:
+                        if search_condition_col == "SEARCH_CONDITION" and hasattr(cursor, "longfetchsize"):
+                            try:
+                                cursor.longfetchsize = max(int(cursor.longfetchsize or 0), 100000)
+                            except (TypeError, ValueError):
+                                cursor.longfetchsize = 100000
                         for owner_chunk in owner_chunks:
                             owners_clause = build_bind_placeholders(len(owner_chunk))
                             sql_cons = sql_cons_tpl.format(owners_clause=owners_clause)
@@ -7317,6 +7536,8 @@ def dump_oracle_metadata(
                                     "r_constraint": _safe_upper(row[5]) if row[5] else None,
                                     "delete_rule": (row[6] or "").strip().upper() if len(row) > 6 else None,
                                     "search_condition": str(row[7]) if len(row) > 7 and row[7] is not None else None,
+                                    "deferrable": str(row[8]) if len(row) > 8 and row[8] is not None else None,
+                                    "deferred": str(row[9]) if len(row) > 9 and row[9] is not None else None,
                                 }
 
                     sql_cons_cols_tpl = """
@@ -7351,6 +7572,8 @@ def dump_oracle_metadata(
                                         "r_constraint": None,
                                         "delete_rule": None,
                                         "search_condition": None,
+                                        "deferrable": None,
+                                        "deferred": None,
                                     }
                                 )["columns"].append(col_name)
 
@@ -10024,9 +10247,13 @@ def build_constraint_signature(
         elif ctype == "C":
             if is_system_notnull_check(name, cons.get("search_condition")):
                 continue
-            expr = normalize_sql_expression(cons.get("search_condition"))
-            if expr:
-                ck.add(expr)
+            expr_key = normalize_check_constraint_signature(
+                cons.get("search_condition"),
+                name,
+                cons
+            )
+            if expr_key:
+                ck.add(expr_key)
     return ConstraintSignature(pk=pk, uk=uk, fk=fk, ck=ck)
 
 
@@ -10787,8 +11014,8 @@ def compare_constraints_for_table(
             entries.append((cols, name, ref_full, delete_rule))
         return entries
 
-    def bucket_check(cons_dict: Dict[str, Dict]) -> List[Tuple[str, str, str]]:
-        entries: List[Tuple[str, str, str]] = []
+    def bucket_check(cons_dict: Dict[str, Dict]) -> List[Tuple[str, str, str, str, str]]:
+        entries: List[Tuple[str, str, str, str, str]] = []
         for name, cons in cons_dict.items():
             ctype = (cons.get("type") or "").upper()
             if ctype != "C":
@@ -10796,10 +11023,10 @@ def compare_constraints_for_table(
             raw_expr = cons.get("search_condition")
             if is_system_notnull_check(name, raw_expr):
                 continue
-            expr_norm = normalize_sql_expression(raw_expr)
-            if not expr_norm:
-                continue
-            entries.append((expr_norm, name, str(raw_expr)))
+            expr_key = normalize_check_constraint_signature(raw_expr, name, cons)
+            deferrable = normalize_deferrable_flag(cons.get("deferrable"))
+            deferred = normalize_deferred_flag(cons.get("deferred"))
+            entries.append((expr_key, name, str(raw_expr or ""), deferrable, deferred))
         return entries
 
     grouped_src_pkuk = bucket_pk_uk(src_cons)
@@ -10921,27 +11148,38 @@ def compare_constraints_for_table(
                 )
 
     def match_check_constraints(
-        src_list: List[Tuple[str, str, str]],
-        tgt_list: List[Tuple[str, str, str]]
+        src_list: List[Tuple[str, str, str, str, str]],
+        tgt_list: List[Tuple[str, str, str, str, str]]
     ) -> None:
         tgt_by_expr: Dict[str, List[str]] = defaultdict(list)
-        tgt_by_name: Dict[str, Tuple[str, str]] = {}
-        for expr_norm, name, raw_expr in tgt_list:
-            tgt_by_expr[expr_norm].append(name)
-            tgt_by_name[name] = (expr_norm, raw_expr)
+        tgt_by_name: Dict[str, Tuple[str, str, str, str]] = {}
+        for expr_key, name, raw_expr, deferrable, deferred in tgt_list:
+            tgt_by_expr[expr_key].append(name)
+            tgt_by_name[name] = (expr_key, raw_expr, deferrable, deferred)
 
         used: Set[str] = set()
-        for expr_norm, name, raw_expr in src_list:
+        for expr_key, name, raw_expr, deferrable, deferred in src_list:
             if name in tgt_by_name:
                 used.add(name)
-                tgt_expr_norm, tgt_expr_raw = tgt_by_name.get(name, ("", ""))
-                if tgt_expr_norm != expr_norm:
+                tgt_expr_key, tgt_expr_raw, tgt_deferrable, tgt_deferred = tgt_by_name.get(
+                    name, ("", "", "", "")
+                )
+                if tgt_expr_key != expr_key:
                     detail_mismatch.append(
-                        f"CHECK: 源约束 {name} 条件不一致 (源={raw_expr}, 目标={tgt_expr_raw})。"
+                        "CHECK: 源约束 %s 条件/延迟属性不一致 (源=%s [DEFERRABLE=%s,DEFERRED=%s], "
+                        "目标=%s [DEFERRABLE=%s,DEFERRED=%s])。" % (
+                            name,
+                            raw_expr,
+                            deferrable,
+                            deferred,
+                            tgt_expr_raw,
+                            tgt_deferrable,
+                            tgt_deferred
+                        )
                     )
                 continue
-            if expr_norm in tgt_by_expr and tgt_by_expr[expr_norm]:
-                matched_name = tgt_by_expr[expr_norm].pop()
+            if expr_key in tgt_by_expr and tgt_by_expr[expr_key]:
+                matched_name = tgt_by_expr[expr_key].pop()
                 used.add(matched_name)
                 continue
             missing.add(name)
@@ -10949,7 +11187,7 @@ def compare_constraints_for_table(
                 f"CHECK: 源约束 {name} (条件 {raw_expr}) 在目标端未找到。"
             )
 
-        for expr_norm, name, raw_expr in tgt_list:
+        for expr_key, name, raw_expr, _deferrable, _deferred in tgt_list:
             if name in used:
                 continue
             extra.add(name)
@@ -11476,7 +11714,7 @@ def check_extra_objects(
     """
     基于 master_list (TABLE 映射) 检查：
       - 索引
-      - 约束 (PK/UK/FK)
+      - 约束 (PK/UK/FK/CHECK)
       - 触发器
     基于 schema 映射检查：
       - 序列
@@ -11486,6 +11724,7 @@ def check_extra_objects(
         "index_mismatched": [],
         "constraint_ok": [],
         "constraint_mismatched": [],
+        "constraint_unsupported": [],
         "sequence_ok": [],
         "sequence_mismatched": [],
         "trigger_ok": [],
@@ -11747,6 +11986,12 @@ def check_extra_objects(
                     detail_mismatch=detail_mismatch
                 ))
 
+    constraint_unsupported = classify_unsupported_check_constraints(
+        extra_results,
+        oracle_meta,
+        build_table_target_map(master_list) if master_list else None
+    )
+    extra_results["constraint_unsupported"] = constraint_unsupported
     return extra_results
 
 
@@ -13710,7 +13955,8 @@ BATCH_DDL_ALLOWED_TYPES = {
     'TABLE', 'VIEW', 'MATERIALIZED VIEW',
     'PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY',
     'SYNONYM', 'SEQUENCE', 'TRIGGER',
-    'TYPE', 'TYPE BODY'
+    'TYPE', 'TYPE BODY',
+    'CONSTRAINT'
 }
 
 
@@ -18749,6 +18995,16 @@ def generate_fixup_scripts(
                                 statements = [stmt]
                                 mark_source('CONSTRAINT', 'fallback')
                                 source_label = "META"
+                            elif not search_condition:
+                                ddl_fallback, ddl_source = get_fallback_ddl(
+                                    ss,
+                                    "CONSTRAINT",
+                                    cons_name_u
+                                )
+                                if ddl_fallback:
+                                    statements = [ddl_fallback]
+                                    mark_source('CONSTRAINT', 'fallback')
+                                    source_label = ddl_source
                         elif cons_meta:
                             log.warning(
                                 "[FIXUP] 约束 %s 类型为 %s，无内联 DDL 可用，无法自动重建。",
@@ -19443,6 +19699,40 @@ def export_unsupported_objects_detail(
         for row in rows_sorted
     ]
     return write_pipe_report("不支持/阻断对象明细", header_fields, data_rows, output_path)
+
+
+def export_constraints_unsupported_detail(
+    rows: List[ConstraintUnsupportedDetail],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出不支持的 CHECK 约束明细。
+    """
+    if not report_dir or not rows or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"constraints_unsupported_detail_{report_timestamp}.txt"
+    rows_sorted = sorted(rows, key=lambda r: (r.table_full, r.constraint_name))
+    header_fields = [
+        "TABLE",
+        "CONSTRAINT_NAME",
+        "SEARCH_CONDITION",
+        "REASON_CODE",
+        "REASON",
+        "OB_ERROR_HINT"
+    ]
+    data_rows = [
+        [
+            row.table_full,
+            row.constraint_name,
+            row.search_condition or "-",
+            row.reason_code,
+            row.reason,
+            row.ob_error_hint or "-"
+        ]
+        for row in rows_sorted
+    ]
+    return write_pipe_report("CHECK 约束不支持明细", header_fields, data_rows, output_path)
 
 
 def export_extra_targets_detail(
@@ -20668,7 +20958,7 @@ def print_final_report(
         extra_results = {
             "index_ok": [], "index_mismatched": [], "constraint_ok": [],
             "constraint_mismatched": [], "sequence_ok": [], "sequence_mismatched": [],
-            "trigger_ok": [], "trigger_mismatched": [],
+            "trigger_ok": [], "trigger_mismatched": [], "constraint_unsupported": [],
         }
     if comment_results is None:
         comment_results = {
@@ -20871,6 +21161,7 @@ def print_final_report(
     ext_text = Text()
     idx_blocked_cnt = extra_blocked_counts.get("INDEX", 0)
     cons_blocked_cnt = extra_blocked_counts.get("CONSTRAINT", 0)
+    cons_unsupported_cnt = len(extra_results.get("constraint_unsupported", []) or [])
     trg_blocked_cnt = extra_blocked_counts.get("TRIGGER", 0)
     ext_text.append("索引: ", style="info")
     ext_text.append(f"一致 {idx_ok_cnt} / ", style="ok")
@@ -20881,8 +21172,11 @@ def print_final_report(
     ext_text.append("约束: ", style="info")
     ext_text.append(f"一致 {cons_ok_cnt} / ", style="ok")
     ext_text.append(f"差异 {cons_mis_cnt}", style="mismatch")
-    if cons_blocked_cnt:
-        ext_text.append(f" (不支持/阻断 {cons_blocked_cnt})", style="mismatch")
+    if cons_blocked_cnt or cons_unsupported_cnt:
+        ext_text.append(
+            f" (不支持/阻断 {cons_blocked_cnt + cons_unsupported_cnt})",
+            style="mismatch"
+        )
     ext_text.append("\n")
     ext_text.append("序列: ", style="info")
     ext_text.append(f"一致 {seq_ok_cnt} / ", style="ok")
@@ -20957,6 +21251,11 @@ def print_final_report(
             )
             if report_ts:
                 detail_hint_lines.append(f"示例: missing_objects_detail_{report_ts}.txt")
+        if extra_results.get("constraint_unsupported"):
+            suffix = f"_{report_ts}" if report_ts else ""
+            detail_hint_lines.append(
+                f"CHECK 约束不支持明细: constraints_unsupported_detail{suffix}.txt"
+            )
         else:
             detail_hint_lines.append("未生成分拆报告，如需细节请设置 report_detail_mode=split。")
         console.print(Panel.fit("\n".join(detail_hint_lines), style="info", width=section_width))
@@ -21271,7 +21570,7 @@ def print_final_report(
         )
     )
     print_ext_mismatch_table(
-        "6. 约束 (PK/UK/FK) 一致性检查", extra_results["constraint_mismatched"], ["表名", "差异详情"],
+        "6. 约束 (PK/UK/FK/CHECK) 一致性检查", extra_results["constraint_mismatched"], ["表名", "差异详情"],
         lambda item: (
             Text(item.table),
             Text(f"- 缺失: {sorted(item.missing_constraints)}\n" if item.missing_constraints else "", style="missing") +
@@ -21447,6 +21746,11 @@ def print_final_report(
                 report_path.parent,
                 report_ts
             )
+        constraint_unsupported_path = export_constraints_unsupported_detail(
+            extra_results.get("constraint_unsupported", []) or [],
+            report_path.parent,
+            report_ts
+        )
         extra_targets_path = None
         skipped_detail_path = None
         mismatched_tables_path = None
@@ -21507,6 +21811,8 @@ def print_final_report(
                 log.info("缺失对象支持性明细已输出到: %s", missing_detail_path)
             if unsupported_detail_path:
                 log.info("不支持/阻断对象明细已输出到: %s", unsupported_detail_path)
+            if constraint_unsupported_path:
+                log.info("CHECK 约束不支持明细已输出到: %s", constraint_unsupported_path)
             if extra_targets_path:
                 log.info("目标端多余对象明细已输出到: %s", extra_targets_path)
             if skipped_detail_path:
@@ -21922,6 +22228,7 @@ def main():
             "index_mismatched": [],
             "constraint_ok": [],
             "constraint_mismatched": [],
+            "constraint_unsupported": [],
             "sequence_ok": [],
             "sequence_mismatched": [],
             "trigger_ok": [],
