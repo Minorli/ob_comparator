@@ -1076,16 +1076,53 @@ def clean_for_loop_collection_attr_range(ddl: str) -> str:
 }
 ```
 
-#### 场景覆盖矩阵
+#### PL/SQL 循环语法完整分类
 
-| 场景 | 源语法 | 目标语法 | 覆盖状态 |
-|------|--------|----------|----------|
-| 整数起始 | `FOR i IN 1.n LOOP` | `1..n` | ✅ 现有规则 |
-| 集合.FIRST | `col.FIRST.col.LAST` | `col.FIRST..col.LAST` | 🔴 新规则 |
-| 集合.FIRST+数字 | `col.FIRST.10` | `col.FIRST..10` | 🔴 新规则 |
-| 集合.FIRST+变量 | `col.FIRST.v_end` | `col.FIRST..v_end` | 🔴 新规则 |
-| 集合.LAST | `1.col.LAST` | `1..col.LAST` | ✅ 现有规则 |
-| 普通变量 | `v_start.v_end` | `v_start..v_end` | ❌ 无法自动判断 |
+**Oracle PL/SQL 支持的循环类型**:
+
+| 循环类型 | 语法示例 | 是否涉及 `..` 范围 |
+|----------|----------|-------------------|
+| **数值 FOR 循环** | `FOR i IN 1..10 LOOP` | ✅ 是 |
+| **REVERSE FOR 循环** | `FOR i IN REVERSE 1..10 LOOP` | ✅ 是 |
+| **游标 FOR 循环** | `FOR rec IN cursor_name LOOP` | ❌ 否 |
+| **SELECT FOR 循环** | `FOR rec IN (SELECT ...) LOOP` | ❌ 否 |
+| **集合遍历循环** | `FOR idx IN col.FIRST..col.LAST LOOP` | ✅ 是 |
+| **WHILE 循环** | `WHILE condition LOOP` | ❌ 否 |
+| **基本 LOOP** | `LOOP ... EXIT WHEN ... END LOOP` | ❌ 否 |
+
+**需要清洗的场景（涉及 `..` 范围运算符）**:
+
+| 场景 | 错误写法 | 正确写法 | 覆盖状态 |
+|------|----------|----------|----------|
+| 整数..变量 | `FOR i IN 1.n LOOP` | `FOR i IN 1..n LOOP` | ✅ 现有规则 |
+| 整数..集合属性 | `FOR i IN 1.col.LAST LOOP` | `FOR i IN 1..col.LAST LOOP` | ✅ 现有规则 |
+| 负整数..变量 | `FOR i IN -1.n LOOP` | `FOR i IN -1..n LOOP` | ✅ 现有规则 |
+| 集合.FIRST..集合.LAST | `col.FIRST.col.LAST` | `col.FIRST..col.LAST` | 🔴 新规则 |
+| 集合.FIRST..数字 | `col.FIRST.10` | `col.FIRST..10` | 🔴 新规则 |
+| 集合.FIRST..变量 | `col.FIRST.v_end` | `col.FIRST..v_end` | 🔴 新规则 |
+| 集合.LAST..数字 | `col.LAST.1` | `col.LAST..1` (REVERSE) | 🔴 新规则 |
+| 变量..变量 | `v_start.v_end` | `v_start..v_end` | ❌ 无法自动判断 |
+| 集合.COUNT | `1.col.COUNT` | `1..col.COUNT` | ✅ 现有规则 |
+
+**其他集合属性（需扩展支持）**:
+
+| 属性 | 说明 | 是否需要清洗 |
+|------|------|--------------|
+| `.FIRST` | 返回集合第一个索引 | ✅ 是 |
+| `.LAST` | 返回集合最后一个索引 | ✅ 是 |
+| `.COUNT` | 返回集合元素数量 | ✅ 是 (建议扩展) |
+| `.NEXT(n)` | 返回 n 之后的索引 | ❌ 否 (函数调用) |
+| `.PRIOR(n)` | 返回 n 之前的索引 | ❌ 否 (函数调用) |
+
+#### 建议的完整正则模式
+
+```python
+# 扩展支持 FIRST, LAST, COUNT 三种集合属性
+FOR_LOOP_COLLECTION_ATTR_PATTERN = re.compile(
+    r'(\.(?:FIRST|LAST|COUNT))\s*\.(?!\.)(\s*(?:[A-Z_][A-Z0-9_$#]*|\d+))',
+    re.IGNORECASE
+)
+```
 
 #### 无法覆盖的场景
 
@@ -1120,14 +1157,163 @@ def test_clean_for_loop_collection_attr_range():
     ) == "FOR idx IN col.FIRST..col.LAST LOOP"
 ```
 
-### 15.11 潜在风险汇总
+### 15.11 表列检查能力矩阵
+
+**位置**: `check_primary_objects()` (第 9800-10018 行)
+
+#### 一、列存在性检查 ✅
+
+| 检查项 | 变量名 | 说明 |
+|--------|--------|------|
+| **缺失列** | `missing_in_tgt` | 源端有、目标端无的列 |
+| **多余列** | `extra_in_tgt` | 目标端有、源端无的列 (含 OMS_* 列检测) |
+
+#### 二、VARCHAR/VARCHAR2 长度检查 ✅
+
+| 检查项 | issue_type | 触发条件 |
+|--------|------------|----------|
+| **长度过短** | `short` | BYTE 语义: `tgt_len < src_len × 1.5` |
+| **长度过大** | `oversize` | BYTE 语义: `tgt_len > src_len × 上限倍数` |
+| **CHAR 语义不匹配** | `char_mismatch` | CHAR_USED='C' 时要求长度和语义完全一致 |
+
+#### 三、NUMBER 类型精度检查 ✅
+
+| 检查项 | issue_type | 触发条件 |
+|--------|------------|----------|
+| **精度不足** | `number_precision` | `tgt_prec < src_prec` |
+| **小数位不一致** | `number_precision` | `tgt_scale != src_scale` |
+| **精度约束变化** | `number_precision` | 源无精度限制，目标有精度限制 |
+
+#### 四、虚拟列 (VIRTUAL COLUMN) 检查 ✅
+
+| 检查项 | issue_type | 说明 |
+|--------|------------|------|
+| **虚拟列缺失** | `virtual_missing` | 源是虚拟列，目标不是 |
+| **表达式不一致** | `virtual_expr_mismatch` | 虚拟列计算表达式不同 |
+
+#### 五、IDENTITY 列检查 ✅
+
+| 检查项 | issue_type | 说明 |
+|--------|------------|------|
+| **IDENTITY 缺失** | `identity_missing` | 源有 IDENTITY 属性，目标无 |
+
+#### 六、DEFAULT ON NULL 检查 ✅
+
+| 检查项 | issue_type | 说明 |
+|--------|------------|------|
+| **DEFAULT ON NULL 缺失** | `default_on_null_missing` | 源有此属性，目标无 |
+
+#### 七、列可见性检查 ✅
+
+| 检查项 | issue_type | 说明 |
+|--------|------------|------|
+| **INVISIBLE→VISIBLE** | `visibility_mismatch` | 源隐藏列变为可见 |
+| **VISIBLE→INVISIBLE** | `visibility_mismatch` | 源可见列变为隐藏 |
+
+#### 八、LONG 类型映射检查 ✅
+
+| 检查项 | issue_type | 说明 |
+|--------|------------|------|
+| **LONG→CLOB 未转换** | `long_type` | LONG 应转为 CLOB |
+| **LONG RAW→BLOB 未转换** | `long_type` | LONG RAW 应转为 BLOB |
+
+#### 九、未实现的检查项 ⚠️
+
+| 属性 | 元数据字段 | 当前状态 | 建议 |
+|------|------------|----------|------|
+| **NULLABLE** | `nullable` | ❌ 已读取未比对 | P3: 可选实现 |
+| **DATA_DEFAULT** | `data_default` | ❌ 已读取未比对 | P3: 可选实现 |
+| **列顺序** | - | ➖ 不关心 | 无需实现 |
+| **字符集** | - | ➖ 不关心 | 无需实现 |
+
+#### 检查能力汇总
+
+| 类别 | 检查数量 | 状态 |
+|------|----------|------|
+| ✅ 已实现检查 | **10 类** | 生产可用 |
+| ⚠️ 元数据已有但未检查 | **2 类** | NULLABLE, DEFAULT |
+| ➖ 业务不关心 | **2 类** | 列顺序, 字符集 |
+
+### 15.12 Fixup 目录清理问题 🔴
+
+**用户反馈**: 进入 fixup 逻辑后不会清空之前的 fixup 目录，导致新的 fixup 无法生成
+
+**位置**: `generate_fixup_scripts()` (第 16809-16838 行)
+
+#### 问题 1: master_list 为空时提前返回 (P1)
+
+```python
+# schema_diff_reconciler.py:16809-16813
+if not master_list:
+    log.info("[FIXUP] master_list 为空，未生成目标端订正 SQL。")
+    return None  # ← 在清理逻辑之前就返回！
+
+ensure_dir(base_dir)
+# ... 清理逻辑在第 16822 行 ...
+```
+
+**影响**: 第二次运行时若无需修复对象，直接返回，**不清理上次遗留的脚本**，用户误以为新脚本未生成。
+
+**修复建议**:
+```python
+# 将目录清理移到 master_list 检查之前
+ensure_dir(base_dir)
+# ... 清理逻辑 ...
+
+if not master_list:
+    log.info("[FIXUP] master_list 为空，目录已清理，无新增订正 SQL。")
+    return None
+```
+
+#### 问题 2: 文件删除无异常处理 (P2)
+
+```python
+# schema_diff_reconciler.py:16826-16832
+for child in base_dir.iterdir():
+    if child.is_file():
+        child.unlink()  # ← 无 try/except，删除失败会中断整个清理
+        removed_files += 1
+```
+
+**影响**: 任何文件被锁定或无权限，后续所有文件都不会被清理。
+
+**修复建议**:
+```python
+for child in base_dir.iterdir():
+    try:
+        if child.is_file():
+            child.unlink()
+            removed_files += 1
+        elif child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+            removed_dirs += 1
+    except OSError as e:
+        log.warning("[FIXUP] 无法删除 %s: %s", child, e)
+        failed_count += 1
+```
+
+#### 问题 3: 绝对路径在 cwd 外时不清理 (P3)
+
+```python
+# schema_diff_reconciler.py:16818
+safe_to_clean = (not base_dir.is_absolute()) or (run_root == base_resolved or run_root in base_resolved.parents)
+```
+
+**影响**: 若 `fixup_dir` 是绝对路径且不在当前工作目录下，旧脚本不会被清理。
+
+**修复建议**: 添加配置项 `fixup_force_clean=true` 允许用户强制清理，或在日志中明确提示用户手动清理。
+
+### 15.13 潜在风险汇总
 
 | ID | 级别 | 问题 | 影响 | 建议 |
 |----|------|------|------|------|
+| P1-2 | P1 | master_list 为空时不清理 fixup 目录 | 旧脚本残留误导用户 | 调整清理逻辑顺序 |
 | P2-9 | P3 | extra_results 重复调用 | 代码冗余 | 重构条件逻辑 |
 | P2-10 | P2 | support_summary 使用前未初始化 | trigger 过滤不准确 | 调整调用顺序 |
 | P2-11 | P2 | OB 元数据未读取 DEFERRABLE/DEFERRED | CHECK 约束比对误报 | 修改 OB 约束查询 |
 | P2-12 | P2 | FOR LOOP 集合属性范围语法未清洗 | PL/SQL 对象迁移失败 | 添加新清洗规则 |
+| P2-13 | P2 | fixup 文件删除无异常处理 | 清理中断导致残留 | 添加 try/except |
+| P2-14 | P3 | 绝对路径在 cwd 外不清理 | 旧脚本可能残留 | 添加强制清理配置 |
 
 ---
 
@@ -1137,8 +1323,11 @@ def test_clean_for_loop_collection_attr_range():
 
 | 类别 | 发现数量 | 说明 |
 |------|----------|------|
+| **Fixup 目录清理问题** | 3 处 | master_list 空时不清理、无异常处理、绝对路径限制 (详见 15.12) |
 | 代码逻辑问题 | 3 处 | 冗余调用、变量初始化顺序、OB 元数据字段缺失 |
-| DDL 清洗规则缺失 | 1 处 | FOR LOOP 集合属性范围语法 `.FIRST.` → `.FIRST..` |
+| DDL 清洗规则缺失 | 1 处 | FOR LOOP 集合属性范围语法 (详见 15.10) |
+| 表列检查能力 | 10 类已实现 | VARCHAR/NUMBER/VIRTUAL/IDENTITY/可见性等 (详见 15.11) |
+| 表列检查缺失 | 2 类 | NULLABLE、DATA_DEFAULT 已读取未比对 |
 | 改进确认 | 3 处 | CHECK 约束增强、主流程修复、DDL 调整正确 |
 | 元数据不对齐 | 1 处 | OB 侧 DEFERRABLE/DEFERRED 硬编码为 None |
 
@@ -1155,16 +1344,18 @@ def test_clean_for_loop_collection_attr_range():
 
 ### 优先修复项更新
 
-1. ✅ **已修复**: `generate_fixup_scripts` 缩进问题
-2. ✅ **已增强**: CHECK 约束 DEFERRABLE/DEFERRED 支持 (但 OB 侧数据缺失)
-3. 🔴 **P2-12**: FOR LOOP 集合属性范围语法清洗规则缺失 (新发现，详见 15.10)
-4. 🔴 **P2-11**: OB 元数据未读取 DEFERRABLE/DEFERRED 字段 (新发现)
-5. 🔴 **P2-10**: `support_summary` 使用前未初始化 (新发现)
-6. 🔴 **P1-1**: `DEPENDENCY_LAYERS` 顺序错误 (待修复)
-7. 🔶 其他之前发现的问题 (参见第 7 节)
+1. 🔴 **P1-2**: **Fixup 目录清理问题** - master_list 为空时不清理旧脚本 (用户反馈，详见 15.12)
+2. ✅ **已修复**: `generate_fixup_scripts` 缩进问题
+3. ✅ **已增强**: CHECK 约束 DEFERRABLE/DEFERRED 支持 (但 OB 侧数据缺失)
+4. 🔴 **P2-13**: fixup 文件删除无异常处理 (新发现)
+5. 🔴 **P2-12**: FOR LOOP 集合属性范围语法清洗规则缺失 (新发现，详见 15.10)
+6. 🔴 **P2-11**: OB 元数据未读取 DEFERRABLE/DEFERRED 字段 (新发现)
+7. 🔴 **P2-10**: `support_summary` 使用前未初始化 (新发现)
+8. 🔴 **P1-1**: `DEPENDENCY_LAYERS` 顺序错误 (待修复)
+9. 🔶 其他之前发现的问题 (参见第 7 节)
 
 ---
 
 *审核人: Cascade AI*  
 *审核工具版本: 2026.01*  
-*更新时间: 2026-01-23 09:10*
+*更新时间: 2026-01-23 09:40*
