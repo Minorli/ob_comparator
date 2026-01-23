@@ -814,6 +814,357 @@ with ThreadPoolExecutor(max_workers=worker_count) as executor:
 
 ---
 
+## 15. 深度审查 (2026-01-23 更新)
+
+### 15.1 代码版本变更
+
+**审查日期**: 2026-01-23  
+**代码行数**: 22,701 行 (较上次 +307 行)  
+**主要变更**: CHECK 约束增强、DEFERRABLE 属性支持
+
+### 15.2 CHECK 约束处理增强 ✅
+
+**新增函数**: `normalize_check_constraint_signature()` (第 1002-1013 行)
+
+```python
+def normalize_check_constraint_signature(
+    expr: Optional[str],
+    cons_name: Optional[str],
+    cons_meta: Optional[Dict]
+) -> str:
+    expr_norm = normalize_sql_expression(expr)
+    deferrable = normalize_deferrable_flag((cons_meta or {}).get("deferrable"))
+    deferred = normalize_deferred_flag((cons_meta or {}).get("deferred"))
+    return f"{expr_norm}||DEFERRABLE={deferrable}||DEFERRED={deferred}"
+```
+
+**改进点**:
+- ✅ CHECK 约束比对现在包含 DEFERRABLE/DEFERRED 属性
+- ✅ 添加 `classify_unsupported_check_constraint()` 检测 OB 不支持的 CHECK 约束
+- ✅ 自动识别包含 `SYS_CONTEXT('USERENV', ...)` 的不兼容约束
+
+### 15.3 发现的新问题
+
+#### P2-9: 代码冗余 - extra_results 重复调用
+
+**位置**: `schema_diff_reconciler.py:22406-22424`
+
+```python
+if enabled_extra_types:
+    with phase_timer("扩展对象校验", phase_durations):
+        extra_results = check_extra_objects(...)  # ← 调用1
+else:
+    extra_results = check_extra_objects(...)      # ← 调用2 (完全相同)
+```
+
+**问题**: 无论 `enabled_extra_types` 是否为空，都调用相同的函数，唯一区别是是否记录计时。
+
+**影响**: 低 - 功能正确但代码冗余
+
+**修复建议**:
+```python
+with phase_timer("扩展对象校验", phase_durations) if enabled_extra_types else nullcontext():
+    extra_results = check_extra_objects(...)
+```
+
+#### P2-10: 变量使用前未初始化
+
+**位置**: `schema_diff_reconciler.py:22428-22434`
+
+```python
+trigger_status_rows: List[TriggerStatusReportRow] = []
+support_summary: Optional[ObjectSupportSummary] = None  # ← 初始化为 None
+if 'TRIGGER' in enabled_extra_types:
+    trigger_status_rows = collect_trigger_status_rows(
+        ...
+        unsupported_table_keys=(support_summary.unsupported_table_keys if support_summary else None)
+        # ↑ 此时 support_summary 始终为 None!
+    )
+
+support_summary = classify_missing_objects(...)  # ← 在此之后才赋值
+```
+
+**问题**: `collect_trigger_status_rows` 中使用 `support_summary.unsupported_table_keys`，但此时 `support_summary` 尚未赋值。
+
+**影响**: 中 - `unsupported_table_keys` 参数始终为 None，可能导致 unsupported 表的触发器被错误处理
+
+**修复建议**: 将 `classify_missing_objects()` 调用移至 `collect_trigger_status_rows` 之前
+
+### 15.4 主流程验证 ✅
+
+**位置**: `main()` 函数 (第 21928-22700 行)
+
+**验证结果**: 之前发现的缩进问题已修复
+
+```python
+# 正确的代码结构 (第 22614-22640 行)
+view_chain_file = generate_fixup_scripts(
+    ora_cfg,
+    ob_cfg,
+    settings,
+    tv_results,
+    ...
+)
+```
+
+✅ `generate_fixup_scripts` 现在正确地在 `phase_timer("修补脚本生成")` 内调用，不再受 `enable_grant_generation` 条件影响。
+
+### 15.5 元数据加载交叉验证 ✅
+
+#### Oracle 元数据 vs OceanBase 元数据字段对齐
+
+| 字段 | Oracle (第7289行) | OceanBase (第6125行) | 对齐状态 |
+|------|-------------------|----------------------|----------|
+| CONSTRAINT_TYPE | `('P','U','R','C')` | `('P','U','R','C')` | ✅ |
+| SEARCH_CONDITION | ✅ 读取 | ✅ 读取 (带回车清理) | ✅ |
+| DELETE_RULE | ✅ 读取 | ✅ 读取 | ✅ |
+| DEFERRABLE | ✅ 读取 (第7505行) | ❌ 硬编码 None (第6388行) | 🔴 不对齐 |
+| DEFERRED | ✅ 读取 (第7540行) | ❌ 硬编码 None (第6389行) | 🔴 不对齐 |
+
+**严重发现**: OceanBase 元数据加载将 `deferrable` 和 `deferred` 字段硬编码为 `None`：
+
+```python
+# schema_diff_reconciler.py:6385-6389
+{
+    ...
+    "deferrable": None,  # ← 硬编码！
+    "deferred": None,    # ← 硬编码！
+}
+```
+
+**影响**: 
+- Oracle 端 DEFERRABLE 约束与 OceanBase 端比对时，OB 侧始终为 `NOT DEFERRABLE/IMMEDIATE`
+- 可能导致正常约束被误报为"条件/延迟属性不一致"
+
+**修复建议**: 在 OceanBase 约束查询中添加 DEFERRABLE/DEFERRED 字段读取
+
+### 15.6 约束比对逻辑交叉验证 ✅
+
+**位置**: `compare_constraints_for_table()` (第 10933-11241 行)
+
+| 约束类型 | bucket 函数 | match 函数 | 评估 |
+|----------|-------------|------------|------|
+| PRIMARY KEY | `bucket_pk_uk()` | `match_constraints()` | ✅ |
+| UNIQUE KEY | `bucket_pk_uk()` | `match_constraints()` | ✅ |
+| FOREIGN KEY | `bucket_fk()` | `match_foreign_keys()` | ✅ |
+| CHECK | `bucket_check()` | `match_check_constraints()` | ✅ |
+
+**验证结论**: 所有四种约束类型都有完整的分桶和匹配逻辑。
+
+### 15.7 DDL 调整逻辑审查 ✅
+
+**位置**: `adjust_ddl_for_object()` (第 14030-14300+ 行)
+
+**审查结论**: 实现复杂但正确
+
+| 功能 | 实现方式 | 评估 |
+|------|----------|------|
+| 主对象 schema/name 替换 | 正则 + 引号处理 | ✅ |
+| 无限定名称替换 | 上下文感知替换 | ✅ |
+| 避免误替换列名 | `stop_tokens` 检测 | ✅ |
+| PUBLIC SYNONYM 特殊处理 | 跳过 schema 添加 | ✅ |
+| SEQUENCE.NEXTVAL 识别 | `_looks_like_namespace()` | ✅ |
+
+### 15.8 依赖链处理验证 ✅
+
+**位置**: `build_view_fixup_chains()` (第 8521-8641 行)
+
+| 检查项 | 状态 | 说明 |
+|--------|------|------|
+| 循环检测 | ✅ | DFS 中 `seen` 集合防止无限递归 |
+| 深度限制 | ✅ | `max_depth=30` 防止过深遍历 |
+| SYNONYM 解析 | ✅ | `resolve_synonym_chain_target` 处理同义词链 |
+| 授权状态检测 | ✅ | `_grant_status()` 检测跨 schema 权限 |
+
+### 15.9 Fixup 脚本生成验证 ✅
+
+**位置**: `generate_fixup_scripts()` (第 16696-19450 行)
+
+**执行阶段验证**:
+
+| 阶段 | 对象类型 | 任务收集 | 并发执行 | 评估 |
+|------|----------|----------|----------|------|
+| 1/9 | SEQUENCE | ✅ `sequence_tasks` | ✅ `run_tasks()` | ✅ |
+| 2/9 | TABLE (CREATE) | ✅ `missing_tables` | ✅ | ✅ |
+| 3/9 | TABLE (ALTER) | ✅ `mismatched_tables` | ✅ | ✅ |
+| 4/9 | 代码对象 (VIEW等) | ✅ `view_missing` 等 | ✅ | ✅ |
+| 5/9 | TABLE (INTERVAL) | ✅ 条件检查 | ✅ | ✅ |
+| 6/9 | INDEX | ✅ `index_tasks` | ✅ | ✅ |
+| 7/9 | CONSTRAINT | ✅ `constraint_tasks` | ✅ | ✅ |
+| 8/9 | TRIGGER | ✅ `trigger_tasks` | ✅ | ✅ |
+| 9/9 | GRANT | ✅ `grant_plan` | ✅ | ✅ |
+
+### 15.10 DDL 清洗规则缺失：FOR LOOP 集合属性范围语法
+
+**问题描述**: Oracle 非标准语法 `FOR idx IN collection.FIRST.collection.LAST LOOP` 需要转换为标准语法 `FOR idx IN collection.FIRST..collection.LAST LOOP`（单点改双点）
+
+#### 现有实现分析
+
+**位置**: `schema_diff_reconciler.py:14404-14417`
+
+```python
+FOR_LOOP_RANGE_SINGLE_DOT_PATTERN = re.compile(
+    r'(\bIN\s+-?\d+)\s*\.(\s*)(?=(?:"[^"]+"|[A-Z_]))',
+    re.IGNORECASE
+)
+
+def clean_for_loop_single_dot_range(ddl: str) -> str:
+    """修复 FOR ... IN 1.var 这种单点范围写法为 1..var"""
+    ...
+```
+
+**当前覆盖范围**:
+- ✅ `FOR i IN 1.n LOOP` → `FOR i IN 1..n LOOP` (整数起始)
+- ❌ `FOR idx IN col.FIRST.col.LAST LOOP` (集合属性) **未覆盖**
+
+#### 需要新增的规则
+
+**规则名称**: `clean_for_loop_collection_attr_range`
+
+**正则模式**:
+```python
+FOR_LOOP_COLLECTION_ATTR_PATTERN = re.compile(
+    r'(\.(?:FIRST|LAST))\s*\.(?!\.)(\s*(?:[A-Z_][A-Z0-9_$#]*|\d+))',
+    re.IGNORECASE
+)
+```
+
+**实现代码**:
+```python
+def clean_for_loop_collection_attr_range(ddl: str) -> str:
+    """
+    修复 FOR ... IN collection.FIRST.xxx 或 collection.LAST.xxx
+    将 .FIRST. 或 .LAST. 后的单点改为双点 (..)
+    
+    原理：.FIRST/.LAST 返回标量索引值，后面不可能有合法的单点字段访问，
+    因此 .FIRST. 或 .LAST. 后跟单点必定是 range 运算符 (..) 写错。
+    
+    示例:
+      col.FIRST.col.LAST  →  col.FIRST..col.LAST
+      col.FIRST.10        →  col.FIRST..10
+      col.FIRST.v_end     →  col.FIRST..v_end
+    """
+    if not ddl:
+        return ddl
+    return FOR_LOOP_COLLECTION_ATTR_PATTERN.sub(r"\1..\2", ddl)
+```
+
+**正则说明**:
+- `(\.(?:FIRST|LAST))` - 匹配 `.FIRST` 或 `.LAST`
+- `\s*\.` - 匹配可能有空格的单点
+- `(?!\.)` - 负向前瞻，确保不是已经正确的 `..`
+- `(\s*(?:[A-Z_][A-Z0-9_$#]*|\d+))` - 匹配后续的标识符或数字
+
+#### 添加位置
+
+**文件**: `schema_diff_reconciler.py`
+
+**步骤 1**: 在 `FOR_LOOP_RANGE_SINGLE_DOT_PATTERN` 定义后添加新模式和函数 (约第 14418 行)
+
+**步骤 2**: 在 `DDL_CLEANUP_RULES['PLSQL_OBJECTS']['rules']` 中添加新规则 (约第 15249 行):
+
+```python
+'PLSQL_OBJECTS': {
+    'types': ['PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'TYPE', 'TYPE BODY', 'TRIGGER'],
+    'rules': [
+        clean_end_schema_prefix,
+        clean_for_loop_single_dot_range,
+        clean_for_loop_collection_attr_range,  # ← 新增
+        clean_plsql_ending,
+        ...
+    ]
+}
+```
+
+#### 场景覆盖矩阵
+
+| 场景 | 源语法 | 目标语法 | 覆盖状态 |
+|------|--------|----------|----------|
+| 整数起始 | `FOR i IN 1.n LOOP` | `1..n` | ✅ 现有规则 |
+| 集合.FIRST | `col.FIRST.col.LAST` | `col.FIRST..col.LAST` | 🔴 新规则 |
+| 集合.FIRST+数字 | `col.FIRST.10` | `col.FIRST..10` | 🔴 新规则 |
+| 集合.FIRST+变量 | `col.FIRST.v_end` | `col.FIRST..v_end` | 🔴 新规则 |
+| 集合.LAST | `1.col.LAST` | `1..col.LAST` | ✅ 现有规则 |
+| 普通变量 | `v_start.v_end` | `v_start..v_end` | ❌ 无法自动判断 |
+
+#### 无法覆盖的场景
+
+`v_start.v_end` 这种两个普通变量之间缺少 `..` 的情况**无法自动修复**，因为程序无法区分：
+- `obj.field` (合法的字段访问)
+- `lower.upper` (错误的 range 写法)
+
+此类情况需要人工审查修复。
+
+#### 测试用例建议
+
+```python
+def test_clean_for_loop_collection_attr_range():
+    # 基本场景
+    assert clean_for_loop_collection_attr_range(
+        "FOR idx IN v_rcpt_info.FIRST.v_rcpt_info.LAST LOOP"
+    ) == "FOR idx IN v_rcpt_info.FIRST..v_rcpt_info.LAST LOOP"
+    
+    # .FIRST + 数字
+    assert clean_for_loop_collection_attr_range(
+        "FOR i IN arr.FIRST.10 LOOP"
+    ) == "FOR i IN arr.FIRST..10 LOOP"
+    
+    # .LAST + 变量
+    assert clean_for_loop_collection_attr_range(
+        "FOR i IN 1.arr.LAST LOOP"
+    ) == "FOR i IN 1.arr.LAST LOOP"  # 现有规则已处理
+    
+    # 已经正确的不应修改
+    assert clean_for_loop_collection_attr_range(
+        "FOR idx IN col.FIRST..col.LAST LOOP"
+    ) == "FOR idx IN col.FIRST..col.LAST LOOP"
+```
+
+### 15.11 潜在风险汇总
+
+| ID | 级别 | 问题 | 影响 | 建议 |
+|----|------|------|------|------|
+| P2-9 | P3 | extra_results 重复调用 | 代码冗余 | 重构条件逻辑 |
+| P2-10 | P2 | support_summary 使用前未初始化 | trigger 过滤不准确 | 调整调用顺序 |
+| P2-11 | P2 | OB 元数据未读取 DEFERRABLE/DEFERRED | CHECK 约束比对误报 | 修改 OB 约束查询 |
+| P2-12 | P2 | FOR LOOP 集合属性范围语法未清洗 | PL/SQL 对象迁移失败 | 添加新清洗规则 |
+
+---
+
+## 16. 总结更新
+
+### 本次深度审查新增发现
+
+| 类别 | 发现数量 | 说明 |
+|------|----------|------|
+| 代码逻辑问题 | 3 处 | 冗余调用、变量初始化顺序、OB 元数据字段缺失 |
+| DDL 清洗规则缺失 | 1 处 | FOR LOOP 集合属性范围语法 `.FIRST.` → `.FIRST..` |
+| 改进确认 | 3 处 | CHECK 约束增强、主流程修复、DDL 调整正确 |
+| 元数据不对齐 | 1 处 | OB 侧 DEFERRABLE/DEFERRED 硬编码为 None |
+
+### 整体评价更新
+
+| 维度 | 评分 | 变化 | 说明 |
+|------|------|------|------|
+| 业务逻辑正确性 | ⭐⭐⭐⭐⭐ | → | CHECK 约束处理增强 |
+| 代码质量 | ⭐⭐⭐⭐ | → | 仍有小问题待修复 |
+| 异常处理 | ⭐⭐⭐ | → | 无变化 |
+| 测试覆盖 | ⭐⭐⭐ | → | 无变化 |
+| 安全性 | ⭐⭐⭐⭐ | → | 无变化 |
+| 性能 | ⭐⭐⭐⭐⭐ | → | 无变化 |
+
+### 优先修复项更新
+
+1. ✅ **已修复**: `generate_fixup_scripts` 缩进问题
+2. ✅ **已增强**: CHECK 约束 DEFERRABLE/DEFERRED 支持 (但 OB 侧数据缺失)
+3. 🔴 **P2-12**: FOR LOOP 集合属性范围语法清洗规则缺失 (新发现，详见 15.10)
+4. 🔴 **P2-11**: OB 元数据未读取 DEFERRABLE/DEFERRED 字段 (新发现)
+5. 🔴 **P2-10**: `support_summary` 使用前未初始化 (新发现)
+6. 🔴 **P1-1**: `DEPENDENCY_LAYERS` 顺序错误 (待修复)
+7. 🔶 其他之前发现的问题 (参见第 7 节)
+
+---
+
 *审核人: Cascade AI*  
 *审核工具版本: 2026.01*  
-*更新时间: 2026-01-22 16:15*
+*更新时间: 2026-01-23 09:10*
