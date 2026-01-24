@@ -401,6 +401,209 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(type_mismatches[0].issue, "number_precision")
         self.assertEqual(type_mismatches[0].expected_type, "NUMBER(10,2)")
 
+    def test_check_primary_objects_number_star_zero_equivalence(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "C1": {
+                    "data_type": "NUMBER",
+                    "data_precision": None,
+                    "data_scale": 0,
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "NUMBER",
+                        "data_precision": 38,
+                        "data_scale": 0,
+                    }
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(len(results["mismatched"]), 0)
+        self.assertEqual(len(results["ok"]), 1)
+
+    def test_check_primary_objects_number_star_scale_equivalence(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "C1": {
+                    "data_type": "NUMBER",
+                    "data_precision": None,
+                    "data_scale": 2,
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "NUMBER",
+                        "data_precision": 38,
+                        "data_scale": 2,
+                    }
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(len(results["mismatched"]), 0)
+        self.assertEqual(len(results["ok"]), 1)
+
+    def test_check_primary_objects_number_star_scale_mismatch(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "C1": {
+                    "data_type": "NUMBER",
+                    "data_precision": None,
+                    "data_scale": 2,
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "NUMBER",
+                        "data_precision": 37,
+                        "data_scale": 2,
+                    }
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(len(results["mismatched"]), 1)
+        type_mismatches = results["mismatched"][0][5]
+        self.assertEqual(len(type_mismatches), 1)
+        self.assertEqual(type_mismatches[0].issue, "number_precision")
+        self.assertEqual(type_mismatches[0].expected_type, "NUMBER(38,2)")
+
+    def test_check_primary_objects_number_decimal_equivalence(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "C1": {
+                    "data_type": "DECIMAL",
+                    "data_precision": 10,
+                    "data_scale": 0,
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "NUMBER",
+                        "data_precision": 10,
+                        "data_scale": 0,
+                    }
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(len(results["mismatched"]), 0)
+        self.assertEqual(len(results["ok"]), 1)
+
+    def test_check_primary_objects_number_scale_default_equivalence(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "C1": {
+                    "data_type": "NUMBER",
+                    "data_precision": 12,
+                    "data_scale": None,
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "NUMBER",
+                        "data_precision": 12,
+                        "data_scale": 0,
+                    }
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(len(results["mismatched"]), 0)
+        self.assertEqual(len(results["ok"]), 1)
+
+    def test_check_primary_objects_number_star_zero_mismatch(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "C1": {
+                    "data_type": "NUMBER",
+                    "data_precision": None,
+                    "data_scale": 0,
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "NUMBER",
+                        "data_precision": 37,
+                        "data_scale": 0,
+                    }
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(len(results["mismatched"]), 1)
+        type_mismatches = results["mismatched"][0][5]
+        self.assertEqual(len(type_mismatches), 1)
+        self.assertEqual(type_mismatches[0].issue, "number_precision")
+
     def test_check_primary_objects_char_semantics_mismatch(self):
         master_list = [("A.T1", "A.T1", "TABLE")]
         oracle_meta = self._make_oracle_meta_with_columns({
@@ -925,6 +1128,165 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
                 )
             self.assertFalse((Path(tmp_dir) / "view" / "TGT.V1.sql").exists())
             self.assertFalse((Path(tmp_dir) / "trigger" / "TGT.TR1.sql").exists())
+
+    def test_generate_fixup_skips_view_compile(self):
+        tv_results = {
+            "missing": [],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": [],
+            "remap_conflicts": []
+        }
+        extra_results = {
+            "index_ok": [], "index_mismatched": [],
+            "constraint_ok": [], "constraint_mismatched": [],
+            "sequence_ok": [], "sequence_mismatched": [],
+            "trigger_ok": [], "trigger_mismatched": [],
+        }
+        master_list = []
+        oracle_meta = self._make_oracle_meta()
+        ob_meta = self._make_ob_meta()
+        ob_meta = ob_meta._replace(objects_by_type={"VIEW": {"TGT.V1"}})
+        full_mapping = {}
+        settings = {
+            "fixup_dir": "",
+            "fixup_workers": 1,
+            "progress_log_interval": 999,
+            "fixup_type_set": {"VIEW"},
+            "fixup_schema_list": set(),
+            "source_schemas_list": ["SRC"],
+        }
+        dep_report = {
+            "missing": [
+                sdr.DependencyIssue(
+                    dependent="TGT.V1",
+                    dependent_type="VIEW",
+                    referenced="TGT.T1",
+                    referenced_type="TABLE",
+                    reason="MISSING_DEP"
+                )
+            ],
+            "unexpected": [],
+            "skipped": []
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings["fixup_dir"] = tmp_dir
+            with mock.patch.object(sdr, "fetch_dbcat_schema_objects", return_value=({}, {})), \
+                 mock.patch.object(sdr, "oracle_get_ddl_batch", return_value={}), \
+                 mock.patch.object(sdr, "get_oceanbase_version", return_value=None):
+                sdr.generate_fixup_scripts(
+                    {"user": "u", "password": "p", "dsn": "d"},
+                    {"executable": "obclient", "host": "h", "port": "1", "user_string": "u", "password": "p"},
+                    settings,
+                    tv_results,
+                    extra_results,
+                    master_list,
+                    oracle_meta,
+                    full_mapping,
+                    {},
+                    grant_plan=None,
+                    enable_grant_generation=False,
+                    dependency_report=dep_report,
+                    ob_meta=ob_meta,
+                    expected_dependency_pairs=set(),
+                    synonym_metadata={},
+                    trigger_filter_entries=None,
+                    trigger_filter_enabled=False,
+                    package_results=None,
+                    report_dir=None,
+                    report_timestamp=None,
+                    support_state_map={},
+                    unsupported_table_keys=set(),
+                    view_compat_map={}
+                )
+            self.assertFalse((Path(tmp_dir) / "compile").exists())
+
+    def test_generate_fixup_filters_grant_owner_scope(self):
+        tv_results = {
+            "missing": [],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": [],
+            "remap_conflicts": []
+        }
+        extra_results = {
+            "index_ok": [], "index_mismatched": [],
+            "constraint_ok": [], "constraint_mismatched": [],
+            "sequence_ok": [], "sequence_mismatched": [],
+            "trigger_ok": [], "trigger_mismatched": [],
+        }
+        master_list = [("APP.T1", "APP.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta()
+        ob_meta = self._make_ob_meta()
+        full_mapping = {"APP.T1": {"TABLE": "APP.T1"}}
+        grant_plan = sdr.GrantPlan(
+            object_grants={
+                "APP": {
+                    sdr.ObjectGrantEntry("SELECT", "APP.T1", False),
+                    sdr.ObjectGrantEntry("SELECT", "SYS.DUAL", False),
+                    sdr.ObjectGrantEntry("SELECT", "PUBLIC.DUAL", False),
+                }
+            },
+            sys_privs={},
+            role_privs={},
+            role_ddls=[],
+            filtered_grants=[]
+        )
+        settings = {
+            "fixup_dir": "",
+            "fixup_workers": 1,
+            "progress_log_interval": 999,
+            "fixup_type_set": set(),
+            "fixup_schema_list": set(),
+            "source_schemas_list": ["APP"],
+            "grant_merge_privileges": "true",
+            "grant_merge_grantees": "true",
+        }
+        dep_report = {"missing": [], "unexpected": [], "skipped": []}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings["fixup_dir"] = tmp_dir
+            with mock.patch.object(sdr, "fetch_dbcat_schema_objects", return_value=({}, {})), \
+                 mock.patch.object(sdr, "oracle_get_ddl_batch", return_value={}), \
+                 mock.patch.object(sdr, "get_oceanbase_version", return_value=None), \
+                 mock.patch.object(sdr, "load_ob_grant_catalog", return_value=None):
+                sdr.generate_fixup_scripts(
+                    {"user": "u", "password": "p", "dsn": "d"},
+                    {"executable": "obclient", "host": "h", "port": "1", "user_string": "u", "password": "p"},
+                    settings,
+                    tv_results,
+                    extra_results,
+                    master_list,
+                    oracle_meta,
+                    full_mapping,
+                    {},
+                    grant_plan=grant_plan,
+                    enable_grant_generation=True,
+                    dependency_report=dep_report,
+                    ob_meta=ob_meta,
+                    expected_dependency_pairs=set(),
+                    synonym_metadata={},
+                    trigger_filter_entries=None,
+                    trigger_filter_enabled=False,
+                    package_results=None,
+                    report_dir=None,
+                    report_timestamp=None,
+                    support_state_map={},
+                    unsupported_table_keys=set(),
+                    view_compat_map={}
+                )
+            app_grants = Path(tmp_dir) / "grants_all" / "APP.grants.sql"
+            sys_grants = Path(tmp_dir) / "grants_all" / "SYS.grants.sql"
+            public_grants = Path(tmp_dir) / "grants_all" / "PUBLIC.grants.sql"
+            self.assertTrue(app_grants.exists())
+            self.assertFalse(sys_grants.exists())
+            self.assertFalse(public_grants.exists())
+            content = app_grants.read_text(encoding="utf-8")
+            self.assertIn("GRANT SELECT ON APP.T1", content)
+            self.assertNotIn("ALTER SESSION SET CURRENT_SCHEMA", content)
 
     def test_generate_fixup_orders_packages_by_dependency(self):
         tv_results = {
@@ -2269,11 +2631,48 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         cleaned = sdr.clean_view_ddl_for_oceanbase(ddl, ob_version="4.2.5.7")
         self.assertNotIn("CONSTRAINT", cleaned.upper())
 
+    def test_normalize_ddl_for_ob_removes_using_index_name(self):
+        ddl = (
+            'ALTER TABLE "A"."T1" ADD CONSTRAINT "C1" UNIQUE ("C1") '
+            'USING INDEX "IDX_C1" ENABLE;'
+        )
+        cleaned = sdr.normalize_ddl_for_ob(ddl)
+        self.assertNotIn("USING INDEX", cleaned.upper())
+        self.assertNotIn("IDX_C1", cleaned.upper())
+
     def test_clean_view_ddl_preserves_force_and_removes_editionable(self):
         ddl = "CREATE OR REPLACE FORCE EDITIONABLE VIEW A.V AS SELECT 1 FROM DUAL"
         cleaned = sdr.clean_view_ddl_for_oceanbase(ddl, ob_version="4.2.5.7")
         self.assertIn("FORCE VIEW", cleaned.upper())
         self.assertNotIn("EDITIONABLE", cleaned.upper())
+
+    def test_clean_trigger_ddl_removes_editionable(self):
+        ddl = (
+            "CREATE OR REPLACE EDITIONABLE TRIGGER \"SRC\".\"TR1\"\n"
+            "BEFORE INSERT ON SRC.T1\n"
+            "FOR EACH ROW\n"
+            "BEGIN\n"
+            "  :new.id := 1;\n"
+            "END;\n"
+        )
+        cleaned = sdr.apply_ddl_cleanup_rules(ddl, 'TRIGGER')
+        self.assertIn("CREATE OR REPLACE TRIGGER", cleaned.upper())
+        self.assertNotIn("EDITIONABLE", cleaned.upper())
+
+    def test_enforce_schema_for_ddl_skips_duplicate(self):
+        ddl = (
+            "ALTER SESSION SET CURRENT_SCHEMA = A;\n"
+            "CREATE OR REPLACE TRIGGER A.T1\n"
+            "BEFORE INSERT ON A.T1\n"
+            "BEGIN\n"
+            "  :new.id := 1;\n"
+            "END;\n"
+        )
+        enforced = sdr.enforce_schema_for_ddl(ddl, "A", "TRIGGER")
+        self.assertEqual(
+            enforced.upper().count("ALTER SESSION SET CURRENT_SCHEMA = A"),
+            1
+        )
 
     def test_sanitize_view_ddl_inline_comment_breaks_line(self):
         ddl = (
@@ -2764,6 +3163,40 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIsNone(mismatch)
 
+    def test_compare_constraints_for_table_derived_unique_constraint(self):
+        oracle_constraints = {("A", "T1"): {}}
+        oracle_indexes = {
+            ("A", "T1"): {
+                "UX_T1": {
+                    "uniqueness": "UNIQUE",
+                    "columns": ["C1"],
+                    "expressions": {},
+                    "descend": []
+                }
+            }
+        }
+        ob_constraints = {
+            ("A", "T1"): {
+                "UX_T1": {
+                    "type": "U",
+                    "columns": ["C1"]
+                }
+            }
+        }
+        oracle_meta = self._make_oracle_meta(constraints=oracle_constraints, indexes=oracle_indexes)
+        ob_meta = self._make_ob_meta(constraints=ob_constraints)
+        ok, mismatch = sdr.compare_constraints_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+            {}
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(mismatch)
+
     def test_compare_constraints_for_table_check_missing_without_expr(self):
         oracle_constraints = {
             ("A", "T1"): {
@@ -2945,6 +3378,101 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(reason_codes, {"CHECK_SYS_CONTEXT", "CHECK_DEFERRABLE"})
         self.assertEqual(extra_results["constraint_mismatched"], [])
         self.assertIn("TGT.T1", extra_results["constraint_ok"])
+
+    def test_build_unsupported_summary_counts_includes_extra(self):
+        support_summary = sdr.SupportClassificationResult(
+            support_state_map={},
+            missing_detail_rows=[],
+            unsupported_rows=[],
+            missing_support_counts={
+                "TABLE": {"supported": 0, "unsupported": 2, "blocked": 1},
+                "VIEW": {"supported": 0, "unsupported": 0, "blocked": 3},
+            },
+            extra_blocked_counts={"INDEX": 4, "CONSTRAINT": 5},
+            unsupported_table_keys=set(),
+            unsupported_view_keys=set(),
+            view_compat_map={}
+        )
+        extra_results = {
+            "index_unsupported": ["IDX1", "IDX2"],
+            "constraint_unsupported": ["C1"]
+        }
+        counts = sdr.build_unsupported_summary_counts(support_summary, extra_results)
+        self.assertEqual(counts["TABLE"], 3)
+        self.assertEqual(counts["VIEW"], 3)
+        self.assertEqual(counts["INDEX"], 6)
+        self.assertEqual(counts["CONSTRAINT"], 6)
+
+    def test_classify_unsupported_deferrable_pk(self):
+        oracle_constraints = {
+            ("SRC", "T1"): {
+                "PK_DEF": {
+                    "type": "P",
+                    "columns": ["C1"],
+                    "deferrable": "DEFERRABLE",
+                    "deferred": "IMMEDIATE",
+                }
+            }
+        }
+        oracle_meta = self._make_oracle_meta(constraints=oracle_constraints)
+        extra_results = {
+            "constraint_ok": [],
+            "constraint_mismatched": [
+                sdr.ConstraintMismatch(
+                    table="TGT.T1",
+                    missing_constraints={"PK_DEF"},
+                    extra_constraints=set(),
+                    detail_mismatch=[
+                        "PRIMARY KEY: 源约束 PK_DEF (列 ['C1']) 在目标端未找到。"
+                    ],
+                    downgraded_pk_constraints=set()
+                )
+            ]
+        }
+        table_target_map = {("SRC", "T1"): ("TGT", "T1")}
+        rows = sdr.classify_unsupported_check_constraints(
+            extra_results,
+            oracle_meta,
+            table_target_map
+        )
+        reason_codes = {row.reason_code for row in rows}
+        self.assertEqual(reason_codes, {"PRIMARY_KEY_DEFERRABLE"})
+        self.assertEqual(extra_results["constraint_mismatched"], [])
+        self.assertIn("TGT.T1", extra_results["constraint_ok"])
+
+    def test_classify_unsupported_indexes_desc(self):
+        oracle_indexes = {
+            ("SRC", "T1"): {
+                "IDX_DESC": {
+                    "uniqueness": "NONUNIQUE",
+                    "columns": ["C1"],
+                    "expressions": {},
+                    "descend": ["DESC"]
+                }
+            }
+        }
+        oracle_meta = self._make_oracle_meta(indexes=oracle_indexes)
+        extra_results = {
+            "index_ok": [],
+            "index_mismatched": [
+                sdr.IndexMismatch(
+                    table="TGT.T1",
+                    missing_indexes={"IDX_DESC"},
+                    extra_indexes=set(),
+                    detail_mismatch=["索引列 ['C1'] 在目标端未找到。"]
+                )
+            ]
+        }
+        table_target_map = {("SRC", "T1"): ("TGT", "T1")}
+        rows = sdr.classify_unsupported_indexes(
+            extra_results,
+            oracle_meta,
+            table_target_map
+        )
+        reason_codes = {row.reason_code for row in rows}
+        self.assertEqual(reason_codes, {"INDEX_DESC"})
+        self.assertEqual(extra_results["index_mismatched"], [])
+        self.assertIn("TGT.T1", extra_results["index_ok"])
 
     def test_compare_constraints_for_table_fk_delete_rule_mismatch(self):
         oracle_constraints = {
@@ -3249,6 +3777,41 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         info_long_raw = {"data_type": "LONG RAW"}
         self.assertEqual(sdr.format_oracle_column_type(info_long), "CLOB")
         self.assertEqual(sdr.format_oracle_column_type(info_long_raw), "BLOB")
+
+    def test_format_oracle_column_type_number_star(self):
+        info_star = {"data_type": "NUMBER", "data_precision": None, "data_scale": 2}
+        info_star_zero = {"data_type": "NUMBER", "data_precision": None, "data_scale": 0}
+        self.assertEqual(sdr.format_oracle_column_type(info_star), "NUMBER(*,2)")
+        self.assertEqual(sdr.format_oracle_column_type(info_star_zero), "NUMBER(*)")
+
+    def test_normalize_check_constraint_expression_casefold(self):
+        expr_upper = '"VOUCHER_STATUS" IS NOT NULL'
+        expr_lower = '"VOUCHER_STATUS" is not null'
+        norm_upper = sdr.normalize_check_constraint_expression(expr_upper, "NN1")
+        norm_lower = sdr.normalize_check_constraint_expression(expr_lower, "NN1")
+        self.assertEqual(norm_upper, norm_lower)
+
+    def test_normalize_check_constraint_expression_preserves_literals(self):
+        expr = "status = 'aBc' and flag = 'XyZ'"
+        norm = sdr.normalize_check_constraint_expression(expr, "C1")
+        self.assertIn("'aBc'", norm)
+        self.assertIn("'XyZ'", norm)
+        self.assertIn("AND", norm)
+
+    def test_normalize_check_constraint_expression_redundant_parentheses(self):
+        expr_oracle = "A > 0 AND B IN (1,2,3)"
+        expr_ob = '("A" > 0) and ("B" in (1,2,3))'
+        norm_oracle = sdr.normalize_check_constraint_expression(expr_oracle, "C1")
+        norm_ob = sdr.normalize_check_constraint_expression(expr_ob, "C2")
+        self.assertEqual(norm_oracle, norm_ob)
+
+    def test_normalize_index_expression_casefold(self):
+        cols = ["SYS_NC0004$"]
+        expr_upper = 'DECODE(\"CMS_RESULT\",\'PBB00\',\"BUSINESS_UNIQUE_ID\",NULL,\"BUSINESS_UNIQUE_ID\")'
+        expr_lower = 'decode(\"CMS_RESULT\",\'PBB00\',\"BUSINESS_UNIQUE_ID\",null,\"BUSINESS_UNIQUE_ID\")'
+        norm_upper = sdr.normalize_index_columns(cols, {1: expr_upper})
+        norm_lower = sdr.normalize_index_columns(cols, {1: expr_lower})
+        self.assertEqual(norm_upper, norm_lower)
 
     def test_recursive_infer_target_schema_uses_indirect_tables(self):
         deps = {

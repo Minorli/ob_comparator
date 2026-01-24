@@ -1,6 +1,8 @@
 import unittest
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import run_fixup as rf
 
@@ -56,7 +58,32 @@ class TestRunFixupConfig(unittest.TestCase):
             ob_cfg, fixup_path, _repo_root, _log_level, _report_path = rf.load_ob_config(cfg_path)
             self.assertEqual(ob_cfg["password"], "p%w")
             self.assertEqual(ob_cfg["timeout"], 77)
-            self.assertEqual(fixup_path, (root / "fixup_scripts").resolve())
+        self.assertEqual(fixup_path, (root / "fixup_scripts").resolve())
+
+
+class TestCurrentSchemaExecution(unittest.TestCase):
+    def test_execute_sql_statements_applies_current_schema(self):
+        sql_text = "\n".join([
+            "ALTER SESSION SET CURRENT_SCHEMA = OB_SALES;",
+            "CREATE TABLE T1(ID INT);",
+            "CREATE VIEW V1 AS SELECT * FROM T1;"
+        ])
+        captured = []
+
+        def fake_run_sql(_cmd, sql, _timeout):
+            captured.append(sql.strip())
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+        with mock.patch.object(rf, "run_sql", side_effect=fake_run_sql):
+            summary = rf.execute_sql_statements([], sql_text, timeout=1)
+
+        self.assertEqual(summary.failures, [])
+        self.assertEqual(len(captured), 3)
+        self.assertTrue(captured[0].startswith("ALTER SESSION SET CURRENT_SCHEMA = OB_SALES;"))
+        self.assertTrue(captured[1].startswith("ALTER SESSION SET CURRENT_SCHEMA = OB_SALES;"))
+        self.assertIn("CREATE TABLE T1", captured[1])
+        self.assertTrue(captured[2].startswith("ALTER SESSION SET CURRENT_SCHEMA = OB_SALES;"))
+        self.assertIn("CREATE VIEW V1", captured[2])
 
 
 class TestGrantLookupPriority(unittest.TestCase):

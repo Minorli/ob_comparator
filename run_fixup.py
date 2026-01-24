@@ -65,6 +65,11 @@ LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOG_FILE_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
 LOG_SECTION_WIDTH = 80
 
+CURRENT_SCHEMA_PATTERN = re.compile(
+    r'ALTER\s+SESSION\s+SET\s+CURRENT_SCHEMA\s*=\s*(?P<schema>"[^"]+"|[A-Z0-9_$#]+)',
+    re.IGNORECASE
+)
+
 
 def _build_console_handler(level: int) -> logging.Handler:
     try:
@@ -1605,21 +1610,28 @@ def execute_sql_statements(
 ) -> ExecutionSummary:
     statements = split_sql_statements(sql_text)
     failures: List[StatementFailure] = []
+    current_schema: Optional[str] = None
 
     for idx, statement in enumerate(statements, start=1):
         if not statement.strip():
             continue
+        match = CURRENT_SCHEMA_PATTERN.search(statement)
+        if match:
+            current_schema = match.group("schema")
+        statement_to_run = statement
+        if current_schema and not match:
+            statement_to_run = f"ALTER SESSION SET CURRENT_SCHEMA = {current_schema};\n{statement}"
         try:
-            result = run_sql(obclient_cmd, statement, timeout)
+            result = run_sql(obclient_cmd, statement_to_run, timeout)
         except subprocess.TimeoutExpired:
             timeout_label = "no-timeout" if timeout is None else f"> {timeout} 秒"
-            failures.append(StatementFailure(idx, f"执行超时 ({timeout_label})", statement))
+            failures.append(StatementFailure(idx, f"执行超时 ({timeout_label})", statement_to_run))
             continue
 
         if result.returncode != 0:
             stderr = (result.stderr or "").strip()
             message = stderr or "执行失败"
-            failures.append(StatementFailure(idx, message, statement))
+            failures.append(StatementFailure(idx, message, statement_to_run))
 
     return ExecutionSummary(statements=len(statements), failures=failures)
 

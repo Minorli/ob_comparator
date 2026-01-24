@@ -778,6 +778,7 @@ def is_ignored_source_column(col_name: Optional[str], col_meta: Optional[Dict] =
 
 VARCHAR_LEN_MIN_MULTIPLIER = 1.5  # 目标端 VARCHAR/2 长度需 >= ceil(src * 1.5)
 VARCHAR_LEN_OVERSIZE_MULTIPLIER = 2.5  # 超过该倍数认为“过大”，需要提示
+NUMBER_STAR_PRECISION = 38  # NUMBER(*) 等价精度
 
 
 def normalize_black_type(value: Optional[str]) -> str:
@@ -963,6 +964,140 @@ def strip_wrapping_parentheses(text: str) -> str:
     return text[1:-1].strip()
 
 
+def tokenize_sql_expression(expr: str) -> List[Tuple[str, str, int, int]]:
+    """
+    将表达式拆分为 token，忽略空白，保留字符串字面量与括号位置。
+    token 形式: (type, value, start, end)
+    """
+    tokens: List[Tuple[str, str, int, int]] = []
+    if not expr:
+        return tokens
+    i = 0
+    n = len(expr)
+    while i < n:
+        ch = expr[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == "'":
+            start = i
+            i += 1
+            while i < n:
+                if expr[i] == "'":
+                    if i + 1 < n and expr[i + 1] == "'":
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            tokens.append(("STRING", expr[start:i], start, i))
+            continue
+        if ch.isalnum() or ch in "_$#":
+            start = i
+            i += 1
+            while i < n and (expr[i].isalnum() or expr[i] in "_$#"):
+                i += 1
+            tokens.append(("WORD", expr[start:i], start, i))
+            continue
+        if ch in ("(", ")"):
+            tokens.append(("PAREN", ch, i, i + 1))
+            i += 1
+            continue
+        tokens.append(("SYMBOL", ch, i, i + 1))
+        i += 1
+    return tokens
+
+
+def strip_redundant_predicate_parentheses(expr: str) -> str:
+    """
+    移除 AND/OR 链中冗余的谓词括号：
+      (A > 0) AND (B IN (1,2,3)) -> A > 0 AND B IN (1,2,3)
+    注意：仅移除顶层谓词括号，保留 NOT/IN/函数调用等必要语法。
+    """
+    if not expr:
+        return expr
+    tokens = tokenize_sql_expression(expr)
+    if not tokens:
+        return expr
+
+    stack: List[Dict[str, object]] = []
+    pairs: List[Dict[str, object]] = []
+
+    for idx, (tok_type, tok_val, tok_start, tok_end) in enumerate(tokens):
+        if tok_type == "STRING":
+            continue
+        if tok_type == "PAREN" and tok_val == "(":
+            stack.append({
+                "start_token_idx": idx,
+                "start_pos": tok_start,
+                "depth": len(stack),
+                "has_boolean": False,
+                "between_pending": False
+            })
+            continue
+        if tok_type == "PAREN" and tok_val == ")":
+            if not stack:
+                continue
+            ctx = stack.pop()
+            ctx["end_token_idx"] = idx
+            ctx["end_pos"] = tok_start
+            pairs.append(ctx)
+            continue
+        if not stack:
+            continue
+        ctx = stack[-1]
+        if tok_type == "WORD":
+            word = tok_val.upper()
+            if word == "BETWEEN":
+                ctx["between_pending"] = True
+            elif word == "AND":
+                if ctx.get("between_pending"):
+                    ctx["between_pending"] = False
+                else:
+                    ctx["has_boolean"] = True
+            elif word == "OR":
+                ctx["has_boolean"] = True
+
+    def _prev_allows(token: Optional[Tuple[str, str, int, int]]) -> bool:
+        if token is None:
+            return True
+        tok_type, tok_val, _, _ = token
+        if tok_type == "WORD":
+            return tok_val.upper() in ("AND", "OR")
+        if tok_type == "PAREN":
+            return tok_val == "("
+        return False
+
+    def _next_allows(token: Optional[Tuple[str, str, int, int]]) -> bool:
+        if token is None:
+            return True
+        tok_type, tok_val, _, _ = token
+        if tok_type == "WORD":
+            return tok_val.upper() in ("AND", "OR")
+        if tok_type == "PAREN":
+            return tok_val == ")"
+        return False
+
+    remove = [False] * len(expr)
+    for ctx in pairs:
+        if ctx.get("depth") != 0:
+            continue
+        if ctx.get("has_boolean"):
+            continue
+        start_idx = int(ctx["start_token_idx"])
+        end_idx = int(ctx["end_token_idx"])
+        prev_tok = tokens[start_idx - 1] if start_idx > 0 else None
+        next_tok = tokens[end_idx + 1] if end_idx + 1 < len(tokens) else None
+        if not _prev_allows(prev_tok) or not _next_allows(next_tok):
+            continue
+        remove[int(ctx["start_pos"])] = True
+        remove[int(ctx["end_pos"])] = True
+
+    if not any(remove):
+        return expr
+    return "".join(ch for i, ch in enumerate(expr) if not remove[i])
+
+
 def normalize_sql_expression(expr: Optional[str]) -> str:
     if expr is None:
         return ""
@@ -980,6 +1115,34 @@ def normalize_sql_expression(expr: Optional[str]) -> str:
             break
         text = stripped
     return text
+
+
+def uppercase_outside_single_quotes(text: str) -> str:
+    if not text:
+        return ""
+    out: List[str] = []
+    in_quote = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "'":
+            out.append(ch)
+            if in_quote:
+                if i + 1 < len(text) and text[i + 1] == "'":
+                    out.append("'")
+                    i += 1
+                else:
+                    in_quote = False
+            else:
+                in_quote = True
+        else:
+            out.append(ch if in_quote else ch.upper())
+        i += 1
+    return "".join(out)
+
+
+def normalize_sql_expression_casefold(expr: Optional[str]) -> str:
+    return uppercase_outside_single_quotes(normalize_sql_expression(expr))
 
 
 def is_system_notnull_check(cons_name: Optional[str], search_condition: Optional[str]) -> bool:
@@ -1024,7 +1187,9 @@ def normalize_check_constraint_expression(
     expr: Optional[str],
     cons_name: Optional[str]
 ) -> str:
-    expr_norm = normalize_sql_expression(expr)
+    expr_norm = normalize_sql_expression_casefold(expr)
+    expr_norm = strip_redundant_predicate_parentheses(expr_norm)
+    expr_norm = uppercase_outside_single_quotes(normalize_sql_expression(expr_norm))
     name_u = (cons_name or "").upper()
     if not expr_norm:
         return f"__NO_EXPR__:{name_u}"
@@ -1042,24 +1207,36 @@ def normalize_check_constraint_signature(
     return f"{expr_norm}||DEFERRABLE={deferrable}||DEFERRED={deferred}"
 
 
-def classify_unsupported_check_constraint(cons_meta: Optional[Dict]) -> Optional[Tuple[str, str, str]]:
+CONSTRAINT_TYPE_LABELS = {
+    "P": "PRIMARY KEY",
+    "U": "UNIQUE",
+    "R": "FOREIGN KEY",
+    "C": "CHECK",
+}
+
+
+def classify_unsupported_constraint(cons_meta: Optional[Dict]) -> Optional[Tuple[str, str, str]]:
     if not cons_meta:
         return None
+    ctype = (cons_meta.get("type") or "").upper()
     deferrable = normalize_deferrable_flag(cons_meta.get("deferrable"))
     deferred = normalize_deferred_flag(cons_meta.get("deferred"))
     if deferrable == "DEFERRABLE" or deferred == "DEFERRED":
+        label = CONSTRAINT_TYPE_LABELS.get(ctype, ctype or "CONSTRAINT")
+        reason_code = f"{label.replace(' ', '_')}_DEFERRABLE"
         return (
-            "CHECK_DEFERRABLE",
-            "CHECK 约束为 DEFERRABLE/DEFERRED，OceanBase 不支持。",
+            reason_code,
+            f"{label} 约束为 DEFERRABLE/DEFERRED，OceanBase 不支持。",
             "ORA-00900"
         )
-    expr = cons_meta.get("search_condition") or ""
-    if expr and CHECK_SYS_CONTEXT_USERENV_RE.search(str(expr)):
-        return (
-            "CHECK_SYS_CONTEXT",
-            "CHECK 约束包含 SYS_CONTEXT('USERENV', ...)，OceanBase 不支持。",
-            "ORA-02436"
-        )
+    if ctype == "C":
+        expr = cons_meta.get("search_condition") or ""
+        if expr and CHECK_SYS_CONTEXT_USERENV_RE.search(str(expr)):
+            return (
+                "CHECK_SYS_CONTEXT",
+                "CHECK 约束包含 SYS_CONTEXT('USERENV', ...)，OceanBase 不支持。",
+                "ORA-02436"
+            )
     return None
 
 
@@ -1092,6 +1269,38 @@ def normalize_number_meta(prec: Optional[object], scale: Optional[object]) -> Tu
     return prec_int, scale_int
 
 
+def normalize_number_signature(
+    src_prec: Optional[int],
+    src_scale: Optional[int],
+    *,
+    star_precision: int = NUMBER_STAR_PRECISION
+) -> Tuple[Optional[int], Optional[int], bool]:
+    if src_prec is None and src_scale is None:
+        return None, None, True
+    if src_prec is None:
+        return star_precision, src_scale, False
+    return src_prec, src_scale, False
+
+
+def is_number_equivalent(
+    src_prec: Optional[int],
+    src_scale: Optional[int],
+    tgt_prec: Optional[int],
+    tgt_scale: Optional[int]
+) -> bool:
+    src_prec_n, src_scale_n, src_unbounded = normalize_number_signature(src_prec, src_scale)
+    tgt_prec_n, tgt_scale_n, tgt_unbounded = normalize_number_signature(tgt_prec, tgt_scale)
+    if src_unbounded:
+        return tgt_unbounded
+    if tgt_unbounded:
+        return True
+    if tgt_scale_n != src_scale_n:
+        return False
+    if tgt_prec_n is None or src_prec_n is None:
+        return False
+    return tgt_prec_n >= src_prec_n
+
+
 def format_number_type_literal(data_type: str, precision: Optional[int], scale: Optional[int]) -> str:
     dt = (data_type or "").strip().upper() or "NUMBER"
     if precision is None:
@@ -1108,8 +1317,15 @@ def build_number_fixup_type(src_info: Dict, tgt_info: Dict) -> str:
     tgt_prec, _tgt_scale = normalize_number_meta(
         tgt_info.get("data_precision"), tgt_info.get("data_scale")
     )
-    if src_prec is None:
+    if src_prec is None and src_scale is None:
         return format_number_type_literal(src_info.get("data_type") or "NUMBER", None, None)
+    if src_prec is None:
+        expected_scale = src_scale if src_scale is not None else 0
+        return format_number_type_literal(
+            src_info.get("data_type") or "NUMBER",
+            NUMBER_STAR_PRECISION,
+            expected_scale
+        )
     expected_prec = src_prec
     if tgt_prec is not None and tgt_prec > expected_prec:
         expected_prec = tgt_prec
@@ -1665,6 +1881,15 @@ class IndexMismatch(NamedTuple):
     detail_mismatch: List[str]
 
 
+class IndexUnsupportedDetail(NamedTuple):
+    table_full: str
+    index_name: str
+    columns: str
+    reason_code: str
+    reason: str
+    ob_error_hint: str
+
+
 class ConstraintMismatch(NamedTuple):
     table: str
     missing_constraints: Set[str]
@@ -1804,7 +2029,7 @@ def normalize_index_columns(
     normalized: List[str] = []
     for idx, col in enumerate(columns, start=1):
         expr = expr_map.get(idx)
-        token = normalize_sql_expression(expr) if expr else (col or "").upper()
+        token = normalize_sql_expression_casefold(expr) if expr else (col or "").upper()
         if not token:
             continue
         if token in seen:
@@ -1812,6 +2037,15 @@ def normalize_index_columns(
         seen.add(token)
         normalized.append(token)
     return tuple(normalized)
+
+
+def index_has_desc(info: Optional[Dict]) -> bool:
+    if not info:
+        return False
+    for flag in (info.get("descend") or []):
+        if (flag or "").strip().upper() == "DESC":
+            return True
+    return False
 
 
 def normalize_trigger_status(value: Optional[str]) -> str:
@@ -5431,7 +5665,7 @@ def classify_unsupported_check_constraints(
     table_target_map: Optional[Dict[Tuple[str, str], Tuple[str, str]]]
 ) -> List[ConstraintUnsupportedDetail]:
     """
-    标记 Oracle->OB 不支持的 CHECK 约束，并从缺失列表中移除。
+    标记 Oracle->OB 不支持的约束（含 DEFERRABLE），并从缺失列表中移除。
     """
     if not extra_results:
         return []
@@ -5454,7 +5688,7 @@ def classify_unsupported_check_constraints(
         filtered: List[str] = []
         for line in lines:
             line_u = line.upper()
-            if "CHECK" in line_u and any(name in line_u for name in names_u):
+            if any(name in line_u for name in names_u):
                 continue
             filtered.append(line)
         return filtered
@@ -5472,11 +5706,10 @@ def classify_unsupported_check_constraints(
             cons_meta = cons_map.get(cons_name.upper()) or cons_map.get(cons_name)
             if not cons_meta:
                 continue
-            if (cons_meta.get("type") or "").upper() != "C":
+            ctype = (cons_meta.get("type") or "").upper()
+            if ctype == "C" and is_system_notnull_check(cons_name, cons_meta.get("search_condition")):
                 continue
-            if is_system_notnull_check(cons_name, cons_meta.get("search_condition")):
-                continue
-            reason = classify_unsupported_check_constraint(cons_meta)
+            reason = classify_unsupported_constraint(cons_meta)
             if not reason:
                 continue
             reason_code, reason_text, ob_hint = reason
@@ -5484,7 +5717,7 @@ def classify_unsupported_check_constraints(
             unsupported_rows.append(ConstraintUnsupportedDetail(
                 table_full=f"{src_schema}.{src_table}",
                 constraint_name=cons_name.upper(),
-                search_condition=str(cons_meta.get("search_condition") or "-"),
+                search_condition=str(cons_meta.get("search_condition") or "-") if ctype == "C" else "-",
                 reason_code=reason_code,
                 reason=reason_text,
                 ob_error_hint=ob_hint
@@ -5510,6 +5743,103 @@ def classify_unsupported_check_constraints(
 
     extra_results["constraint_mismatched"] = updated_mismatches
     extra_results["constraint_ok"] = sorted(ok_tables)
+    return unsupported_rows
+
+
+def classify_unsupported_indexes(
+    extra_results: ExtraCheckResults,
+    oracle_meta: OracleMetadata,
+    table_target_map: Optional[Dict[Tuple[str, str], Tuple[str, str]]]
+) -> List[IndexUnsupportedDetail]:
+    """
+    标记 Oracle->OB 不支持的索引（如 DESC），并从缺失列表中移除。
+    """
+    if not extra_results:
+        return []
+    index_items = list(extra_results.get("index_mismatched", []) or [])
+    if not index_items or not table_target_map:
+        return []
+
+    table_map = {
+        f"{tgt_schema.upper()}.{tgt_table.upper()}": (src_schema.upper(), src_table.upper())
+        for (src_schema, src_table), (tgt_schema, tgt_table) in table_target_map.items()
+    }
+    unsupported_rows: List[IndexUnsupportedDetail] = []
+    updated_mismatches: List[IndexMismatch] = []
+    ok_tables: Set[str] = set(extra_results.get("index_ok", []) or [])
+
+    def _extract_cols_from_detail(line: str) -> Optional[Tuple[str, ...]]:
+        match = re.search(r"索引列\s*\[(.*?)\]", line)
+        if not match:
+            return None
+        raw = match.group(1)
+        if not raw:
+            return tuple()
+        parts = [p.strip().strip("'\"") for p in raw.split(",") if p.strip()]
+        return tuple(parts)
+
+    def _filter_detail_lines(lines: List[str], unsupported_cols: Set[Tuple[str, ...]]) -> List[str]:
+        if not lines or not unsupported_cols:
+            return lines
+        filtered: List[str] = []
+        for line in lines:
+            if "在目标端未找到" in line and "索引列" in line:
+                cols = _extract_cols_from_detail(line)
+                if cols and cols in unsupported_cols:
+                    continue
+            filtered.append(line)
+        return filtered
+
+    for item in index_items:
+        table_str = (item.table or "").split()[0].upper()
+        src_pair = table_map.get(table_str)
+        if not src_pair:
+            updated_mismatches.append(item)
+            continue
+        src_schema, src_table = src_pair
+        idx_map = oracle_meta.indexes.get((src_schema, src_table), {}) or {}
+        unsupported_names: Set[str] = set()
+        unsupported_cols: Set[Tuple[str, ...]] = set()
+        for idx_name in item.missing_indexes:
+            idx_meta = idx_map.get(idx_name.upper()) or idx_map.get(idx_name)
+            if not idx_meta:
+                continue
+            if not index_has_desc(idx_meta):
+                continue
+            cols = normalize_index_columns(
+                idx_meta.get("columns") or [],
+                idx_meta.get("expressions") or {}
+            )
+            unsupported_names.add(idx_name)
+            unsupported_cols.add(cols)
+            unsupported_rows.append(IndexUnsupportedDetail(
+                table_full=f"{src_schema}.{src_table}",
+                index_name=idx_name.upper(),
+                columns=",".join(cols) if cols else "-",
+                reason_code="INDEX_DESC",
+                reason="索引包含 DESC 列，OceanBase 不支持。",
+                ob_error_hint="ORA-00900"
+            ))
+
+        if not unsupported_names:
+            updated_mismatches.append(item)
+            continue
+
+        new_missing = set(item.missing_indexes) - unsupported_names
+        new_detail = _filter_detail_lines(item.detail_mismatch, unsupported_cols)
+        if not new_missing and not item.extra_indexes and not new_detail:
+            ok_tables.add(item.table)
+            continue
+
+        updated_mismatches.append(IndexMismatch(
+            table=item.table,
+            missing_indexes=new_missing,
+            extra_indexes=item.extra_indexes,
+            detail_mismatch=new_detail
+        ))
+
+    extra_results["index_mismatched"] = updated_mismatches
+    extra_results["index_ok"] = sorted(ok_tables)
     return unsupported_rows
 
 
@@ -6262,14 +6592,17 @@ def dump_ob_metadata(
                 indexes.setdefault(key, {})[idx_name] = {
                     "uniqueness": uniq,
                     "columns": [],
-                    "expressions": {}
+                    "expressions": {},
+                    "descend": []
                 }
 
         # --- 4. DBA_IND_COLUMNS ---
-        sql_tpl = """
-            SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_NAME, COLUMN_POSITION
+        has_descend_col = ob_has_dba_column(ob_cfg, "DBA_IND_COLUMNS", "DESCEND")
+        descend_select = ", DESCEND" if has_descend_col else ""
+        sql_tpl = f"""
+            SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_NAME, COLUMN_POSITION{descend_select}
             FROM DBA_IND_COLUMNS
-            WHERE TABLE_OWNER IN ({owners_in})
+            WHERE TABLE_OWNER IN ({{owners_in}})
             ORDER BY TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_POSITION
         """
         ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners_in_list)
@@ -6288,6 +6621,7 @@ def dump_ob_metadata(
                     parts[2].strip().upper(),
                     parts[3].strip().upper()
                 )
+                descend_flag = parts[5].strip().upper() if has_descend_col and len(parts) > 5 else ""
                 key = (t_owner, t_name)
                 # 只有在 DBA_INDEXES 已有记录时才补充列，避免虚构 UNKNOWN 索引
                 idx_info = indexes.get(key, {}).get(idx_name)
@@ -6295,6 +6629,7 @@ def dump_ob_metadata(
                     log.debug("索引 %s.%s.%s 未出现在 DBA_INDEXES，跳过列信息。", t_owner, t_name, idx_name)
                     continue
                 idx_info["columns"].append(col_name)
+                idx_info["descend"].append(descend_flag or "ASC")
 
         # 尝试读取函数索引表达式（可能在部分 OB 版本不可用）
         sql_expr_tpl = """
@@ -7496,11 +7831,12 @@ def dump_oracle_metadata(
                                 indexes.setdefault(key, {})[idx_name] = {
                                     "uniqueness": (row[3] or "").upper(),
                                     "columns": [],
-                                    "expressions": {}
+                                    "expressions": {},
+                                    "descend": []
                                 }
 
                     sql_idx_cols_tpl = """
-                        SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_NAME
+                        SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_NAME, DESCEND
                         FROM DBA_IND_COLUMNS
                         WHERE TABLE_OWNER IN ({owners_clause})
                         ORDER BY TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_POSITION
@@ -7520,11 +7856,14 @@ def dump_oracle_metadata(
                                     continue
                                 idx_name = _safe_upper(row[2])
                                 col_name = _safe_upper(row[3])
+                                descend_flag = (row[4] or "").strip().upper() if len(row) > 4 else ""
                                 if not idx_name or not col_name:
                                     continue
                                 indexes.setdefault(key, {}).setdefault(
-                                    idx_name, {"uniqueness": "UNKNOWN", "columns": [], "expressions": {}}
+                                    idx_name,
+                                    {"uniqueness": "UNKNOWN", "columns": [], "expressions": {}, "descend": []}
                                 )["columns"].append(col_name)
+                                indexes[key][idx_name]["descend"].append(descend_flag or "ASC")
 
                     # 读取函数索引表达式
                     sql_idx_expr_tpl = """
@@ -10093,18 +10432,7 @@ def check_primary_objects(
                         tgt_info.get("data_precision"),
                         tgt_info.get("data_scale")
                     )
-                    mismatch = False
-                    if src_prec is None:
-                        if tgt_prec is not None:
-                            mismatch = True
-                    else:
-                        if tgt_prec is not None:
-                            if tgt_prec < src_prec:
-                                mismatch = True
-                            if tgt_scale != src_scale:
-                                mismatch = True
-                        # tgt_prec is None implies unbounded, treat as compatible
-                    if mismatch:
+                    if not is_number_equivalent(src_prec, src_scale, tgt_prec, tgt_scale):
                         expected_type = build_number_fixup_type(src_info, tgt_info)
                         type_mismatches.append(
                             ColumnTypeIssue(
@@ -11077,6 +11405,19 @@ def compare_constraints_for_table(
         source_all_cols = set(src_norm_cols.values())
         partition_key_set = get_partition_key_set(oracle_meta, src_schema, src_table)
 
+    src_idx_unique_cols: Set[Tuple[str, ...]] = set()
+    src_idx_unique_names: Set[str] = set()
+    src_idx_entries = oracle_meta.indexes.get((src_schema.upper(), src_table.upper()), {}) or {}
+    if src_idx_entries:
+        src_idx_map = build_index_map(src_idx_entries)
+        for cols, info in src_idx_map.items():
+            uniq_set = info.get("uniq") or set()
+            if "UNIQUE" in uniq_set:
+                src_idx_unique_cols.add(cols)
+                for name in info.get("names", set()):
+                    if name:
+                        src_idx_unique_names.add(name.upper())
+
     detail_mismatch: List[str] = []
     missing: Set[str] = set()
     extra: Set[str] = set()
@@ -11205,6 +11546,15 @@ def compare_constraints_for_table(
             extra_cols = tgt_list[idx][0]
             if extra_cols in source_all_cols:
                 continue
+            if label == "UNIQUE KEY":
+                extra_name_u = (extra_name or "").upper()
+                if extra_cols in src_idx_unique_cols or (extra_name_u and extra_name_u in src_idx_unique_names):
+                    log.debug(
+                        "忽略派生 UNIQUE 约束 %s (列 %s)，源端已存在 UNIQUE 索引。",
+                        extra_name,
+                        list(extra_cols)
+                    )
+                    continue
             if "_OMS_ROWID" in (extra_name or ""):
                 continue
             extra.add(extra_name)
@@ -11851,6 +12201,7 @@ def check_extra_objects(
     extra_results: ExtraCheckResults = {
         "index_ok": [],
         "index_mismatched": [],
+        "index_unsupported": [],
         "constraint_ok": [],
         "constraint_mismatched": [],
         "constraint_unsupported": [],
@@ -12114,6 +12465,13 @@ def check_extra_objects(
                     missing_mappings=missing_map,
                     detail_mismatch=detail_mismatch
                 ))
+
+    index_unsupported = classify_unsupported_indexes(
+        extra_results,
+        oracle_meta,
+        build_table_target_map(master_list) if master_list else None
+    )
+    extra_results["index_unsupported"] = index_unsupported
 
     constraint_unsupported = classify_unsupported_check_constraints(
         extra_results,
@@ -14466,6 +14824,10 @@ USING_INDEX_PATTERN_SIMPLE = re.compile(
     r'USING\s+INDEX\s+(ENABLE|DISABLE)',
     re.IGNORECASE
 )
+USING_INDEX_PATTERN_NAME = re.compile(
+    r'USING\s+INDEX\s+("[^"]+"|[A-Za-z0-9_$#]+)(\s+(ENABLE|DISABLE))?',
+    re.IGNORECASE
+)
 MV_REFRESH_ON_DEMAND_PATTERN = re.compile(r'\s+ON\s+DEMAND', re.IGNORECASE)
 
 
@@ -15390,6 +15752,7 @@ DDL_CLEANUP_RULES = {
         'types': ['PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'TYPE', 'TYPE BODY', 'TRIGGER'],
         'rules': [
             clean_end_schema_prefix,
+            clean_editionable_flags,
             clean_for_loop_single_dot_range,
             clean_for_loop_collection_attr_range,
             clean_plsql_ending,
@@ -15522,6 +15885,7 @@ def normalize_ddl_for_ob(ddl: str) -> str:
     """
     ddl = USING_INDEX_PATTERN_WITH_OPTIONS.sub(lambda m: m.group(1), ddl)
     ddl = USING_INDEX_PATTERN_SIMPLE.sub(lambda m: m.group(1), ddl)
+    ddl = USING_INDEX_PATTERN_NAME.sub("", ddl)
     ddl = MV_REFRESH_ON_DEMAND_PATTERN.sub('', ddl)
     return ddl
 
@@ -15531,7 +15895,15 @@ def enforce_schema_for_ddl(ddl: str, schema: str, obj_type: str) -> str:
     if obj_type_u not in DDL_OBJECT_TYPE_OVERRIDE:
         return ddl
 
-    set_stmt = f"ALTER SESSION SET CURRENT_SCHEMA = {schema.upper()};"
+    schema_u = schema.upper()
+    existing_pattern = re.compile(
+        rf'^\s*ALTER\s+SESSION\s+SET\s+CURRENT_SCHEMA\s*=\s*"?{re.escape(schema_u)}"?\s*;?\s*$',
+        re.IGNORECASE | re.MULTILINE
+    )
+    if existing_pattern.search(ddl):
+        return ddl
+
+    set_stmt = f"ALTER SESSION SET CURRENT_SCHEMA = {schema_u};"
     lines = ddl.splitlines()
     insert_idx = 0
 
@@ -16349,12 +16721,15 @@ def format_oracle_column_type(
 
     # NUMBER-like
     if dt in ("NUMBER", "DECIMAL", "NUMERIC"):
+        base_dt = "NUMBER" if dt in ("DECIMAL", "NUMERIC") else dt
         if prec is not None:
             if scale is not None:
                 return f"{dt}({int(prec)},{int(scale)})"
             return f"{dt}({int(prec)})"
         if scale is not None:
-            return f"{dt}({int(scale)})"
+            if int(scale) == 0:
+                return f"{base_dt}(*)"
+            return f"{base_dt}(*,{int(scale)})"
         return dt
 
     # FLOAT
@@ -17378,6 +17753,27 @@ def generate_fixup_scripts(
     grants_by_owner: Dict[str, Set[str]] = {}
     merge_privileges = parse_bool_flag(settings.get('grant_merge_privileges', 'true'), True)
     merge_grantees = parse_bool_flag(settings.get('grant_merge_grantees', 'true'), True)
+    source_schema_set = {s.upper() for s in settings.get('source_schemas_list', []) if s}
+    target_schema_set: Set[str] = set()
+    for type_map in full_object_mapping.values():
+        for tgt_name in type_map.values():
+            if '.' in tgt_name:
+                target_schema_set.add(tgt_name.split('.', 1)[0].upper())
+    for tgt_full in remap_rules.values():
+        if '.' in tgt_full:
+            target_schema_set.add(tgt_full.split('.', 1)[0].upper())
+    grant_owner_allowlist: Set[str] = set(source_schema_set) | target_schema_set
+    grant_owner_denylist: Set[str] = {"SYS", "PUBLIC"}
+
+    def is_allowed_grant_owner(owner: str) -> bool:
+        owner_u = (owner or "").upper()
+        if not owner_u:
+            return False
+        if owner_u in grant_owner_denylist:
+            return False
+        if not grant_owner_allowlist:
+            return False
+        return owner_u in grant_owner_allowlist
 
     def format_object_grant(grantee: str, entry: ObjectGrantEntry) -> str:
         stmt = f"GRANT {entry.privilege.upper()} ON {entry.object_full.upper()} TO {grantee.upper()}"
@@ -17418,6 +17814,9 @@ def generate_fixup_scripts(
         privilege_u = (privilege or "").upper()
         if not grantee_u or not object_u or not privilege_u:
             return
+        owner_u = object_u.split('.', 1)[0] if '.' in object_u else ""
+        if not is_allowed_grant_owner(owner_u):
+            return
         if grantable:
             object_grants_by_grantee[grantee_u].discard(ObjectGrantEntry(
                 privilege=privilege_u,
@@ -17452,6 +17851,7 @@ def generate_fixup_scripts(
         if not raw_count:
             return 0, 0, dict(object_grant_lookup_local), dict(grants_by_owner_local)
         object_index: Dict[str, Dict[bool, Dict[str, Set[str]]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
+        filtered = 0
         for grantee, entries in grants_by_grantee.items():
             grantee_u = (grantee or "").upper()
             if not grantee_u:
@@ -17460,7 +17860,14 @@ def generate_fixup_scripts(
                 if not entry or not entry.object_full:
                     continue
                 obj_full_u = entry.object_full.upper()
+                owner_u = obj_full_u.split('.', 1)[0] if '.' in obj_full_u else ""
+                if not is_allowed_grant_owner(owner_u):
+                    filtered += 1
+                    continue
                 object_index[obj_full_u][bool(entry.grantable)][grantee_u].add(entry.privilege.upper())
+
+        if filtered:
+            log.info("[GRANT] 已过滤 %d 条对象授权（owner 不在允许范围）。", filtered)
 
         merged_count = 0
         for obj_full, grantable_map in object_index.items():
@@ -19383,8 +19790,6 @@ def generate_fixup_scripts(
             ]
         if obj_type_u == "TRIGGER":
             return [f"ALTER TRIGGER {obj_name_u} COMPILE;"]
-        if obj_type_u in ("VIEW", "MATERIALIZED VIEW"):
-            return [f"ALTER {obj_type_u} {obj_name_u} COMPILE;"]
         if obj_type_u == "TYPE":
             return [f"ALTER TYPE {obj_name_u} COMPILE;"]
         if obj_type_u == "TYPE BODY":
@@ -19454,7 +19859,7 @@ def generate_fixup_scripts(
                 for owner, stmts in sorted(grants_by_owner.items()):
                     if not stmts:
                         continue
-                    content = prepend_set_schema("\n".join(sorted(stmts)), owner)
+                    content = "\n".join(sorted(stmts))
                     header = f"{owner} 对象权限授权"
                     write_fixup_file(
                         base_dir,
@@ -19496,7 +19901,7 @@ def generate_fixup_scripts(
                 for owner, stmts in sorted(miss_grants_by_owner.items()):
                     if not stmts:
                         continue
-                    content = prepend_set_schema("\n".join(sorted(stmts)), owner)
+                    content = "\n".join(sorted(stmts))
                     header = f"{owner} 对象权限授权"
                     write_fixup_file(
                         base_dir,
@@ -19872,7 +20277,7 @@ def export_constraints_unsupported_detail(
     report_timestamp: Optional[str]
 ) -> Optional[Path]:
     """
-    输出不支持的 CHECK 约束明细。
+    输出不支持的约束明细。
     """
     if not report_dir or not rows or not report_timestamp:
         return None
@@ -19897,7 +20302,41 @@ def export_constraints_unsupported_detail(
         ]
         for row in rows_sorted
     ]
-    return write_pipe_report("CHECK 约束不支持明细", header_fields, data_rows, output_path)
+    return write_pipe_report("约束不支持明细", header_fields, data_rows, output_path)
+
+
+def export_indexes_unsupported_detail(
+    rows: List[IndexUnsupportedDetail],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出不支持的索引明细。
+    """
+    if not report_dir or not rows or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"indexes_unsupported_detail_{report_timestamp}.txt"
+    rows_sorted = sorted(rows, key=lambda r: (r.table_full, r.index_name))
+    header_fields = [
+        "TABLE",
+        "INDEX_NAME",
+        "COLUMNS",
+        "REASON_CODE",
+        "REASON",
+        "OB_ERROR_HINT"
+    ]
+    data_rows = [
+        [
+            row.table_full,
+            row.index_name,
+            row.columns or "-",
+            row.reason_code,
+            row.reason,
+            row.ob_error_hint or "-"
+        ]
+        for row in rows_sorted
+    ]
+    return write_pipe_report("索引不支持明细", header_fields, data_rows, output_path)
 
 
 def export_extra_targets_detail(
@@ -20722,6 +21161,26 @@ def collect_blacklisted_missing_tables(
     }
 
 
+def build_unsupported_summary_counts(
+    support_summary: Optional[SupportClassificationResult],
+    extra_results: Optional[ExtraCheckResults]
+) -> Dict[str, int]:
+    """
+    汇总不支持/阻断数量（含扩展对象），供报告汇总使用。
+    """
+    counts: Dict[str, int] = defaultdict(int)
+    if support_summary:
+        for obj_type, data in (support_summary.missing_support_counts or {}).items():
+            counts[obj_type] += int(data.get("unsupported", 0) or 0)
+            counts[obj_type] += int(data.get("blocked", 0) or 0)
+        for obj_type, blocked in (support_summary.extra_blocked_counts or {}).items():
+            counts[obj_type] += int(blocked or 0)
+    if extra_results:
+        counts["INDEX"] += len(extra_results.get("index_unsupported", []) or [])
+        counts["CONSTRAINT"] += len(extra_results.get("constraint_unsupported", []) or [])
+    return dict(counts)
+
+
 def build_run_summary(
     ctx: RunSummaryContext,
     tv_results: ReportResults,
@@ -21121,8 +21580,8 @@ def print_final_report(
 
     if extra_results is None:
         extra_results = {
-            "index_ok": [], "index_mismatched": [], "constraint_ok": [],
-            "constraint_mismatched": [], "sequence_ok": [], "sequence_mismatched": [],
+            "index_ok": [], "index_mismatched": [], "index_unsupported": [],
+            "constraint_ok": [], "constraint_mismatched": [], "sequence_ok": [], "sequence_mismatched": [],
             "trigger_ok": [], "trigger_mismatched": [], "constraint_unsupported": [],
         }
     if comment_results is None:
@@ -21156,6 +21615,7 @@ def print_final_report(
     extraneous_count = len(tv_results['extraneous'])
     idx_ok_cnt = len(extra_results.get("index_ok", []))
     idx_mis_cnt = len(extra_results.get("index_mismatched", []))
+    idx_unsupported_cnt = len(extra_results.get("index_unsupported", []) or [])
     cons_ok_cnt = len(extra_results.get("constraint_ok", []))
     cons_mis_cnt = len(extra_results.get("constraint_mismatched", []))
     seq_ok_cnt = len(extra_results.get("sequence_ok", []))
@@ -21193,6 +21653,7 @@ def print_final_report(
     unsupported_rows = list(support_summary.unsupported_rows) if support_summary else []
     missing_detail_rows = list(support_summary.missing_detail_rows) if support_summary else []
     extra_blocked_counts = dict(support_summary.extra_blocked_counts) if support_summary else {}
+    unsupported_summary_counts = build_unsupported_summary_counts(support_summary, extra_results)
 
     console.print(Panel.fit(f"[bold]数据库对象迁移校验报告 (V{__version__} - Rich)[/bold]", style="title"))
     console.print(f"[info]项目主页: {REPO_URL} | 问题反馈: {REPO_ISSUES_URL}[/info]")
@@ -21331,8 +21792,11 @@ def print_final_report(
     ext_text.append("索引: ", style="info")
     ext_text.append(f"一致 {idx_ok_cnt} / ", style="ok")
     ext_text.append(f"差异 {idx_mis_cnt}", style="mismatch")
-    if idx_blocked_cnt:
-        ext_text.append(f" (不支持/阻断 {idx_blocked_cnt})", style="mismatch")
+    if idx_blocked_cnt or idx_unsupported_cnt:
+        ext_text.append(
+            f" (不支持/阻断 {idx_blocked_cnt + idx_unsupported_cnt})",
+            style="mismatch"
+        )
     ext_text.append("\n")
     ext_text.append("约束: ", style="info")
     ext_text.append(f"一致 {cons_ok_cnt} / ", style="ok")
@@ -21416,13 +21880,16 @@ def print_final_report(
             )
             if report_ts:
                 detail_hint_lines.append(f"示例: missing_objects_detail_{report_ts}.txt")
+        if extra_results.get("index_unsupported"):
+            suffix = f"_{report_ts}" if report_ts else ""
+            detail_hint_lines.append(
+                f"索引不支持明细: indexes_unsupported_detail{suffix}.txt"
+            )
         if extra_results.get("constraint_unsupported"):
             suffix = f"_{report_ts}" if report_ts else ""
             detail_hint_lines.append(
-                f"CHECK 约束不支持明细: constraints_unsupported_detail{suffix}.txt"
+                f"约束不支持明细: constraints_unsupported_detail{suffix}.txt"
             )
-        else:
-            detail_hint_lines.append("未生成分拆报告，如需细节请设置 report_detail_mode=split。")
         console.print(Panel.fit("\n".join(detail_hint_lines), style="info", width=section_width))
 
     if config_diagnostics:
@@ -21527,8 +21994,7 @@ def print_final_report(
             ob_val = ob_counts.get(obj_type, 0)
             miss_val = missing_counts.get(obj_type, 0)
             extra_val = extra_counts.get(obj_type, 0)
-            support_info = support_counts.get(obj_type, {})
-            unsupported_val = int(support_info.get("unsupported", 0) or 0) + int(support_info.get("blocked", 0) or 0)
+            unsupported_val = int(unsupported_summary_counts.get(obj_type, 0) or 0)
             count_table.add_row(
                 obj_type,
                 str(ora_val),
@@ -21911,6 +22377,11 @@ def print_final_report(
                 report_path.parent,
                 report_ts
             )
+        index_unsupported_path = export_indexes_unsupported_detail(
+            extra_results.get("index_unsupported", []) or [],
+            report_path.parent,
+            report_ts
+        )
         constraint_unsupported_path = export_constraints_unsupported_detail(
             extra_results.get("constraint_unsupported", []) or [],
             report_path.parent,
@@ -21976,8 +22447,10 @@ def print_final_report(
                 log.info("缺失对象支持性明细已输出到: %s", missing_detail_path)
             if unsupported_detail_path:
                 log.info("不支持/阻断对象明细已输出到: %s", unsupported_detail_path)
+            if index_unsupported_path:
+                log.info("索引不支持明细已输出到: %s", index_unsupported_path)
             if constraint_unsupported_path:
-                log.info("CHECK 约束不支持明细已输出到: %s", constraint_unsupported_path)
+                log.info("约束不支持明细已输出到: %s", constraint_unsupported_path)
             if extra_targets_path:
                 log.info("目标端多余对象明细已输出到: %s", extra_targets_path)
             if skipped_detail_path:
@@ -22391,6 +22864,7 @@ def main():
         extra_results: ExtraCheckResults = {
             "index_ok": [],
             "index_mismatched": [],
+            "index_unsupported": [],
             "constraint_ok": [],
             "constraint_mismatched": [],
             "constraint_unsupported": [],

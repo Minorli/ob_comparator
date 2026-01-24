@@ -16,6 +16,7 @@ schema_diff_reconciler_v0.8.8.py
 logs
 config.ini
 AGENTS.md
+CLAUDE.md
 docs/MIGRATION_PROPOSAL_1567_SCHEMAS.md
 .venv
 

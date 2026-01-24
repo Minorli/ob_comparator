@@ -1,10 +1,17 @@
 # 全量代码审核报告
 
 **审核日期**: 2026-01-22  
-**代码版本**: commit 6e6a99d  
+**更新日期**: 2026-01-23  
+**代码版本**: commit ae8ca5d  
 **审核范围**: 全代码库  
 
 ---
+
+## 0. 更新记录 (2026-01-23)
+
+- 基于 commit `ae8ca5d` 复核并更新状态，标记已修复与待处理项。
+- 已修复：CHECK 约束表达式优先匹配、SYS_NC 索引列集匹配、OB DEFERRABLE/DEFERRED 读取、fixup 目录清理、PL/SQL 集合属性范围清洗、依赖排序与非 VIEW 授权联动。
+- 仍待处理：同义词 1:1 场景误判、映射术语描述不一致、异常处理与测试覆盖中的若干建议项。
 
 ## 1. 代码库概览
 
@@ -375,6 +382,8 @@ CREATE FUNCTION get_user RETURN user_type IS ...
 
 **修复建议**: 调整层级顺序或实现全对象拓扑排序。
 
+**状态更新 (2026-01-23)**: 已修复，`DEPENDENCY_LAYERS` 已调整为 TYPE/TYPE BODY 在 PROCEDURE/FUNCTION 之前，并按对象类型分层执行。
+
 #### P2-6: TYPE/TYPE BODY 遗漏拓扑排序 (与 PACKAGE 同类问题)
 
 **位置**: `schema_diff_reconciler.py:624-627` 和 `17519-17584`
@@ -397,6 +406,8 @@ CREATE TYPE type_b AS OBJECT (...);
 
 **修复建议**: 扩展常量或创建独立的 `_order_type_fixups` 函数。
 
+**状态更新 (2026-01-23)**: 已修复，PL/SQL 修补排序已覆盖 TYPE/TYPE BODY，并按依赖关系排序。
+
 #### P2-7: PROCEDURE/FUNCTION/TRIGGER 缺少层内拓扑排序
 
 **影响对象**: PROCEDURE, FUNCTION, TRIGGER
@@ -414,9 +425,13 @@ CREATE PROCEDURE proc_b AS BEGIN NULL; END;
 
 **缓解措施**: 使用 `--iterative` 模式可多轮重试，但效率低。
 
+**状态更新 (2026-01-23)**: 已修复，PROCEDURE/FUNCTION/TRIGGER 已纳入依赖拓扑排序逻辑。
+
 #### P2-8: 非 VIEW 对象缺少授权联动
 
 **问题**: VIEW 的 `build_view_chain_plan` 会自动规划授权，但其他对象没有。
+
+**状态更新 (2026-01-23)**: 已增强，非 VIEW 对象也会标记跨 schema 授权状态并参与授权推导。
 
 **场景示例**:
 ```sql
@@ -1403,6 +1418,8 @@ def match_check_constraints(src_list, tgt_list):
             extra.add(name)
 ```
 
+**状态更新 (2026-01-23)**: 已修复，CHECK 约束匹配改为表达式优先，同名但表达式不一致仍会提示不一致。
+
 ### 15.13 Fixup 目录清理问题 🔴
 
 **用户反馈**: 进入 fixup 逻辑后不会清空之前的 fixup 目录，导致新的 fixup 无法生成
@@ -1434,6 +1451,8 @@ if not master_list:
     return None
 ```
 
+**状态更新 (2026-01-23)**: 已修复，清理顺序已提前且支持异常容错。
+
 #### 问题 2: 文件删除无异常处理 (P2)
 
 ```python
@@ -1461,6 +1480,8 @@ for child in base_dir.iterdir():
         failed_count += 1
 ```
 
+**状态更新 (2026-01-23)**: 已修复，删除异常已捕获并记录。
+
 #### 问题 3: 绝对路径在 cwd 外时不清理 (P3)
 
 ```python
@@ -1471,6 +1492,8 @@ safe_to_clean = (not base_dir.is_absolute()) or (run_root == base_resolved or ru
 **影响**: 若 `fixup_dir` 是绝对路径且不在当前工作目录下，旧脚本不会被清理。
 
 **修复建议**: 添加配置项 `fixup_force_clean=true` 允许用户强制清理，或在日志中明确提示用户手动清理。
+
+**状态更新 (2026-01-23)**: 已修复，已新增 `fixup_force_clean` 开关。
 
 ### 15.13 潜在风险汇总
 
@@ -1500,8 +1523,8 @@ safe_to_clean = (not base_dir.is_absolute()) or (run_root == base_resolved or ru
 | DDL 清洗规则缺失 | 1 处 | FOR LOOP 集合属性范围语法 (详见 15.10) |
 | 表列检查能力 | 10 类已实现 | VARCHAR/NUMBER/VIRTUAL/IDENTITY/可见性等 (详见 15.11) |
 | 表列检查缺失 | 2 类 | NULLABLE、DATA_DEFAULT 已读取未比对 |
-| 改进确认 | 3 处 | CHECK 约束增强、主流程修复、DDL 调整正确 |
-| 元数据不对齐 | 1 处 | OB 侧 DEFERRABLE/DEFERRED 硬编码为 None |
+| 改进确认 | 6 处 | CHECK 约束增强、主流程修复、DDL 调整正确、fixup 清理、PL/SQL 清洗、依赖排序 |
+| 元数据不对齐 | 1 处 | OB 侧 DEFERRABLE/DEFERRED 硬编码为 None（已修复） |
 
 ### 整体评价更新
 
@@ -1514,20 +1537,34 @@ safe_to_clean = (not base_dir.is_absolute()) or (run_root == base_resolved or ru
 | 安全性 | ⭐⭐⭐⭐ | → | 无变化 |
 | 性能 | ⭐⭐⭐⭐⭐ | → | 无变化 |
 
-### 优先修复项更新
+### 优先修复项更新 (2026-01-23)
 
-1. � **P3-17**: **映射术语描述矛盾** - "1:1或一对多场景"等矛盾表述 (用户反馈，详见 15.12)
-2. �🔴 **P2-16**: **同义词 1:1 场景误判** - 跨 schema 同义词被错误推导到目标 schema (用户反馈，详见 15.13)
-3. 🔴 **P2-15**: **CHECK 约束比对逻辑** - 优先按名称匹配不合理，应按表达式匹配 (用户反馈，详见 15.14)
-4. 🔴 **P1-2**: **Fixup 目录清理问题** - master_list 为空时不清理旧脚本 (用户反馈，详见 15.15)
-5. ✅ **已修复**: `generate_fixup_scripts` 缩进问题
-6. ✅ **已增强**: CHECK 约束 DEFERRABLE/DEFERRED 支持 (但 OB 侧数据缺失)
-7. 🔴 **P2-13**: fixup 文件删除无异常处理 (新发现)
-8. 🔴 **P2-12**: FOR LOOP 集合属性范围语法清洗规则缺失 (新发现，详见 15.10)
-9. 🔴 **P2-11**: OB 元数据未读取 DEFERRABLE/DEFERRED 字段 (新发现)
-10. 🔴 **P2-10**: `support_summary` 使用前未初始化 (新发现)
-11. 🔴 **P1-1**: `DEPENDENCY_LAYERS` 顺序错误 (待修复)
-12. 🔶 其他之前发现的问题 (参见第 7 节)
+**待处理（仍需修复）**
+1. **P2-16**: 同义词 1:1 场景误判（跨 schema 同义词被错误推导到目标 schema，详见 15.13）
+2. **P3-17**: 映射术语描述矛盾（"1:1或一对多场景" 等措辞不清，详见 15.12）
+3. **P2**: `obclient_run_sql()` 异常分类不够细（见 3.1）
+4. **P2**: `oracle_get_ddl_batch()` 回退重试次数未限制（见 3.1）
+5. **P3**: 多处 `sys.exit(1)` 直接退出（如需库化/嵌入，见 3.1）
+6. **P3**: `run_fixup.py` 集成测试与 E2E 测试不足（见 4.4）
+7. **P2**: 密码通过命令行传递（进程列表可见，见 5.2）
+8. **P3**: 日志可能泄露连接字符串（见 5.2）
+9. **P3**: 超大规模 schema 的内存占用优化（见 6.1）
+
+**已完成（已修复/已增强）**
+- **P1-1**: DEPENDENCY_LAYERS 顺序错误 → 已调整排序
+- **P2-6**: TYPE/TYPE BODY 缺少排序 → 已纳入拓扑排序
+- **P2-7**: PROCEDURE/FUNCTION/TRIGGER 缺少拓扑排序 → 已修复
+- **P2-8**: 非 VIEW 授权联动缺失 → 已增强依赖授权状态
+- **P2-15**: CHECK 约束名称优先匹配 → 已改为表达式优先匹配
+- **P1-2**: fixup 目录清理顺序问题 → 已修复
+- **P2-9**: extra_results 重复调用 → 已修复
+- **P2-10**: support_summary 初始化顺序 → 已修复
+- **P2-11**: OB DEFERRABLE/DEFERRED 未读取 → 已修复
+- **P2-12**: FOR LOOP 集合属性范围语法清洗 → 已修复
+- **P2-13**: fixup 删除缺少异常处理 → 已修复
+- **P2-14**: 绝对路径清理限制 → 已新增 `fixup_force_clean`
+- **P2-4**: 约束统计遗漏 CHECK → 已修复
+- **P3-4**: 文档/标题遗漏 CHECK → 已修复
 
 ---
 
