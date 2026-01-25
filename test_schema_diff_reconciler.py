@@ -26,11 +26,15 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         indexes: Dict = None,
         constraints: Dict = None,
         triggers: Dict = None,
-        invisible_supported: bool = False
+        invisible_supported: bool = False,
+        identity_supported: bool = True,
+        default_on_null_supported: bool = True
     ) -> sdr.OracleMetadata:
         return sdr.OracleMetadata(
             table_columns={},
             invisible_column_supported=invisible_supported,
+            identity_column_supported=identity_supported,
+            default_on_null_supported=default_on_null_supported,
             indexes=indexes or {},
             constraints=constraints or {},
             triggers=triggers or {},
@@ -61,12 +65,16 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         constraints: Dict = None,
         triggers: Dict = None,
         invisible_supported: bool = False,
+        identity_supported: bool = True,
+        default_on_null_supported: bool = True,
         constraint_deferrable_supported: bool = False
     ) -> sdr.ObMetadata:
         return sdr.ObMetadata(
             objects_by_type={},
             tab_columns={},
             invisible_column_supported=invisible_supported,
+            identity_column_supported=identity_supported,
+            default_on_null_supported=default_on_null_supported,
             indexes=indexes or {},
             constraints=constraints or {},
             triggers=triggers or {},
@@ -87,11 +95,15 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self,
         table_columns: Dict,
         *,
-        invisible_supported: bool = False
+        invisible_supported: bool = False,
+        identity_supported: bool = True,
+        default_on_null_supported: bool = True
     ) -> sdr.OracleMetadata:
         return sdr.OracleMetadata(
             table_columns=table_columns,
             invisible_column_supported=invisible_supported,
+            identity_column_supported=identity_supported,
+            default_on_null_supported=default_on_null_supported,
             indexes={},
             constraints={},
             triggers={},
@@ -120,12 +132,16 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         tab_columns: Dict,
         *,
         invisible_supported: bool = False,
+        identity_supported: bool = True,
+        default_on_null_supported: bool = True,
         constraint_deferrable_supported: bool = False
     ) -> sdr.ObMetadata:
         return sdr.ObMetadata(
             objects_by_type=objects_by_type,
             tab_columns=tab_columns,
             invisible_column_supported=invisible_supported,
+            identity_column_supported=identity_supported,
+            default_on_null_supported=default_on_null_supported,
             indexes={},
             constraints={},
             triggers={},
@@ -141,6 +157,46 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             partition_key_columns={},
             constraint_deferrable_supported=constraint_deferrable_supported
         )
+
+    def test_select_tab_columns_view_prefers_secondary(self):
+        primary_support = {
+            "HIDDEN_COLUMN": False,
+            "VIRTUAL_COLUMN": False,
+            "IDENTITY_COLUMN": True
+        }
+        secondary_support = {
+            "HIDDEN_COLUMN": True,
+            "VIRTUAL_COLUMN": True,
+            "IDENTITY_COLUMN": True
+        }
+        view_name, support_map, missing_cols = sdr.select_tab_columns_view(
+            "DBA_TAB_COLUMNS",
+            primary_support,
+            "DBA_TAB_COLS",
+            secondary_support
+        )
+        self.assertEqual(view_name, "DBA_TAB_COLS")
+        self.assertEqual(support_map, secondary_support)
+        self.assertEqual(set(missing_cols), {"HIDDEN_COLUMN", "VIRTUAL_COLUMN"})
+
+    def test_select_tab_columns_view_keeps_primary(self):
+        primary_support = {
+            "HIDDEN_COLUMN": True,
+            "VIRTUAL_COLUMN": True
+        }
+        secondary_support = {
+            "HIDDEN_COLUMN": True,
+            "VIRTUAL_COLUMN": True
+        }
+        view_name, support_map, missing_cols = sdr.select_tab_columns_view(
+            "DBA_TAB_COLUMNS",
+            primary_support,
+            "DBA_TAB_COLS",
+            secondary_support
+        )
+        self.assertEqual(view_name, "DBA_TAB_COLUMNS")
+        self.assertEqual(support_map, primary_support)
+        self.assertFalse(missing_cols)
 
     def test_infer_dominant_schema_tables_only(self):
         remap_rules = {
@@ -261,6 +317,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             },
             tab_columns={},
             invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
             indexes={},
             constraints={},
             triggers={},
@@ -279,6 +337,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         oracle_meta = sdr.OracleMetadata(
             table_columns={},
             invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
             indexes={},
             constraints={},
             triggers={},
@@ -364,6 +424,190 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         issues = {issue.issue for issue in type_mismatches}
         self.assertIn("identity_missing", issues)
         self.assertIn("default_on_null_missing", issues)
+
+    def test_check_primary_objects_ignores_hidden_source_columns_in_target(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "C1": {
+                    "data_type": "VARCHAR2",
+                    "data_length": 10,
+                    "char_length": 10,
+                    "char_used": "C",
+                    "data_precision": None,
+                    "data_scale": None,
+                    "nullable": "Y",
+                    "data_default": None,
+                    "hidden": False,
+                    "virtual": False,
+                    "virtual_expr": None,
+                },
+                "HIDDEN_COL": {
+                    "data_type": "VARCHAR2",
+                    "data_length": 10,
+                    "char_length": 10,
+                    "char_used": "B",
+                    "data_precision": None,
+                    "data_scale": None,
+                    "nullable": "Y",
+                    "data_default": None,
+                    "hidden": True,
+                    "virtual": False,
+                    "virtual_expr": None,
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "VARCHAR2",
+                        "data_length": 10,
+                        "char_length": 10,
+                        "char_used": "C",
+                        "data_precision": None,
+                        "data_scale": None,
+                        "nullable": "Y",
+                        "data_default": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                    },
+                    "HIDDEN_COL": {
+                        "data_type": "VARCHAR2",
+                        "data_length": 10,
+                        "char_length": 10,
+                        "char_used": "B",
+                        "data_precision": None,
+                        "data_scale": None,
+                        "nullable": "Y",
+                        "data_default": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                    },
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(results["mismatched"], [])
+        self.assertEqual(results["missing"], [])
+        self.assertIn(("TABLE", "A.T1"), results["ok"])
+
+    def test_check_primary_objects_skips_virtual_length_rule(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "V1": {
+                    "data_type": "VARCHAR2",
+                    "data_length": 30,
+                    "char_length": 30,
+                    "char_used": "B",
+                    "data_precision": None,
+                    "data_scale": None,
+                    "nullable": "Y",
+                    "data_default": None,
+                    "hidden": False,
+                    "virtual": True,
+                    "virtual_expr": "BASE_COL + 1",
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "V1": {
+                        "data_type": "VARCHAR2",
+                        "data_length": 30,
+                        "char_length": 30,
+                        "char_used": "B",
+                        "data_precision": None,
+                        "data_scale": None,
+                        "nullable": "Y",
+                        "data_default": None,
+                        "hidden": False,
+                        "virtual": True,
+                        "virtual_expr": "BASE_COL + 1",
+                    }
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(results["mismatched"], [])
+        self.assertIn(("TABLE", "A.T1"), results["ok"])
+
+    def test_check_primary_objects_skips_identity_default_on_null_when_unsupported(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns(
+            {
+                ("A", "T1"): {
+                    "ID": {
+                        "data_type": "NUMBER",
+                        "data_length": None,
+                        "data_precision": 10,
+                        "data_scale": 0,
+                        "nullable": "N",
+                        "data_default": None,
+                        "char_used": None,
+                        "char_length": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                        "identity": True,
+                        "default_on_null": True,
+                    }
+                }
+            },
+            identity_supported=True,
+            default_on_null_supported=True,
+        )
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "ID": {
+                        "data_type": "NUMBER",
+                        "data_length": None,
+                        "data_precision": 10,
+                        "data_scale": 0,
+                        "nullable": "N",
+                        "data_default": None,
+                        "char_used": None,
+                        "char_length": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                        "identity": False,
+                        "default_on_null": False,
+                    }
+                }
+            },
+            identity_supported=False,
+            default_on_null_supported=False,
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(results["mismatched"], [])
+        self.assertIn(("TABLE", "A.T1"), results["ok"])
 
     def test_check_primary_objects_number_precision_mismatch(self):
         master_list = [("A.T1", "A.T1", "TABLE")]
@@ -675,6 +919,39 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         type_mismatches = results["mismatched"][0][5]
         self.assertEqual(len(type_mismatches), 1)
         self.assertEqual(type_mismatches[0].issue, "virtual_missing")
+
+    def test_check_primary_objects_virtual_expr_whitespace_equivalent(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "C1": {
+                    "data_type": "NUMBER",
+                    "virtual": True,
+                    "virtual_expr": "BASE_COL+1",
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "NUMBER",
+                        "virtual": True,
+                        "virtual_expr": "BASE_COL + 1",
+                    }
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(len(results["mismatched"]), 0)
+        self.assertEqual(len(results["ok"]), 1)
 
     def test_check_primary_objects_visibility_mismatch(self):
         master_list = [("SRC.T1", "TGT.T1", "TABLE")]
@@ -1583,6 +1860,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             objects_by_type={"VIEW": {"A.V1"}},
             tab_columns={},
             invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
             indexes={},
             constraints={},
             triggers={},
@@ -1899,6 +2178,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         oracle_meta = sdr.OracleMetadata(
             table_columns={},
             invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
             indexes={},
             constraints={},
             triggers={},
@@ -1930,6 +2211,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             },
             tab_columns={},
             invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
             indexes={},
             constraints={},
             triggers={},
@@ -2126,6 +2409,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         oracle_meta = sdr.OracleMetadata(
             table_columns={},
             invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
             indexes={},
             constraints={},
             triggers={},
@@ -2149,6 +2434,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             objects_by_type={"PACKAGE": set(), "PACKAGE BODY": set()},
             tab_columns={},
             invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
             indexes={},
             constraints={},
             triggers={},
@@ -2233,7 +2520,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         }
         master_list = [("A.P1", "A.P1", "PACKAGE")]
         oracle_meta = sdr.OracleMetadata(
-            table_columns={}, invisible_column_supported=False, indexes={}, constraints={}, triggers={}, sequences={}, sequence_attrs={},
+            table_columns={}, invisible_column_supported=False, identity_column_supported=True, default_on_null_supported=True,
+            indexes={}, constraints={}, triggers={}, sequences={}, sequence_attrs={},
             table_comments={}, column_comments={}, comments_complete=True,
             blacklist_tables={}, object_privileges=[], sys_privileges=[],
             role_privileges=[], role_metadata={}, system_privilege_map=set(),
@@ -2241,7 +2529,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         ob_meta = sdr.ObMetadata(
             objects_by_type={"PACKAGE": set(), "PACKAGE BODY": set()},
-            tab_columns={}, invisible_column_supported=False, indexes={}, constraints={}, triggers={}, sequences={}, sequence_attrs={},
+            tab_columns={}, invisible_column_supported=False, identity_column_supported=True, default_on_null_supported=True,
+            indexes={}, constraints={}, triggers={}, sequences={}, sequence_attrs={},
             roles=set(), table_comments={}, column_comments={}, comments_complete=True,
             object_statuses={}, package_errors={}, package_errors_complete=False, partition_key_columns={}
         )
@@ -2483,6 +2772,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             },
             tab_columns={},
             invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
             indexes={},
             constraints={},
             triggers={},
@@ -2848,6 +3139,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         oracle_meta = sdr.OracleMetadata(
             table_columns={},
             invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
             indexes={},
             constraints={},
             triggers={},
@@ -2919,6 +3212,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         oracle_meta = sdr.OracleMetadata(
             table_columns={},
             invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
             indexes={},
             constraints={},
             triggers={},
@@ -3074,6 +3369,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         oracle_meta = sdr.OracleMetadata(
             table_columns={},
             invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
             indexes={},
             constraints=oracle_constraints,
             triggers={},
@@ -3097,6 +3394,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             objects_by_type={},
             tab_columns={},
             invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
             indexes={},
             constraints=ob_constraints,
             triggers={},
@@ -3162,6 +3461,36 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertTrue(ok)
         self.assertIsNone(mismatch)
+
+    def test_classify_unsupported_check_constraints_filters_extra(self):
+        oracle_meta = self._make_oracle_meta(
+            constraints={
+                ("A", "T1"): {
+                    "CK1": {
+                        "type": "C",
+                        "columns": ["C1"],
+                        "search_condition": "C1>0",
+                        "deferrable": "DEFERRABLE",
+                        "deferred": "IMMEDIATE",
+                    }
+                }
+            }
+        )
+        extra_results = {
+            "constraint_ok": [],
+            "constraint_mismatched": [
+                sdr.ConstraintMismatch(
+                    table="A.T1",
+                    missing_constraints={"CK1"},
+                    extra_constraints={"CK1"},
+                    detail_mismatch=["CHECK: CK1 mismatch"],
+                    downgraded_pk_constraints=set(),
+                )
+            ]
+        }
+        table_target_map = {("A", "T1"): ("A", "T1")}
+        sdr.classify_unsupported_check_constraints(extra_results, oracle_meta, table_target_map)
+        self.assertEqual(extra_results["constraint_mismatched"], [])
 
     def test_compare_constraints_for_table_derived_unique_constraint(self):
         oracle_constraints = {("A", "T1"): {}}
@@ -4066,6 +4395,198 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         cleaned = sdr.sanitize_view_ddl(ddl, column_names={"COL1", "COL2", "COL3", "COL4"})
         self.assertIn("--说明", cleaned)
         self.assertIn("\n (a.col2 - a.col3)", cleaned)
+
+
+class TestNoiseSuppression(unittest.TestCase):
+    def _empty_extra_results(self) -> Dict[str, List]:
+        return {
+            "index_ok": [],
+            "index_mismatched": [],
+            "index_unsupported": [],
+            "constraint_ok": [],
+            "constraint_mismatched": [],
+            "constraint_unsupported": [],
+            "sequence_ok": [],
+            "sequence_mismatched": [],
+            "trigger_ok": [],
+            "trigger_mismatched": [],
+        }
+
+    def test_noise_suppression_filters_table_auto_columns(self):
+        tv_results = {
+            "missing": [],
+            "mismatched": [
+                ("TABLE", "A.T1", set(), {"__PK_INCREMENT", "SYS_NC19$"}, [], [])
+            ],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": []
+        }
+        comment_results = {"ok": [], "mismatched": [], "skipped_reason": None}
+        result = sdr.apply_noise_suppression(
+            tv_results,
+            self._empty_extra_results(),
+            comment_results
+        )
+        self.assertEqual(result.tv_results["mismatched"], [])
+        self.assertIn(("TABLE", "A.T1"), result.tv_results["ok"])
+        reasons = {row.reason for row in result.suppressed_details}
+        self.assertIn(sdr.NOISE_REASON_AUTO_COLUMN, reasons)
+        self.assertIn(sdr.NOISE_REASON_SYS_NC_COLUMN, reasons)
+
+    def test_noise_suppression_filters_comment_columns(self):
+        tv_results = {
+            "missing": [],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": []
+        }
+        comment_results = {
+            "ok": [],
+            "mismatched": [
+                sdr.CommentMismatch(
+                    table="A.T1",
+                    table_comment=None,
+                    column_comment_diffs=[
+                        ("__PK_INCREMENT", "x", "y"),
+                        ("C1", "x", "y"),
+                    ],
+                    missing_columns=set(),
+                    extra_columns=set()
+                )
+            ],
+            "skipped_reason": None
+        }
+        result = sdr.apply_noise_suppression(
+            tv_results,
+            self._empty_extra_results(),
+            comment_results
+        )
+        filtered = result.comment_results["mismatched"]
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual([d[0] for d in filtered[0].column_comment_diffs], ["C1"])
+        reasons = {row.reason for row in result.suppressed_details}
+        self.assertIn(sdr.NOISE_REASON_AUTO_COLUMN, reasons)
+
+    def test_noise_suppression_filters_oms_rowid_indexes(self):
+        tv_results = {
+            "missing": [],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": []
+        }
+        extra_results = self._empty_extra_results()
+        extra_results["index_mismatched"] = [
+            sdr.IndexMismatch(
+                table="A.T1",
+                missing_indexes=set(),
+                extra_indexes={"IDX_OMS_ROWID"},
+                detail_mismatch=[]
+            )
+        ]
+        comment_results = {"ok": [], "mismatched": [], "skipped_reason": None}
+        result = sdr.apply_noise_suppression(
+            tv_results,
+            extra_results,
+            comment_results
+        )
+        self.assertEqual(result.extra_results["index_mismatched"], [])
+        self.assertIn("A.T1", result.extra_results["index_ok"])
+
+    def test_noise_suppression_filters_auto_sequences(self):
+        tv_results = {
+            "missing": [],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": []
+        }
+        extra_results = self._empty_extra_results()
+        extra_results["sequence_mismatched"] = [
+            sdr.SequenceMismatch(
+                src_schema="A",
+                tgt_schema="A",
+                missing_sequences={"ISEQ$$_1", "SEQ1"},
+                extra_sequences={"ISEQ$$_2"},
+                note=None,
+                missing_mappings=[("A.ISEQ$$_1", "A.ISEQ$$_1"), ("A.SEQ1", "A.SEQ1")],
+                detail_mismatch=[]
+            )
+        ]
+        comment_results = {"ok": [], "mismatched": [], "skipped_reason": None}
+        result = sdr.apply_noise_suppression(
+            tv_results,
+            extra_results,
+            comment_results
+        )
+        seq_items = result.extra_results["sequence_mismatched"]
+        self.assertEqual(len(seq_items), 1)
+        self.assertEqual(seq_items[0].missing_sequences, {"SEQ1"})
+        self.assertEqual(seq_items[0].extra_sequences, set())
+        reasons = {row.reason for row in result.suppressed_details}
+        self.assertIn(sdr.NOISE_REASON_AUTO_SEQUENCE, reasons)
+
+    def test_is_oms_index_filters_rowid_name(self):
+        self.assertTrue(sdr.is_oms_index("IDX_CODEX_OMS_ROWID", ["C1"]))
+
+    def test_check_comments_skips_missing_target_table(self):
+        master_list = [("SRC.T1", "TGT.T1", "TABLE")]
+        oracle_meta = sdr.OracleMetadata(
+            table_columns={},
+            invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
+            indexes={},
+            constraints={},
+            triggers={},
+            sequences={},
+            sequence_attrs={},
+            table_comments={("SRC", "T1"): "table comment"},
+            column_comments={("SRC", "T1"): {"C1": "col comment"}},
+            comments_complete=True,
+            blacklist_tables={},
+            object_privileges=[],
+            sys_privileges=[],
+            role_privileges=[],
+            role_metadata={},
+            system_privilege_map=set(),
+            table_privilege_map=set(),
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False,
+            partition_key_columns={},
+            interval_partitions={}
+        )
+        ob_meta = sdr.ObMetadata(
+            objects_by_type={"TABLE": {"TGT.OTHER"}},
+            tab_columns={},
+            invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
+            indexes={},
+            constraints={},
+            triggers={},
+            sequences={},
+            sequence_attrs={},
+            roles=set(),
+            table_comments={},
+            column_comments={},
+            comments_complete=True,
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False,
+            partition_key_columns={},
+            constraint_deferrable_supported=False
+        )
+        result = sdr.check_comments(master_list, oracle_meta, ob_meta, True)
+        self.assertEqual(result["mismatched"], [])
+        self.assertEqual(result["ok"], [])
 
 
 if __name__ == "__main__":
