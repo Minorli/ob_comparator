@@ -14,6 +14,7 @@ schema_diff_reconciler_audit_report_20251212.md
 schema_diff_reconciler_backup_20251212_pre_patch.py
 schema_diff_reconciler_v0.8.8.py
 logs
+audit/table_check_validation/
 config.ini
 AGENTS.md
 CLAUDE.md
@@ -24,3 +25,4 @@ docs/MIGRATION_PROPOSAL_1567_SCHEMAS.md
 gha-creds-*.json
 .github/
 compatibility_suite/
+.claude
