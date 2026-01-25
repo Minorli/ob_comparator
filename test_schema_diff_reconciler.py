@@ -3608,6 +3608,47 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIsNone(mismatch)
 
+    def test_compare_indexes_expression_constraint_index_name(self):
+        oracle_indexes = {
+            ("A", "T1"): {
+                "IDX_SRC": {
+                    "columns": ["SYS_NC00004$"],
+                    "expressions": {1: "UPPER(NAME)"},
+                    "uniqueness": "NONUNIQUE",
+                }
+            }
+        }
+        ob_indexes = {
+            ("A", "T1"): {
+                "IDX_TGT": {
+                    "columns": ["SYS_NC00004$"],
+                    "expressions": {1: "UPPER(NAME)"},
+                    "uniqueness": "UNIQUE",
+                }
+            }
+        }
+        ob_constraints = {
+            ("A", "T1"): {
+                "UK_TGT": {
+                    "type": "U",
+                    "columns": ["SYS_NC00004$"],
+                    "index_name": "IDX_TGT",
+                }
+            }
+        }
+        oracle_meta = self._make_oracle_meta(indexes=oracle_indexes)
+        ob_meta = self._make_ob_meta(indexes=ob_indexes, constraints=ob_constraints)
+        ok, mismatch = sdr.compare_indexes_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(mismatch)
+
     def test_collect_blacklisted_missing_tables(self):
         tv_results = {
             "missing": [

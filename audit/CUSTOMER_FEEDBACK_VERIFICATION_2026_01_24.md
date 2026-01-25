@@ -1,7 +1,7 @@
 # 客户反馈问题验证报告
 
 **验证日期**: 2026-01-24  
-**代码版本**: commit ae8ca5d (最新)  
+**代码版本**: commit 8f6ac30 (最新)  
 **验证人**: Cascade AI  
 **复核人**: _______________  
 
@@ -149,7 +149,21 @@ def test_normalize_index_expression_casefold(self):
 
 **测试执行结果**: ✅ PASS
 
-### 3.4 潜在问题分析
+### 3.4 目标端元数据验证
+
+**验证查询**:
+```sql
+SELECT 1
+FROM DBA_TAB_COLUMNS
+WHERE OWNER = 'SYS'
+  AND TABLE_NAME = 'DBA_CONSTRAINTS'
+  AND COLUMN_NAME = 'INDEX_NAME'
+  AND ROWNUM = 1;
+```
+
+**验证结果**: 返回 `1`，说明目标端 `DBA_CONSTRAINTS` 提供 `INDEX_NAME` 字段，可用于约束→索引表达式关联。
+
+### 3.5 潜在问题分析
 
 | 场景 | 问题 | 状态 |
 |------|------|------|
@@ -167,7 +181,7 @@ def test_normalize_index_expression_casefold(self):
 
 两者不匹配，导致误报。
 
-### 3.5 结论
+### 3.6 结论
 
 | 项目 | 状态 |
 |------|------|
@@ -274,6 +288,8 @@ test_normalize_index_expression_casefold ... ok
 | 索引函数表达式大小写 | ✅ | ✅ | 低 |
 | 约束 vs 索引列集匹配 | ⚠️ | ❌ | 中 |
 
+**补充验证**: 目标端 `DBA_CONSTRAINTS.INDEX_NAME` 可用，可用于修复表达式索引的列集匹配问题。
+
 ---
 
 ## 7. 建议后续行动
@@ -309,7 +325,7 @@ test_normalize_index_expression_casefold ... ok
 
 ### 7.2 代码改进建议
 
-1. **约束列集标准化**: 考虑在 `constraint_index_cols` 构建时也使用函数表达式标准化
+1. **约束列集标准化**: 使用 `INDEX_NAME` 关联索引表达式并通过 `normalize_index_columns()` 生成列集
 2. **日志增强**: 在比对逻辑中增加 DEBUG 级别日志，便于问题定位
 
 ---
@@ -331,5 +347,5 @@ _______________________________________________________________________________
 
 ---
 
-*报告生成时间: 2026-01-24 20:28*  
+*报告生成时间: 2026-01-24 20:54*  
 *代码版本: ae8ca5d*

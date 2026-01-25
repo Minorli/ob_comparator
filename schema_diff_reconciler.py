@@ -426,7 +426,7 @@ class ObMetadata(NamedTuple):
     tab_columns: Dict[Tuple[str, str], Dict[str, Dict]]   # (OWNER, TABLE_NAME) -> {COLUMN_NAME: {type, length, etc.}}
     invisible_column_supported: bool                     # 是否支持读取 INVISIBLE_COLUMN 元数据
     indexes: Dict[Tuple[str, str], Dict[str, Dict]]      # (OWNER, TABLE_NAME) -> {INDEX_NAME: {uniqueness, columns[list]}}
-    constraints: Dict[Tuple[str, str], Dict[str, Dict]]  # (OWNER, TABLE_NAME) -> {CONS_NAME: {type, columns[list]}}
+    constraints: Dict[Tuple[str, str], Dict[str, Dict]]  # (OWNER, TABLE_NAME) -> {CONS_NAME: {type, columns[list], index_name}}
     triggers: Dict[Tuple[str, str], Dict[str, Dict]]     # (OWNER, TABLE_NAME) -> {TRG_NAME: {event, status}}
     sequences: Dict[str, Set[str]]                       # SEQUENCE_OWNER -> {SEQUENCE_NAME}
     sequence_attrs: Dict[str, Dict[str, Dict[str, object]]]  # OWNER -> {SEQUENCE_NAME: attrs}
@@ -448,7 +448,7 @@ class OracleMetadata(NamedTuple):
     table_columns: Dict[Tuple[str, str], Dict[str, Dict]]   # (OWNER, TABLE_NAME) -> 列定义
     invisible_column_supported: bool                        # 是否支持读取 INVISIBLE_COLUMN 元数据
     indexes: Dict[Tuple[str, str], Dict[str, Dict]]        # (OWNER, TABLE_NAME) -> 索引
-    constraints: Dict[Tuple[str, str], Dict[str, Dict]]    # (OWNER, TABLE_NAME) -> 约束
+    constraints: Dict[Tuple[str, str], Dict[str, Dict]]    # (OWNER, TABLE_NAME) -> 约束 (含 index_name)
     triggers: Dict[Tuple[str, str], Dict[str, Dict]]       # (OWNER, TABLE_NAME) -> 触发器
     sequences: Dict[str, Set[str]]                         # OWNER -> {SEQUENCE_NAME}
     sequence_attrs: Dict[str, Dict[str, Dict[str, object]]]  # OWNER -> {SEQUENCE_NAME: attrs}
@@ -6685,11 +6685,13 @@ def dump_ob_metadata(
             ob_has_dba_column(ob_cfg, "DBA_CONSTRAINTS", "DEFERRABLE")
             and ob_has_dba_column(ob_cfg, "DBA_CONSTRAINTS", "DEFERRED")
         )
+        support_index_name = ob_has_dba_column(ob_cfg, "DBA_CONSTRAINTS", "INDEX_NAME")
         constraint_deferrable_supported = deferrable_supported
         deferrable_select = ", DEFERRABLE, DEFERRED" if deferrable_supported else ""
+        index_name_select = ", INDEX_NAME" if support_index_name else ""
 
         sql_ext_tpl_vc = f"""
-            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME,
+            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE{index_name_select}, R_OWNER, R_CONSTRAINT_NAME,
                    DELETE_RULE,
                    REPLACE(REPLACE(REPLACE(SEARCH_CONDITION_VC, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS SEARCH_CONDITION
                    {deferrable_select}
@@ -6699,7 +6701,7 @@ def dump_ob_metadata(
               AND STATUS = 'ENABLED'
         """
         sql_ext_tpl = f"""
-            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME,
+            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE{index_name_select}, R_OWNER, R_CONSTRAINT_NAME,
                    DELETE_RULE,
                    REPLACE(REPLACE(REPLACE(SEARCH_CONDITION, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS SEARCH_CONDITION
                    {deferrable_select}
@@ -6728,7 +6730,7 @@ def dump_ob_metadata(
         if not ok:
             log.warning("读取 OB DBA_CONSTRAINTS(含条件)失败，将回退为中间字段：%s", err)
             sql_mid_tpl = f"""
-                SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME, DELETE_RULE
+                SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE{index_name_select}, R_OWNER, R_CONSTRAINT_NAME, DELETE_RULE
                        {deferrable_select}
                 FROM DBA_CONSTRAINTS
                 WHERE OWNER IN ({{owners_in}})
@@ -6742,7 +6744,7 @@ def dump_ob_metadata(
         if not ok:
             log.warning("读取 OB DBA_CONSTRAINTS(含引用信息)失败，将回退为基础字段：%s", err)
             sql_tpl = f"""
-                SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE
+                SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE{index_name_select}
                        {deferrable_select}
                 FROM DBA_CONSTRAINTS
                 WHERE OWNER IN ({{owners_in}})
@@ -6768,6 +6770,10 @@ def dump_ob_metadata(
                 idx += 1
                 ctype = parts[idx].strip().upper()
                 idx += 1
+                index_name = None
+                if support_index_name and len(parts) > idx:
+                    index_name = parts[idx].strip().upper()
+                    idx += 1
                 r_owner = r_cons = delete_rule = None
                 if support_fk_ref:
                     r_owner = parts[idx].strip().upper() if len(parts) > idx else None
@@ -6790,6 +6796,7 @@ def dump_ob_metadata(
                 constraints.setdefault(key, {})[cons_name] = {
                     "type": ctype,
                     "columns": [],
+                    "index_name": index_name,
                     "r_owner": r_owner if ctype == "R" else None,
                     "r_constraint": r_cons if ctype == "R" else None,
                     "delete_rule": delete_rule if ctype == "R" else None,
@@ -6828,6 +6835,7 @@ def dump_ob_metadata(
                     constraints[key][cons_name] = {
                         "type": "UNKNOWN",
                         "columns": [],
+                        "index_name": None,
                         "r_owner": None,
                         "r_constraint": None,
                         "delete_rule": None,
@@ -7946,6 +7954,7 @@ def dump_oracle_metadata(
                                 constraints.setdefault(key, {})[name] = {
                                     "type": (row[3] or "").upper(),
                                     "columns": [],
+                                    "index_name": None,
                                     "r_owner": _safe_upper(row[4]) if row[4] else None,
                                     "r_constraint": _safe_upper(row[5]) if row[5] else None,
                                     "delete_rule": (row[6] or "").strip().upper() if len(row) > 6 else None,
@@ -7982,6 +7991,7 @@ def dump_oracle_metadata(
                                     {
                                         "type": "UNKNOWN",
                                         "columns": [],
+                                        "index_name": None,
                                         "r_owner": None,
                                         "r_constraint": None,
                                         "delete_rule": None,
@@ -10652,6 +10662,30 @@ def build_index_signature(
     }
 
 
+def build_constraint_index_cols(
+    tgt_constraints: Optional[Dict[str, Dict]],
+    tgt_indexes: Optional[Dict[str, Dict]]
+) -> Set[Tuple[str, ...]]:
+    cols_set: Set[Tuple[str, ...]] = set()
+    for cons in (tgt_constraints or {}).values():
+        ctype = (cons.get("type") or "").upper()
+        if ctype not in ("P", "U"):
+            continue
+        idx_name = (cons.get("index_name") or "").upper()
+        if idx_name:
+            idx_info = (tgt_indexes or {}).get(idx_name)
+            if idx_info:
+                expr_map = idx_info.get("expressions") or {}
+                cols = normalize_index_columns(idx_info.get("columns") or [], expr_map)
+                if cols:
+                    cols_set.add(cols)
+                    continue
+        cols = normalize_column_sequence(cons.get("columns"))
+        if cols:
+            cols_set.add(cols)
+    return cols_set
+
+
 def build_constraint_signature(
     cons_dict: Dict[str, Dict],
     norm_cols: Dict[str, Tuple[str, ...]],
@@ -10718,11 +10752,7 @@ def build_index_cache_for_table(
     src_sig = build_index_signature(src_map)
     tgt_sig = build_index_signature(tgt_map)
     tgt_constraints = ob_meta.constraints.get(tgt_key, {})
-    constraint_index_cols: Set[Tuple[str, ...]] = {
-        normalize_column_sequence(cons.get("columns"))
-        for cons in tgt_constraints.values()
-        if (cons.get("type") or "").upper() in ("P", "U")
-    }
+    constraint_index_cols = build_constraint_index_cols(tgt_constraints, tgt_idx)
     return IndexCompareCache(
         src_map=src_map,
         tgt_map=tgt_map,
@@ -10996,11 +11026,7 @@ def compare_indexes_for_table(
         src_idx = {}
     tgt_idx = ob_meta.indexes.get(tgt_key, {})
     tgt_constraints = ob_meta.constraints.get(tgt_key, {})
-    constraint_index_cols: Set[Tuple[str, ...]] = {
-        normalize_column_sequence(cons.get("columns"))
-        for cons in tgt_constraints.values()
-        if (cons.get("type") or "").upper() in ("P", "U")
-    }
+    constraint_index_cols = build_constraint_index_cols(tgt_constraints, tgt_idx)
     src_map = build_index_map(src_idx)
     tgt_map = build_index_map(tgt_idx)
     if build_index_signature(src_map) == build_index_signature(tgt_map):
