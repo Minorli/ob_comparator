@@ -55,10 +55,39 @@ class TestRunFixupConfig(unittest.TestCase):
                 ]) + "\n",
                 encoding="utf-8"
             )
-            ob_cfg, fixup_path, _repo_root, _log_level, _report_path = rf.load_ob_config(cfg_path)
+            ob_cfg, fixup_path, _repo_root, _log_level, _report_path, fixup_settings = rf.load_ob_config(cfg_path)
             self.assertEqual(ob_cfg["password"], "p%w")
             self.assertEqual(ob_cfg["timeout"], 77)
+            self.assertTrue(fixup_settings.enabled)
         self.assertEqual(fixup_path, (root / "fixup_scripts").resolve())
+
+
+class TestDependencyChainParsing(unittest.TestCase):
+    def test_parse_dependency_chains_target_only(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "dependency_chains_20260101_000000.txt"
+            path.write_text(
+                "\n".join([
+                    "# header",
+                    "[SOURCE - ORACLE] 依赖链:",
+                    "00001. SRC.V1(VIEW) -> SRC.T1(TABLE)",
+                    "",
+                    "[TARGET - REMAPPED] 依赖链:",
+                    "00001. TGT.V1(VIEW) -> TGT.T1(TABLE)",
+                ]) + "\n",
+                encoding="utf-8"
+            )
+            deps = rf.parse_dependency_chains_file(path)
+            key = ("TGT.V1", "VIEW")
+            self.assertIn(key, deps)
+            self.assertIn(("TGT.T1", "TABLE"), deps[key])
+
+
+class TestFixupAutoGrantTypes(unittest.TestCase):
+    def test_parse_fixup_auto_grant_types_defaults(self):
+        types = rf.parse_fixup_auto_grant_types("")
+        self.assertIn("VIEW", types)
+        self.assertIn("PACKAGE BODY", types)
 
 
 class TestCurrentSchemaExecution(unittest.TestCase):
@@ -188,6 +217,36 @@ class TestViewChainHelpers(unittest.TestCase):
             failure_count=2
         )
         self.assertEqual(status, "PARTIAL")
+
+
+class TestRecompileSkipTypes(unittest.TestCase):
+    def test_recompile_skips_unsupported_types(self):
+        invalid_batches = [
+            [
+                ("APP", "V1", "VIEW"),
+                ("APP", "TB1", "TYPE BODY"),
+                ("APP", "P1", "PROCEDURE"),
+            ],
+            [],
+        ]
+
+        def fake_query(_cmd, _timeout):
+            return invalid_batches.pop(0)
+
+        executed = []
+
+        def fake_run_sql(_cmd, sql, _timeout):
+            executed.append(sql)
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+        with mock.patch.object(rf, "query_invalid_objects", side_effect=fake_query), \
+             mock.patch.object(rf, "run_sql", side_effect=fake_run_sql):
+            recompiled, remaining = rf.recompile_invalid_objects([], timeout=1, max_retries=2)
+
+        self.assertEqual(recompiled, 1)
+        self.assertEqual(remaining, 0)
+        self.assertEqual(len(executed), 1)
+        self.assertIn("ALTER PROCEDURE APP.P1 COMPILE;", executed[0])
 
 
 if __name__ == "__main__":

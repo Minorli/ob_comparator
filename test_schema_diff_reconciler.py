@@ -1723,7 +1723,10 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         master_list = []
         oracle_meta = self._make_oracle_meta()
         ob_meta = self._make_ob_meta()
-        ob_meta = ob_meta._replace(objects_by_type={"VIEW": {"TGT.V1"}})
+        ob_meta = ob_meta._replace(objects_by_type={
+            "VIEW": {"TGT.V1"},
+            "TYPE BODY": {"TGT.TB1"},
+        })
         full_mapping = {}
         settings = {
             "fixup_dir": "",
@@ -1738,6 +1741,13 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
                 sdr.DependencyIssue(
                     dependent="TGT.V1",
                     dependent_type="VIEW",
+                    referenced="TGT.T1",
+                    referenced_type="TABLE",
+                    reason="MISSING_DEP"
+                ),
+                sdr.DependencyIssue(
+                    dependent="TGT.TB1",
+                    dependent_type="TYPE BODY",
                     referenced="TGT.T1",
                     referenced_type="TABLE",
                     reason="MISSING_DEP"

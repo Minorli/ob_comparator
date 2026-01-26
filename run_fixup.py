@@ -324,6 +324,13 @@ TYPE_DIR_MAP = {
     "GRANTS": "grants",
 }
 
+DIR_OBJECT_TYPE_MAP = {
+    dir_name: obj_type.replace("_", " ")
+    for obj_type, dir_name in TYPE_DIR_MAP.items()
+    if dir_name != "grants"
+}
+DIR_OBJECT_TYPE_MAP["table_alter"] = "TABLE"
+
 # Execution priority for dependency-aware ordering
 DEPENDENCY_LAYERS = [
     ["sequence"],                                    # Layer 0: No dependencies
@@ -362,6 +369,22 @@ GRANT_PRIVILEGE_BY_TYPE = {
 }
 
 GRANT_OPTION_TYPES = {"VIEW", "MATERIALIZED VIEW"}
+
+DEFAULT_FIXUP_AUTO_GRANT_TYPES_ORDERED = (
+    "VIEW",
+    "MATERIALIZED VIEW",
+    "SYNONYM",
+    "PROCEDURE",
+    "FUNCTION",
+    "PACKAGE",
+    "PACKAGE BODY",
+    "TRIGGER",
+    "TYPE",
+    "TYPE BODY",
+)
+DEFAULT_FIXUP_AUTO_GRANT_TYPES = set(DEFAULT_FIXUP_AUTO_GRANT_TYPES_ORDERED)
+FIXUP_AUTO_GRANT_ALLOWED_TYPES = set(GRANT_PRIVILEGE_BY_TYPE.keys())
+AUTO_GRANT_SYSTEM_SCHEMAS = {"SYS", "PUBLIC"}
 
 SYS_PRIV_IMPLICATIONS = {
     "SELECT": {
@@ -510,7 +533,43 @@ class ErrorReportEntry:
     message: str
 
 
-def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, Path]:
+@dataclass
+class FixupAutoGrantSettings:
+    enabled: bool
+    types: Set[str]
+    fallback: bool
+
+
+@dataclass
+class AutoGrantStats:
+    planned: int = 0
+    executed: int = 0
+    failed: int = 0
+    blocked: int = 0
+    skipped: int = 0
+
+
+@dataclass
+class AutoGrantContext:
+    settings: FixupAutoGrantSettings
+    deps_by_object: Dict[Tuple[str, str], Set[Tuple[str, str]]]
+    grant_index_miss: "GrantIndex"
+    grant_index_all: "GrantIndex"
+    obclient_cmd: List[str]
+    timeout: Optional[int]
+    roles_cache: Dict[str, Set[str]]
+    tab_privs_cache: Dict[Tuple[str, str, str], Set[str]]
+    tab_privs_grantable_cache: Dict[Tuple[str, str, str], Set[str]]
+    sys_privs_cache: Dict[str, Set[str]]
+    planned_statements: Set[str]
+    planned_object_privs: Set[Tuple[str, str, str]]
+    planned_object_privs_with_option: Set[Tuple[str, str, str]]
+    planned_sys_privs: Set[Tuple[str, str]]
+    applied_grants: Set[str]
+    stats: AutoGrantStats
+
+
+def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, Path, FixupAutoGrantSettings]:
     """Load OceanBase connection info and fixup directory from config.ini."""
     parser = configparser.ConfigParser(interpolation=None)
     if not config_path.exists():
@@ -553,7 +612,23 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
     report_path = (repo_root / report_dir).resolve()
 
     log_level = parser.get("SETTINGS", "log_level", fallback="AUTO").strip().upper() or "AUTO"
-    return ob_cfg, fixup_path, repo_root, log_level, report_path
+    auto_grant_enabled = parse_bool_flag(
+        parser.get("SETTINGS", "fixup_auto_grant", fallback="true"),
+        True
+    )
+    auto_grant_types = parse_fixup_auto_grant_types(
+        parser.get("SETTINGS", "fixup_auto_grant_types", fallback="")
+    )
+    auto_grant_fallback = parse_bool_flag(
+        parser.get("SETTINGS", "fixup_auto_grant_fallback", fallback="true"),
+        True
+    )
+    fixup_settings = FixupAutoGrantSettings(
+        enabled=auto_grant_enabled,
+        types=auto_grant_types,
+        fallback=auto_grant_fallback
+    )
+    return ob_cfg, fixup_path, repo_root, log_level, report_path, fixup_settings
 
 
 def build_obclient_command(ob_cfg: Dict[str, str]) -> List[str]:
@@ -725,6 +800,38 @@ def parse_object_from_filename(path: Path) -> Tuple[Optional[str], Optional[str]
         return None, None
     schema, name = stem.split(".", 1)
     return normalize_identifier(schema), normalize_identifier(name)
+
+
+def parse_object_identity_from_path(path: Path) -> Tuple[Optional[str], Optional[str]]:
+    stem = path.stem
+    if "." not in stem:
+        return None, None
+    parts = stem.split(".")
+    if len(parts) < 2:
+        return None, None
+    return normalize_identifier(parts[0]), normalize_identifier(parts[1])
+
+
+def normalize_object_type(raw: str) -> str:
+    return (raw or "").strip().upper().replace("_", " ")
+
+
+def parse_bool_flag(value: Optional[str], default: bool = True) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def parse_fixup_auto_grant_types(raw_value: str) -> Set[str]:
+    if not raw_value or not raw_value.strip():
+        return set(DEFAULT_FIXUP_AUTO_GRANT_TYPES)
+    if raw_value.strip().lower() in {"all", "*"}:
+        return set(FIXUP_AUTO_GRANT_ALLOWED_TYPES)
+    parsed = {normalize_object_type(item) for item in raw_value.split(",") if item.strip()}
+    unknown = parsed - FIXUP_AUTO_GRANT_ALLOWED_TYPES
+    if unknown:
+        log.warning("fixup_auto_grant_types 包含未知类型 %s，将忽略。", sorted(unknown))
+    return parsed & FIXUP_AUTO_GRANT_ALLOWED_TYPES
 
 
 def extract_object_from_error(stderr: str) -> Tuple[Optional[str], Optional[str]]:
@@ -967,15 +1074,239 @@ def split_full_name(full_name: str) -> Tuple[Optional[str], Optional[str]]:
     return parts[0].strip().upper(), parts[1].strip().upper()
 
 
-def find_latest_view_chain_file(report_dir: Path) -> Optional[Path]:
+def normalize_full_name(raw: str) -> str:
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    if "." in value:
+        schema, name = value.split(".", 1)
+        return f"{normalize_identifier(schema)}.{normalize_identifier(name)}"
+    return normalize_identifier(value)
+
+
+def find_latest_report_file(report_dir: Path, prefix: str) -> Optional[Path]:
+    if not report_dir:
+        return None
+    candidates: List[Path] = []
     try:
-        candidates = list(report_dir.glob("VIEWs_chain_*.txt"))
+        candidates.extend(report_dir.glob(f"{prefix}_*.txt"))
+        candidates.extend(report_dir.glob(f"run_*/{prefix}_*.txt"))
     except OSError:
         return None
     if not candidates:
         return None
-    candidates.sort(key=lambda p: p.stat().st_mtime)
+    ts_re = re.compile(rf"{re.escape(prefix)}_(\d{{8}}_\d{{6}})")
+
+    def sort_key(path: Path) -> Tuple[int, str]:
+        match = ts_re.search(path.name)
+        if match:
+            return (1, match.group(1))
+        try:
+            return (0, f"{path.stat().st_mtime:020.6f}")
+        except OSError:
+            return (0, "0")
+
+    candidates.sort(key=sort_key)
     return candidates[-1]
+
+
+def parse_dependency_chains_file(path: Path) -> Dict[Tuple[str, str], Set[Tuple[str, str]]]:
+    deps: Dict[Tuple[str, str], Set[Tuple[str, str]]] = defaultdict(set)
+    if not path:
+        return deps
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return deps
+    section = ""
+    line_re = re.compile(
+        r"^\s*(?:\d+\.)?\s*(?P<dep>[^()]+)\((?P<dep_type>[^)]+)\)\s*->\s*(?P<ref>[^()]+)\((?P<ref_type>[^)]+)\)"
+    )
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            section = "target" if line.upper().startswith("[TARGET") else "source"
+            continue
+        if section != "target":
+            continue
+        match = line_re.match(line)
+        if not match:
+            continue
+        dep_full = normalize_full_name(match.group("dep"))
+        ref_full = normalize_full_name(match.group("ref"))
+        dep_type = normalize_object_type(match.group("dep_type"))
+        ref_type = normalize_object_type(match.group("ref_type"))
+        if not dep_full or not ref_full or not dep_type or not ref_type:
+            continue
+        deps[(dep_full, dep_type)].add((ref_full, ref_type))
+    return deps
+
+
+def build_dependencies_from_view_chains(
+    chains_by_view: Dict[str, List[List[Tuple[str, str]]]]
+) -> Dict[Tuple[str, str], Set[Tuple[str, str]]]:
+    deps: Dict[Tuple[str, str], Set[Tuple[str, str]]] = defaultdict(set)
+    for chains in chains_by_view.values():
+        for chain in chains:
+            if len(chain) < 2:
+                continue
+            for idx in range(len(chain) - 1):
+                dep_name, dep_type = chain[idx]
+                ref_name, ref_type = chain[idx + 1]
+                dep_full = normalize_full_name(dep_name)
+                ref_full = normalize_full_name(ref_name)
+                dep_type_u = normalize_object_type(dep_type)
+                ref_type_u = normalize_object_type(ref_type)
+                if dep_full and ref_full and dep_type_u and ref_type_u:
+                    deps[(dep_full, dep_type_u)].add((ref_full, ref_type_u))
+    return deps
+
+
+def init_auto_grant_context(
+    fixup_settings: FixupAutoGrantSettings,
+    report_dir: Path,
+    fixup_dir: Path,
+    exclude_dirs: List[str],
+    obclient_cmd: List[str],
+    timeout: Optional[int]
+) -> Optional[AutoGrantContext]:
+    if not fixup_settings.enabled:
+        return None
+    dep_file = find_latest_report_file(report_dir, "dependency_chains")
+    dep_map = parse_dependency_chains_file(dep_file) if dep_file else {}
+    view_chain_file = find_latest_view_chain_file(report_dir)
+    if view_chain_file:
+        view_chains = parse_view_chain_file(view_chain_file)
+        view_deps = build_dependencies_from_view_chains(view_chains)
+        for key, refs in view_deps.items():
+            dep_map.setdefault(key, set()).update(refs)
+    if not dep_map:
+        log.warning("[AUTO-GRANT] 未找到 dependency_chains/VIEWs_chain，自动补权限跳过。")
+        return None
+    grant_index_miss = build_grant_index(
+        fixup_dir,
+        set(exclude_dirs),
+        include_dirs={"grants_miss"}
+    )
+    grant_index_all = build_grant_index(
+        fixup_dir,
+        set(exclude_dirs),
+        include_dirs={"grants_all"}
+    )
+    stats = AutoGrantStats()
+    ctx = AutoGrantContext(
+        settings=fixup_settings,
+        deps_by_object=dep_map,
+        grant_index_miss=grant_index_miss,
+        grant_index_all=grant_index_all,
+        obclient_cmd=obclient_cmd,
+        timeout=timeout,
+        roles_cache={},
+        tab_privs_cache={},
+        tab_privs_grantable_cache={},
+        sys_privs_cache={},
+        planned_statements=set(),
+        planned_object_privs=set(),
+        planned_object_privs_with_option=set(),
+        planned_sys_privs=set(),
+        applied_grants=set(),
+        stats=stats
+    )
+    log.info(
+        "[AUTO-GRANT] 启用: types=%s fallback=%s deps=%d",
+        ",".join(sorted(fixup_settings.types)),
+        "true" if fixup_settings.fallback else "false",
+        sum(len(v) for v in dep_map.values())
+    )
+    return ctx
+
+
+def build_auto_grant_plan_for_object(
+    ctx: AutoGrantContext,
+    obj_full: str,
+    obj_type: str
+) -> Tuple[List[str], List[str], bool]:
+    obj_full_u = normalize_full_name(obj_full)
+    obj_type_u = normalize_object_type(obj_type)
+    deps = ctx.deps_by_object.get((obj_full_u, obj_type_u), set())
+    if not deps:
+        return [], [], False
+    plan_lines: List[str] = []
+    sql_lines: List[str] = []
+    blocked = False
+    grantee_schema, _ = split_full_name(obj_full_u)
+    if not grantee_schema or grantee_schema.upper() in AUTO_GRANT_SYSTEM_SCHEMAS:
+        return [], [], False
+    for ref_full, ref_type in sorted(deps):
+        ref_full_u = normalize_full_name(ref_full)
+        ref_type_u = normalize_object_type(ref_type)
+        required_priv = GRANT_PRIVILEGE_BY_TYPE.get(ref_type_u)
+        if not required_priv:
+            continue
+        ref_schema, _ = split_full_name(ref_full_u)
+        if not ref_schema or ref_schema.upper() == grantee_schema.upper():
+            continue
+        require_option = requires_grant_option(grantee_schema, ref_full_u, ref_type_u)
+        blocked = plan_object_grant_for_dependency(
+            grantee_schema,
+            ref_full_u,
+            ref_type_u,
+            required_priv,
+            require_option,
+            ctx.settings.fallback,
+            ctx.obclient_cmd,
+            ctx.timeout,
+            ctx.grant_index_miss,
+            ctx.grant_index_all,
+            ctx.roles_cache,
+            ctx.tab_privs_cache,
+            ctx.tab_privs_grantable_cache,
+            ctx.sys_privs_cache,
+            ctx.planned_statements,
+            ctx.planned_object_privs,
+            ctx.planned_object_privs_with_option,
+            ctx.planned_sys_privs,
+            plan_lines,
+            sql_lines
+        ) or blocked
+    return plan_lines, sql_lines, blocked
+
+
+def execute_auto_grant_for_object(
+    ctx: AutoGrantContext,
+    obj_full: str,
+    obj_type: str,
+    label: str
+) -> Tuple[int, bool]:
+    if not ctx.settings.enabled:
+        return 0, False
+    obj_type_u = normalize_object_type(obj_type)
+    if obj_type_u not in ctx.settings.types:
+        ctx.stats.skipped += 1
+        return 0, False
+    plan_lines, sql_lines, blocked = build_auto_grant_plan_for_object(ctx, obj_full, obj_type_u)
+    if blocked:
+        ctx.stats.blocked += 1
+    if not sql_lines:
+        return 0, blocked
+    ctx.stats.planned += len(sql_lines)
+    sql_text = "\n".join(line for line in sql_lines if not line.lstrip().startswith("--")).strip()
+    if not sql_text:
+        return 0, blocked
+    summary = execute_sql_statements(ctx.obclient_cmd, sql_text, ctx.timeout)
+    if summary.failures:
+        ctx.stats.failed += len(summary.failures)
+        log.warning("%s [AUTO-GRANT] %s(%s) 授权失败 %d/%d", label, obj_full, obj_type_u, len(summary.failures), summary.statements)
+    else:
+        ctx.stats.executed += summary.statements
+        log.info("%s [AUTO-GRANT] %s(%s) 授权成功 %d", label, obj_full, obj_type_u, summary.statements)
+    return summary.statements, blocked
+
+
+def find_latest_view_chain_file(report_dir: Path) -> Optional[Path]:
+    return find_latest_report_file(report_dir, "VIEWs_chain")
 
 
 def check_object_exists(
@@ -1178,6 +1509,7 @@ def plan_object_grant_for_dependency(
     target_type: str,
     required_priv: str,
     require_grant_option: bool,
+    allow_fallback: bool,
     obclient_cmd: List[str],
     timeout: Optional[int],
     grant_index_miss: GrantIndex,
@@ -1221,25 +1553,26 @@ def plan_object_grant_for_dependency(
         require_grant_option=require_grant_option
     )
     if not entries:
-        auto_stmt = build_auto_grant_statement(
-            grantee,
-            target_full,
-            required_priv,
-            with_grant_option=require_grant_option
-        )
-        if auto_stmt:
-            stmt_key = normalize_statement_key(auto_stmt)
-            if stmt_key not in planned_statements:
-                planned_statements.add(stmt_key)
-                plan_lines.append(f"GRANT AUTO: {priv_label} on {target_full} to {grantee}")
-                sql_lines.append("-- SOURCE: auto-generated")
-                sql_lines.append(auto_stmt.rstrip().rstrip(";") + ";")
-                planned_object_privs.add((grantee.upper(), required_priv.upper(), target_full.upper()))
-                if require_grant_option:
-                    planned_object_privs_with_option.add(
-                        (grantee.upper(), required_priv.upper(), target_full.upper())
-                    )
-            return False
+        if allow_fallback:
+            auto_stmt = build_auto_grant_statement(
+                grantee,
+                target_full,
+                required_priv,
+                with_grant_option=require_grant_option
+            )
+            if auto_stmt:
+                stmt_key = normalize_statement_key(auto_stmt)
+                if stmt_key not in planned_statements:
+                    planned_statements.add(stmt_key)
+                    plan_lines.append(f"GRANT AUTO: {priv_label} on {target_full} to {grantee}")
+                    sql_lines.append("-- SOURCE: auto-generated")
+                    sql_lines.append(auto_stmt.rstrip().rstrip(";") + ";")
+                    planned_object_privs.add((grantee.upper(), required_priv.upper(), target_full.upper()))
+                    if require_grant_option:
+                        planned_object_privs_with_option.add(
+                            (grantee.upper(), required_priv.upper(), target_full.upper())
+                        )
+                return False
         plan_lines.append(f"BLOCK: 缺少 GRANT {priv_label} on {target_full} to {grantee}")
         return True
 
@@ -1275,6 +1608,7 @@ def ensure_view_owner_grant_option(
     timeout: Optional[int],
     grant_index_miss: GrantIndex,
     grant_index_all: GrantIndex,
+    allow_fallback: bool,
     roles_cache: Dict[str, Set[str]],
     tab_privs_cache: Dict[Tuple[str, str, str], Set[str]],
     tab_privs_grantable_cache: Dict[Tuple[str, str, str], Set[str]],
@@ -1316,6 +1650,7 @@ def ensure_view_owner_grant_option(
             target_type,
             required_priv,
             True,
+            allow_fallback,
             obclient_cmd,
             timeout,
             grant_index_miss,
@@ -1342,6 +1677,7 @@ def ensure_view_owner_grant_option(
                 timeout,
                 grant_index_miss,
                 grant_index_all,
+                allow_fallback,
                 roles_cache,
                 tab_privs_cache,
                 tab_privs_grantable_cache,
@@ -1369,6 +1705,7 @@ def build_view_chain_plan(
     done_name_index: Dict[str, List[Path]],
     grant_index_miss: GrantIndex,
     grant_index_all: GrantIndex,
+    allow_fallback: bool,
     repo_root: Path,
     exists_cache: Dict[Tuple[str, str], bool],
     roles_cache: Dict[str, Set[str]],
@@ -1424,6 +1761,7 @@ def build_view_chain_plan(
                     timeout,
                     grant_index_miss,
                     grant_index_all,
+                    allow_fallback,
                     roles_cache,
                     tab_privs_cache,
                     tab_privs_grantable_cache,
@@ -1443,6 +1781,7 @@ def build_view_chain_plan(
                 target_type,
                 required_priv,
                 require_option,
+                allow_fallback,
                 obclient_cmd,
                 timeout,
                 grant_index_miss,
@@ -2300,11 +2639,11 @@ def build_compile_statement(owner: str, obj_name: str, obj_type: str) -> Optiona
     obj_type_u = obj_type.strip().upper()
     owner_u = owner.strip()
     name_u = obj_name.strip()
+    if obj_type_u in {"VIEW", "MATERIALIZED VIEW", "TYPE BODY"}:
+        return None
     if obj_type_u == "PACKAGE BODY":
         return f"ALTER PACKAGE {owner_u}.{name_u} COMPILE BODY;"
-    if obj_type_u == "TYPE BODY":
-        return f"ALTER TYPE {owner_u}.{name_u} COMPILE BODY;"
-    if obj_type_u in {"PACKAGE", "TYPE", "PROCEDURE", "FUNCTION", "VIEW", "TRIGGER"}:
+    if obj_type_u in {"PACKAGE", "TYPE", "PROCEDURE", "FUNCTION", "TRIGGER"}:
         return f"ALTER {obj_type_u} {owner_u}.{name_u} COMPILE;"
     return None
 
@@ -2542,7 +2881,9 @@ def main() -> None:
     
     # Load configuration
     try:
-        ob_cfg, fixup_dir, repo_root, log_level, report_dir = load_ob_config(config_arg.resolve())
+        ob_cfg, fixup_dir, repo_root, log_level, report_dir, fixup_settings = load_ob_config(
+            config_arg.resolve()
+        )
     except ConfigError as exc:
         log.error("配置错误: %s", exc)
         sys.exit(1)
@@ -2573,18 +2914,21 @@ def main() -> None:
             repo_root,
             report_dir,
             only_dirs,
-            exclude_dirs
+            exclude_dirs,
+            fixup_settings
         )
     elif iterative_mode:
         run_iterative_fixup(
-            args, ob_cfg, fixup_dir, repo_root, 
+            args, ob_cfg, fixup_dir, repo_root, report_dir,
             only_dirs, exclude_dirs,
+            fixup_settings,
             max_rounds, min_progress
         )
     else:
         run_single_fixup(
-            args, ob_cfg, fixup_dir, repo_root,
-            only_dirs, exclude_dirs
+            args, ob_cfg, fixup_dir, repo_root, report_dir,
+            only_dirs, exclude_dirs,
+            fixup_settings
         )
 
 
@@ -2593,8 +2937,10 @@ def run_single_fixup(
     ob_cfg: Dict[str, str],
     fixup_dir: Path,
     repo_root: Path,
+    report_dir: Path,
     only_dirs: List[str],
-    exclude_dirs: List[str]
+    exclude_dirs: List[str],
+    fixup_settings: FixupAutoGrantSettings
 ) -> None:
     """Original single-round fixup execution (backward compatible)."""
     
@@ -2621,6 +2967,14 @@ def run_single_fixup(
     
     obclient_cmd = build_obclient_command(ob_cfg)
     ob_timeout = resolve_timeout_value(ob_cfg.get("timeout"))
+    auto_grant_ctx = init_auto_grant_context(
+        fixup_settings,
+        report_dir,
+        fixup_dir,
+        exclude_dirs,
+        obclient_cmd,
+        ob_timeout
+    )
     
     total_scripts = len(files_with_layer)
     width = len(str(total_scripts)) or 1
@@ -2682,6 +3036,13 @@ def run_single_fixup(
             error_truncated = error_truncated or truncated
             results.append(result)
         else:
+            obj_type = DIR_OBJECT_TYPE_MAP.get(sql_path.parent.name.lower())
+            obj_schema, obj_name = parse_object_identity_from_path(sql_path)
+            obj_full = (
+                f"{obj_schema}.{obj_name}" if obj_schema and obj_name else None
+            )
+            if auto_grant_ctx and obj_full and obj_type:
+                execute_auto_grant_for_object(auto_grant_ctx, obj_full, obj_type, label)
             summary = execute_sql_statements(obclient_cmd, sql_text, timeout=ob_timeout)
             if summary.statements == 0:
                 results.append(ScriptResult(relative_path, "SKIPPED", "文件为空", layer))
@@ -2703,28 +3064,64 @@ def run_single_fixup(
                 log.info("%s %s -> OK %s", label, relative_path, move_note)
             else:
                 first_error = summary.failures[0].error if summary.failures else "执行失败"
-                results.append(ScriptResult(relative_path, "FAILED", first_error, layer))
-                log.error(
-                    "%s %s -> FAIL (%d/%d statements)",
-                    label,
-                    relative_path,
-                    len(summary.failures),
-                    summary.statements
-                )
-                for failure in summary.failures[:3]:
-                    preview = failure.error.splitlines()[0] if failure.error else "执行失败"
-                    log.error("  [%d] %s", failure.index, preview[:200])
-                for failure in summary.failures:
-                    if error_truncated:
-                        break
-                    error_truncated = not record_error_entry(
-                        error_entries,
-                        DEFAULT_ERROR_REPORT_LIMIT,
-                        relative_path,
-                        failure.index,
-                        failure.statement,
-                        failure.error
+                error_type = classify_sql_error(first_error)
+                retried = False
+                if (
+                    auto_grant_ctx
+                    and obj_full
+                    and obj_type
+                    and error_type == FailureType.PERMISSION_DENIED
+                ):
+                    applied, _blocked = execute_auto_grant_for_object(
+                        auto_grant_ctx,
+                        obj_full,
+                        obj_type,
+                        f"{label} (retry)"
                     )
+                    if applied > 0:
+                        retry_summary = execute_sql_statements(
+                            obclient_cmd,
+                            sql_text,
+                            timeout=ob_timeout
+                        )
+                        if retry_summary.success:
+                            retried = True
+                            move_note = ""
+                            try:
+                                target_dir = done_dir / sql_path.parent.name
+                                target_dir.mkdir(parents=True, exist_ok=True)
+                                target_path = target_dir / sql_path.name
+                                shutil.move(str(sql_path), target_path)
+                                move_note = f"(已移至 done/{sql_path.parent.name}/)"
+                            except Exception as exc:
+                                move_note = f"(移动失败: {exc})"
+                            results.append(ScriptResult(relative_path, "SUCCESS", move_note.strip(), layer))
+                            log.info("%s %s -> OK %s", label, relative_path, move_note)
+                        else:
+                            summary = retry_summary
+                if not retried:
+                    results.append(ScriptResult(relative_path, "FAILED", first_error, layer))
+                    log.error(
+                        "%s %s -> FAIL (%d/%d statements)",
+                        label,
+                        relative_path,
+                        len(summary.failures),
+                        summary.statements
+                    )
+                    for failure in summary.failures[:3]:
+                        preview = failure.error.splitlines()[0] if failure.error else "执行失败"
+                        log.error("  [%d] %s", failure.index, preview[:200])
+                    for failure in summary.failures:
+                        if error_truncated:
+                            break
+                        error_truncated = not record_error_entry(
+                            error_entries,
+                            DEFAULT_ERROR_REPORT_LIMIT,
+                            relative_path,
+                            failure.index,
+                            failure.statement,
+                            failure.error
+                        )
     
     # Recompilation phase
     total_recompiled = 0
@@ -2734,6 +3131,14 @@ def run_single_fixup(
         total_recompiled, remaining_invalid = recompile_invalid_objects(
             obclient_cmd, ob_timeout, args.max_retries
         )
+
+    if auto_grant_ctx:
+        log_subsection("自动补权限统计")
+        log.info("计划语句 : %d", auto_grant_ctx.stats.planned)
+        log.info("执行成功 : %d", auto_grant_ctx.stats.executed)
+        log.info("执行失败 : %d", auto_grant_ctx.stats.failed)
+        log.info("阻断提示 : %d", auto_grant_ctx.stats.blocked)
+        log.info("范围跳过 : %d", auto_grant_ctx.stats.skipped)
     
     # Summary
     executed = sum(1 for r in results if r.status != "SKIPPED")
@@ -2813,7 +3218,8 @@ def run_view_chain_autofix(
     repo_root: Path,
     report_dir: Path,
     only_dirs: List[str],
-    exclude_dirs: List[str]
+    exclude_dirs: List[str],
+    fixup_settings: FixupAutoGrantSettings
 ) -> None:
     log_section("VIEW 链路自动修复")
     log.info("配置文件: %s", Path(args.config).resolve())
@@ -2901,6 +3307,8 @@ def run_view_chain_autofix(
 
     log.info("读取 VIEW 依赖链: %d", total_views)
 
+    allow_fallback = bool(fixup_settings.fallback)
+
     for idx, view_full in enumerate(sorted(chains_by_view.keys()), start=1):
         view_key = normalize_identifier(view_full)
         label = format_progress_label(idx, total_views, view_width)
@@ -2933,6 +3341,7 @@ def run_view_chain_autofix(
                 done_name_index,
                 grant_index_miss,
                 grant_index_all,
+                allow_fallback,
                 repo_root,
                 exists_cache,
                 roles_cache,
@@ -3074,8 +3483,10 @@ def run_iterative_fixup(
     ob_cfg: Dict[str, str],
     fixup_dir: Path,
     repo_root: Path,
+    report_dir: Path,
     only_dirs: List[str],
     exclude_dirs: List[str],
+    fixup_settings: FixupAutoGrantSettings,
     max_rounds: int = 10,
     min_progress: int = 1
 ) -> None:
@@ -3113,12 +3524,14 @@ def run_iterative_fixup(
     
     obclient_cmd = build_obclient_command(ob_cfg)
     ob_timeout = resolve_timeout_value(ob_cfg.get("timeout"))
-    grant_index = build_grant_index(
+    auto_grant_ctx = init_auto_grant_context(
+        fixup_settings,
+        report_dir,
         fixup_dir,
-        set(exclude_dirs),
-        include_dirs=set(only_dirs) if only_dirs else None
+        exclude_dirs,
+        obclient_cmd,
+        ob_timeout
     )
-    applied_grants: Set[str] = set()
     error_entries: List[ErrorReportEntry] = []
     error_truncated = False
     
@@ -3186,6 +3599,14 @@ def run_iterative_fixup(
                 round_results.append(result)
                 continue
 
+            obj_type = DIR_OBJECT_TYPE_MAP.get(sql_path.parent.name.lower())
+            obj_schema, obj_name = parse_object_identity_from_path(sql_path)
+            obj_full = (
+                f"{obj_schema}.{obj_name}" if obj_schema and obj_name else None
+            )
+            if auto_grant_ctx and obj_full and obj_type:
+                execute_auto_grant_for_object(auto_grant_ctx, obj_full, obj_type, label)
+
             result, summary = execute_script_with_summary(
                 obclient_cmd,
                 sql_path,
@@ -3222,12 +3643,12 @@ def run_iterative_fixup(
             is_view = sql_path.parent.name.lower() == "view"
             handled = False
 
-            if is_view and error_type in (FailureType.MISSING_OBJECT, FailureType.PERMISSION_DENIED):
+            if is_view and error_type == FailureType.MISSING_OBJECT:
                 view_schema, _view_name = parse_object_from_filename(sql_path)
                 failure_stmt = summary.failures[0].statement if summary.failures else ""
                 if not is_create_view_statement(failure_stmt):
                     log.warning("%s %s -> 失败语句非 CREATE VIEW，跳过解析", label, relative_path)
-                elif error_type == FailureType.MISSING_OBJECT:
+                else:
                     missing_schema, missing_name = extract_object_from_error(first_error)
                     if missing_name:
                         dep_path = select_dependency_script(
@@ -3262,37 +3683,17 @@ def run_iterative_fixup(
                     else:
                         log.warning("%s %s -> 缺失对象未解析", label, relative_path)
 
-                elif error_type == FailureType.PERMISSION_DENIED:
-                    missing_schema, missing_name = extract_object_from_error(first_error)
-                    if not grant_index.by_grantee_object:
-                        log.warning("%s %s -> 授权目录为空或已被排除", label, relative_path)
-                    elif view_schema and missing_name:
-                        entries = select_grant_entries(
-                            grant_index,
-                            view_schema,
-                            missing_schema,
-                            missing_name,
-                            view_schema
-                        )
-                        if entries:
-                            applied, failed = apply_grant_entries(
-                                obclient_cmd,
-                                entries,
-                                ob_timeout,
-                                applied_grants
-                            )
-                            log.info(
-                                "%s %s -> 应用授权 %d 条, 失败 %d 条",
-                                label,
-                                relative_path,
-                                applied,
-                                failed
-                            )
-                            handled = applied > 0
-                        else:
-                            log.warning("%s %s -> 未找到匹配的授权语句", label, relative_path)
-                    else:
-                        log.warning("%s %s -> 权限错误未解析目标对象", label, relative_path)
+            if error_type == FailureType.PERMISSION_DENIED:
+                if auto_grant_ctx and obj_full and obj_type:
+                    applied, _blocked = execute_auto_grant_for_object(
+                        auto_grant_ctx,
+                        obj_full,
+                        obj_type,
+                        f"{label} (grant)"
+                    )
+                    handled = applied > 0
+                else:
+                    log.warning("%s %s -> 权限错误未解析目标对象", label, relative_path)
 
             if handled:
                 retry_result, retry_summary = execute_script_with_summary(
@@ -3387,6 +3788,14 @@ def run_iterative_fixup(
         total_recompiled, remaining_invalid = recompile_invalid_objects(
             obclient_cmd, ob_timeout, args.max_retries
         )
+
+    if auto_grant_ctx:
+        log_subsection("自动补权限统计")
+        log.info("计划语句 : %d", auto_grant_ctx.stats.planned)
+        log.info("执行成功 : %d", auto_grant_ctx.stats.executed)
+        log.info("执行失败 : %d", auto_grant_ctx.stats.failed)
+        log.info("阻断提示 : %d", auto_grant_ctx.stats.blocked)
+        log.info("范围跳过 : %d", auto_grant_ctx.stats.skipped)
     
     # Final summary
     log_section("迭代执行汇总")

@@ -83,6 +83,13 @@ interval_partition_cutoff_numeric =
 # 是否生成授权脚本并附加到修补 DDL（依赖于源端权限/依赖推导）
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 generate_grants         = true
+# run_fixup 自动补权限（默认开启）
+# fixup_auto_grant: true/false
+# fixup_auto_grant_types: 自动补权限对象类型（逗号分隔）
+# fixup_auto_grant_fallback: 无匹配授权脚本时是否自动生成 GRANT (true/false)
+fixup_auto_grant        = true
+fixup_auto_grant_types  = VIEW,MATERIALIZED VIEW,SYNONYM,PROCEDURE,FUNCTION,PACKAGE,PACKAGE BODY,TRIGGER,TYPE,TYPE BODY
+fixup_auto_grant_fallback = true
 # 授权抽取范围（DBA_TAB_PRIVS）
 # owner: 仅加载源 schema 拥有的对象权限（默认，性能更佳）
 # owner_or_grantee: 兼容旧逻辑，额外加载 grantee 在源 schema 的对象授权

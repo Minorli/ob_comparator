@@ -760,6 +760,21 @@ FIXUP_CREATE_REPLACE_TYPES: Set[str] = {
 
 FIXUP_IDEMPOTENT_DEFAULT_TYPES: Set[str] = set(FIXUP_CREATE_REPLACE_TYPES)
 
+FIXUP_AUTO_GRANT_DEFAULT_TYPES_ORDERED: Tuple[str, ...] = (
+    'VIEW',
+    'MATERIALIZED VIEW',
+    'SYNONYM',
+    'PROCEDURE',
+    'FUNCTION',
+    'PACKAGE',
+    'PACKAGE BODY',
+    'TRIGGER',
+    'TYPE',
+    'TYPE BODY',
+)
+FIXUP_AUTO_GRANT_DEFAULT_TYPES: Set[str] = set(FIXUP_AUTO_GRANT_DEFAULT_TYPES_ORDERED)
+FIXUP_AUTO_GRANT_ALLOWED_TYPES: Set[str] = set(PRIMARY_OBJECT_TYPES) | set(EXTRA_OBJECT_CHECK_TYPES)
+
 # 注释比对时批量 IN 子句的大小，避免 ORA-01795
 COMMENT_BATCH_SIZE = 200
 # Oracle IN 列表最大表达式数量为 1000，预留余量
@@ -1541,6 +1556,17 @@ def parse_type_list(
     if unknown:
         log.warning("配置 %s 包含未知类型 %s，将被忽略。", label, sorted(unknown))
     return parsed & allowed
+
+
+def parse_fixup_auto_grant_types(raw_value: str) -> Set[str]:
+    if not raw_value or not raw_value.strip():
+        return set(FIXUP_AUTO_GRANT_DEFAULT_TYPES)
+    return parse_type_list(
+        raw_value,
+        FIXUP_AUTO_GRANT_ALLOWED_TYPES,
+        'fixup_auto_grant_types',
+        default_all=False
+    )
 
 
 def normalize_ddl_formatter(raw_value: Optional[str]) -> str:
@@ -2687,6 +2713,12 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('fixup_types', '')
         settings.setdefault('fixup_idempotent_mode', 'off')
         settings.setdefault('fixup_idempotent_types', '')
+        settings.setdefault('fixup_auto_grant', 'true')
+        settings.setdefault(
+            'fixup_auto_grant_types',
+            ",".join(FIXUP_AUTO_GRANT_DEFAULT_TYPES_ORDERED)
+        )
+        settings.setdefault('fixup_auto_grant_fallback', 'true')
         settings.setdefault('synonym_fixup_scope', 'all')
         settings.setdefault('trigger_list', '')
         settings.setdefault('trigger_qualify_schema', 'true')
@@ -2901,6 +2933,17 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         if not idempotent_types:
             idempotent_types = set(FIXUP_IDEMPOTENT_DEFAULT_TYPES)
         settings['fixup_idempotent_types_set'] = idempotent_types
+        settings['fixup_auto_grant'] = parse_bool_flag(
+            settings.get('fixup_auto_grant', 'true'),
+            True
+        )
+        settings['fixup_auto_grant_types_set'] = parse_fixup_auto_grant_types(
+            settings.get('fixup_auto_grant_types', '')
+        )
+        settings['fixup_auto_grant_fallback'] = parse_bool_flag(
+            settings.get('fixup_auto_grant_fallback', 'true'),
+            True
+        )
         settings['column_visibility_policy'] = normalize_column_visibility_policy(
             settings.get('column_visibility_policy', 'auto')
         )
@@ -3294,6 +3337,30 @@ def run_config_wizard(config_path: Path) -> None:
         "generate_grants",
         "是否生成授权脚本并附加到修复 DDL (true/false)",
         default=cfg.get("SETTINGS", "generate_grants", fallback="true"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "fixup_auto_grant",
+        "run_fixup 自动补权限 (true/false)",
+        default=cfg.get("SETTINGS", "fixup_auto_grant", fallback="true"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "fixup_auto_grant_types",
+        "自动补权限对象类型 (逗号分隔)",
+        default=cfg.get(
+            "SETTINGS",
+            "fixup_auto_grant_types",
+            fallback=",".join(FIXUP_AUTO_GRANT_DEFAULT_TYPES_ORDERED),
+        ),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "fixup_auto_grant_fallback",
+        "自动补权限兜底生成 GRANT (true/false)",
+        default=cfg.get("SETTINGS", "fixup_auto_grant_fallback", fallback="true"),
         transform=_bool_transform,
     )
     _prompt_field(
@@ -20575,6 +20642,8 @@ def generate_fixup_scripts(
     def _compile_statements(obj_type: str, obj_name: str) -> List[str]:
         obj_type_u = obj_type.upper()
         obj_name_u = obj_name.upper()
+        if obj_type_u in ("VIEW", "MATERIALIZED VIEW", "TYPE BODY"):
+            return []
         if obj_type_u in ("FUNCTION", "PROCEDURE"):
             return [f"ALTER {obj_type_u} {obj_name_u} COMPILE;"]
         if obj_type_u in ("PACKAGE", "PACKAGE BODY"):

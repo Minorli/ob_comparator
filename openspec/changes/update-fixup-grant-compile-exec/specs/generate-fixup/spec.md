@@ -1,10 +1,10 @@
 ## MODIFIED Requirements
 
 ### Requirement: Compile and grant scripts
-The system SHALL generate compile scripts for missing dependencies and GRANT scripts derived from Oracle privileges and dependency-based grants when generate_grants is enabled, emitting both missing-grant and full-audit outputs. Unsupported target types (VIEW/MATERIALIZED VIEW) SHALL be excluded from compile outputs.
+The system SHALL generate compile scripts for missing dependencies and GRANT scripts derived from Oracle privileges and dependency-based grants when generate_grants is enabled, emitting both missing-grant and full-audit outputs. Unsupported target types (VIEW, MATERIALIZED VIEW, TYPE BODY) SHALL be excluded from compile outputs.
 
-#### Scenario: View compile omitted
-- **WHEN** a missing dependency is a VIEW or MATERIALIZED VIEW
+#### Scenario: Unsupported compile omitted
+- **WHEN** a missing dependency is a VIEW, MATERIALIZED VIEW, or TYPE BODY
 - **THEN** no ALTER ... COMPILE script is generated for that object
 
 #### Scenario: Grant generation enabled
