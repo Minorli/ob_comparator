@@ -501,6 +501,303 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(results["missing"], [])
         self.assertIn(("TABLE", "A.T1"), results["ok"])
 
+    def test_check_primary_objects_column_order_disabled(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "C1": {
+                    "data_type": "NUMBER",
+                    "data_length": None,
+                    "data_precision": 10,
+                    "data_scale": 0,
+                    "nullable": "Y",
+                    "data_default": None,
+                    "char_used": None,
+                    "char_length": None,
+                    "hidden": False,
+                    "virtual": False,
+                    "virtual_expr": None,
+                    "identity": None,
+                    "default_on_null": None,
+                    "invisible": None,
+                    "column_id": 1,
+                },
+                "C2": {
+                    "data_type": "NUMBER",
+                    "data_length": None,
+                    "data_precision": 10,
+                    "data_scale": 0,
+                    "nullable": "Y",
+                    "data_default": None,
+                    "char_used": None,
+                    "char_length": None,
+                    "hidden": False,
+                    "virtual": False,
+                    "virtual_expr": None,
+                    "identity": None,
+                    "default_on_null": None,
+                    "invisible": None,
+                    "column_id": 2,
+                },
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "NUMBER",
+                        "data_length": None,
+                        "data_precision": 10,
+                        "data_scale": 0,
+                        "nullable": "Y",
+                        "data_default": None,
+                        "char_used": None,
+                        "char_length": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                        "identity": None,
+                        "default_on_null": None,
+                        "invisible": None,
+                        "column_id": 2,
+                    },
+                    "C2": {
+                        "data_type": "NUMBER",
+                        "data_length": None,
+                        "data_precision": 10,
+                        "data_scale": 0,
+                        "nullable": "Y",
+                        "data_default": None,
+                        "char_used": None,
+                        "char_length": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                        "identity": None,
+                        "default_on_null": None,
+                        "invisible": None,
+                        "column_id": 1,
+                    },
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+            settings={"enable_column_order_check": False}
+        )
+        self.assertEqual(results["column_order_mismatched"], [])
+        self.assertEqual(results["column_order_skipped"], [])
+
+    def test_check_primary_objects_column_order_mismatch(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "C1": {
+                    "data_type": "NUMBER",
+                    "data_length": None,
+                    "data_precision": 10,
+                    "data_scale": 0,
+                    "nullable": "Y",
+                    "data_default": None,
+                    "char_used": None,
+                    "char_length": None,
+                    "hidden": False,
+                    "virtual": False,
+                    "virtual_expr": None,
+                    "identity": None,
+                    "default_on_null": None,
+                    "invisible": None,
+                    "column_id": 1,
+                },
+                "C2": {
+                    "data_type": "NUMBER",
+                    "data_length": None,
+                    "data_precision": 10,
+                    "data_scale": 0,
+                    "nullable": "Y",
+                    "data_default": None,
+                    "char_used": None,
+                    "char_length": None,
+                    "hidden": False,
+                    "virtual": False,
+                    "virtual_expr": None,
+                    "identity": None,
+                    "default_on_null": None,
+                    "invisible": None,
+                    "column_id": 2,
+                },
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "NUMBER",
+                        "data_length": None,
+                        "data_precision": 10,
+                        "data_scale": 0,
+                        "nullable": "Y",
+                        "data_default": None,
+                        "char_used": None,
+                        "char_length": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                        "identity": None,
+                        "default_on_null": None,
+                        "invisible": None,
+                        "column_id": 2,
+                    },
+                    "C2": {
+                        "data_type": "NUMBER",
+                        "data_length": None,
+                        "data_precision": 10,
+                        "data_scale": 0,
+                        "nullable": "Y",
+                        "data_default": None,
+                        "char_used": None,
+                        "char_length": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                        "identity": None,
+                        "default_on_null": None,
+                        "invisible": None,
+                        "column_id": 1,
+                    },
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+            settings={"enable_column_order_check": True}
+        )
+        self.assertEqual(results["mismatched"], [])
+        self.assertEqual(len(results["column_order_mismatched"]), 1)
+        mismatch = results["column_order_mismatched"][0]
+        self.assertEqual(mismatch.table, "A.T1")
+        self.assertEqual(mismatch.src_order, ("C1", "C2"))
+        self.assertEqual(mismatch.tgt_order, ("C2", "C1"))
+
+    def test_check_primary_objects_column_order_filters_noise(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "C1": {
+                    "data_type": "NUMBER",
+                    "data_length": None,
+                    "data_precision": 10,
+                    "data_scale": 0,
+                    "nullable": "Y",
+                    "data_default": None,
+                    "char_used": None,
+                    "char_length": None,
+                    "hidden": False,
+                    "virtual": False,
+                    "virtual_expr": None,
+                    "identity": None,
+                    "default_on_null": None,
+                    "invisible": None,
+                    "column_id": 1,
+                },
+                "C2": {
+                    "data_type": "NUMBER",
+                    "data_length": None,
+                    "data_precision": 10,
+                    "data_scale": 0,
+                    "nullable": "Y",
+                    "data_default": None,
+                    "char_used": None,
+                    "char_length": None,
+                    "hidden": False,
+                    "virtual": False,
+                    "virtual_expr": None,
+                    "identity": None,
+                    "default_on_null": None,
+                    "invisible": None,
+                    "column_id": 2,
+                },
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "NUMBER",
+                        "data_length": None,
+                        "data_precision": 10,
+                        "data_scale": 0,
+                        "nullable": "Y",
+                        "data_default": None,
+                        "char_used": None,
+                        "char_length": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                        "identity": None,
+                        "default_on_null": None,
+                        "invisible": None,
+                        "column_id": 1,
+                    },
+                    "__PK_INCREMENT": {
+                        "data_type": "NUMBER",
+                        "data_length": None,
+                        "data_precision": 10,
+                        "data_scale": 0,
+                        "nullable": "Y",
+                        "data_default": None,
+                        "char_used": None,
+                        "char_length": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                        "identity": None,
+                        "default_on_null": None,
+                        "invisible": None,
+                        "column_id": 2,
+                    },
+                    "C2": {
+                        "data_type": "NUMBER",
+                        "data_length": None,
+                        "data_precision": 10,
+                        "data_scale": 0,
+                        "nullable": "Y",
+                        "data_default": None,
+                        "char_used": None,
+                        "char_length": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                        "identity": None,
+                        "default_on_null": None,
+                        "invisible": None,
+                        "column_id": 3,
+                    },
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+            settings={"enable_column_order_check": True}
+        )
+        self.assertEqual(results["column_order_mismatched"], [])
+        self.assertEqual(results["column_order_skipped"], [])
+
     def test_check_primary_objects_skips_virtual_length_rule(self):
         master_list = [("A.T1", "A.T1", "TABLE")]
         oracle_meta = self._make_oracle_meta_with_columns({
@@ -2949,6 +3246,56 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         cleaned = sdr.apply_ddl_cleanup_rules(ddl, 'TRIGGER')
         self.assertIn("CREATE OR REPLACE TRIGGER", cleaned.upper())
         self.assertNotIn("EDITIONABLE", cleaned.upper())
+
+    def test_is_ob_notnull_constraint_handles_tuple(self):
+        self.assertTrue(sdr.is_ob_notnull_constraint(("ZZ_OBNOTNULL_1", "extra")))
+        self.assertFalse(sdr.is_ob_notnull_constraint(("ZZ_NORMAL", "extra")))
+
+    def test_normalize_extra_results_names_handles_tuple(self):
+        extra_results = {
+            "index_mismatched": [
+                sdr.IndexMismatch(
+                    table="A.T1",
+                    missing_indexes={("IDX1", ("C1",))},
+                    extra_indexes=set(),
+                    detail_mismatch=[]
+                )
+            ],
+            "constraint_mismatched": [
+                sdr.ConstraintMismatch(
+                    table="A.T1",
+                    missing_constraints={("CK1", "X")},
+                    extra_constraints=set(),
+                    detail_mismatch=[],
+                    downgraded_pk_constraints={("PK1", ("C1",))}
+                )
+            ],
+            "sequence_mismatched": [
+                sdr.SequenceMismatch(
+                    src_schema="A",
+                    tgt_schema="A",
+                    missing_sequences={("SEQ1", "X")},
+                    extra_sequences=set(),
+                    note=None,
+                    missing_mappings=[],
+                    detail_mismatch=[]
+                )
+            ],
+            "trigger_mismatched": [
+                sdr.TriggerMismatch(
+                    table="A.T1",
+                    missing_triggers={("TR1", "X")},
+                    extra_triggers=set(),
+                    detail_mismatch=[]
+                )
+            ]
+        }
+        normalized = sdr.normalize_extra_results_names(extra_results)
+        self.assertEqual(normalized["index_mismatched"][0].missing_indexes, {"IDX1"})
+        self.assertEqual(normalized["constraint_mismatched"][0].missing_constraints, {"CK1"})
+        self.assertEqual(normalized["constraint_mismatched"][0].downgraded_pk_constraints, {"PK1"})
+        self.assertEqual(normalized["sequence_mismatched"][0].missing_sequences, {"SEQ1"})
+        self.assertEqual(normalized["trigger_mismatched"][0].missing_triggers, {"TR1"})
 
     def test_enforce_schema_for_ddl_skips_duplicate(self):
         ddl = (

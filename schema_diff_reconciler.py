@@ -88,7 +88,7 @@ from collections import defaultdict, OrderedDict, deque
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Dict, Set, List, Tuple, Optional, NamedTuple, Callable, Union
+from typing import Dict, Set, List, Tuple, Optional, NamedTuple, Callable, Union, Iterable
 import textwrap
 
 # 尝试导入 oracledb，如果失败则提示安装
@@ -780,6 +780,18 @@ def normalize_identifier_name(name: Optional[str]) -> str:
     return str(name).strip().strip('"').upper()
 
 
+def parse_column_id(value: Optional[object]) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        num = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if num <= 0:
+        return None
+    return num
+
+
 def is_sys_nc_column_name(name: Optional[str]) -> bool:
     name_u = normalize_identifier_name(name)
     if not name_u:
@@ -1021,12 +1033,30 @@ def is_oms_index(name: str, columns: List[str]) -> bool:
     return oms_cols_set.issubset(cols_set)
 
 
-def is_ob_notnull_constraint(name: Optional[str]) -> bool:
+def extract_name_value(value: Optional[object]) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            if isinstance(item, str) and item:
+                return item
+        if value:
+            return extract_name_value(value[0])
+    return str(value)
+
+
+def extract_constraint_name(value: Optional[object]) -> str:
+    return extract_name_value(value)
+
+
+def is_ob_notnull_constraint(name: Optional[object]) -> bool:
     """
     识别 OceanBase Oracle 模式下自动生成的 *_OBNOTNULL_* CHECK 约束。
     这些约束用于保证 PK 列非空，Oracle 侧不会显式出现，报告统计应忽略以避免误判“多余约束”。
     """
-    return "OBNOTNULL" in (name or "").upper()
+    return "OBNOTNULL" in extract_constraint_name(name).upper()
 
 
 def strip_wrapping_parentheses(text: str) -> str:
@@ -2068,6 +2098,12 @@ class CommentMismatch(NamedTuple):
     extra_columns: Set[str]
 
 
+class ColumnOrderMismatch(NamedTuple):
+    table: str
+    src_order: Tuple[str, ...]
+    tgt_order: Tuple[str, ...]
+
+
 ExtraCheckResults = Dict[str, List]
 
 
@@ -2149,6 +2185,62 @@ def normalize_column_sequence(columns: Optional[List[str]]) -> Tuple[str, ...]:
         seen.add(col_u)
         normalized.append(col_u)
     return tuple(normalized)
+
+
+def is_column_order_candidate(
+    col_name: Optional[str],
+    col_meta: Optional[Dict],
+    *,
+    is_source: bool,
+    hidden_src_cols: Optional[Set[str]] = None,
+    invisible_src_cols: Optional[Set[str]] = None
+) -> bool:
+    if not col_name:
+        return False
+    if classify_noise_column(col_name):
+        return False
+    if is_source:
+        if is_ignored_source_column(col_name, col_meta):
+            return False
+    else:
+        if is_ignored_oms_column(col_name, col_meta):
+            return False
+        if hidden_src_cols and col_name in hidden_src_cols:
+            return False
+        if invisible_src_cols and col_name in invisible_src_cols:
+            return False
+    if col_meta:
+        if col_meta.get("hidden"):
+            return False
+        if col_meta.get("invisible") is True:
+            return False
+    return True
+
+
+def build_column_order_sequence(
+    col_meta: Dict[str, Dict],
+    candidates: Set[str]
+) -> Tuple[Optional[Tuple[str, ...]], Optional[str]]:
+    if not candidates:
+        return tuple(), None
+    items: List[Tuple[int, str]] = []
+    for name in candidates:
+        meta = col_meta.get(name)
+        if not meta:
+            return None, "column_meta_missing"
+        col_id = meta.get("column_id")
+        if col_id is None:
+            return None, "column_id_missing"
+        if not isinstance(col_id, int):
+            col_id = parse_column_id(col_id)
+        if col_id is None:
+            return None, "column_id_missing"
+        items.append((col_id, name))
+    ids = [entry[0] for entry in items]
+    if len(ids) != len(set(ids)):
+        return None, "column_id_duplicate"
+    ordered = [name for _, name in sorted(items, key=lambda x: x[0])]
+    return tuple(ordered), None
 
 
 def normalize_index_columns(
@@ -2583,6 +2675,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('check_dependencies', 'true')
         settings.setdefault('print_dependency_chains', 'true')
         settings.setdefault('check_comments', 'true')
+        settings.setdefault('check_column_order', 'false')
         settings.setdefault('generate_interval_partition_fixup', 'false')
         settings.setdefault('interval_partition_cutoff', '20280301')
         settings.setdefault('interval_partition_cutoff_numeric', '')
@@ -2653,6 +2746,10 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings['enable_comment_check'] = parse_bool_flag(
             settings.get('check_comments', 'true'),
             True
+        )
+        settings['enable_column_order_check'] = parse_bool_flag(
+            settings.get('check_column_order', 'false'),
+            False
         )
         settings['generate_interval_partition_fixup'] = parse_bool_flag(
             settings.get('generate_interval_partition_fixup', 'false'),
@@ -3238,6 +3335,13 @@ def run_config_wizard(config_path: Path) -> None:
         "check_comments",
         "是否比对表/列注释 (true/false)",
         default=cfg.get("SETTINGS", "check_comments", fallback="true"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "check_column_order",
+        "是否校验列顺序 (true/false，默认 false)",
+        default=cfg.get("SETTINGS", "check_column_order", fallback="false"),
         transform=_bool_transform,
     )
     _prompt_field(
@@ -5965,14 +6069,20 @@ def apply_noise_suppression(
                 "CONSTRAINT",
                 item.table,
                 "MISSING_CONSTRAINT",
-                {NOISE_REASON_OBNOTNULL_CONSTRAINT: {normalize_identifier_name(n) or str(n) for n in missing_suppressed}}
+                {NOISE_REASON_OBNOTNULL_CONSTRAINT: {
+                    normalize_identifier_name(extract_constraint_name(n)) or str(n)
+                    for n in missing_suppressed
+                }}
             )
         if extra_suppressed:
             _record_noise_details(
                 "CONSTRAINT",
                 item.table,
                 "EXTRA_CONSTRAINT",
-                {NOISE_REASON_OBNOTNULL_CONSTRAINT: {normalize_identifier_name(n) or str(n) for n in extra_suppressed}}
+                {NOISE_REASON_OBNOTNULL_CONSTRAINT: {
+                    normalize_identifier_name(extract_constraint_name(n)) or str(n)
+                    for n in extra_suppressed
+                }}
             )
         new_missing = set(item.missing_constraints) - missing_suppressed
         new_extra = set(item.extra_constraints) - extra_suppressed
@@ -6043,6 +6153,72 @@ def apply_noise_suppression(
         comment_results=filtered_comments,
         suppressed_details=suppressed_details
     )
+
+
+def normalize_extra_results_names(extra_results: ExtraCheckResults) -> ExtraCheckResults:
+    if not extra_results:
+        return extra_results
+
+    def _norm_set(values: Optional[Iterable[object]]) -> Set[str]:
+        if not values:
+            return set()
+        normalized: Set[str] = set()
+        for value in values:
+            name = extract_name_value(value)
+            if name:
+                normalized.add(name)
+        return normalized
+
+    def _norm_list(values: Optional[Iterable[object]]) -> List[str]:
+        if not values:
+            return []
+        normalized: List[str] = []
+        for value in values:
+            name = extract_name_value(value)
+            if name:
+                normalized.append(name)
+        return normalized
+
+    normalized = dict(extra_results)
+    normalized["index_ok"] = _norm_list(normalized.get("index_ok"))
+    normalized["constraint_ok"] = _norm_list(normalized.get("constraint_ok"))
+    normalized["sequence_ok"] = _norm_list(normalized.get("sequence_ok"))
+    normalized["trigger_ok"] = _norm_list(normalized.get("trigger_ok"))
+
+    index_items = []
+    for item in normalized.get("index_mismatched", []) or []:
+        index_items.append(item._replace(
+            missing_indexes=_norm_set(item.missing_indexes),
+            extra_indexes=_norm_set(item.extra_indexes)
+        ))
+    normalized["index_mismatched"] = index_items
+
+    constraint_items = []
+    for item in normalized.get("constraint_mismatched", []) or []:
+        constraint_items.append(item._replace(
+            missing_constraints=_norm_set(item.missing_constraints),
+            extra_constraints=_norm_set(item.extra_constraints),
+            downgraded_pk_constraints=_norm_set(item.downgraded_pk_constraints)
+        ))
+    normalized["constraint_mismatched"] = constraint_items
+
+    sequence_items = []
+    for item in normalized.get("sequence_mismatched", []) or []:
+        sequence_items.append(item._replace(
+            missing_sequences=_norm_set(item.missing_sequences),
+            extra_sequences=_norm_set(item.extra_sequences)
+        ))
+    normalized["sequence_mismatched"] = sequence_items
+
+    trigger_items = []
+    for item in normalized.get("trigger_mismatched", []) or []:
+        trigger_items.append(item._replace(
+            missing_triggers=_norm_set(item.missing_triggers),
+            extra_triggers=_norm_set(item.extra_triggers)
+        ))
+    normalized["trigger_mismatched"] = trigger_items
+
+    return normalized
 
 
 def classify_unsupported_check_constraints(
@@ -6576,6 +6752,7 @@ def dump_ob_metadata(
     target_schemas: Set[str],
     tracked_object_types: Optional[Set[str]] = None,
     include_tab_columns: bool = True,
+    include_column_order: bool = False,
     include_indexes: bool = True,
     include_constraints: bool = True,
     include_triggers: bool = True,
@@ -6750,6 +6927,7 @@ def dump_ob_metadata(
     support_identity_col = False
     support_default_on_null = False
     support_invisible_col = False
+    support_column_id = False
     if include_tab_columns:
         def _probe_ob_dict_col(col_name: str, view_name: str) -> bool:
             sql = (
@@ -6773,6 +6951,8 @@ def dump_ob_metadata(
             "DEFAULT_ON_NULL",
             "INVISIBLE_COLUMN"
         )
+        if include_column_order:
+            optional_cols = optional_cols + ("COLUMN_ID",)
         support_by_view: Dict[str, Dict[str, bool]] = {
             "DBA_TAB_COLUMNS": {col: False for col in optional_cols},
             "DBA_TAB_COLS": {col: False for col in optional_cols}
@@ -6791,6 +6971,8 @@ def dump_ob_metadata(
         support_identity_col = bool(support_cols.get("IDENTITY_COLUMN"))
         support_default_on_null = bool(support_cols.get("DEFAULT_ON_NULL"))
         support_invisible_col = bool(support_cols.get("INVISIBLE_COLUMN"))
+        if include_column_order:
+            support_column_id = bool(support_cols.get("COLUMN_ID"))
         if tab_cols_view != "DBA_TAB_COLUMNS" and missing_cols:
             log.info(
                 "OB DBA_TAB_COLUMNS 缺少列元数据(%s)，切换为 %s 读取列信息。",
@@ -6803,10 +6985,12 @@ def dump_ob_metadata(
     identity_col = ", IDENTITY_COLUMN" if support_identity_col else ""
     default_on_null_col = ", DEFAULT_ON_NULL" if support_default_on_null else ""
     invisible_col = ", INVISIBLE_COLUMN" if support_invisible_col else ""
+    column_id_col = ", COLUMN_ID" if support_column_id else ""
     sql_cols_ext_tpl = f"""
         SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
                CHAR_LENGTH, DATA_LENGTH, DATA_PRECISION, DATA_SCALE, CHAR_USED, NULLABLE,
                REPLACE(REPLACE(REPLACE(DATA_DEFAULT, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS DATA_DEFAULT
+               {column_id_col}
                {hidden_col}{virtual_col}{identity_col}{default_on_null_col}{invisible_col}
         FROM {tab_cols_view}
         WHERE OWNER IN ({{owners_in}})
@@ -6814,12 +6998,14 @@ def dump_ob_metadata(
     sql_cols_mid_tpl = f"""
         SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
                CHAR_LENGTH, DATA_LENGTH, DATA_PRECISION, DATA_SCALE, NULLABLE, DATA_DEFAULT
+               {column_id_col}
                {hidden_col}{virtual_col}{identity_col}{default_on_null_col}{invisible_col}
         FROM {tab_cols_view}
         WHERE OWNER IN ({{owners_in}})
     """
     sql_cols_basic_tpl = f"""
         SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHAR_LENGTH, NULLABLE, DATA_DEFAULT
+               {column_id_col}
                {hidden_col}{virtual_col}{identity_col}{default_on_null_col}{invisible_col}
         FROM {tab_cols_view}
         WHERE OWNER IN ({{owners_in}})
@@ -6870,6 +7056,7 @@ def dump_ob_metadata(
                 nullable = ""
                 default = ""
                 idx = 0
+                column_id = None
                 if parse_mode == "ext":
                     data_length = parts[5].strip()
                     data_precision = parts[6].strip()
@@ -6889,6 +7076,10 @@ def dump_ob_metadata(
                     nullable = parts[5].strip()
                     default = parts[6].strip() if len(parts) > 6 else ""
                     idx = 7
+
+                if support_column_id and len(parts) > idx:
+                    column_id = parse_column_id(parts[idx])
+                    idx += 1
 
                 hidden_flag = None
                 virtual_flag = None
@@ -6924,6 +7115,7 @@ def dump_ob_metadata(
                     "char_used": char_used_clean or None,
                     "nullable": nullable,
                     "data_default": default,
+                    "column_id": column_id,
                     "hidden": bool(hidden_flag) if support_hidden_col else False,
                     "virtual": is_virtual,
                     "virtual_expr": default if is_virtual else None,
@@ -8043,6 +8235,7 @@ def dump_oracle_metadata(
                 if (obj_type or "").upper() in INVALID_STATUS_TYPES
             }
             include_partition_keys = include_constraints or include_interval_partitions
+            include_column_order = bool(settings.get("enable_column_order_check", False))
             if owners or need_package_status:
                 # 检测列元数据视图支持情况（DBA_TAB_COLUMNS / DBA_TAB_COLS）
                 support_hidden_col = False
@@ -8050,6 +8243,7 @@ def dump_oracle_metadata(
                 support_identity_col = False
                 support_default_on_null = False
                 support_invisible_col = False
+                support_column_id = False
                 tab_cols_view = "DBA_TAB_COLUMNS"
                 optional_cols = (
                     "HIDDEN_COLUMN",
@@ -8058,6 +8252,8 @@ def dump_oracle_metadata(
                     "DEFAULT_ON_NULL",
                     "INVISIBLE_COLUMN"
                 )
+                if include_column_order:
+                    optional_cols = optional_cols + ("COLUMN_ID",)
                 support_by_view: Dict[str, Dict[str, bool]] = {
                     "DBA_TAB_COLUMNS": {col: False for col in optional_cols},
                     "DBA_TAB_COLS": {col: False for col in optional_cols}
@@ -8094,6 +8290,8 @@ def dump_oracle_metadata(
                     support_identity_col = bool(support_cols.get("IDENTITY_COLUMN"))
                     support_default_on_null = bool(support_cols.get("DEFAULT_ON_NULL"))
                     support_invisible_col = bool(support_cols.get("INVISIBLE_COLUMN"))
+                    if include_column_order:
+                        support_column_id = bool(support_cols.get("COLUMN_ID"))
                     if tab_cols_view != "DBA_TAB_COLUMNS" and missing_cols:
                         log.info(
                             "[CHECK] DBA_TAB_COLUMNS 缺少列元数据(%s)，切换为 %s 读取列信息。",
@@ -8110,6 +8308,7 @@ def dump_oracle_metadata(
                     support_identity_col = False
                     support_default_on_null = False
                     support_invisible_col = False
+                    support_column_id = False
                     tab_cols_view = "DBA_TAB_COLUMNS"
 
                 invisible_column_supported = support_invisible_col
@@ -8121,6 +8320,7 @@ def dump_oracle_metadata(
                     include_identity: bool,
                     include_default_on_null: bool,
                     include_invisible: bool,
+                    include_column_id: bool,
                     view_name: str
                 ) -> str:
                     select_cols = [
@@ -8128,6 +8328,8 @@ def dump_oracle_metadata(
                         "DATA_LENGTH", "DATA_PRECISION", "DATA_SCALE",
                         "NULLABLE", "DATA_DEFAULT", "CHAR_USED", "CHAR_LENGTH"
                     ]
+                    if include_column_id:
+                        select_cols.append("COLUMN_ID")
                     if include_hidden:
                         select_cols.append("NVL(TO_CHAR(HIDDEN_COLUMN),'NO') AS HIDDEN_COLUMN")
                     if include_virtual:
@@ -8150,9 +8352,14 @@ def dump_oracle_metadata(
                     include_virtual: bool,
                     include_identity: bool,
                     include_default_on_null: bool,
-                    include_invisible: bool
+                    include_invisible: bool,
+                    include_column_id: bool
                 ) -> Dict:
                     idx = 11
+                    column_id = None
+                    if include_column_id and len(row) > idx:
+                        column_id = parse_column_id(row[idx])
+                        idx += 1
                     hidden_flag = False
                     virtual_flag = False
                     identity_flag = None
@@ -8181,6 +8388,7 @@ def dump_oracle_metadata(
                         "data_default": row[8],
                         "char_used": row[9],
                         "char_length": row[10],
+                        "column_id": column_id,
                         "hidden": hidden_flag if include_hidden else False,
                         "virtual": virtual_flag,
                         "virtual_expr": row[8] if virtual_flag else None,
@@ -8196,6 +8404,7 @@ def dump_oracle_metadata(
                         include_identity=support_identity_col,
                         include_default_on_null=support_default_on_null,
                         include_invisible=support_invisible_col,
+                        include_column_id=include_column_order and support_column_id,
                         view_name=tab_cols_view
                     )
                     with ora_conn.cursor() as cursor:
@@ -8218,7 +8427,8 @@ def dump_oracle_metadata(
                                     support_virtual_col,
                                     support_identity_col,
                                     support_default_on_null,
-                                    support_invisible_col
+                                    support_invisible_col,
+                                    include_column_order and support_column_id
                                 )
                 except oracledb.Error as e:
                     if support_hidden_col or support_virtual_col or support_identity_col or support_default_on_null or support_invisible_col:
@@ -8228,6 +8438,7 @@ def dump_oracle_metadata(
                         support_identity_col = False
                         support_default_on_null = False
                         support_invisible_col = False
+                        support_column_id = False
                         if tab_cols_view != "DBA_TAB_COLUMNS":
                             log.info("回退到 DBA_TAB_COLUMNS 读取列元数据。")
                             tab_cols_view = "DBA_TAB_COLUMNS"
@@ -8237,6 +8448,7 @@ def dump_oracle_metadata(
                             include_identity=False,
                             include_default_on_null=False,
                             include_invisible=False,
+                            include_column_id=False,
                             view_name=tab_cols_view
                         )
                         with ora_conn.cursor() as cursor:
@@ -8250,17 +8462,18 @@ def dump_oracle_metadata(
                                     col = _safe_upper(row[2])
                                     if not owner or not table or not col:
                                         continue
-                                    key = (owner, table)
-                                    if key not in table_pairs:
-                                        continue
-                                    table_columns.setdefault(key, {})[col] = _parse_tab_column_row(
-                                        row,
-                                        False,
-                                        False,
-                                        False,
-                                        False,
-                                        False
-                                    )
+                                key = (owner, table)
+                                if key not in table_pairs:
+                                    continue
+                                table_columns.setdefault(key, {})[col] = _parse_tab_column_row(
+                                    row,
+                                    False,
+                                    False,
+                                    False,
+                                    False,
+                                    False,
+                                    False
+                                )
                     else:
                         raise
 
@@ -10638,9 +10851,13 @@ def check_primary_objects(
         "mismatched": [],
         "ok": [],
         "skipped": [],
+        "column_order_mismatched": [],
+        "column_order_skipped": [],
         "extraneous": extraneous_rules,
         "extra_targets": []
     }
+    column_order_mismatched: List[ColumnOrderMismatch] = results["column_order_mismatched"]
+    column_order_skipped: List[Tuple[str, str]] = results["column_order_skipped"]
 
     visibility_policy = normalize_column_visibility_policy(
         (settings or {}).get("column_visibility_policy", "auto")
@@ -10669,6 +10886,8 @@ def check_primary_objects(
     )
     if not default_on_null_enabled:
         log.info("[CHECK] DEFAULT ON NULL 校验已跳过 (DEFAULT_ON_NULL 元数据不完整)。")
+
+    column_order_enabled = bool((settings or {}).get("enable_column_order_check", False))
 
     if not master_list:
         log.info("主校验清单为空，没有需要校验的对象。")
@@ -10737,6 +10956,7 @@ def check_primary_objects(
                 continue
 
             hidden_src_cols = {col for col, meta in src_cols_details.items() if meta.get("hidden")}
+            invisible_src_cols = {col for col, meta in src_cols_details.items() if meta.get("invisible") is True}
             src_col_names = {
                 col for col, meta in src_cols_details.items()
                 if not is_ignored_source_column(col, meta)
@@ -10935,6 +11155,36 @@ def check_primary_objects(
                                 "number_precision"
                             )
                         )
+
+            if column_order_enabled:
+                order_src_names = {
+                    col for col in src_col_names
+                    if is_column_order_candidate(col, src_cols_details.get(col), is_source=True)
+                }
+                order_tgt_names = {
+                    col for col in tgt_col_names
+                    if is_column_order_candidate(
+                        col,
+                        tgt_cols_details.get(col),
+                        is_source=False,
+                        hidden_src_cols=hidden_src_cols,
+                        invisible_src_cols=invisible_src_cols
+                    )
+                }
+                if order_src_names != order_tgt_names:
+                    column_order_skipped.append((full_tgt, "column_set_mismatch"))
+                else:
+                    src_order, src_reason = build_column_order_sequence(src_cols_details, order_src_names)
+                    tgt_order, tgt_reason = build_column_order_sequence(tgt_cols_details, order_tgt_names)
+                    skip_reason = src_reason or tgt_reason
+                    if skip_reason:
+                        column_order_skipped.append((full_tgt, skip_reason))
+                    elif src_order != tgt_order:
+                        column_order_mismatched.append(ColumnOrderMismatch(
+                            table=full_tgt,
+                            src_order=src_order or tuple(),
+                            tgt_order=tgt_order or tuple()
+                        ))
 
             if not missing_in_tgt and not extra_in_tgt and not length_mismatches and not type_mismatches:
                 results['ok'].append(('TABLE', full_tgt))
@@ -12973,6 +13223,8 @@ def check_extra_objects(
                     missing_mappings=missing_map,
                     detail_mismatch=detail_mismatch
                 ))
+
+    extra_results = normalize_extra_results_names(extra_results)
 
     index_unsupported = classify_unsupported_indexes(
         extra_results,
@@ -20913,6 +21165,23 @@ def export_mismatched_tables_detail(
     return write_pipe_report("表列不匹配明细", header_fields, rows, output_path)
 
 
+def export_column_order_mismatch_detail(
+    order_items: List[ColumnOrderMismatch],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not order_items or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"column_order_mismatch_detail_{report_timestamp}.txt"
+    header_fields = ["TABLE", "SRC_ORDER", "TGT_ORDER"]
+    rows: List[List[str]] = []
+    for item in order_items:
+        src_seq = ",".join(item.src_order) if item.src_order else "-"
+        tgt_seq = ",".join(item.tgt_order) if item.tgt_order else "-"
+        rows.append([item.table, src_seq, tgt_seq])
+    return write_pipe_report("表列顺序差异明细", header_fields, rows, output_path)
+
+
 def export_comment_mismatch_detail(
     comment_items: List[CommentMismatch],
     report_dir: Path,
@@ -20953,7 +21222,10 @@ def export_extra_mismatch_detail(
     def _csv(values) -> str:
         if not values:
             return "-"
-        return ",".join(sorted(str(v) for v in values))
+        names = [extract_name_value(v) for v in values if extract_name_value(v)]
+        if not names:
+            return "-"
+        return ",".join(sorted(names))
     for item in extra_results.get("index_mismatched", []):
         rows.append([
             "INDEX",
@@ -20971,8 +21243,8 @@ def export_extra_mismatch_detail(
             ";".join(item.detail_mismatch) if item.detail_mismatch else "-"
         ])
     for item in extra_results.get("sequence_mismatched", []):
-        missing = ",".join(sorted(item.missing_sequences)) if item.missing_sequences else "-"
-        extra = ",".join(sorted(item.extra_sequences)) if item.extra_sequences else "-"
+        missing = _csv(item.missing_sequences)
+        extra = _csv(item.extra_sequences)
         detail_parts: List[str] = []
         if item.note:
             detail_parts.append(item.note)
@@ -22169,6 +22441,8 @@ def print_final_report(
     comment_ok_cnt = len(comment_results.get("ok", []))
     comment_mis_cnt = len(comment_results.get("mismatched", []))
     comment_skip_reason = comment_results.get("skipped_reason")
+    column_order_mismatches = list(tv_results.get("column_order_mismatched", []) or [])
+    column_order_mismatch_cnt = len(column_order_mismatches)
     noise_suppressed_count = len(noise_suppressed_details)
     extra_target_cnt = len(tv_results.get('extra_targets', []))
     dep_missing_cnt = len(dependency_report.get("missing", []))
@@ -22329,6 +22603,18 @@ def print_final_report(
         comment_text.append(f"{comment_mis_cnt}")
     summary_table.add_row("[bold]注释一致性[/bold]", comment_text)
 
+    if column_order_mismatch_cnt:
+        order_text = Text()
+        order_text.append("差异: ", style="mismatch")
+        order_text.append(f"{column_order_mismatch_cnt}", style="mismatch")
+        if emit_detail_files and report_ts:
+            order_text.append("\n")
+            order_text.append(
+                f"详见: column_order_mismatch_detail_{report_ts}.txt",
+                style="info"
+            )
+        summary_table.add_row("[bold]列顺序差异[/bold]", order_text)
+
     if noise_suppressed_count:
         noise_text = Text()
         noise_text.append("降噪项: ", style="info")
@@ -22434,6 +22720,8 @@ def print_final_report(
             )
             if report_ts:
                 detail_hint_lines.append(f"示例: missing_objects_detail_{report_ts}.txt")
+            if column_order_mismatch_cnt and report_ts:
+                detail_hint_lines.append(f"列顺序差异明细: column_order_mismatch_detail_{report_ts}.txt")
             if noise_suppressed_count and report_ts:
                 detail_hint_lines.append(f"降噪明细: noise_suppressed_detail_{report_ts}.txt")
         if extra_results.get("index_unsupported"):
@@ -22685,6 +22973,20 @@ def print_final_report(
                                 f"    - {col}: 源={src_len} BYTE, 目标={tgt_len}, 上限允许={limit_len}\n"
                             )
             table.add_row(tgt_name, details)
+        console.print(table)
+
+    if show_detail_sections and column_order_mismatches:
+        table = Table(
+            title=f"[header]2.b 列顺序差异 (共 {column_order_mismatch_cnt} 张表)",
+            width=section_width
+        )
+        table.add_column("表名", style="info", width=OBJECT_COL_WIDTH)
+        table.add_column("源端顺序", width=DETAIL_COL_WIDTH // 2)
+        table.add_column("目标顺序", width=DETAIL_COL_WIDTH // 2)
+        for item in column_order_mismatches:
+            src_seq = ", ".join(item.src_order) if item.src_order else "-"
+            tgt_seq = ", ".join(item.tgt_order) if item.tgt_order else "-"
+            table.add_row(item.table, src_seq, tgt_seq)
         console.print(table)
 
     comment_mismatches = comment_results.get("mismatched", [])
@@ -22951,6 +23253,7 @@ def print_final_report(
         extra_targets_path = None
         skipped_detail_path = None
         mismatched_tables_path = None
+        column_order_mismatch_path = None
         comment_mismatch_path = None
         extra_mismatch_path = None
         dependency_detail_path = None
@@ -22968,6 +23271,11 @@ def print_final_report(
             )
             mismatched_tables_path = export_mismatched_tables_detail(
                 tv_results.get("mismatched", []),
+                report_path.parent,
+                report_ts
+            )
+            column_order_mismatch_path = export_column_order_mismatch_detail(
+                tv_results.get("column_order_mismatched", []) or [],
                 report_path.parent,
                 report_ts
             )
@@ -23024,6 +23332,8 @@ def print_final_report(
                 log.info("仅打印未校验对象明细已输出到: %s", skipped_detail_path)
             if mismatched_tables_path:
                 log.info("表列不匹配明细已输出到: %s", mismatched_tables_path)
+            if column_order_mismatch_path:
+                log.info("列顺序差异明细已输出到: %s", column_order_mismatch_path)
             if comment_mismatch_path:
                 log.info("注释差异明细已输出到: %s", comment_mismatch_path)
             if extra_mismatch_path:
@@ -23084,6 +23394,7 @@ def parse_cli_args() -> argparse.Namespace:
             sqlcl_bin               SQLcl 根目录或 bin/sql 路径
             ddl_format_timeout      SQLcl 批次超时（秒，0 不超时）
             check_dependencies      true/false 控制依赖校验
+            check_column_order      true/false 控制列顺序校验（默认 false）
             generate_grants         true/false 控制授权脚本生成
             grant_tab_privs_scope   owner/owner_or_grantee 控制 DBA_TAB_PRIVS 抽取范围
             grant_merge_privileges  true/false 合并同对象多权限授权
@@ -23165,6 +23476,7 @@ def main():
         enabled_object_types = enabled_primary_types | enabled_extra_types
         enable_dependencies_check: bool = bool(settings.get('enable_dependencies_check', True))
         enable_comment_check: bool = bool(settings.get('enable_comment_check', True))
+        enable_column_order_check: bool = bool(settings.get('enable_column_order_check', False))
         enable_grant_generation: bool = bool(settings.get('enable_grant_generation', True))
 
         log.info(
@@ -23184,6 +23496,8 @@ def main():
             log.info("已根据配置跳过依赖关系校验。")
         if not enable_comment_check:
             log.info("已根据配置关闭注释一致性校验。")
+        if enable_column_order_check:
+            log.info("已开启列顺序校验（check_column_order=true）。")
         if not enable_grant_generation:
             log.info("已根据配置关闭授权脚本生成。")
 
@@ -23425,6 +23739,8 @@ def main():
             "mismatched": [],
             "ok": [],
             "skipped": [],
+            "column_order_mismatched": [],
+            "column_order_skipped": [],
             "remap_conflicts": remap_conflict_items,
             "extraneous": extraneous_rules,
             "extra_targets": []
@@ -23520,6 +23836,7 @@ def main():
             target_schemas,
             tracked_object_types=tracked_types,
             include_tab_columns='TABLE' in enabled_primary_types,
+            include_column_order=enable_column_order_check,
             include_indexes='INDEX' in enabled_extra_types,
             include_constraints='CONSTRAINT' in enabled_extra_types,
             include_triggers='TRIGGER' in enabled_extra_types,
