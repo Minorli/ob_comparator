@@ -157,6 +157,20 @@ def set_console_log_level(root_logger: logging.Logger, level: int) -> None:
         handler.setLevel(level)
 
 
+def resolve_console_log_level(level_name: Optional[str], *, is_tty: Optional[bool] = None) -> int:
+    if is_tty is None:
+        try:
+            is_tty = sys.stdout.isatty()
+        except Exception:
+            is_tty = False
+    name = (level_name or "AUTO").strip().upper()
+    if name == "AUTO":
+        return logging.INFO if is_tty else logging.WARNING
+    if hasattr(logging, name):
+        return getattr(logging, name)
+    return logging.INFO
+
+
 def log_section(title: str, fill_char: str = "=") -> None:
     clean = f" {title.strip()} "
     if len(clean) >= LOG_SECTION_WIDTH:
@@ -251,7 +265,7 @@ def setup_run_logging(settings: Dict, timestamp: str) -> Optional[Path]:
     """
     为每次运行创建日志文件：
       - 日志目录默认 logs，可在 config.ini 的 [SETTINGS]->log_dir 覆盖
-      - 控制台默认 INFO（可用 log_level 覆盖）
+      - 控制台默认 auto（TTY=INFO, 非TTY=WARNING，可用 log_level 覆盖）
       - 文件记录 DEBUG 及以上，包含推导细节
     """
     try:
@@ -274,12 +288,20 @@ def setup_run_logging(settings: Dict, timestamp: str) -> Optional[Path]:
             file_handler.setFormatter(logging.Formatter(LOG_FILE_FORMAT, datefmt=LOG_TIME_FORMAT))
             root_logger.addHandler(file_handler)
 
-        level_name = (settings.get("log_level") or "INFO").strip().upper()
-        console_level = getattr(logging, level_name, logging.INFO)
+        level_name = (settings.get("log_level") or "AUTO").strip().upper()
+        console_level = resolve_console_log_level(level_name)
+        if level_name not in ("AUTO", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            log.warning("未知 log_level=%s，回退为 %s", level_name, logging.getLevelName(console_level))
         set_console_log_level(root_logger, console_level)
 
         log.info("本次运行日志将输出到: %s", log_file.resolve())
-        log.info("日志级别: console=%s, file=DEBUG", logging.getLevelName(console_level))
+        if level_name == "AUTO":
+            log.info(
+                "日志级别: console=%s (AUTO), file=DEBUG",
+                logging.getLevelName(console_level)
+            )
+        else:
+            log.info("日志级别: console=%s, file=DEBUG", logging.getLevelName(console_level))
         return log_file
     except Exception as exc:
         log.warning("初始化日志文件失败，将仅输出到控制台: %s", exc)
@@ -2081,6 +2103,13 @@ class TriggerStatusReportRow(NamedTuple):
     detail: str
 
 
+class ReportIndexEntry(NamedTuple):
+    category: str
+    path: str
+    rows: str
+    description: str
+
+
 class ConstraintUnsupportedDetail(NamedTuple):
     table_full: str
     constraint_name: str
@@ -2712,7 +2741,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('report_width', '160')  # 报告宽度，避免nohup时被截断为80
         # 运行日志目录与级别
         settings.setdefault('log_dir', 'logs')
-        settings.setdefault('log_level', 'INFO')
+        settings.setdefault('log_level', 'auto')
 
         enabled_primary_types = parse_type_list(
             settings.get('check_primary_types', ''),
@@ -20956,6 +20985,100 @@ def write_pipe_report(
         return None
 
 
+def _report_index_relpath(report_dir: Path, target: Path) -> str:
+    try:
+        return str(target.relative_to(report_dir))
+    except ValueError:
+        return str(target)
+
+
+def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
+    name = path.name
+    if path.is_dir():
+        if name == "missed_tables_views_for_OMS":
+            return "DIR", "缺失 TABLE/VIEW 规则目录"
+        return "DIR", "报告输出目录"
+    if name.startswith("report_") and name.endswith(".txt"):
+        return "REPORT", "主报告"
+    if name.startswith("package_compare_"):
+        return "DETAIL", "PACKAGE/PKG BODY 对比明细"
+    if name.startswith("object_mapping_"):
+        return "AUX", "全量对象映射"
+    if name.startswith("remap_conflicts_"):
+        return "AUX", "无法自动推导对象"
+    if name.startswith("dependency_chains_"):
+        return "AUX", "依赖链条导出"
+    if name.startswith("VIEWs_chain_"):
+        return "AUX", "VIEW 依赖链"
+    if name == "blacklist_tables.txt":
+        return "AUX", "黑名单表清单"
+    if name == "trigger_status_report.txt":
+        return "AUX", "触发器状态/清单报告"
+    if name == "filtered_grants.txt":
+        return "AUX", "过滤授权清单"
+    if name.startswith("fixup_skip_summary_"):
+        return "AUX", "Fixup 跳过汇总"
+    if name.startswith("ddl_format_report_"):
+        return "AUX", "DDL 格式化报告"
+    if name.startswith("ddl_punct_clean_"):
+        return "AUX", "全角标点清洗报告"
+    if name.startswith("ddl_hint_clean_"):
+        return "AUX", "DDL hint 清洗报告"
+    if name.startswith("missing_objects_detail_"):
+        return "DETAIL", "缺失对象支持性明细"
+    if name.startswith("unsupported_objects_detail_"):
+        return "DETAIL", "不支持/阻断对象明细"
+    if name.startswith("indexes_unsupported_detail_"):
+        return "DETAIL", "索引不支持明细"
+    if name.startswith("constraints_unsupported_detail_"):
+        return "DETAIL", "约束不支持明细"
+    if name.startswith("extra_targets_detail_"):
+        return "DETAIL", "目标端多余对象明细"
+    if name.startswith("skipped_objects_detail_"):
+        return "DETAIL", "仅打印未校验对象明细"
+    if name.startswith("mismatched_tables_detail_"):
+        return "DETAIL", "表列不匹配明细"
+    if name.startswith("column_order_mismatch_detail_"):
+        return "DETAIL", "列顺序差异明细"
+    if name.startswith("comment_mismatch_detail_"):
+        return "DETAIL", "注释差异明细"
+    if name.startswith("extra_mismatch_detail_"):
+        return "DETAIL", "扩展对象差异明细"
+    if name.startswith("noise_suppressed_detail_"):
+        return "DETAIL", "降噪明细"
+    if name.startswith("dependency_detail_"):
+        return "DETAIL", "依赖关系差异明细"
+    if name.startswith("report_index_"):
+        return "AUX", "报告索引"
+    return "AUX", "其他报告输出"
+
+
+def export_report_index(
+    entries: List[ReportIndexEntry],
+    report_dir: Path,
+    report_timestamp: Optional[str],
+    report_detail_mode: str
+) -> Optional[Path]:
+    if not report_dir or not report_timestamp:
+        return None
+    if not entries:
+        entries = []
+    report_detail_mode = normalize_report_detail_mode(report_detail_mode)
+    rows: List[List[str]] = [
+        [entry.category, entry.path, entry.rows, entry.description]
+        for entry in entries
+    ]
+    if report_detail_mode == "summary":
+        rows.append(["NOTE", "-", "-", "report_detail_mode=summary，明细文件未输出"])
+    elif report_detail_mode == "full":
+        rows.append(["NOTE", "-", "-", "report_detail_mode=full，明细已内嵌在主报告"])
+    if not rows:
+        return None
+    output_path = Path(report_dir) / f"report_index_{report_timestamp}.txt"
+    header_fields = ["CATEGORY", "PATH", "ROWS", "DESCRIPTION"]
+    return write_pipe_report("报告索引", header_fields, rows, output_path)
+
+
 def export_missing_objects_detail(
     rows: List[ObjectSupportReportRow],
     report_dir: Path,
@@ -22530,6 +22653,51 @@ def print_final_report(
         console.print(env_table)
         console.print("")
 
+    unsupported_total = 0
+    if support_counts:
+        for data in support_counts.values():
+            unsupported_total += int(data.get("unsupported", 0) or 0)
+            unsupported_total += int(data.get("blocked", 0) or 0)
+    idx_blocked_cnt = extra_blocked_counts.get("INDEX", 0)
+    cons_blocked_cnt = extra_blocked_counts.get("CONSTRAINT", 0)
+    trg_blocked_cnt = extra_blocked_counts.get("TRIGGER", 0)
+    cons_unsupported_cnt = len(extra_results.get("constraint_unsupported", []) or [])
+
+    def build_execution_conclusion() -> Panel:
+        ext_mismatch_cnt = idx_mis_cnt + cons_mis_cnt + seq_mis_cnt + trg_mis_cnt
+        actionable_cnt = missing_count + mismatched_count + ext_mismatch_cnt
+        blocked_total = (
+            unsupported_total
+            + idx_blocked_cnt
+            + idx_unsupported_cnt
+            + cons_blocked_cnt
+            + cons_unsupported_cnt
+            + trg_blocked_cnt
+        )
+        status = "通过" if actionable_cnt == 0 and blocked_total == 0 else "需处理"
+        lines: List[str] = [
+            f"状态: {status} | 总校验对象: {total_checked}",
+            f"主对象: 缺失 {missing_count}, 不匹配 {mismatched_count}, 多余 {extra_target_cnt}",
+            f"扩展对象差异: 索引 {idx_mis_cnt}, 约束 {cons_mis_cnt}, 序列 {seq_mis_cnt}, 触发器 {trg_mis_cnt}",
+        ]
+        if blocked_total:
+            lines.append(f"不支持/阻断: {blocked_total}")
+        next_steps: List[str] = []
+        if actionable_cnt:
+            if settings and not bool(settings.get("generate_fixup", True)):
+                next_steps.append("如需生成修补脚本，请开启 generate_fixup")
+            else:
+                next_steps.append("查看 fixup_scripts/ 下的缺失与修补脚本")
+        if blocked_total:
+            suffix = f"_{report_ts}" if report_ts else "_*"
+            next_steps.append(f"查看 unsupported_objects_detail{suffix}.txt 或 blacklist_tables.txt")
+        if next_steps:
+            lines.append("下一步: " + "；".join(next_steps))
+        return Panel.fit("\n".join(lines), title="[header]执行结论", border_style="info")
+
+    console.print(build_execution_conclusion())
+    console.print("")
+
     # --- 综合概要 ---
     summary_table = Table(
         title="[header]综合概要",
@@ -22554,11 +22722,6 @@ def print_final_report(
     primary_text.append(f"{ok_count}\n")
     primary_text.append("缺失: ", style="missing")
     primary_text.append(f"{missing_count}\n")
-    unsupported_total = 0
-    if support_counts:
-        for data in support_counts.values():
-            unsupported_total += int(data.get("unsupported", 0) or 0)
-            unsupported_total += int(data.get("blocked", 0) or 0)
     if unsupported_total:
         primary_text.append("缺失(不支持/阻断): ", style="mismatch")
         primary_text.append(f"{unsupported_total}\n", style="mismatch")
@@ -22569,7 +22732,7 @@ def print_final_report(
     if skipped_count:
         primary_text.append("仅打印: ", style="info")
         primary_text.append(f"{skipped_count}\n")
-    primary_text.append("无效规则: ", style="mismatch")
+    primary_text.append("无效 Remap 规则: ", style="mismatch")
     primary_text.append(f"{extraneous_count}")
     if remap_conflict_cnt:
         primary_text.append("\n")
@@ -22625,10 +22788,6 @@ def print_final_report(
         summary_table.add_row("[bold]降噪统计[/bold]", noise_text)
 
     ext_text = Text()
-    idx_blocked_cnt = extra_blocked_counts.get("INDEX", 0)
-    cons_blocked_cnt = extra_blocked_counts.get("CONSTRAINT", 0)
-    cons_unsupported_cnt = len(extra_results.get("constraint_unsupported", []) or [])
-    trg_blocked_cnt = extra_blocked_counts.get("TRIGGER", 0)
     ext_text.append("索引: ", style="info")
     ext_text.append(f"一致 {idx_ok_cnt} / ", style="ok")
     ext_text.append(f"差异 {idx_mis_cnt}", style="mismatch")
@@ -22700,7 +22859,7 @@ def print_final_report(
     dep_text = Text()
     dep_text.append("缺失依赖: ", style="missing")
     dep_text.append(f"{dep_missing_cnt}  ")
-    dep_text.append("额外依赖: ", style="mismatch")
+    dep_text.append("多余依赖: ", style="mismatch")
     dep_text.append(f"{dep_unexpected_cnt}  ")
     dep_text.append("跳过: ", style="info")
     dep_text.append(f"{dep_skipped_cnt}")
@@ -22935,6 +23094,13 @@ def print_final_report(
             )
         console.print(table)
 
+    if show_detail_sections and tv_results['extraneous']:
+        table = Table(title=f"[header]1.f 无效的 Remap 规则 (共 {extraneous_count} 个)", width=section_width)
+        table.add_column("在 remap_rules.txt 中定义, 但在源端 Oracle 中未找到的对象", style="info", width=section_width - 6)
+        for item in tv_results['extraneous']:
+            table.add_row(item, style="mismatch")
+        console.print(table)
+
     # --- 2. 列不匹配的表 ---
     if show_detail_sections and tv_results['mismatched']:
         table = Table(title=f"[header]2. 不匹配的表 (共 {mismatched_count} 个)", width=section_width)
@@ -23036,7 +23202,7 @@ def print_final_report(
         header = Text("- 缺失:\n", style="missing") if include_header else Text("")
         return header + Text(lines + "\n", style="missing")
 
-    # --- 3. 扩展对象差异 ---
+    # --- 4. 扩展对象差异 ---
     def print_ext_mismatch_table(title, items, headers, render_func):
         if not show_detail_sections:
             return
@@ -23050,7 +23216,7 @@ def print_final_report(
         console.print(table)
 
     print_ext_mismatch_table(
-        "5. 索引一致性检查", extra_results["index_mismatched"], ["表名", "差异详情"],
+        "4. 索引一致性检查", extra_results["index_mismatched"], ["表名", "差异详情"],
         lambda item: (
             Text(item.table),
             Text(f"- 缺失: {sorted(item.missing_indexes)}\n" if item.missing_indexes else "", style="missing") +
@@ -23059,7 +23225,7 @@ def print_final_report(
         )
     )
     print_ext_mismatch_table(
-        "6. 约束 (PK/UK/FK/CHECK) 一致性检查", extra_results["constraint_mismatched"], ["表名", "差异详情"],
+        "5. 约束 (PK/UK/FK/CHECK) 一致性检查", extra_results["constraint_mismatched"], ["表名", "差异详情"],
         lambda item: (
             Text(item.table),
             Text(f"- 缺失: {sorted(item.missing_constraints)}\n" if item.missing_constraints else "", style="missing") +
@@ -23068,7 +23234,7 @@ def print_final_report(
         )
     )
     print_ext_mismatch_table(
-        "7. 序列 (SEQUENCE) 一致性检查", extra_results["sequence_mismatched"], ["Schema 映射", "差异详情"],
+        "6. 序列 (SEQUENCE) 一致性检查", extra_results["sequence_mismatched"], ["Schema 映射", "差异详情"],
         lambda item: (
             Text(f"{item.src_schema}->{item.tgt_schema}"),
             build_missing_text(item.missing_mappings or [], bool(item.missing_sequences))
@@ -23084,7 +23250,7 @@ def print_final_report(
         )
     )
     print_ext_mismatch_table(
-        "8. 触发器 (TRIGGER) 一致性检查", extra_results["trigger_mismatched"], ["表名", "差异详情"],
+        "7. 触发器 (TRIGGER) 一致性检查", extra_results["trigger_mismatched"], ["表名", "差异详情"],
         lambda item: (
             Text(item.table),
             build_missing_text(item.missing_mappings or [], bool(item.missing_triggers))
@@ -23098,7 +23264,7 @@ def print_final_report(
 
     dep_total = dep_missing_cnt + dep_unexpected_cnt + dep_skipped_cnt
     if show_detail_sections and dep_total:
-        dep_table = Table(title=f"[header]9. 依赖关系校验 (共 {dep_total} 项)", width=section_width)
+        dep_table = Table(title=f"[header]8. 依赖关系校验 (共 {dep_total} 项)", width=section_width)
         dep_table.add_column("类别", style="info", width=12)
         dep_table.add_column("依赖对象", style="info", width=OBJECT_COL_WIDTH)
         dep_table.add_column("依赖类型", style="info", width=TYPE_COL_WIDTH)
@@ -23118,17 +23284,9 @@ def print_final_report(
                 )
 
         render_dep_rows("缺失", dependency_report.get("missing", []), "missing")
-        render_dep_rows("额外", dependency_report.get("unexpected", []), "mismatch")
+        render_dep_rows("多余", dependency_report.get("unexpected", []), "mismatch")
         render_dep_rows("跳过", dependency_report.get("skipped", []), "info")
         console.print(dep_table)
-
-    # --- 4. 无效 Remap 规则 ---
-    if show_detail_sections and tv_results['extraneous']:
-        table = Table(title=f"[header]4. 无效的 Remap 规则 (共 {extraneous_count} 个)", width=section_width)
-        table.add_column("在 remap_rules.txt 中定义, 但在源端 Oracle 中未找到的对象", style="info", width=section_width - 6)
-        for item in tv_results['extraneous']:
-            table.add_row(item, style="mismatch")
-        console.print(table)
 
     # --- 提示 ---
     fixup_panel = Panel.fit(
@@ -23196,6 +23354,18 @@ def print_final_report(
 
     if report_file:
         report_path = Path(report_file)
+        index_entries: List[ReportIndexEntry] = []
+
+        def _add_index_entry(category: str, path: Optional[Path], rows: Optional[int], description: str) -> None:
+            if not path:
+                return
+            rel_path = _report_index_relpath(report_path.parent, path)
+            if not rel_path:
+                return
+            row_text = str(rows) if rows is not None else "-"
+            index_entries.append(ReportIndexEntry(category, rel_path, row_text, description))
+
+        _add_index_entry("REPORT", report_path, None, "主报告")
         blacklisted_table_keys = set((blacklisted_missing_tables or {}).keys())
         export_dir = export_missing_table_view_mappings(
             tv_results,
@@ -23203,13 +23373,16 @@ def print_final_report(
             blacklisted_tables=blacklisted_table_keys,
             support_state_map=(support_summary.support_state_map if support_summary else None)
         )
+        _add_index_entry("DIR", export_dir, None, "缺失 TABLE/VIEW 规则目录")
         package_report_path = None
         if package_rows:
             package_report_path = export_package_compare_report(
                 package_rows,
                 derive_package_report_path(report_path)
             )
+        _add_index_entry("DETAIL", package_report_path, len(package_rows) if package_rows else None, "PACKAGE/PKG BODY 对比明细")
         blacklist_path = export_blacklist_tables(blacklist_report_rows or [], report_path.parent)
+        _add_index_entry("AUX", blacklist_path, len(blacklist_report_rows or []), "黑名单表清单")
         trigger_report_path = None
         if trigger_list_summary or trigger_status_rows:
             trigger_report_path = export_trigger_status_report(
@@ -23218,15 +23391,19 @@ def print_final_report(
                 trigger_status_rows or [],
                 report_path.parent
             )
+        trigger_row_count = (len(trigger_list_rows or []) + len(trigger_status_rows or [])) if trigger_report_path else None
+        _add_index_entry("AUX", trigger_report_path, trigger_row_count, "触发器状态/清单报告")
         filtered_grants_path = export_filtered_grants(
             filtered_grants or [],
             report_path.parent
         )
+        _add_index_entry("AUX", filtered_grants_path, len(filtered_grants or []), "过滤授权清单")
         fixup_skip_path = export_fixup_skip_summary(
             fixup_skip_summary or {},
             report_path.parent,
             report_ts
         )
+        _add_index_entry("AUX", fixup_skip_path, None, "Fixup 跳过汇总")
         missing_detail_path = None
         unsupported_detail_path = None
         if emit_detail_files:
@@ -23240,15 +23417,39 @@ def print_final_report(
                 report_path.parent,
                 report_ts
             )
+        _add_index_entry(
+            "DETAIL",
+            missing_detail_path,
+            len(missing_detail_rows or []),
+            "缺失对象支持性明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            unsupported_detail_path,
+            len(unsupported_rows or []),
+            "不支持/阻断对象明细"
+        )
         index_unsupported_path = export_indexes_unsupported_detail(
             extra_results.get("index_unsupported", []) or [],
             report_path.parent,
             report_ts
         )
+        _add_index_entry(
+            "DETAIL",
+            index_unsupported_path,
+            len(extra_results.get("index_unsupported", []) or []),
+            "索引不支持明细"
+        )
         constraint_unsupported_path = export_constraints_unsupported_detail(
             extra_results.get("constraint_unsupported", []) or [],
             report_path.parent,
             report_ts
+        )
+        _add_index_entry(
+            "DETAIL",
+            constraint_unsupported_path,
+            len(extra_results.get("constraint_unsupported", []) or []),
+            "约束不支持明细"
         )
         extra_targets_path = None
         skipped_detail_path = None
@@ -23299,6 +23500,83 @@ def print_final_report(
                 report_path.parent,
                 report_ts
             )
+        _add_index_entry(
+            "DETAIL",
+            extra_targets_path,
+            len(tv_results.get("extra_targets", []) or []),
+            "目标端多余对象明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            skipped_detail_path,
+            len(tv_results.get("skipped", []) or []),
+            "仅打印未校验对象明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            mismatched_tables_path,
+            len(tv_results.get("mismatched", []) or []),
+            "表列不匹配明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            column_order_mismatch_path,
+            column_order_mismatch_cnt,
+            "列顺序差异明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            comment_mismatch_path,
+            len(comment_results.get("mismatched", []) or []),
+            "注释差异明细"
+        )
+        extra_mismatch_count = (
+            len(extra_results.get("index_mismatched", []) or [])
+            + len(extra_results.get("constraint_mismatched", []) or [])
+            + len(extra_results.get("sequence_mismatched", []) or [])
+            + len(extra_results.get("trigger_mismatched", []) or [])
+        )
+        _add_index_entry(
+            "DETAIL",
+            extra_mismatch_path,
+            extra_mismatch_count,
+            "扩展对象差异明细"
+        )
+        dep_detail_count = dep_missing_cnt + dep_unexpected_cnt + dep_skipped_cnt
+        _add_index_entry(
+            "DETAIL",
+            dependency_detail_path,
+            dep_detail_count,
+            "依赖关系差异明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            noise_suppressed_path,
+            len(noise_suppressed_details or []),
+            "降噪明细"
+        )
+        if report_ts:
+            mapping_path = report_path.parent / f"object_mapping_{report_ts}.txt"
+            if mapping_path.exists():
+                _add_index_entry("AUX", mapping_path, None, "全量对象映射")
+            conflict_path = report_path.parent / f"remap_conflicts_{report_ts}.txt"
+            if conflict_path.exists():
+                _add_index_entry("AUX", conflict_path, None, "无法自动推导对象")
+            ddl_format_path = report_path.parent / f"ddl_format_report_{report_ts}.txt"
+            if ddl_format_path.exists():
+                _add_index_entry("AUX", ddl_format_path, None, "DDL 格式化报告")
+            ddl_punct_path = report_path.parent / f"ddl_punct_clean_{report_ts}.txt"
+            if ddl_punct_path.exists():
+                _add_index_entry("AUX", ddl_punct_path, None, "全角标点清洗报告")
+            ddl_hint_path = report_path.parent / f"ddl_hint_clean_{report_ts}.txt"
+            if ddl_hint_path.exists():
+                _add_index_entry("AUX", ddl_hint_path, None, "DDL hint 清洗报告")
+            dep_chain_path = report_path.parent / f"dependency_chains_{report_ts}.txt"
+            if dep_chain_path.exists():
+                _add_index_entry("AUX", dep_chain_path, None, "依赖链条导出")
+            view_chain_path = report_path.parent / f"VIEWs_chain_{report_ts}.txt"
+            if view_chain_path.exists():
+                _add_index_entry("AUX", view_chain_path, None, "VIEW 依赖链")
         try:
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report_text = console.export_text(clear=False)
@@ -23342,6 +23620,22 @@ def print_final_report(
                 log.info("降噪明细已输出到: %s", noise_suppressed_path)
             if dependency_detail_path:
                 log.info("依赖关系差异明细已输出到: %s", dependency_detail_path)
+            existing_paths = {entry.path for entry in index_entries}
+            for item in report_path.parent.iterdir():
+                rel_path = _report_index_relpath(report_path.parent, item)
+                if not rel_path or rel_path in existing_paths:
+                    continue
+                category, description = _infer_report_index_meta(item)
+                index_entries.append(ReportIndexEntry(category, rel_path, "-", description))
+                existing_paths.add(rel_path)
+            index_path = export_report_index(
+                index_entries,
+                report_path.parent,
+                report_ts,
+                report_detail_mode
+            )
+            if index_path:
+                log.info("报告索引已输出到: %s", index_path)
         except OSError as exc:
             console.print(f"[missing]报告写入失败: {exc}")
 
@@ -23409,6 +23703,7 @@ def parse_cli_args() -> argparse.Namespace:
           python schema_diff_reconciler.py /path/to/conf.ini # 指定配置
         输出:
           main_reports/run_<ts>/report_<ts>.txt  Rich 报告文本 (report_dir_layout=per_run)
+          main_reports/run_<ts>/report_index_<ts>.txt  报告索引 (报告与明细文件清单)
           main_reports/run_<ts>/package_compare_<ts>.txt  PACKAGE/PKG BODY 对比明细
           main_reports/run_<ts>/missed_tables_views_for_OMS/ 按 schema 输出缺失 TABLE/VIEW 规则 (schema_T.txt / schema_V.txt)
           main_reports/run_<ts>/blacklist_tables.txt 黑名单表清单 (含 LONG 转换校验状态)

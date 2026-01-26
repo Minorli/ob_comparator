@@ -47,9 +47,10 @@ report_dir_layout       = per_run
 #   summary-> 仅输出概要，不生成细节文件
 report_detail_mode      = split
 # 日志目录与级别（日志文件与控制台输出）
-# log_level 可选值：DEBUG/INFO/WARNING/ERROR/CRITICAL
+# log_level 可选值：AUTO/DEBUG/INFO/WARNING/ERROR/CRITICAL
+# AUTO: TTY 使用 INFO，非 TTY 使用 WARNING
 log_dir                 = logs
-log_level               = INFO
+log_level               = auto
 # report_width 为报告宽度（避免 nohup 等环境下自动截断）
 report_width            = 160
 

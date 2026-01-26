@@ -45,7 +45,8 @@
 - fixup_force_clean：强制清理 fixup_dir（即使为项目外绝对路径）。默认：false。
   说明：开启后会删除 fixup_dir 下旧脚本；请确保路径配置正确，避免误删。
 - log_dir：运行日志目录。默认：logs。
-- log_level：控制台日志级别。默认：INFO。可选：DEBUG/INFO/WARNING/ERROR/CRITICAL。
+- log_level：控制台日志级别。默认：auto。可选：AUTO/DEBUG/INFO/WARNING/ERROR/CRITICAL。
+  说明：AUTO 在 TTY 使用 INFO，非 TTY 使用 WARNING；日志文件固定 DEBUG。
 - report_width：报告宽度（字符数）。默认：160。
   说明：非交互/重定向环境下可避免 Rich 报告被截断为 80 列。
 

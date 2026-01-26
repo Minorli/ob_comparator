@@ -111,6 +111,20 @@ def set_console_log_level(level: int) -> None:
         handler.setLevel(level)
 
 
+def resolve_console_log_level(level_name: Optional[str], *, is_tty: Optional[bool] = None) -> int:
+    if is_tty is None:
+        try:
+            is_tty = sys.stdout.isatty()
+        except Exception:
+            is_tty = False
+    name = (level_name or "AUTO").strip().upper()
+    if name == "AUTO":
+        return logging.INFO if is_tty else logging.WARNING
+    if hasattr(logging, name):
+        return getattr(logging, name)
+    return logging.INFO
+
+
 def log_section(title: str, fill_char: str = "=") -> None:
     clean = f" {title.strip()} "
     if len(clean) >= LOG_SECTION_WIDTH:
@@ -538,7 +552,7 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
     report_dir = parser.get("SETTINGS", "report_dir", fallback="main_reports").strip() or "main_reports"
     report_path = (repo_root / report_dir).resolve()
 
-    log_level = parser.get("SETTINGS", "log_level", fallback="INFO").strip().upper() or "INFO"
+    log_level = parser.get("SETTINGS", "log_level", fallback="AUTO").strip().upper() or "AUTO"
     return ob_cfg, fixup_path, repo_root, log_level, report_path
 
 
@@ -2536,11 +2550,14 @@ def main() -> None:
         log.error("致命错误: 无法读取配置: %s", exc)
         sys.exit(1)
 
-    level_name = log_level or "INFO"
-    if not hasattr(logging, level_name):
-        log.warning("未知 log_level: %s，使用 INFO", level_name)
-        level_name = "INFO"
-    level = getattr(logging, level_name)
+    level_name = (log_level or "AUTO").strip().upper()
+    level = resolve_console_log_level(level_name)
+    if level_name not in ("AUTO", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+        log.warning("未知 log_level: %s，使用 %s", level_name, logging.getLevelName(level))
+    if level_name == "AUTO":
+        log.info("日志级别: console=%s (AUTO)", logging.getLevelName(level))
+    else:
+        log.info("日志级别: console=%s", logging.getLevelName(level))
     set_console_log_level(level)
     
     # Check if iterative mode requested via config or args

@@ -1,4 +1,5 @@
 import unittest
+import logging
 from unittest import mock
 import sys
 import types
@@ -3296,6 +3297,31 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(normalized["constraint_mismatched"][0].downgraded_pk_constraints, {"PK1"})
         self.assertEqual(normalized["sequence_mismatched"][0].missing_sequences, {"SEQ1"})
         self.assertEqual(normalized["trigger_mismatched"][0].missing_triggers, {"TR1"})
+
+    def test_resolve_console_log_level_auto(self):
+        self.assertEqual(sdr.resolve_console_log_level("AUTO", is_tty=True), logging.INFO)
+        self.assertEqual(sdr.resolve_console_log_level("AUTO", is_tty=False), logging.WARNING)
+        self.assertEqual(sdr.resolve_console_log_level("INFO", is_tty=False), logging.INFO)
+
+    def test_export_report_index_summary_note(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_dir = Path(tmpdir)
+            entries = [sdr.ReportIndexEntry("REPORT", "report_123.txt", "-", "主报告")]
+            output = sdr.export_report_index(entries, report_dir, "123", "summary")
+            self.assertIsNotNone(output)
+            content = Path(output).read_text(encoding="utf-8")
+            self.assertIn("report_123.txt", content)
+            self.assertIn("report_detail_mode=summary", content)
+
+    def test_export_report_index_split_no_note(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_dir = Path(tmpdir)
+            entries = [sdr.ReportIndexEntry("REPORT", "report_123.txt", "-", "主报告")]
+            output = sdr.export_report_index(entries, report_dir, "123", "split")
+            self.assertIsNotNone(output)
+            content = Path(output).read_text(encoding="utf-8")
+            self.assertIn("report_123.txt", content)
+            self.assertNotIn("report_detail_mode=summary", content)
 
     def test_enforce_schema_for_ddl_skips_duplicate(self):
         ddl = (
