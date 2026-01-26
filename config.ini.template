@@ -147,6 +147,9 @@ print_dependency_chains = true
 # 是否比对表/列注释 (DBA_TAB_COMMENTS / DBA_COL_COMMENTS)，若元数据权限不足可设为 false
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 check_comments          = true
+# 是否校验列顺序（仅在启用时比较，默认关闭）
+# 可选值：true/false/1/0/yes/no（大小写不敏感）
+check_column_order      = false
 # 列可见性(INVISIBLE)处理策略
 #   auto    -> 元数据可用时校验并生成修补（默认）
 #   enforce -> 强制校验/生成修补（即使元数据不完整）

@@ -9,7 +9,8 @@ Audit findings show false positives and invalid DDL generation when source objec
 - Skip fixup DDL generation for INVALID VIEW and TRIGGER objects and record skip reasons.
 - Order PACKAGE and PACKAGE BODY fixups using dependency graph with cycle detection and stable fallback order.
 - Filter trigger status report entries for triggers whose parent tables are unsupported/blacklisted.
+- Add a configurable invalid-source policy switch to control whether INVALID objects are skipped, reported as blocked, or still exported for fixup.
 
 ## Impact
-- Affected specs: compare-objects, generate-fixup, export-reports
-- Affected code: schema_diff_reconciler.py (Oracle metadata status load, support classification, trigger status reporting, fixup ordering)
+- Affected specs: compare-objects, configuration-control, generate-fixup, export-reports
+- Affected code: schema_diff_reconciler.py (status load, support classification, fixup generation, reporting)

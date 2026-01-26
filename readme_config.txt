@@ -66,6 +66,8 @@
   说明：开启后生成 dependency_chains_*.txt 与 dependency_detail_*.txt。
 - check_comments：是否比对表/列注释。默认：true。
   说明：依赖 DBA_TAB_COMMENTS / DBA_COL_COMMENTS。
+- check_column_order：是否校验列顺序。默认：false。
+  说明：仅在启用时比较列顺序，自动过滤 OMS/自动列/SYS_NC 等噪声列。
 - column_visibility_policy：列可见性(INVISIBLE)处理策略。默认：auto。
   可选值：auto（元数据可用时校验并生成修补）、enforce（强制校验/修补）、ignore（跳过可见性校验）。
 - infer_schema_mapping：是否启用 schema 推导（多对一/一对多场景）。默认：true。

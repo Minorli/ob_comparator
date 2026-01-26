@@ -24,3 +24,18 @@ The system SHALL omit trigger status comparisons for triggers whose parent table
 #### Scenario: Trigger status on blacklisted table
 - **WHEN** a TRIGGER belongs to a blacklisted TABLE
 - **THEN** trigger status differences for that TRIGGER are not included in trigger status reporting
+
+### Requirement: Invalid source policy drives support classification
+The system SHALL apply the configured invalid-source policy when classifying missing objects and their dependents.
+
+#### Scenario: Policy block
+- **WHEN** `invalid_source_policy=block` and a source object is INVALID
+- **THEN** the object is reported as BLOCKED with reason SOURCE_INVALID and dependents are blocked
+
+#### Scenario: Policy skip
+- **WHEN** `invalid_source_policy=skip` and a source object is INVALID
+- **THEN** the object is excluded from missing/support classification and does not block dependents
+
+#### Scenario: Policy fixup
+- **WHEN** `invalid_source_policy=fixup` and a source object is INVALID
+- **THEN** the object remains eligible for fixup classification and is still recorded as INVALID in summary statistics

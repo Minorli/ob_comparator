@@ -1,15 +1,19 @@
 ## ADDED Requirements
 
-### Requirement: Skip invalid source objects during fixup
-The system SHALL skip fixup DDL generation for source objects marked INVALID and record the skip reason in logs.
+### Requirement: Invalid source policy controls fixup generation
+The system SHALL honor `invalid_source_policy` when deciding whether to generate fixup DDL for INVALID source objects, and record the decision.
 
-#### Scenario: Invalid VIEW skipped
-- **WHEN** a missing VIEW is INVALID in the source
+#### Scenario: Default skip for invalid VIEW
+- **WHEN** `invalid_source_policy` is not set and a missing VIEW is INVALID in the source
 - **THEN** no VIEW DDL is generated for that object and the skip reason is recorded
 
-#### Scenario: Invalid TRIGGER skipped
-- **WHEN** a missing TRIGGER is INVALID in the source
-- **THEN** no TRIGGER DDL is generated for that object and the skip reason is recorded
+#### Scenario: Policy block exports to unsupported
+- **WHEN** `invalid_source_policy=block` and a missing TRIGGER is INVALID in the source
+- **THEN** the DDL is emitted under an unsupported directory with reason SOURCE_INVALID and not included in supported fixups
+
+#### Scenario: Policy fixup generates DDL
+- **WHEN** `invalid_source_policy=fixup` and a missing PACKAGE is INVALID in the source
+- **THEN** the PACKAGE DDL is generated in the normal fixup directory with an INVALID warning header
 
 ### Requirement: PACKAGE fixup dependency ordering
 The system SHALL order PACKAGE and PACKAGE BODY fixup generation using dependency data and ensure PACKAGE BODY entries are emitted after their PACKAGE specs.
