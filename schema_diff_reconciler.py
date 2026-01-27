@@ -9511,6 +9511,11 @@ def build_expected_dependency_pairs(
     expected: Set[Tuple[str, str, str, str]] = set()
     skipped: List[DependencyIssue] = []
 
+    def _is_builtin_dependency(owner: str, name: str) -> bool:
+        owner_u = (owner or "").strip().upper()
+        name_u = (name or "").strip().upper()
+        return name_u == "DUAL" and owner_u in {"PUBLIC", "SYS"}
+
     for dep in dependencies:
         dep_key = f"{dep.owner}.{dep.name}".upper()
         ref_key = f"{dep.referenced_owner}.{dep.referenced_name}".upper()
@@ -9527,6 +9532,15 @@ def build_expected_dependency_pairs(
             ))
             continue
         if ref_target is None:
+            if _is_builtin_dependency(dep.referenced_owner, dep.referenced_name):
+                skipped.append(DependencyIssue(
+                    dependent=dep_key,
+                    dependent_type=dep.object_type.upper(),
+                    referenced=ref_key,
+                    referenced_type=dep.referenced_type.upper(),
+                    reason="内建对象依赖无需映射 (DUAL)。"
+                ))
+                continue
             skipped.append(DependencyIssue(
                 dependent=dep_key,
                 dependent_type=dep.object_type.upper(),
@@ -12506,6 +12520,11 @@ def compare_constraints_for_table(
                             "CHECK: 源约束 %s 条件不一致 (源=%s, 目标=%s)。"
                             % (name, raw_expr, tgt_expr_raw)
                         )
+                expr_matches = tgt_by_expr.get(expr_key)
+                if expr_matches and name in expr_matches:
+                    expr_matches.remove(name)
+                used.add(name)
+                continue
             expr_matches = tgt_by_expr.get(expr_key)
             if expr_matches:
                 if name in expr_matches:
@@ -15278,6 +15297,47 @@ def oracle_get_view_text(
         return None
 
 
+QUALIFIED_NAME_PATTERN = re.compile(
+    r'^\s*(?:"([^"]+)"|([A-Z0-9_\$#]+))\s*\.\s*(?:"([^"]+)"|([A-Z0-9_\$#]+))\s*$',
+    re.IGNORECASE
+)
+
+
+def quote_identifier(name: str) -> str:
+    if name is None:
+        return ""
+    text = str(name).strip()
+    if not text:
+        return text
+    if text.startswith('"') and text.endswith('"'):
+        return text
+    return f'"{text}"'
+
+
+def quote_qualified_parts(*parts: str) -> str:
+    return ".".join(
+        quote_identifier(part)
+        for part in parts
+        if part is not None and str(part).strip() != ""
+    )
+
+
+def normalize_qualified_name(name: str) -> Optional[str]:
+    if not name:
+        return None
+    text = str(name).strip()
+    match = QUALIFIED_NAME_PATTERN.match(text)
+    if not match:
+        return None
+    schema = match.group(1) or match.group(2)
+    obj = match.group(3) or match.group(4)
+    return quote_qualified_parts(schema, obj)
+
+
+def ensure_quoted_qualified(name: str) -> str:
+    return normalize_qualified_name(name) or name
+
+
 def build_view_ddl_from_text(
     owner: str,
     name: str,
@@ -15287,7 +15347,8 @@ def build_view_ddl_from_text(
 ) -> Optional[str]:
     if not text:
         return None
-    ddl = f"CREATE OR REPLACE VIEW {owner.upper()}.{name.upper()} AS {text.strip()}"
+    view_full = quote_qualified_parts(owner.upper(), name.upper())
+    ddl = f"CREATE OR REPLACE VIEW {view_full} AS {text.strip()}"
     upper_text = text.upper()
     if check_option and check_option != "NONE" and "WITH CHECK OPTION" not in upper_text:
         ddl = f"{ddl} WITH CHECK OPTION"
@@ -15914,7 +15975,7 @@ def remap_trigger_table_references(
             preferred_types=("TABLE",)
         )
         if tgt_name:
-            replacements[table_ref] = tgt_name
+            replacements[table_ref] = ensure_quoted_qualified(tgt_name)
 
     # 执行替换
     result_ddl = ddl
@@ -15943,7 +16004,7 @@ TRIGGER_REF_PREFERRED_TYPES: Tuple[str, ...] = (
 )
 
 TRIGGER_QUALIFIED_REF_PATTERN = re.compile(
-    r'\b("?[A-Z0-9_\$#]+"?)\s*\.\s*("?[A-Z0-9_\$#]+"?)\b',
+    r'(?P<schema>"[^"]+"|[A-Z0-9_\$#]+)\s*\.\s*(?P<object>"[^"]+"|[A-Z0-9_\$#]+)',
     re.IGNORECASE
 )
 TRIGGER_SEQ_UNQUALIFIED_PATTERN = re.compile(
@@ -16015,7 +16076,7 @@ def remap_trigger_object_references(
             re.IGNORECASE
         )
         working_sql = name_pattern.sub(
-            lambda m: f"{m.group(1)}{tgt_schema_u}.{tgt_trigger_u}",
+            lambda m: f"{m.group(1)}{quote_qualified_parts(tgt_schema_u, tgt_trigger_u)}",
             working_sql,
             count=1
         )
@@ -16027,17 +16088,26 @@ def remap_trigger_object_references(
             re.IGNORECASE | re.DOTALL
         )
         working_sql = on_pattern.sub(
-            lambda m: f"{m.group(1)}{on_schema_u}.{on_table_u}",
+            lambda m: f"{m.group(1)}{quote_qualified_parts(on_schema_u, on_table_u)}",
             working_sql,
             count=1
         )
 
     # 替换已带 schema 的引用
     def _replace_qualified(match: re.Match) -> str:
-        schema = _strip_quotes(match.group(1))
-        obj = _strip_quotes(match.group(2))
+        # 避免误匹配触发器伪记录 :NEW/:OLD 之类的字段引用
+        idx = match.start() - 1
+        text = match.string
+        while idx >= 0 and text[idx].isspace():
+            idx -= 1
+        if idx >= 0 and text[idx] == ':':
+            return match.group(0)
+        schema = _strip_quotes(match.group("schema"))
+        obj = _strip_quotes(match.group("object"))
+        if schema in ("NEW", "OLD"):
+            return match.group(0)
         tgt_full = _map_full_name(schema, obj)
-        return tgt_full if tgt_full else match.group(0)
+        return ensure_quoted_qualified(tgt_full) if tgt_full else match.group(0)
 
     working_sql = TRIGGER_QUALIFIED_REF_PATTERN.sub(_replace_qualified, working_sql)
 
@@ -16055,7 +16125,7 @@ def remap_trigger_object_references(
         if pos < len(text) and text[pos] == ".":
             return match.group(0)
         tgt_full = _map_unqualified(name_clean)
-        return f"{prefix}{tgt_full}" if tgt_full else match.group(0)
+        return f"{prefix}{ensure_quoted_qualified(tgt_full)}" if tgt_full else match.group(0)
 
     for pattern in TRIGGER_DML_PATTERNS:
         working_sql = pattern.sub(_replace_dml, working_sql)
@@ -16071,6 +16141,10 @@ def remap_trigger_object_references(
         pos = match.start() - 1
         while pos >= 0 and text[pos].isspace():
             pos -= 1
+        if pos >= 0 and text[pos] == '"':
+            pos -= 1
+            while pos >= 0 and text[pos].isspace():
+                pos -= 1
         if pos >= 0 and text[pos] == ".":
             return match.group(0)
         tgt_full = find_mapped_target_any_type(
@@ -16080,7 +16154,7 @@ def remap_trigger_object_references(
         )
         if not tgt_full:
             return match.group(0)
-        return f"{tgt_full}.{suffix}"
+        return f"{ensure_quoted_qualified(tgt_full)}.{suffix}"
 
     working_sql = TRIGGER_SEQ_UNQUALIFIED_PATTERN.sub(_replace_seq, working_sql)
 
@@ -17033,14 +17107,16 @@ def _build_drop_statement(obj_type: str, schema: str, name: str, parent_table: O
     if obj_type_u == "CONSTRAINT":
         if not parent_table:
             return None
-        return f"ALTER TABLE {schema_u}.{parent_table.upper()} DROP CONSTRAINT {name_u}"
+        table_full = quote_qualified_parts(schema_u, parent_table.upper())
+        return f"ALTER TABLE {table_full} DROP CONSTRAINT {name_u}"
     if obj_type_u == "PACKAGE BODY":
         return None
     if obj_type_u == "TYPE BODY":
         return None
     if obj_type_u in ("TABLE", "VIEW", "MATERIALIZED VIEW", "SEQUENCE", "INDEX", "TRIGGER",
                       "PROCEDURE", "FUNCTION", "PACKAGE", "TYPE", "SYNONYM", "JOB", "SCHEDULE"):
-        return f"DROP {obj_type_u} {schema_u}.{name_u}"
+        obj_full = quote_qualified_parts(schema_u, name_u)
+        return f"DROP {obj_type_u} {obj_full}"
     return None
 
 
@@ -17753,6 +17829,7 @@ def generate_alter_for_table_columns(
     lines: List[str] = []
     tgt_schema_u = tgt_schema.upper()
     tgt_table_u = tgt_table.upper()
+    table_full = quote_qualified_parts(tgt_schema_u, tgt_table_u)
 
     # 缺失列：ADD
     if missing_cols:
@@ -17800,7 +17877,7 @@ def generate_alter_for_table_columns(
                     lines.append(f"-- WARNING: 虚拟列 {col_u} 未获取表达式，需手工补充。")
 
             lines.append(
-                f"ALTER TABLE {tgt_schema_u}.{tgt_table_u} "
+                f"ALTER TABLE {table_full} "
                 f"ADD ({col_u} {col_type}{virtual_clause}{default_clause}{nullable_clause});"
             )
 
@@ -17817,7 +17894,7 @@ def generate_alter_for_table_columns(
             # 转义单引号
             comment_escaped = comment.replace("'", "''")
             added_col_comments.append(
-                f"COMMENT ON COLUMN {tgt_schema_u}.{tgt_table_u}.{col_u} IS '{comment_escaped}';"
+                f"COMMENT ON COLUMN {table_full}.{col_u} IS '{comment_escaped}';"
             )
     if added_col_comments:
         lines.append("")
@@ -17842,7 +17919,7 @@ def generate_alter_for_table_columns(
                     prefer_ob_varchar=True
                 )
                 lines.append(
-                    f"ALTER TABLE {tgt_schema_u}.{tgt_table_u} "
+                    f"ALTER TABLE {table_full} "
                     f"MODIFY ({col_name.upper()} {modified_type}); "
                     f"-- CHAR语义，源长度: {src_len}, 目标长度: {tgt_len}, 要求一致"
                 )
@@ -17854,7 +17931,7 @@ def generate_alter_for_table_columns(
                     prefer_ob_varchar=True
                 )
                 lines.append(
-                    f"ALTER TABLE {tgt_schema_u}.{tgt_table_u} "
+                    f"ALTER TABLE {table_full} "
                     f"MODIFY ({col_name.upper()} {modified_type}); "
                     f"-- BYTE语义，源长度: {src_len}, 目标长度: {tgt_len}, 期望下限: {limit_len}"
                 )
@@ -17875,7 +17952,7 @@ def generate_alter_for_table_columns(
                 continue
             if issue_type in ("long_type", "number_precision"):
                 lines.append(
-                    f"ALTER TABLE {tgt_schema_u}.{tgt_table_u} "
+                    f"ALTER TABLE {table_full} "
                     f"MODIFY ({col_name.upper()} {expected_type}); "
                     f"-- 源类型: {src_type}, 目标类型: {tgt_type}"
                 )
@@ -17890,13 +17967,13 @@ def generate_alter_for_table_columns(
             elif issue_type == "visibility_mismatch":
                 if expected_type.upper() == "INVISIBLE":
                     lines.append(
-                        f"ALTER TABLE {tgt_schema_u}.{tgt_table_u} "
+                        f"ALTER TABLE {table_full} "
                         f"MODIFY {col_name.upper()} INVISIBLE; "
                         f"-- 列可见性需要与源端一致"
                     )
                 elif expected_type.upper() == "VISIBLE":
                     lines.append(
-                        f"ALTER TABLE {tgt_schema_u}.{tgt_table_u} "
+                        f"ALTER TABLE {table_full} "
                         f"MODIFY {col_name.upper()} VISIBLE; "
                         f"-- 列可见性需要与源端一致"
                     )
@@ -17916,7 +17993,7 @@ def generate_alter_for_table_columns(
         for col in sorted(extra_cols):
             col_u = col.upper()
             lines.append(
-                f"-- ALTER TABLE {tgt_schema_u}.{tgt_table_u} "
+                f"-- ALTER TABLE {table_full} "
                 f"DROP COLUMN {col_u};"
             )
 
@@ -17937,6 +18014,7 @@ def build_invisible_column_alter_sql(
     src_table_u = src_table.upper()
     tgt_schema_u = tgt_schema.upper()
     tgt_table_u = tgt_table.upper()
+    table_full = quote_qualified_parts(tgt_schema_u, tgt_table_u)
     col_details = oracle_meta.table_columns.get((src_schema_u, src_table_u), {})
     if not col_details:
         return None
@@ -17946,7 +18024,7 @@ def build_invisible_column_alter_sql(
             continue
         if meta.get("invisible") is True:
             lines.append(
-                f"ALTER TABLE {tgt_schema_u}.{tgt_table_u} "
+                f"ALTER TABLE {table_full} "
                 f"MODIFY {col_name.upper()} INVISIBLE;"
             )
     return "\n".join(lines) if lines else None
@@ -18010,7 +18088,7 @@ def generate_interval_partition_fixup_scripts(
         part_col = info.partition_key_columns[0]
         col_meta = oracle_meta.table_columns.get(key, {}).get(part_col, {})
         data_type = (col_meta.get("data_type") or "").strip()
-        table_full = f"{tgt_schema.upper()}.{tgt_table.upper()}"
+        table_full = quote_qualified_parts(tgt_schema.upper(), tgt_table.upper())
         statements, warnings, kind = generate_interval_partition_statements(
             info,
             cutoff_date,
@@ -18451,9 +18529,12 @@ def generate_fixup_scripts(
                 if syn_meta.db_link:
                     target = f"{target}@{syn_meta.db_link}"
                 if syn_meta.owner == 'PUBLIC':
-                    ddl = f"CREATE OR REPLACE PUBLIC SYNONYM {syn_name} FOR {target};"
+                    syn_name_quoted = quote_identifier(syn_name)
+                    ddl = f"CREATE OR REPLACE PUBLIC SYNONYM {syn_name_quoted} FOR {target};"
                 else:
-                    ddl = f"CREATE OR REPLACE SYNONYM {syn_meta.owner}.{syn_name} FOR {target};"
+                    syn_owner = (syn_meta.owner or "").upper()
+                    syn_full = quote_qualified_parts(syn_owner, syn_name)
+                    ddl = f"CREATE OR REPLACE SYNONYM {syn_full} FOR {target};"
                 elapsed = time.time() - start_time
                 log.info(
                     "[DDL_FETCH] %s.%s (%s) 来源=META_SYN 耗时=%.3fs",
@@ -19415,7 +19496,9 @@ def generate_fixup_scripts(
             ddl_cols.append(expr if expr else col)
         col_list = ", ".join(ddl_cols)
         prefix = "UNIQUE " if uniq else ""
-        return f"CREATE {prefix}INDEX {tgt_schema.upper()}.{idx_name.upper()} ON {tgt_schema.upper()}.{tgt_table.upper()} ({col_list});"
+        idx_full = quote_qualified_parts(tgt_schema.upper(), idx_name.upper())
+        table_full = quote_qualified_parts(tgt_schema.upper(), tgt_table.upper())
+        return f"CREATE {prefix}INDEX {idx_full} ON {table_full} ({col_list});"
 
     worker_count = max(1, int(settings.get('fixup_workers', 1)))
     if worker_count == 1:
@@ -20313,6 +20396,7 @@ def generate_fixup_scripts(
             extracted = extract_statements_for_names(table_ddl, it.missing_constraints, constraint_predicate) if table_ddl else {}
             for cons_name in sorted(it.missing_constraints):
                 cons_name_u = cons_name.upper()
+                table_full = quote_qualified_parts(ts, tt)
                 grants_for_constraint: Set[str] = set()
                 try:
                     statements = extracted.get(cons_name_u) or []
@@ -20359,7 +20443,7 @@ def generate_fixup_scripts(
                         if cols_join and ctype in ('P', 'U'):
                             add_clause = "PRIMARY KEY" if ctype == 'P' and not downgrade_pk else "UNIQUE"
                             stmt = (
-                                f"ALTER TABLE {ts}.{tt} "
+                                f"ALTER TABLE {table_full} "
                                 f"ADD CONSTRAINT {cons_name_u} {add_clause} ({cols_join})"
                             )
                             statements = [stmt]
@@ -20401,9 +20485,10 @@ def generate_fixup_scripts(
                                 delete_rule = normalize_delete_rule(cons_meta.get("delete_rule"))
                                 delete_clause = f" ON DELETE {delete_rule}" if delete_rule else ""
                                 stmt = (
-                                    f"ALTER TABLE {ts}.{tt} "
+                                    f"ALTER TABLE {table_full} "
                                     f"ADD CONSTRAINT {cons_name_u} FOREIGN KEY ({', '.join(cols)}) "
-                                    f"REFERENCES {ref_tgt_schema}.{ref_tgt_table} ({', '.join(ref_cols)})"
+                                    f"REFERENCES {quote_qualified_parts(ref_tgt_schema, ref_tgt_table)} "
+                                    f"({', '.join(ref_cols)})"
                                     f"{delete_clause}"
                                 )
                                 statements = [stmt]
@@ -20422,7 +20507,7 @@ def generate_fixup_scripts(
                             search_condition = cons_meta.get("search_condition")
                             if search_condition and not is_system_notnull_check(cons_name_u, search_condition):
                                 stmt = (
-                                    f"ALTER TABLE {ts}.{tt} "
+                                    f"ALTER TABLE {table_full} "
                                     f"ADD CONSTRAINT {cons_name_u} CHECK ({search_condition})"
                                 )
                                 statements = [stmt]
@@ -20561,13 +20646,21 @@ def generate_fixup_scripts(
                             rf'(CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+)"?{re.escape(ss)}"?\s*\.\s*"?{re.escape(tn)}"?',
                             re.IGNORECASE
                         )
-                        text = name_pattern.sub(rf'\1{ts}.{to}', text, count=1)
+                        text = name_pattern.sub(
+                            rf'\1{quote_qualified_parts(ts, to)}',
+                            text,
+                            count=1
+                        )
                         if st and tt and tts:
                             on_pattern = re.compile(
                                 rf'(\bON\s+)("?\s*{re.escape(ss)}\s*"?\s*\.\s*)?"?{re.escape(st)}"?',
                                 re.IGNORECASE
                             )
-                            text = on_pattern.sub(rf'\1{tts}.{tt}', text, count=1)
+                            text = on_pattern.sub(
+                                rf'\1{quote_qualified_parts(tts, tt)}',
+                                text,
+                                count=1
+                            )
                         return text
                     ddl_adj = _rewrite_trigger_name_and_on(ddl_adj)
                 ddl_adj = cleanup_dbcat_wrappers(ddl_adj)

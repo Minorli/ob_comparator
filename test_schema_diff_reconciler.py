@@ -1392,7 +1392,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             True
         )
         self.assertIsNotNone(sql)
-        self.assertIn("ALTER TABLE TGT.T1 MODIFY C1 INVISIBLE;", sql)
+        self.assertIn('ALTER TABLE "TGT"."T1" MODIFY C1 INVISIBLE;', sql)
 
     def test_generate_alter_for_table_columns_visibility_mismatch(self):
         oracle_meta = self._make_oracle_meta_with_columns(
@@ -2472,11 +2472,37 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             on_target=("TGT", "T1"),
             qualify_schema=True
         )
-        self.assertIn("CREATE OR REPLACE TRIGGER TGT.TRG1", remapped)
-        self.assertIn("ON TGT.T1", remapped)
-        self.assertIn("INSERT INTO TGT.T2", remapped)
-        self.assertIn("TGT.SEQ1.NEXTVAL", remapped)
+        self.assertIn('CREATE OR REPLACE TRIGGER "TGT"."TRG1"', remapped)
+        self.assertIn('ON "TGT"."T1"', remapped)
+        self.assertIn('INSERT INTO "TGT"."T2"', remapped)
+        self.assertIn('"TGT"."SEQ1".NEXTVAL', remapped)
         self.assertNotIn("TGT.TGT", remapped)
+
+    def test_remap_trigger_object_references_preserves_quoted(self):
+        ddl = (
+            'CREATE OR REPLACE TRIGGER "SRC"."TRG1" BEFORE INSERT ON "SRC"."T1"\n'
+            "BEGIN\n"
+            '  INSERT INTO "SRC"."T2"(col) VALUES (1);\n'
+            "  :new.id := \"SRC\".\"SEQ1\".NEXTVAL;\n"
+            "END;\n"
+        )
+        mapping = {
+            "SRC.T1": {"TABLE": "TGT.T1"},
+            "SRC.T2": {"TABLE": "TGT.T2"},
+            "SRC.SEQ1": {"SEQUENCE": "TGT.SEQ1"},
+        }
+        remapped = sdr.remap_trigger_object_references(
+            ddl,
+            mapping,
+            "SRC",
+            "TGT",
+            "TRG1",
+            on_target=("TGT", "T1"),
+            qualify_schema=True
+        )
+        self.assertIn('CREATE OR REPLACE TRIGGER "TGT"."TRG1"', remapped)
+        self.assertIn('ON "TGT"."T1"', remapped)
+        self.assertNotIn('""TGT"', remapped)
 
     def test_compare_package_objects_source_invalid_and_target_invalid(self):
         master_list = [
@@ -3366,6 +3392,16 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn("\n (a.C2", cleaned)
         self.assertIn("\n decode", cleaned)
 
+    def test_build_view_ddl_from_text_quotes_owner(self):
+        ddl = sdr.build_view_ddl_from_text(
+            "scott",
+            "v1",
+            "select 1 from dual",
+            "",
+            ""
+        )
+        self.assertIn('CREATE OR REPLACE VIEW "SCOTT"."V1" AS', ddl)
+
     def test_sanitize_view_ddl_repairs_split_identifier(self):
         ddl = "CREATE OR REPLACE VIEW A.V AS SELECT TOT_P ERM FROM T"
         cleaned = sdr.sanitize_view_ddl(ddl, {"TOT_PERM"})
@@ -4044,7 +4080,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIsNotNone(mismatch)
         self.assertEqual(mismatch.missing_constraints, set())
-        self.assertIn("CK_A", mismatch.extra_constraints)
+        self.assertIn("CK_B", mismatch.extra_constraints)
+        self.assertNotIn("CK_A", mismatch.extra_constraints)
         self.assertTrue(any("条件不一致" in item for item in mismatch.detail_mismatch))
 
     def test_classify_unsupported_check_constraints(self):
@@ -4611,6 +4648,37 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             obj_type="VIEW",
         )
         self.assertIn("A.T2", adjusted.upper())
+
+    def test_build_expected_dependency_pairs_skips_builtin_dual(self):
+        deps = [
+            sdr.DependencyRecord(
+                owner="SRC",
+                name="V1",
+                object_type="VIEW",
+                referenced_owner="PUBLIC",
+                referenced_name="DUAL",
+                referenced_type="SYNONYM",
+            ),
+            sdr.DependencyRecord(
+                owner="SRC",
+                name="V1",
+                object_type="VIEW",
+                referenced_owner="SRC",
+                referenced_name="T1",
+                referenced_type="TABLE",
+            ),
+        ]
+        mapping = {"SRC.V1": {"VIEW": "TGT.V1"}}
+        expected, skipped = sdr.build_expected_dependency_pairs(deps, mapping)
+        self.assertEqual(expected, set())
+        self.assertEqual(len(skipped), 2)
+        reasons = {entry.referenced: entry.reason for entry in skipped}
+        self.assertIn("PUBLIC.DUAL", reasons)
+        self.assertIn("内建对象", reasons["PUBLIC.DUAL"])
+        self.assertEqual(
+            reasons["SRC.T1"],
+            "被依赖对象未纳入受管范围或缺少 remap 规则，无法建立依赖。"
+        )
 
     def test_precompute_transitive_table_cache_handles_cycle(self):
         deps = {
