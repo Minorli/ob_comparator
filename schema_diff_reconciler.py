@@ -21191,9 +21191,17 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
     if name.startswith("unsupported_objects_detail_"):
         return "DETAIL", "不支持/阻断对象明细"
     if name.startswith("indexes_unsupported_detail_"):
-        return "DETAIL", "索引不支持明细"
+        return "DETAIL", "索引语法不支持明细(仅DESC)"
+    if name.startswith("indexes_blocked_detail_"):
+        return "DETAIL", "索引依赖阻断明细"
     if name.startswith("constraints_unsupported_detail_"):
-        return "DETAIL", "约束不支持明细"
+        return "DETAIL", "约束语法不支持明细(DEFERRABLE等)"
+    if name.startswith("constraints_blocked_detail_"):
+        return "DETAIL", "约束依赖阻断明细"
+    if name.startswith("triggers_blocked_detail_"):
+        return "DETAIL", "触发器依赖阻断明细"
+    if name.startswith("migration_focus_"):
+        return "DETAIL", "迁移聚焦清单"
     if name.startswith("extra_targets_detail_"):
         return "DETAIL", "目标端多余对象明细"
     if name.startswith("skipped_objects_detail_"):
@@ -21387,6 +21395,184 @@ def export_indexes_unsupported_detail(
         for row in rows_sorted
     ]
     return write_pipe_report("索引不支持明细", header_fields, data_rows, output_path)
+
+
+def _filter_blocked_support_rows(
+    rows: List[ObjectSupportReportRow],
+    obj_type: str
+) -> List[ObjectSupportReportRow]:
+    obj_type_u = (obj_type or "").upper()
+    return [
+        row for row in rows
+        if row.obj_type.upper() == obj_type_u
+        and row.reason_code == "DEPENDENCY_UNSUPPORTED"
+    ]
+
+
+def _export_blocked_extra_detail(
+    rows: List[ObjectSupportReportRow],
+    report_dir: Path,
+    report_timestamp: Optional[str],
+    obj_type: str,
+    file_prefix: str,
+    title: str
+) -> Optional[Path]:
+    if not report_dir or not report_timestamp or not rows:
+        return None
+    filtered = _filter_blocked_support_rows(rows, obj_type)
+    if not filtered:
+        return None
+    output_path = Path(report_dir) / f"{file_prefix}_blocked_detail_{report_timestamp}.txt"
+    rows_sorted = sorted(
+        filtered,
+        key=lambda r: (r.dependency or "-", r.src_full or "-", r.tgt_full or "-")
+    )
+    header_fields = [
+        "TABLE",
+        "OBJECT_NAME",
+        "SRC_FULL",
+        "TGT_FULL",
+        "REASON_CODE",
+        "REASON",
+        "DEPENDENCY",
+        "ACTION",
+        "DETAIL"
+    ]
+    data_rows = []
+    for row in rows_sorted:
+        src_full = row.src_full or "-"
+        obj_name = src_full.split(".", 1)[1] if "." in src_full else src_full
+        data_rows.append([
+            row.dependency or "-",
+            obj_name,
+            src_full,
+            row.tgt_full or "-",
+            row.reason_code or "-",
+            row.reason or "-",
+            row.dependency or "-",
+            row.action or "-",
+            row.detail or "-"
+        ])
+    return write_pipe_report(title, header_fields, data_rows, output_path)
+
+
+def export_indexes_blocked_detail(
+    rows: List[ObjectSupportReportRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出索引依赖阻断明细（依赖不支持表）。
+    """
+    return _export_blocked_extra_detail(
+        rows,
+        report_dir,
+        report_timestamp,
+        "INDEX",
+        "indexes",
+        "索引阻断明细"
+    )
+
+
+def export_constraints_blocked_detail(
+    rows: List[ObjectSupportReportRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出约束依赖阻断明细（依赖不支持表）。
+    """
+    return _export_blocked_extra_detail(
+        rows,
+        report_dir,
+        report_timestamp,
+        "CONSTRAINT",
+        "constraints",
+        "约束阻断明细"
+    )
+
+
+def export_triggers_blocked_detail(
+    rows: List[ObjectSupportReportRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出触发器依赖阻断明细（依赖不支持表）。
+    """
+    return _export_blocked_extra_detail(
+        rows,
+        report_dir,
+        report_timestamp,
+        "TRIGGER",
+        "triggers",
+        "触发器阻断明细"
+    )
+
+
+def export_migration_focus_report(
+    missing_rows: List[ObjectSupportReportRow],
+    unsupported_rows: List[ObjectSupportReportRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出迁移聚焦清单：仅包含缺失但可修补的对象，以及不支持/阻断对象。
+    """
+    if not report_dir or not report_timestamp:
+        return None
+    missing_supported = [
+        row for row in (missing_rows or [])
+        if row.support_state == SUPPORT_STATE_SUPPORTED
+    ]
+    unsupported_or_blocked = [
+        row for row in (unsupported_rows or [])
+        if row.support_state in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED}
+    ]
+    output_path = Path(report_dir) / f"migration_focus_{report_timestamp}.txt"
+    lines: List[str] = [
+        "# Migration focus report",
+        f"# timestamp={report_timestamp}",
+        f"# missing_supported={len(missing_supported)}",
+        f"# unsupported_or_blocked={len(unsupported_or_blocked)}",
+        "",
+        "# section=MISSING_SUPPORTED",
+        "# fields: SRC_FULL|TYPE|TGT_FULL|ACTION|DETAIL",
+        "SRC_FULL|TYPE|TGT_FULL|ACTION|DETAIL"
+    ]
+    for row in missing_supported:
+        lines.append("|".join([
+            sanitize_pipe_field(row.src_full),
+            sanitize_pipe_field(row.obj_type),
+            sanitize_pipe_field(row.tgt_full),
+            sanitize_pipe_field(row.action),
+            sanitize_pipe_field(row.detail),
+        ]))
+    lines.extend([
+        "",
+        "# section=UNSUPPORTED_OR_BLOCKED",
+        "# fields: SRC_FULL|TYPE|TGT_FULL|STATE|REASON_CODE|REASON|DEPENDENCY|ACTION|DETAIL",
+        "SRC_FULL|TYPE|TGT_FULL|STATE|REASON_CODE|REASON|DEPENDENCY|ACTION|DETAIL"
+    ])
+    for row in unsupported_or_blocked:
+        lines.append("|".join([
+            sanitize_pipe_field(row.src_full),
+            sanitize_pipe_field(row.obj_type),
+            sanitize_pipe_field(row.tgt_full),
+            sanitize_pipe_field(row.support_state),
+            sanitize_pipe_field(row.reason_code),
+            sanitize_pipe_field(row.reason),
+            sanitize_pipe_field(row.dependency),
+            sanitize_pipe_field(row.action),
+            sanitize_pipe_field(row.detail),
+        ]))
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        return output_path
+    except OSError as exc:
+        log.warning("写入迁移聚焦清单失败 %s: %s", output_path, exc)
+        return None
 
 
 def export_extra_targets_detail(
@@ -22758,6 +22944,18 @@ def print_final_report(
     missing_detail_rows = list(support_summary.missing_detail_rows) if support_summary else []
     extra_blocked_counts = dict(support_summary.extra_blocked_counts) if support_summary else {}
     unsupported_summary_counts = build_unsupported_summary_counts(support_summary, extra_results)
+    blocked_index_rows = _filter_blocked_support_rows(unsupported_rows, "INDEX") if unsupported_rows else []
+    blocked_constraint_rows = _filter_blocked_support_rows(unsupported_rows, "CONSTRAINT") if unsupported_rows else []
+    blocked_trigger_rows = _filter_blocked_support_rows(unsupported_rows, "TRIGGER") if unsupported_rows else []
+    missing_supported_rows = [
+        row for row in missing_detail_rows
+        if row.support_state == SUPPORT_STATE_SUPPORTED
+    ]
+    missing_supported_cnt = len(missing_supported_rows)
+    unsupported_blocked_cnt = len([
+        row for row in unsupported_rows
+        if row.support_state in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED}
+    ])
 
     console.print(Panel.fit(f"[bold]数据库对象迁移校验报告 (V{__version__} - Rich)[/bold]", style="title"))
     console.print(f"[info]项目主页: {REPO_URL} | 问题反馈: {REPO_ISSUES_URL}[/info]")
@@ -22842,6 +23040,10 @@ def print_final_report(
             f"主对象: 缺失 {missing_count}, 不匹配 {mismatched_count}, 多余 {extra_target_cnt}",
             f"扩展对象差异: 索引 {idx_mis_cnt}, 约束 {cons_mis_cnt}, 序列 {seq_mis_cnt}, 触发器 {trg_mis_cnt}",
         ]
+        if missing_supported_cnt or unsupported_blocked_cnt:
+            lines.append(
+                f"迁移聚焦: 缺失可修补 {missing_supported_cnt}, 不兼容/阻断 {unsupported_blocked_cnt}"
+            )
         if blocked_total:
             lines.append(f"不支持/阻断: {blocked_total}")
         next_steps: List[str] = []
@@ -22853,6 +23055,8 @@ def print_final_report(
         if blocked_total:
             suffix = f"_{report_ts}" if report_ts else "_*"
             next_steps.append(f"查看 unsupported_objects_detail{suffix}.txt 或 blacklist_tables.txt")
+        if report_ts:
+            next_steps.append(f"查看 migration_focus_{report_ts}.txt 汇总迁移动作清单")
         if next_steps:
             lines.append("下一步: " + "；".join(next_steps))
         return Panel.fit("\n".join(lines), title="[header]执行结论", border_style="info")
@@ -22901,6 +23105,16 @@ def print_final_report(
         primary_text.append("无法推导: ", style="mismatch")
         primary_text.append(f"{remap_conflict_cnt}")
     summary_table.add_row("[bold]主对象 (TABLE/VIEW/etc.)[/bold]", primary_text)
+
+    focus_text = Text()
+    focus_text.append("缺失可修补: ", style="missing")
+    focus_text.append(f"{missing_supported_cnt}")
+    focus_text.append("\n不兼容/阻断: ", style="mismatch")
+    focus_text.append(f"{unsupported_blocked_cnt}")
+    if report_ts:
+        focus_text.append("\n详见: ", style="info")
+        focus_text.append(f"migration_focus_{report_ts}.txt", style="info")
+    summary_table.add_row("[bold]迁移聚焦[/bold]", focus_text)
 
     if package_rows:
         pkg_text = Text()
@@ -23048,13 +23262,26 @@ def print_final_report(
         if extra_results.get("index_unsupported"):
             suffix = f"_{report_ts}" if report_ts else ""
             detail_hint_lines.append(
-                f"索引不支持明细: indexes_unsupported_detail{suffix}.txt"
+                f"索引语法不支持明细(仅DESC): indexes_unsupported_detail{suffix}.txt"
             )
         if extra_results.get("constraint_unsupported"):
             suffix = f"_{report_ts}" if report_ts else ""
             detail_hint_lines.append(
-                f"约束不支持明细: constraints_unsupported_detail{suffix}.txt"
+                f"约束语法不支持明细(DEFERRABLE等): constraints_unsupported_detail{suffix}.txt"
             )
+        if emit_detail_files and report_ts:
+            if blocked_index_rows:
+                detail_hint_lines.append(
+                    f"索引依赖阻断明细: indexes_blocked_detail_{report_ts}.txt"
+                )
+            if blocked_constraint_rows:
+                detail_hint_lines.append(
+                    f"约束依赖阻断明细: constraints_blocked_detail_{report_ts}.txt"
+                )
+            if blocked_trigger_rows:
+                detail_hint_lines.append(
+                    f"触发器依赖阻断明细: triggers_blocked_detail_{report_ts}.txt"
+                )
         console.print(Panel.fit("\n".join(detail_hint_lines), style="info", width=section_width))
 
     if config_diagnostics:
@@ -23568,6 +23795,7 @@ def print_final_report(
         _add_index_entry("AUX", fixup_skip_path, None, "Fixup 跳过汇总")
         missing_detail_path = None
         unsupported_detail_path = None
+        migration_focus_path = None
         if emit_detail_files:
             missing_detail_path = export_missing_objects_detail(
                 missing_detail_rows,
@@ -23575,6 +23803,13 @@ def print_final_report(
                 report_ts
             )
             unsupported_detail_path = export_unsupported_objects_detail(
+                unsupported_rows,
+                report_path.parent,
+                report_ts
+            )
+        if report_ts:
+            migration_focus_path = export_migration_focus_report(
+                missing_detail_rows,
                 unsupported_rows,
                 report_path.parent,
                 report_ts
@@ -23591,6 +23826,12 @@ def print_final_report(
             len(unsupported_rows or []),
             "不支持/阻断对象明细"
         )
+        _add_index_entry(
+            "DETAIL",
+            migration_focus_path,
+            (missing_supported_cnt + unsupported_blocked_cnt),
+            "迁移聚焦清单"
+        )
         index_unsupported_path = export_indexes_unsupported_detail(
             extra_results.get("index_unsupported", []) or [],
             report_path.parent,
@@ -23600,7 +23841,7 @@ def print_final_report(
             "DETAIL",
             index_unsupported_path,
             len(extra_results.get("index_unsupported", []) or []),
-            "索引不支持明细"
+            "索引语法不支持明细(仅DESC)"
         )
         constraint_unsupported_path = export_constraints_unsupported_detail(
             extra_results.get("constraint_unsupported", []) or [],
@@ -23611,7 +23852,44 @@ def print_final_report(
             "DETAIL",
             constraint_unsupported_path,
             len(extra_results.get("constraint_unsupported", []) or []),
-            "约束不支持明细"
+            "约束语法不支持明细(DEFERRABLE等)"
+        )
+        blocked_index_path = None
+        blocked_constraint_path = None
+        blocked_trigger_path = None
+        if emit_detail_files and report_ts:
+            blocked_index_path = export_indexes_blocked_detail(
+                blocked_index_rows,
+                report_path.parent,
+                report_ts
+            )
+            blocked_constraint_path = export_constraints_blocked_detail(
+                blocked_constraint_rows,
+                report_path.parent,
+                report_ts
+            )
+            blocked_trigger_path = export_triggers_blocked_detail(
+                blocked_trigger_rows,
+                report_path.parent,
+                report_ts
+            )
+        _add_index_entry(
+            "DETAIL",
+            blocked_index_path,
+            len(blocked_index_rows),
+            "索引依赖阻断明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            blocked_constraint_path,
+            len(blocked_constraint_rows),
+            "约束依赖阻断明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            blocked_trigger_path,
+            len(blocked_trigger_rows),
+            "触发器依赖阻断明细"
         )
         extra_targets_path = None
         skipped_detail_path = None
@@ -23766,6 +24044,14 @@ def print_final_report(
                 log.info("索引不支持明细已输出到: %s", index_unsupported_path)
             if constraint_unsupported_path:
                 log.info("约束不支持明细已输出到: %s", constraint_unsupported_path)
+            if blocked_index_path:
+                log.info("索引阻断明细已输出到: %s", blocked_index_path)
+            if blocked_constraint_path:
+                log.info("约束阻断明细已输出到: %s", blocked_constraint_path)
+            if blocked_trigger_path:
+                log.info("触发器阻断明细已输出到: %s", blocked_trigger_path)
+            if migration_focus_path:
+                log.info("迁移聚焦清单已输出到: %s", migration_focus_path)
             if extra_targets_path:
                 log.info("目标端多余对象明细已输出到: %s", extra_targets_path)
             if skipped_detail_path:
