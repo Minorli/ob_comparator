@@ -18,8 +18,16 @@ audit/table_check_validation/
 config.ini
 AGENTS.md
 CLAUDE.md
-docs/MIGRATION_PROPOSAL_1567_SCHEMAS.md
 .venv
+
+# Only track these docs; ignore the rest under docs/
+docs/*
+!docs/
+!docs/ARCHITECTURE.md
+!docs/ADVANCED_USAGE.md
+!docs/TECHNICAL_SPECIFICATION.md
+!docs/DEPLOYMENT.md
+!docs/CHANGELOG.md
 
 .gemini/
 gha-creds-*.json
