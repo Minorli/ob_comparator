@@ -1088,14 +1088,43 @@ def find_latest_report_file(report_dir: Path, prefix: str) -> Optional[Path]:
     if not report_dir:
         return None
     candidates: List[Path] = []
+    ts_re = re.compile(rf"{re.escape(prefix)}_(\d{{8}}_\d{{6}})")
+    run_ts_re = re.compile(r"run_(\d{8}_\d{6})")
     try:
-        candidates.extend(report_dir.glob(f"{prefix}_*.txt"))
-        candidates.extend(report_dir.glob(f"run_*/{prefix}_*.txt"))
+        run_dirs = [p for p in report_dir.glob("run_*") if p.is_dir()]
     except OSError:
-        return None
+        run_dirs = []
+    # Prefer newest run directory if present.
+    run_dirs.sort(key=lambda p: run_ts_re.search(p.name).group(1) if run_ts_re.search(p.name) else "", reverse=True)
+    for run_dir in run_dirs:
+        try:
+            run_candidates = list(run_dir.glob(f"{prefix}_*.txt"))
+        except OSError:
+            continue
+        if run_candidates:
+            candidates.extend(run_candidates)
+            break
+    if not candidates:
+        try:
+            candidates.extend(report_dir.glob(f"{prefix}_*.txt"))
+            candidates.extend(report_dir.glob(f"run_*/{prefix}_*.txt"))
+        except OSError:
+            return None
+    if not candidates:
+        parent = report_dir.parent if report_dir.parent != report_dir else None
+        if parent:
+            try:
+                candidates.extend(parent.glob(f"{prefix}_*.txt"))
+                candidates.extend(parent.glob(f"run_*/{prefix}_*.txt"))
+            except OSError:
+                pass
+    if not candidates:
+        try:
+            candidates.extend(report_dir.rglob(f"{prefix}_*.txt"))
+        except OSError:
+            return None
     if not candidates:
         return None
-    ts_re = re.compile(rf"{re.escape(prefix)}_(\d{{8}}_\d{{6}})")
 
     def sort_key(path: Path) -> Tuple[int, str]:
         match = ts_re.search(path.name)

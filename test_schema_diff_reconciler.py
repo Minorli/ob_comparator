@@ -3359,6 +3359,93 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             self.assertIn("report_123.txt", content)
             self.assertNotIn("report_detail_mode=summary", content)
 
+    def test_export_indexes_blocked_detail_filters_dependency_unsupported(self):
+        rows = [
+            sdr.ObjectSupportReportRow(
+                obj_type="INDEX",
+                src_full="SRC.IDX1",
+                tgt_full="TGT.IDX1",
+                support_state="BLOCKED",
+                reason_code="DEPENDENCY_UNSUPPORTED",
+                reason="依赖不支持表",
+                dependency="TGT.T1",
+                action="先改造依赖表",
+                detail="INDEX"
+            ),
+            sdr.ObjectSupportReportRow(
+                obj_type="INDEX",
+                src_full="SRC.IDX2",
+                tgt_full="TGT.IDX2",
+                support_state="BLOCKED",
+                reason_code="OTHER",
+                reason="其他原因",
+                dependency="TGT.T2",
+                action="先改造依赖表",
+                detail="INDEX"
+            ),
+            sdr.ObjectSupportReportRow(
+                obj_type="CONSTRAINT",
+                src_full="SRC.CK1",
+                tgt_full="TGT.CK1",
+                support_state="BLOCKED",
+                reason_code="DEPENDENCY_UNSUPPORTED",
+                reason="依赖不支持表",
+                dependency="TGT.T3",
+                action="先改造依赖表",
+                detail="CONSTRAINT"
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = sdr.export_indexes_blocked_detail(rows, Path(tmpdir), "123")
+            self.assertIsNotNone(path)
+            content = Path(path).read_text(encoding="utf-8")
+            self.assertIn("IDX1", content)
+            self.assertIn("TGT.T1", content)
+            self.assertNotIn("IDX2", content)
+            self.assertNotIn("TGT.T2", content)
+            self.assertNotIn("CK1", content)
+
+    def test_export_migration_focus_report_sections(self):
+        missing_rows = [
+            sdr.ObjectSupportReportRow(
+                obj_type="VIEW",
+                src_full="SRC.V1",
+                tgt_full="TGT.V1",
+                support_state=sdr.SUPPORT_STATE_SUPPORTED,
+                reason_code="-",
+                reason="-",
+                dependency="-",
+                action="FIXUP",
+                detail="-"
+            )
+        ]
+        unsupported_rows = [
+            sdr.ObjectSupportReportRow(
+                obj_type="INDEX",
+                src_full="SRC.IDX1",
+                tgt_full="TGT.IDX1",
+                support_state=sdr.SUPPORT_STATE_BLOCKED,
+                reason_code="DEPENDENCY_UNSUPPORTED",
+                reason="依赖不支持表",
+                dependency="TGT.T1",
+                action="先改造依赖表",
+                detail="INDEX"
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = sdr.export_migration_focus_report(
+                missing_rows,
+                unsupported_rows,
+                Path(tmpdir),
+                "123"
+            )
+            self.assertIsNotNone(path)
+            content = Path(path).read_text(encoding="utf-8")
+            self.assertIn("section=MISSING_SUPPORTED", content)
+            self.assertIn("section=UNSUPPORTED_OR_BLOCKED", content)
+            self.assertIn("SRC.V1", content)
+            self.assertIn("SRC.IDX1", content)
+
     def test_enforce_schema_for_ddl_skips_duplicate(self):
         ddl = (
             "ALTER SESSION SET CURRENT_SCHEMA = A;\n"

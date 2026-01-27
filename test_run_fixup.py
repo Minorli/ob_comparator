@@ -219,6 +219,25 @@ class TestViewChainHelpers(unittest.TestCase):
         self.assertEqual(status, "PARTIAL")
 
 
+class TestReportLookup(unittest.TestCase):
+    def test_find_latest_report_prefers_latest_run_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            report_dir = root / "main_reports"
+            report_dir.mkdir()
+            run_old = report_dir / "run_20260101_000000"
+            run_new = report_dir / "run_20260102_000000"
+            run_old.mkdir()
+            run_new.mkdir()
+            old_file = run_old / "VIEWs_chain_20260103_000000.txt"
+            new_file = run_new / "VIEWs_chain_20260101_000000.txt"
+            old_file.write_text("old", encoding="utf-8")
+            new_file.write_text("new", encoding="utf-8")
+
+            chosen = rf.find_latest_report_file(report_dir, "VIEWs_chain")
+            self.assertEqual(chosen, new_file)
+
+
 class TestRecompileSkipTypes(unittest.TestCase):
     def test_recompile_skips_unsupported_types(self):
         invalid_batches = [
