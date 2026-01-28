@@ -1444,7 +1444,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             "TGT",
             "T1",
             missing_cols=set(),
-            extra_cols={"SYS_C000123", "EXTRA1"},
+            extra_cols={"SYS_C00025_2025121711:29:07$", "EXTRA1"},
             length_mismatches=[],
             type_mismatches=[],
             drop_sys_c_columns=True
@@ -1452,7 +1452,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIsNotNone(sql)
         self.assertIn('ALTER TABLE "TGT"."T1" FORCE;', sql)
         self.assertIn('-- ALTER TABLE "TGT"."T1" DROP COLUMN EXTRA1;', sql)
-        self.assertNotIn('DROP COLUMN SYS_C000123', sql)
+        self.assertNotIn('DROP COLUMN SYS_C00025', sql)
 
     def test_generate_alter_for_table_columns_sys_c_drop_disabled(self):
         oracle_meta = self._make_oracle_meta_with_columns({("SRC", "T1"): {}})

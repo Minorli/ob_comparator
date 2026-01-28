@@ -825,8 +825,9 @@ SYS_NC_COLUMN_PATTERNS = (
     re.compile(r"^SYS_NC\d+\$", re.IGNORECASE),
     re.compile(r"^SYS_NC_[A-Z_]+\$", re.IGNORECASE),
 )
+# SYS_C* 可能带 $ 或其他后缀（目标端内部列），用前缀匹配避免漏判
 SYS_C_COLUMN_PATTERNS = (
-    re.compile(r"^SYS_C\d+$", re.IGNORECASE),
+    re.compile(r"^SYS_C\d+", re.IGNORECASE),
 )
 NOISE_REASON_AUTO_COLUMN = "AUTO_COLUMN"
 NOISE_REASON_AUTO_SEQUENCE = "AUTO_SEQUENCE"
@@ -865,7 +866,10 @@ def is_sys_c_column_name(name: Optional[str]) -> bool:
     name_u = normalize_identifier_name(name)
     if not name_u:
         return False
-    return any(pattern.match(name_u) for pattern in SYS_C_COLUMN_PATTERNS)
+    if any(pattern.match(name_u) for pattern in SYS_C_COLUMN_PATTERNS):
+        return True
+    # 兜底：SYS_C + 数字开头（后缀可能包含时间戳等特殊字符）
+    return name_u.startswith("SYS_C") and len(name_u) > 5 and name_u[5].isdigit()
 
 
 def classify_noise_column(name: Optional[str]) -> Optional[str]:
