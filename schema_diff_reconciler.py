@@ -22955,10 +22955,10 @@ def build_run_summary(
         if report_file:
             report_parent = Path(report_file).parent
             next_steps.append(
-                f"如需明细，设置 report_detail_mode=split 后查看 {report_parent}/unsupported_objects_detail_*.txt。"
+                f"如需明细，设置 report_detail_mode=split 后查看 {report_parent}/report_index_*.txt，定位 unsupported_<type>_detail_*.txt。"
             )
         else:
-            next_steps.append("如需明细，设置 report_detail_mode=split 后查看 unsupported_objects_detail_*.txt。")
+            next_steps.append("如需明细，设置 report_detail_mode=split 后查看 report_index_*.txt，定位 unsupported_<type>_detail_*.txt。")
 
     return RunSummary(
         start_time=ctx.start_time,
@@ -23493,8 +23493,9 @@ def print_final_report(
             )
             if report_ts:
                 detail_hint_lines.append(f"示例: missing_objects_detail_{report_ts}.txt")
+                detail_hint_lines.append(f"报告索引: report_index_{report_ts}.txt")
                 detail_hint_lines.append(
-                    "按类型明细: missing_<type>_detail / unsupported_<type>_detail (详见 report_index)"
+                    "按类型明细: missing_<type>_detail / unsupported_<type>_detail (含 ROOT_CAUSE，详见 report_index)"
                 )
             if column_order_mismatch_cnt and report_ts:
                 detail_hint_lines.append(f"列顺序差异明细: column_order_mismatch_detail_{report_ts}.txt")
@@ -24452,6 +24453,8 @@ def parse_cli_args() -> argparse.Namespace:
           main_reports/run_<ts>/missing_objects_detail_<ts>.txt 缺失对象支持性明细 (report_detail_mode=split)
           main_reports/run_<ts>/unsupported_objects_detail_<ts>.txt 不支持/阻断对象明细 (report_detail_mode=split)
           main_reports/run_<ts>/extra_mismatch_detail_<ts>.txt 扩展对象差异明细 (report_detail_mode=split)
+          main_reports/run_<ts>/missing_<TYPE>_detail_<ts>.txt 按类型缺失明细 (report_detail_mode=split)
+          main_reports/run_<ts>/unsupported_<TYPE>_detail_<ts>.txt 按类型不支持/阻断明细 (含 ROOT_CAUSE)
           fixup_scripts/                按类型分类的订正 SQL
         项目信息:
           主页: {repo_url}
