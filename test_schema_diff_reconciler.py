@@ -1435,6 +1435,43 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIsNotNone(sql)
         self.assertIn("MODIFY C1 INVISIBLE", sql)
 
+    def test_generate_alter_for_table_columns_sys_c_drop_enabled(self):
+        oracle_meta = self._make_oracle_meta_with_columns({("SRC", "T1"): {}})
+        sql = sdr.generate_alter_for_table_columns(
+            oracle_meta,
+            "SRC",
+            "T1",
+            "TGT",
+            "T1",
+            missing_cols=set(),
+            extra_cols={"SYS_C000123", "EXTRA1"},
+            length_mismatches=[],
+            type_mismatches=[],
+            drop_sys_c_columns=True
+        )
+        self.assertIsNotNone(sql)
+        self.assertIn('ALTER TABLE "TGT"."T1" FORCE;', sql)
+        self.assertIn('-- ALTER TABLE "TGT"."T1" DROP COLUMN EXTRA1;', sql)
+        self.assertNotIn('DROP COLUMN SYS_C000123', sql)
+
+    def test_generate_alter_for_table_columns_sys_c_drop_disabled(self):
+        oracle_meta = self._make_oracle_meta_with_columns({("SRC", "T1"): {}})
+        sql = sdr.generate_alter_for_table_columns(
+            oracle_meta,
+            "SRC",
+            "T1",
+            "TGT",
+            "T1",
+            missing_cols=set(),
+            extra_cols={"SYS_C000123"},
+            length_mismatches=[],
+            type_mismatches=[],
+            drop_sys_c_columns=False
+        )
+        self.assertIsNotNone(sql)
+        self.assertIn('-- ALTER TABLE "TGT"."T1" DROP COLUMN SYS_C000123;', sql)
+        self.assertNotIn('\nALTER TABLE "TGT"."T1" FORCE;', "\n" + sql)
+
     def test_filter_trigger_results_for_unsupported_tables(self):
         extra_results = {
             "index_ok": [],
@@ -2220,6 +2257,14 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         cleaned = sdr.clean_for_loop_collection_attr_range(ddl)
         self.assertIn("v_list.FIRST..v_list.LAST", cleaned)
 
+    def test_clean_long_types_in_table_ddl(self):
+        ddl = "CREATE TABLE T_LONG (A LONG, B LONG RAW, C VARCHAR2(10));"
+        cleaned = sdr.clean_long_types_in_table_ddl(ddl)
+        self.assertIn("A CLOB", cleaned)
+        self.assertIn("B BLOB", cleaned)
+        self.assertNotIn("LONG RAW", cleaned.upper())
+        self.assertNotIn(" LONG,", cleaned.upper())
+
     def test_normalize_synonym_fixup_scope(self):
         self.assertEqual(sdr.normalize_synonym_fixup_scope(None), "all")
         self.assertEqual(sdr.normalize_synonym_fixup_scope("all"), "all")
@@ -2390,9 +2435,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             {"A.SEQ1": {"SEQUENCE": "X.SEQ1"}},
             enabled_extra_types={"SEQUENCE"}
         )
-        self.assertEqual(len(extra_results["sequence_mismatched"]), 1)
-        mismatch = extra_results["sequence_mismatched"][0]
-        self.assertTrue(any("INCREMENT_BY" in item for item in (mismatch.detail_mismatch or [])))
+        self.assertEqual(len(extra_results["sequence_mismatched"]), 0)
 
     def test_check_extra_objects_large_table_uses_threadpool(self):
         oracle_meta = self._make_oracle_meta()
@@ -3446,6 +3489,60 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             self.assertIn("SRC.V1", content)
             self.assertIn("SRC.IDX1", content)
 
+    def test_export_missing_by_type_filters_supported(self):
+        rows = [
+            sdr.ObjectSupportReportRow(
+                obj_type="VIEW",
+                src_full="SRC.V1",
+                tgt_full="TGT.V1",
+                support_state=sdr.SUPPORT_STATE_SUPPORTED,
+                reason_code="-",
+                reason="-",
+                dependency="-",
+                action="FIXUP",
+                detail="-"
+            ),
+            sdr.ObjectSupportReportRow(
+                obj_type="VIEW",
+                src_full="SRC.V2",
+                tgt_full="TGT.V2",
+                support_state=sdr.SUPPORT_STATE_BLOCKED,
+                reason_code="DEPENDENCY_UNSUPPORTED",
+                reason="依赖不支持表",
+                dependency="TGT.T1",
+                action="先改造依赖表",
+                detail="VIEW"
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = sdr.export_missing_by_type(rows, Path(tmpdir), "123")
+            self.assertIn("VIEW", paths)
+            content = Path(paths["VIEW"]).read_text(encoding="utf-8")
+            self.assertIn("SRC.V1", content)
+            self.assertNotIn("SRC.V2", content)
+
+    def test_export_unsupported_by_type_includes_root_cause(self):
+        rows = [
+            sdr.ObjectSupportReportRow(
+                obj_type="VIEW",
+                src_full="SRC.V1",
+                tgt_full="TGT.V1",
+                support_state=sdr.SUPPORT_STATE_BLOCKED,
+                reason_code="DEPENDENCY_UNSUPPORTED",
+                reason="依赖不支持表",
+                dependency="SRC.T1",
+                action="先改造依赖表",
+                detail="VIEW",
+                root_cause="SRC.T1(SPE)"
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = sdr.export_unsupported_by_type(rows, Path(tmpdir), "123")
+            self.assertIn("VIEW", paths)
+            content = Path(paths["VIEW"]).read_text(encoding="utf-8")
+            self.assertIn("ROOT_CAUSE", content)
+            self.assertIn("SRC.T1(SPE)", content)
+
     def test_enforce_schema_for_ddl_skips_duplicate(self):
         ddl = (
             "ALTER SESSION SET CURRENT_SCHEMA = A;\n"
@@ -4220,6 +4317,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             support_state_map={},
             missing_detail_rows=[],
             unsupported_rows=[],
+            extra_missing_rows=[],
             missing_support_counts={
                 "TABLE": {"supported": 0, "unsupported": 2, "blocked": 1},
                 "VIEW": {"supported": 0, "unsupported": 0, "blocked": 3},

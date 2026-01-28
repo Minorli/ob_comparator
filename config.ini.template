@@ -36,6 +36,8 @@ fixup_cli_timeout       = 3600
 fixup_dir               = fixup_scripts
 # fixup_force_clean=true 时，即使 fixup_dir 为项目外绝对路径也会清理旧脚本（谨慎使用）
 fixup_force_clean       = false
+# fixup_drop_sys_c_columns：是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE（默认 false）
+fixup_drop_sys_c_columns = false
 report_dir              = main_reports
 # 报告目录布局：
 #   flat    -> 输出到 report_dir 根目录（旧行为）

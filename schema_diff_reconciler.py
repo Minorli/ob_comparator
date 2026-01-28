@@ -355,6 +355,7 @@ class ObjectSupportReportRow(NamedTuple):
     dependency: str
     action: str
     detail: str
+    root_cause: str = ""
 
 
 class ViewCompatResult(NamedTuple):
@@ -370,6 +371,7 @@ class SupportClassificationResult(NamedTuple):
     support_state_map: Dict[Tuple[str, str], ObjectSupportReportRow]
     missing_detail_rows: List[ObjectSupportReportRow]
     unsupported_rows: List[ObjectSupportReportRow]
+    extra_missing_rows: List[ObjectSupportReportRow]
     missing_support_counts: Dict[str, Dict[str, int]]
     extra_blocked_counts: Dict[str, int]
     unsupported_table_keys: Set[Tuple[str, str]]
@@ -699,7 +701,7 @@ BLACKLIST_REASON_BY_TYPE: Dict[str, str] = {
     'TEMPORARY_TABLE': "源表是临时表，不需要生成DDL",
     'DIY': "表中字段存在自定义类型，不支持创建，不需要生成DDL",
     'LOB_OVERSIZE': "表中存在的LOB字段体积超过512 MiB，可以在目标端创建表，但是 OMS 不支持同步",
-    'LONG': "LONG/LONG RAW 需人工转换为 CLOB/BLOB",
+    'LONG': "LONG/LONG RAW 需转换为 CLOB/BLOB",
     'DBLINK': "源表可能是 IOT 表或者外部表，不需要生成DDL"
 }
 BLACKLIST_MODES: Set[str] = {"auto", "table_only", "rules_only", "disabled"}
@@ -803,6 +805,9 @@ SYS_NC_COLUMN_PATTERNS = (
     re.compile(r"^SYS_NC\d+\$", re.IGNORECASE),
     re.compile(r"^SYS_NC_[A-Z_]+\$", re.IGNORECASE),
 )
+SYS_C_COLUMN_PATTERNS = (
+    re.compile(r"^SYS_C\d+$", re.IGNORECASE),
+)
 NOISE_REASON_AUTO_COLUMN = "AUTO_COLUMN"
 NOISE_REASON_AUTO_SEQUENCE = "AUTO_SEQUENCE"
 NOISE_REASON_SYS_NC_COLUMN = "SYS_NC_COLUMN"
@@ -834,6 +839,13 @@ def is_sys_nc_column_name(name: Optional[str]) -> bool:
     if not name_u:
         return False
     return any(pattern.match(name_u) for pattern in SYS_NC_COLUMN_PATTERNS)
+
+
+def is_sys_c_column_name(name: Optional[str]) -> bool:
+    name_u = normalize_identifier_name(name)
+    if not name_u:
+        return False
+    return any(pattern.match(name_u) for pattern in SYS_C_COLUMN_PATTERNS)
 
 
 def classify_noise_column(name: Optional[str]) -> Optional[str]:
@@ -1040,6 +1052,22 @@ def summarize_blacklist_entries(
 def is_long_type(data_type: Optional[str]) -> bool:
     dt = (data_type or "").strip().upper()
     return dt in ("LONG", "LONG RAW")
+
+
+def is_long_only_blacklist(entries: Optional[Dict[Tuple[str, str], BlacklistEntry]]) -> bool:
+    """
+    判断黑名单条目是否全部为 LONG/LONG RAW 类型。
+    """
+    if not entries:
+        return False
+    for (black_type, data_type), entry in entries.items():
+        bt = (black_type or "").strip().upper()
+        dt = (data_type or "").strip().upper()
+        if bt != "LONG" and not is_long_type(dt):
+            return False
+        if entry and entry.black_type and entry.black_type.upper() != "LONG" and not is_long_type(entry.data_type):
+            return False
+    return True
 
 
 def map_long_type_to_ob(data_type: Optional[str]) -> str:
@@ -2691,6 +2719,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         # fixup 脚本目录
         settings.setdefault('fixup_dir', 'fixup_scripts')
         settings.setdefault('fixup_force_clean', 'false')
+        settings.setdefault('fixup_drop_sys_c_columns', 'false')
         # obclient 超时时间 (秒)
         settings.setdefault('obclient_timeout', '60')
         # 报告输出目录
@@ -2807,6 +2836,10 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings['enable_comment_check'] = parse_bool_flag(
             settings.get('check_comments', 'true'),
             True
+        )
+        settings['fixup_drop_sys_c_columns'] = parse_bool_flag(
+            settings.get('fixup_drop_sys_c_columns', 'false'),
+            False
         )
         settings['enable_column_order_check'] = parse_bool_flag(
             settings.get('check_column_order', 'false'),
@@ -3330,6 +3363,13 @@ def run_config_wizard(config_path: Path) -> None:
         "generate_fixup",
         "是否生成目标端订正 SQL (true/false)",
         default=cfg.get("SETTINGS", "generate_fixup", fallback="true"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "fixup_drop_sys_c_columns",
+        "是否对 SYS_C* 列生成 ALTER TABLE FORCE (true/false)",
+        default=cfg.get("SETTINGS", "fixup_drop_sys_c_columns", fallback="false"),
         transform=_bool_transform,
     )
     _prompt_field(
@@ -4207,31 +4247,17 @@ def classify_missing_objects(
         if not schema_u or not table_u:
             continue
         full = f"{schema_u}.{table_u}"
-
-        long_only = True
-        for (black_type, data_type), entry in (entries or {}).items():
-            bt = (black_type or "").strip().upper()
-            dt = (data_type or "").strip().upper()
-            if bt != "LONG" and not is_long_type(dt):
-                long_only = False
-                break
-            if entry and entry.black_type and entry.black_type.upper() != "LONG" and not is_long_type(entry.data_type):
-                long_only = False
-                break
-
-        if long_only:
+        if is_long_only_blacklist(entries):
             tgt_schema_u, tgt_table_u = table_target_map.get((schema_u, table_u), (schema_u, table_u))
-            _status, _detail, verified = evaluate_long_conversion_status(
-                oracle_meta,
-                ob_meta,
-                schema_u,
-                table_u,
-                tgt_schema_u,
-                tgt_table_u
-            )
-            if verified:
-                log.info("[BLACKLIST] LONG 表 %s 已校验转换，依赖不再阻断。", full)
-                continue
+            tgt_full = f"{tgt_schema_u}.{tgt_table_u}"
+            if ob_meta and ob_meta.objects_by_type and "TABLE" in (ob_meta.objects_by_type or {}):
+                if tgt_full in ob_meta.objects_by_type.get("TABLE", set()):
+                    log.info("[BLACKLIST] LONG 表 %s 目标端存在，依赖不再阻断。", full)
+                else:
+                    log.info("[BLACKLIST] LONG 表 %s 目标端缺失，仍不阻断依赖。", full)
+            else:
+                log.info("[BLACKLIST] LONG 表 %s 未能确认目标端存在性，默认不阻断依赖。", full)
+            continue
 
         black_type, reason, detail = summarize_blacklist_entries(entries)
         unsupported_nodes.add((full, "TABLE"))
@@ -4255,6 +4281,48 @@ def classify_missing_objects(
         object_parent_map=object_parent_map
     )
 
+    root_cause_cache: Dict[DependencyNode, str] = {}
+
+    def _root_cause_label(node: DependencyNode) -> str:
+        full, obj_type = node
+        if node in invalid_nodes:
+            return f"{full}(SOURCE_INVALID)"
+        obj_type_u = (obj_type or "").upper()
+        if obj_type_u == "TABLE" and full in unsupported_table_map:
+            black_type = (unsupported_table_map.get(full) or ("", "", ""))[0] or "BLACKLIST"
+            return f"{full}({black_type})"
+        if obj_type_u == "VIEW":
+            parsed = parse_full_object_name(full)
+            if parsed:
+                key = (parsed[0].upper(), parsed[1].upper())
+                compat = view_compat_map.get(key)
+                if compat and compat.support_state != SUPPORT_STATE_SUPPORTED:
+                    reason_code = compat.reason_code or "VIEW_UNSUPPORTED"
+                    return f"{full}({reason_code})"
+        return f"{full}(UNSUPPORTED)"
+
+    def _resolve_root_cause(node: DependencyNode) -> str:
+        if node in root_cause_cache:
+            return root_cause_cache[node]
+        if node in block_source_nodes:
+            root_cause_cache[node] = _root_cause_label(node)
+            return root_cause_cache[node]
+        blocked_refs = blocked_by_map.get(node)
+        if not blocked_refs:
+            root_cause_cache[node] = ""
+            return ""
+        # Prefer stable ordering for deterministic output
+        for ref in sorted(blocked_refs, key=lambda n: (n[0], n[1])):
+            if ref in block_source_nodes:
+                root_cause_cache[node] = _root_cause_label(ref)
+                return root_cause_cache[node]
+            rc = _resolve_root_cause(ref)
+            if rc:
+                root_cause_cache[node] = rc
+                return rc
+        root_cause_cache[node] = ""
+        return ""
+
     for obj_type, tgt_name, src_name in missing_items:
         obj_type_u = (obj_type or "").upper()
         if "." not in src_name or "." not in tgt_name:
@@ -4269,6 +4337,7 @@ def classify_missing_objects(
         dependency = ""
         action = "FIXUP"
         detail = ""
+        root_cause = ""
 
         if (src_full, obj_type_u) in invalid_nodes:
             support_state = SUPPORT_STATE_BLOCKED
@@ -4279,11 +4348,12 @@ def classify_missing_objects(
         elif obj_type_u == "TABLE":
             entries = oracle_meta.blacklist_tables.get((src_schema, src_obj))
             if entries:
-                black_type, reason, detail = summarize_blacklist_entries(entries)
-                support_state = SUPPORT_STATE_UNSUPPORTED
-                reason_code = f"BLACKLIST_{black_type}" if black_type else "BLACKLIST"
-                dependency = "-"
-                action = "改造/不迁移"
+                if not is_long_only_blacklist(entries):
+                    black_type, reason, detail = summarize_blacklist_entries(entries)
+                    support_state = SUPPORT_STATE_UNSUPPORTED
+                    reason_code = f"BLACKLIST_{black_type}" if black_type else "BLACKLIST"
+                    dependency = "-"
+                    action = "改造/不迁移"
         elif obj_type_u == "VIEW":
             compat = view_compat_map.get((src_schema, src_obj))
             if compat and compat.support_state != SUPPORT_STATE_SUPPORTED:
@@ -4325,6 +4395,18 @@ def classify_missing_objects(
                     action = "先改造依赖对象"
                 dependency = ",".join(sorted({n[0] for n in blocked_refs}))
 
+        if support_state == SUPPORT_STATE_UNSUPPORTED:
+            root_cause = _root_cause_label((src_full, obj_type_u))
+        elif support_state == SUPPORT_STATE_BLOCKED:
+            root_cause = _resolve_root_cause((src_full, obj_type_u))
+            if not root_cause and dependency and dependency != "-":
+                dep_full = dependency.split(",", 1)[0].upper()
+                root_cause = (
+                    _resolve_root_cause((dep_full, "TABLE"))
+                    or _resolve_root_cause((dep_full, "VIEW"))
+                    or f"{dep_full}(DEPENDENCY)"
+                )
+
         row = ObjectSupportReportRow(
             obj_type=obj_type_u,
             src_full=src_full,
@@ -4334,7 +4416,8 @@ def classify_missing_objects(
             reason=reason or ("-" if support_state == SUPPORT_STATE_SUPPORTED else ""),
             dependency=dependency or ("-" if support_state == SUPPORT_STATE_SUPPORTED else ""),
             action=action,
-            detail=detail or "-"
+            detail=detail or "-",
+            root_cause=root_cause or "-"
         )
         support_state_map[(obj_type_u, src_full)] = row
         missing_detail_rows.append(row)
@@ -4363,6 +4446,7 @@ def classify_missing_objects(
         if (src_schema.upper(), src_table.upper()) not in unsupported_table_keys:
             continue
         tgt_schema, _ = table_str.split('.', 1)
+        root_cause = _root_cause_label((f"{src_schema.upper()}.{src_table.upper()}", "TABLE"))
         for idx_name in sorted(item.missing_indexes):
             row = ObjectSupportReportRow(
                 obj_type="INDEX",
@@ -4373,7 +4457,8 @@ def classify_missing_objects(
                 reason="依赖不支持表",
                 dependency=table_str.upper(),
                 action="先改造依赖表",
-                detail="INDEX"
+                detail="INDEX",
+                root_cause=root_cause
             )
             unsupported_rows.append(row)
             extra_blocked_counts["INDEX"] += 1
@@ -4389,6 +4474,7 @@ def classify_missing_objects(
         if (src_schema.upper(), src_table.upper()) not in unsupported_table_keys:
             continue
         tgt_schema, _ = table_str.split('.', 1)
+        root_cause = _root_cause_label((f"{src_schema.upper()}.{src_table.upper()}", "TABLE"))
         for cons_name in sorted(item.missing_constraints):
             row = ObjectSupportReportRow(
                 obj_type="CONSTRAINT",
@@ -4399,7 +4485,8 @@ def classify_missing_objects(
                 reason="依赖不支持表",
                 dependency=table_str.upper(),
                 action="先改造依赖表",
-                detail="CONSTRAINT"
+                detail="CONSTRAINT",
+                root_cause=root_cause
             )
             unsupported_rows.append(row)
             extra_blocked_counts["CONSTRAINT"] += 1
@@ -4415,6 +4502,7 @@ def classify_missing_objects(
         if (src_schema.upper(), src_table.upper()) not in unsupported_table_keys:
             continue
         tgt_schema, _ = table_str.split('.', 1)
+        root_cause = _root_cause_label((f"{src_schema.upper()}.{src_table.upper()}", "TABLE"))
         for trg_name in sorted(item.missing_triggers):
             row = ObjectSupportReportRow(
                 obj_type="TRIGGER",
@@ -4425,15 +4513,116 @@ def classify_missing_objects(
                 reason="依赖不支持表",
                 dependency=table_str.upper(),
                 action="先改造依赖表",
-                detail="TRIGGER"
+                detail="TRIGGER",
+                root_cause=root_cause
             )
             unsupported_rows.append(row)
             extra_blocked_counts["TRIGGER"] += 1
+
+    extra_missing_rows: List[ObjectSupportReportRow] = []
+
+    def _add_extra_missing_row(
+        obj_type: str,
+        src_full: str,
+        tgt_full: str,
+        dependency: str,
+        detail: str
+    ) -> None:
+        extra_missing_rows.append(
+            ObjectSupportReportRow(
+                obj_type=obj_type,
+                src_full=src_full,
+                tgt_full=tgt_full,
+                support_state=SUPPORT_STATE_SUPPORTED,
+                reason_code="-",
+                reason="-",
+                dependency=dependency or "-",
+                action="FIXUP",
+                detail=detail or "-",
+                root_cause="-"
+            )
+        )
+
+    for item in extra_results.get('index_mismatched', []):
+        table_str = item.table.split()[0]
+        if '.' not in table_str:
+            continue
+        src_name = table_map.get(table_str)
+        if not src_name or '.' not in src_name:
+            continue
+        src_schema, src_table = src_name.split('.', 1)
+        if (src_schema.upper(), src_table.upper()) in unsupported_table_keys:
+            continue
+        tgt_schema, _ = table_str.split('.', 1)
+        for idx_name in sorted(item.missing_indexes):
+            _add_extra_missing_row(
+                "INDEX",
+                f"{src_schema.upper()}.{idx_name.upper()}",
+                f"{tgt_schema.upper()}.{idx_name.upper()}",
+                table_str.upper(),
+                "INDEX"
+            )
+
+    for item in extra_results.get('constraint_mismatched', []):
+        table_str = item.table.split()[0]
+        if '.' not in table_str:
+            continue
+        src_name = table_map.get(table_str)
+        if not src_name or '.' not in src_name:
+            continue
+        src_schema, src_table = src_name.split('.', 1)
+        if (src_schema.upper(), src_table.upper()) in unsupported_table_keys:
+            continue
+        tgt_schema, _ = table_str.split('.', 1)
+        for cons_name in sorted(item.missing_constraints):
+            _add_extra_missing_row(
+                "CONSTRAINT",
+                f"{src_schema.upper()}.{cons_name.upper()}",
+                f"{tgt_schema.upper()}.{cons_name.upper()}",
+                table_str.upper(),
+                "CONSTRAINT"
+            )
+
+    for item in extra_results.get('trigger_mismatched', []):
+        table_str = item.table.split()[0]
+        if '.' not in table_str:
+            continue
+        src_name = table_map.get(table_str)
+        if not src_name or '.' not in src_name:
+            continue
+        src_schema, src_table = src_name.split('.', 1)
+        if (src_schema.upper(), src_table.upper()) in unsupported_table_keys:
+            continue
+        tgt_schema, _ = table_str.split('.', 1)
+        for trg_name in sorted(item.missing_triggers):
+            _add_extra_missing_row(
+                "TRIGGER",
+                f"{src_schema.upper()}.{trg_name.upper()}",
+                f"{tgt_schema.upper()}.{trg_name.upper()}",
+                table_str.upper(),
+                "TRIGGER"
+            )
+
+    for item in extra_results.get('sequence_mismatched', []):
+        src_schema = (item.src_schema or "").upper()
+        tgt_schema = (item.tgt_schema or "").upper()
+        for seq_name in sorted(item.missing_sequences):
+            seq_u = (seq_name or "").upper()
+            if not seq_u:
+                continue
+            _add_extra_missing_row(
+                "SEQUENCE",
+                f"{src_schema}.{seq_u}" if src_schema else seq_u,
+                f"{tgt_schema}.{seq_u}" if tgt_schema else seq_u,
+                "-",
+                "SEQUENCE"
+            )
 
     return SupportClassificationResult(
         support_state_map=support_state_map,
         missing_detail_rows=missing_detail_rows,
         unsupported_rows=unsupported_rows,
+        extra_missing_rows=extra_missing_rows,
         missing_support_counts=dict(missing_support_counts),
         extra_blocked_counts=dict(extra_blocked_counts),
         unsupported_table_keys=unsupported_table_keys,
@@ -12599,42 +12788,6 @@ def compare_sequences_for_schema(
     src_schema: str,
     tgt_schema: str
 ) -> Tuple[bool, Optional[SequenceMismatch]]:
-    def _norm_flag(value: Optional[object]) -> Optional[str]:
-        if value is None:
-            return None
-        text = str(value).strip().upper()
-        if not text:
-            return None
-        if text in ("YES", "Y", "TRUE", "1"):
-            return "Y"
-        if text in ("NO", "N", "FALSE", "0"):
-            return "N"
-        return text
-
-    def _compare_attrs(src_attrs: Optional[Dict[str, object]], tgt_attrs: Optional[Dict[str, object]]) -> List[str]:
-        if not src_attrs or not tgt_attrs:
-            return []
-        diffs: List[str] = []
-        pairs = [
-            ("increment_by", "INCREMENT_BY", False),
-            ("min_value", "MIN_VALUE", False),
-            ("max_value", "MAX_VALUE", False),
-            ("cycle_flag", "CYCLE_FLAG", True),
-            ("order_flag", "ORDER_FLAG", True),
-            ("cache_size", "CACHE_SIZE", False),
-        ]
-        for key, label, is_flag in pairs:
-            s_val = src_attrs.get(key)
-            t_val = tgt_attrs.get(key)
-            if is_flag:
-                s_val = _norm_flag(s_val)
-                t_val = _norm_flag(t_val)
-            if s_val is None or t_val is None:
-                continue
-            if str(s_val) != str(t_val):
-                diffs.append(f"{label}: {s_val}->{t_val}")
-        return diffs
-
     src_seqs = oracle_meta.sequences.get(src_schema.upper())
     if src_seqs is None:
         log.warning(f"[序列检查] 未找到 {src_schema} 的 Oracle 序列元数据。")
@@ -12694,7 +12847,7 @@ def compare_sequences_for_schema(
                 extra_sequences=tgt_seqs_snapshot,
                 note=note,
                 missing_mappings=[],
-                detail_mismatch=[]
+                detail_mismatch=None
             )
         else:
             # 双方都没有序列，认为一致
@@ -12705,16 +12858,7 @@ def compare_sequences_for_schema(
 
     missing = src_seqs - tgt_seqs
     extra = tgt_seqs - src_seqs
-    detail_mismatch: List[str] = []
-    common = src_seqs & tgt_seqs
-    if common:
-        src_attrs_map = oracle_meta.sequence_attrs.get(src_schema.upper(), {})
-        tgt_attrs_map = ob_meta.sequence_attrs.get(tgt_schema.upper(), {})
-        for seq_name in sorted(common):
-            diffs = _compare_attrs(src_attrs_map.get(seq_name), tgt_attrs_map.get(seq_name))
-            if diffs:
-                detail_mismatch.append(f"{seq_name}: " + "; ".join(diffs))
-    all_good = (not missing) and (not extra) and (not detail_mismatch)
+    all_good = (not missing) and (not extra)
     if all_good:
         return True, None
     else:
@@ -12728,7 +12872,7 @@ def compare_sequences_for_schema(
                 (f"{src_schema.upper()}.{seq}", f"{tgt_schema.upper()}.{seq}")
                 for seq in sorted(missing)
             ],
-            detail_mismatch=detail_mismatch
+            detail_mismatch=None
         )
 
 
@@ -13273,55 +13417,9 @@ def check_extra_objects(
                 if tgt_name not in actual_tgt_names
             }
             extra_tgt = actual_tgt_names - all_expected_for_tgt
-            detail_mismatch: List[str] = []
-
-            src_attrs_map = oracle_meta.sequence_attrs.get(src_schema_u, {})
-            tgt_attrs_map = ob_meta.sequence_attrs.get(tgt_schema_u, {})
-            def _norm_flag(value: Optional[object]) -> Optional[str]:
-                if value is None:
-                    return None
-                text = str(value).strip().upper()
-                if not text:
-                    return None
-                if text in ("YES", "Y", "TRUE", "1"):
-                    return "Y"
-                if text in ("NO", "N", "FALSE", "0"):
-                    return "N"
-                return text
-
-            def _compare_attrs(src_attrs: Optional[Dict[str, object]], tgt_attrs: Optional[Dict[str, object]]) -> List[str]:
-                if not src_attrs or not tgt_attrs:
-                    return []
-                diffs: List[str] = []
-                pairs = [
-                    ("increment_by", "INCREMENT_BY", False),
-                    ("min_value", "MIN_VALUE", False),
-                    ("max_value", "MAX_VALUE", False),
-                    ("cycle_flag", "CYCLE_FLAG", True),
-                    ("order_flag", "ORDER_FLAG", True),
-                    ("cache_size", "CACHE_SIZE", False),
-                ]
-                for key, label, is_flag in pairs:
-                    s_val = src_attrs.get(key)
-                    t_val = tgt_attrs.get(key)
-                    if is_flag:
-                        s_val = _norm_flag(s_val)
-                        t_val = _norm_flag(t_val)
-                    if s_val is None or t_val is None:
-                        continue
-                    if str(s_val) != str(t_val):
-                        diffs.append(f"{label}: {s_val}->{t_val}")
-                return diffs
-
-            for src_name, tgt_name in entries:
-                if tgt_name not in actual_tgt_names:
-                    continue
-                diffs = _compare_attrs(src_attrs_map.get(src_name), tgt_attrs_map.get(tgt_name))
-                if diffs:
-                    detail_mismatch.append(f"{src_schema_u}.{src_name}->{tgt_schema_u}.{tgt_name}: " + "; ".join(diffs))
 
             mapping_label = f"{src_schema_u}->{tgt_schema_u}"
-            if not missing_src and not extra_tgt and not detail_mismatch:
+            if not missing_src and not extra_tgt:
                 extra_results["sequence_ok"].append(mapping_label)
             else:
                 missing_map = [
@@ -13336,7 +13434,7 @@ def check_extra_objects(
                     extra_sequences=extra_tgt,
                     note=None,
                     missing_mappings=missing_map,
-                    detail_mismatch=detail_mismatch
+                    detail_mismatch=None
                 ))
 
     extra_results = normalize_extra_results_names(extra_results)
@@ -16680,6 +16778,17 @@ def clean_semicolon_before_slash(ddl: str) -> str:
     return "\n".join(cleaned)
 
 
+def clean_long_types_in_table_ddl(ddl: str) -> str:
+    """
+    将 TABLE DDL 中的 LONG/LONG RAW 转换为 CLOB/BLOB。
+    """
+    if not ddl:
+        return ddl
+    ddl = re.sub(r'\bLONG\s+RAW\b', 'BLOB', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bLONG\b', 'CLOB', ddl, flags=re.IGNORECASE)
+    return ddl
+
+
 # DDL清理规则配置（更新为包含生产环境规则）
 DDL_CLEANUP_RULES = {
     # PL/SQL对象需要特殊的结尾处理和PRAGMA清理
@@ -16705,6 +16814,7 @@ DDL_CLEANUP_RULES = {
     'TABLE_OBJECTS': {
         'types': ['TABLE'],
         'rules': [
+            clean_long_types_in_table_ddl,
             clean_interval_partition_clause,
             clean_storage_clauses,
             clean_oracle_specific_syntax,
@@ -17809,12 +17919,13 @@ def generate_alter_for_table_columns(
     missing_cols: Set[str],
     extra_cols: Set[str],
     length_mismatches: List[ColumnLengthIssue],
-    type_mismatches: List[ColumnTypeIssue]
+    type_mismatches: List[ColumnTypeIssue],
+    drop_sys_c_columns: bool = False
 ) -> Optional[str]:
     """
     为一个具体的表生成 ALTER TABLE 脚本：
       - 对 missing_cols 生成 ADD COLUMN
-      - 对 extra_cols 生成注释掉的 DROP COLUMN 建议
+      - 对 extra_cols 生成注释掉的 DROP COLUMN 建议（可选对 SYS_C* 生成 FORCE）
       - 对 length_mismatches 生成 MODIFY COLUMN
       - 对 type_mismatches (LONG/LONG RAW、NUMBER 精度等) 生成 MODIFY COLUMN
     """
@@ -17986,12 +18097,19 @@ def generate_alter_for_table_columns(
                     f"-- WARNING: {col_name.upper()} 类型差异未自动修复 (源={src_type}, 目标={tgt_type})。"
                 )
 
-    # 多余列：DROP（注释掉，供人工评估）
+    # 多余列：DROP（默认注释掉，供人工评估；SYS_C* 可选 FORCE）
     if extra_cols:
         lines.append("")
-        lines.append("-- 目标端存在而源端不存在的列，以下 DROP COLUMN 为建议操作，请谨慎执行：")
+        sys_c_cols = {col for col in extra_cols if is_sys_c_column_name(col)}
+        if drop_sys_c_columns and sys_c_cols:
+            lines.append("-- 目标端存在而源端不存在的列：SYS_C* 无法 DROP，将通过 FORCE 清理。")
+            lines.append(f"ALTER TABLE {table_full} FORCE;")
+        else:
+            lines.append("-- 目标端存在而源端不存在的列，以下 DROP COLUMN 为建议操作，请谨慎执行：")
         for col in sorted(extra_cols):
             col_u = col.upper()
+            if drop_sys_c_columns and col in sys_c_cols:
+                continue
             lines.append(
                 f"-- ALTER TABLE {table_full} "
                 f"DROP COLUMN {col_u};"
@@ -19796,7 +19914,8 @@ def generate_fixup_scripts(
             missing_cols,
             extra_cols,
             length_mismatches,
-            type_mismatches
+            type_mismatches,
+            drop_sys_c_columns=bool(settings.get("fixup_drop_sys_c_columns", False)),
         )
         if alter_sql:
             alter_sql = prepend_set_schema(alter_sql, tgt_schema)
@@ -21218,6 +21337,16 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "降噪明细"
     if name.startswith("dependency_detail_"):
         return "DETAIL", "依赖关系差异明细"
+    if name.startswith("missing_") and "_detail_" in name:
+        match = re.match(r"missing_(.+)_detail_", name)
+        if match:
+            obj_type = match.group(1).replace("_", " ").upper()
+            return "DETAIL", f"缺失 {obj_type} 明细"
+    if name.startswith("unsupported_") and "_detail_" in name:
+        match = re.match(r"unsupported_(.+)_detail_", name)
+        if match:
+            obj_type = match.group(1).replace("_", " ").upper()
+            return "DETAIL", f"不支持/阻断 {obj_type} 明细"
     if name.startswith("report_index_"):
         return "AUX", "报告索引"
     return "AUX", "其他报告输出"
@@ -21327,6 +21456,110 @@ def export_unsupported_objects_detail(
         for row in rows_sorted
     ]
     return write_pipe_report("不支持/阻断对象明细", header_fields, data_rows, output_path)
+
+
+def export_missing_by_type(
+    rows: List[ObjectSupportReportRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Dict[str, Optional[Path]]:
+    """
+    按对象类型输出缺失且可修补的对象明细（支持但缺失）。
+    """
+    if not report_dir or not report_timestamp or not rows:
+        return {}
+    grouped: Dict[str, List[ObjectSupportReportRow]] = defaultdict(list)
+    for row in rows:
+        if row.support_state != SUPPORT_STATE_SUPPORTED:
+            continue
+        grouped[row.obj_type.upper()].append(row)
+    result: Dict[str, Optional[Path]] = {}
+    header_fields = [
+        "SRC_FULL",
+        "TYPE",
+        "TGT_FULL",
+        "STATE",
+        "REASON_CODE",
+        "REASON",
+        "DEPENDENCY",
+        "ACTION",
+        "DETAIL"
+    ]
+    for obj_type, items in sorted(grouped.items()):
+        if not items:
+            continue
+        type_lower = obj_type.lower().replace(" ", "_")
+        output_path = Path(report_dir) / f"missing_{type_lower}_detail_{report_timestamp}.txt"
+        rows_sorted = sorted(items, key=lambda r: (r.src_full, r.tgt_full))
+        data_rows = [
+            [
+                row.src_full,
+                row.obj_type,
+                row.tgt_full,
+                row.support_state,
+                row.reason_code,
+                row.reason,
+                row.dependency,
+                row.action,
+                row.detail
+            ]
+            for row in rows_sorted
+        ]
+        result[obj_type] = write_pipe_report(f"缺失 {obj_type} 明细", header_fields, data_rows, output_path)
+    return result
+
+
+def export_unsupported_by_type(
+    rows: List[ObjectSupportReportRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Dict[str, Optional[Path]]:
+    """
+    按对象类型输出不支持/阻断对象明细（含 ROOT_CAUSE）。
+    """
+    if not report_dir or not report_timestamp or not rows:
+        return {}
+    grouped: Dict[str, List[ObjectSupportReportRow]] = defaultdict(list)
+    for row in rows:
+        if row.support_state not in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED}:
+            continue
+        grouped[row.obj_type.upper()].append(row)
+    result: Dict[str, Optional[Path]] = {}
+    header_fields = [
+        "SRC_FULL",
+        "TYPE",
+        "TGT_FULL",
+        "STATE",
+        "REASON_CODE",
+        "REASON",
+        "DEPENDENCY",
+        "ACTION",
+        "DETAIL",
+        "ROOT_CAUSE"
+    ]
+    for obj_type, items in sorted(grouped.items()):
+        if not items:
+            continue
+        type_lower = obj_type.lower().replace(" ", "_")
+        output_path = Path(report_dir) / f"unsupported_{type_lower}_detail_{report_timestamp}.txt"
+        rows_sorted = sorted(items, key=lambda r: (r.support_state, r.src_full, r.tgt_full))
+        data_rows = [
+            [
+                row.src_full,
+                row.obj_type,
+                row.tgt_full,
+                row.support_state,
+                row.reason_code,
+                row.reason,
+                row.dependency,
+                row.action,
+                row.detail,
+                row.root_cause or "-"
+            ]
+            for row in rows_sorted
+        ]
+        result[obj_type] = write_pipe_report(f"不支持/阻断 {obj_type} 明细", header_fields, data_rows, output_path)
+    return result
 
 
 def export_constraints_unsupported_detail(
@@ -22942,6 +23175,7 @@ def print_final_report(
     support_counts = dict(support_summary.missing_support_counts) if support_summary else {}
     unsupported_rows = list(support_summary.unsupported_rows) if support_summary else []
     missing_detail_rows = list(support_summary.missing_detail_rows) if support_summary else []
+    extra_missing_rows = list(support_summary.extra_missing_rows) if support_summary else []
     extra_blocked_counts = dict(support_summary.extra_blocked_counts) if support_summary else {}
     unsupported_summary_counts = build_unsupported_summary_counts(support_summary, extra_results)
     blocked_index_rows = _filter_blocked_support_rows(unsupported_rows, "INDEX") if unsupported_rows else []
@@ -22951,6 +23185,10 @@ def print_final_report(
         row for row in missing_detail_rows
         if row.support_state == SUPPORT_STATE_SUPPORTED
     ]
+    combined_missing_rows = list(missing_detail_rows)
+    if extra_missing_rows:
+        combined_missing_rows.extend(extra_missing_rows)
+        missing_supported_rows.extend(extra_missing_rows)
     missing_supported_cnt = len(missing_supported_rows)
     unsupported_blocked_cnt = len([
         row for row in unsupported_rows
@@ -23255,6 +23493,9 @@ def print_final_report(
             )
             if report_ts:
                 detail_hint_lines.append(f"示例: missing_objects_detail_{report_ts}.txt")
+                detail_hint_lines.append(
+                    "按类型明细: missing_<type>_detail / unsupported_<type>_detail (详见 report_index)"
+                )
             if column_order_mismatch_cnt and report_ts:
                 detail_hint_lines.append(f"列顺序差异明细: column_order_mismatch_detail_{report_ts}.txt")
             if noise_suppressed_count and report_ts:
@@ -23755,7 +23996,11 @@ def print_final_report(
             index_entries.append(ReportIndexEntry(category, rel_path, row_text, description))
 
         _add_index_entry("REPORT", report_path, None, "主报告")
-        blacklisted_table_keys = set((blacklisted_missing_tables or {}).keys())
+        blacklisted_table_keys: Set[Tuple[str, str]] = set()
+        for key, entries in (blacklisted_missing_tables or {}).items():
+            if is_long_only_blacklist(entries):
+                continue
+            blacklisted_table_keys.add(key)
         export_dir = export_missing_table_view_mappings(
             tv_results,
             report_path.parent,
@@ -23796,6 +24041,8 @@ def print_final_report(
         missing_detail_path = None
         unsupported_detail_path = None
         migration_focus_path = None
+        missing_by_type_paths: Dict[str, Optional[Path]] = {}
+        unsupported_by_type_paths: Dict[str, Optional[Path]] = {}
         if emit_detail_files:
             missing_detail_path = export_missing_objects_detail(
                 missing_detail_rows,
@@ -23807,9 +24054,19 @@ def print_final_report(
                 report_path.parent,
                 report_ts
             )
+            missing_by_type_paths = export_missing_by_type(
+                combined_missing_rows,
+                report_path.parent,
+                report_ts
+            )
+            unsupported_by_type_paths = export_unsupported_by_type(
+                unsupported_rows,
+                report_path.parent,
+                report_ts
+            )
         if report_ts:
             migration_focus_path = export_migration_focus_report(
-                missing_detail_rows,
+                combined_missing_rows,
                 unsupported_rows,
                 report_path.parent,
                 report_ts
@@ -23826,6 +24083,33 @@ def print_final_report(
             len(unsupported_rows or []),
             "不支持/阻断对象明细"
         )
+        for obj_type, path in sorted(missing_by_type_paths.items()):
+            if not path:
+                continue
+            type_rows = [
+                row for row in (missing_detail_rows + extra_missing_rows)
+                if row.support_state == SUPPORT_STATE_SUPPORTED and row.obj_type.upper() == obj_type
+            ]
+            _add_index_entry(
+                "DETAIL",
+                path,
+                len(type_rows),
+                f"缺失 {obj_type} 明细"
+            )
+        for obj_type, path in sorted(unsupported_by_type_paths.items()):
+            if not path:
+                continue
+            type_rows = [
+                row for row in unsupported_rows
+                if row.support_state in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED}
+                and row.obj_type.upper() == obj_type
+            ]
+            _add_index_entry(
+                "DETAIL",
+                path,
+                len(type_rows),
+                f"不支持/阻断 {obj_type} 明细"
+            )
         _add_index_entry(
             "DETAIL",
             migration_focus_path,
@@ -24040,6 +24324,12 @@ def print_final_report(
                 log.info("缺失对象支持性明细已输出到: %s", missing_detail_path)
             if unsupported_detail_path:
                 log.info("不支持/阻断对象明细已输出到: %s", unsupported_detail_path)
+            if missing_by_type_paths:
+                for path in sorted(p for p in missing_by_type_paths.values() if p):
+                    log.info("缺失按类型明细已输出到: %s", path)
+            if unsupported_by_type_paths:
+                for path in sorted(p for p in unsupported_by_type_paths.values() if p):
+                    log.info("不支持按类型明细已输出到: %s", path)
             if index_unsupported_path:
                 log.info("索引不支持明细已输出到: %s", index_unsupported_path)
             if constraint_unsupported_path:
@@ -24122,6 +24412,7 @@ def parse_cli_args() -> argparse.Namespace:
             fixup_types             仅生成指定对象类型的订正 SQL（留空为全部，例如 TABLE,TRIGGER）
             fixup_idempotent_mode   修补脚本幂等模式 (off/guard/replace/drop_create)
             fixup_idempotent_types  幂等模式作用对象类型（逗号分隔，留空用默认）
+            fixup_drop_sys_c_columns 是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE (true/false)
             synonym_fixup_scope     同义词修补范围 (all/public_only，默认 all)
             trigger_list            仅生成指定触发器清单 (每行 SCHEMA.TRIGGER_NAME)
             trigger_qualify_schema  触发器 DDL 是否强制补全 schema 前缀 (true/false)

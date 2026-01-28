@@ -88,6 +88,8 @@
 
 修补脚本生成（Fixup）
 - generate_fixup：是否生成修补脚本。默认：true。
+- fixup_drop_sys_c_columns：是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE。默认：false。
+  说明：仅对“目标端多出来且列名匹配 SYS_C\\d+”的列生成 FORCE 清理；其余多余列仍保持注释建议。
 - generate_interval_partition_fixup：是否生成 interval 分区补齐脚本。默认：false。
 - interval_partition_cutoff：interval 分区补齐截止日期（YYYYMMDD）。默认：20280301。
 - interval_partition_cutoff_numeric：数值型 interval 分区补齐上限（仅数值分区键生效）。默认：空（不补齐数值 interval）。注意：必须为正数。
