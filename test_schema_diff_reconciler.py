@@ -3308,6 +3308,73 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn("TGT.POL_INFO", rewritten.upper())
         self.assertNotIn("TGT.T", rewritten.upper())
 
+    def test_remap_view_dependencies_realistic_alias_case(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW LIFEDATA.V_POL AS\n"
+            "SELECT t.FCD, t.FCU\n"
+            "FROM UWSDATA.POL_INFO T, LCSDATA.CHILD_REGION_CODE_SYNCH r1, "
+            "LCSDATA.REGION_CODE_TBL b1\n"
+            "WHERE t.lcd >= SYSDATE - 7\n"
+            "AND business_src IN ('D', 'W')"
+        )
+        full_mapping = {
+            "UWSDATA.POL_INFO": {"TABLE": "LIFEDATA.POL_INFO"},
+            "LCSDATA.CHILD_REGION_CODE_SYNCH": {"TABLE": "LIFEDATA.CHILD_REGION_CODE_SYNCH"},
+            "LCSDATA.REGION_CODE_TBL": {"TABLE": "LIFEDATA.REGION_CODE_TBL"},
+            "LIFEDATA.T": {"TABLE": "LIFEDATA.T"}
+        }
+        rewritten = sdr.remap_view_dependencies(
+            ddl,
+            "LIFEDATA",
+            "V_POL",
+            {},
+            full_mapping
+        )
+        upper = rewritten.upper()
+        self.assertIn("LIFEDATA.POL_INFO T", upper)
+        self.assertIn("LIFEDATA.CHILD_REGION_CODE_SYNCH R1", upper)
+        self.assertIn("LIFEDATA.REGION_CODE_TBL B1", upper)
+        self.assertNotIn("LIFEDATA.T", upper)
+
+    def test_remap_view_dependencies_unqualified_from_only(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW SRC.V AS\n"
+            "SELECT t.C1 FROM T1 t WHERE t.C1 > 0\n"
+        )
+        full_mapping = {"SRC.T1": {"TABLE": "TGT.T1"}}
+        rewritten = sdr.remap_view_dependencies(
+            ddl,
+            "SRC",
+            "V",
+            {},
+            full_mapping
+        )
+        upper = rewritten.upper()
+        self.assertIn("TGT.T1 T", upper)
+        self.assertIn("T.C1", upper)
+
+    def test_remap_view_dependencies_subquery_alias_kept(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW SRC.V AS\n"
+            "SELECT x.C1 FROM (SELECT * FROM T1) x JOIN T2 y ON x.ID = y.ID"
+        )
+        full_mapping = {
+            "SRC.T1": {"TABLE": "TGT.T1"},
+            "SRC.T2": {"TABLE": "TGT.T2"},
+            "SRC.X": {"TABLE": "TGT.X"}
+        }
+        rewritten = sdr.remap_view_dependencies(
+            ddl,
+            "SRC",
+            "V",
+            {},
+            full_mapping
+        )
+        upper = rewritten.upper()
+        self.assertIn("FROM (SELECT * FROM TGT.T1) X", upper)
+        self.assertIn("JOIN TGT.T2 Y", upper)
+        self.assertNotIn("TGT.X", upper)
+
     def test_clean_view_ddl_preserves_check_option_on_new_version(self):
         ddl = "CREATE OR REPLACE VIEW A.V AS SELECT 1 FROM DUAL WITH CHECK OPTION"
         cleaned = sdr.clean_view_ddl_for_oceanbase(ddl, ob_version="4.2.5.7")
