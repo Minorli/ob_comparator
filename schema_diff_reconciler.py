@@ -23981,8 +23981,6 @@ def print_final_report(
         )
         console.print(render_run_summary_panel(run_summary, section_width))
 
-    console.print(Panel.fit("[bold]报告结束[/bold]", style="title"))
-
     if report_file:
         report_path = Path(report_file)
         index_entries: List[ReportIndexEntry] = []
@@ -24377,6 +24375,8 @@ def print_final_report(
                 log.info("报告索引已输出到: %s", index_path)
         except OSError as exc:
             console.print(f"[missing]报告写入失败: {exc}")
+
+    console.print(Panel.fit("[bold]报告结束[/bold]", style="title"))
 
     return run_summary
 
