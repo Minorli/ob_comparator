@@ -15551,6 +15551,98 @@ def extract_view_dependencies(
     return dependencies
 
 
+def replace_unqualified_table_refs(
+    ddl: str,
+    replacements: Dict[str, str]
+) -> str:
+    """
+    仅在 FROM/JOIN/UPDATE/INTO/MERGE INTO 段落中替换未带 schema 的对象名。
+    避免误替换别名或 SELECT 列表中的同名标识符。
+    """
+    if not ddl or not replacements:
+        return ddl
+
+    masked = mask_sql_for_scan(ddl)
+    start_keywords = r'(?:FROM|JOIN|UPDATE|INTO|MERGE\s+INTO)'
+    stopper_keywords = [
+        'WHERE', 'GROUP', 'HAVING', 'ORDER', 'UNION', 'INTERSECT', 'MINUS', 'EXCEPT',
+        'START', 'CONNECT', 'MODEL', 'WINDOW', 'FETCH', 'OFFSET', 'FOR',
+        'ON', 'USING', 'LEFT', 'RIGHT', 'FULL', 'INNER', 'CROSS', 'NATURAL',
+        'SELECT', 'SET', 'VALUES', 'RETURNING', 'AS'
+    ]
+    stopper_pattern = r'\b(?:' + '|'.join(stopper_keywords) + r')\b'
+    combined_pattern = re.compile(rf'\b{start_keywords}\b', re.IGNORECASE)
+    stopper_regex = re.compile(stopper_pattern + r'|' + rf'\b{start_keywords}\b', re.IGNORECASE)
+
+    edits: List[Tuple[int, int, str]] = []
+
+    def _process_part(part_start: int, part_end: int, segment_offset: int) -> None:
+        j = part_start
+        while j < part_end and masked[segment_offset + j].isspace():
+            j += 1
+        if j >= part_end:
+            return
+        if masked[segment_offset + j] == '(':
+            return
+        k = j
+        while k < part_end:
+            ch = masked[segment_offset + k]
+            if ch.isspace() or ch == ',' or ch == ')':
+                break
+            k += 1
+        if k <= j:
+            return
+        token_raw = ddl[segment_offset + j:segment_offset + k]
+        norm = token_raw.strip().strip('"')
+        if not norm:
+            return
+        norm_u = norm.upper()
+        if '.' in norm_u or '@' in norm_u:
+            return
+        tgt = replacements.get(norm_u)
+        if not tgt:
+            return
+        edits.append((segment_offset + j, segment_offset + k, tgt))
+
+    current_pos = 0
+    while True:
+        match = combined_pattern.search(masked, current_pos)
+        if not match:
+            break
+        content_start = match.end()
+        stop_match = stopper_regex.search(masked, content_start)
+        if stop_match:
+            content_end = stop_match.start()
+            next_scan_pos = stop_match.start()
+        else:
+            content_end = len(masked)
+            next_scan_pos = len(masked)
+        segment = masked[content_start:content_end]
+        depth = 0
+        part_start = 0
+        for idx, ch in enumerate(segment):
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                if depth > 0:
+                    depth -= 1
+            elif ch == ',' and depth == 0:
+                _process_part(part_start, idx, content_start)
+                part_start = idx + 1
+        _process_part(part_start, len(segment), content_start)
+
+        current_pos = next_scan_pos
+        if current_pos <= match.start():
+            current_pos = match.end()
+
+    if not edits:
+        return ddl
+
+    for start, end, tgt in sorted(edits, key=lambda x: x[0], reverse=True):
+        ddl = ddl[:start] + tgt + ddl[end:]
+    return ddl
+
+
 def remap_view_dependencies(
     ddl: str, 
     view_schema: str,
@@ -15578,8 +15670,9 @@ def remap_view_dependencies(
         if fallback_deps:
             dependencies |= {d.upper() for d in fallback_deps}
 
-    # 构建替换映射（既替换全名，也替换同 schema 下无前缀引用）
-    replacements: Dict[str, str] = {}
+    # 构建替换映射（全名与无前缀引用分别处理）
+    replacements_qualified: Dict[str, str] = {}
+    replacements_unqualified: Dict[str, str] = {}
     view_schema_u = (view_schema or "").upper()
     synonym_meta = synonym_meta or {}
     preferred_types = ("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM", "FUNCTION")
@@ -15619,34 +15712,30 @@ def remap_view_dependencies(
         if not mapped_target:
             continue
         tgt_u = mapped_target.upper()
-        replacements[dep_u] = tgt_u
+        replacements_qualified[dep_u] = tgt_u
         if dep_schema == view_schema_u:
             # 无前缀引用也替换为全名(或目标名)，避免跨 schema 迁移后失效
-            replacements.setdefault(dep_obj, tgt_u)
+            replacements_unqualified.setdefault(dep_obj.upper(), tgt_u)
 
-    if not replacements:
+    if not replacements_qualified and not replacements_unqualified:
         return ddl
 
     # 使用 Masker 保护
     masker = SqlMasker(ddl)
     working_sql = masker.masked_sql
 
-    for src_ref in sorted(replacements.keys(), key=len, reverse=True):
-        tgt_ref = replacements[src_ref]
-        if '.' in src_ref:
-            pattern = re.compile(
-                rf'(?<![A-Z0-9_\$#"]){re.escape(src_ref)}(?![A-Z0-9_\$#"])',
-                re.IGNORECASE
-            )
-        else:
-            # Unqualified identifier: avoid replacing the tail of an already-qualified reference
-            pattern = re.compile(
-                rf'(?<![A-Z0-9_\$#"\.]){re.escape(src_ref)}(?![A-Z0-9_\$#"])',
-                re.IGNORECASE
-            )
+    for src_ref in sorted(replacements_qualified.keys(), key=len, reverse=True):
+        tgt_ref = replacements_qualified[src_ref]
+        pattern = re.compile(
+            rf'(?<![A-Z0-9_\$#"]){re.escape(src_ref)}(?![A-Z0-9_\$#"])',
+            re.IGNORECASE
+        )
         working_sql = pattern.sub(tgt_ref, working_sql)
 
-    return masker.unmask(working_sql)
+    rewritten = masker.unmask(working_sql)
+    if replacements_unqualified:
+        rewritten = replace_unqualified_table_refs(rewritten, replacements_unqualified)
+    return rewritten
 
 
 def remap_synonym_target(

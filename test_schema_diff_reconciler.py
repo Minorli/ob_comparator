@@ -3270,6 +3270,44 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertIn("X.T1", rewritten.upper())
 
+    def test_remap_view_dependencies_skips_alias_rewrite(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW SRC.V AS\n"
+            "SELECT t.FCD, t.FCU FROM SRC.POL_INFO T\n"
+        )
+        full_mapping = {
+            "SRC.POL_INFO": {"TABLE": "TGT.POL_INFO"},
+            "SRC.T": {"TABLE": "TGT.T"}
+        }
+        rewritten = sdr.remap_view_dependencies(
+            ddl,
+            "SRC",
+            "V",
+            {},
+            full_mapping
+        )
+        self.assertIn("TGT.POL_INFO T", rewritten.upper())
+        self.assertNotIn("TGT.T", rewritten.upper())
+
+    def test_remap_view_dependencies_skips_derived_alias(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW SRC.V AS\n"
+            "SELECT t.FCD FROM (SELECT * FROM SRC.POL_INFO) T\n"
+        )
+        full_mapping = {
+            "SRC.POL_INFO": {"TABLE": "TGT.POL_INFO"},
+            "SRC.T": {"TABLE": "TGT.T"}
+        }
+        rewritten = sdr.remap_view_dependencies(
+            ddl,
+            "SRC",
+            "V",
+            {},
+            full_mapping
+        )
+        self.assertIn("TGT.POL_INFO", rewritten.upper())
+        self.assertNotIn("TGT.T", rewritten.upper())
+
     def test_clean_view_ddl_preserves_check_option_on_new_version(self):
         ddl = "CREATE OR REPLACE VIEW A.V AS SELECT 1 FROM DUAL WITH CHECK OPTION"
         cleaned = sdr.clean_view_ddl_for_oceanbase(ddl, ob_version="4.2.5.7")
