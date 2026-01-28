@@ -228,6 +228,11 @@ view_compat_rules_path  =
 #   block -> 遇到 @ 视为不支持
 #   allow -> 允许 DBLINK
 view_dblink_policy      = block
+# VIEW 列清单约束清洗策略：
+#   auto  -> 仅清洗 RELY DISABLE / DISABLE / NOVALIDATE
+#   force -> 强制清洗所有列清单约束
+#   off   -> 不清洗（视为不支持）
+view_constraint_cleanup = auto
 # 是否清洗 PL/SQL DDL 中的全角标点（默认开启，避免目标端解析失败）
 ddl_punct_sanitize      = true
 # DDL hint 清洗策略:

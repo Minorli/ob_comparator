@@ -367,6 +367,14 @@ class ViewCompatResult(NamedTuple):
     rewrite_notes: List[str]
 
 
+class ViewConstraintReportRow(NamedTuple):
+    view_full: str
+    mode: str
+    action: str
+    reason: str
+    constraints: str
+
+
 class SupportClassificationResult(NamedTuple):
     support_state_map: Dict[Tuple[str, str], ObjectSupportReportRow]
     missing_detail_rows: List[ObjectSupportReportRow]
@@ -377,6 +385,8 @@ class SupportClassificationResult(NamedTuple):
     unsupported_table_keys: Set[Tuple[str, str]]
     unsupported_view_keys: Set[Tuple[str, str]]
     view_compat_map: Dict[Tuple[str, str], ViewCompatResult]
+    view_constraint_cleaned_rows: List[ViewConstraintReportRow]
+    view_constraint_uncleanable_rows: List[ViewConstraintReportRow]
 
 
 class IntervalPartitionInfo(NamedTuple):
@@ -724,6 +734,16 @@ VIEW_UNSUPPORTED_PATTERNS: Tuple[str, ...] = (
     r'(?<!\w)"?SYS"?\s*\.\s*"?OBJ\$"?(?!\w)',
 )
 VIEW_DBLINK_POLICIES: Set[str] = {"block", "allow"}
+VIEW_CONSTRAINT_CLEANUP_VALUES: Set[str] = {"auto", "force", "off"}
+VIEW_CONSTRAINT_CLEANUP_ALIASES = {
+    "on": "auto",
+    "true": "auto",
+    "yes": "auto",
+    "1": "auto",
+    "disable": "off",
+    "false": "off",
+    "0": "off",
+}
 
 # 主对象中除 TABLE 外均做存在性验证
 PRIMARY_EXISTENCE_ONLY_TYPES: Tuple[str, ...] = tuple(
@@ -1999,6 +2019,17 @@ def normalize_view_dblink_policy(raw_value: Optional[str]) -> str:
     return value
 
 
+def normalize_view_constraint_cleanup(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "auto"
+    value = str(raw_value).strip().lower()
+    value = VIEW_CONSTRAINT_CLEANUP_ALIASES.get(value, value)
+    if value not in VIEW_CONSTRAINT_CLEANUP_VALUES:
+        log.warning("view_constraint_cleanup=%s 不在支持范围内，将回退为 auto。", raw_value)
+        return "auto"
+    return value
+
+
 def load_view_compat_rules(path_value: Optional[str]) -> Dict[str, object]:
     rules = {
         "unsupported_views": set(VIEW_UNSUPPORTED_DEFAULT_VIEWS),
@@ -2792,6 +2823,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('sqlcl_profile_path', '')
         settings.setdefault('view_compat_rules_path', '')
         settings.setdefault('view_dblink_policy', 'block')
+        settings.setdefault('view_constraint_cleanup', 'auto')
         settings.setdefault('column_visibility_policy', 'auto')
         settings.setdefault('dbcat_chunk_size', '150')
         settings.setdefault('fixup_workers', '')
@@ -2946,6 +2978,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         )
         settings['view_dblink_policy'] = normalize_view_dblink_policy(
             settings.get('view_dblink_policy', 'block')
+        )
+        settings['view_constraint_cleanup'] = normalize_view_constraint_cleanup(
+            settings.get('view_constraint_cleanup', 'auto')
         )
         settings['view_compat_rules'] = load_view_compat_rules(
             settings.get('view_compat_rules_path', '')
@@ -3296,6 +3331,14 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "仅支持 block/allow"
 
+    def _validate_view_constraint_cleanup(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = VIEW_CONSTRAINT_CLEANUP_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in VIEW_CONSTRAINT_CLEANUP_VALUES:
+            return True, ""
+        return False, "仅支持 auto/force/off"
+
     def _validate_ddl_format_fail_policy(val: str) -> Tuple[bool, str]:
         if not val.strip():
             return True, ""
@@ -3636,6 +3679,14 @@ def run_config_wizard(config_path: Path) -> None:
         default=cfg.get("SETTINGS", "view_dblink_policy", fallback="block"),
         validator=_validate_view_dblink_policy,
         transform=normalize_view_dblink_policy,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "view_constraint_cleanup",
+        "VIEW 列清单约束清洗策略 (auto/force/off)",
+        default=cfg.get("SETTINGS", "view_constraint_cleanup", fallback="auto"),
+        validator=_validate_view_constraint_cleanup,
+        transform=normalize_view_constraint_cleanup,
     )
     _prompt_field(
         "SETTINGS",
@@ -4181,6 +4232,8 @@ def classify_missing_objects(
     extra_blocked_counts: Dict[str, int] = defaultdict(int)
     unsupported_table_keys: Set[Tuple[str, str]] = set()
     unsupported_view_keys: Set[Tuple[str, str]] = set()
+    view_constraint_cleaned_rows: List[ViewConstraintReportRow] = []
+    view_constraint_uncleanable_rows: List[ViewConstraintReportRow] = []
 
     view_compat_map: Dict[Tuple[str, str], ViewCompatResult] = {}
     invalid_nodes: Set[DependencyNode] = set()
@@ -4188,6 +4241,7 @@ def classify_missing_objects(
 
     view_rules = settings.get("view_compat_rules") or {}
     dblink_policy = settings.get("view_dblink_policy", "block")
+    view_constraint_mode = settings.get("view_constraint_cleanup", "auto")
 
     missing_items = tv_results.get("missing", []) or []
     missing_views: List[Tuple[str, str]] = []
@@ -4221,11 +4275,45 @@ def classify_missing_objects(
 
     for schema, view_name in missing_views:
         ddl = view_ddl_map.get((schema, view_name))
-        view_compat_map[(schema, view_name)] = analyze_view_compatibility(
-            ddl,
+        cleanup_result = apply_view_constraint_cleanup(ddl or "", view_constraint_mode)
+        ddl_for_analysis = cleanup_result.cleaned_ddl if ddl else ddl
+        compat = analyze_view_compatibility(
+            ddl_for_analysis,
             view_rules,
             dblink_policy
         )
+        if cleanup_result.action == VIEW_CONSTRAINT_ACTION_CLEANED:
+            compat = compat._replace(
+                cleaned_ddl=compat.cleaned_ddl,
+                rewrite_notes=compat.rewrite_notes + ["VIEW_CONSTRAINT_CLEANED"]
+            )
+            view_constraint_cleaned_rows.append(
+                ViewConstraintReportRow(
+                    view_full=f"{schema.upper()}.{view_name.upper()}",
+                    mode=view_constraint_mode,
+                    action=cleanup_result.action,
+                    reason=cleanup_result.reason,
+                    constraints=cleanup_result.detail or "; ".join(cleanup_result.constraints)
+                )
+            )
+        elif cleanup_result.action == VIEW_CONSTRAINT_ACTION_UNCLEANABLE:
+            view_constraint_uncleanable_rows.append(
+                ViewConstraintReportRow(
+                    view_full=f"{schema.upper()}.{view_name.upper()}",
+                    mode=view_constraint_mode,
+                    action=cleanup_result.action,
+                    reason=cleanup_result.reason,
+                    constraints=cleanup_result.detail or "; ".join(cleanup_result.constraints)
+                )
+            )
+            if compat.support_state == SUPPORT_STATE_SUPPORTED:
+                compat = compat._replace(
+                    support_state=SUPPORT_STATE_UNSUPPORTED,
+                    reason_code="VIEW_CONSTRAINT_UNCLEANABLE",
+                    reason="视图列清单约束无法清洗",
+                    detail=cleanup_result.detail or "VIEW_CONSTRAINT"
+                )
+        view_compat_map[(schema, view_name)] = compat
 
     for (owner, name, obj_type), status in (oracle_meta.object_statuses or {}).items():
         obj_type_u = (obj_type or "").upper()
@@ -4627,7 +4715,9 @@ def classify_missing_objects(
         extra_blocked_counts=dict(extra_blocked_counts),
         unsupported_table_keys=unsupported_table_keys,
         unsupported_view_keys=unsupported_view_keys,
-        view_compat_map=view_compat_map
+        view_compat_map=view_compat_map,
+        view_constraint_cleaned_rows=view_constraint_cleaned_rows,
+        view_constraint_uncleanable_rows=view_constraint_uncleanable_rows
     )
 
 
@@ -14947,6 +15037,321 @@ def sanitize_view_ddl(ddl: str, column_names: Optional[Set[str]] = None) -> str:
     return cleaned
 
 
+def mask_sql_for_scan(sql: str) -> str:
+    """
+    将 SQL 中的字符串/注释替换为空格，以便进行关键字/括号扫描。
+    保持原长度，确保索引位置可复用。
+    """
+    if not sql:
+        return sql
+    chars = list(sql)
+    i = 0
+    in_single = False
+    in_double = False
+    in_line_comment = False
+    in_block_comment = False
+    length = len(chars)
+    while i < length:
+        ch = chars[i]
+        nxt = chars[i + 1] if i + 1 < length else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            else:
+                chars[i] = " "
+            i += 1
+            continue
+        if in_block_comment:
+            chars[i] = " "
+            if ch == "*" and nxt == "/":
+                chars[i + 1] = " "
+                i += 2
+                in_block_comment = False
+                continue
+            i += 1
+            continue
+        if in_single:
+            chars[i] = " "
+            if ch == "'" and nxt == "'":
+                chars[i + 1] = " "
+                i += 2
+                continue
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            chars[i] = " "
+            if ch == '"' and nxt == '"':
+                chars[i + 1] = " "
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "-" and nxt == "-":
+            chars[i] = " "
+            chars[i + 1] = " "
+            i += 2
+            in_line_comment = True
+            continue
+        if ch == "/" and nxt == "*":
+            chars[i] = " "
+            chars[i + 1] = " "
+            i += 2
+            in_block_comment = True
+            continue
+        if ch == "'":
+            chars[i] = " "
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            chars[i] = " "
+            in_double = True
+            i += 1
+            continue
+        i += 1
+    return "".join(chars)
+
+
+def locate_view_column_list_span(ddl: str) -> Optional[Tuple[int, int]]:
+    """
+    定位 CREATE VIEW (...) AS 语句中列清单的起止位置（不含括号）。
+    若不存在列清单则返回 None。
+    """
+    if not ddl:
+        return None
+    masked = mask_sql_for_scan(ddl)
+    create_match = re.search(r"\bCREATE\b", masked, flags=re.IGNORECASE)
+    if not create_match:
+        return None
+    view_match = re.search(r"\bVIEW\b", masked[create_match.end():], flags=re.IGNORECASE)
+    if not view_match:
+        return None
+    view_pos = create_match.end() + view_match.start()
+    as_match = re.search(r"\bAS\b", masked[view_pos:], flags=re.IGNORECASE)
+    if not as_match:
+        return None
+    as_pos = view_pos + as_match.start()
+    open_pos = masked.find("(", view_pos, as_pos)
+    if open_pos == -1:
+        return None
+    depth = 0
+    close_pos = None
+    for idx in range(open_pos, as_pos):
+        ch = masked[idx]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                close_pos = idx
+                break
+    if close_pos is None:
+        return None
+    return open_pos + 1, close_pos
+
+
+def split_sql_list_items(segment: str) -> List[str]:
+    if not segment:
+        return []
+    items: List[str] = []
+    buf: List[str] = []
+    depth = 0
+    in_single = False
+    in_double = False
+    i = 0
+    length = len(segment)
+    while i < length:
+        ch = segment[i]
+        nxt = segment[i + 1] if i + 1 < length else ""
+        if in_single:
+            buf.append(ch)
+            if ch == "'" and nxt == "'":
+                buf.append(nxt)
+                i += 2
+                continue
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            buf.append(ch)
+            if ch == '"' and nxt == '"':
+                buf.append(nxt)
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth > 0:
+                depth -= 1
+        if ch == "," and depth == 0:
+            item = "".join(buf).strip()
+            if item:
+                items.append(item)
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        items.append(tail)
+    return items
+
+
+def is_view_constraint_item(item: str) -> bool:
+    if not item:
+        return False
+    head = item.lstrip()
+    if not head:
+        return False
+    return bool(re.match(r'^(CONSTRAINT|PRIMARY|UNIQUE|CHECK)\b', head, flags=re.IGNORECASE))
+
+
+def _summarize_view_constraint_item(item: str) -> str:
+    summary = re.sub(r'\s+', ' ', item.strip())
+    if len(summary) > 200:
+        return summary[:197] + "..."
+    return summary
+
+
+def _detect_view_constraint_state(item: str) -> Tuple[bool, str]:
+    upper = re.sub(r'\s+', ' ', item.strip()).upper()
+    if "ENABLE" in upper and "DISABLE" not in upper:
+        return False, "ENABLE"
+    if "DISABLE" in upper:
+        return True, "DISABLE"
+    if "NOVALIDATE" in upper:
+        return True, "NOVALIDATE"
+    return False, "AMBIGUOUS"
+
+
+class ViewConstraintCleanupResult(NamedTuple):
+    action: str
+    reason: str
+    detail: str
+    constraints: List[str]
+    cleaned_ddl: str
+
+
+VIEW_CONSTRAINT_ACTION_NONE = "NONE"
+VIEW_CONSTRAINT_ACTION_CLEANED = "CLEANED"
+VIEW_CONSTRAINT_ACTION_UNCLEANABLE = "UNCLEANABLE"
+
+
+def apply_view_constraint_cleanup(
+    ddl: str,
+    mode: str
+) -> ViewConstraintCleanupResult:
+    if not ddl:
+        return ViewConstraintCleanupResult(
+            action=VIEW_CONSTRAINT_ACTION_NONE,
+            reason="",
+            detail="",
+            constraints=[],
+            cleaned_ddl=ddl
+        )
+    mode = normalize_view_constraint_cleanup(mode)
+    span = locate_view_column_list_span(ddl)
+    if not span:
+        return ViewConstraintCleanupResult(
+            action=VIEW_CONSTRAINT_ACTION_NONE,
+            reason="",
+            detail="",
+            constraints=[],
+            cleaned_ddl=ddl
+        )
+    start, end = span
+    column_list = ddl[start:end]
+    items = split_sql_list_items(column_list)
+    if not items:
+        return ViewConstraintCleanupResult(
+            action=VIEW_CONSTRAINT_ACTION_NONE,
+            reason="",
+            detail="",
+            constraints=[],
+            cleaned_ddl=ddl
+        )
+    constraint_items = [item for item in items if is_view_constraint_item(item)]
+    if not constraint_items:
+        return ViewConstraintCleanupResult(
+            action=VIEW_CONSTRAINT_ACTION_NONE,
+            reason="",
+            detail="",
+            constraints=[],
+            cleaned_ddl=ddl
+        )
+    constraints_summary = [_summarize_view_constraint_item(item) for item in constraint_items]
+    cleanable = True
+    state_labels: List[str] = []
+    for item in constraint_items:
+        ok, state = _detect_view_constraint_state(item)
+        state_labels.append(state)
+        if not ok:
+            cleanable = False
+    detail = "; ".join(
+        f"{state}:{summary}" for state, summary in zip(state_labels, constraints_summary)
+    )
+    if mode == "off":
+        return ViewConstraintCleanupResult(
+            action=VIEW_CONSTRAINT_ACTION_UNCLEANABLE,
+            reason="view_constraint_cleanup=off",
+            detail=detail,
+            constraints=constraints_summary,
+            cleaned_ddl=ddl
+        )
+    if mode == "auto" and not cleanable:
+        return ViewConstraintCleanupResult(
+            action=VIEW_CONSTRAINT_ACTION_UNCLEANABLE,
+            reason="存在 ENABLE 或无法判断状态的约束",
+            detail=detail,
+            constraints=constraints_summary,
+            cleaned_ddl=ddl
+        )
+    kept_items = [item for item in items if not is_view_constraint_item(item)]
+    if not kept_items:
+        return ViewConstraintCleanupResult(
+            action=VIEW_CONSTRAINT_ACTION_UNCLEANABLE,
+            reason="清洗后列清单为空",
+            detail=detail,
+            constraints=constraints_summary,
+            cleaned_ddl=ddl
+        )
+    indent = ""
+    for line in column_list.splitlines():
+        if line.strip():
+            indent = line[:len(line) - len(line.lstrip())]
+            break
+    joiner = ",\n" + indent if indent else ", "
+    rebuilt = (indent + joiner.join(item.strip() for item in kept_items)).rstrip()
+    cleaned_ddl = ddl[:start] + rebuilt + ddl[end:]
+    return ViewConstraintCleanupResult(
+        action=VIEW_CONSTRAINT_ACTION_CLEANED,
+        reason="force" if mode == "force" else "auto",
+        detail=detail,
+        constraints=constraints_summary,
+        cleaned_ddl=cleaned_ddl
+    )
+
+
 def analyze_view_compatibility(
     ddl: Optional[str],
     rules: Dict[str, object],
@@ -21309,6 +21714,10 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "缺失对象支持性明细"
     if name.startswith("unsupported_objects_detail_"):
         return "DETAIL", "不支持/阻断对象明细"
+    if name.startswith("view_constraint_cleaned_detail_"):
+        return "DETAIL", "VIEW 列清单约束清洗明细"
+    if name.startswith("view_constraint_uncleanable_detail_"):
+        return "DETAIL", "VIEW 列清单约束无法清洗明细"
     if name.startswith("indexes_unsupported_detail_"):
         return "DETAIL", "索引语法不支持明细(仅DESC)"
     if name.startswith("indexes_blocked_detail_"):
@@ -21456,6 +21865,40 @@ def export_unsupported_objects_detail(
         for row in rows_sorted
     ]
     return write_pipe_report("不支持/阻断对象明细", header_fields, data_rows, output_path)
+
+
+def export_view_constraint_cleaned_detail(
+    rows: List[ViewConstraintReportRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not rows or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"view_constraint_cleaned_detail_{report_timestamp}.txt"
+    rows_sorted = sorted(rows, key=lambda r: (r.view_full, r.mode))
+    header_fields = ["VIEW", "MODE", "ACTION", "REASON", "CONSTRAINTS"]
+    data_rows = [
+        [row.view_full, row.mode, row.action, row.reason, row.constraints]
+        for row in rows_sorted
+    ]
+    return write_pipe_report("VIEW 列清单约束清洗明细", header_fields, data_rows, output_path)
+
+
+def export_view_constraint_uncleanable_detail(
+    rows: List[ViewConstraintReportRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not rows or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"view_constraint_uncleanable_detail_{report_timestamp}.txt"
+    rows_sorted = sorted(rows, key=lambda r: (r.view_full, r.mode))
+    header_fields = ["VIEW", "MODE", "ACTION", "REASON", "CONSTRAINTS"]
+    data_rows = [
+        [row.view_full, row.mode, row.action, row.reason, row.constraints]
+        for row in rows_sorted
+    ]
+    return write_pipe_report("VIEW 列清单约束无法清洗明细", header_fields, data_rows, output_path)
 
 
 def export_missing_by_type(
@@ -23177,6 +23620,8 @@ def print_final_report(
     missing_detail_rows = list(support_summary.missing_detail_rows) if support_summary else []
     extra_missing_rows = list(support_summary.extra_missing_rows) if support_summary else []
     extra_blocked_counts = dict(support_summary.extra_blocked_counts) if support_summary else {}
+    view_constraint_cleaned_rows = list(support_summary.view_constraint_cleaned_rows) if support_summary else []
+    view_constraint_uncleanable_rows = list(support_summary.view_constraint_uncleanable_rows) if support_summary else []
     unsupported_summary_counts = build_unsupported_summary_counts(support_summary, extra_results)
     blocked_index_rows = _filter_blocked_support_rows(unsupported_rows, "INDEX") if unsupported_rows else []
     blocked_constraint_rows = _filter_blocked_support_rows(unsupported_rows, "CONSTRAINT") if unsupported_rows else []
@@ -23380,6 +23825,21 @@ def print_final_report(
         comment_text.append(f"{comment_mis_cnt}")
     summary_table.add_row("[bold]注释一致性[/bold]", comment_text)
 
+    if view_constraint_cleaned_rows or view_constraint_uncleanable_rows:
+        vc_text = Text()
+        vc_text.append("清洗: ", style="info")
+        vc_text.append(str(len(view_constraint_cleaned_rows)), style="info")
+        vc_text.append("\n无法清洗: ", style="mismatch")
+        vc_text.append(str(len(view_constraint_uncleanable_rows)), style="mismatch")
+        if emit_detail_files and report_ts:
+            vc_text.append("\n详见: ", style="info")
+            vc_text.append(
+                f"view_constraint_cleaned_detail_{report_ts}.txt / "
+                f"view_constraint_uncleanable_detail_{report_ts}.txt",
+                style="info"
+            )
+        summary_table.add_row("[bold]VIEW 约束清洗[/bold]", vc_text)
+
     if column_order_mismatch_cnt:
         order_text = Text()
         order_text.append("差异: ", style="mismatch")
@@ -23510,6 +23970,16 @@ def print_final_report(
             suffix = f"_{report_ts}" if report_ts else ""
             detail_hint_lines.append(
                 f"约束语法不支持明细(DEFERRABLE等): constraints_unsupported_detail{suffix}.txt"
+            )
+        if view_constraint_cleaned_rows:
+            suffix = f"_{report_ts}" if report_ts else ""
+            detail_hint_lines.append(
+                f"VIEW 约束清洗明细: view_constraint_cleaned_detail{suffix}.txt"
+            )
+        if view_constraint_uncleanable_rows:
+            suffix = f"_{report_ts}" if report_ts else ""
+            detail_hint_lines.append(
+                f"VIEW 约束无法清洗明细: view_constraint_uncleanable_detail{suffix}.txt"
             )
         if emit_detail_files and report_ts:
             if blocked_index_rows:
@@ -24040,6 +24510,8 @@ def print_final_report(
         missing_detail_path = None
         unsupported_detail_path = None
         migration_focus_path = None
+        view_constraint_cleaned_path = None
+        view_constraint_uncleanable_path = None
         missing_by_type_paths: Dict[str, Optional[Path]] = {}
         unsupported_by_type_paths: Dict[str, Optional[Path]] = {}
         if emit_detail_files:
@@ -24050,6 +24522,16 @@ def print_final_report(
             )
             unsupported_detail_path = export_unsupported_objects_detail(
                 unsupported_rows,
+                report_path.parent,
+                report_ts
+            )
+            view_constraint_cleaned_path = export_view_constraint_cleaned_detail(
+                view_constraint_cleaned_rows,
+                report_path.parent,
+                report_ts
+            )
+            view_constraint_uncleanable_path = export_view_constraint_uncleanable_detail(
+                view_constraint_uncleanable_rows,
                 report_path.parent,
                 report_ts
             )
@@ -24081,6 +24563,18 @@ def print_final_report(
             unsupported_detail_path,
             len(unsupported_rows or []),
             "不支持/阻断对象明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            view_constraint_cleaned_path,
+            len(view_constraint_cleaned_rows or []),
+            "VIEW 列清单约束清洗明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            view_constraint_uncleanable_path,
+            len(view_constraint_uncleanable_rows or []),
+            "VIEW 列清单约束无法清洗明细"
         )
         for obj_type, path in sorted(missing_by_type_paths.items()):
             if not path:
@@ -24422,6 +24916,7 @@ def parse_cli_args() -> argparse.Namespace:
             report_dir_layout       报告目录布局 (flat/per_run)
             view_compat_rules_path  VIEW 兼容规则 JSON (可选)
             view_dblink_policy      VIEW DBLINK 处理策略 (block/allow)
+            view_constraint_cleanup VIEW 列清单约束清洗策略 (auto/force/off)
             column_visibility_policy 列可见性(INVISIBLE)处理策略 (auto/enforce/ignore)
             ddl_format_enable       true/false 启用 SQLcl DDL 格式化
             ddl_format_types        DDL 格式化对象类型列表（逗号分隔）
@@ -24452,6 +24947,8 @@ def parse_cli_args() -> argparse.Namespace:
           main_reports/run_<ts>/ddl_format_report_<ts>.txt SQLcl DDL 格式化报告 (ddl_format_enable=true)
           main_reports/run_<ts>/missing_objects_detail_<ts>.txt 缺失对象支持性明细 (report_detail_mode=split)
           main_reports/run_<ts>/unsupported_objects_detail_<ts>.txt 不支持/阻断对象明细 (report_detail_mode=split)
+          main_reports/run_<ts>/view_constraint_cleaned_detail_<ts>.txt VIEW 列清单约束清洗明细 (report_detail_mode=split)
+          main_reports/run_<ts>/view_constraint_uncleanable_detail_<ts>.txt VIEW 列清单约束无法清洗明细 (report_detail_mode=split)
           main_reports/run_<ts>/extra_mismatch_detail_<ts>.txt 扩展对象差异明细 (report_detail_mode=split)
           main_reports/run_<ts>/missing_<TYPE>_detail_<ts>.txt 按类型缺失明细 (report_detail_mode=split)
           main_reports/run_<ts>/unsupported_<TYPE>_detail_<ts>.txt 按类型不支持/阻断明细 (含 ROOT_CAUSE)

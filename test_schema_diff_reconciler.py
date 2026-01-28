@@ -3299,6 +3299,57 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         cleaned = sdr.clean_view_ddl_for_oceanbase(ddl, ob_version="4.2.5.7")
         self.assertNotIn("CONSTRAINT", cleaned.upper())
 
+    def test_view_constraint_cleanup_auto_cleanable(self):
+        ddl = (
+            "CREATE OR REPLACE FORCE VIEW A.V\n"
+            "(\n"
+            "  C1,\n"
+            "  C2,\n"
+            "  CONSTRAINT PK_V PRIMARY KEY (C1) RELY DISABLE\n"
+            ") AS SELECT 1 C1, 2 C2 FROM DUAL"
+        )
+        result = sdr.apply_view_constraint_cleanup(ddl, "auto")
+        self.assertEqual(result.action, sdr.VIEW_CONSTRAINT_ACTION_CLEANED)
+        self.assertNotIn("CONSTRAINT", result.cleaned_ddl.upper())
+        self.assertIn("C1", result.cleaned_ddl.upper())
+        self.assertIn("C2", result.cleaned_ddl.upper())
+
+    def test_view_constraint_cleanup_auto_uncleanable(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW A.V\n"
+            "(\n"
+            "  C1,\n"
+            "  CONSTRAINT PK_V PRIMARY KEY (C1) ENABLE\n"
+            ") AS SELECT 1 C1 FROM DUAL"
+        )
+        result = sdr.apply_view_constraint_cleanup(ddl, "auto")
+        self.assertEqual(result.action, sdr.VIEW_CONSTRAINT_ACTION_UNCLEANABLE)
+        self.assertIn("CONSTRAINT", result.cleaned_ddl.upper())
+
+    def test_view_constraint_cleanup_force(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW A.V\n"
+            "(\n"
+            "  C1,\n"
+            "  CONSTRAINT PK_V PRIMARY KEY (C1) ENABLE\n"
+            ") AS SELECT 1 C1 FROM DUAL"
+        )
+        result = sdr.apply_view_constraint_cleanup(ddl, "force")
+        self.assertEqual(result.action, sdr.VIEW_CONSTRAINT_ACTION_CLEANED)
+        self.assertNotIn("CONSTRAINT", result.cleaned_ddl.upper())
+
+    def test_view_constraint_cleanup_off(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW A.V\n"
+            "(\n"
+            "  C1,\n"
+            "  CONSTRAINT PK_V PRIMARY KEY (C1) RELY DISABLE\n"
+            ") AS SELECT 1 C1 FROM DUAL"
+        )
+        result = sdr.apply_view_constraint_cleanup(ddl, "off")
+        self.assertEqual(result.action, sdr.VIEW_CONSTRAINT_ACTION_UNCLEANABLE)
+        self.assertIn("CONSTRAINT", result.cleaned_ddl.upper())
+
     def test_normalize_ddl_for_ob_removes_using_index_name(self):
         ddl = (
             'ALTER TABLE "A"."T1" ADD CONSTRAINT "C1" UNIQUE ("C1") '
@@ -4325,7 +4376,9 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             extra_blocked_counts={"INDEX": 4, "CONSTRAINT": 5},
             unsupported_table_keys=set(),
             unsupported_view_keys=set(),
-            view_compat_map={}
+            view_compat_map={},
+            view_constraint_cleaned_rows=[],
+            view_constraint_uncleanable_rows=[]
         )
         extra_results = {
             "index_unsupported": ["IDX1", "IDX2"],

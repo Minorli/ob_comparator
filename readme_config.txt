@@ -160,6 +160,9 @@ DDL 格式化 (SQLcl)
 - view_compat_rules_path：视图兼容性规则 JSON 路径（可选）。默认：空（使用内置规则）。
 - view_dblink_policy：视图 DBLINK 处理策略。默认：block。
   可选值：block（遇到 @ 视为不支持）、allow（允许 DBLINK）。
+- view_constraint_cleanup：VIEW 列清单约束清洗策略。默认：auto。
+  可选值：auto（仅清洗 RELY DISABLE / DISABLE / NOVALIDATE）、force（强制清洗所有列清单约束）、off（不清洗，视为不支持）。
+  说明：仅处理 CREATE VIEW 列清单内的约束声明；清洗仅影响输出 DDL，不改变依赖/映射逻辑。
 
 扩展对象校验性能调优
 - extra_check_workers：扩展对象校验并发数。默认：min(4, CPU)。
