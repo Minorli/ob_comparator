@@ -20,6 +20,7 @@
 ### 修复
 - 修复 run_fixup 迭代执行累计失败统计不准确的问题。
 - 修复 VIEW remap 时表别名被误替换为 `SCHEMA.ALIAS` 的问题。
+- 修复 OB 侧 CHAR_USED 缺失导致 VARCHAR 语义误判的问题（默认 BYTE，并结合 DATA_LENGTH/CHAR_LENGTH 推断）。
 
 ## [0.9.8] - 2026-01-09
 
