@@ -28,6 +28,8 @@ docs/*
 !docs/TECHNICAL_SPECIFICATION.md
 !docs/DEPLOYMENT.md
 !docs/CHANGELOG.md
+!docs/RELEASE_NOTES_0.9.8.1.md
+!docs/VERSION_DIFF_0.9.8_to_0.9.8.1.md
 
 .gemini/
 gha-creds-*.json
