@@ -10,6 +10,8 @@
 - SYS_C* 额外列修复改为 `ALTER TABLE ... FORCE`（可配置）。
 - 配置模板去重，统计工具 SQL 模板统一，提升一致性与可维护性。
 
+详见：`RELEASE_NOTES_0.9.8.1.md`
+
 ## 核心能力
 - **对象覆盖完整**：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。
 - **Dump-Once 架构**：Oracle Thick Mode + 少量 obclient 调用，元数据一次性落本地内存。
