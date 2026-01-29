@@ -219,6 +219,82 @@ class TestViewChainHelpers(unittest.TestCase):
         self.assertEqual(status, "PARTIAL")
 
 
+class TestRunFixupHelpers(unittest.TestCase):
+    def test_safe_first_line(self):
+        self.assertEqual(rf.safe_first_line("", 80, "n/a"), "n/a")
+        self.assertEqual(rf.safe_first_line(None, 80, "n/a"), "n/a")
+        self.assertEqual(rf.safe_first_line("line1\nline2", 80, "n/a"), "line1")
+        self.assertEqual(rf.safe_first_line("line1", 3, "n/a"), "lin")
+
+
+class TestIterativeFixupSummary(unittest.TestCase):
+    def test_cumulative_failed_counts_all_rounds(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            fixup_dir = repo_root / "fixup_scripts"
+            (fixup_dir / "table").mkdir(parents=True)
+            report_dir = repo_root / "reports"
+            report_dir.mkdir()
+
+            f1 = fixup_dir / "table" / "A.T1.sql"
+            f2 = fixup_dir / "table" / "A.T2.sql"
+            f3 = fixup_dir / "table" / "A.T3.sql"
+            for fp in (f1, f2, f3):
+                fp.write_text("SELECT 1;", encoding="utf-8")
+
+            args = SimpleNamespace(
+                config=str(repo_root / "config.ini"),
+                smart_order=False,
+                glob_patterns=None,
+                recompile=False,
+            )
+            ob_cfg = {
+                "executable": "obclient",
+                "host": "127.0.0.1",
+                "port": "2881",
+                "user_string": "root@sys",
+                "password": "p",
+            }
+            fixup_settings = rf.FixupAutoGrantSettings(enabled=False, types=set(), fallback=False)
+
+            rounds = [
+                [(0, f1), (0, f2)],
+                [(0, f3)],
+            ]
+
+            def fake_collect(*_a, **_k):
+                return rounds.pop(0)
+
+            def fake_exec(_cmd, path, *_a, **_k):
+                if path == f1:
+                    return rf.ScriptResult(path, "SUCCESS"), rf.ExecutionSummary(1, [])
+                failure = rf.StatementFailure(1, "ERR", "SELECT 1")
+                return rf.ScriptResult(path, "FAILED", "ERR"), rf.ExecutionSummary(1, [failure])
+
+            with mock.patch.object(rf, "collect_sql_files_by_layer", side_effect=fake_collect), \
+                 mock.patch.object(rf, "execute_script_with_summary", side_effect=fake_exec), \
+                 mock.patch.object(rf, "build_obclient_command", return_value=["obclient"]), \
+                 mock.patch.object(rf, "resolve_timeout_value", return_value=None), \
+                 mock.patch.object(rf, "build_fixup_object_index", return_value=({}, {})):
+                with self.assertLogs(rf.__name__, level="INFO") as cm:
+                    with self.assertRaises(SystemExit):
+                        rf.run_iterative_fixup(
+                            args,
+                            ob_cfg,
+                            fixup_dir,
+                            repo_root,
+                            report_dir,
+                            [],
+                            [],
+                            fixup_settings,
+                            max_rounds=2,
+                            min_progress=1
+                        )
+
+            joined = "\n".join(cm.output)
+            self.assertIn("总计失败: 2", joined)
+
+
 class TestReportLookup(unittest.TestCase):
     def test_find_latest_report_prefers_latest_run_dir(self):
         with tempfile.TemporaryDirectory() as tmpdir:

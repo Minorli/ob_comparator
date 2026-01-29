@@ -20,7 +20,7 @@ import configparser
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
 try:
     import oracledb
@@ -29,6 +29,29 @@ except ImportError:
     sys.exit(1)
 
 ORACLE_IN_BATCH_SIZE = 900
+
+INDEX_TABLE_STATS_SQL = """
+    SELECT OWNER, TABLE_NAME, COUNT(*)
+    FROM DBA_INDEXES
+    WHERE OWNER IN ({owners})
+      AND TABLE_NAME IS NOT NULL
+    GROUP BY OWNER, TABLE_NAME
+"""
+CONSTRAINT_TABLE_STATS_SQL = """
+    SELECT OWNER, TABLE_NAME, COUNT(*)
+    FROM DBA_CONSTRAINTS
+    WHERE OWNER IN ({owners})
+      AND TABLE_NAME IS NOT NULL
+      AND CONSTRAINT_TYPE IN ('P','U','R')
+    GROUP BY OWNER, TABLE_NAME
+"""
+TRIGGER_TABLE_STATS_SQL = """
+    SELECT TABLE_OWNER, TABLE_NAME, COUNT(*)
+    FROM DBA_TRIGGERS
+    WHERE TABLE_OWNER IN ({owners})
+      AND TABLE_NAME IS NOT NULL
+    GROUP BY TABLE_OWNER, TABLE_NAME
+"""
 
 OBJECT_TYPES = [
     "TABLE",
@@ -135,6 +158,16 @@ def fetch_table_group_counts(
                     continue
                 results[f"{owner_u}.{table_u}"] += int(count or 0)
     return results
+
+
+def fetch_table_stats_counts(
+    conn: "oracledb.Connection",
+    owners: List[str],
+) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, int]]:
+    index_counts = fetch_table_group_counts(conn, owners, INDEX_TABLE_STATS_SQL)
+    constraint_counts = fetch_table_group_counts(conn, owners, CONSTRAINT_TABLE_STATS_SQL)
+    trigger_counts = fetch_table_group_counts(conn, owners, TRIGGER_TABLE_STATS_SQL)
+    return index_counts, constraint_counts, trigger_counts
 
 
 def fetch_public_synonym_count(
@@ -269,31 +302,7 @@ def print_brief_report(
         print(f"  {owner}\t{total}")
 
     if table_stats:
-        index_sql = """
-            SELECT OWNER, TABLE_NAME, COUNT(*)
-            FROM DBA_INDEXES
-            WHERE OWNER IN ({owners})
-              AND TABLE_NAME IS NOT NULL
-            GROUP BY OWNER, TABLE_NAME
-        """
-        constraint_sql = """
-            SELECT OWNER, TABLE_NAME, COUNT(*)
-            FROM DBA_CONSTRAINTS
-            WHERE OWNER IN ({owners})
-              AND TABLE_NAME IS NOT NULL
-              AND CONSTRAINT_TYPE IN ('P','U','R')
-            GROUP BY OWNER, TABLE_NAME
-        """
-        trigger_sql = """
-            SELECT TABLE_OWNER, TABLE_NAME, COUNT(*)
-            FROM DBA_TRIGGERS
-            WHERE TABLE_OWNER IN ({owners})
-              AND TABLE_NAME IS NOT NULL
-            GROUP BY TABLE_OWNER, TABLE_NAME
-        """
-        index_counts = fetch_table_group_counts(conn, owners, index_sql)
-        constraint_counts = fetch_table_group_counts(conn, owners, constraint_sql)
-        trigger_counts = fetch_table_group_counts(conn, owners, trigger_sql)
+        index_counts, constraint_counts, trigger_counts = fetch_table_stats_counts(conn, owners)
         summarize_table_stats_brief("INDEX", index_counts, top_n)
         summarize_table_stats_brief("CONSTRAINT", constraint_counts, top_n)
         summarize_table_stats_brief("TRIGGER", trigger_counts, top_n)
@@ -399,32 +408,7 @@ def main() -> int:
             print("\t".join(row))
 
         if args.table_stats:
-            index_sql = """
-                SELECT OWNER, TABLE_NAME, COUNT(*)
-                FROM DBA_INDEXES
-                WHERE OWNER IN ({owners})
-                  AND TABLE_NAME IS NOT NULL
-                GROUP BY OWNER, TABLE_NAME
-            """
-            constraint_sql = """
-                SELECT OWNER, TABLE_NAME, COUNT(*)
-                FROM DBA_CONSTRAINTS
-                WHERE OWNER IN ({owners})
-                  AND TABLE_NAME IS NOT NULL
-                  AND CONSTRAINT_TYPE IN ('P','U','R')
-                GROUP BY OWNER, TABLE_NAME
-            """
-            trigger_sql = """
-                SELECT TABLE_OWNER, TABLE_NAME, COUNT(*)
-                FROM DBA_TRIGGERS
-                WHERE TABLE_OWNER IN ({owners})
-                  AND TABLE_NAME IS NOT NULL
-                GROUP BY TABLE_OWNER, TABLE_NAME
-            """
-
-            index_counts = fetch_table_group_counts(conn, owner_list, index_sql)
-            constraint_counts = fetch_table_group_counts(conn, owner_list, constraint_sql)
-            trigger_counts = fetch_table_group_counts(conn, owner_list, trigger_sql)
+            index_counts, constraint_counts, trigger_counts = fetch_table_stats_counts(conn, owner_list)
 
             summarize_table_stats("INDEX", index_counts, args.top_n)
             summarize_table_stats("CONSTRAINT", constraint_counts, args.top_n)

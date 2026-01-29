@@ -85,7 +85,8 @@ def _build_console_handler(level: int) -> logging.Handler:
         )
         handler.setFormatter(logging.Formatter("%(message)s"))
         return handler
-    except Exception:
+    except Exception as exc:
+        logging.getLogger(__name__).debug("RichHandler init failed, fallback to StreamHandler: %s", exc)
         handler = logging.StreamHandler()
         handler.setLevel(level)
         handler.setFormatter(logging.Formatter(LOG_FILE_FORMAT, datefmt=LOG_TIME_FORMAT))
@@ -115,7 +116,8 @@ def resolve_console_log_level(level_name: Optional[str], *, is_tty: Optional[boo
     if is_tty is None:
         try:
             is_tty = sys.stdout.isatty()
-        except Exception:
+        except Exception as exc:
+            logging.getLogger(__name__).debug("TTY detection failed, defaulting to non-tty: %s", exc)
             is_tty = False
     name = (level_name or "AUTO").strip().upper()
     if name == "AUTO":
@@ -145,6 +147,15 @@ def format_progress_label(current: int, total: int, width: Optional[int] = None)
     if width is None:
         width = len(str(total)) or 1
     return f"[进度 {current:0{width}}/{total}]"
+
+
+def safe_first_line(text: Optional[str], limit: int = 160, default: str = "") -> str:
+    if not text:
+        return default
+    lines = text.splitlines()
+    if not lines:
+        return default
+    return lines[0][:limit]
 
 
 init_console_logging()
@@ -297,7 +308,7 @@ def log_failure_analysis(failures_by_type: Dict[str, List['ScriptResult']]) -> N
         log.info("   建议: 查看详细错误信息进行诊断")
         if len(items) <= 3:
             for item in items[:3]:
-                msg_preview = item.message.splitlines()[0][:80] if item.message else "无错误信息"
+                msg_preview = safe_first_line(item.message, 80, "无错误信息")
                 log.info("     - %s: %s", item.path.name, msg_preview)
     
     log.info("")
@@ -597,7 +608,8 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
             fixup_timeout = parser.getint("SETTINGS", "obclient_timeout", fallback=DEFAULT_FIXUP_TIMEOUT)
         if fixup_timeout is None or fixup_timeout < 0:
             fixup_timeout = DEFAULT_FIXUP_TIMEOUT
-    except Exception:
+    except Exception as exc:
+        log.warning("fixup 超时解析失败，回退默认值 %s: %s", DEFAULT_FIXUP_TIMEOUT, exc)
         fixup_timeout = DEFAULT_FIXUP_TIMEOUT
     ob_cfg["timeout"] = None if fixup_timeout == 0 else fixup_timeout
 
@@ -2156,7 +2168,8 @@ def build_grant_index(
         for grant_file in sorted(grants_path.glob("*.sql")):
             try:
                 content = grant_file.read_text(encoding="utf-8")
-            except Exception:
+            except Exception as exc:
+                log.warning("读取授权文件失败: %s (%s)", grant_file, exc)
                 continue
             for statement in split_sql_statements(content):
                 parsed = parse_grant_statement(statement)
@@ -2377,7 +2390,7 @@ def apply_grant_entries(
             result = run_sql(obclient_cmd, entry.statement, timeout)
         except subprocess.TimeoutExpired:
             failed += 1
-            log.warning("[GRANT] 执行超时: %s", entry.statement.splitlines()[0][:160])
+            log.warning("[GRANT] 执行超时: %s", safe_first_line(entry.statement, 160, "执行超时"))
             continue
         if result.returncode == 0:
             applied_grants.add(key)
@@ -2385,8 +2398,7 @@ def apply_grant_entries(
             continue
         failed += 1
         stderr = (result.stderr or "").strip()
-        preview = stderr.splitlines()[0] if stderr else "执行失败"
-        log.warning("[GRANT] 执行失败: %s", preview[:160])
+        log.warning("[GRANT] 执行失败: %s", safe_first_line(stderr, 160, "执行失败"))
 
     return applied, failed
 
@@ -2396,7 +2408,8 @@ def resolve_timeout_value(raw_timeout: Optional[int]) -> Optional[int]:
         return None
     try:
         return int(raw_timeout)
-    except Exception:
+    except Exception as exc:
+        log.warning("超时配置非法，回退默认值 %s: %s", DEFAULT_FIXUP_TIMEOUT, exc)
         return DEFAULT_FIXUP_TIMEOUT
 
 
@@ -2627,8 +2640,7 @@ def execute_script_with_summary(
         summary.statements
     )
     for failure in summary.failures[:3]:
-        preview = failure.error.splitlines()[0] if failure.error else "执行失败"
-        log.warning("  [%d] %s", failure.index, preview[:200])
+        log.warning("  [%d] %s", failure.index, safe_first_line(failure.error, 200, "执行失败"))
     return ScriptResult(relative_path, "FAILED", first_error, layer), summary
 
 
@@ -2658,7 +2670,8 @@ def query_invalid_objects(obclient_cmd: List[str], timeout: Optional[int]) -> Li
                 invalid_objects.append((parts[0].strip(), parts[1].strip(), parts[2].strip()))
         
         return invalid_objects
-    except Exception:
+    except Exception as exc:
+        log.warning("查询 INVALID 对象失败: %s", exc)
         return []
 
 
@@ -3138,8 +3151,7 @@ def run_single_fixup(
                         summary.statements
                     )
                     for failure in summary.failures[:3]:
-                        preview = failure.error.splitlines()[0] if failure.error else "执行失败"
-                        log.error("  [%d] %s", failure.index, preview[:200])
+                        log.error("  [%d] %s", failure.index, safe_first_line(failure.error, 200, "执行失败"))
                     for failure in summary.failures:
                         if error_truncated:
                             break
@@ -3217,7 +3229,7 @@ def run_single_fixup(
             
             log.info("%s (%d)", status_label, len(items))
             for item in items[:20]:  # Limit to first 20
-                msg = item.message.splitlines()[0][:100] if item.message else ""
+                msg = safe_first_line(item.message, 100, "")
                 log.info("  %s", item.path)
                 if msg:
                     log.info("    %s", msg)
@@ -3769,13 +3781,14 @@ def run_iterative_fixup(
         round_skipped = sum(1 for r in round_results if r.status == "SKIPPED")
         
         cumulative_success += round_success
-        cumulative_failed = round_failed  # Only count current failures
+        cumulative_failed += round_failed
         
         log_subsection(f"第 {round_num} 轮结果")
         log.info("本轮成功: %d", round_success)
         log.info("本轮失败: %d", round_failed)
         log.info("本轮跳过: %d", round_skipped)
         log.info("累计成功: %d", cumulative_success)
+        log.info("累计失败: %d", cumulative_failed)
         log.info("")
         
         all_round_results.append({
@@ -3830,7 +3843,7 @@ def run_iterative_fixup(
     log_section("迭代执行汇总")
     log.info("执行轮次: %d", round_num)
     log.info("总计成功: %d", cumulative_success)
-    log.info("剩余失败: %d", cumulative_failed)
+    log.info("总计失败: %d", cumulative_failed)
     
     if args.recompile:
         log_subsection("最终重编译统计")

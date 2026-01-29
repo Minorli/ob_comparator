@@ -233,21 +233,6 @@ view_dblink_policy      = block
 #   force -> 强制清洗所有列清单约束
 #   off   -> 不清洗（视为不支持）
 view_constraint_cleanup = auto
-# 是否清洗 PL/SQL DDL 中的全角标点（默认开启，避免目标端解析失败）
-ddl_punct_sanitize      = true
-# DDL hint 清洗策略:
-#   drop_all       - 删除全部 hint 注释
-#   keep_supported - 保留 OceanBase 支持的 hint (默认)
-#   keep_all       - 保留全部 hint (但仍受 denylist 控制)
-#   report_only    - 保留全部 hint，仅报告未知 hint
-ddl_hint_policy         = keep_supported
-# 额外允许的 hint（逗号分隔，大小写不敏感）
-ddl_hint_allowlist      =
-# 强制删除的 hint（逗号分隔，大小写不敏感）
-ddl_hint_denylist       =
-# 额外允许 hint 文件（每行一个，# 开头视为注释）
-ddl_hint_allowlist_file =
-
 # Oracle Instant Client 目录 (必须包含 libclntsh.so)
 oracle_client_lib_dir   = /path/to/instantclient_19_29
 

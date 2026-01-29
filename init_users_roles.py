@@ -88,7 +88,8 @@ def load_config(config_path: Path) -> Tuple[Dict[str, str], Dict[str, str], Dict
 
     try:
         ob_timeout = int(settings.get("obclient_timeout", DEFAULT_OBCLIENT_TIMEOUT))
-    except Exception:
+    except (TypeError, ValueError) as exc:
+        log.warning("obclient_timeout 无效，回退默认值 %s: %s", DEFAULT_OBCLIENT_TIMEOUT, exc)
         ob_timeout = DEFAULT_OBCLIENT_TIMEOUT
 
     try:
@@ -99,7 +100,8 @@ def load_config(config_path: Path) -> Tuple[Dict[str, str], Dict[str, str], Dict
             fixup_timeout = int(settings.get("obclient_timeout", DEFAULT_FIXUP_TIMEOUT))
         if fixup_timeout < 0:
             fixup_timeout = DEFAULT_FIXUP_TIMEOUT
-    except Exception:
+    except (TypeError, ValueError) as exc:
+        log.warning("fixup_cli_timeout 无效，回退默认值 %s: %s", DEFAULT_FIXUP_TIMEOUT, exc)
         fixup_timeout = DEFAULT_FIXUP_TIMEOUT
 
     ddl_timeout = None if fixup_timeout == 0 else fixup_timeout
