@@ -1,6 +1,6 @@
 # 数据库对象对比工具设计文档
 
-> 当前版本：V0.9.8（Dump-Once, Compare-Locally + 依赖分析 + 修补脚本生成）
+> 当前版本：V0.9.8.1（Dump-Once, Compare-Locally + 依赖分析 + 修补脚本生成）
 
 ## 1. 设计原则
 - **一次转储、本地对比**：最大限度减少数据库往返，性能可控。
@@ -64,7 +64,8 @@
   - VIEW 注释吞行修复
 
 ## 9. 输出与执行
-- 报告输出到 `main_reports/`，脚本输出到 `fixup_scripts/`。
+- 报告输出到 `main_reports/`（默认 `run_<timestamp>` 分目录），脚本输出到 `fixup_scripts/`。
+- 报告索引 `report_index_<timestamp>.txt` 用于快速定位细节文件。
 - `run_fixup.py` 支持：
   - 依赖感知排序（smart-order）
   - 迭代重试（iterative）

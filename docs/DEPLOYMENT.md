@@ -1,5 +1,7 @@
 # 数据库对象对比工具 - 跨平台打包与执行指南 (Wheelhouse 版)
 
+> 适用版本：V0.9.8.1
+
 > 适用场景：需要在无网络或不同机器上运行本工具，且保持源码不改。  
 > 方案：wheelhouse + venv，无需 PyInstaller。
 
@@ -65,6 +67,8 @@ python schema_diff_reconciler.py
 # 运行修补执行器
 python run_fixup.py --smart-order --recompile
 ```
+
+提示：默认报告输出为 `main_reports/run_<timestamp>/`，如需兼容旧流程可设置 `report_dir_layout=flat`。
 
 ## 5. 常见问题检查清单
 - `LD_LIBRARY_PATH` 是否包含 instantclient。

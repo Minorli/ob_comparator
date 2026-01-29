@@ -3,12 +3,23 @@
 本文件记录 OceanBase Comparator Toolkit 的重要变更。
 
 ## [未发布]
+
+## [0.9.8.1] - 2026-01-29
+
 ### 新增
 - SQLcl DDL 格式化：可选启用对 fixup 输出进行格式化，支持多类型与批量控制。
 - DDL 格式化报告：新增 `ddl_format_report_<timestamp>.txt`，汇总格式化结果与跳过原因。
+- SYS_C* 额外列清理：支持 `fixup_drop_sys_c_columns=true` 生成 `ALTER TABLE ... FORCE`。
 
 ### 变更
 - DDL 格式化报告使用 `|` 分隔，便于直接导入 Excel。
+- report 目录支持 per_run 布局，默认输出到 `main_reports/run_<timestamp>/`。
+- collect_source_object_stats 统计 SQL 模板统一，减少简版/全量输出偏差风险。
+- config.ini.template 去重并新增重复键检测测试。
+
+### 修复
+- 修复 run_fixup 迭代执行累计失败统计不准确的问题。
+- 修复 VIEW remap 时表别名被误替换为 `SCHEMA.ALIAS` 的问题。
 
 ## [0.9.8] - 2026-01-09
 

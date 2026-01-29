@@ -111,7 +111,19 @@
 
 ---
 
-## 5. run_fixup 高级执行
+## 5. 报告与输出布局
+
+### 5.1 目录布局
+- `report_dir_layout=per_run`：每次运行输出到 `main_reports/run_<timestamp>`（默认）。
+- `report_dir_layout=flat`：输出到 `main_reports/` 根目录（兼容旧流程）。
+
+### 5.2 明细拆分
+- `report_detail_mode=split`：主报告仅概要，明细拆分到 `*_detail_<timestamp>.txt`。
+- 明细文件默认使用 `|` 分隔并带 `# 字段说明` 头，方便 Excel 直接导入。
+
+---
+
+## 6. run_fixup 高级执行
 
 ### 5.1 依赖感知顺序（--smart-order）
 示例层级：
@@ -140,7 +152,7 @@ sequence -> table -> table_alter -> grants -> view -> procedure -> package -> co
 
 ---
 
-## 6. 大规模迁移建议
+## 7. 大规模迁移建议
 - Schema 过多时分批执行（100~150/批）
 - 适当增大 `cli_timeout` / `obclient_timeout`
 - 使用 `dbcat_output` 复用缓存
@@ -148,7 +160,7 @@ sequence -> table -> table_alter -> grants -> view -> procedure -> package -> co
 
 ---
 
-## 7. 常见问题速查
+## 8. 常见问题速查
 
 **Q1: VIEW/触发器为什么没跟随表的 remap？**  
 A: 这类对象默认保持原 schema，需显式 remap。
@@ -159,4 +171,4 @@ A: 依赖指向多个 schema 或依赖缺失，请补充显式 remap。
 **Q3: 只检查 TABLE 时为何不生成 PACKAGE？**  
 A: `check_primary_types` 限制后，未包含的类型不会加载/推导/生成。
 
-更新时间：2026-01-09 (V0.9.8)
+更新时间：2026-01-29 (V0.9.8.1)

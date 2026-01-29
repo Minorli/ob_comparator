@@ -1,8 +1,14 @@
 # OceanBase Comparator Toolkit
 
-> 当前版本：V0.9.8  
+> 当前版本：V0.9.8.1  
 > 面向 Oracle → OceanBase (Oracle 模式) 的结构一致性校验与修补脚本生成工具  
 > 核心理念：一次转储、本地对比、脚本审计优先
+
+## 近期更新（0.9.8.1）
+- 修复 run_fixup 迭代执行的累计失败统计，汇总更准确。
+- 修复 VIEW remap 过程中别名被误替换的问题。
+- SYS_C* 额外列修复改为 `ALTER TABLE ... FORCE`（可配置）。
+- 配置模板去重，统计工具 SQL 模板统一，提升一致性与可维护性。
 
 ## 核心能力
 - **对象覆盖完整**：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。
