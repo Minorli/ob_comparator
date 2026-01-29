@@ -2375,6 +2375,86 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         finally:
             sdr.subprocess.run = orig_run
 
+    def test_dump_ob_metadata_infers_char_used_from_lengths(self):
+        def fake_run(_cfg, sql):
+            if "NLS_LENGTH_SEMANTICS" in sql.upper():
+                return True, "BYTE", ""
+            return True, "", ""
+
+        def fake_query(_cfg, sql_tpl, _owners, **_kwargs):
+            sql = sql_tpl.upper()
+            if "DBA_OBJECTS" in sql:
+                return True, [], ""
+            if "DBA_TAB_COLUMNS" in sql:
+                line = "A\tT1\tC1\tVARCHAR2\t10\t20\t\t\t\tY\t"
+                return True, [line], ""
+            return True, [], ""
+
+        orig_run = sdr.obclient_run_sql
+        orig_query = sdr.obclient_query_by_owner_chunks
+        try:
+            sdr.obclient_run_sql = fake_run
+            sdr.obclient_query_by_owner_chunks = fake_query
+            ob_meta = sdr.dump_ob_metadata(
+                {"executable": "/bin/obclient", "host": "h", "port": "1", "user_string": "u", "password": "p"},
+                {"A"},
+                tracked_object_types={"TABLE"},
+                include_tab_columns=True,
+                include_column_order=False,
+                include_indexes=False,
+                include_constraints=False,
+                include_triggers=False,
+                include_sequences=False,
+                include_comments=False,
+                include_roles=False,
+            )
+            self.assertEqual(ob_meta.tab_columns[("A", "T1")]["C1"]["char_used"], "C")
+        finally:
+            sdr.obclient_run_sql = orig_run
+            sdr.obclient_query_by_owner_chunks = orig_query
+
+    def test_dump_ob_metadata_defaults_char_used_to_nls(self):
+        def fake_run(_cfg, sql):
+            if "NLS_LENGTH_SEMANTICS" in sql.upper():
+                return True, "BYTE", ""
+            return True, "", ""
+
+        def fake_query(_cfg, sql_tpl, _owners, **_kwargs):
+            sql = sql_tpl.upper()
+            if "DBA_OBJECTS" in sql:
+                return True, [], ""
+            if "DBA_TAB_COLUMNS" in sql:
+                if "CHAR_USED" in sql:
+                    return False, [], "no column"
+                if "DATA_LENGTH" in sql and "DATA_PRECISION" in sql:
+                    return False, [], "no column"
+                line = "A\tT1\tC1\tVARCHAR2\t10\tY\t"
+                return True, [line], ""
+            return True, [], ""
+
+        orig_run = sdr.obclient_run_sql
+        orig_query = sdr.obclient_query_by_owner_chunks
+        try:
+            sdr.obclient_run_sql = fake_run
+            sdr.obclient_query_by_owner_chunks = fake_query
+            ob_meta = sdr.dump_ob_metadata(
+                {"executable": "/bin/obclient", "host": "h", "port": "1", "user_string": "u", "password": "p"},
+                {"A"},
+                tracked_object_types={"TABLE"},
+                include_tab_columns=True,
+                include_column_order=False,
+                include_indexes=False,
+                include_constraints=False,
+                include_triggers=False,
+                include_sequences=False,
+                include_comments=False,
+                include_roles=False,
+            )
+            self.assertEqual(ob_meta.tab_columns[("A", "T1")]["C1"]["char_used"], "B")
+        finally:
+            sdr.obclient_run_sql = orig_run
+            sdr.obclient_query_by_owner_chunks = orig_query
+
     def test_check_extra_objects_sequence_without_master_list(self):
         oracle_meta = self._make_oracle_meta(sequences={"A": {"SEQ1", "SEQ2"}})
         ob_meta = self._make_ob_meta(sequences={"A": {"SEQ2"}})

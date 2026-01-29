@@ -7168,6 +7168,24 @@ def dump_ob_metadata(
             constraint_deferrable_supported=False
         )
 
+    ob_default_char_used = "B"
+    if include_tab_columns:
+        ok, out, err = obclient_run_sql(
+            ob_cfg,
+            "SELECT value FROM nls_database_parameters WHERE parameter='NLS_LENGTH_SEMANTICS'"
+        )
+        if ok and out:
+            nls_val = out.splitlines()[0].strip().upper()
+            if nls_val.startswith("CHAR"):
+                ob_default_char_used = "C"
+            elif nls_val.startswith("BYTE"):
+                ob_default_char_used = "B"
+        else:
+            log.warning(
+                "读取 OB NLS_LENGTH_SEMANTICS 失败，将按 BYTE 语义处理: %s",
+                err or "unknown"
+            )
+
     owners_in_list = sorted(target_schemas)
     owners_in_objects_list = list(owners_in_list)
     if 'PUBLIC' in target_schemas and '__PUBLIC' not in owners_in_objects_list:
@@ -7484,6 +7502,19 @@ def dump_ob_metadata(
                 char_used_clean = char_used.strip().upper() if char_used else ""
                 if char_used_clean in ("", "NULL"):
                     char_used_clean = ""
+                if not char_used_clean:
+                    if dtype in ("VARCHAR2", "VARCHAR", "CHAR"):
+                        try:
+                            if (
+                                (data_length or "").isdigit()
+                                and (char_len or "").isdigit()
+                                and int(data_length) > int(char_len)
+                            ):
+                                char_used_clean = "C"
+                        except ValueError:
+                            char_used_clean = ""
+                    if not char_used_clean:
+                        char_used_clean = ob_default_char_used
                 is_virtual = bool(virtual_flag)
                 tab_columns.setdefault(key, {})[col] = {
                     "data_type": dtype,
