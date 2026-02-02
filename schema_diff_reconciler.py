@@ -634,6 +634,7 @@ class GrantPlan(NamedTuple):
     role_privs: Dict[str, Set[RoleGrantEntry]]
     role_ddls: List[str]
     filtered_grants: List[FilteredGrantEntry]
+    view_grant_targets: Set[str]
 
 
 class ObGrantCatalog(NamedTuple):
@@ -773,6 +774,10 @@ VIEW_PRIVILEGE_DEFAULT_VIEWS: Set[str] = {
 }
 VIEW_UNSUPPORTED_PATTERNS: Tuple[str, ...] = (
     r'(?<!\w)"?SYS"?\s*\.\s*"?OBJ\$"?(?!\w)',
+)
+VIEW_X_DOLLAR_PATTERN = re.compile(
+    r'(?<![A-Z0-9_\$#])"?X\$[A-Z0-9_#$]+"?(?![A-Z0-9_\$#])',
+    flags=re.IGNORECASE
 )
 VIEW_DBLINK_POLICIES: Set[str] = {"block", "allow"}
 VIEW_CONSTRAINT_CLEANUP_VALUES: Set[str] = {"auto", "force", "off"}
@@ -4448,6 +4453,52 @@ def classify_missing_objects(
                     detail=cleanup_result.detail or "VIEW_CONSTRAINT"
                 )
         view_compat_map[(schema, view_name)] = compat
+
+    source_objects = source_objects or {}
+
+    def _is_x_dollar_ref(ref_full: str) -> bool:
+        if not ref_full:
+            return False
+        obj = ref_full.split('.', 1)[1] if '.' in ref_full else ref_full
+        return obj.upper().startswith("X$")
+
+    def _collect_view_x_refs(schema: str, view_name: str) -> Set[str]:
+        refs: Set[str] = set()
+        view_full = f"{schema.upper()}.{view_name.upper()}"
+        if dependency_graph:
+            for ref_full, _ref_type in dependency_graph.get((view_full, "VIEW"), set()):
+                if ref_full:
+                    refs.add(ref_full.upper())
+        elif view_ddl_map:
+            ddl = view_ddl_map.get((schema, view_name))
+            if ddl:
+                deps = extract_view_dependencies(ddl, default_schema=schema)
+                refs.update({d.upper() for d in deps})
+        return {ref for ref in refs if _is_x_dollar_ref(ref)}
+
+    if view_compat_map:
+        for (schema, view_name), compat in list(view_compat_map.items()):
+            x_refs = _collect_view_x_refs(schema, view_name)
+            if not x_refs:
+                continue
+            blocked = {ref for ref in x_refs if ref.upper() not in source_objects}
+            if blocked:
+                if compat.support_state == SUPPORT_STATE_SUPPORTED or compat.reason_code == "VIEW_X$":
+                    compat = compat._replace(
+                        support_state=SUPPORT_STATE_UNSUPPORTED,
+                        reason_code="VIEW_X$",
+                        reason="引用 X$ 系统表，OB 不支持",
+                        detail=",".join(sorted(blocked))
+                    )
+            else:
+                if compat.reason_code == "VIEW_X$":
+                    compat = compat._replace(
+                        support_state=SUPPORT_STATE_SUPPORTED,
+                        reason_code="",
+                        reason="",
+                        detail=""
+                    )
+            view_compat_map[(schema, view_name)] = compat
 
     for (owner, name, obj_type), status in (oracle_meta.object_statuses or {}).items():
         obj_type_u = (obj_type or "").upper()
@@ -10183,6 +10234,7 @@ def build_view_fixup_chains(
     synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]] = None,
     ob_meta: Optional[ObMetadata] = None,
     ob_grant_catalog: Optional[ObGrantCatalog] = None,
+    view_grant_targets: Optional[Set[str]] = None,
     max_depth: int = 30
 ) -> Tuple[List[str], List[str]]:
     if not view_targets:
@@ -10229,7 +10281,9 @@ def build_view_fixup_chains(
             return "UNKNOWN"
         return "EXISTS" if obj_full in obj_set else "MISSING"
 
-    def _grant_status(dep_node: DependencyNode, ref_node: DependencyNode) -> str:
+    view_grant_targets = {v.upper() for v in (view_grant_targets or set()) if v}
+
+    def _grant_status(dep_node: DependencyNode, ref_node: DependencyNode, require_grantable: bool) -> str:
         if not ob_grant_catalog:
             return "GRANT_UNKNOWN"
         if dep_node in synonym_target_map and synonym_target_map.get(dep_node) == ref_node:
@@ -10253,21 +10307,28 @@ def build_view_fixup_chains(
         if not required_priv:
             return "GRANT_UNKNOWN"
         obj_key = (dep_schema, required_priv, ref_full_u)
-        if obj_key in ob_grant_catalog.object_privs or obj_key in ob_grant_catalog.object_privs_grantable:
-            return "GRANT_OK"
+        if require_grantable:
+            if obj_key in ob_grant_catalog.object_privs_grantable:
+                return "GRANT_OK"
+            if obj_key in ob_grant_catalog.object_privs:
+                return "GRANT_MISSING_OPTION"
+        else:
+            if obj_key in ob_grant_catalog.object_privs or obj_key in ob_grant_catalog.object_privs_grantable:
+                return "GRANT_OK"
         implied = SYS_PRIV_IMPLICATIONS.get(required_priv, set())
         for sys_priv in implied:
             sys_key = (dep_schema, sys_priv)
             if sys_key in ob_grant_catalog.sys_privs or sys_key in ob_grant_catalog.sys_privs_admin:
-                return "GRANT_OK"
-        return "GRANT_MISSING"
+                return "GRANT_MISSING_OPTION" if require_grantable else "GRANT_OK"
+        return "GRANT_MISSING_OPTION" if require_grantable else "GRANT_MISSING"
 
     def _format_chain(path: List[DependencyNode]) -> str:
         parts: List[str] = []
+        require_grantable = bool(path and path[0][0] in view_grant_targets)
         for idx, node in enumerate(path):
             obj_type = (node[1] or "UNKNOWN").upper()
             exists = _exists(node)
-            grant_status = "GRANT_NA" if idx == 0 else _grant_status(path[idx - 1], node)
+            grant_status = "GRANT_NA" if idx == 0 else _grant_status(path[idx - 1], node, require_grantable)
             parts.append(f"{node[0]}[{obj_type}|{exists}|{grant_status}]")
         return " -> ".join(parts)
 
@@ -10306,7 +10367,8 @@ def export_view_fixup_chains(
     remap_rules: RemapRules,
     synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]] = None,
     ob_meta: Optional[ObMetadata] = None,
-    ob_grant_catalog: Optional[ObGrantCatalog] = None
+    ob_grant_catalog: Optional[ObGrantCatalog] = None,
+    view_grant_targets: Optional[Set[str]] = None
 ) -> Optional[Path]:
     chains, cycles = build_view_fixup_chains(
         view_targets,
@@ -10315,7 +10377,8 @@ def export_view_fixup_chains(
         remap_rules,
         synonym_meta=synonym_meta,
         ob_meta=ob_meta,
-        ob_grant_catalog=ob_grant_catalog
+        ob_grant_catalog=ob_grant_catalog,
+        view_grant_targets=view_grant_targets
     )
     if not chains:
         return None
@@ -10731,6 +10794,65 @@ def filter_missing_grant_entries(
             miss_role[g_u].add(entry)
 
     return miss_obj, miss_sys, miss_role
+
+
+def split_view_grants(
+    view_targets: Set[str],
+    expected_dependency_pairs: Optional[Set[Tuple[str, str, str, str]]],
+    object_grants_missing_by_grantee: Dict[str, Set[ObjectGrantEntry]]
+) -> Tuple[
+    Dict[str, Set[ObjectGrantEntry]],
+    Dict[str, Set[ObjectGrantEntry]],
+    Dict[str, Set[ObjectGrantEntry]]
+]:
+    """
+    拆分视图相关授权：
+      - view_prereq_grants: 视图创建前的依赖授权（基于依赖对）
+      - view_post_grants: 视图创建后授权（源端视图权限同步）
+      - remaining: 其余授权
+    """
+    view_targets_u = {v.upper() for v in (view_targets or set()) if v}
+    prereq_needed: Set[Tuple[str, str, str]] = set()
+
+    if view_targets_u and expected_dependency_pairs:
+        for dep_full, dep_type, ref_full, ref_type in expected_dependency_pairs:
+            dep_full_u = (dep_full or "").upper()
+            if dep_full_u not in view_targets_u:
+                continue
+            if (dep_type or "").upper() not in {"VIEW", "MATERIALIZED VIEW"}:
+                continue
+            if not dep_full or not ref_full or '.' not in dep_full or '.' not in ref_full:
+                continue
+            dep_schema = dep_full_u.split('.', 1)[0]
+            ref_schema = (ref_full or "").upper().split('.', 1)[0]
+            if dep_schema == ref_schema:
+                continue
+            privilege = GRANT_PRIVILEGE_BY_TYPE.get((ref_type or "").upper())
+            if not privilege:
+                continue
+            prereq_needed.add((dep_schema, privilege.upper(), (ref_full or "").upper()))
+
+    view_prereq: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
+    view_post: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
+    remaining: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
+
+    for grantee, entries in (object_grants_missing_by_grantee or {}).items():
+        grantee_u = (grantee or "").upper()
+        for entry in entries or set():
+            priv_u = (entry.privilege or "").upper()
+            obj_u = (entry.object_full or "").upper()
+            key = (grantee_u, priv_u, obj_u)
+            if key in prereq_needed:
+                view_prereq[grantee_u].add(entry)
+                continue
+            if obj_u in view_targets_u:
+                owner_u = obj_u.split('.', 1)[0] if '.' in obj_u else ""
+                if grantee_u and owner_u and grantee_u != owner_u:
+                    view_post[grantee_u].add(entry)
+                    continue
+            remaining[grantee_u].add(entry)
+
+    return dict(view_prereq), dict(view_post), dict(remaining)
 
 
 PRIVILEGE_TYPE_PRIORITY: Tuple[str, ...] = (
@@ -11378,7 +11500,8 @@ def build_grant_plan(
         sys_privs=sys_privs,
         role_privs=role_privs,
         role_ddls=role_ddls,
-        filtered_grants=filtered_grants
+        filtered_grants=filtered_grants,
+        view_grant_targets=view_grant_targets
     )
 
 
@@ -15222,6 +15345,14 @@ def clean_view_ddl_for_oceanbase(ddl: str, ob_version: Optional[str] = None) -> 
     
     cleaned_ddl = ddl
 
+    # 移除 CREATE OR REPLACE FORCE VIEW 中的 FORCE 关键字
+    cleaned_ddl = re.sub(
+        r'(\bCREATE\s+(?:OR\s+REPLACE\s+)?)\s*FORCE\s+((?:MATERIALIZED\s+)?VIEW\b)',
+        r'\1\2',
+        cleaned_ddl,
+        flags=re.IGNORECASE
+    )
+
     # 先移除 WITH CHECK OPTION 的 CONSTRAINT 名称（保留 CHECK OPTION 本身）
     cleaned_ddl = re.sub(
         r'(\bWITH\s+CHECK\s+OPTION)\s+CONSTRAINT\s+("(?:""|[^"])*"|[A-Za-z0-9_#$]+)',
@@ -15951,6 +16082,12 @@ def analyze_view_compatibility(
             sys_obj_hit = True
             break
 
+    x_hits: Set[str] = set()
+    for match in VIEW_X_DOLLAR_PATTERN.finditer(masked_upper):
+        token = (match.group(0) or "").replace('"', '').upper()
+        if token.startswith("X$"):
+            x_hits.add(token)
+
     dblink_hit = (dblink_policy == "block") and ("@" in masked_upper)
 
     unsupported_hits: List[str] = []
@@ -15987,6 +16124,15 @@ def analyze_view_compatibility(
             reason_code="VIEW_UNSUPPORTED_SYS_VIEW",
             reason="引用 OB 不支持的系统视图",
             detail=",".join(unsupported_hits),
+            cleaned_ddl=cleaned,
+            rewrite_notes=rewrite_notes
+        )
+    if x_hits:
+        return ViewCompatResult(
+            support_state=SUPPORT_STATE_UNSUPPORTED,
+            reason_code="VIEW_X$",
+            reason="引用 X$ 系统表，OB 不支持",
+            detail=",".join(sorted(x_hits)),
             cleaned_ddl=cleaned,
             rewrite_notes=rewrite_notes
         )
@@ -19837,7 +19983,8 @@ def generate_fixup_scripts(
             sys_privs={},
             role_privs={},
             role_ddls=[],
-            filtered_grants=[]
+            filtered_grants=[],
+            view_grant_targets=set()
         )
     if not grant_enabled:
         grant_plan = GrantPlan(
@@ -19845,7 +19992,8 @@ def generate_fixup_scripts(
             sys_privs={},
             role_privs={},
             role_ddls=[],
-            filtered_grants=[]
+            filtered_grants=[],
+            view_grant_targets=set()
         )
 
     object_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
@@ -20443,6 +20591,24 @@ def generate_fixup_scripts(
     view_missing_objects = list(view_missing_supported)
     non_view_missing_objects = list(non_view_missing_supported)
 
+    view_target_set: Set[str] = {
+        f"{tgt_schema}.{tgt_obj}".upper()
+        for _src_schema, _src_obj, tgt_schema, tgt_obj in view_missing_supported
+    }
+    view_prereq_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]] = {}
+    view_post_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]] = {}
+    if grant_enabled and object_grants_missing_by_grantee and view_target_set:
+        (
+            view_prereq_grants_by_grantee,
+            view_post_grants_by_grantee,
+            object_grants_missing_by_grantee
+        ) = split_view_grants(
+            view_target_set,
+            expected_dependency_pairs,
+            object_grants_missing_by_grantee
+        )
+    view_grants_split_enabled = bool(view_prereq_grants_by_grantee or view_post_grants_by_grantee)
+
     def _order_plsql_fixups(
         items: List[Tuple[str, str, str, str, str]]
     ) -> List[Tuple[str, str, str, str, str]]:
@@ -20546,7 +20712,8 @@ def generate_fixup_scripts(
                 remap_rules,
                 synonym_meta=synonym_meta_map,
                 ob_meta=ob_meta,
-                ob_grant_catalog=ob_grant_catalog
+                ob_grant_catalog=ob_grant_catalog,
+                view_grant_targets=grant_plan.view_grant_targets if grant_plan else None
             )
             if view_chain_file:
                 log.info("VIEW fixup 依赖链已输出: %s", view_chain_file)
@@ -21184,7 +21351,7 @@ def generate_fixup_scripts(
                 extra_comments = []
                 if compat and compat.rewrite_notes:
                     extra_comments.append("rewrite_notes: " + "; ".join(compat.rewrite_notes))
-                grants_for_view = collect_grants_for_object(obj_full)
+                grants_for_view = [] if view_grants_split_enabled else collect_grants_for_object(obj_full)
                 log.info("[FIXUP]%s 写入 VIEW 脚本: %s", source_tag(ddl_source_label), filename)
                 write_fixup_file(
                     base_dir,
@@ -21961,6 +22128,8 @@ def generate_fixup_scripts(
     if grant_enabled:
         grant_dir_all = 'grants_all'
         grant_dir_miss = 'grants_miss'
+        grant_dir_view_prereq = 'view_prereq_grants'
+        grant_dir_view_post = 'view_post_grants'
 
         if grant_plan.role_ddls:
             role_content = "\n".join(grant_plan.role_ddls).strip()
@@ -21979,6 +22148,40 @@ def generate_fixup_scripts(
                     "roles.sql",
                     role_content,
                     "角色 DDL (来自 Oracle 授权引用)"
+                )
+
+        if view_prereq_grants_by_grantee:
+            _raw_pre, _merged_pre, _obj_lookup_pre, prereq_by_owner = (
+                build_object_grant_statements_for(view_prereq_grants_by_grantee)
+            )
+            for owner, stmts in sorted(prereq_by_owner.items()):
+                if not stmts:
+                    continue
+                content = "\n".join(sorted(stmts))
+                header = f"{owner} VIEW 前置授权 (依赖对象)"
+                write_fixup_file(
+                    base_dir,
+                    grant_dir_view_prereq,
+                    f"{owner}.grants.sql",
+                    content,
+                    header
+                )
+
+        if view_post_grants_by_grantee:
+            _raw_post, _merged_post, _obj_lookup_post, post_by_owner = (
+                build_object_grant_statements_for(view_post_grants_by_grantee)
+            )
+            for owner, stmts in sorted(post_by_owner.items()):
+                if not stmts:
+                    continue
+                content = "\n".join(sorted(stmts))
+                header = f"{owner} VIEW 创建后授权"
+                write_fixup_file(
+                    base_dir,
+                    grant_dir_view_post,
+                    f"{owner}.grants.sql",
+                    content,
+                    header
                 )
 
         if object_grants_by_grantee or sys_privs_by_grantee or role_privs_by_grantee:
@@ -22067,6 +22270,8 @@ def generate_fixup_scripts(
                 and not grant_plan.role_ddls
                 and not miss_grants_by_owner
                 and not miss_privs_by_grantee
+                and not view_prereq_grants_by_grantee
+                and not view_post_grants_by_grantee
             ):
                 log.info("[FIXUP] (9/9) 无需生成授权脚本。")
         else:
@@ -25137,7 +25342,9 @@ def print_final_report(
         "fixup_scripts/table         : 缺失 TABLE 的 CREATE 脚本\n"
         "fixup_scripts/tables_unsupported : 不支持 TABLE 的 DDL (默认不执行)\n"
         "fixup_scripts/tables_unsupported/temporary : 不支持临时表 DDL\n"
+        "fixup_scripts/view_prereq_grants : VIEW 前置授权 (依赖对象)\n"
         "fixup_scripts/view          : 缺失 VIEW 的 CREATE 脚本\n"
+        "fixup_scripts/view_post_grants : VIEW 创建后授权 (同步源端权限)\n"
         "fixup_scripts/materialized_view : MATERIALIZED VIEW 默认仅打印不生成\n"
         "fixup_scripts/procedure     : 缺失 PROCEDURE 的 CREATE 脚本\n"
         "fixup_scripts/function      : 缺失 FUNCTION 的 CREATE 脚本\n"

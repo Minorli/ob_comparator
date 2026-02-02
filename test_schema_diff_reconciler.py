@@ -1856,7 +1856,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             sys_privs={},
             role_privs={},
             role_ddls=[],
-            filtered_grants=[]
+            filtered_grants=[],
+            view_grant_targets=set()
         )
         settings = {
             "fixup_dir": "",
@@ -5062,6 +5063,123 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         norm_upper = sdr.normalize_index_columns(cols, {1: expr_upper})
         norm_lower = sdr.normalize_index_columns(cols, {1: expr_lower})
         self.assertEqual(norm_upper, norm_lower)
+
+    def test_clean_view_ddl_removes_force(self):
+        ddl = "CREATE OR REPLACE FORCE VIEW A.V1 AS SELECT 1 FROM DUAL"
+        cleaned = sdr.clean_view_ddl_for_oceanbase(ddl)
+        self.assertIn("CREATE OR REPLACE VIEW", cleaned.upper())
+        self.assertNotIn("FORCE VIEW", cleaned.upper())
+
+    def test_classify_missing_objects_blocks_x_dollar(self):
+        tv_results = {
+            "missing": [("VIEW", "TGT.V1", "SRC.V1")],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": []
+        }
+        oracle_meta = self._make_oracle_meta()
+        ob_meta = self._make_ob_meta()
+        full_mapping = {"SRC.V1": {"VIEW": "TGT.V1"}}
+        source_objects = {"SRC.V1": {"VIEW"}}
+        deps = {("SRC", "V1", "VIEW", "SYS", "X$KQF", "TABLE")}
+        dependency_graph = sdr.build_dependency_graph(deps)
+        settings = {"view_compat_rules": {}, "view_dblink_policy": "block"}
+        ora_cfg = {"user": "u", "password": "p", "dsn": "d"}
+
+        with mock.patch.object(
+            sdr,
+            "oracle_get_views_ddl_batch",
+            return_value={("SRC", "V1"): "CREATE VIEW V1 AS SELECT * FROM X$KQF"}
+        ):
+            summary = sdr.classify_missing_objects(
+                ora_cfg,
+                settings,
+                tv_results,
+                {
+                    "index_ok": [], "index_mismatched": [],
+                    "constraint_ok": [], "constraint_mismatched": [],
+                    "sequence_ok": [], "sequence_mismatched": [],
+                    "trigger_ok": [], "trigger_mismatched": [],
+                },
+                oracle_meta,
+                ob_meta,
+                full_mapping,
+                source_objects,
+                dependency_graph=dependency_graph,
+                object_parent_map=None,
+                table_target_map={},
+                synonym_meta_map={}
+            )
+
+        view_row = next(row for row in summary.missing_detail_rows if row.src_full == "SRC.V1")
+        self.assertEqual(view_row.support_state, sdr.SUPPORT_STATE_UNSUPPORTED)
+        self.assertEqual(view_row.reason_code, "VIEW_X$")
+
+    def test_classify_missing_objects_allows_user_defined_x_dollar(self):
+        tv_results = {
+            "missing": [("VIEW", "TGT.V1", "SRC.V1")],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": []
+        }
+        oracle_meta = self._make_oracle_meta()
+        ob_meta = self._make_ob_meta()
+        full_mapping = {"SRC.V1": {"VIEW": "TGT.V1"}, "SRC.X$CUSTOM": {"TABLE": "TGT.X$CUSTOM"}}
+        source_objects = {"SRC.V1": {"VIEW"}, "SRC.X$CUSTOM": {"TABLE"}}
+        deps = {("SRC", "V1", "VIEW", "SRC", "X$CUSTOM", "TABLE")}
+        dependency_graph = sdr.build_dependency_graph(deps)
+        settings = {"view_compat_rules": {}, "view_dblink_policy": "block"}
+        ora_cfg = {"user": "u", "password": "p", "dsn": "d"}
+
+        with mock.patch.object(
+            sdr,
+            "oracle_get_views_ddl_batch",
+            return_value={("SRC", "V1"): "CREATE VIEW V1 AS SELECT * FROM X$CUSTOM"}
+        ):
+            summary = sdr.classify_missing_objects(
+                ora_cfg,
+                settings,
+                tv_results,
+                {
+                    "index_ok": [], "index_mismatched": [],
+                    "constraint_ok": [], "constraint_mismatched": [],
+                    "sequence_ok": [], "sequence_mismatched": [],
+                    "trigger_ok": [], "trigger_mismatched": [],
+                },
+                oracle_meta,
+                ob_meta,
+                full_mapping,
+                source_objects,
+                dependency_graph=dependency_graph,
+                object_parent_map=None,
+                table_target_map={},
+                synonym_meta_map={}
+            )
+
+        view_row = next(row for row in summary.missing_detail_rows if row.src_full == "SRC.V1")
+        self.assertEqual(view_row.support_state, sdr.SUPPORT_STATE_SUPPORTED)
+
+    def test_split_view_grants(self):
+        view_targets = {"TGT.V1"}
+        expected_pairs = {("TGT.V1", "VIEW", "TGT2.T1", "TABLE")}
+        grants = {
+            "TGT": {
+                sdr.ObjectGrantEntry("SELECT", "TGT2.T1", True)
+            },
+            "APP": {
+                sdr.ObjectGrantEntry("SELECT", "TGT.V1", False)
+            }
+        }
+        prereq, post, remaining = sdr.split_view_grants(view_targets, expected_pairs, grants)
+        self.assertIn("TGT", prereq)
+        self.assertIn(sdr.ObjectGrantEntry("SELECT", "TGT2.T1", True), prereq["TGT"])
+        self.assertIn("APP", post)
+        self.assertIn(sdr.ObjectGrantEntry("SELECT", "TGT.V1", False), post["APP"])
+        self.assertEqual(remaining, {})
 
     def test_recursive_infer_target_schema_uses_indirect_tables(self):
         deps = {

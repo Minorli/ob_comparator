@@ -347,16 +347,17 @@ DEPENDENCY_LAYERS = [
     ["sequence"],                                    # Layer 0: No dependencies
     ["table"],                                       # Layer 1: Base tables
     ["table_alter"],                                 # Layer 2: Table modifications
-    ["grants"],                                      # Layer 3: Grants BEFORE dependent objects
+    ["view_prereq_grants", "grants"],                # Layer 3: View prereq + general grants
     ["view", "synonym"],                             # Layer 4: Simple dependent objects
-    ["materialized_view"],                           # Layer 5: MVIEWs
-    ["type"],                                        # Layer 6: Types (specs)
-    ["package"],                                     # Layer 7: Package specs
-    ["procedure", "function"],                       # Layer 8: Standalone routines
-    ["type_body", "package_body"],                   # Layer 9: Type/package bodies
-    ["constraint", "index"],                         # Layer 10: Constraints and indexes
-    ["trigger"],                                     # Layer 11: Triggers (last)
-    ["job", "schedule"],                             # Layer 12: Jobs
+    ["view_post_grants"],                            # Layer 5: View post grants
+    ["materialized_view"],                           # Layer 6: MVIEWs
+    ["type"],                                        # Layer 7: Types (specs)
+    ["package"],                                     # Layer 8: Package specs
+    ["procedure", "function"],                       # Layer 9: Standalone routines
+    ["type_body", "package_body"],                   # Layer 10: Type/package bodies
+    ["constraint", "index"],                         # Layer 11: Constraints and indexes
+    ["trigger"],                                     # Layer 12: Triggers (last)
+    ["job", "schedule"],                             # Layer 13: Jobs
 ]
 
 GRANT_DIRS = {"grants", "grants_miss", "grants_all"}
@@ -734,9 +735,10 @@ def collect_sql_files_by_layer(
     else:
         # Original priority order (backward compatible)
         priority = [
-            "sequence", "table", "table_alter", "constraint", "index",
-            "view", "materialized_view", "synonym", "procedure", "function",
-            "package", "package_body", "type", "type_body", "trigger",
+            "sequence", "table", "table_alter", "view_prereq_grants", "constraint", "index",
+            "view", "materialized_view", "synonym", "view_post_grants",
+            "procedure", "function", "package", "package_body",
+            "type", "type_body", "trigger",
             "job", "schedule", "grants",
         ]
         

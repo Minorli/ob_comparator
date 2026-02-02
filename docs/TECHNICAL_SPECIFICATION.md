@@ -81,6 +81,7 @@
 
 ### 5.2 VIEW / PLSQL / TYPE / SYNONYM / JOB / SCHEDULE
 - 存在性校验
+- VIEW 兼容性分析：SYS.OBJ$ / X$ 系统对象视为不支持（用户自建 X$ 对象除外）
 
 ### 5.3 PACKAGE / PACKAGE BODY
 - 有效性校验（`DBA_ERRORS` 摘要）
@@ -114,6 +115,8 @@
 ### 6.2 授权生成
 - 基于 `DBA_TAB_PRIVS`、`DBA_SYS_PRIVS`、`DBA_ROLE_PRIVS`
 - 支持权限合并与白名单过滤
+- 视图权限拆分：依赖对象授权输出到 `view_prereq_grants/`，视图自身授权输出到 `view_post_grants/`
+- 视图链路要求 `WITH GRANT OPTION` 的场景会单独标注缺失
 - 输出 `grants_miss/` 与 `grants_all/`
 
 ---
@@ -129,10 +132,13 @@
 - PL/SQL 结尾修正
 - Oracle 特有语法清理
 - VIEW 行内注释修复
+- VIEW FORCE 关键字清理（CREATE OR REPLACE FORCE VIEW -> CREATE OR REPLACE VIEW）
 
 ### 7.3 输出目录
 - `fixup_scripts/table/` / `table_alter/`
+- `fixup_scripts/view_prereq_grants/`
 - `fixup_scripts/view/`
+- `fixup_scripts/view_post_grants/`
 - `fixup_scripts/compile/`
 - `fixup_scripts/grants_miss/`
 
@@ -159,6 +165,7 @@
 - `package_compare_*.txt`：包对比明细
 - `remap_conflicts_*.txt`：推导冲突
 - `VIEWs_chain_*.txt`：VIEW 链路
+- `unsupported_<TYPE>_detail_*.txt`：按类型不支持明细（含 ROOT_CAUSE，如 VIEW_X$ 及命中对象）
 - `filtered_grants.txt`：过滤权限
 
 ---
