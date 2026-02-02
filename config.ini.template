@@ -160,6 +160,20 @@ check_comments          = true
 # 是否校验列顺序（仅在启用时比较，默认关闭）
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 check_column_order      = false
+# 是否校验 VIEW/SYNONYM 可用性（存在但不可用场景）
+# 可选值：true/false/1/0/yes/no（大小写不敏感）
+check_object_usability  = false
+# 是否同时校验源端可用性（用于判断“预期不可用”）
+# 可选值：true/false/1/0/yes/no（大小写不敏感）
+check_source_usability  = true
+# 可用性校验超时（秒，建议 5~30）
+usability_check_timeout = 10
+# 可用性校验并发线程数
+usability_check_workers = 10
+# 可用性校验抽样阈值（0 表示不抽样）
+max_usability_objects   = 0
+# 可用性校验抽样比例（0~1；留空或 0 表示不抽样）
+usability_sample_ratio  = 0
 # 列可见性(INVISIBLE)处理策略
 #   auto    -> 元数据可用时校验并生成修补（默认）
 #   enforce -> 强制校验/生成修补（即使元数据不完整）

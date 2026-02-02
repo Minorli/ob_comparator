@@ -70,6 +70,17 @@
   说明：依赖 DBA_TAB_COMMENTS / DBA_COL_COMMENTS。
 - check_column_order：是否校验列顺序。默认：false。
   说明：仅在启用时比较列顺序，自动过滤 OMS/自动列/SYS_NC 等噪声列。
+- check_object_usability：是否校验 VIEW/SYNONYM 可用性。默认：false。
+  说明：通过 `SELECT * FROM <obj> WHERE 1=2` 验证对象能否解析/查询；不会返回数据。
+- check_source_usability：是否同时校验源端可用性。默认：true。
+  说明：用于判定“目标端不可用是否为预期行为”（源端也不可用）。
+- usability_check_timeout：可用性校验单对象超时（秒）。默认：10。
+  说明：超时会标记为 TIMEOUT，不视为不可用。
+- usability_check_workers：可用性校验并发线程数。默认：10。
+- max_usability_objects：可用性校验抽样阈值。默认：0（不抽样）。
+- usability_sample_ratio：可用性校验抽样比例（0~1）。默认：0（不抽样）。
+  说明：仅当 max_usability_objects>0 且 usability_sample_ratio>0 时才启用抽样。
+  说明：被抽样跳过的对象不会写入明细报告，仅计入汇总的“跳过”数量。
 - column_visibility_policy：列可见性(INVISIBLE)处理策略。默认：auto。
   可选值：auto（元数据可用时校验并生成修补）、enforce（强制校验/修补）、ignore（跳过可见性校验）。
 - 说明：OB 侧 CHAR_USED 缺失时默认按 BYTE 语义处理；若 DATA_LENGTH > CHAR_LENGTH 则推断为 CHAR 语义，避免长度语义误判。

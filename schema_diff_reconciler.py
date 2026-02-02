@@ -69,6 +69,7 @@ import sys
 import logging
 import math
 import re
+import random
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 
@@ -197,6 +198,7 @@ RUN_PHASE_ORDER: Tuple[str, ...] = (
     "Oracle 元数据转储",
     "主对象校验",
     "扩展对象校验",
+    "对象可用性校验",
     "依赖/授权校验",
     "修补脚本生成",
     "报告输出",
@@ -427,6 +429,45 @@ class DdlFormatReportRow(NamedTuple):
     size_bytes: int
     line_count: int
     path: str
+
+
+USABILITY_STATUS_OK = "OK"
+USABILITY_STATUS_UNUSABLE = "UNUSABLE"
+USABILITY_STATUS_EXPECTED_UNUSABLE = "EXPECTED_UNUSABLE"
+USABILITY_STATUS_UNEXPECTED_USABLE = "UNEXPECTED_USABLE"
+USABILITY_STATUS_TIMEOUT = "TIMEOUT"
+USABILITY_STATUS_SKIPPED = "SKIPPED"
+
+
+class UsabilityCheckResult(NamedTuple):
+    schema: str
+    object_name: str
+    object_type: str
+    src_exists: bool
+    src_usable: Optional[bool]
+    tgt_exists: bool
+    tgt_usable: Optional[bool]
+    status: str
+    src_error: str
+    tgt_error: str
+    root_cause: str
+    recommendation: str
+    src_time_ms: int
+    tgt_time_ms: int
+
+
+class UsabilitySummary(NamedTuple):
+    total_candidates: int
+    total_checked: int
+    total_usable: int
+    total_unusable: int
+    total_expected_unusable: int
+    total_unexpected_usable: int
+    total_timeout: int
+    total_skipped: int
+    total_sampled_out: int
+    duration_seconds: float
+    results: List[UsabilityCheckResult]
 
 
 @dataclass
@@ -2801,6 +2842,12 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('print_dependency_chains', 'true')
         settings.setdefault('check_comments', 'true')
         settings.setdefault('check_column_order', 'false')
+        settings.setdefault('check_object_usability', 'false')
+        settings.setdefault('check_source_usability', 'true')
+        settings.setdefault('usability_check_timeout', '10')
+        settings.setdefault('usability_check_workers', '10')
+        settings.setdefault('max_usability_objects', '')
+        settings.setdefault('usability_sample_ratio', '')
         settings.setdefault('generate_interval_partition_fixup', 'false')
         settings.setdefault('interval_partition_cutoff', '20280301')
         settings.setdefault('interval_partition_cutoff_numeric', '')
@@ -2873,6 +2920,36 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             settings.get('check_comments', 'true'),
             True
         )
+        settings['check_object_usability'] = parse_bool_flag(
+            settings.get('check_object_usability', 'false'),
+            False
+        )
+        settings['check_source_usability'] = parse_bool_flag(
+            settings.get('check_source_usability', 'true'),
+            True
+        )
+        try:
+            settings['usability_check_timeout'] = int(settings.get('usability_check_timeout', '10'))
+        except (TypeError, ValueError):
+            settings['usability_check_timeout'] = 10
+        if settings['usability_check_timeout'] <= 0:
+            settings['usability_check_timeout'] = 10
+        try:
+            settings['usability_check_workers'] = int(settings.get('usability_check_workers', '10'))
+        except (TypeError, ValueError):
+            settings['usability_check_workers'] = 10
+        if settings['usability_check_workers'] <= 0:
+            settings['usability_check_workers'] = 10
+        try:
+            settings['max_usability_objects'] = int(settings.get('max_usability_objects', '0') or 0)
+        except (TypeError, ValueError):
+            settings['max_usability_objects'] = 0
+        try:
+            settings['usability_sample_ratio'] = float(settings.get('usability_sample_ratio', '0') or 0)
+        except (TypeError, ValueError):
+            settings['usability_sample_ratio'] = 0.0
+        if settings['usability_sample_ratio'] < 0:
+            settings['usability_sample_ratio'] = 0.0
         settings['fixup_drop_sys_c_columns'] = parse_bool_flag(
             settings.get('fixup_drop_sys_c_columns', 'false'),
             False
@@ -3274,6 +3351,17 @@ def run_config_wizard(config_path: Path) -> None:
         except ValueError:
             return False, "需要非负整数"
 
+    def _validate_ratio_0_1(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        try:
+            ratio = float(val)
+        except ValueError:
+            return False, "需要 0~1 之间的小数"
+        if 0 <= ratio <= 1:
+            return True, ""
+        return False, "需要 0~1 之间的小数"
+
     def _validate_grant_scope(val: str) -> Tuple[bool, str]:
         v = val.strip().lower()
         if v in ("owner", "owner_or_grantee"):
@@ -3526,6 +3614,48 @@ def run_config_wizard(config_path: Path) -> None:
         "是否校验列顺序 (true/false，默认 false)",
         default=cfg.get("SETTINGS", "check_column_order", fallback="false"),
         transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "check_object_usability",
+        "是否校验 VIEW/SYNONYM 可用性 (true/false，默认 false)",
+        default=cfg.get("SETTINGS", "check_object_usability", fallback="false"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "check_source_usability",
+        "是否同时校验源端可用性 (true/false，默认 true)",
+        default=cfg.get("SETTINGS", "check_source_usability", fallback="true"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "usability_check_timeout",
+        "可用性校验超时（秒，默认 10）",
+        default=cfg.get("SETTINGS", "usability_check_timeout", fallback="10"),
+        validator=_validate_positive_int,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "usability_check_workers",
+        "可用性校验并发线程数（默认 10）",
+        default=cfg.get("SETTINGS", "usability_check_workers", fallback="10"),
+        validator=_validate_positive_int,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "max_usability_objects",
+        "可用性校验抽样阈值（0 表示不抽样）",
+        default=cfg.get("SETTINGS", "max_usability_objects", fallback="0"),
+        validator=_validate_non_negative_int,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "usability_sample_ratio",
+        "可用性校验抽样比例（0~1，留空/0 表示不抽样）",
+        default=cfg.get("SETTINGS", "usability_sample_ratio", fallback="0"),
+        validator=_validate_ratio_0_1,
     )
     _prompt_field(
         "SETTINGS",
@@ -7000,8 +7130,9 @@ def compute_object_counts(
 
 # ====================== obclient + 一次性元数据转储 ======================
 
-def obclient_run_sql(ob_cfg: ObConfig, sql_query: str) -> Tuple[bool, str, str]:
+def obclient_run_sql(ob_cfg: ObConfig, sql_query: str, timeout: Optional[int] = None) -> Tuple[bool, str, str]:
     """运行 obclient CLI 命令并返回 (Success, stdout, stderr)，带 timeout。"""
+    timeout_val = OBC_TIMEOUT if timeout is None else max(1, int(timeout))
     command_args = [
         ob_cfg['executable'],
         '-h', ob_cfg['host'],
@@ -7019,7 +7150,7 @@ def obclient_run_sql(ob_cfg: ObConfig, sql_query: str) -> Tuple[bool, str, str]:
             text=True,
             encoding='utf-8',
             errors='ignore',
-            timeout=OBC_TIMEOUT
+            timeout=timeout_val
         )
 
         if result.returncode != 0:
@@ -13681,6 +13812,400 @@ def check_comments(
             results["ok"].append(f"{tgt_key[0]}.{tgt_key[1]}")
 
     return results
+
+
+# ====================== VIEW/SYNONYM 可用性校验 ======================
+
+def classify_usability_status(
+    src_checked: bool,
+    src_usable: Optional[bool],
+    tgt_usable: Optional[bool],
+    timeout: bool = False
+) -> str:
+    if timeout:
+        return USABILITY_STATUS_TIMEOUT
+    if tgt_usable is True:
+        if src_checked and src_usable is False:
+            return USABILITY_STATUS_UNEXPECTED_USABLE
+        return USABILITY_STATUS_OK
+    if tgt_usable is False:
+        if src_checked and src_usable is False:
+            return USABILITY_STATUS_EXPECTED_UNUSABLE
+        return USABILITY_STATUS_UNUSABLE
+    return USABILITY_STATUS_SKIPPED
+
+
+def analyze_usability_error(error_msg: str) -> Tuple[str, str]:
+    """
+    返回 (root_cause, recommendation)
+    """
+    if not error_msg:
+        return "-", "-"
+    msg = normalize_error_text(error_msg)
+    msg_upper = msg.upper()
+    if "ORA-00942" in msg_upper or "ORA-04043" in msg_upper:
+        return "依赖对象不存在", "检查依赖对象是否已迁移，必要时执行缺失对象修补"
+    if "ORA-00980" in msg_upper:
+        return "同义词指向对象无效", "重建同义词或创建目标对象"
+    if "ORA-01775" in msg_upper:
+        return "同义词循环引用", "检查并修复同义词链条"
+    if "ORA-00904" in msg_upper:
+        return "列或标识符不存在", "检查依赖表结构或视图定义"
+    if "ORA-01031" in msg_upper:
+        return "权限不足", "授予查询权限或执行 grant 修补脚本"
+    if "ORA-04063" in msg_upper:
+        return "视图编译错误", "重新编译视图或修复依赖对象"
+    if "TIMEOUT" in msg_upper or "DPY-4011" in msg_upper or "ORA-01013" in msg_upper:
+        return "查询超时", "可增加超时或人工验证"
+    if "ORA-00600" in msg_upper:
+        return "OceanBase 内部错误", "检查 OB 日志或联系 DBA"
+    if "ORA-00900" in msg_upper:
+        return "SQL 语法错误", "检查 DDL 兼容性或清洗规则"
+    return "未知错误", "查看错误信息并人工定位"
+
+
+def _build_usability_query(full_name: str) -> Optional[str]:
+    parsed = parse_full_object_name(full_name)
+    if not parsed:
+        return None
+    schema, obj = parsed
+    return f"SELECT * FROM {quote_qualified_parts(schema, obj)} WHERE 1=2"
+
+
+def _compute_usability_sample(
+    total: int,
+    max_objects: int,
+    sample_ratio: float
+) -> Tuple[int, int, bool]:
+    if total <= 0:
+        return 0, 0, False
+    if max_objects <= 0 or sample_ratio <= 0 or sample_ratio >= 1:
+        return total, 0, False
+    if total <= max_objects:
+        return total, 0, False
+    sample_cnt = max(1, int(total * sample_ratio))
+    if sample_cnt > max_objects:
+        sample_cnt = max_objects
+    return sample_cnt, max(0, total - sample_cnt), True
+
+
+def check_object_usability(
+    settings: Dict,
+    master_list: MasterCheckList,
+    tv_results: ReportResults,
+    ob_cfg: ObConfig,
+    ora_cfg: OraConfig,
+    ob_meta: ObMetadata,
+    enabled_primary_types: Set[str],
+    support_summary: Optional[SupportClassificationResult] = None
+) -> Optional[UsabilitySummary]:
+    if not settings:
+        return None
+    if not parse_bool_flag(settings.get("check_object_usability", "false"), False):
+        return None
+    if not master_list:
+        return None
+
+    target_types = {"VIEW", "SYNONYM"}
+    if not (enabled_primary_types & target_types):
+        log.info("[USABILITY] VIEW/SYNONYM 未启用主对象检查，可用性校验跳过。")
+        return None
+
+    check_source = parse_bool_flag(settings.get("check_source_usability", "true"), True)
+    try:
+        timeout_sec = int(settings.get("usability_check_timeout", "10"))
+    except (TypeError, ValueError):
+        timeout_sec = 10
+    if timeout_sec <= 0:
+        timeout_sec = 10
+    try:
+        workers = int(settings.get("usability_check_workers", "10"))
+    except (TypeError, ValueError):
+        workers = 10
+    if workers <= 0:
+        workers = 10
+    try:
+        max_objects = int(settings.get("max_usability_objects", "0"))
+    except (TypeError, ValueError):
+        max_objects = 0
+    try:
+        sample_ratio = float(settings.get("usability_sample_ratio", "0"))
+    except (TypeError, ValueError):
+        sample_ratio = 0.0
+
+    missing_targets = {
+        (obj_type.upper(), tgt_full.upper())
+        for obj_type, _src_full, tgt_full in (tv_results.get("missing") or [])
+    }
+    unsupported_map = support_summary.support_state_map if support_summary else {}
+    unsupported_views = support_summary.unsupported_view_keys if support_summary else set()
+
+    candidates: List[Tuple[str, str, str]] = []
+    results: List[UsabilityCheckResult] = []
+    for src_full, tgt_full, obj_type in master_list:
+        obj_type_u = (obj_type or "").upper()
+        if obj_type_u not in target_types:
+            continue
+        if obj_type_u not in enabled_primary_types:
+            continue
+        src_parsed = parse_full_object_name(src_full)
+        tgt_parsed = parse_full_object_name(tgt_full)
+        if not src_parsed or not tgt_parsed:
+            results.append(UsabilityCheckResult(
+                schema="",
+                object_name=src_full,
+                object_type=obj_type_u,
+                src_exists=False,
+                src_usable=None,
+                tgt_exists=False,
+                tgt_usable=None,
+                status=USABILITY_STATUS_SKIPPED,
+                src_error="-",
+                tgt_error="-",
+                root_cause="对象名无法解析",
+                recommendation="检查映射或对象名格式",
+                src_time_ms=0,
+                tgt_time_ms=0
+            ))
+            continue
+        src_schema, src_obj = src_parsed
+        tgt_schema, tgt_obj = tgt_parsed
+        tgt_key = f"{tgt_schema}.{tgt_obj}"
+        if (obj_type_u, tgt_key) in missing_targets:
+            results.append(UsabilityCheckResult(
+                schema=tgt_schema,
+                object_name=tgt_obj,
+                object_type=obj_type_u,
+                src_exists=True,
+                src_usable=None,
+                tgt_exists=False,
+                tgt_usable=None,
+                status=USABILITY_STATUS_SKIPPED,
+                src_error="-",
+                tgt_error="-",
+                root_cause="目标端对象缺失",
+                recommendation="先修补缺失对象再校验可用性",
+                src_time_ms=0,
+                tgt_time_ms=0
+            ))
+            continue
+        if obj_type_u == "VIEW" and (src_schema.upper(), src_obj.upper()) in unsupported_views:
+            results.append(UsabilityCheckResult(
+                schema=tgt_schema,
+                object_name=tgt_obj,
+                object_type=obj_type_u,
+                src_exists=True,
+                src_usable=None,
+                tgt_exists=True,
+                tgt_usable=None,
+                status=USABILITY_STATUS_SKIPPED,
+                src_error="-",
+                tgt_error="-",
+                root_cause="视图被标记为不支持/需改造",
+                recommendation="先处理视图兼容性问题",
+                src_time_ms=0,
+                tgt_time_ms=0
+            ))
+            continue
+        if unsupported_map:
+            support_row = unsupported_map.get((src_full, obj_type_u))
+            if support_row and support_row.support_state != SUPPORT_STATE_SUPPORTED:
+                results.append(UsabilityCheckResult(
+                    schema=tgt_schema,
+                    object_name=tgt_obj,
+                    object_type=obj_type_u,
+                    src_exists=True,
+                    src_usable=None,
+                    tgt_exists=True,
+                    tgt_usable=None,
+                    status=USABILITY_STATUS_SKIPPED,
+                    src_error="-",
+                    tgt_error="-",
+                    root_cause="对象被标记为不支持/阻断",
+                    recommendation="先处理不支持原因再校验可用性",
+                    src_time_ms=0,
+                    tgt_time_ms=0
+                ))
+                continue
+        candidates.append((src_full, tgt_full, obj_type_u))
+
+    total_candidates = len(candidates)
+    if total_candidates == 0:
+        return UsabilitySummary(
+            total_candidates=0,
+            total_checked=0,
+            total_usable=0,
+            total_unusable=0,
+            total_expected_unusable=0,
+            total_unexpected_usable=0,
+            total_timeout=0,
+            total_skipped=len(results),
+            total_sampled_out=0,
+            duration_seconds=0.0,
+            results=results
+        )
+
+    sample_count, sampled_out, sampled = _compute_usability_sample(
+        total_candidates,
+        max_objects,
+        sample_ratio
+    )
+    if sampled:
+        rng = random.Random(0)
+        candidates = rng.sample(candidates, sample_count)
+        log.info(
+            "[USABILITY] 启用抽样：候选 %d，实际校验 %d，跳过 %d。",
+            total_candidates,
+            sample_count,
+            sampled_out
+        )
+
+    ob_views = ob_meta.objects_by_type.get("VIEW", set()) if ob_meta else set()
+    ob_synonyms = ob_meta.objects_by_type.get("SYNONYM", set()) if ob_meta else set()
+
+    oracle_conns: List[oracledb.Connection] = []
+    oracle_conn_lock = threading.Lock()
+    oracle_local = threading.local()
+
+    def _get_oracle_conn() -> oracledb.Connection:
+        conn = getattr(oracle_local, "conn", None)
+        if conn is None:
+            conn = oracledb.connect(
+                user=ora_cfg["user"],
+                password=ora_cfg["password"],
+                dsn=ora_cfg["dsn"]
+            )
+            with oracle_conn_lock:
+                oracle_conns.append(conn)
+            oracle_local.conn = conn
+        return conn
+
+    def _oracle_check(full_name: str) -> Tuple[Optional[bool], str, int, bool]:
+        sql = _build_usability_query(full_name)
+        if not sql:
+            return None, "INVALID_NAME", 0, False
+        start = time.perf_counter()
+        try:
+            conn = _get_oracle_conn()
+            cur = conn.cursor()
+            if timeout_sec:
+                cur.call_timeout = int(timeout_sec * 1000)
+            cur.execute(sql)
+            cur.close()
+            return True, "", int((time.perf_counter() - start) * 1000), False
+        except Exception as exc:
+            msg = normalize_error_text(str(exc))
+            timeout_hit = any(token in msg.upper() for token in ("DPY-4011", "ORA-01013", "TIMEOUT"))
+            return False, msg, int((time.perf_counter() - start) * 1000), timeout_hit
+
+    def _ob_check(full_name: str) -> Tuple[Optional[bool], str, int, bool]:
+        sql = _build_usability_query(full_name)
+        if not sql:
+            return None, "INVALID_NAME", 0, False
+        start = time.perf_counter()
+        ok, _out, err = obclient_run_sql(ob_cfg, sql, timeout=timeout_sec)
+        duration_ms = int((time.perf_counter() - start) * 1000)
+        if ok:
+            return True, "", duration_ms, False
+        err_msg = normalize_error_text(err)
+        timeout_hit = "TIMEOUT" in err_msg.upper() or "TIMEOUTEXPIRED" in err_msg.upper()
+        return False, err_msg, duration_ms, timeout_hit
+
+    def _check_one(item: Tuple[str, str, str]) -> UsabilityCheckResult:
+        src_full, tgt_full, obj_type_u = item
+        src_schema, src_obj = parse_full_object_name(src_full) or ("", src_full)
+        tgt_schema, tgt_obj = parse_full_object_name(tgt_full) or ("", tgt_full)
+        tgt_exists = False
+        if obj_type_u == "VIEW":
+            tgt_exists = tgt_full.upper() in ob_views
+        elif obj_type_u == "SYNONYM":
+            tgt_exists = tgt_full.upper() in ob_synonyms
+        if not tgt_exists:
+            return UsabilityCheckResult(
+                schema=tgt_schema,
+                object_name=tgt_obj,
+                object_type=obj_type_u,
+                src_exists=True,
+                src_usable=None,
+                tgt_exists=False,
+                tgt_usable=None,
+                status=USABILITY_STATUS_SKIPPED,
+                src_error="-",
+                tgt_error="-",
+                root_cause="目标端对象缺失",
+                recommendation="先修补缺失对象再校验可用性",
+                src_time_ms=0,
+                tgt_time_ms=0
+            )
+
+        tgt_usable, tgt_err, tgt_ms, tgt_timeout = _ob_check(tgt_full)
+        src_usable = None
+        src_err = "-"
+        src_ms = 0
+        src_timeout = False
+        if check_source:
+            src_usable, src_err, src_ms, src_timeout = _oracle_check(src_full)
+
+        timeout_hit = tgt_timeout or src_timeout
+        status = classify_usability_status(check_source, src_usable, tgt_usable, timeout_hit)
+        if status == USABILITY_STATUS_TIMEOUT:
+            root_cause, recommendation = "查询超时", "可增加超时或人工验证"
+        elif status == USABILITY_STATUS_SKIPPED:
+            root_cause, recommendation = "跳过校验", "-"
+        else:
+            err_msg = tgt_err if tgt_usable is False else src_err if src_usable is False else ""
+            root_cause, recommendation = analyze_usability_error(err_msg)
+
+        return UsabilityCheckResult(
+            schema=tgt_schema,
+            object_name=tgt_obj,
+            object_type=obj_type_u,
+            src_exists=True,
+            src_usable=src_usable,
+            tgt_exists=True,
+            tgt_usable=tgt_usable,
+            status=status,
+            src_error=src_err or "-",
+            tgt_error=tgt_err or "-",
+            root_cause=root_cause,
+            recommendation=recommendation,
+            src_time_ms=src_ms,
+            tgt_time_ms=tgt_ms
+        )
+
+    start_perf = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_check_one, item) for item in candidates]
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    for conn in oracle_conns:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    total_checked = len([r for r in results if r.status not in {USABILITY_STATUS_SKIPPED}])
+    total_usable = len([r for r in results if r.status == USABILITY_STATUS_OK])
+    total_unusable = len([r for r in results if r.status == USABILITY_STATUS_UNUSABLE])
+    total_expected_unusable = len([r for r in results if r.status == USABILITY_STATUS_EXPECTED_UNUSABLE])
+    total_unexpected_usable = len([r for r in results if r.status == USABILITY_STATUS_UNEXPECTED_USABLE])
+    total_timeout = len([r for r in results if r.status == USABILITY_STATUS_TIMEOUT])
+    total_skipped = len([r for r in results if r.status == USABILITY_STATUS_SKIPPED]) + sampled_out
+
+    return UsabilitySummary(
+        total_candidates=total_candidates,
+        total_checked=total_checked,
+        total_usable=total_usable,
+        total_unusable=total_unusable,
+        total_expected_unusable=total_expected_unusable,
+        total_unexpected_usable=total_unexpected_usable,
+        total_timeout=total_timeout,
+        total_skipped=total_skipped,
+        total_sampled_out=sampled_out,
+        duration_seconds=time.perf_counter() - start_perf,
+        results=results
+    )
 
 
 # ====================== DDL 抽取 & ALTER 级别修补 ======================
@@ -21870,6 +22395,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "降噪明细"
     if name.startswith("dependency_detail_"):
         return "DETAIL", "依赖关系差异明细"
+    if name.startswith("usability_check_detail_"):
+        return "DETAIL", "对象可用性校验明细"
     if name.startswith("missing_") and "_detail_" in name:
         match = re.match(r"missing_(.+)_detail_", name)
         if match:
@@ -22478,6 +23005,51 @@ def export_comment_mismatch_detail(
             ";".join(col_comment_parts) if col_comment_parts else "-"
         ])
     return write_pipe_report("注释差异明细", header_fields, rows, output_path)
+
+
+def export_usability_check_detail(
+    summary: UsabilitySummary,
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not summary or not report_dir or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"usability_check_detail_{report_timestamp}.txt"
+    header_fields = [
+        "SCHEMA",
+        "OBJECT_NAME",
+        "OBJECT_TYPE",
+        "SRC_EXISTS",
+        "SRC_USABLE",
+        "TGT_EXISTS",
+        "TGT_USABLE",
+        "STATUS",
+        "SRC_ERROR",
+        "TGT_ERROR",
+        "ROOT_CAUSE",
+        "RECOMMENDATION",
+        "SRC_TIME_MS",
+        "TGT_TIME_MS"
+    ]
+    rows: List[List[str]] = []
+    for item in summary.results:
+        rows.append([
+            item.schema,
+            item.object_name,
+            item.object_type,
+            "YES" if item.src_exists else "NO",
+            "-" if item.src_usable is None else ("YES" if item.src_usable else "NO"),
+            "YES" if item.tgt_exists else "NO",
+            "-" if item.tgt_usable is None else ("YES" if item.tgt_usable else "NO"),
+            item.status,
+            item.src_error or "-",
+            item.tgt_error or "-",
+            item.root_cause or "-",
+            item.recommendation or "-",
+            str(item.src_time_ms),
+            str(item.tgt_time_ms)
+        ])
+    return write_pipe_report("对象可用性校验明细", header_fields, rows, output_path)
 
 
 def export_extra_mismatch_detail(
@@ -23632,7 +24204,8 @@ def print_final_report(
     config_diagnostics: Optional[List[str]] = None,
     fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None,
     support_summary: Optional[SupportClassificationResult] = None,
-    noise_suppressed_details: Optional[List[NoiseSuppressedDetail]] = None
+    noise_suppressed_details: Optional[List[NoiseSuppressedDetail]] = None,
+    usability_summary: Optional[UsabilitySummary] = None
 ):
     custom_theme = Theme({
         "ok": "green",
@@ -23719,6 +24292,23 @@ def print_final_report(
     dep_missing_cnt = len(dependency_report.get("missing", []))
     dep_unexpected_cnt = len(dependency_report.get("unexpected", []))
     dep_skipped_cnt = len(dependency_report.get("skipped", []))
+    usability_checked_cnt = 0
+    usability_usable_cnt = 0
+    usability_unusable_cnt = 0
+    usability_expected_unusable_cnt = 0
+    usability_unexpected_usable_cnt = 0
+    usability_timeout_cnt = 0
+    usability_skipped_cnt = 0
+    usability_sampled_out_cnt = 0
+    if usability_summary:
+        usability_checked_cnt = usability_summary.total_checked
+        usability_usable_cnt = usability_summary.total_usable
+        usability_unusable_cnt = usability_summary.total_unusable
+        usability_expected_unusable_cnt = usability_summary.total_expected_unusable
+        usability_unexpected_usable_cnt = usability_summary.total_unexpected_usable
+        usability_timeout_cnt = usability_summary.total_timeout
+        usability_skipped_cnt = usability_summary.total_skipped
+        usability_sampled_out_cnt = usability_summary.total_sampled_out
     source_missing_schema_cnt = len(schema_summary.get("source_missing", []))
     package_rows: List[PackageCompareRow] = []
     package_diff_rows: List[PackageCompareRow] = []
@@ -24063,6 +24653,30 @@ def print_final_report(
     dep_text.append(f"{dep_skipped_cnt}")
     summary_table.add_row("[bold]依赖关系[/bold]", dep_text)
 
+    if usability_summary:
+        usability_text = Text()
+        usability_text.append("校验对象: ", style="info")
+        usability_text.append(str(usability_checked_cnt))
+        if usability_sampled_out_cnt:
+            usability_text.append(f" (抽样跳过 {usability_sampled_out_cnt})", style="info")
+        usability_text.append("\n可用: ", style="ok")
+        usability_text.append(str(usability_usable_cnt), style="ok")
+        usability_text.append("  不可用: ", style="mismatch")
+        usability_text.append(str(usability_unusable_cnt), style="mismatch")
+        usability_text.append("\n预期不可用: ", style="info")
+        usability_text.append(str(usability_expected_unusable_cnt), style="info")
+        usability_text.append("  意外可用: ", style="mismatch")
+        usability_text.append(str(usability_unexpected_usable_cnt), style="mismatch")
+        usability_text.append("\n超时: ", style="mismatch")
+        usability_text.append(str(usability_timeout_cnt), style="mismatch")
+        if usability_skipped_cnt:
+            usability_text.append("  跳过: ", style="info")
+            usability_text.append(str(usability_skipped_cnt), style="info")
+        if report_ts:
+            usability_text.append("\n详见: ", style="info")
+            usability_text.append(f"usability_check_detail_{report_ts}.txt", style="info")
+        summary_table.add_row("[bold]对象可用性 (VIEW/SYNONYM)[/bold]", usability_text)
+
     console.print(summary_table)
     console.print("")
     console.print("")
@@ -24104,6 +24718,10 @@ def print_final_report(
             suffix = f"_{report_ts}" if report_ts else ""
             detail_hint_lines.append(
                 f"VIEW 约束无法清洗明细: view_constraint_uncleanable_detail{suffix}.txt"
+            )
+        if usability_summary and report_ts:
+            detail_hint_lines.append(
+                f"对象可用性明细: usability_check_detail_{report_ts}.txt"
             )
         if emit_detail_files and report_ts:
             if blocked_index_rows:
@@ -24797,9 +25415,16 @@ def print_final_report(
         mismatched_tables_path = None
         column_order_mismatch_path = None
         comment_mismatch_path = None
+        usability_detail_path = None
         extra_mismatch_path = None
         dependency_detail_path = None
         noise_suppressed_path = None
+        if usability_summary and report_ts:
+            usability_detail_path = export_usability_check_detail(
+                usability_summary,
+                report_path.parent,
+                report_ts
+            )
         if emit_detail_files and report_ts:
             extra_targets_path = export_extra_targets_detail(
                 tv_results.get("extra_targets", []),
@@ -24870,6 +25495,12 @@ def print_final_report(
             comment_mismatch_path,
             len(comment_results.get("mismatched", []) or []),
             "注释差异明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            usability_detail_path,
+            len(usability_summary.results) if usability_summary else 0,
+            "对象可用性校验明细"
         )
         extra_mismatch_count = (
             len(extra_results.get("index_mismatched", []) or [])
@@ -24969,6 +25600,8 @@ def print_final_report(
                 log.info("列顺序差异明细已输出到: %s", column_order_mismatch_path)
             if comment_mismatch_path:
                 log.info("注释差异明细已输出到: %s", comment_mismatch_path)
+            if usability_detail_path:
+                log.info("对象可用性明细已输出到: %s", usability_detail_path)
             if extra_mismatch_path:
                 log.info("扩展对象差异明细已输出到: %s", extra_mismatch_path)
             if noise_suppressed_path:
@@ -25136,6 +25769,7 @@ def main():
         enable_comment_check: bool = bool(settings.get('enable_comment_check', True))
         enable_column_order_check: bool = bool(settings.get('enable_column_order_check', False))
         enable_grant_generation: bool = bool(settings.get('enable_grant_generation', True))
+        enable_usability_check: bool = bool(settings.get('check_object_usability', False))
 
         log.info(
             "本次启用的主对象类型: %s",
@@ -25158,6 +25792,8 @@ def main():
             log.info("已开启列顺序校验（check_column_order=true）。")
         if not enable_grant_generation:
             log.info("已根据配置关闭授权脚本生成。")
+        if enable_usability_check:
+            log.info("已开启 VIEW/SYNONYM 可用性校验。")
 
         config_diagnostics = collect_fixup_config_diagnostics(
             settings,
@@ -25185,6 +25821,8 @@ def main():
     generate_fixup_enabled = settings.get('generate_fixup', 'true').strip().lower() in ('true', '1', 'yes')
     if not enabled_extra_types:
         phase_skip_reasons["扩展对象校验"] = "check_extra_types 为空"
+    if not enable_usability_check:
+        phase_skip_reasons["对象可用性校验"] = "check_object_usability=false"
     if not enable_dependencies_check:
         phase_skip_reasons["依赖/授权校验"] = "check_dependencies=false"
     if not generate_fixup_enabled:
@@ -25386,6 +26024,7 @@ def main():
             "Oracle 元数据转储",
             "主对象校验",
             "扩展对象校验",
+            "对象可用性校验",
             "依赖/授权校验",
             "修补脚本生成"
         ):
@@ -25475,7 +26114,8 @@ def main():
             run_summary_ctx=run_summary_ctx,
             filtered_grants=None,
             config_diagnostics=config_diagnostics,
-            fixup_skip_summary=None
+            fixup_skip_summary=None,
+            usability_summary=None
         )
         if run_summary:
             log_run_summary(run_summary)
@@ -25617,6 +26257,20 @@ def main():
     extra_results = noise_result.extra_results
     comment_results = noise_result.comment_results
     noise_suppressed_details = noise_result.suppressed_details
+
+    usability_summary: Optional[UsabilitySummary] = None
+    if enable_usability_check:
+        with phase_timer("对象可用性校验", phase_durations):
+            usability_summary = check_object_usability(
+                settings,
+                master_list,
+                tv_results,
+                ob_cfg,
+                ora_cfg,
+                ob_meta,
+                enabled_primary_types,
+                support_summary=support_summary
+            )
 
     extra_results_for_report = filter_trigger_results_for_unsupported_tables(
         extra_results,
@@ -25888,7 +26542,8 @@ def main():
         config_diagnostics=config_diagnostics,
         fixup_skip_summary=fixup_skip_summary,
         support_summary=support_summary,
-        noise_suppressed_details=noise_suppressed_details
+        noise_suppressed_details=noise_suppressed_details,
+        usability_summary=usability_summary
     )
     if run_summary:
         log_run_summary(run_summary)

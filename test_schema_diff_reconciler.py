@@ -2375,6 +2375,43 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         finally:
             sdr.subprocess.run = orig_run
 
+    def test_classify_usability_status(self):
+        self.assertEqual(
+            sdr.classify_usability_status(True, True, True, False),
+            sdr.USABILITY_STATUS_OK
+        )
+        self.assertEqual(
+            sdr.classify_usability_status(True, True, False, False),
+            sdr.USABILITY_STATUS_UNUSABLE
+        )
+        self.assertEqual(
+            sdr.classify_usability_status(True, False, False, False),
+            sdr.USABILITY_STATUS_EXPECTED_UNUSABLE
+        )
+        self.assertEqual(
+            sdr.classify_usability_status(True, False, True, False),
+            sdr.USABILITY_STATUS_UNEXPECTED_USABLE
+        )
+        self.assertEqual(
+            sdr.classify_usability_status(True, True, True, True),
+            sdr.USABILITY_STATUS_TIMEOUT
+        )
+
+    def test_analyze_usability_error_mapping(self):
+        root, rec = sdr.analyze_usability_error("ORA-00942: table or view does not exist")
+        self.assertIn("依赖对象不存在", root)
+        root, rec = sdr.analyze_usability_error("ORA-01031: insufficient privileges")
+        self.assertIn("权限不足", root)
+
+    def test_compute_usability_sample(self):
+        sample_cnt, skipped, sampled = sdr._compute_usability_sample(2000, 1000, 0.1)
+        self.assertTrue(sampled)
+        self.assertEqual(sample_cnt, 200)
+        self.assertEqual(skipped, 1800)
+        sample_cnt, skipped, sampled = sdr._compute_usability_sample(2000, 0, 0.1)
+        self.assertFalse(sampled)
+        self.assertEqual(sample_cnt, 2000)
+
     def test_dump_ob_metadata_infers_char_used_from_lengths(self):
         def fake_run(_cfg, sql):
             if "NLS_LENGTH_SEMANTICS" in sql.upper():
