@@ -117,6 +117,7 @@
 - 支持权限合并与白名单过滤
 - 视图权限拆分：依赖对象授权输出到 `view_prereq_grants/`，视图自身授权输出到 `view_post_grants/`
 - 视图链路要求 `WITH GRANT OPTION` 的场景会单独标注缺失
+- 依赖推导不再对 PUBLIC 生成授权，仅保留源端显式 PUBLIC 授权
 - 输出 `grants_miss/` 与 `grants_all/`
 
 ---

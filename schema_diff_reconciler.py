@@ -11397,6 +11397,9 @@ def build_grant_plan(
                 continue
             dep_schema = dep_full.split('.', 1)[0]
             ref_schema = ref_full.split('.', 1)[0]
+            if dep_schema.upper() == "PUBLIC":
+                # PUBLIC 同义词不要求 PUBLIC 授权，仅保留源端显式 PUBLIC 授权
+                continue
             if dep_schema == ref_schema:
                 continue
             if not grantee_exists(dep_schema):

@@ -4219,6 +4219,66 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertIn(("A.V1", "VIEW", "HR.T1", "TABLE"), expected)
 
+    def test_dependency_grants_skip_public_grantee(self):
+        oracle_meta = sdr.OracleMetadata(
+            table_columns={},
+            invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
+            indexes={},
+            constraints={},
+            triggers={},
+            sequences={},
+            sequence_attrs={},
+            table_comments={},
+            column_comments={},
+            comments_complete=True,
+            blacklist_tables={},
+            object_privileges=[],
+            sys_privileges=[],
+            role_privileges=[],
+            role_metadata={},
+            system_privilege_map=set(),
+            table_privilege_map=set(),
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False, partition_key_columns={}, interval_partitions={}
+        )
+        deps = [
+            sdr.DependencyRecord(
+                owner="PUBLIC",
+                name="S1",
+                object_type="SYNONYM",
+                referenced_owner="HR",
+                referenced_name="T1",
+                referenced_type="TABLE"
+            )
+        ]
+        source_objects = {
+            "PUBLIC.S1": {"SYNONYM"},
+            "HR.T1": {"TABLE"}
+        }
+        full_mapping = {
+            "PUBLIC.S1": {"SYNONYM": "PUBLIC.S1"},
+            "HR.T1": {"TABLE": "HR.T1"}
+        }
+        grant_plan = sdr.build_grant_plan(
+            oracle_meta=oracle_meta,
+            full_mapping=full_mapping,
+            remap_rules={},
+            source_objects=source_objects,
+            schema_mapping={},
+            object_parent_map=None,
+            dependency_graph=None,
+            transitive_table_cache=None,
+            source_dependencies=None,
+            source_schema_set={"PUBLIC", "HR"},
+            remap_conflicts=None,
+            synonym_meta={},
+            dependencies=deps
+        )
+        self.assertNotIn("PUBLIC", grant_plan.object_grants)
+
     def test_compare_constraints_for_table_fk_reference_check(self):
         oracle_constraints = {
             ("A", "T1"): {
