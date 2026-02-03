@@ -1,8 +1,8 @@
 # Oracle → OceanBase 结构一致性校验与修复引擎
 ## 技术规格说明 (Technical Specification)
 
-**版本**：0.9.8.1  
-**日期**：2026-01-29  
+**版本**：0.9.8.2  
+**日期**：2026-02-03  
 **适用场景**：Oracle → OceanBase（Oracle 模式）迁移后的结构一致性校验、对象补全、DDL 兼容性修复。
 
 ---
@@ -82,6 +82,7 @@
 ### 5.2 VIEW / PLSQL / TYPE / SYNONYM / JOB / SCHEDULE
 - 存在性校验
 - VIEW 兼容性分析：SYS.OBJ$ / X$ 系统对象视为不支持（用户自建 X$ 对象除外）
+- PUBLIC 同义词按 Oracle 语义处理（OB `__public` 归一化为 `PUBLIC`）
 
 ### 5.3 PACKAGE / PACKAGE BODY
 - 有效性校验（`DBA_ERRORS` 摘要）
@@ -93,6 +94,7 @@
 ### 5.5 CONSTRAINT
 - PK/UK/FK 按列序列匹配
 - 忽略 `_OBNOTNULL_` 约束
+- FK 额外比对 `DELETE_RULE` / `UPDATE_RULE`
 
 ### 5.6 SEQUENCE
 - 按 schema 映射比较集合

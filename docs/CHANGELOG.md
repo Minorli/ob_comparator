@@ -5,6 +5,12 @@
 ## [未发布]
 
 ### 新增
+
+### 变更
+
+## [0.9.8.2] - 2026-02-03
+
+### 新增
 - VIEW/SYNONYM 可用性校验（可选）：目标端 `SELECT * FROM <obj> WHERE 1=2` 验证可用性，支持源端对照/超时/并发/抽样控制，并输出明细报告。
 - VIEW 兼容规则增强：识别 X$ 系统对象引用并判定不支持（用户自建 X$ 对象除外）。
 - VIEW 修补授权拆分：新增 `view_prereq_grants/`（依赖对象前置授权）与 `view_post_grants/`（创建后授权）。
@@ -12,6 +18,10 @@
 ### 变更
 - VIEW DDL 清洗移除 `FORCE` 关键字，避免创建不可用视图。
 - run_fixup 顺序加入 view_prereq_grants / view_post_grants。
+- PUBLIC/`__public` 语义统一：报告与比对以 PUBLIC 展示。
+- FK 约束比对补齐 `UPDATE_RULE`。
+- obclient SQL 改为 stdin 传入，特殊字符更稳定。
+- 致命错误收敛为异常链路，避免并发任务直接 `sys.exit`。
 
 ## [0.9.8.1] - 2026-01-29
 

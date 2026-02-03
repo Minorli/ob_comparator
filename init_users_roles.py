@@ -38,7 +38,7 @@ try:
 except ImportError:
     oracledb = None
 
-__version__ = "0.9.8.1"
+__version__ = "0.9.8.2"
 __author__ = "Minor Li"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
 REPO_ISSUES_URL = f"{REPO_URL}/issues"

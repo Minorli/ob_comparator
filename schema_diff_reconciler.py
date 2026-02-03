@@ -16,7 +16,7 @@
 
 """
 
-数据库对象对比工具 (V0.9.8.1 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
+数据库对象对比工具 (V0.9.8.2 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -33,7 +33,7 @@
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.9.8.1 核心)：
+3. 性能架构 (V0.9.8.2 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          DBA_OBJECTS
@@ -73,7 +73,7 @@ import random
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 
-__version__ = "0.9.8.1"
+__version__ = "0.9.8.2"
 __author__ = "Minor Li"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
 REPO_ISSUES_URL = f"{REPO_URL}/issues"
@@ -118,6 +118,14 @@ def strip_ansi_text(text: str) -> str:
 LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOG_FILE_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
 LOG_SECTION_WIDTH = 80
+
+
+class FatalError(RuntimeError):
+    """致命错误：用于替代 sys.exit 以便并发任务可回传异常。"""
+
+
+def abort_run(message: Optional[str] = None) -> None:
+    raise FatalError(message or "fatal error")
 
 
 def _build_console_handler(level: int) -> logging.Handler:
@@ -1530,6 +1538,120 @@ def normalize_delete_rule(value: Optional[str]) -> str:
     return rule
 
 
+def normalize_update_rule(value: Optional[str]) -> str:
+    rule = (value or "").strip().upper()
+    if not rule or rule == "NO ACTION":
+        return ""
+    return rule
+
+
+def normalize_public_owner(owner: Optional[str]) -> Optional[str]:
+    if owner is None:
+        return None
+    owner_str = str(owner).strip()
+    if not owner_str:
+        return None
+    owner_u = owner_str.upper()
+    if owner_u == "__PUBLIC":
+        return "PUBLIC"
+    return owner_u
+
+
+def normalize_ob_metadata_public_owner(meta: ObMetadata) -> ObMetadata:
+    def _norm_owner(owner: Optional[str]) -> Optional[str]:
+        return normalize_public_owner(owner) if owner else owner
+
+    def _norm_full_name(full_name: str) -> str:
+        if not full_name:
+            return full_name
+        if '.' in full_name:
+            owner, name = full_name.split('.', 1)
+            owner_n = normalize_public_owner(owner)
+            name_u = (name or "").upper()
+            return f"{owner_n}.{name_u}"
+        return full_name.upper()
+
+    def _remap_owner_table_dict(
+        data: Dict[Tuple[str, str], Dict[str, Dict]]
+    ) -> Dict[Tuple[str, str], Dict[str, Dict]]:
+        remapped: Dict[Tuple[str, str], Dict[str, Dict]] = {}
+        for (owner, table), payload in data.items():
+            owner_n = _norm_owner(owner)
+            table_u = (table or "").upper()
+            key = (owner_n, table_u)
+            if key in remapped and isinstance(payload, dict):
+                remapped[key].update(payload)
+            else:
+                remapped[key] = payload
+        return remapped
+
+    def _remap_owner_table_simple(
+        data: Dict[Tuple[str, str], object]
+    ) -> Dict[Tuple[str, str], object]:
+        remapped: Dict[Tuple[str, str], object] = {}
+        for (owner, table), payload in data.items():
+            owner_n = _norm_owner(owner)
+            table_u = (table or "").upper()
+            key = (owner_n, table_u)
+            remapped[key] = payload
+        return remapped
+
+    objects_by_type: Dict[str, Set[str]] = {}
+    for obj_type, full_set in (meta.objects_by_type or {}).items():
+        objects_by_type[obj_type] = {_norm_full_name(name) for name in (full_set or set())}
+
+    object_statuses = {}
+    for (owner, name, obj_type), status in (meta.object_statuses or {}).items():
+        owner_n = _norm_owner(owner)
+        name_u = (name or "").upper()
+        obj_type_u = (obj_type or "").upper()
+        object_statuses[(owner_n, name_u, obj_type_u)] = status
+
+    package_errors = {}
+    for (owner, name, obj_type), info in (meta.package_errors or {}).items():
+        owner_n = _norm_owner(owner)
+        name_u = (name or "").upper()
+        obj_type_u = (obj_type or "").upper()
+        package_errors[(owner_n, name_u, obj_type_u)] = info
+
+    sequences = {}
+    for owner, seqs in (meta.sequences or {}).items():
+        owner_n = _norm_owner(owner)
+        sequences[owner_n] = {str(s).upper() for s in (seqs or set())}
+
+    sequence_attrs = {}
+    for owner, attrs in (meta.sequence_attrs or {}).items():
+        owner_n = _norm_owner(owner)
+        sequence_attrs[owner_n] = attrs
+
+    table_comments = _remap_owner_table_simple(meta.table_comments or {})
+    column_comments = {}
+    for (owner, table), cols in (meta.column_comments or {}).items():
+        owner_n = _norm_owner(owner)
+        table_u = (table or "").upper()
+        column_comments[(owner_n, table_u)] = cols
+
+    partition_key_columns = {}
+    for (owner, table), cols in (meta.partition_key_columns or {}).items():
+        owner_n = _norm_owner(owner)
+        table_u = (table or "").upper()
+        partition_key_columns[(owner_n, table_u)] = cols
+
+    return meta._replace(
+        objects_by_type=objects_by_type,
+        tab_columns=_remap_owner_table_dict(meta.tab_columns or {}),
+        indexes=_remap_owner_table_dict(meta.indexes or {}),
+        constraints=_remap_owner_table_dict(meta.constraints or {}),
+        triggers=_remap_owner_table_dict(meta.triggers or {}),
+        sequences=sequences,
+        sequence_attrs=sequence_attrs,
+        table_comments=table_comments,
+        column_comments=column_comments,
+        object_statuses=object_statuses,
+        package_errors=package_errors,
+        partition_key_columns=partition_key_columns
+    )
+
 def is_index_expression_token(token: Optional[str]) -> bool:
     if not token:
         return False
@@ -2292,7 +2414,7 @@ TableEntry = Tuple[str, str, str, str]  # (SRC_SCHEMA, SRC_TABLE, TGT_SCHEMA, TG
 class ConstraintSignature(NamedTuple):
     pk: Set[Tuple[str, ...]]
     uk: Set[Tuple[str, ...]]
-    fk: Set[Tuple[Tuple[str, ...], Optional[str], str]]
+    fk: Set[Tuple[Tuple[str, ...], Optional[str], str, str]]
     ck: Set[str]
 
 
@@ -2780,7 +2902,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
     config = configparser.ConfigParser(interpolation=None)
     if not config.read(config_file):
         log.error(f"严重错误: 配置文件 {config_file} 未找到或无法读取。")
-        sys.exit(1)
+        abort_run()
 
     try:
         ora_cfg = dict(config['ORACLE_SOURCE'])
@@ -2791,7 +2913,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         schemas_list = [s.strip().upper() for s in schemas_raw.split(',') if s.strip()]
         if not schemas_list:
             log.error(f"严重错误: [SETTINGS] 中的 'source_schemas' 未配置或为空。")
-            sys.exit(1)
+            abort_run()
         settings['source_schemas_list'] = schemas_list
 
         # remap 规则文件（可为空，表示按 1:1 映射）
@@ -3184,7 +3306,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         return ora_cfg, ob_cfg, settings
     except KeyError as e:
         log.error(f"严重错误: 配置文件中缺少必要的部分: {e}")
-        sys.exit(1)
+        abort_run()
 
 
 def validate_runtime_paths(settings: Dict, ob_cfg: ObConfig) -> None:
@@ -3273,7 +3395,7 @@ def validate_runtime_paths(settings: Dict, ob_cfg: ObConfig) -> None:
         for msg in errors:
             log.error(msg)
         log.error("关键路径缺失或不可用，已终止。请按提示修复后重试。")
-        sys.exit(1)
+        abort_run()
 
 
 def run_config_wizard(config_path: Path) -> None:
@@ -3283,7 +3405,7 @@ def run_config_wizard(config_path: Path) -> None:
     """
     if not sys.stdin.isatty():
         log.error("交互式向导需要可用的标准输入/终端。请在可交互环境运行或直接编辑 config.ini。")
-        sys.exit(1)
+        abort_run()
 
     cfg = configparser.ConfigParser(interpolation=None)
     if config_path.exists():
@@ -4912,12 +5034,12 @@ def init_oracle_client_from_settings(settings: Dict) -> None:
     if not client_dir:
         log.error("严重错误: 未在 [SETTINGS] 中配置 oracle_client_lib_dir。")
         log.error("请在 config.ini 中添加例如: oracle_client_lib_dir = /home/user/instantclient_19_28")
-        sys.exit(1)
+        abort_run()
 
     client_path = Path(client_dir).expanduser()
     if not client_path.exists():
         log.error(f"严重错误: 指定的 Oracle Instant Client 目录不存在: {client_path}")
-        sys.exit(1)
+        abort_run()
 
     ld_path = os.environ.get('LD_LIBRARY_PATH') or '<未设置>'
     log.info(f"准备使用 Oracle Instant Client 目录: {client_path}")
@@ -4931,7 +5053,7 @@ def init_oracle_client_from_settings(settings: Dict) -> None:
         log.error("严重错误: Oracle Thick Mode 初始化失败。")
         log.error("请确认 instant client 路径和 LD_LIBRARY_PATH 设置正确。")
         log.error(f"错误详情: {exc}")
-        sys.exit(1)
+        abort_run()
 
 
 def get_source_objects(
@@ -5060,7 +5182,7 @@ def get_source_objects(
                             table_pairs.add((owner, name))
     except oracledb.Error as e:
         log.error(f"严重错误: 连接或查询 Oracle 失败: {e}")
-        sys.exit(1)
+        abort_run()
 
     # Materialized View 在 DBA_OBJECTS 中通常会同时作为 TABLE 出现，去重以避免误将 MV 当成 TABLE 校验/抽取。
     mview_dedup = 0
@@ -7184,6 +7306,11 @@ def compute_object_counts(
 def obclient_run_sql(ob_cfg: ObConfig, sql_query: str, timeout: Optional[int] = None) -> Tuple[bool, str, str]:
     """运行 obclient CLI 命令并返回 (Success, stdout, stderr)，带 timeout。"""
     timeout_val = OBC_TIMEOUT if timeout is None else max(1, int(timeout))
+    sql_payload = (sql_query or "").strip()
+    if sql_payload and not sql_payload.endswith(";"):
+        sql_payload += ";"
+    if sql_payload:
+        sql_payload += "\n"
     command_args = [
         ob_cfg['executable'],
         '-h', ob_cfg['host'],
@@ -7191,12 +7318,12 @@ def obclient_run_sql(ob_cfg: ObConfig, sql_query: str, timeout: Optional[int] = 
         '-u', ob_cfg['user_string'],
         '-p' + ob_cfg['password'],
         '-ss',  # Silent 模式
-        '-e', sql_query
     ]
 
     try:
         result = subprocess.run(
             command_args,
+            input=sql_payload,
             capture_output=True,
             text=True,
             encoding='utf-8',
@@ -7223,7 +7350,7 @@ def obclient_run_sql(ob_cfg: ObConfig, sql_query: str, timeout: Optional[int] = 
     except FileNotFoundError:
         log.error(f"严重错误: 未找到 obclient 可执行文件: {ob_cfg['executable']}")
         log.error("请检查 config.ini 中的 [OCEANBASE_TARGET] -> executable 路径。")
-        sys.exit(1)
+        abort_run()
     except Exception as e:
         log.error(f"严重错误: 执行 subprocess 时发生未知错误: {e}")
         return False, "", str(e)
@@ -7398,7 +7525,7 @@ def dump_ob_metadata(
     )
     if not ok:
         log.error("无法从 OB 读取 DBA_OBJECTS，程序退出。")
-        sys.exit(1)
+        abort_run()
 
     if lines:
         for line in lines:
@@ -7604,7 +7731,7 @@ def dump_ob_metadata(
             ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_cols_basic_tpl, owners_in_list)
         if not ok:
             log.error("无法从 OB 读取 DBA_TAB_COLUMNS，程序退出。")
-            sys.exit(1)
+            abort_run()
 
         def _normalize_flag(value: str) -> Optional[bool]:
             if value is None:
@@ -7804,7 +7931,7 @@ def dump_ob_metadata(
         ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners_in_list)
         if not ok:
             log.error("无法从 OB 读取 DBA_INDEXES，程序退出。")
-            sys.exit(1)
+            abort_run()
 
         if lines:
             for line in lines:
@@ -7837,7 +7964,7 @@ def dump_ob_metadata(
         ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners_in_list)
         if not ok:
             log.error("无法从 OB 读取 DBA_IND_COLUMNS，程序退出。")
-            sys.exit(1)
+            abort_run()
 
         if lines:
             for line in lines:
@@ -7915,13 +8042,15 @@ def dump_ob_metadata(
             and ob_has_dba_column(ob_cfg, "DBA_CONSTRAINTS", "DEFERRED")
         )
         support_index_name = ob_has_dba_column(ob_cfg, "DBA_CONSTRAINTS", "INDEX_NAME")
+        support_update_rule = ob_has_dba_column(ob_cfg, "DBA_CONSTRAINTS", "UPDATE_RULE")
         constraint_deferrable_supported = deferrable_supported
         deferrable_select = ", DEFERRABLE, DEFERRED" if deferrable_supported else ""
         index_name_select = ", INDEX_NAME" if support_index_name else ""
+        update_rule_select = ", UPDATE_RULE" if support_update_rule else ""
 
         sql_ext_tpl_vc = f"""
             SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE{index_name_select}, R_OWNER, R_CONSTRAINT_NAME,
-                   DELETE_RULE,
+                   DELETE_RULE{update_rule_select},
                    REPLACE(REPLACE(REPLACE(SEARCH_CONDITION_VC, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS SEARCH_CONDITION
                    {deferrable_select}
             FROM DBA_CONSTRAINTS
@@ -7931,7 +8060,7 @@ def dump_ob_metadata(
         """
         sql_ext_tpl = f"""
             SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE{index_name_select}, R_OWNER, R_CONSTRAINT_NAME,
-                   DELETE_RULE,
+                   DELETE_RULE{update_rule_select},
                    REPLACE(REPLACE(REPLACE(SEARCH_CONDITION, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS SEARCH_CONDITION
                    {deferrable_select}
             FROM DBA_CONSTRAINTS
@@ -7959,7 +8088,7 @@ def dump_ob_metadata(
         if not ok:
             log.warning("读取 OB DBA_CONSTRAINTS(含条件)失败，将回退为中间字段：%s", err)
             sql_mid_tpl = f"""
-                SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE{index_name_select}, R_OWNER, R_CONSTRAINT_NAME, DELETE_RULE
+                SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE{index_name_select}, R_OWNER, R_CONSTRAINT_NAME, DELETE_RULE{update_rule_select}
                        {deferrable_select}
                 FROM DBA_CONSTRAINTS
                 WHERE OWNER IN ({{owners_in}})
@@ -7983,7 +8112,7 @@ def dump_ob_metadata(
             ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners_in_list)
             if not ok:
                 log.error("无法从 OB 读取 DBA_CONSTRAINTS，程序退出。")
-                sys.exit(1)
+                abort_run()
 
         if lines:
             for line in lines:
@@ -8003,7 +8132,7 @@ def dump_ob_metadata(
                 if support_index_name and len(parts) > idx:
                     index_name = parts[idx].strip().upper()
                     idx += 1
-                r_owner = r_cons = delete_rule = None
+                r_owner = r_cons = delete_rule = update_rule = None
                 if support_fk_ref:
                     r_owner = parts[idx].strip().upper() if len(parts) > idx else None
                     idx += 1
@@ -8011,6 +8140,9 @@ def dump_ob_metadata(
                     idx += 1
                     delete_rule = parts[idx].strip().upper() if len(parts) > idx else None
                     idx += 1
+                    if support_update_rule and len(parts) > idx:
+                        update_rule = parts[idx].strip().upper() if len(parts) > idx else None
+                        idx += 1
                 search_condition = None
                 if support_search_condition and len(parts) > idx:
                     search_condition = parts[idx].strip()
@@ -8029,6 +8161,7 @@ def dump_ob_metadata(
                     "r_owner": r_owner if ctype == "R" else None,
                     "r_constraint": r_cons if ctype == "R" else None,
                     "delete_rule": delete_rule if ctype == "R" else None,
+                    "update_rule": update_rule if ctype == "R" else None,
                     "search_condition": search_condition if ctype == "C" else None,
                     "deferrable": deferrable,
                     "deferred": deferred,
@@ -8044,7 +8177,7 @@ def dump_ob_metadata(
         ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners_in_list)
         if not ok:
             log.error("无法从 OB 读取 DBA_CONS_COLUMNS，程序退出。")
-            sys.exit(1)
+            abort_run()
 
         if lines:
             for line in lines:
@@ -8068,6 +8201,7 @@ def dump_ob_metadata(
                         "r_owner": None,
                         "r_constraint": None,
                         "delete_rule": None,
+                        "update_rule": None,
                         "search_condition": None,
                         "deferrable": None,
                         "deferred": None,
@@ -8123,7 +8257,7 @@ def dump_ob_metadata(
         ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners_in_list)
         if not ok:
             log.error("无法从 OB 读取 DBA_TRIGGERS，程序退出。")
-            sys.exit(1)
+            abort_run()
 
         if lines:
             for line in lines:
@@ -8157,7 +8291,7 @@ def dump_ob_metadata(
         ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners_in_list)
         if not ok:
             log.error("无法从 OB 读取 DBA_SEQUENCES，程序退出。")
-            sys.exit(1)
+            abort_run()
 
         if lines:
             for line in lines:
@@ -8269,7 +8403,7 @@ def dump_ob_metadata(
                     roles.add(role)
 
     log.info("OceanBase 元数据转储完成 (根据开关加载 DBA_OBJECTS/列/索引/约束/触发器/序列/注释)。")
-    return ObMetadata(
+    ob_meta = ObMetadata(
         objects_by_type=objects_by_type,
         tab_columns=tab_columns,
         invisible_column_supported=support_invisible_col,
@@ -8290,6 +8424,7 @@ def dump_ob_metadata(
         partition_key_columns=partition_key_columns,
         constraint_deferrable_supported=constraint_deferrable_supported
     )
+    return normalize_ob_metadata_public_owner(ob_meta)
 
 
 def load_ob_supported_sys_privs(ob_cfg: ObConfig) -> Set[str]:
@@ -9170,6 +9305,7 @@ def dump_oracle_metadata(
                 # 约束
                 if include_constraints:
                     search_condition_col = "SEARCH_CONDITION"
+                    support_update_rule = False
                     try:
                         with ora_conn.cursor() as cursor:
                             cursor.execute(
@@ -9178,9 +9314,18 @@ def dump_oracle_metadata(
                             search_condition_col = "SEARCH_CONDITION_VC"
                     except oracledb.Error:
                         search_condition_col = "SEARCH_CONDITION"
+                    try:
+                        with ora_conn.cursor() as cursor:
+                            cursor.execute(
+                                "SELECT UPDATE_RULE FROM DBA_CONSTRAINTS WHERE ROWNUM = 1"
+                            )
+                            support_update_rule = True
+                    except oracledb.Error:
+                        support_update_rule = False
+                    update_rule_select = ", UPDATE_RULE" if support_update_rule else ""
                     sql_cons_tpl = f"""
                         SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME,
-                               DELETE_RULE, {search_condition_col}, DEFERRABLE, DEFERRED
+                               DELETE_RULE{update_rule_select}, {search_condition_col}, DEFERRABLE, DEFERRED
                         FROM DBA_CONSTRAINTS
                         WHERE OWNER IN ({{owners_clause}})
                           AND CONSTRAINT_TYPE IN ('P','U','R','C')
@@ -9207,16 +9352,29 @@ def dump_oracle_metadata(
                                 name = _safe_upper(row[2])
                                 if not name:
                                     continue
+                                update_rule = None
+                                idx_base = 6
+                                delete_rule = (row[idx_base] or "").strip().upper() if len(row) > idx_base else None
+                                idx_base += 1
+                                if support_update_rule:
+                                    update_rule = (row[idx_base] or "").strip().upper() if len(row) > idx_base else None
+                                    idx_base += 1
+                                search_condition = str(row[idx_base]) if len(row) > idx_base and row[idx_base] is not None else None
+                                idx_base += 1
+                                deferrable = str(row[idx_base]) if len(row) > idx_base and row[idx_base] is not None else None
+                                idx_base += 1
+                                deferred = str(row[idx_base]) if len(row) > idx_base and row[idx_base] is not None else None
                                 constraints.setdefault(key, {})[name] = {
                                     "type": (row[3] or "").upper(),
                                     "columns": [],
                                     "index_name": None,
                                     "r_owner": _safe_upper(row[4]) if row[4] else None,
                                     "r_constraint": _safe_upper(row[5]) if row[5] else None,
-                                    "delete_rule": (row[6] or "").strip().upper() if len(row) > 6 else None,
-                                    "search_condition": str(row[7]) if len(row) > 7 and row[7] is not None else None,
-                                    "deferrable": str(row[8]) if len(row) > 8 and row[8] is not None else None,
-                                    "deferred": str(row[9]) if len(row) > 9 and row[9] is not None else None,
+                                    "delete_rule": delete_rule,
+                                    "update_rule": update_rule,
+                                    "search_condition": search_condition,
+                                    "deferrable": deferrable,
+                                    "deferred": deferred,
                                 }
 
                     sql_cons_cols_tpl = """
@@ -9251,6 +9409,7 @@ def dump_oracle_metadata(
                                         "r_owner": None,
                                         "r_constraint": None,
                                         "delete_rule": None,
+                                        "update_rule": None,
                                         "search_condition": None,
                                         "deferrable": None,
                                         "deferred": None,
@@ -9786,7 +9945,7 @@ def dump_oracle_metadata(
 
     except oracledb.Error as e:
         log.error(f"严重错误: 批量获取 Oracle 元数据失败: {e}")
-        sys.exit(1)
+        abort_run()
 
     log.info(
         "Oracle 元数据加载完成：列=%d, 索引表=%d, 约束表=%d, 触发器表=%d, 序列schema=%d, 注释表=%d, 黑名单表=%d",
@@ -9933,7 +10092,7 @@ def load_oracle_dependencies(
                                 ))
     except oracledb.Error as exc:
         log.error(f"严重错误: 加载 Oracle 依赖信息失败: {exc}")
-        sys.exit(1)
+        abort_run()
 
     log.info("Oracle 依赖信息加载完成，共 %d 条记录。", len(records))
     return records
@@ -9969,7 +10128,7 @@ def load_ob_dependencies(
     ok, lines, err = obclient_query_by_owner_pairs(ob_cfg, sql_tpl, owners_list, owners_list)
     if not ok:
         log.error("无法从 OB 读取 DBA_DEPENDENCIES，程序退出。")
-        sys.exit(1)
+        abort_run()
 
     result: Set[Tuple[str, str, str, str]] = set()
     if lines:
@@ -9977,11 +10136,11 @@ def load_ob_dependencies(
             parts = line.split('\t')
             if len(parts) < 6:
                 continue
-            owner = parts[0].strip().upper()
-            name = parts[1].strip().upper()
+            owner = normalize_public_owner(parts[0])
+            name = (parts[1] or "").strip().upper()
             obj_type = parts[2].strip().upper()
-            ref_owner = parts[3].strip().upper()
-            ref_name = parts[4].strip().upper()
+            ref_owner = normalize_public_owner(parts[3])
+            ref_name = (parts[4] or "").strip().upper()
             ref_type = parts[5].strip().upper()
             if not owner or not name or not ref_owner or not ref_name:
                 continue
@@ -12109,7 +12268,7 @@ def build_constraint_signature(
 ) -> ConstraintSignature:
     pk: Set[Tuple[str, ...]] = set()
     uk: Set[Tuple[str, ...]] = set()
-    fk: Set[Tuple[Tuple[str, ...], Optional[str], str]] = set()
+    fk: Set[Tuple[Tuple[str, ...], Optional[str], str, str]] = set()
     ck: Set[str] = set()
     for name, cons in (cons_dict or {}).items():
         ctype = (cons.get("type") or "").upper()
@@ -12123,6 +12282,7 @@ def build_constraint_signature(
             ref_owner = cons.get("ref_table_owner")
             ref_name = cons.get("ref_table_name")
             delete_rule = normalize_delete_rule(cons.get("delete_rule"))
+            update_rule = normalize_update_rule(cons.get("update_rule"))
             if ref_owner and ref_name:
                 ref_full_raw = f"{str(ref_owner).upper()}.{str(ref_name).upper()}"
                 if is_source:
@@ -12130,7 +12290,7 @@ def build_constraint_signature(
                     ref_full = (mapped or ref_full_raw).upper()
                 else:
                     ref_full = ref_full_raw.upper()
-            fk.add((cols, ref_full, delete_rule))
+            fk.add((cols, ref_full, delete_rule, update_rule))
         elif ctype == "C":
             if is_system_notnull_check(name, cons.get("search_condition")):
                 continue
@@ -12881,8 +13041,8 @@ def compare_constraints_for_table(
         cons_dict: Dict[str, Dict],
         *,
         is_source: bool
-    ) -> List[Tuple[Tuple[str, ...], str, Optional[str], str]]:
-        entries: List[Tuple[Tuple[str, ...], str, Optional[str], str]] = []
+    ) -> List[Tuple[Tuple[str, ...], str, Optional[str], str, str]]:
+        entries: List[Tuple[Tuple[str, ...], str, Optional[str], str, str]] = []
         for name, cons in cons_dict.items():
             ctype = (cons.get("type") or "").upper()
             if ctype != 'R':
@@ -12892,6 +13052,7 @@ def compare_constraints_for_table(
             ref_owner = cons.get("ref_table_owner")
             ref_name = cons.get("ref_table_name")
             delete_rule = normalize_delete_rule(cons.get("delete_rule"))
+            update_rule = normalize_update_rule(cons.get("update_rule"))
             if ref_owner and ref_name:
                 ref_full_raw = f"{str(ref_owner).upper()}.{str(ref_name).upper()}"
                 if is_source:
@@ -12901,7 +13062,7 @@ def compare_constraints_for_table(
                 else:
                     # 目标端FK引用：使用原始名称（目标端已经是remapped之后的名称）
                     ref_full = ref_full_raw.upper()
-            entries.append((cols, name, ref_full, delete_rule))
+            entries.append((cols, name, ref_full, delete_rule, update_rule))
         return entries
 
     def bucket_check(
@@ -13002,17 +13163,17 @@ def compare_constraints_for_table(
             )
 
     def match_foreign_keys(
-        src_list: List[Tuple[Tuple[str, ...], str, Optional[str], str]],
-        tgt_list: List[Tuple[Tuple[str, ...], str, Optional[str], str]]
+        src_list: List[Tuple[Tuple[str, ...], str, Optional[str], str, str]],
+        tgt_list: List[Tuple[Tuple[str, ...], str, Optional[str], str, str]]
     ) -> None:
         tgt_used = [False] * len(tgt_list)
         tgt_by_cols: Dict[Tuple[str, ...], Set[Optional[str]]] = defaultdict(set)
-        for cols, _name, ref, _rule in tgt_list:
+        for cols, _name, ref, _rule, _update_rule in tgt_list:
             tgt_by_cols[cols].add(ref)
 
-        for cols, name, src_ref, src_rule in src_list:
+        for cols, name, src_ref, src_rule, src_update_rule in src_list:
             found_idx = None
-            for idx, (t_cols, _t_name, t_ref, t_rule) in enumerate(tgt_list):
+            for idx, (t_cols, _t_name, t_ref, t_rule, t_update_rule) in enumerate(tgt_list):
                 if tgt_used[idx]:
                     continue
                 if cols != t_cols:
@@ -13034,6 +13195,7 @@ def compare_constraints_for_table(
                     )
             else:
                 tgt_rule = tgt_list[found_idx][3]
+                tgt_update_rule = tgt_list[found_idx][4]
                 src_rule_norm = normalize_delete_rule(src_rule)
                 tgt_rule_norm = normalize_delete_rule(tgt_rule)
                 if src_rule_norm != tgt_rule_norm:
@@ -13041,10 +13203,17 @@ def compare_constraints_for_table(
                         f"FOREIGN KEY: 源约束 {name} DELETE_RULE={src_rule_norm or 'NO ACTION'}，"
                         f"目标端 DELETE_RULE={tgt_rule_norm or 'NO ACTION'}。"
                     )
+                src_update_norm = normalize_update_rule(src_update_rule)
+                tgt_update_norm = normalize_update_rule(tgt_update_rule)
+                if src_update_norm != tgt_update_norm:
+                    detail_mismatch.append(
+                        f"FOREIGN KEY: 源约束 {name} UPDATE_RULE={src_update_norm or 'NO ACTION'}，"
+                        f"目标端 UPDATE_RULE={tgt_update_norm or 'NO ACTION'}。"
+                    )
 
         for idx, used in enumerate(tgt_used):
             if not used:
-                extra_name, extra_cols, extra_ref, extra_rule = tgt_list[idx]
+                extra_name, extra_cols, extra_ref, extra_rule, extra_update_rule = tgt_list[idx]
                 if extra_cols in source_all_cols:
                     continue
                 if "_OMS_ROWID" in (extra_name or ""):
@@ -13052,8 +13221,9 @@ def compare_constraints_for_table(
                 extra.add(extra_name)
                 ref_note = f" 引用 {extra_ref}" if extra_ref else ""
                 rule_note = f" DELETE_RULE={normalize_delete_rule(extra_rule) or 'NO ACTION'}"
+                update_note = f" UPDATE_RULE={normalize_update_rule(extra_update_rule) or 'NO ACTION'}"
                 detail_mismatch.append(
-                    f"FOREIGN KEY: 目标端存在额外约束 {extra_name} (列 {list(extra_cols)}){ref_note}{rule_note}。"
+                    f"FOREIGN KEY: 目标端存在额外约束 {extra_name} (列 {list(extra_cols)}){ref_note}{rule_note}{update_note}。"
                 )
 
     def match_check_constraints(
@@ -14343,7 +14513,7 @@ def parse_oracle_dsn(dsn: str) -> Tuple[str, str, Optional[str]]:
         return host.strip(), port.strip(), service.strip()
     except ValueError:
         log.error("严重错误: 无法解析 Oracle DSN (host:port/service_name): %s", dsn)
-        sys.exit(1)
+        abort_run()
 
 
 def collect_oracle_env_info(ora_cfg: OraConfig) -> Dict[str, str]:
@@ -14470,13 +14640,13 @@ def resolve_dbcat_cli(settings: Dict) -> Path:
     bin_path = settings.get('dbcat_bin', '').strip()
     if not bin_path:
         log.error("严重错误: 未配置 dbcat_bin，请在 config.ini 的 [SETTINGS] 中指定 dbcat 目录。")
-        sys.exit(1)
+        abort_run()
     cli_path = Path(bin_path)
     if cli_path.is_dir():
         cli_path = cli_path / 'bin' / 'dbcat'
     if not cli_path.exists():
         log.error("严重错误: 找不到 dbcat 可执行文件: %s", cli_path)
-        sys.exit(1)
+        abort_run()
     return cli_path
 
 
@@ -15025,7 +15195,7 @@ def fetch_dbcat_schema_objects(
     java_home = settings.get('java_home') or os.environ.get('JAVA_HOME')
     if not java_home:
         log.error("严重错误: 需要 JAVA_HOME 才能运行 dbcat，请在环境或 config.ini 中配置。")
-        sys.exit(1)
+        abort_run()
 
     max_chunk = int(settings.get('dbcat_chunk_size', 150)) or 150
     cleanup_run = settings.get('dbcat_cleanup_run_dirs', 'true').lower() in ('true', '1', 'yes')
@@ -15225,7 +15395,7 @@ def fetch_dbcat_schema_objects(
             err = _export_single_schema(schema, prepared)
             if err:
                 log.error(err)
-                sys.exit(1)
+                abort_run()
     else:
         # 多 schema 并行执行
         log.info("[dbcat] 启用并行导出 (workers=%d)，共 %d 个 schema 待导出。", 
@@ -15244,10 +15414,10 @@ def fetch_dbcat_schema_objects(
                         # 取消其他任务
                         for f in futures:
                             f.cancel()
-                        sys.exit(1)
+                        abort_run()
                 except Exception as exc:
                     log.error("[dbcat] schema=%s 导出异常: %s", schema, exc)
-                    sys.exit(1)
+                    abort_run()
 
     return results, source_meta
 
@@ -26760,4 +26930,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except FatalError as exc:
+        try:
+            log.error("运行终止: %s", exc)
+        except Exception:
+            print(f"运行终止: {exc}", file=sys.stderr)
+        sys.exit(1)

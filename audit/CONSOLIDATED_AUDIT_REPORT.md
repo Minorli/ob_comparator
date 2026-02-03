@@ -1,7 +1,7 @@
 # OceanBase Comparator Toolkit 综合审计报告
 
 **项目**: OceanBase Comparator Toolkit
-**版本**: V0.9.8.1
+**版本**: V0.9.8.2
 **审计日期**: 2026-01-20 ~ 2026-01-29
 **审计范围**: 全部核心代码 (~31,000 行)
 **审计方法**: 场景化交叉验证 + 代码静态分析 + 迁移专家审查
@@ -170,7 +170,7 @@ for result in executor.map(_load_file, load_tasks):
 | FUNC-07 | PACKAGE 循环依赖未处理 | 无拓扑排序 | 创建顺序错误 |
 | FUNC-08 | INVALID 对象未传播到依赖分析 | 3239-3259 | 依赖对象未被正确分类 |
 
-**修复状态快照（截至 0.9.8.1）**
+**修复状态快照（截至 0.9.8.2）**
 - FUNC-03：✅ 已调整为“仅检查存在性”（需求变更），不再对比属性。
 - FUNC-04：✅ 已支持（元数据缺失时自动降级/跳过）。
 - FUNC-05：✅ 已支持（元数据缺失时自动降级/跳过）。
@@ -189,7 +189,7 @@ for result in executor.map(_load_file, load_tasks):
 | CONSTRAINT FK | CONSTRAINT | 20404-20406 |
 | 分区 DDL | PARTITION | 12167, 12212 |
 
-**修复状态快照（截至 0.9.8.1）**
+**修复状态快照（截至 0.9.8.2）**
 - TRIGGER 主对象/ON 子句引号：✅ 已修复（见 DDL-01）
 - 其余位置：❌ 未统一修复（需分类型逐一校验）
 
@@ -232,7 +232,7 @@ for result in executor.map(_load_file, load_tasks):
 | test_init_users_roles.py | 4 | ~27 | 14.8% |
 
 **关键覆盖缺口**: 68 个关键函数缺少单元测试
-**备注**: 0.9.8.1 新增了 run_fixup 与统计工具的回归测试，但整体覆盖率仍偏低。
+**备注**: 0.9.8.2 延续了 run_fixup 与统计工具的回归测试，但整体覆盖率仍偏低。
 
 ### 3.2 代码质量
 

@@ -3130,6 +3130,18 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertEqual(target, "PUBLIC.SYN1")
 
+    def test_normalize_ob_public_owner(self):
+        meta = self._make_ob_meta()
+        meta = meta._replace(
+            objects_by_type={"SYNONYM": {"__PUBLIC.S1"}},
+            object_statuses={("__PUBLIC", "S1", "SYNONYM"): "VALID"},
+            sequences={"__PUBLIC": {"SEQ1"}},
+        )
+        normalized = sdr.normalize_ob_metadata_public_owner(meta)
+        self.assertIn("PUBLIC.S1", normalized.objects_by_type.get("SYNONYM", set()))
+        self.assertIn(("PUBLIC", "S1", "SYNONYM"), normalized.object_statuses)
+        self.assertIn("PUBLIC", normalized.sequences)
+
     def test_find_mapped_target_any_type_deterministic_fallback(self):
         full_mapping = {
             "A.O1": {"VIEW": "Z.O1", "TABLE": "Y.O1"},
@@ -4781,6 +4793,44 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIsNotNone(mismatch)
         self.assertTrue(any("DELETE_RULE" in item for item in mismatch.detail_mismatch))
+
+    def test_compare_constraints_for_table_fk_update_rule_mismatch(self):
+        oracle_constraints = {
+            ("A", "T1"): {
+                "FK_SRC": {
+                    "type": "R",
+                    "columns": ["C1"],
+                    "ref_table_owner": "A",
+                    "ref_table_name": "P1",
+                    "update_rule": "CASCADE",
+                }
+            }
+        }
+        ob_constraints = {
+            ("A", "T1"): {
+                "FK_TGT": {
+                    "type": "R",
+                    "columns": ["C1"],
+                    "ref_table_owner": "A",
+                    "ref_table_name": "P1",
+                    "update_rule": "NO ACTION",
+                }
+            }
+        }
+        oracle_meta = self._make_oracle_meta(constraints=oracle_constraints)
+        ob_meta = self._make_ob_meta(constraints=ob_constraints)
+        ok, mismatch = sdr.compare_constraints_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+            {}
+        )
+        self.assertFalse(ok)
+        self.assertIsNotNone(mismatch)
+        self.assertTrue(any("UPDATE_RULE" in item for item in mismatch.detail_mismatch))
 
     def test_compare_indexes_expression_sys_nc_match(self):
         oracle_indexes = {
