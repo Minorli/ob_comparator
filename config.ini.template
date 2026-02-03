@@ -35,7 +35,7 @@ fixup_cli_timeout       = 3600
 # 报告与修复脚本输出目录（可为相对路径或绝对路径）
 fixup_dir               = fixup_scripts
 # fixup_force_clean=true 时，即使 fixup_dir 为项目外绝对路径也会清理旧脚本（谨慎使用）
-fixup_force_clean       = false
+fixup_force_clean       = true
 # fixup_drop_sys_c_columns：是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE（默认 false）
 fixup_drop_sys_c_columns = false
 report_dir              = main_reports
@@ -48,6 +48,23 @@ report_dir_layout       = per_run
 #   split  -> 主报告仅概要，细节拆分到多个 *_detail_*.txt（默认）
 #   summary-> 仅输出概要，不生成细节文件
 report_detail_mode      = split
+# 报告存库（默认开启）
+# report_to_db: 是否写入 OceanBase（obclient 方式）
+# report_db_schema: 存储 schema（留空使用目标连接用户）
+# report_retention_days: 历史保留天数（0 表示不清理）
+# report_db_fail_abort: 写库失败是否中止
+# report_db_detail_mode: 写入明细范围（missing/mismatched/unsupported/ok/skipped/all）
+# report_db_detail_max_rows: 明细最大行数（0 不限制）
+# report_db_insert_batch: INSERT ALL 批量大小
+# report_db_save_full_json: 是否保存完整 JSON（可能很大）
+report_to_db            = true
+report_db_schema        =
+report_retention_days   = 90
+report_db_fail_abort    = false
+report_db_detail_mode   = missing,mismatched,unsupported
+report_db_detail_max_rows = 500000
+report_db_insert_batch  = 200
+report_db_save_full_json = false
 # 日志目录与级别（日志文件与控制台输出）
 # log_level 可选值：AUTO/DEBUG/INFO/WARNING/ERROR/CRITICAL
 # AUTO: TTY 使用 INFO，非 TTY 使用 WARNING
@@ -62,8 +79,8 @@ fixup_workers           = 8
 # progress_log_interval 控制生成脚本时的进度日志间隔（秒，>=1）
 progress_log_interval   = 10
 # 扩展对象校验性能调优
-# extra_check_workers 控制并发校验进程数，建议 4 或 8；留空或 0 则自动取 min(4, CPU)
-extra_check_workers     = 4
+# extra_check_workers 控制并发校验进程数，建议 8 或 16；留空或 0 则自动取 min(16, CPU)
+extra_check_workers     = 16
 # extra_check_chunk_size 控制每个进程一次处理的表数量（默认 200）
 extra_check_chunk_size  = 200
 # extra_check_progress_interval 控制扩展对象校验的进度日志间隔（秒，>=1）
@@ -75,10 +92,10 @@ dbcat_chunk_size        = 150
 # 是否在对比后生成修复脚本（dbcat 抽取，VIEW 走 DBMS_METADATA）
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 generate_fixup          = true
-# interval 分区补齐脚本（默认关闭）
+# interval 分区补齐脚本（默认开启）
 # generate_interval_partition_fixup: true/false
 # interval_partition_cutoff: 截止日期，格式 YYYYMMDD（默认 20280301）
-generate_interval_partition_fixup = false
+generate_interval_partition_fixup = true
 interval_partition_cutoff = 20280301
 # interval_partition_cutoff_numeric: 数值型 interval 分区补齐上限（仅数值分区键使用），如 100000
 interval_partition_cutoff_numeric =
@@ -121,14 +138,14 @@ fixup_types             =
 #   replace     -> 对支持的对象类型使用 CREATE OR REPLACE
 #   guard       -> 对不支持 REPLACE 的对象，存在则跳过创建
 #   drop_create -> 先判断存在则 DROP，再执行 CREATE
-fixup_idempotent_mode   = off
+fixup_idempotent_mode   = replace
 # 幂等模式作用对象类型（逗号分隔，留空使用默认安全集合）
 # 示例：fixup_idempotent_types=TABLE,INDEX,CONSTRAINT
 fixup_idempotent_types  =
 # 同义词修补范围：
 #   all         -> 生成 PUBLIC + 私有同义词（默认）
 #   public_only -> 仅生成 PUBLIC 同义词
-synonym_fixup_scope     = all
+synonym_fixup_scope     = public_only
 # 可选：触发器清单过滤（每行 SCHEMA.TRIGGER_NAME）
 # 配置后仅生成列表内触发器脚本，并输出 report_dir/trigger_status_report.txt 记录清单与状态差异
 trigger_list            =

@@ -121,6 +121,70 @@
 - `report_detail_mode=split`：主报告仅概要，明细拆分到 `*_detail_<timestamp>.txt`。
 - 明细文件默认使用 `|` 分隔并带 `# 字段说明` 头，方便 Excel 直接导入。
 
+### 5.3 报告存库（默认开启，obclient）
+- `report_to_db=true` 后，会将报告写入 OceanBase（仅 obclient；不影响本地报告文件）。
+- 支持 `report_db_schema` 指定存储 schema；留空使用目标连接用户。
+- 明细范围与规模控制：
+  - `report_db_detail_mode=missing,mismatched,unsupported`（建议保留核心差异）
+  - `report_db_detail_max_rows=500000`（防止超大写入）
+  - `report_db_insert_batch=200`（INSERT ALL 批量）
+- 清理策略：`report_retention_days=90`（0 表示不自动清理）。
+- 写库表清单：
+  - `DIFF_REPORT_SUMMARY` / `DIFF_REPORT_COUNTS` / `DIFF_REPORT_DETAIL` / `DIFF_REPORT_GRANT`
+  - `DIFF_REPORT_USABILITY`（可用性校验明细）
+  - `DIFF_REPORT_PACKAGE_COMPARE`（PACKAGE/PKG BODY 对比摘要）
+  - `DIFF_REPORT_TRIGGER_STATUS`（触发器状态差异）
+- 缺失/不支持明细无需额外表，使用 `DIFF_REPORT_DETAIL` 按 `report_type/object_type` 查询。
+
+示例查询：
+```sql
+SELECT REPORT_ID, RUN_TIMESTAMP, TOTAL_CHECKED, MISSING_COUNT, MISMATCHED_COUNT, CONCLUSION
+FROM DIFF_REPORT_SUMMARY
+ORDER BY RUN_TIMESTAMP DESC
+FETCH FIRST 10 ROWS ONLY;
+```
+
+按类型统计（对应“检查汇总”）：
+```sql
+SELECT OBJECT_TYPE, ORACLE_COUNT, OCEANBASE_COUNT, MISSING_COUNT, UNSUPPORTED_COUNT, EXTRA_COUNT
+FROM DIFF_REPORT_COUNTS
+WHERE REPORT_ID = '<report_id>'
+ORDER BY OBJECT_TYPE;
+```
+
+缺失/不支持明细（按类型过滤）：
+```sql
+SELECT OBJECT_TYPE, SOURCE_SCHEMA, SOURCE_NAME, TARGET_SCHEMA, TARGET_NAME, REASON
+FROM DIFF_REPORT_DETAIL
+WHERE REPORT_ID = '<report_id>'
+  AND REPORT_TYPE IN ('MISSING','UNSUPPORTED')
+  AND OBJECT_TYPE = 'VIEW';
+```
+
+可用性校验明细：
+```sql
+SELECT SCHEMA_NAME, OBJECT_NAME, OBJECT_TYPE, STATUS, REASON
+FROM DIFF_REPORT_USABILITY
+WHERE REPORT_ID = '<report_id>'
+ORDER BY STATUS, SCHEMA_NAME, OBJECT_NAME;
+```
+
+PACKAGE 对比摘要：
+```sql
+SELECT SCHEMA_NAME, OBJECT_NAME, OBJECT_TYPE, DIFF_STATUS, DIFF_HASH, DIFF_PATH
+FROM DIFF_REPORT_PACKAGE_COMPARE
+WHERE REPORT_ID = '<report_id>'
+ORDER BY SCHEMA_NAME, OBJECT_NAME;
+```
+
+触发器状态差异：
+```sql
+SELECT SCHEMA_NAME, TRIGGER_NAME, SRC_ENABLED, TGT_ENABLED, SRC_VALID, TGT_VALID, DIFF_STATUS
+FROM DIFF_REPORT_TRIGGER_STATUS
+WHERE REPORT_ID = '<report_id>'
+ORDER BY SCHEMA_NAME, TRIGGER_NAME;
+```
+
 ---
 
 ## 6. run_fixup 高级执行

@@ -42,8 +42,22 @@
   可选值：full（主报告包含全部明细）、split（主报告仅概要，细节拆分为 *_detail_*.txt）、summary（仅概要，不生成细节文件）。
   说明：split 模式下的明细文件采用 `|` 分隔并包含 `# total/# 字段说明` 头，格式与 package_compare 相同，便于 Excel 直接分隔导入。
   说明：若存在不支持的 CHECK 约束，会额外输出 constraints_unsupported_detail_<timestamp>.txt（不受 report_detail_mode 影响）。
+- report_to_db：是否将报告存储到 OceanBase（obclient 方式）。默认：true。
+  说明：开启后仍会保留本地文本报告，写库失败时是否中断由 report_db_fail_abort 控制。
+- report_db_schema：报告存库 schema。默认：空（使用 OCEANBASE_TARGET 连接用户）。
+- report_retention_days：报告保留天数。默认：90；设为 0 表示不自动清理。
+- report_db_fail_abort：报告写库失败是否中止主流程。默认：false。
+- report_db_detail_mode：写入明细范围。默认：missing,mismatched,unsupported。
+  可选值：missing,mismatched,unsupported,ok,skipped,all（all 等同全量）。
+  说明：建议仅保存关键明细，避免海量写库压力。
+- report_db_detail_max_rows：写入明细最大行数。默认：500000；0 表示不限制。
+- report_db_insert_batch：写库批量大小（INSERT ALL）。默认：200。
+- report_db_save_full_json：是否保存完整报告 JSON。默认：false。
+  说明：开启后会写入主报告 JSON（可能较大，影响性能）。
+  说明：report_to_db 写入表包含 DIFF_REPORT_SUMMARY / DIFF_REPORT_COUNTS / DIFF_REPORT_DETAIL / DIFF_REPORT_GRANT / DIFF_REPORT_USABILITY / DIFF_REPORT_PACKAGE_COMPARE / DIFF_REPORT_TRIGGER_STATUS。
+        缺失/不支持明细不单独建表，使用 DIFF_REPORT_DETAIL 按 report_type + object_type 查询即可。
 - fixup_dir：修补脚本输出目录。默认：fixup_scripts。
-- fixup_force_clean：强制清理 fixup_dir（即使为项目外绝对路径）。默认：false。
+- fixup_force_clean：强制清理 fixup_dir（即使为项目外绝对路径）。默认：true。
   说明：开启后会删除 fixup_dir 下旧脚本；请确保路径配置正确，避免误删。
 - log_dir：运行日志目录。默认：logs。
 - log_level：控制台日志级别。默认：auto。可选：AUTO/DEBUG/INFO/WARNING/ERROR/CRITICAL。
@@ -103,7 +117,7 @@
 - generate_fixup：是否生成修补脚本。默认：true。
 - fixup_drop_sys_c_columns：是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE。默认：false。
   说明：仅对“目标端多出来且列名匹配 SYS_C\\d+”的列生成 FORCE 清理；其余多余列仍保持注释建议。
-- generate_interval_partition_fixup：是否生成 interval 分区补齐脚本。默认：false。
+- generate_interval_partition_fixup：是否生成 interval 分区补齐脚本。默认：true。
 - interval_partition_cutoff：interval 分区补齐截止日期（YYYYMMDD）。默认：20280301。
 - interval_partition_cutoff_numeric：数值型 interval 分区补齐上限（仅数值分区键生效）。默认：空（不补齐数值 interval）。注意：必须为正数。
 - fixup_schemas：仅为指定目标 schema 生成修补脚本。默认：空（全量）。
@@ -111,7 +125,7 @@
   可选值：TABLE, VIEW, MATERIALIZED VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY,
            SYNONYM, JOB, SCHEDULE, TYPE, TYPE BODY, SEQUENCE, TRIGGER, INDEX, CONSTRAINT。
   注意：fixup_types 包含 INDEX/CONSTRAINT/TRIGGER 时，需要 check_primary_types 含 TABLE 才能生成。
-- fixup_idempotent_mode：修补脚本幂等模式。默认：off。
+- fixup_idempotent_mode：修补脚本幂等模式。默认：replace。
   可选值：off（不处理）、replace（CREATE OR REPLACE）、guard（存在则跳过创建）、drop_create（存在则 DROP 再创建）。
 - fixup_idempotent_types：幂等模式作用对象类型（逗号分隔）。默认：空（使用安全默认集）。
   默认集：VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, TRIGGER, TYPE, TYPE BODY, SYNONYM。
@@ -137,7 +151,7 @@
   说明：关闭后仅使用 grants_miss/grants_all，找不到授权则记录提示并继续执行。
 
 同义词与触发器
-- synonym_fixup_scope：同义词修补范围。默认：all。
+- synonym_fixup_scope：同义词修补范围。默认：public_only。
   可选值：all（PUBLIC+私有）、public_only（仅 PUBLIC）。
 - trigger_list：触发器清单文件（每行 SCHEMA.TRIGGER_NAME）。默认：空。
   注意：配置后仅生成列表内触发器，并输出 trigger_status_report.txt 报告；清单读取失败会回退全量触发器。
@@ -178,7 +192,7 @@ DDL 格式化 (SQLcl)
   说明：仅处理 CREATE VIEW 列清单内的约束声明；清洗仅影响输出 DDL，不改变依赖/映射逻辑。
 
 扩展对象校验性能调优
-- extra_check_workers：扩展对象校验并发数。默认：min(4, CPU)。
+- extra_check_workers：扩展对象校验并发数。默认：min(16, CPU)。
 - extra_check_chunk_size：扩展对象校验单批表数量。默认：200（最小 1）。
 - extra_check_progress_interval：扩展对象校验进度日志间隔（秒）。默认：10（最小 1）。
 

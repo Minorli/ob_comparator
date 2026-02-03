@@ -5,6 +5,7 @@ import sys
 import types
 import tempfile
 import json
+import inspect
 import subprocess
 from pathlib import Path
 from typing import Dict, Set, List, Tuple
@@ -2267,7 +2268,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertNotIn(" LONG,", cleaned.upper())
 
     def test_normalize_synonym_fixup_scope(self):
-        self.assertEqual(sdr.normalize_synonym_fixup_scope(None), "all")
+        self.assertEqual(sdr.normalize_synonym_fixup_scope(None), "public_only")
         self.assertEqual(sdr.normalize_synonym_fixup_scope("all"), "all")
         self.assertEqual(sdr.normalize_synonym_fixup_scope("public"), "public_only")
         self.assertEqual(sdr.normalize_synonym_fixup_scope("PUBLIC_ONLY"), "public_only")
@@ -5726,6 +5727,145 @@ class TestNoiseSuppression(unittest.TestCase):
         result = sdr.check_comments(master_list, oracle_meta, ob_meta, True)
         self.assertEqual(result["mismatched"], [])
         self.assertEqual(result["ok"], [])
+
+
+class TestReportDbHelpers(unittest.TestCase):
+    def test_sql_quote_literal(self):
+        self.assertEqual(sdr.sql_quote_literal(None), "NULL")
+        self.assertEqual(sdr.sql_quote_literal("O'Reilly"), "'O''Reilly'")
+
+    def test_sql_clob_literal_chunking(self):
+        text = "a" * 4500
+        clob = sdr.sql_clob_literal(text, chunk_size=2000)
+        self.assertIn("TO_CLOB", clob)
+        self.assertIn("||", clob)
+
+    def test_generate_report_id_format(self):
+        report_id = sdr.generate_report_id("20260203_123456")
+        self.assertTrue(report_id.startswith("20260203_123456_"))
+        self.assertEqual(len(report_id.split("_")[-1]), 8)
+        other_id = sdr.generate_report_id("20260203_123456")
+        self.assertNotEqual(report_id, other_id)
+
+    def test_parse_report_db_detail_mode(self):
+        self.assertEqual(
+            sdr.parse_report_db_detail_mode(""),
+            {"missing", "mismatched", "unsupported"}
+        )
+        self.assertEqual(
+            sdr.parse_report_db_detail_mode("all"),
+            set(sdr.REPORT_DB_DETAIL_MODE_VALUES)
+        )
+        self.assertEqual(
+            sdr.parse_report_db_detail_mode("missing,ok"),
+            {"missing", "ok"}
+        )
+
+    def test_build_report_counts_rows(self):
+        counts = {
+            "oracle": {"TABLE": 2},
+            "oceanbase": {"TABLE": 1},
+            "missing": {"TABLE": 1},
+            "extra": {"TABLE": 0},
+        }
+        rows = sdr._build_report_counts_rows(counts, {"TABLE": 1})
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["object_type"], "TABLE")
+        self.assertEqual(rows[0]["oracle_count"], 2)
+        self.assertEqual(rows[0]["unsupported_count"], 1)
+
+    def test_build_report_usability_rows(self):
+        summary = sdr.UsabilitySummary(
+            total_candidates=2,
+            total_checked=2,
+            total_usable=1,
+            total_unusable=1,
+            total_expected_unusable=0,
+            total_unexpected_usable=0,
+            total_timeout=0,
+            total_skipped=0,
+            total_sampled_out=0,
+            duration_seconds=0.1,
+            results=[
+                sdr.UsabilityCheckResult(
+                    schema="S1",
+                    object_name="V1",
+                    object_type="VIEW",
+                    src_exists=True,
+                    src_usable=True,
+                    tgt_exists=True,
+                    tgt_usable=True,
+                    status=sdr.USABILITY_STATUS_OK,
+                    src_error="-",
+                    tgt_error="-",
+                    root_cause="-",
+                    recommendation="-",
+                    src_time_ms=1,
+                    tgt_time_ms=2
+                ),
+                sdr.UsabilityCheckResult(
+                    schema="S1",
+                    object_name="V2",
+                    object_type="VIEW",
+                    src_exists=True,
+                    src_usable=True,
+                    tgt_exists=True,
+                    tgt_usable=False,
+                    status=sdr.USABILITY_STATUS_UNUSABLE,
+                    src_error="-",
+                    tgt_error="ORA-00942",
+                    root_cause="依赖对象不存在",
+                    recommendation="修补依赖",
+                    src_time_ms=1,
+                    tgt_time_ms=2
+                )
+            ]
+        )
+        rows = sdr._build_report_usability_rows(summary)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["usable"], 1)
+        self.assertEqual(rows[1]["usable"], 0)
+        self.assertIn("status", rows[0]["detail_json"])
+
+    def test_build_report_package_compare_rows(self):
+        row = sdr.PackageCompareRow(
+            src_full="SRC.PKG1",
+            obj_type="PACKAGE",
+            src_status="VALID",
+            tgt_full="TGT.PKG1",
+            tgt_status="VALID",
+            result="OK",
+            error_count=0,
+            first_error=""
+        )
+        results = {"rows": [row], "summary": {}, "diff_rows": []}
+        rows = sdr._build_report_package_compare_rows(results, None, None)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["schema_name"], "TGT")
+        self.assertEqual(rows[0]["object_name"], "PKG1")
+        self.assertEqual(rows[0]["diff_hash"], sdr._hash_package_compare_row(row))
+
+    def test_build_report_trigger_status_rows(self):
+        row = sdr.TriggerStatusReportRow(
+            trigger_full="TGT.TRG1",
+            src_event="INSERT",
+            tgt_event="INSERT",
+            src_enabled="ENABLED",
+            tgt_enabled="DISABLED",
+            src_valid="VALID",
+            tgt_valid="VALID",
+            detail="ENABLED"
+        )
+        rows = sdr._build_report_trigger_status_rows([row])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["schema_name"], "TGT")
+        self.assertEqual(rows[0]["trigger_name"], "TRG1")
+
+    def test_report_db_ddls_include_cascade(self):
+        source = inspect.getsource(sdr.ensure_report_db_tables_exist)
+        self.assertIn("FK_DIFF_REPORT_USABILITY_SUMMARY", source)
+        self.assertIn("FK_DIFF_REPORT_PKG_SUMMARY", source)
+        self.assertIn("FK_DIFF_REPORT_TRG_SUMMARY", source)
 
 
 if __name__ == "__main__":

@@ -62,6 +62,7 @@
 """
 
 import argparse
+import hashlib
 import configparser
 import textwrap
 import subprocess
@@ -80,6 +81,7 @@ REPO_ISSUES_URL = f"{REPO_URL}/issues"
 import os
 import threading
 import json
+import socket
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import uuid
 import shutil
@@ -2065,12 +2067,12 @@ SYNONYM_FIXUP_SCOPE_ALIASES = {
 
 def normalize_synonym_fixup_scope(raw_value: Optional[str]) -> str:
     if not raw_value or not str(raw_value).strip():
-        return "all"
+        return "public_only"
     value = str(raw_value).strip().lower()
     value = SYNONYM_FIXUP_SCOPE_ALIASES.get(value, value)
     if value not in SYNONYM_FIXUP_SCOPE_VALUES:
-        log.warning("synonym_fixup_scope=%s 不在支持范围内，将回退为 all。", raw_value)
-        return "all"
+        log.warning("synonym_fixup_scope=%s 不在支持范围内，将回退为 public_only。", raw_value)
+        return "public_only"
     return value
 
 
@@ -2126,6 +2128,16 @@ REPORT_DETAIL_MODE_ALIASES = {
     "lite": "summary",
 }
 
+REPORT_DB_DETAIL_MODE_VALUES = {"missing", "mismatched", "unsupported", "ok", "skipped"}
+REPORT_DB_DETAIL_MODE_ALIASES = {
+    "miss": "missing",
+    "mismatch": "mismatched",
+    "unsupport": "unsupported",
+    "unsupported_only": "unsupported",
+    "all": "all",
+}
+DEFAULT_REPORT_DB_DETAIL_MODES = {"missing", "mismatched", "unsupported"}
+
 
 def normalize_report_detail_mode(raw_value: Optional[str]) -> str:
     if not raw_value or not str(raw_value).strip():
@@ -2136,6 +2148,33 @@ def normalize_report_detail_mode(raw_value: Optional[str]) -> str:
         log.warning("report_detail_mode=%s 不在支持范围内，将回退为 split。", raw_value)
         return "split"
     return value
+
+
+def parse_report_db_detail_mode(raw_value: Optional[str]) -> Set[str]:
+    if not raw_value or not str(raw_value).strip():
+        return set(DEFAULT_REPORT_DB_DETAIL_MODES)
+    tokens = [token.strip().lower() for token in str(raw_value).split(",") if token.strip()]
+    if not tokens:
+        return set(DEFAULT_REPORT_DB_DETAIL_MODES)
+    normalized: Set[str] = set()
+    unknown: List[str] = []
+    for token in tokens:
+        mapped = REPORT_DB_DETAIL_MODE_ALIASES.get(token, token)
+        if mapped == "all":
+            return set(REPORT_DB_DETAIL_MODE_VALUES)
+        if mapped in REPORT_DB_DETAIL_MODE_VALUES:
+            normalized.add(mapped)
+        else:
+            unknown.append(token)
+    if unknown:
+        log.warning("report_db_detail_mode 包含未知项: %s，将忽略。", ",".join(sorted(set(unknown))))
+    if not normalized:
+        log.warning(
+            "report_db_detail_mode 为空或无有效值，将回退为 %s。",
+            ",".join(sorted(DEFAULT_REPORT_DB_DETAIL_MODES))
+        )
+        return set(DEFAULT_REPORT_DB_DETAIL_MODES)
+    return normalized
 
 
 FIXUP_IDEMPOTENT_MODE_VALUES = {"off", "guard", "replace", "drop_create"}
@@ -2152,12 +2191,12 @@ FIXUP_IDEMPOTENT_MODE_ALIASES = {
 
 def normalize_fixup_idempotent_mode(raw_value: Optional[str]) -> str:
     if not raw_value or not str(raw_value).strip():
-        return "off"
+        return "replace"
     value = str(raw_value).strip().lower()
     value = FIXUP_IDEMPOTENT_MODE_ALIASES.get(value, value)
     if value not in FIXUP_IDEMPOTENT_MODE_VALUES:
-        log.warning("fixup_idempotent_mode=%s 不在支持范围内，将回退为 off。", raw_value)
-        return "off"
+        log.warning("fixup_idempotent_mode=%s 不在支持范围内，将回退为 replace。", raw_value)
+        return "replace"
     return value
 
 
@@ -2921,7 +2960,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
 
         # fixup 脚本目录
         settings.setdefault('fixup_dir', 'fixup_scripts')
-        settings.setdefault('fixup_force_clean', 'false')
+        settings.setdefault('fixup_force_clean', 'true')
         settings.setdefault('fixup_drop_sys_c_columns', 'false')
         # obclient 超时时间 (秒)
         settings.setdefault('obclient_timeout', '60')
@@ -2929,6 +2968,14 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('report_dir', 'main_reports')
         settings.setdefault('report_dir_layout', 'per_run')
         settings.setdefault('report_detail_mode', 'split')
+        settings.setdefault('report_to_db', 'true')
+        settings.setdefault('report_db_schema', '')
+        settings.setdefault('report_retention_days', '90')
+        settings.setdefault('report_db_fail_abort', 'false')
+        settings.setdefault('report_db_detail_mode', 'missing,mismatched,unsupported')
+        settings.setdefault('report_db_detail_max_rows', '500000')
+        settings.setdefault('report_db_insert_batch', '200')
+        settings.setdefault('report_db_save_full_json', 'false')
         # Oracle Instant Client 目录 (Thick Mode)
         settings.setdefault('oracle_client_lib_dir', '')
         # dbcat 相关配置
@@ -2943,7 +2990,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         # fixup 定向生成选项
         settings.setdefault('fixup_schemas', '')
         settings.setdefault('fixup_types', '')
-        settings.setdefault('fixup_idempotent_mode', 'off')
+        settings.setdefault('fixup_idempotent_mode', 'replace')
         settings.setdefault('fixup_idempotent_types', '')
         settings.setdefault('fixup_auto_grant', 'true')
         settings.setdefault(
@@ -2951,7 +2998,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             ",".join(FIXUP_AUTO_GRANT_DEFAULT_TYPES_ORDERED)
         )
         settings.setdefault('fixup_auto_grant_fallback', 'true')
-        settings.setdefault('synonym_fixup_scope', 'all')
+        settings.setdefault('synonym_fixup_scope', 'public_only')
         settings.setdefault('trigger_list', '')
         settings.setdefault('trigger_qualify_schema', 'true')
         settings.setdefault('sequence_remap_policy', 'source_only')
@@ -2975,7 +3022,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('usability_check_workers', '10')
         settings.setdefault('max_usability_objects', '')
         settings.setdefault('usability_sample_ratio', '')
-        settings.setdefault('generate_interval_partition_fixup', 'false')
+        settings.setdefault('generate_interval_partition_fixup', 'true')
         settings.setdefault('interval_partition_cutoff', '20280301')
         settings.setdefault('interval_partition_cutoff_numeric', '')
         settings.setdefault('blacklist_mode', 'auto')
@@ -3006,7 +3053,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('dbcat_chunk_size', '150')
         settings.setdefault('fixup_workers', '')
         settings.setdefault('progress_log_interval', '10')
-        settings.setdefault('extra_check_workers', '')
+        settings.setdefault('extra_check_workers', '16')
         settings.setdefault('extra_check_chunk_size', '200')
         settings.setdefault('extra_check_progress_interval', '10')
         settings.setdefault('report_width', '160')  # 报告宽度，避免nohup时被截断为80
@@ -3086,8 +3133,8 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             False
         )
         settings['generate_interval_partition_fixup'] = parse_bool_flag(
-            settings.get('generate_interval_partition_fixup', 'false'),
-            False
+            settings.get('generate_interval_partition_fixup', 'true'),
+            True
         )
         cutoff_raw = (settings.get('interval_partition_cutoff', '20280301') or '').strip()
         settings['interval_partition_cutoff'] = cutoff_raw or '20280301'
@@ -3176,13 +3223,47 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         else:
             settings['ddl_format_type_set'] = set()
         settings['synonym_fixup_scope'] = normalize_synonym_fixup_scope(
-            settings.get('synonym_fixup_scope', 'all')
+            settings.get('synonym_fixup_scope', 'public_only')
         )
         settings['report_dir_layout'] = normalize_report_dir_layout(
             settings.get('report_dir_layout', 'per_run')
         )
         settings['report_detail_mode'] = normalize_report_detail_mode(
             settings.get('report_detail_mode', 'split')
+        )
+        settings['report_to_db'] = parse_bool_flag(
+            settings.get('report_to_db', 'true'),
+            True
+        )
+        settings['report_db_schema'] = (settings.get('report_db_schema', '') or '').strip().upper()
+        try:
+            settings['report_retention_days'] = int(settings.get('report_retention_days', '90'))
+        except (TypeError, ValueError):
+            settings['report_retention_days'] = 90
+        if settings['report_retention_days'] < 0:
+            settings['report_retention_days'] = 0
+        settings['report_db_fail_abort'] = parse_bool_flag(
+            settings.get('report_db_fail_abort', 'false'),
+            False
+        )
+        settings['report_db_detail_mode_set'] = parse_report_db_detail_mode(
+            settings.get('report_db_detail_mode', 'missing,mismatched,unsupported')
+        )
+        try:
+            settings['report_db_detail_max_rows'] = int(settings.get('report_db_detail_max_rows', '500000'))
+        except (TypeError, ValueError):
+            settings['report_db_detail_max_rows'] = 500000
+        if settings['report_db_detail_max_rows'] < 0:
+            settings['report_db_detail_max_rows'] = 0
+        try:
+            settings['report_db_insert_batch'] = int(settings.get('report_db_insert_batch', '200'))
+        except (TypeError, ValueError):
+            settings['report_db_insert_batch'] = 200
+        if settings['report_db_insert_batch'] <= 0:
+            settings['report_db_insert_batch'] = 200
+        settings['report_db_save_full_json'] = parse_bool_flag(
+            settings.get('report_db_save_full_json', 'false'),
+            False
         )
         settings['view_dblink_policy'] = normalize_view_dblink_policy(
             settings.get('view_dblink_policy', 'block')
@@ -3197,7 +3278,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             settings.get('sequence_remap_policy', 'source_only')
         )
         settings['fixup_idempotent_mode'] = normalize_fixup_idempotent_mode(
-            settings.get('fixup_idempotent_mode', 'off')
+            settings.get('fixup_idempotent_mode', 'replace')
         )
         idempotent_allowed = set(ALL_TRACKED_OBJECT_TYPES) | set(EXTRA_OBJECT_CHECK_TYPES)
         idempotent_types = parse_type_list(
@@ -3253,12 +3334,12 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             settings['fixup_workers'] = min(12, cpu_default)
         try:
             settings['extra_check_workers'] = int(
-                settings.get('extra_check_workers') or min(4, cpu_default)
+                settings.get('extra_check_workers') or min(16, cpu_default)
             )
             if settings['extra_check_workers'] <= 0:
-                settings['extra_check_workers'] = min(4, cpu_default)
+                settings['extra_check_workers'] = min(16, cpu_default)
         except (TypeError, ValueError):
-            settings['extra_check_workers'] = min(4, cpu_default)
+            settings['extra_check_workers'] = min(16, cpu_default)
         settings['extra_check_workers'] = max(1, min(int(settings['extra_check_workers']), cpu_default))
         try:
             settings['dbcat_chunk_size'] = int(settings.get('dbcat_chunk_size', '150'))
@@ -3543,6 +3624,20 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "仅支持 full/split/summary"
 
+    def _validate_report_db_detail_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        tokens = [token.strip().lower() for token in val.split(",") if token.strip()]
+        if not tokens:
+            return True, ""
+        for token in tokens:
+            normalized = REPORT_DB_DETAIL_MODE_ALIASES.get(token, token)
+            if normalized == "all":
+                return True, ""
+            if normalized not in REPORT_DB_DETAIL_MODE_VALUES:
+                return False, "仅支持 missing/mismatched/unsupported/ok/skipped/all"
+        return True, ""
+
     def _validate_view_dblink_policy(val: str) -> Tuple[bool, str]:
         if not val.strip():
             return True, ""
@@ -3669,7 +3764,7 @@ def run_config_wizard(config_path: Path) -> None:
         "SETTINGS",
         "synonym_fixup_scope",
         "同义词修补范围 (all/public_only)",
-        default=cfg.get("SETTINGS", "synonym_fixup_scope", fallback="all"),
+        default=cfg.get("SETTINGS", "synonym_fixup_scope", fallback="public_only"),
         validator=_validate_synonym_fixup_scope,
         transform=normalize_synonym_fixup_scope,
     )
@@ -3821,8 +3916,8 @@ def run_config_wizard(config_path: Path) -> None:
     _prompt_field(
         "SETTINGS",
         "extra_check_workers",
-        "扩展对象校验并发进程数 (建议 4 或 8)",
-        default=cfg.get("SETTINGS", "extra_check_workers", fallback="4"),
+        "扩展对象校验并发进程数 (建议 8 或 16)",
+        default=cfg.get("SETTINGS", "extra_check_workers", fallback="16"),
         validator=_validate_positive_int,
     )
     _prompt_field(
@@ -3849,7 +3944,7 @@ def run_config_wizard(config_path: Path) -> None:
         "SETTINGS",
         "fixup_force_clean",
         "是否强制清理 fixup_dir（即使目录在项目外）(true/false)",
-        default=cfg.get("SETTINGS", "fixup_force_clean", fallback="false"),
+        default=cfg.get("SETTINGS", "fixup_force_clean", fallback="true"),
         transform=_bool_transform,
     )
     _prompt_field(
@@ -3868,7 +3963,7 @@ def run_config_wizard(config_path: Path) -> None:
         "SETTINGS",
         "fixup_idempotent_mode",
         "修补脚本幂等模式 (off/guard/replace/drop_create)",
-        default=cfg.get("SETTINGS", "fixup_idempotent_mode", fallback="off"),
+        default=cfg.get("SETTINGS", "fixup_idempotent_mode", fallback="replace"),
         validator=_validate_fixup_idempotent_mode,
         transform=normalize_fixup_idempotent_mode,
     )
@@ -3912,6 +4007,61 @@ def run_config_wizard(config_path: Path) -> None:
         default=cfg.get("SETTINGS", "report_detail_mode", fallback="split"),
         validator=_validate_report_detail_mode,
         transform=normalize_report_detail_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "report_to_db",
+        "是否将报告存储到 OceanBase (true/false，默认 true)",
+        default=cfg.get("SETTINGS", "report_to_db", fallback="true"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "report_db_schema",
+        "报告存库 schema（可选，留空使用目标连接用户）",
+        default=cfg.get("SETTINGS", "report_db_schema", fallback=""),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "report_retention_days",
+        "报告保留天数（0 表示不清理）",
+        default=cfg.get("SETTINGS", "report_retention_days", fallback="90"),
+        validator=_validate_non_negative_int,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "report_db_fail_abort",
+        "报告写库失败是否中止 (true/false)",
+        default=cfg.get("SETTINGS", "report_db_fail_abort", fallback="false"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "report_db_detail_mode",
+        "写入明细范围 (missing,mismatched,unsupported,ok,skipped,all)",
+        default=cfg.get("SETTINGS", "report_db_detail_mode", fallback="missing,mismatched,unsupported"),
+        validator=_validate_report_db_detail_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "report_db_detail_max_rows",
+        "报告明细最大写入行数（0 不限制）",
+        default=cfg.get("SETTINGS", "report_db_detail_max_rows", fallback="500000"),
+        validator=_validate_non_negative_int,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "report_db_insert_batch",
+        "报告写库批量大小（INSERT ALL）",
+        default=cfg.get("SETTINGS", "report_db_insert_batch", fallback="200"),
+        validator=_validate_positive_int,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "report_db_save_full_json",
+        "是否保存完整报告 JSON (true/false)",
+        default=cfg.get("SETTINGS", "report_db_save_full_json", fallback="false"),
+        transform=_bool_transform,
     )
     _prompt_field(
         "SETTINGS",
@@ -13829,7 +13979,7 @@ def check_extra_objects(
         progress_interval = max(1.0, progress_interval)
 
         if worker_count <= 1:
-            log.info("[EXTRA] 并发未启用 (worker=1)，可通过 extra_check_workers=4 提升速度。")
+            log.info("[EXTRA] 并发未启用 (worker=1)，可通过 extra_check_workers=16 提升速度。")
         else:
             log.info(
                 "[EXTRA] 启用并发校验 (worker=%d, chunk=%d)。",
@@ -18668,7 +18818,7 @@ def apply_fixup_idempotency(
     if not ddl:
         return ddl
     obj_type_u = (obj_type or "").upper()
-    mode = normalize_fixup_idempotent_mode(settings.get("fixup_idempotent_mode", "off"))
+    mode = normalize_fixup_idempotent_mode(settings.get("fixup_idempotent_mode", "replace"))
     types_set = settings.get("fixup_idempotent_types_set") or set()
     if mode == "off" or obj_type_u not in types_set:
         return ddl
@@ -19719,9 +19869,9 @@ def generate_fixup_scripts(
 
     base_dir = Path(settings.get('fixup_dir', 'fixup_scripts')).expanduser()
     log.info("[FIXUP] 准备生成修补脚本，目标目录=%s", base_dir.resolve())
-    fixup_force_clean = parse_bool_flag(settings.get("fixup_force_clean", "false"), False)
+    fixup_force_clean = parse_bool_flag(settings.get("fixup_force_clean", "true"), True)
     idempotent_stats: Dict[str, int] = {}
-    idempotent_mode = settings.get("fixup_idempotent_mode", "off")
+    idempotent_mode = settings.get("fixup_idempotent_mode", "replace")
     idempotent_types = settings.get("fixup_idempotent_types_set") or set()
     if idempotent_mode and normalize_fixup_idempotent_mode(idempotent_mode) != "off":
         log.info(
@@ -19875,7 +20025,7 @@ def generate_fixup_scripts(
     fixup_schema_filter: Set[str] = set(settings.get('fixup_schema_list', []))
     fixup_type_filter: Set[str] = set(settings.get('fixup_type_set', []))
     fixup_schema_used_source_match = False
-    synonym_fixup_scope = settings.get('synonym_fixup_scope', 'all')
+    synonym_fixup_scope = settings.get('synonym_fixup_scope', 'public_only')
     if synonym_fixup_scope == "public_only":
         log.info("[FIXUP] synonym_fixup_scope=public_only，仅生成 PUBLIC 同义词脚本。")
 
@@ -24164,6 +24314,1188 @@ def export_fixup_skip_summary(
         return None
 
 
+REPORT_DB_TABLES = {
+    "summary": "DIFF_REPORT_SUMMARY",
+    "detail": "DIFF_REPORT_DETAIL",
+    "grants": "DIFF_REPORT_GRANT",
+    "counts": "DIFF_REPORT_COUNTS",
+    "usability": "DIFF_REPORT_USABILITY",
+    "package_compare": "DIFF_REPORT_PACKAGE_COMPARE",
+    "trigger_status": "DIFF_REPORT_TRIGGER_STATUS",
+}
+REPORT_DB_CLOB_CHUNK_SIZE = 2000
+
+
+def sql_quote_literal(value: Optional[object]) -> str:
+    if value is None:
+        return "NULL"
+    text = str(value)
+    return "'" + text.replace("'", "''") + "'"
+
+
+def sql_clob_literal(value: Optional[object], chunk_size: int = REPORT_DB_CLOB_CHUNK_SIZE) -> str:
+    if value is None:
+        return "NULL"
+    text = str(value)
+    if text == "":
+        return "TO_CLOB('')"
+    chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+    clob_parts = [f"TO_CLOB({sql_quote_literal(chunk)})" for chunk in chunks]
+    return " || ".join(clob_parts)
+
+
+def build_report_db_schema_prefix(settings: Dict) -> str:
+    schema = (settings.get("report_db_schema") or "").strip()
+    return f"{schema}." if schema else ""
+
+
+def generate_report_id(timestamp: str) -> str:
+    short_uuid = uuid.uuid4().hex[:8]
+    return f"{timestamp}_{short_uuid}"
+
+
+def ensure_report_db_tables_exist(ob_cfg: ObConfig, settings: Dict) -> Tuple[bool, str]:
+    schema = (settings.get("report_db_schema") or "").strip().upper()
+    schema_prefix = f"{schema}." if schema else ""
+    owner_clause = f"OWNER = '{schema}'" if schema else "OWNER = USER"
+    table_names = "', '".join(REPORT_DB_TABLES.values())
+    check_sql = (
+        "SELECT TABLE_NAME FROM ALL_TABLES "
+        f"WHERE {owner_clause} AND TABLE_NAME IN ('{table_names}')"
+    )
+    ok, out, err = obclient_run_sql(ob_cfg, check_sql)
+    if not ok:
+        return False, f"检查报告表失败: {err}"
+    existing = {line.strip().upper() for line in (out.splitlines() if out else []) if line.strip()}
+
+    ddl_summary = f"""
+CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['summary']} (
+    REPORT_ID           VARCHAR2(64) NOT NULL,
+    RUN_TIMESTAMP       TIMESTAMP NOT NULL,
+    RUN_DATE            DATE GENERATED ALWAYS AS (TRUNC(RUN_TIMESTAMP)) VIRTUAL,
+    DURATION_SECONDS    NUMBER(10,2),
+    SOURCE_HOST         VARCHAR2(256),
+    SOURCE_PORT         NUMBER,
+    SOURCE_SERVICE      VARCHAR2(128),
+    SOURCE_USER         VARCHAR2(128),
+    SOURCE_SCHEMAS      CLOB,
+    TARGET_HOST         VARCHAR2(256),
+    TARGET_PORT         NUMBER,
+    TARGET_TENANT       VARCHAR2(128),
+    TARGET_USER         VARCHAR2(128),
+    TARGET_SCHEMAS      CLOB,
+    CHECK_PRIMARY_TYPES VARCHAR2(512),
+    CHECK_EXTRA_TYPES   VARCHAR2(512),
+    FIXUP_ENABLED       NUMBER(1) DEFAULT 0,
+    GRANT_ENABLED       NUMBER(1) DEFAULT 0,
+    TOTAL_CHECKED       NUMBER DEFAULT 0,
+    MISSING_COUNT       NUMBER DEFAULT 0,
+    MISMATCHED_COUNT    NUMBER DEFAULT 0,
+    OK_COUNT            NUMBER DEFAULT 0,
+    SKIPPED_COUNT       NUMBER DEFAULT 0,
+    UNSUPPORTED_COUNT   NUMBER DEFAULT 0,
+    INDEX_MISSING       NUMBER DEFAULT 0,
+    INDEX_MISMATCHED    NUMBER DEFAULT 0,
+    CONSTRAINT_MISSING  NUMBER DEFAULT 0,
+    CONSTRAINT_MISMATCH NUMBER DEFAULT 0,
+    TRIGGER_MISSING     NUMBER DEFAULT 0,
+    SEQUENCE_MISSING    NUMBER DEFAULT 0,
+    DETAIL_TRUNCATED    NUMBER(1) DEFAULT 0,
+    DETAIL_TRUNCATED_COUNT NUMBER DEFAULT 0,
+    CONCLUSION          VARCHAR2(32),
+    CONCLUSION_DETAIL   VARCHAR2(1000),
+    FULL_REPORT_JSON    CLOB,
+    TOOL_VERSION        VARCHAR2(64),
+    HOSTNAME            VARCHAR2(256),
+    RUN_DIR             VARCHAR2(512),
+    CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP,
+    CONSTRAINT PK_DIFF_REPORT_SUMMARY PRIMARY KEY (REPORT_ID)
+)
+"""
+    ddl_detail = f"""
+CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['detail']} (
+    DETAIL_ID           VARCHAR2(64) NOT NULL,
+    REPORT_ID           VARCHAR2(64) NOT NULL,
+    REPORT_TYPE         VARCHAR2(64) NOT NULL,
+    OBJECT_TYPE         VARCHAR2(32) NOT NULL,
+    SUB_TYPE            VARCHAR2(64),
+    SOURCE_SCHEMA       VARCHAR2(128),
+    SOURCE_NAME         VARCHAR2(128),
+    TARGET_SCHEMA       VARCHAR2(128),
+    TARGET_NAME         VARCHAR2(128),
+    STATUS              VARCHAR2(64),
+    REASON              VARCHAR2(2000),
+    BLACKLIST_REASON    VARCHAR2(256),
+    DETAIL_JSON         CLOB,
+    CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP,
+    CONSTRAINT PK_DIFF_REPORT_DETAIL PRIMARY KEY (DETAIL_ID),
+    CONSTRAINT FK_DIFF_REPORT_DETAIL_SUMMARY FOREIGN KEY (REPORT_ID)
+        REFERENCES {schema_prefix}{REPORT_DB_TABLES['summary']}(REPORT_ID) ON DELETE CASCADE
+)
+"""
+    ddl_grants = f"""
+CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['grants']} (
+    GRANT_ID            VARCHAR2(64) NOT NULL,
+    REPORT_ID           VARCHAR2(64) NOT NULL,
+    GRANT_TYPE          VARCHAR2(32) NOT NULL,
+    GRANTEE             VARCHAR2(128) NOT NULL,
+    GRANTOR             VARCHAR2(128),
+    PRIVILEGE           VARCHAR2(64),
+    TARGET_SCHEMA       VARCHAR2(128),
+    TARGET_NAME         VARCHAR2(128),
+    TARGET_TYPE         VARCHAR2(32),
+    WITH_GRANT_OPTION   NUMBER(1) DEFAULT 0,
+    STATUS              VARCHAR2(32),
+    FILTER_REASON       VARCHAR2(256),
+    CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP,
+    CONSTRAINT PK_DIFF_REPORT_GRANT PRIMARY KEY (GRANT_ID),
+    CONSTRAINT FK_DIFF_REPORT_GRANT_SUMMARY FOREIGN KEY (REPORT_ID)
+        REFERENCES {schema_prefix}{REPORT_DB_TABLES['summary']}(REPORT_ID) ON DELETE CASCADE
+)
+"""
+    ddl_counts = f"""
+CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['counts']} (
+    REPORT_ID           VARCHAR2(64) NOT NULL,
+    OBJECT_TYPE         VARCHAR2(32) NOT NULL,
+    ORACLE_COUNT        NUMBER DEFAULT 0,
+    OCEANBASE_COUNT     NUMBER DEFAULT 0,
+    MISSING_COUNT       NUMBER DEFAULT 0,
+    UNSUPPORTED_COUNT   NUMBER DEFAULT 0,
+    EXTRA_COUNT         NUMBER DEFAULT 0,
+    CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP,
+    CONSTRAINT PK_DIFF_REPORT_COUNTS PRIMARY KEY (REPORT_ID, OBJECT_TYPE),
+    CONSTRAINT FK_DIFF_REPORT_COUNTS_SUMMARY FOREIGN KEY (REPORT_ID)
+        REFERENCES {schema_prefix}{REPORT_DB_TABLES['summary']}(REPORT_ID) ON DELETE CASCADE
+)
+"""
+    ddl_usability = f"""
+CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['usability']} (
+    REPORT_ID           VARCHAR2(64) NOT NULL,
+    OBJECT_TYPE         VARCHAR2(32) NOT NULL,
+    SCHEMA_NAME         VARCHAR2(128),
+    OBJECT_NAME         VARCHAR2(256),
+    USABLE              NUMBER(1),
+    STATUS              VARCHAR2(32),
+    REASON              VARCHAR2(1024),
+    DETAIL_JSON         CLOB,
+    CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP,
+    CONSTRAINT FK_DIFF_REPORT_USABILITY_SUMMARY FOREIGN KEY (REPORT_ID)
+        REFERENCES {schema_prefix}{REPORT_DB_TABLES['summary']}(REPORT_ID) ON DELETE CASCADE
+)
+"""
+    ddl_package_compare = f"""
+CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['package_compare']} (
+    REPORT_ID           VARCHAR2(64) NOT NULL,
+    SCHEMA_NAME         VARCHAR2(128),
+    OBJECT_NAME         VARCHAR2(256),
+    OBJECT_TYPE         VARCHAR2(32),
+    SRC_STATUS          VARCHAR2(32),
+    TGT_STATUS          VARCHAR2(32),
+    DIFF_STATUS         VARCHAR2(32),
+    DIFF_HASH           VARCHAR2(64),
+    DIFF_SUMMARY        VARCHAR2(4000),
+    DIFF_PATH           VARCHAR2(512),
+    CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP,
+    CONSTRAINT FK_DIFF_REPORT_PKG_SUMMARY FOREIGN KEY (REPORT_ID)
+        REFERENCES {schema_prefix}{REPORT_DB_TABLES['summary']}(REPORT_ID) ON DELETE CASCADE
+)
+"""
+    ddl_trigger_status = f"""
+CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['trigger_status']} (
+    REPORT_ID           VARCHAR2(64) NOT NULL,
+    SCHEMA_NAME         VARCHAR2(128),
+    TRIGGER_NAME        VARCHAR2(256),
+    SRC_EVENT           VARCHAR2(256),
+    TGT_EVENT           VARCHAR2(256),
+    SRC_ENABLED         VARCHAR2(16),
+    TGT_ENABLED         VARCHAR2(16),
+    SRC_VALID           VARCHAR2(16),
+    TGT_VALID           VARCHAR2(16),
+    DIFF_STATUS         VARCHAR2(64),
+    REASON              VARCHAR2(1024),
+    CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP,
+    CONSTRAINT FK_DIFF_REPORT_TRG_SUMMARY FOREIGN KEY (REPORT_ID)
+        REFERENCES {schema_prefix}{REPORT_DB_TABLES['summary']}(REPORT_ID) ON DELETE CASCADE
+)
+"""
+
+    ddl_index_sqls = [
+        ("IDX_DIFF_REPORT_TS",
+         f"CREATE INDEX IDX_DIFF_REPORT_TS ON {schema_prefix}{REPORT_DB_TABLES['summary']}(RUN_TIMESTAMP)"),
+        ("IDX_DIFF_REPORT_DATE",
+         f"CREATE INDEX IDX_DIFF_REPORT_DATE ON {schema_prefix}{REPORT_DB_TABLES['summary']}(RUN_DATE)"),
+        ("IDX_DIFF_REPORT_CONCLUSION",
+         f"CREATE INDEX IDX_DIFF_REPORT_CONCLUSION ON {schema_prefix}{REPORT_DB_TABLES['summary']}(CONCLUSION)"),
+        ("IDX_DIFF_DETAIL_REPORT_ID",
+         f"CREATE INDEX IDX_DIFF_DETAIL_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['detail']}(REPORT_ID)"),
+        ("IDX_DIFF_DETAIL_TYPE",
+         f"CREATE INDEX IDX_DIFF_DETAIL_TYPE ON {schema_prefix}{REPORT_DB_TABLES['detail']}(REPORT_TYPE, OBJECT_TYPE)"),
+        ("IDX_DIFF_GRANT_REPORT_ID",
+         f"CREATE INDEX IDX_DIFF_GRANT_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['grants']}(REPORT_ID)"),
+        ("IDX_DIFF_COUNTS_REPORT_ID",
+         f"CREATE INDEX IDX_DIFF_COUNTS_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['counts']}(REPORT_ID)"),
+        ("IDX_DIFF_USABILITY_REPORT_ID",
+         f"CREATE INDEX IDX_DIFF_USABILITY_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['usability']}(REPORT_ID)"),
+        ("IDX_DIFF_USABILITY_TYPE",
+         f"CREATE INDEX IDX_DIFF_USABILITY_TYPE ON {schema_prefix}{REPORT_DB_TABLES['usability']}(OBJECT_TYPE)"),
+        ("IDX_DIFF_PKG_REPORT_ID",
+         f"CREATE INDEX IDX_DIFF_PKG_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['package_compare']}(REPORT_ID)"),
+        ("IDX_DIFF_PKG_OBJ",
+         f"CREATE INDEX IDX_DIFF_PKG_OBJ ON {schema_prefix}{REPORT_DB_TABLES['package_compare']}(OBJECT_TYPE, SCHEMA_NAME)"),
+        ("IDX_DIFF_TRG_REPORT_ID",
+         f"CREATE INDEX IDX_DIFF_TRG_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['trigger_status']}(REPORT_ID)"),
+    ]
+
+    to_create: List[Tuple[str, str]] = []
+    if REPORT_DB_TABLES["summary"] not in existing:
+        to_create.append(("summary", ddl_summary))
+    if REPORT_DB_TABLES["detail"] not in existing:
+        to_create.append(("detail", ddl_detail))
+    if REPORT_DB_TABLES["grants"] not in existing:
+        to_create.append(("grants", ddl_grants))
+    if REPORT_DB_TABLES["counts"] not in existing:
+        to_create.append(("counts", ddl_counts))
+    if REPORT_DB_TABLES["usability"] not in existing:
+        to_create.append(("usability", ddl_usability))
+    if REPORT_DB_TABLES["package_compare"] not in existing:
+        to_create.append(("package_compare", ddl_package_compare))
+    if REPORT_DB_TABLES["trigger_status"] not in existing:
+        to_create.append(("trigger_status", ddl_trigger_status))
+
+    if not to_create:
+        return True, ""
+
+    for name, ddl in to_create:
+        ok, _out, err = obclient_run_sql(ob_cfg, ddl)
+        if not ok:
+            return False, f"创建报告表失败({name}): {err}"
+
+    if ddl_index_sqls:
+        idx_names = "', '".join(name for name, _ in ddl_index_sqls)
+        idx_check_sql = (
+            "SELECT INDEX_NAME FROM ALL_INDEXES "
+            f"WHERE {owner_clause} AND INDEX_NAME IN ('{idx_names}')"
+        )
+        ok_idx, idx_out, _idx_err = obclient_run_sql(ob_cfg, idx_check_sql)
+        existing_indexes = {
+            line.strip().upper() for line in (idx_out.splitlines() if idx_out else []) if line.strip()
+        } if ok_idx else set()
+        for idx_name, idx_sql in ddl_index_sqls:
+            if idx_name.upper() in existing_indexes:
+                continue
+            obclient_run_sql(ob_cfg, idx_sql)
+
+    return True, ""
+
+
+def _build_report_detail_rows(
+    settings: Dict,
+    tv_results: ReportResults,
+    extra_results: ExtraCheckResults,
+    support_summary: Optional[SupportClassificationResult],
+    table_target_map: Optional[Dict[Tuple[str, str], Tuple[str, str]]] = None,
+) -> Tuple[List[Dict[str, object]], bool, int]:
+    detail_modes = settings.get("report_db_detail_mode_set") or set(DEFAULT_REPORT_DB_DETAIL_MODES)
+    max_rows = int(settings.get("report_db_detail_max_rows", 0) or 0)
+    rows: List[Dict[str, object]] = []
+
+    missing_supported: List[ObjectSupportReportRow] = []
+    unsupported_rows: List[ObjectSupportReportRow] = []
+    if support_summary:
+        missing_supported = [
+            row for row in support_summary.missing_detail_rows
+            if row.support_state == SUPPORT_STATE_SUPPORTED
+        ]
+        unsupported_rows = [
+            row for row in support_summary.unsupported_rows
+            if row.support_state in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED}
+        ]
+
+    mismatch_rows = tv_results.get("mismatched", []) or []
+    ok_rows = tv_results.get("ok", []) or []
+    skipped_rows = tv_results.get("skipped", []) or []
+
+    extra_index_unsupported = extra_results.get("index_unsupported", []) or []
+    extra_constraint_unsupported = extra_results.get("constraint_unsupported", []) or []
+    extra_index_mismatched = extra_results.get("index_mismatched", []) or []
+    extra_constraint_mismatched = extra_results.get("constraint_mismatched", []) or []
+    extra_sequence_mismatched = extra_results.get("sequence_mismatched", []) or []
+    extra_trigger_mismatched = extra_results.get("trigger_mismatched", []) or []
+
+    total_count = 0
+    if "missing" in detail_modes:
+        total_count += len(missing_supported) or 0
+    if "unsupported" in detail_modes:
+        total_count += len(unsupported_rows) or 0
+        total_count += len(extra_index_unsupported) + len(extra_constraint_unsupported)
+    if "mismatched" in detail_modes:
+        total_count += len(mismatch_rows)
+        total_count += len(extra_index_mismatched) + len(extra_constraint_mismatched)
+        total_count += len(extra_sequence_mismatched) + len(extra_trigger_mismatched)
+    if "ok" in detail_modes:
+        total_count += len(ok_rows)
+    if "skipped" in detail_modes:
+        total_count += len(skipped_rows)
+
+    truncated = False
+    truncated_count = 0
+
+    def _push(row: Dict[str, object]) -> None:
+        nonlocal truncated, truncated_count
+        if max_rows and len(rows) >= max_rows:
+            truncated = True
+            truncated_count += 1
+            return
+        rows.append(row)
+
+    if "missing" in detail_modes:
+        for row in missing_supported:
+            src_schema, src_name = parse_full_object_name(row.src_full) or ("", "")
+            tgt_schema, tgt_name = parse_full_object_name(row.tgt_full) or ("", "")
+            _push({
+                "report_type": "MISSING",
+                "object_type": row.obj_type,
+                "source_schema": src_schema,
+                "source_name": src_name,
+                "target_schema": tgt_schema,
+                "target_name": tgt_name,
+                "status": row.support_state,
+                "reason": row.reason,
+                "detail_json": json.dumps({
+                    "reason_code": row.reason_code,
+                    "dependency": row.dependency,
+                    "action": row.action,
+                    "detail": row.detail,
+                    "root_cause": row.root_cause,
+                }, ensure_ascii=False)
+            })
+
+    if "unsupported" in detail_modes:
+        for row in unsupported_rows:
+            src_schema, src_name = parse_full_object_name(row.src_full) or ("", "")
+            tgt_schema, tgt_name = parse_full_object_name(row.tgt_full) or ("", "")
+            _push({
+                "report_type": "UNSUPPORTED",
+                "object_type": row.obj_type,
+                "source_schema": src_schema,
+                "source_name": src_name,
+                "target_schema": tgt_schema,
+                "target_name": tgt_name,
+                "status": row.support_state,
+                "reason": row.reason,
+                "detail_json": json.dumps({
+                    "reason_code": row.reason_code,
+                    "dependency": row.dependency,
+                    "action": row.action,
+                    "detail": row.detail,
+                    "root_cause": row.root_cause,
+                }, ensure_ascii=False)
+            })
+        for row in extra_index_unsupported:
+            table_schema, table_name = parse_full_object_name(row.table_full) or ("", row.table_full)
+            _push({
+                "report_type": "UNSUPPORTED",
+                "object_type": "INDEX",
+                "source_schema": table_schema,
+                "source_name": row.index_name,
+                "target_schema": table_schema,
+                "target_name": row.index_name,
+                "status": row.reason_code,
+                "reason": row.reason,
+                "detail_json": json.dumps({
+                    "table": row.table_full,
+                    "columns": row.columns,
+                    "ob_error_hint": row.ob_error_hint,
+                }, ensure_ascii=False)
+            })
+        for row in extra_constraint_unsupported:
+            table_schema, table_name = parse_full_object_name(row.table_full) or ("", row.table_full)
+            _push({
+                "report_type": "UNSUPPORTED",
+                "object_type": "CONSTRAINT",
+                "source_schema": table_schema,
+                "source_name": row.constraint_name,
+                "target_schema": table_schema,
+                "target_name": row.constraint_name,
+                "status": row.reason_code,
+                "reason": row.reason,
+                "detail_json": json.dumps({
+                    "table": row.table_full,
+                    "search_condition": row.search_condition,
+                    "ob_error_hint": row.ob_error_hint,
+                }, ensure_ascii=False)
+            })
+
+    if "mismatched" in detail_modes:
+        target_to_source: Dict[str, Tuple[str, str]] = {}
+        if table_target_map:
+            target_to_source = {
+                f"{tgt_schema}.{tgt_name}".upper(): (src_schema, src_name)
+                for (src_schema, src_name), (tgt_schema, tgt_name) in table_target_map.items()
+            }
+        for obj_type, tgt_name, missing, extra, length_mismatches, type_mismatches in mismatch_rows:
+            src_schema = ""
+            src_name = ""
+            if tgt_name:
+                src_pair = target_to_source.get(tgt_name.upper())
+                if src_pair:
+                    src_schema, src_name = src_pair
+            tgt_schema, tgt_obj = parse_full_object_name(tgt_name) or ("", tgt_name)
+            _push({
+                "report_type": "MISMATCHED",
+                "object_type": obj_type,
+                "source_schema": src_schema,
+                "source_name": src_name,
+                "target_schema": tgt_schema,
+                "target_name": tgt_obj,
+                "status": "MISMATCH",
+                "reason": "TABLE column mismatch" if (obj_type or "").upper() == "TABLE" else "MISMATCH",
+                "detail_json": json.dumps({
+                    "missing_columns": sorted(list(missing)) if isinstance(missing, (set, list)) else list(missing or []),
+                    "extra_columns": sorted(list(extra)) if isinstance(extra, (set, list)) else list(extra or []),
+                    "length_mismatches": length_mismatches,
+                    "type_mismatches": type_mismatches,
+                }, ensure_ascii=False, default=str)
+            })
+        for row in extra_index_mismatched:
+            table_schema, table_name = parse_full_object_name(row.table) or ("", row.table)
+            _push({
+                "report_type": "MISMATCHED",
+                "object_type": "INDEX",
+                "source_schema": table_schema,
+                "source_name": table_name,
+                "target_schema": table_schema,
+                "target_name": table_name,
+                "status": "MISMATCH",
+                "reason": "INDEX mismatch",
+                "detail_json": json.dumps({
+                    "missing_indexes": sorted(list(row.missing_indexes)),
+                    "extra_indexes": sorted(list(row.extra_indexes)),
+                    "detail": row.detail_mismatch,
+                }, ensure_ascii=False)
+            })
+        for row in extra_constraint_mismatched:
+            table_schema, table_name = parse_full_object_name(row.table) or ("", row.table)
+            _push({
+                "report_type": "MISMATCHED",
+                "object_type": "CONSTRAINT",
+                "source_schema": table_schema,
+                "source_name": table_name,
+                "target_schema": table_schema,
+                "target_name": table_name,
+                "status": "MISMATCH",
+                "reason": "CONSTRAINT mismatch",
+                "detail_json": json.dumps({
+                    "missing_constraints": sorted(list(row.missing_constraints)),
+                    "extra_constraints": sorted(list(row.extra_constraints)),
+                    "detail": row.detail_mismatch,
+                    "downgraded_pk": sorted(list(row.downgraded_pk_constraints)),
+                }, ensure_ascii=False)
+            })
+        for row in extra_sequence_mismatched:
+            _push({
+                "report_type": "MISMATCHED",
+                "object_type": "SEQUENCE",
+                "source_schema": row.src_schema,
+                "source_name": "",
+                "target_schema": row.tgt_schema,
+                "target_name": "",
+                "status": "MISMATCH",
+                "reason": row.note or "SEQUENCE mismatch",
+                "detail_json": json.dumps({
+                    "missing_sequences": sorted(list(row.missing_sequences)),
+                    "extra_sequences": sorted(list(row.extra_sequences)),
+                    "missing_mappings": row.missing_mappings,
+                    "detail": row.detail_mismatch,
+                }, ensure_ascii=False, default=str)
+            })
+        for row in extra_trigger_mismatched:
+            table_schema, table_name = parse_full_object_name(row.table) or ("", row.table)
+            _push({
+                "report_type": "MISMATCHED",
+                "object_type": "TRIGGER",
+                "source_schema": table_schema,
+                "source_name": table_name,
+                "target_schema": table_schema,
+                "target_name": table_name,
+                "status": "MISMATCH",
+                "reason": "TRIGGER mismatch",
+                "detail_json": json.dumps({
+                    "missing_triggers": sorted(list(row.missing_triggers)),
+                    "extra_triggers": sorted(list(row.extra_triggers)),
+                    "detail": row.detail_mismatch,
+                    "missing_mappings": row.missing_mappings,
+                }, ensure_ascii=False, default=str)
+            })
+
+    if "ok" in detail_modes:
+        for obj_type, tgt_name in ok_rows:
+            tgt_schema, tgt_obj = parse_full_object_name(tgt_name) or ("", tgt_name)
+            _push({
+                "report_type": "OK",
+                "object_type": obj_type,
+                "source_schema": "",
+                "source_name": "",
+                "target_schema": tgt_schema,
+                "target_name": tgt_obj,
+                "status": "OK",
+                "reason": "",
+                "detail_json": None,
+            })
+
+    if "skipped" in detail_modes:
+        for obj_type, tgt_name, src_name, reason in skipped_rows:
+            src_schema, src_obj = parse_full_object_name(src_name) or ("", src_name)
+            tgt_schema, tgt_obj = parse_full_object_name(tgt_name) or ("", tgt_name)
+            _push({
+                "report_type": "SKIPPED",
+                "object_type": obj_type,
+                "source_schema": src_schema,
+                "source_name": src_obj,
+                "target_schema": tgt_schema,
+                "target_name": tgt_obj,
+                "status": "SKIPPED",
+                "reason": reason or "",
+                "detail_json": None,
+            })
+
+    if max_rows and total_count > max_rows:
+        truncated = True
+        truncated_count = max(truncated_count, total_count - max_rows)
+    return rows, truncated, truncated_count
+
+
+def _build_report_usability_rows(
+    summary: Optional[UsabilitySummary]
+) -> List[Dict[str, object]]:
+    if not summary:
+        return []
+    rows: List[Dict[str, object]] = []
+    for item in summary.results:
+        usable_val: Optional[int] = None
+        if item.tgt_usable is True:
+            usable_val = 1
+        elif item.tgt_usable is False:
+            usable_val = 0
+        detail_json = json.dumps({
+            "status": item.status,
+            "src_exists": item.src_exists,
+            "src_usable": item.src_usable,
+            "tgt_exists": item.tgt_exists,
+            "tgt_usable": item.tgt_usable,
+            "src_error": item.src_error,
+            "tgt_error": item.tgt_error,
+            "root_cause": item.root_cause,
+            "recommendation": item.recommendation,
+            "src_time_ms": item.src_time_ms,
+            "tgt_time_ms": item.tgt_time_ms,
+        }, ensure_ascii=False)
+        rows.append({
+            "object_type": item.object_type,
+            "schema_name": item.schema,
+            "object_name": item.object_name,
+            "usable": usable_val,
+            "status": item.status,
+            "reason": item.root_cause,
+            "detail_json": detail_json
+        })
+    return rows
+
+
+def _hash_package_compare_row(row: PackageCompareRow) -> str:
+    payload = "|".join([
+        row.src_full or "",
+        row.obj_type or "",
+        row.src_status or "",
+        row.tgt_full or "",
+        row.tgt_status or "",
+        row.result or "",
+        str(row.error_count),
+        normalize_error_text(row.first_error or "")
+    ])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _build_report_package_compare_rows(
+    package_results: Optional[PackageCompareResults],
+    report_dir: Optional[Path],
+    report_timestamp: Optional[str]
+) -> List[Dict[str, object]]:
+    if not package_results:
+        return []
+    rows: List[PackageCompareRow] = list(package_results.get("rows") or [])
+    if not rows:
+        return []
+    diff_path: Optional[str] = None
+    if report_dir and report_timestamp:
+        report_path = Path(report_dir) / f"report_{report_timestamp}.txt"
+        pkg_path = derive_package_report_path(report_path)
+        if pkg_path.exists():
+            diff_path = str(pkg_path.resolve())
+        else:
+            diff_path = str(pkg_path)
+    results: List[Dict[str, object]] = []
+    for row in rows:
+        tgt_schema, tgt_obj = parse_full_object_name(row.tgt_full) or ("", row.tgt_full)
+        summary = (
+            f"RESULT={row.result}; SRC_STATUS={row.src_status}; TGT_STATUS={row.tgt_status}; "
+            f"ERROR_COUNT={row.error_count}; FIRST_ERROR={normalize_error_text(row.first_error or '')}"
+        )
+        if len(summary) > 4000:
+            summary = summary[:3997] + "..."
+        results.append({
+            "schema_name": tgt_schema,
+            "object_name": tgt_obj,
+            "object_type": row.obj_type,
+            "src_status": row.src_status,
+            "tgt_status": row.tgt_status,
+            "diff_status": row.result,
+            "diff_hash": _hash_package_compare_row(row),
+            "diff_summary": summary,
+            "diff_path": diff_path
+        })
+    return results
+
+
+def _build_report_trigger_status_rows(
+    status_rows: Optional[List[TriggerStatusReportRow]]
+) -> List[Dict[str, object]]:
+    if not status_rows:
+        return []
+    results: List[Dict[str, object]] = []
+    for row in status_rows:
+        schema, name = parse_full_object_name(row.trigger_full) or ("", row.trigger_full)
+        results.append({
+            "schema_name": schema,
+            "trigger_name": name,
+            "src_event": row.src_event,
+            "tgt_event": row.tgt_event,
+            "src_enabled": row.src_enabled,
+            "tgt_enabled": row.tgt_enabled,
+            "src_valid": row.src_valid,
+            "tgt_valid": row.tgt_valid,
+            "diff_status": row.detail or "MISMATCH",
+            "reason": ""
+        })
+    return results
+
+
+def _build_report_detail_insert_all(
+    schema_prefix: str,
+    report_id: str,
+    rows: List[Dict[str, object]]
+) -> Optional[str]:
+    if not rows:
+        return None
+    values_sql: List[str] = []
+    for row in rows:
+        detail_id = f"{report_id}_{uuid.uuid4().hex[:12]}"
+        reason = (row.get("reason") or "")
+        if len(reason) > 2000:
+            reason = reason[:1997] + "..."
+        detail_json = row.get("detail_json")
+        values_sql.append(
+            "INTO {table} (DETAIL_ID, REPORT_ID, REPORT_TYPE, OBJECT_TYPE, SUB_TYPE, "
+            "SOURCE_SCHEMA, SOURCE_NAME, TARGET_SCHEMA, TARGET_NAME, STATUS, REASON, BLACKLIST_REASON, DETAIL_JSON) "
+            "VALUES ({detail_id}, {report_id}, {report_type}, {object_type}, {sub_type}, "
+            "{src_schema}, {src_name}, {tgt_schema}, {tgt_name}, {status}, {reason}, {blacklist_reason}, {detail_json})".format(
+                table=f"{schema_prefix}{REPORT_DB_TABLES['detail']}",
+                detail_id=sql_quote_literal(detail_id),
+                report_id=sql_quote_literal(report_id),
+                report_type=sql_quote_literal(row.get("report_type")),
+                object_type=sql_quote_literal(row.get("object_type")),
+                sub_type=sql_quote_literal(row.get("sub_type")) if row.get("sub_type") else "NULL",
+                src_schema=sql_quote_literal(row.get("source_schema")) if row.get("source_schema") else "NULL",
+                src_name=sql_quote_literal(row.get("source_name")) if row.get("source_name") else "NULL",
+                tgt_schema=sql_quote_literal(row.get("target_schema")) if row.get("target_schema") else "NULL",
+                tgt_name=sql_quote_literal(row.get("target_name")) if row.get("target_name") else "NULL",
+                status=sql_quote_literal(row.get("status")) if row.get("status") else "NULL",
+                reason=sql_quote_literal(reason) if reason else "NULL",
+                blacklist_reason=sql_quote_literal(row.get("blacklist_reason")) if row.get("blacklist_reason") else "NULL",
+                detail_json=sql_clob_literal(detail_json) if detail_json else "NULL",
+            )
+        )
+    sql = "INSERT ALL\n  " + "\n  ".join(values_sql) + "\nSELECT 1 FROM DUAL"
+    return sql
+
+
+def _insert_report_detail_rows(
+    ob_cfg: ObConfig,
+    schema_prefix: str,
+    report_id: str,
+    rows: List[Dict[str, object]],
+    batch_size: int
+) -> bool:
+    if not rows:
+        return True
+    ok_all = True
+    for batch in chunk_list(rows, batch_size):
+        insert_sql = _build_report_detail_insert_all(schema_prefix, report_id, batch)
+        if not insert_sql:
+            continue
+        ok, _out, err = obclient_run_sql(ob_cfg, insert_sql)
+        if not ok:
+            log.warning("[REPORT_DB] INSERT ALL 失败，回退单行插入: %s", err)
+            ok_all = False
+            for row in batch:
+                insert_sql = _build_report_detail_insert_all(schema_prefix, report_id, [row])
+                if not insert_sql:
+                    continue
+                ok_single, _o, err_single = obclient_run_sql(ob_cfg, insert_sql)
+                if not ok_single:
+                    ok_all = False
+                    log.warning("[REPORT_DB] 单行写入失败: %s", err_single)
+    return ok_all
+
+
+def _insert_report_usability_rows(
+    ob_cfg: ObConfig,
+    schema_prefix: str,
+    report_id: str,
+    rows: List[Dict[str, object]],
+    batch_size: int
+) -> bool:
+    if not rows:
+        return True
+    ok_all = True
+    for batch in chunk_list(rows, batch_size):
+        values_sql: List[str] = []
+        for row in batch:
+            values_sql.append(
+                "INTO {table} (REPORT_ID, OBJECT_TYPE, SCHEMA_NAME, OBJECT_NAME, USABLE, STATUS, REASON, DETAIL_JSON) "
+                "VALUES ({report_id}, {object_type}, {schema_name}, {object_name}, {usable}, {status}, {reason}, {detail_json})".format(
+                    table=f"{schema_prefix}{REPORT_DB_TABLES['usability']}",
+                    report_id=sql_quote_literal(report_id),
+                    object_type=sql_quote_literal(row.get("object_type")),
+                    schema_name=sql_quote_literal(row.get("schema_name")) if row.get("schema_name") else "NULL",
+                    object_name=sql_quote_literal(row.get("object_name")) if row.get("object_name") else "NULL",
+                    usable=str(row.get("usable")) if row.get("usable") is not None else "NULL",
+                    status=sql_quote_literal(row.get("status")) if row.get("status") else "NULL",
+                    reason=sql_quote_literal(row.get("reason")) if row.get("reason") else "NULL",
+                    detail_json=sql_clob_literal(row.get("detail_json")) if row.get("detail_json") else "NULL",
+                )
+            )
+        insert_sql = "INSERT ALL\n  " + "\n  ".join(values_sql) + "\nSELECT 1 FROM DUAL"
+        ok, _out, err = obclient_run_sql(ob_cfg, insert_sql)
+        if not ok:
+            ok_all = False
+            log.warning("[REPORT_DB] 写入 usability 失败: %s", err)
+    return ok_all
+
+
+def _insert_report_package_compare_rows(
+    ob_cfg: ObConfig,
+    schema_prefix: str,
+    report_id: str,
+    rows: List[Dict[str, object]],
+    batch_size: int
+) -> bool:
+    if not rows:
+        return True
+    ok_all = True
+    for batch in chunk_list(rows, batch_size):
+        values_sql: List[str] = []
+        for row in batch:
+            summary = row.get("diff_summary") or ""
+            if len(summary) > 4000:
+                summary = summary[:3997] + "..."
+            values_sql.append(
+                "INTO {table} (REPORT_ID, SCHEMA_NAME, OBJECT_NAME, OBJECT_TYPE, SRC_STATUS, TGT_STATUS, "
+                "DIFF_STATUS, DIFF_HASH, DIFF_SUMMARY, DIFF_PATH) "
+                "VALUES ({report_id}, {schema_name}, {object_name}, {object_type}, {src_status}, {tgt_status}, "
+                "{diff_status}, {diff_hash}, {diff_summary}, {diff_path})".format(
+                    table=f"{schema_prefix}{REPORT_DB_TABLES['package_compare']}",
+                    report_id=sql_quote_literal(report_id),
+                    schema_name=sql_quote_literal(row.get("schema_name")) if row.get("schema_name") else "NULL",
+                    object_name=sql_quote_literal(row.get("object_name")) if row.get("object_name") else "NULL",
+                    object_type=sql_quote_literal(row.get("object_type")) if row.get("object_type") else "NULL",
+                    src_status=sql_quote_literal(row.get("src_status")) if row.get("src_status") else "NULL",
+                    tgt_status=sql_quote_literal(row.get("tgt_status")) if row.get("tgt_status") else "NULL",
+                    diff_status=sql_quote_literal(row.get("diff_status")) if row.get("diff_status") else "NULL",
+                    diff_hash=sql_quote_literal(row.get("diff_hash")) if row.get("diff_hash") else "NULL",
+                    diff_summary=sql_quote_literal(summary) if summary else "NULL",
+                    diff_path=sql_quote_literal(row.get("diff_path")) if row.get("diff_path") else "NULL",
+                )
+            )
+        insert_sql = "INSERT ALL\n  " + "\n  ".join(values_sql) + "\nSELECT 1 FROM DUAL"
+        ok, _out, err = obclient_run_sql(ob_cfg, insert_sql)
+        if not ok:
+            ok_all = False
+            log.warning("[REPORT_DB] 写入 package_compare 失败: %s", err)
+    return ok_all
+
+
+def _insert_report_trigger_status_rows(
+    ob_cfg: ObConfig,
+    schema_prefix: str,
+    report_id: str,
+    rows: List[Dict[str, object]],
+    batch_size: int
+) -> bool:
+    if not rows:
+        return True
+    ok_all = True
+    for batch in chunk_list(rows, batch_size):
+        values_sql: List[str] = []
+        for row in batch:
+            values_sql.append(
+                "INTO {table} (REPORT_ID, SCHEMA_NAME, TRIGGER_NAME, SRC_EVENT, TGT_EVENT, "
+                "SRC_ENABLED, TGT_ENABLED, SRC_VALID, TGT_VALID, DIFF_STATUS, REASON) "
+                "VALUES ({report_id}, {schema_name}, {trigger_name}, {src_event}, {tgt_event}, "
+                "{src_enabled}, {tgt_enabled}, {src_valid}, {tgt_valid}, {diff_status}, {reason})".format(
+                    table=f"{schema_prefix}{REPORT_DB_TABLES['trigger_status']}",
+                    report_id=sql_quote_literal(report_id),
+                    schema_name=sql_quote_literal(row.get("schema_name")) if row.get("schema_name") else "NULL",
+                    trigger_name=sql_quote_literal(row.get("trigger_name")) if row.get("trigger_name") else "NULL",
+                    src_event=sql_quote_literal(row.get("src_event")) if row.get("src_event") else "NULL",
+                    tgt_event=sql_quote_literal(row.get("tgt_event")) if row.get("tgt_event") else "NULL",
+                    src_enabled=sql_quote_literal(row.get("src_enabled")) if row.get("src_enabled") else "NULL",
+                    tgt_enabled=sql_quote_literal(row.get("tgt_enabled")) if row.get("tgt_enabled") else "NULL",
+                    src_valid=sql_quote_literal(row.get("src_valid")) if row.get("src_valid") else "NULL",
+                    tgt_valid=sql_quote_literal(row.get("tgt_valid")) if row.get("tgt_valid") else "NULL",
+                    diff_status=sql_quote_literal(row.get("diff_status")) if row.get("diff_status") else "NULL",
+                    reason=sql_quote_literal(row.get("reason")) if row.get("reason") else "NULL",
+                )
+            )
+        insert_sql = "INSERT ALL\n  " + "\n  ".join(values_sql) + "\nSELECT 1 FROM DUAL"
+        ok, _out, err = obclient_run_sql(ob_cfg, insert_sql)
+        if not ok:
+            ok_all = False
+            log.warning("[REPORT_DB] 写入 trigger_status 失败: %s", err)
+    return ok_all
+
+
+def _insert_report_grant_rows(
+    ob_cfg: ObConfig,
+    schema_prefix: str,
+    report_id: str,
+    grant_plan: GrantPlan,
+    batch_size: int
+) -> bool:
+    if not grant_plan:
+        return True
+    rows: List[Dict[str, object]] = []
+    for grantee, entries in (grant_plan.object_grants or {}).items():
+        for entry in entries:
+            schema, name = parse_full_object_name(entry.object_full) or ("", entry.object_full)
+            rows.append({
+                "grant_type": "OBJECT",
+                "grantee": grantee,
+                "grantor": "",
+                "privilege": entry.privilege,
+                "target_schema": schema,
+                "target_name": name,
+                "target_type": "",
+                "with_grant_option": 1 if entry.grantable else 0,
+                "status": "PLANNED",
+                "filter_reason": ""
+            })
+    for grantee, entries in (grant_plan.sys_privs or {}).items():
+        for entry in entries:
+            rows.append({
+                "grant_type": "SYSTEM",
+                "grantee": grantee,
+                "grantor": "",
+                "privilege": entry.privilege,
+                "target_schema": "",
+                "target_name": "",
+                "target_type": "",
+                "with_grant_option": 1 if entry.admin_option else 0,
+                "status": "PLANNED",
+                "filter_reason": ""
+            })
+    for grantee, entries in (grant_plan.role_privs or {}).items():
+        for entry in entries:
+            rows.append({
+                "grant_type": "ROLE",
+                "grantee": grantee,
+                "grantor": "",
+                "privilege": entry.role,
+                "target_schema": "",
+                "target_name": "",
+                "target_type": "",
+                "with_grant_option": 1 if entry.admin_option else 0,
+                "status": "PLANNED",
+                "filter_reason": ""
+            })
+    for filtered in (grant_plan.filtered_grants or []):
+        schema, name = parse_full_object_name(filtered.object_full) or ("", filtered.object_full)
+        rows.append({
+            "grant_type": filtered.category or "UNKNOWN",
+            "grantee": filtered.grantee,
+            "grantor": "",
+            "privilege": filtered.privilege,
+            "target_schema": schema,
+            "target_name": name,
+            "target_type": "",
+            "with_grant_option": 0,
+            "status": "FILTERED",
+            "filter_reason": filtered.reason,
+        })
+
+    if not rows:
+        return True
+
+    ok_all = True
+    for batch in chunk_list(rows, batch_size):
+        values_sql: List[str] = []
+        for row in batch:
+            grant_id = f"{report_id}_{uuid.uuid4().hex[:12]}"
+            values_sql.append(
+                "INTO {table} (GRANT_ID, REPORT_ID, GRANT_TYPE, GRANTEE, GRANTOR, PRIVILEGE, "
+                "TARGET_SCHEMA, TARGET_NAME, TARGET_TYPE, WITH_GRANT_OPTION, STATUS, FILTER_REASON) "
+                "VALUES ({grant_id}, {report_id}, {grant_type}, {grantee}, {grantor}, {privilege}, "
+                "{target_schema}, {target_name}, {target_type}, {with_grant_option}, {status}, {filter_reason})".format(
+                    table=f"{schema_prefix}{REPORT_DB_TABLES['grants']}",
+                    grant_id=sql_quote_literal(grant_id),
+                    report_id=sql_quote_literal(report_id),
+                    grant_type=sql_quote_literal(row.get("grant_type")),
+                    grantee=sql_quote_literal(row.get("grantee")),
+                    grantor=sql_quote_literal(row.get("grantor")) if row.get("grantor") else "NULL",
+                    privilege=sql_quote_literal(row.get("privilege")) if row.get("privilege") else "NULL",
+                    target_schema=sql_quote_literal(row.get("target_schema")) if row.get("target_schema") else "NULL",
+                    target_name=sql_quote_literal(row.get("target_name")) if row.get("target_name") else "NULL",
+                    target_type=sql_quote_literal(row.get("target_type")) if row.get("target_type") else "NULL",
+                    with_grant_option=str(int(row.get("with_grant_option", 0))),
+                    status=sql_quote_literal(row.get("status")) if row.get("status") else "NULL",
+                    filter_reason=sql_quote_literal(row.get("filter_reason")) if row.get("filter_reason") else "NULL",
+                )
+            )
+        insert_sql = "INSERT ALL\n  " + "\n  ".join(values_sql) + "\nSELECT 1 FROM DUAL"
+        ok, _out, err = obclient_run_sql(ob_cfg, insert_sql)
+        if not ok:
+            ok_all = False
+            log.warning("[REPORT_DB] GRANT 批量写入失败: %s", err)
+    return ok_all
+
+
+def _build_report_counts_rows(
+    object_counts_summary: Optional[ObjectCountSummary],
+    unsupported_counts: Optional[Dict[str, int]]
+) -> List[Dict[str, object]]:
+    if not object_counts_summary:
+        return []
+    oracle_counts = dict(object_counts_summary.get("oracle", {}))
+    ob_counts = dict(object_counts_summary.get("oceanbase", {}))
+    missing_counts = dict(object_counts_summary.get("missing", {}))
+    extra_counts = dict(object_counts_summary.get("extra", {}))
+    unsupported_counts = dict(unsupported_counts or {})
+    all_types = sorted(set(oracle_counts) | set(ob_counts) | set(missing_counts) | set(extra_counts) | set(unsupported_counts))
+    rows: List[Dict[str, object]] = []
+    for obj_type in all_types:
+        rows.append({
+            "object_type": obj_type,
+            "oracle_count": int(oracle_counts.get(obj_type, 0) or 0),
+            "oceanbase_count": int(ob_counts.get(obj_type, 0) or 0),
+            "missing_count": int(missing_counts.get(obj_type, 0) or 0),
+            "unsupported_count": int(unsupported_counts.get(obj_type, 0) or 0),
+            "extra_count": int(extra_counts.get(obj_type, 0) or 0),
+        })
+    return rows
+
+
+def _insert_report_counts_rows(
+    ob_cfg: ObConfig,
+    schema_prefix: str,
+    report_id: str,
+    rows: List[Dict[str, object]],
+    batch_size: int
+) -> bool:
+    if not rows:
+        return True
+    ok_all = True
+    for batch in chunk_list(rows, batch_size):
+        values_sql: List[str] = []
+        for row in batch:
+            values_sql.append(
+                "INTO {table} (REPORT_ID, OBJECT_TYPE, ORACLE_COUNT, OCEANBASE_COUNT, "
+                "MISSING_COUNT, UNSUPPORTED_COUNT, EXTRA_COUNT) "
+                "VALUES ({report_id}, {object_type}, {oracle_count}, {oceanbase_count}, "
+                "{missing_count}, {unsupported_count}, {extra_count})".format(
+                    table=f"{schema_prefix}{REPORT_DB_TABLES['counts']}",
+                    report_id=sql_quote_literal(report_id),
+                    object_type=sql_quote_literal(row.get("object_type")),
+                    oracle_count=int(row.get("oracle_count", 0)),
+                    oceanbase_count=int(row.get("oceanbase_count", 0)),
+                    missing_count=int(row.get("missing_count", 0)),
+                    unsupported_count=int(row.get("unsupported_count", 0)),
+                    extra_count=int(row.get("extra_count", 0)),
+                )
+            )
+        insert_sql = "INSERT ALL\n  " + "\n  ".join(values_sql) + "\nSELECT 1 FROM DUAL"
+        ok, _out, err = obclient_run_sql(ob_cfg, insert_sql)
+        if not ok:
+            ok_all = False
+            log.warning("[REPORT_DB] COUNT 批量写入失败: %s", err)
+    return ok_all
+
+
+def save_report_to_db(
+    ob_cfg: ObConfig,
+    settings: Dict,
+    run_summary: RunSummary,
+    run_summary_ctx: RunSummaryContext,
+    report_timestamp: str,
+    report_dir: Optional[Path],
+    tv_results: ReportResults,
+    extra_results: ExtraCheckResults,
+    support_summary: Optional[SupportClassificationResult],
+    endpoint_info: Dict[str, str],
+    object_counts_summary: Optional[ObjectCountSummary],
+    table_target_map: Optional[Dict[Tuple[str, str], Tuple[str, str]]],
+    target_schemas: Optional[Set[str]],
+    grant_plan: Optional[GrantPlan] = None,
+    usability_summary: Optional[UsabilitySummary] = None,
+    package_results: Optional[PackageCompareResults] = None,
+    trigger_status_rows: Optional[List[TriggerStatusReportRow]] = None
+) -> Tuple[bool, Optional[str]]:
+    if not settings.get("report_to_db", False):
+        return True, None
+
+    schema_prefix = build_report_db_schema_prefix(settings)
+    ok, err = ensure_report_db_tables_exist(ob_cfg, settings)
+    if not ok:
+        log.error("[REPORT_DB] 创建报告表失败: %s", err)
+        if settings.get("report_db_fail_abort"):
+            return False, err
+        return True, None
+
+    report_id = generate_report_id(report_timestamp)
+    report_dir_val = str(report_dir.resolve()) if report_dir else ""
+
+    missing_count = len(tv_results.get("missing", []))
+    mismatched_count = len(tv_results.get("mismatched", []))
+    ok_count = len(tv_results.get("ok", []))
+    skipped_count = len(tv_results.get("skipped", []))
+    unsupported_count = len(support_summary.unsupported_rows) if support_summary else 0
+    unsupported_by_type = build_unsupported_summary_counts(support_summary, extra_results)
+
+    index_missing_total = sum(len(item.missing_indexes) for item in extra_results.get("index_mismatched", []))
+    index_mismatch_total = len(extra_results.get("index_mismatched", []))
+    constraint_missing_total = sum(len(item.missing_constraints) for item in extra_results.get("constraint_mismatched", []))
+    constraint_mismatch_total = len(extra_results.get("constraint_mismatched", []))
+    trigger_missing_total = len(extra_results.get("trigger_mismatched", []))
+    sequence_missing_total = len(extra_results.get("sequence_mismatched", []))
+
+    if missing_count == 0 and mismatched_count == 0:
+        conclusion = "PASS"
+        conclusion_detail = "所有校验对象均已通过"
+    elif missing_count > 0:
+        conclusion = "FAIL"
+        conclusion_detail = f"存在 {missing_count} 个缺失对象"
+    else:
+        conclusion = "WARN"
+        conclusion_detail = f"存在 {mismatched_count} 个不匹配对象"
+
+    detail_rows, detail_truncated, detail_truncated_count = _build_report_detail_rows(
+        settings,
+        tv_results,
+        extra_results,
+        support_summary,
+        table_target_map
+    )
+
+    full_json = None
+    if settings.get("report_db_save_full_json"):
+        full_json = json.dumps({
+            "missing": tv_results.get("missing", []),
+            "mismatched": tv_results.get("mismatched", []),
+            "ok_count": ok_count,
+            "skipped_count": skipped_count,
+        }, ensure_ascii=False, default=str)
+
+    enabled_primary_types = settings.get("enabled_primary_types", set())
+    enabled_extra_types = settings.get("enabled_extra_types", set())
+    target_schema_list = sorted(target_schemas or set())
+
+    insert_sql = f"""
+INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
+    REPORT_ID, RUN_TIMESTAMP, DURATION_SECONDS,
+    SOURCE_HOST, SOURCE_PORT, SOURCE_SERVICE, SOURCE_USER, SOURCE_SCHEMAS,
+    TARGET_HOST, TARGET_PORT, TARGET_TENANT, TARGET_USER, TARGET_SCHEMAS,
+    CHECK_PRIMARY_TYPES, CHECK_EXTRA_TYPES, FIXUP_ENABLED, GRANT_ENABLED,
+    TOTAL_CHECKED, MISSING_COUNT, MISMATCHED_COUNT, OK_COUNT, SKIPPED_COUNT, UNSUPPORTED_COUNT,
+    INDEX_MISSING, INDEX_MISMATCHED, CONSTRAINT_MISSING, CONSTRAINT_MISMATCH,
+    TRIGGER_MISSING, SEQUENCE_MISSING, DETAIL_TRUNCATED, DETAIL_TRUNCATED_COUNT,
+    CONCLUSION, CONCLUSION_DETAIL, FULL_REPORT_JSON, TOOL_VERSION, HOSTNAME, RUN_DIR
+) VALUES (
+    {sql_quote_literal(report_id)},
+    TO_TIMESTAMP({sql_quote_literal(report_timestamp.replace('_', ''))}, 'YYYYMMDDHH24MISS'),
+    {run_summary.total_seconds:.2f},
+    {sql_quote_literal(endpoint_info.get("source_host", ""))},
+    {int(endpoint_info.get("source_port", 0) or 0)},
+    {sql_quote_literal(endpoint_info.get("source_service", ""))},
+    {sql_quote_literal(endpoint_info.get("source_user", ""))},
+    {sql_clob_literal(",".join(settings.get("source_schemas_list", [])))},
+    {sql_quote_literal(endpoint_info.get("target_host", ""))},
+    {int(endpoint_info.get("target_port", 0) or 0)},
+    {sql_quote_literal(endpoint_info.get("target_tenant", ""))},
+    {sql_quote_literal(endpoint_info.get("target_user", ""))},
+    {sql_clob_literal(",".join(target_schema_list))},
+    {sql_quote_literal(",".join(sorted(enabled_primary_types)))},
+    {sql_quote_literal(",".join(sorted(enabled_extra_types)))},
+    {1 if run_summary_ctx.fixup_enabled else 0},
+    {1 if run_summary_ctx.enable_grant_generation else 0},
+    {run_summary_ctx.total_checked},
+    {missing_count},
+    {mismatched_count},
+    {ok_count},
+    {skipped_count},
+    {unsupported_count},
+    {index_missing_total},
+    {index_mismatch_total},
+    {constraint_missing_total},
+    {constraint_mismatch_total},
+    {trigger_missing_total},
+    {sequence_missing_total},
+    {1 if detail_truncated else 0},
+    {detail_truncated_count},
+    {sql_quote_literal(conclusion)},
+    {sql_quote_literal(conclusion_detail)},
+    {sql_clob_literal(full_json) if full_json else "NULL"},
+    {sql_quote_literal(__version__)},
+    {sql_quote_literal(socket.gethostname())},
+    {sql_quote_literal(report_dir_val)}
+)
+"""
+
+    ok, _out, err = obclient_run_sql(ob_cfg, insert_sql)
+    if not ok:
+        log.error("[REPORT_DB] 写入主报告失败: %s", err)
+        if settings.get("report_db_fail_abort"):
+            return False, err
+        return True, report_id
+
+    batch_size = int(settings.get("report_db_insert_batch", 200) or 200)
+    count_rows = _build_report_counts_rows(object_counts_summary, unsupported_by_type)
+    if count_rows:
+        ok_counts = _insert_report_counts_rows(ob_cfg, schema_prefix, report_id, count_rows, batch_size)
+        if not ok_counts and settings.get("report_db_fail_abort"):
+            return False, "写入 DIFF_REPORT_COUNTS 失败"
+    _insert_report_detail_rows(ob_cfg, schema_prefix, report_id, detail_rows, batch_size)
+    if grant_plan:
+        _insert_report_grant_rows(ob_cfg, schema_prefix, report_id, grant_plan, batch_size)
+    usability_rows = _build_report_usability_rows(usability_summary)
+    if usability_rows:
+        _insert_report_usability_rows(ob_cfg, schema_prefix, report_id, usability_rows, batch_size)
+    package_rows = _build_report_package_compare_rows(package_results, report_dir, report_timestamp)
+    if package_rows:
+        _insert_report_package_compare_rows(ob_cfg, schema_prefix, report_id, package_rows, batch_size)
+    trigger_rows = _build_report_trigger_status_rows(trigger_status_rows)
+    if trigger_rows:
+        _insert_report_trigger_status_rows(ob_cfg, schema_prefix, report_id, trigger_rows, batch_size)
+
+    retention_days = int(settings.get("report_retention_days", 0) or 0)
+    if retention_days > 0:
+        delete_sql = (
+            f"DELETE FROM {schema_prefix}{REPORT_DB_TABLES['summary']} "
+            f"WHERE RUN_TIMESTAMP < SYSTIMESTAMP - INTERVAL '{retention_days}' DAY"
+        )
+        obclient_run_sql(ob_cfg, delete_sql)
+
+    log.info("[REPORT_DB] 报告已写入数据库: report_id=%s", report_id)
+    return True, report_id
+
 def collect_blacklisted_missing_tables(
     tv_results: ReportResults,
     blacklist_tables: BlacklistTableMap
@@ -25063,6 +26395,15 @@ def print_final_report(
         detail_hint_lines = [
             f"report_detail_mode={report_detail_mode}，主报告仅保留概要。"
         ]
+        if settings.get("report_to_db", False):
+            report_dir_effective = settings.get("report_dir_effective") or ""
+            db_hint = (
+                "DB 覆盖范围提醒: 缺失/不支持/阻断/可用性/触发器状态/包对比摘要已入库；"
+                "依赖链/格式化/黑名单/索引等细节仍在 run 目录文本中。"
+            )
+            if report_dir_effective:
+                db_hint = f"{db_hint} run_dir={report_dir_effective}"
+            detail_hint_lines.append(db_hint)
         if emit_detail_files:
             detail_hint_lines.append(
                 "详细差异请查看分拆报告：missing_objects_detail / unsupported_objects_detail / extra_mismatch_detail 等。"
@@ -26037,7 +27378,7 @@ def parse_cli_args() -> argparse.Namespace:
           可选开关：
             check_primary_types     限制主对象类型（默认全量）
             check_extra_types       限制扩展对象 (index,constraint,sequence,trigger)
-            extra_check_workers     扩展对象校验并发进程数（默认 4）
+            extra_check_workers     扩展对象校验并发进程数（默认 16）
             extra_check_chunk_size  扩展对象校验批量表数量（默认 200）
             extra_check_progress_interval 扩展对象校验进度日志间隔（秒）
             fixup_schemas           仅对指定目标 schema 生成订正 SQL（逗号分隔，留空为全部）
@@ -26045,7 +27386,7 @@ def parse_cli_args() -> argparse.Namespace:
             fixup_idempotent_mode   修补脚本幂等模式 (off/guard/replace/drop_create)
             fixup_idempotent_types  幂等模式作用对象类型（逗号分隔，留空用默认）
             fixup_drop_sys_c_columns 是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE (true/false)
-            synonym_fixup_scope     同义词修补范围 (all/public_only，默认 all)
+            synonym_fixup_scope     同义词修补范围 (all/public_only，默认 public_only)
             trigger_list            仅生成指定触发器清单 (每行 SCHEMA.TRIGGER_NAME)
             trigger_qualify_schema  触发器 DDL 是否强制补全 schema 前缀 (true/false)
             sequence_remap_policy   SEQUENCE 目标 schema 推导策略 (infer/source_only/dominant_table)
@@ -26499,6 +27840,27 @@ def main():
         )
         if run_summary:
             log_run_summary(run_summary)
+            db_ok, _ = save_report_to_db(
+                ob_cfg,
+                settings,
+                run_summary,
+                run_summary_ctx,
+                timestamp,
+                report_dir,
+            tv_results,
+            extra_results,
+            None,
+            endpoint_info,
+            None,
+            None,
+            set(),
+            grant_plan=None,
+            usability_summary=None,
+            package_results=package_results,
+            trigger_status_rows=None
+        )
+            if not db_ok:
+                abort_run()
         return
 
     log_section("元数据转储")
@@ -26927,6 +28289,27 @@ def main():
     )
     if run_summary:
         log_run_summary(run_summary)
+        db_ok, _ = save_report_to_db(
+            ob_cfg,
+            settings,
+            run_summary,
+            run_summary_ctx,
+            timestamp,
+            report_dir,
+            tv_results,
+            extra_results_for_report,
+            support_summary,
+            endpoint_info,
+            object_counts_summary,
+            table_target_map,
+            target_schemas,
+            grant_plan=grant_plan,
+            usability_summary=usability_summary,
+            package_results=package_results,
+            trigger_status_rows=trigger_status_rows
+        )
+        if not db_ok:
+            abort_run()
 
 
 if __name__ == "__main__":

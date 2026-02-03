@@ -67,11 +67,12 @@ password = xxx
 [SETTINGS]
 source_schemas = SCOTT,HR
 remap_file = remap_rules.txt
-synonym_fixup_scope = all
+synonym_fixup_scope = public_only
 sequence_remap_policy = source_only
 trigger_qualify_schema = true
 report_dir_layout = per_run
 report_detail_mode = split
+report_to_db = true
 oracle_client_lib_dir = /opt/instantclient_19_28
 dbcat_bin = /opt/dbcat-2.5.0-SNAPSHOT
 dbcat_output_dir = dbcat_output
@@ -174,7 +175,7 @@ generate_grants = true
 
 **扩展对象校验加速：**
 ```ini
-extra_check_workers = 4
+extra_check_workers = 16
 extra_check_chunk_size = 200
 extra_check_progress_interval = 10
 ```
