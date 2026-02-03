@@ -62,37 +62,36 @@
 """
 
 import argparse
-import hashlib
 import configparser
-import textwrap
-import subprocess
-import sys
+import hashlib
+import json
 import logging
 import math
-import re
+import os
 import random
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import uuid
+from collections import OrderedDict, defaultdict, deque
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple, Union
 
 __version__ = "0.9.8.2"
 __author__ = "Minor Li"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
 REPO_ISSUES_URL = f"{REPO_URL}/issues"
-import os
-import threading
-import json
-import socket
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-import uuid
-import shutil
-import time
-import tempfile
-from collections import defaultdict, OrderedDict, deque
-from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation
-from pathlib import Path
-from typing import Dict, Set, List, Tuple, Optional, NamedTuple, Callable, Union, Iterable
-import textwrap
 
 # 尝试导入 oracledb，如果失败则提示安装
 try:
@@ -145,6 +144,7 @@ def _build_console_handler(level: int) -> logging.Handler:
         handler.setFormatter(logging.Formatter("%(message)s"))
         return handler
     except Exception:
+        # 兜底：rich 处理异常时回退到标准日志，避免启动中断
         handler = logging.StreamHandler()
         handler.setLevel(level)
         handler.setFormatter(logging.Formatter(LOG_FILE_FORMAT, datefmt=LOG_TIME_FORMAT))
@@ -173,6 +173,7 @@ def resolve_console_log_level(level_name: Optional[str], *, is_tty: Optional[boo
         try:
             is_tty = sys.stdout.isatty()
         except Exception:
+            # 兜底：某些环境 stdout 无法检测 TTY，默认按非 TTY 处理
             is_tty = False
     name = (level_name or "AUTO").strip().upper()
     if name == "AUTO":
