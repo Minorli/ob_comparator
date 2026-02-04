@@ -119,6 +119,38 @@ class TestCurrentSchemaExecution(unittest.TestCase):
         self.assertIn("CREATE VIEW V1", captured[2])
 
 
+class TestExecuteSqlErrorDetection(unittest.TestCase):
+    def test_execute_sql_statements_detects_stdout_error(self):
+        def fake_run_sql(_cmd, _sql, _timeout):
+            return SimpleNamespace(returncode=0, stderr="", stdout="ORA-00900: invalid SQL statement")
+
+        with mock.patch.object(rf, "run_sql", side_effect=fake_run_sql):
+            summary = rf.execute_sql_statements([], "CREATE VIEW V1 AS SELECT 1 FROM dual;", timeout=1)
+
+        self.assertEqual(summary.statements, 1)
+        self.assertEqual(len(summary.failures), 1)
+        self.assertIn("ORA-00900", summary.failures[0].error)
+
+    def test_run_query_lines_detects_stdout_error(self):
+        def fake_run_sql(_cmd, _sql, _timeout):
+            return SimpleNamespace(returncode=0, stderr="", stdout="ERROR 1064 (42000): bad syntax")
+
+        with mock.patch.object(rf, "run_sql", side_effect=fake_run_sql):
+            ok, lines, err = rf.run_query_lines([], "SELECT 1", timeout=1)
+
+        self.assertFalse(ok)
+        self.assertEqual(lines, [])
+        self.assertIn("ERROR 1064", err)
+
+
+class TestViewChainDdlSanitize(unittest.TestCase):
+    def test_sanitize_view_chain_view_ddl_removes_force(self):
+        ddl = 'CREATE OR REPLACE FORCE EDITIONABLE VIEW "A"."V1" AS SELECT 1 FROM dual;'
+        cleaned = rf.sanitize_view_chain_view_ddl(ddl)
+        self.assertIn("CREATE OR REPLACE VIEW", cleaned.upper())
+        self.assertNotIn("FORCE", cleaned.upper())
+        self.assertNotIn("EDITIONABLE", cleaned.upper())
+
 class TestGrantLookupPriority(unittest.TestCase):
     def test_grant_lookup_prefers_miss(self):
         entry_miss = rf.GrantEntry(

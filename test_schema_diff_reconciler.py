@@ -3611,10 +3611,10 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertNotIn("USING INDEX", cleaned.upper())
         self.assertNotIn("IDX_C1", cleaned.upper())
 
-    def test_clean_view_ddl_preserves_force_and_removes_editionable(self):
+    def test_clean_view_ddl_removes_force_and_editionable(self):
         ddl = "CREATE OR REPLACE FORCE EDITIONABLE VIEW A.V AS SELECT 1 FROM DUAL"
         cleaned = sdr.clean_view_ddl_for_oceanbase(ddl, ob_version="4.2.5.7")
-        self.assertIn("FORCE VIEW", cleaned.upper())
+        self.assertNotIn("FORCE VIEW", cleaned.upper())
         self.assertNotIn("EDITIONABLE", cleaned.upper())
 
     def test_clean_trigger_ddl_removes_editionable(self):
@@ -5239,6 +5239,27 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         cleaned = sdr.clean_view_ddl_for_oceanbase(ddl)
         self.assertIn("CREATE OR REPLACE VIEW", cleaned.upper())
         self.assertNotIn("FORCE VIEW", cleaned.upper())
+
+    def test_clean_view_ddl_force_removal_preserves_check_option_by_version(self):
+        ddl = (
+            "CREATE OR REPLACE FORCE VIEW A.V1 AS SELECT 1 FROM DUAL "
+            "WITH CHECK OPTION"
+        )
+        cleaned_new = sdr.clean_view_ddl_for_oceanbase(ddl, ob_version="4.2.5.7")
+        cleaned_old = sdr.clean_view_ddl_for_oceanbase(ddl, ob_version="4.2.5.6")
+        self.assertNotIn("FORCE VIEW", cleaned_new.upper())
+        self.assertNotIn("FORCE VIEW", cleaned_old.upper())
+        self.assertIn("WITH CHECK OPTION", cleaned_new.upper())
+        self.assertNotIn("WITH CHECK OPTION", cleaned_old.upper())
+
+    def test_clean_view_ddl_force_removal_preserves_read_only(self):
+        ddl = (
+            "CREATE OR REPLACE FORCE VIEW A.V1 AS SELECT 1 FROM DUAL "
+            "WITH READ ONLY"
+        )
+        cleaned = sdr.clean_view_ddl_for_oceanbase(ddl, ob_version="4.2.5.7")
+        self.assertNotIn("FORCE VIEW", cleaned.upper())
+        self.assertIn("WITH READ ONLY", cleaned.upper())
 
     def test_classify_missing_objects_blocks_x_dollar(self):
         tv_results = {

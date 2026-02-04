@@ -15990,12 +15990,24 @@ def clean_view_ddl_for_oceanbase(ddl: str, ob_version: Optional[str] = None) -> 
     
     cleaned_ddl = ddl
 
-    # 移除 CREATE OR REPLACE FORCE VIEW 中的 FORCE 关键字
+    # 移除 CREATE ... FORCE [EDITIONABLE] VIEW 中的 FORCE 关键字（兼容多关键字场景）
+    def _strip_force_in_create_view(match: re.Match) -> str:
+        prefix = match.group(1)
+        middle = match.group(2) or ""
+        view_kw = match.group(3)
+        # 移除 NO FORCE / FORCE
+        middle = re.sub(r'\bNO\s+FORCE\b', ' ', middle, flags=re.IGNORECASE)
+        middle = re.sub(r'\bFORCE\b', ' ', middle, flags=re.IGNORECASE)
+        middle = re.sub(r'[ \t]+', ' ', middle).strip()
+        if middle:
+            return f"{prefix}{middle} {view_kw}"
+        return f"{prefix}{view_kw}"
+
     cleaned_ddl = re.sub(
-        r'(\bCREATE\s+(?:OR\s+REPLACE\s+)?)\s*FORCE\s+((?:MATERIALIZED\s+)?VIEW\b)',
-        r'\1\2',
+        r'(\bCREATE\s+(?:OR\s+REPLACE\s+)?)(.*?)\b((?:MATERIALIZED\s+)?VIEW)\b',
+        _strip_force_in_create_view,
         cleaned_ddl,
-        flags=re.IGNORECASE
+        flags=re.IGNORECASE | re.DOTALL
     )
 
     # 先移除 WITH CHECK OPTION 的 CONSTRAINT 名称（保留 CHECK OPTION 本身）

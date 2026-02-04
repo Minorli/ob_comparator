@@ -567,6 +567,7 @@ RE_CREATE_VIEW = re.compile(
     re.IGNORECASE
 )
 RE_ERROR_CODE = re.compile(r"(ORA-\d{5}|OB-\d+)", re.IGNORECASE)
+RE_SQL_ERROR = re.compile(r"(ORA-\d{5}|OB-\d+|ERROR\s+\d+)", re.IGNORECASE)
 RE_GRANT_ON = re.compile(
     r"^GRANT\s+.+?\s+ON\s+(?P<object>[^\s]+)\s+TO\s+(?P<grantee>[^\s;]+)",
     re.IGNORECASE | re.DOTALL
@@ -607,6 +608,38 @@ def read_sql_text_with_limit(sql_path: Path, max_bytes: Optional[int]) -> Tuple[
         return sql_path.read_text(encoding="utf-8"), None
     except Exception as exc:
         return None, f"读取文件失败: {exc}"
+
+
+def extract_sql_error(output: str) -> Optional[str]:
+    if not output:
+        return None
+    for line in output.splitlines():
+        if RE_SQL_ERROR.search(line):
+            return line.strip()
+    return None
+
+
+def sanitize_view_chain_view_ddl(ddl_text: str) -> str:
+    if not ddl_text:
+        return ddl_text
+    match = re.search(
+        r"(?is)\bCREATE\b(?P<or_replace>\s+OR\s+REPLACE)?(?P<mid>.*?)\bVIEW\b",
+        ddl_text
+    )
+    if not match:
+        return ddl_text
+    mid = match.group("mid") or ""
+    mid_clean = re.sub(
+        r"(?is)\bNO\s+FORCE\b|\bFORCE\b|\bEDITIONABLE\b|\bNONEDITIONABLE\b",
+        " ",
+        mid
+    )
+    mid_clean = " ".join(mid_clean.split())
+    prefix = "CREATE"
+    if match.group("or_replace"):
+        prefix += " OR REPLACE"
+    replacement = prefix + (" " + mid_clean if mid_clean else "") + " VIEW"
+    return ddl_text[:match.start()] + replacement + ddl_text[match.end():]
 
 
 def move_sql_to_done(sql_path: Path, done_dir: Path) -> str:
@@ -2056,6 +2089,8 @@ def build_view_chain_plan(
             blocked = True
             continue
         ddl_text = (ddl_text or "").rstrip()
+        if ddl_text and dep_type.upper() == "VIEW":
+            ddl_text = sanitize_view_chain_view_ddl(ddl_text)
         if ddl_text:
             rel_path = ddl_path.relative_to(repo_root)
             if ddl_source == "done":
@@ -2219,6 +2254,11 @@ def execute_sql_statements(
             failures.append(StatementFailure(idx, f"执行超时 ({timeout_label})", statement_to_run))
             continue
 
+        error_msg = extract_sql_error(result.stderr) or extract_sql_error(result.stdout)
+        if error_msg:
+            failures.append(StatementFailure(idx, error_msg, statement_to_run))
+            continue
+
         if result.returncode != 0:
             stderr = (result.stderr or "").strip()
             message = stderr or "执行失败"
@@ -2236,6 +2276,9 @@ def run_query_lines(
         result = run_sql(obclient_cmd, sql_text, timeout)
     except subprocess.TimeoutExpired:
         return False, [], "TimeoutExpired"
+    error_msg = extract_sql_error(result.stderr) or extract_sql_error(result.stdout)
+    if error_msg:
+        return False, [], error_msg
     if result.returncode != 0:
         stderr = (result.stderr or "").strip()
         return False, [], stderr or "执行失败"
