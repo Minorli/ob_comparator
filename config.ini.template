@@ -34,6 +34,10 @@ fixup_cli_timeout       = 3600
 
 # 报告与修复脚本输出目录（可为相对路径或绝对路径）
 fixup_dir               = fixup_scripts
+# fixup_dir_allow_outside_repo: 是否允许 fixup_dir 指向项目目录外 (true/false)
+fixup_dir_allow_outside_repo = true
+# fixup_max_sql_file_mb: run_fixup 单文件最大读取大小（MB），<=0 表示不限制
+fixup_max_sql_file_mb   = 50
 # fixup_force_clean=true 时，即使 fixup_dir 为项目外绝对路径也会清理旧脚本（谨慎使用）
 fixup_force_clean       = true
 # fixup_drop_sys_c_columns：是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE（默认 false）
@@ -106,9 +110,11 @@ generate_grants         = true
 # fixup_auto_grant: true/false
 # fixup_auto_grant_types: 自动补权限对象类型（逗号分隔）
 # fixup_auto_grant_fallback: 无匹配授权脚本时是否自动生成 GRANT (true/false)
+# fixup_auto_grant_cache_limit: 自动补权限缓存大小（条目数）
 fixup_auto_grant        = true
 fixup_auto_grant_types  = VIEW,MATERIALIZED VIEW,SYNONYM,PROCEDURE,FUNCTION,PACKAGE,PACKAGE BODY,TRIGGER,TYPE,TYPE BODY
 fixup_auto_grant_fallback = true
+fixup_auto_grant_cache_limit = 10000
 # 授权抽取范围（DBA_TAB_PRIVS）
 # owner: 仅加载源 schema 拥有的对象权限（默认，性能更佳）
 # owner_or_grantee: 兼容旧逻辑，额外加载 grantee 在源 schema 的对象授权

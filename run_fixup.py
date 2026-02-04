@@ -45,7 +45,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -57,6 +57,8 @@ DONE_DIR_NAME = "done"
 DEFAULT_OBCLIENT_TIMEOUT = 60
 DEFAULT_FIXUP_TIMEOUT = 3600
 DEFAULT_ERROR_REPORT_LIMIT = 200
+DEFAULT_FIXUP_MAX_SQL_FILE_MB = 50
+DEFAULT_FIXUP_AUTO_GRANT_CACHE_LIMIT = 10000
 MAX_RECOMPILE_RETRIES = 5
 REPO_URL = "https://github.com/Minorli/ob_comparator"
 REPO_ISSUES_URL = f"{REPO_URL}/issues"
@@ -173,6 +175,12 @@ class FailureType:
     INVALID_IDENTIFIER = "invalid_identifier" # Column/table name error -> needs DDL fix
     NAME_IN_USE = "name_in_use"              # Name already used -> needs resolution
     TIMEOUT = "timeout"                       # Execution timeout -> may retry
+    LOCK_TIMEOUT = "lock_timeout"             # Resource busy/locked
+    AUTH_FAILED = "auth_failed"               # Login/auth failure
+    CONNECTION_TIMEOUT = "connection_timeout" # Network timeout
+    RESOURCE_EXHAUSTED = "resource_exhausted" # Out of shared pool/memory
+    SNAPSHOT_ERROR = "snapshot_error"         # Snapshot too old
+    DEADLOCK = "deadlock"                     # Deadlock detected
     UNKNOWN = "unknown"                       # Unknown error -> investigate
 
 
@@ -201,6 +209,30 @@ def classify_sql_error(stderr: str) -> str:
     # Permission denied (needs grant scripts)
     if 'ORA-01031' in stderr_upper or 'ORA-01720' in stderr_upper or 'INSUFFICIENT PRIVILEGES' in stderr_upper:
         return FailureType.PERMISSION_DENIED
+
+    # Authentication failure
+    if 'ORA-01017' in stderr_upper or 'INVALID USERNAME/PASSWORD' in stderr_upper:
+        return FailureType.AUTH_FAILED
+
+    # Connection timeout
+    if 'ORA-12170' in stderr_upper or 'TNS:CONNECT TIMEOUT' in stderr_upper:
+        return FailureType.CONNECTION_TIMEOUT
+
+    # Lock timeout / resource busy
+    if 'ORA-00054' in stderr_upper or 'RESOURCE BUSY' in stderr_upper:
+        return FailureType.LOCK_TIMEOUT
+
+    # Resource exhausted
+    if 'ORA-04031' in stderr_upper:
+        return FailureType.RESOURCE_EXHAUSTED
+
+    # Snapshot too old
+    if 'ORA-01555' in stderr_upper:
+        return FailureType.SNAPSHOT_ERROR
+
+    # Deadlock
+    if 'ORA-00060' in stderr_upper:
+        return FailureType.DEADLOCK
     
     # Data conflict (unique constraint violation)
     if 'ORA-00001' in stderr_upper or 'UNIQUE CONSTRAINT' in stderr_upper:
@@ -299,6 +331,60 @@ def log_failure_analysis(failures_by_type: Dict[str, List['ScriptResult']]) -> N
         log.info("   建议: 清理重复数据后重试相关DDL")
         if len(items) <= 3:
             for item in items[:3]:
+                log.info("     - %s", item.path.name)
+
+    # Lock timeout
+    if FailureType.LOCK_TIMEOUT in failures_by_type:
+        items = failures_by_type[FailureType.LOCK_TIMEOUT]
+        log.info("❌ 资源锁/超时: %d 个", len(items))
+        log.info("   建议: 检查锁等待或并发冲突，稍后重试")
+        if len(items) <= 3:
+            for item in items[:3]:
+                log.info("     - %s", item.path.name)
+
+    # Authentication failure
+    if FailureType.AUTH_FAILED in failures_by_type:
+        items = failures_by_type[FailureType.AUTH_FAILED]
+        log.info("❌ 认证失败: %d 个", len(items))
+        log.info("   建议: 检查配置中的用户/密码是否正确")
+        if len(items) <= 1:
+            for item in items[:1]:
+                log.info("     - %s", item.path.name)
+
+    # Connection timeout
+    if FailureType.CONNECTION_TIMEOUT in failures_by_type:
+        items = failures_by_type[FailureType.CONNECTION_TIMEOUT]
+        log.info("❌ 连接超时: %d 个", len(items))
+        log.info("   建议: 检查网络连通性或数据库负载")
+        if len(items) <= 1:
+            for item in items[:1]:
+                log.info("     - %s", item.path.name)
+
+    # Resource exhausted
+    if FailureType.RESOURCE_EXHAUSTED in failures_by_type:
+        items = failures_by_type[FailureType.RESOURCE_EXHAUSTED]
+        log.info("❌ 资源不足: %d 个", len(items))
+        log.info("   建议: 检查数据库内存/共享池资源")
+        if len(items) <= 1:
+            for item in items[:1]:
+                log.info("     - %s", item.path.name)
+
+    # Snapshot too old
+    if FailureType.SNAPSHOT_ERROR in failures_by_type:
+        items = failures_by_type[FailureType.SNAPSHOT_ERROR]
+        log.info("❌ 快照过旧: %d 个", len(items))
+        log.info("   建议: 缩短事务或提高 UNDO 保留")
+        if len(items) <= 1:
+            for item in items[:1]:
+                log.info("     - %s", item.path.name)
+
+    # Deadlock
+    if FailureType.DEADLOCK in failures_by_type:
+        items = failures_by_type[FailureType.DEADLOCK]
+        log.info("❌ 死锁: %d 个", len(items))
+        log.info("   建议: 降低并发或重试")
+        if len(items) <= 1:
+            for item in items[:1]:
                 log.info("     - %s", item.path.name)
     
     # Unknown errors
@@ -511,6 +597,39 @@ class ConfigError(Exception):
     """Custom exception for configuration issues."""
 
 
+def read_sql_text_with_limit(sql_path: Path, max_bytes: Optional[int]) -> Tuple[Optional[str], Optional[str]]:
+    """Read SQL file with optional size limit."""
+    try:
+        if max_bytes and max_bytes > 0:
+            size = sql_path.stat().st_size
+            if size > max_bytes:
+                return None, f"文件过大 ({size} bytes) 超过限制 {max_bytes} bytes"
+        return sql_path.read_text(encoding="utf-8"), None
+    except Exception as exc:
+        return None, f"读取文件失败: {exc}"
+
+
+def move_sql_to_done(sql_path: Path, done_dir: Path) -> str:
+    """Move executed SQL to done directory with backup if needed."""
+    try:
+        target_dir = done_dir / sql_path.parent.name
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / sql_path.name
+        backup_note = ""
+        if target_path.exists():
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = target_dir / f"{sql_path.stem}.bak_{timestamp}{sql_path.suffix}"
+            try:
+                target_path.replace(backup_path)
+                backup_note = f" (已备份: {backup_path.name})"
+            except Exception as exc:
+                log.warning("已存在文件备份失败: %s (%s)", target_path, str(exc)[:200])
+        shutil.move(str(sql_path), target_path)
+        return f"(已移至 done/{sql_path.parent.name}/){backup_note}"
+    except Exception as exc:
+        return f"(移动失败: {exc})"
+
+
 @dataclass
 class ScriptResult:
     path: Path
@@ -550,6 +669,37 @@ class FixupAutoGrantSettings:
     enabled: bool
     types: Set[str]
     fallback: bool
+    cache_limit: int
+
+
+class LimitedCache(OrderedDict):
+    """Simple size-limited cache with FIFO eviction."""
+
+    def __init__(self, max_size: int):
+        super().__init__()
+        self.max_size = int(max_size) if max_size is not None else 0
+
+    def __setitem__(self, key, value) -> None:
+        if key in self:
+            try:
+                self.move_to_end(key)
+            except Exception:
+                pass
+        super().__setitem__(key, value)
+        if self.max_size > 0:
+            while len(self) > self.max_size:
+                try:
+                    self.popitem(last=False)
+                except KeyError:
+                    break
+
+    def get(self, key, default=None):
+        if key in self:
+            try:
+                self.move_to_end(key)
+            except Exception:
+                pass
+        return super().get(key, default)
 
 
 @dataclass
@@ -581,7 +731,7 @@ class AutoGrantContext:
     stats: AutoGrantStats
 
 
-def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, Path, FixupAutoGrantSettings]:
+def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, Path, FixupAutoGrantSettings, Optional[int]]:
     """Load OceanBase connection info and fixup directory from config.ini."""
     parser = configparser.ConfigParser(interpolation=None)
     if not config_path.exists():
@@ -599,7 +749,13 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
         raise ConfigError(f"[OCEANBASE_TARGET] 缺少必填项: {', '.join(missing)}")
 
     ob_cfg = {key: ob_section[key].strip() for key in required_keys}
-    ob_cfg["port"] = str(int(ob_cfg["port"]))
+    try:
+        port_value = int(ob_cfg["port"])
+    except ValueError as exc:
+        raise ConfigError(f"端口解析失败: {ob_cfg['port']}") from exc
+    if port_value <= 0 or port_value > 65535:
+        raise ConfigError(f"端口超出范围: {port_value}")
+    ob_cfg["port"] = str(port_value)
 
     try:
         fixup_raw = parser.get("SETTINGS", "fixup_cli_timeout", fallback="").strip()
@@ -617,6 +773,13 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
     repo_root = config_path.parent.resolve()
     fixup_dir = parser.get("SETTINGS", "fixup_dir", fallback=DEFAULT_FIXUP_DIR).strip()
     fixup_path = (repo_root / fixup_dir).resolve()
+    allow_outside = parse_bool_flag(
+        parser.get("SETTINGS", "fixup_dir_allow_outside_repo", fallback="true"),
+        True
+    )
+    if not allow_outside:
+        if fixup_path != repo_root and repo_root not in fixup_path.parents:
+            raise ConfigError(f"fixup_dir 不允许在项目目录之外: {fixup_path}")
 
     if not fixup_path.exists():
         raise ConfigError(f"修补脚本目录不存在: {fixup_path}")
@@ -636,12 +799,26 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
         parser.get("SETTINGS", "fixup_auto_grant_fallback", fallback="true"),
         True
     )
+    auto_grant_cache_limit = parser.getint(
+        "SETTINGS",
+        "fixup_auto_grant_cache_limit",
+        fallback=DEFAULT_FIXUP_AUTO_GRANT_CACHE_LIMIT
+    )
+    if auto_grant_cache_limit < 0:
+        auto_grant_cache_limit = DEFAULT_FIXUP_AUTO_GRANT_CACHE_LIMIT
     fixup_settings = FixupAutoGrantSettings(
         enabled=auto_grant_enabled,
         types=auto_grant_types,
-        fallback=auto_grant_fallback
+        fallback=auto_grant_fallback,
+        cache_limit=auto_grant_cache_limit
     )
-    return ob_cfg, fixup_path, repo_root, log_level, report_path, fixup_settings
+    max_sql_mb = parser.getint(
+        "SETTINGS",
+        "fixup_max_sql_file_mb",
+        fallback=DEFAULT_FIXUP_MAX_SQL_FILE_MB
+    )
+    max_sql_bytes = None if max_sql_mb <= 0 else max_sql_mb * 1024 * 1024
+    return ob_cfg, fixup_path, repo_root, log_level, report_path, fixup_settings, max_sql_bytes
 
 
 def build_obclient_command(ob_cfg: Dict[str, str]) -> List[str]:
@@ -1226,7 +1403,10 @@ def init_auto_grant_context(
         for key, refs in view_deps.items():
             dep_map.setdefault(key, set()).update(refs)
     if not dep_map:
-        log.warning("[AUTO-GRANT] 未找到 dependency_chains/VIEWs_chain，自动补权限跳过。")
+        log.warning(
+            "[AUTO-GRANT] 未找到 dependency_chains/VIEWs_chain，自动补权限跳过 (report_dir=%s).",
+            report_dir
+        )
         return None
     grant_index_miss = build_grant_index(
         fixup_dir,
@@ -1246,10 +1426,10 @@ def init_auto_grant_context(
         grant_index_all=grant_index_all,
         obclient_cmd=obclient_cmd,
         timeout=timeout,
-        roles_cache={},
-        tab_privs_cache={},
-        tab_privs_grantable_cache={},
-        sys_privs_cache={},
+        roles_cache=LimitedCache(fixup_settings.cache_limit),
+        tab_privs_cache=LimitedCache(fixup_settings.cache_limit),
+        tab_privs_grantable_cache=LimitedCache(fixup_settings.cache_limit),
+        sys_privs_cache=LimitedCache(fixup_settings.cache_limit),
         planned_statements=set(),
         planned_object_privs=set(),
         planned_object_privs_with_option=set(),
@@ -1258,9 +1438,10 @@ def init_auto_grant_context(
         stats=stats
     )
     log.info(
-        "[AUTO-GRANT] 启用: types=%s fallback=%s deps=%d",
+        "[AUTO-GRANT] 启用: types=%s fallback=%s cache_limit=%d deps=%d",
         ",".join(sorted(fixup_settings.types)),
         "true" if fixup_settings.fallback else "false",
+        fixup_settings.cache_limit,
         sum(len(v) for v in dep_map.values())
     )
     return ctx
@@ -1759,7 +1940,8 @@ def build_view_chain_plan(
     planned_object_privs: Set[Tuple[str, str, str]],
     planned_object_privs_with_option: Set[Tuple[str, str, str]],
     planned_sys_privs: Set[Tuple[str, str]],
-    planned_objects: Set[Tuple[str, str]]
+    planned_objects: Set[Tuple[str, str]],
+    max_sql_file_bytes: Optional[int]
 ) -> Tuple[List[str], List[str], bool]:
     plan_lines: List[str] = []
     sql_lines: List[str] = []
@@ -1772,6 +1954,7 @@ def build_view_chain_plan(
         for cycle in cycles:
             cycle_str = " -> ".join(f"{n[0]}({n[1]})" for n in cycle)
             plan_lines.append(f"  CYCLE: {cycle_str}")
+        return plan_lines, sql_lines, True
 
     synonym_targets = resolve_synonym_target_map(edges)
     grant_option_views: Set[Tuple[str, str]] = set()
@@ -1867,12 +2050,12 @@ def build_view_chain_plan(
             plan_lines.append(f"BLOCK: 缺少 DDL for {dep_full}({dep_type})")
             blocked = True
             continue
-        try:
-            ddl_text = ddl_path.read_text(encoding="utf-8").rstrip()
-        except OSError as exc:
-            plan_lines.append(f"BLOCK: 读取 DDL 失败 {ddl_path} ({exc})")
+        ddl_text, ddl_error = read_sql_text_with_limit(ddl_path, max_sql_file_bytes)
+        if ddl_error:
+            plan_lines.append(f"BLOCK: 读取 DDL 失败 {ddl_path} ({ddl_error})")
             blocked = True
             continue
+        ddl_text = (ddl_text or "").rstrip()
         if ddl_text:
             rel_path = ddl_path.relative_to(repo_root)
             if ddl_source == "done":
@@ -1891,7 +2074,7 @@ def split_sql_statements(sql_text: str) -> List[str]:
     buffer: List[str] = []
     in_single = False
     in_double = False
-    in_block_comment = False
+    block_comment_depth = 0
     in_q_quote = False
     q_quote_end = ""
     slash_block = False
@@ -1906,7 +2089,7 @@ def split_sql_statements(sql_text: str) -> List[str]:
         if not slash_block and (RE_BLOCK_START.match(line) or RE_ANON_BLOCK_START.match(line)):
             slash_block = True
         stripped = line.strip()
-        if not in_single and not in_double and not in_block_comment and stripped == "/":
+        if not in_single and not in_double and block_comment_depth == 0 and stripped == "/":
             buffer.append(line)
             flush_buffer()
             slash_block = False
@@ -1917,12 +2100,17 @@ def split_sql_statements(sql_text: str) -> List[str]:
             ch = line[idx]
             nxt = line[idx + 1] if idx + 1 < len(line) else ""
 
-            if in_block_comment:
+            if block_comment_depth > 0:
                 buffer.append(ch)
+                if ch == "/" and nxt == "*":
+                    buffer.append(nxt)
+                    idx += 2
+                    block_comment_depth += 1
+                    continue
                 if ch == "*" and nxt == "/":
                     buffer.append(nxt)
                     idx += 2
-                    in_block_comment = False
+                    block_comment_depth -= 1
                     continue
                 idx += 1
                 continue
@@ -1952,7 +2140,7 @@ def split_sql_statements(sql_text: str) -> List[str]:
                     buffer.append(ch)
                     buffer.append(nxt)
                     idx += 2
-                    in_block_comment = True
+                    block_comment_depth += 1
                     continue
                 if ch == "-" and nxt == "-":
                     buffer.append(line[idx:])
@@ -1989,14 +2177,21 @@ def split_sql_statements(sql_text: str) -> List[str]:
 
 def run_sql(obclient_cmd: List[str], sql_text: str, timeout: Optional[int]) -> subprocess.CompletedProcess:
     """Execute SQL text by piping it to obclient."""
-    return subprocess.run(
-        obclient_cmd,
-        input=sql_text,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout,
-    )
+    try:
+        return subprocess.run(
+            obclient_cmd,
+            input=sql_text,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except FileNotFoundError as exc:
+        raise ConfigError(f"obclient 不存在或不可执行: {exc}") from exc
+    except PermissionError as exc:
+        raise ConfigError(f"obclient 权限不足: {exc}") from exc
+    except OSError as exc:
+        raise ConfigError(f"调用 obclient 失败: {exc}") from exc
 
 
 def execute_sql_statements(
@@ -2495,18 +2690,18 @@ def execute_grant_file_with_prune(
     layer: int,
     label_prefix: str,
     error_entries: List[ErrorReportEntry],
-    error_limit: int
+    error_limit: int,
+    max_sql_file_bytes: Optional[int]
 ) -> Tuple[ScriptResult, ExecutionSummary, int, int, bool]:
     relative_path = sql_path.relative_to(repo_root)
-    try:
-        sql_text = sql_path.read_text(encoding="utf-8")
-    except Exception as exc:
-        msg = f"读取文件失败: {exc}"
+    sql_text, read_error = read_sql_text_with_limit(sql_path, max_sql_file_bytes)
+    if read_error:
+        msg = read_error
         log.error("%s %s -> ERROR (%s)", label_prefix, relative_path, msg)
         failure = StatementFailure(0, msg, "")
         return ScriptResult(relative_path, "ERROR", msg, layer), ExecutionSummary(0, [failure]), 0, 0, False
 
-    statements = split_sql_statements(sql_text)
+    statements = split_sql_statements(sql_text or "")
     kept_statements: List[str] = []
     failures: List[StatementFailure] = []
     executed_count = 0
@@ -2554,15 +2749,7 @@ def execute_grant_file_with_prune(
         return ScriptResult(relative_path, "SKIPPED", "文件为空", layer), summary, 0, 0, truncated
 
     if summary.success:
-        move_note = ""
-        try:
-            target_dir = done_dir / sql_path.parent.name
-            target_dir.mkdir(parents=True, exist_ok=True)
-            target_path = target_dir / sql_path.name
-            shutil.move(str(sql_path), target_path)
-            move_note = f"(已移至 done/{sql_path.parent.name}/)"
-        except Exception as exc:
-            move_note = f"(移动失败: {exc})"
+        move_note = move_sql_to_done(sql_path, done_dir)
         log.info(
             "%s %s -> OK %s (已清理授权 %d 条)",
             label_prefix,
@@ -2601,35 +2788,27 @@ def execute_script_with_summary(
     done_dir: Path,
     timeout: Optional[int],
     layer: int,
-    label_prefix: str
+    label_prefix: str,
+    max_sql_file_bytes: Optional[int]
 ) -> Tuple[ScriptResult, ExecutionSummary]:
     relative_path = sql_path.relative_to(repo_root)
-    try:
-        sql_text = sql_path.read_text(encoding="utf-8")
-    except Exception as exc:
-        msg = f"读取文件失败: {exc}"
+    sql_text, read_error = read_sql_text_with_limit(sql_path, max_sql_file_bytes)
+    if read_error:
+        msg = read_error
         log.error("%s %s -> ERROR (%s)", label_prefix, relative_path, msg)
         return ScriptResult(relative_path, "ERROR", msg, layer), ExecutionSummary(0, [StatementFailure(0, msg, "")])
 
-    if not sql_text.strip():
+    if not (sql_text or "").strip():
         log.warning("%s %s -> SKIP (文件为空)", label_prefix, relative_path)
         return ScriptResult(relative_path, "SKIPPED", "文件为空", layer), ExecutionSummary(0, [])
 
-    summary = execute_sql_statements(obclient_cmd, sql_text, timeout=timeout)
+    summary = execute_sql_statements(obclient_cmd, sql_text or "", timeout=timeout)
     if summary.statements == 0:
         log.warning("%s %s -> SKIP (文件无有效语句)", label_prefix, relative_path)
         return ScriptResult(relative_path, "SKIPPED", "文件无有效语句", layer), summary
 
     if summary.success:
-        move_note = ""
-        try:
-            target_dir = done_dir / sql_path.parent.name
-            target_dir.mkdir(parents=True, exist_ok=True)
-            target_path = target_dir / sql_path.name
-            shutil.move(str(sql_path), target_path)
-            move_note = f"(已移至 done/{sql_path.parent.name}/)"
-        except Exception as exc:
-            move_note = f"(移动失败: {exc})"
+        move_note = move_sql_to_done(sql_path, done_dir)
         log.info("%s %s -> OK %s", label_prefix, relative_path, move_note)
         return ScriptResult(relative_path, "SUCCESS", move_note.strip(), layer), summary
 
@@ -2925,7 +3104,7 @@ def main() -> None:
     
     # Load configuration
     try:
-        ob_cfg, fixup_dir, repo_root, log_level, report_dir, fixup_settings = load_ob_config(
+        ob_cfg, fixup_dir, repo_root, log_level, report_dir, fixup_settings, max_sql_file_bytes = load_ob_config(
             config_arg.resolve()
         )
     except ConfigError as exc:
@@ -2950,30 +3129,37 @@ def main() -> None:
     max_rounds = getattr(args, 'max_rounds', 10)
     min_progress = getattr(args, 'min_progress', 1)
     
-    if getattr(args, "view_chain_autofix", False):
-        run_view_chain_autofix(
-            args,
-            ob_cfg,
-            fixup_dir,
-            repo_root,
-            report_dir,
-            only_dirs,
-            exclude_dirs,
-            fixup_settings
-        )
-    elif iterative_mode:
-        run_iterative_fixup(
-            args, ob_cfg, fixup_dir, repo_root, report_dir,
-            only_dirs, exclude_dirs,
-            fixup_settings,
-            max_rounds, min_progress
-        )
-    else:
-        run_single_fixup(
-            args, ob_cfg, fixup_dir, repo_root, report_dir,
-            only_dirs, exclude_dirs,
-            fixup_settings
-        )
+    try:
+        if getattr(args, "view_chain_autofix", False):
+            run_view_chain_autofix(
+                args,
+                ob_cfg,
+                fixup_dir,
+                repo_root,
+                report_dir,
+                only_dirs,
+                exclude_dirs,
+                fixup_settings,
+                max_sql_file_bytes
+            )
+        elif iterative_mode:
+            run_iterative_fixup(
+                args, ob_cfg, fixup_dir, repo_root, report_dir,
+                only_dirs, exclude_dirs,
+                fixup_settings,
+                max_sql_file_bytes,
+                max_rounds, min_progress
+            )
+        else:
+            run_single_fixup(
+                args, ob_cfg, fixup_dir, repo_root, report_dir,
+                only_dirs, exclude_dirs,
+                fixup_settings,
+                max_sql_file_bytes
+            )
+    except ConfigError as exc:
+        log.error("执行失败: %s", exc)
+        sys.exit(1)
 
 
 def run_single_fixup(
@@ -2984,7 +3170,8 @@ def run_single_fixup(
     report_dir: Path,
     only_dirs: List[str],
     exclude_dirs: List[str],
-    fixup_settings: FixupAutoGrantSettings
+    fixup_settings: FixupAutoGrantSettings,
+    max_sql_file_bytes: Optional[int]
 ) -> None:
     """Original single-round fixup execution (backward compatible)."""
     
@@ -3052,19 +3239,6 @@ def run_single_fixup(
         relative_path = sql_path.relative_to(repo_root)
         label = format_progress_label(idx, total_scripts, width)
         
-        try:
-            sql_text = sql_path.read_text(encoding="utf-8")
-        except Exception as exc:
-            msg = f"读取文件失败: {exc}"
-            results.append(ScriptResult(relative_path, "ERROR", msg, layer))
-            log.error("%s %s -> ERROR (%s)", label, relative_path, msg)
-            continue
-        
-        if not sql_text.strip():
-            results.append(ScriptResult(relative_path, "SKIPPED", "文件为空", layer))
-            log.warning("%s %s -> SKIP (文件为空)", label, relative_path)
-            continue
-        
         if is_grant_dir(sql_path.parent.name):
             result, summary, _removed, _kept, truncated = execute_grant_file_with_prune(
                 obclient_cmd,
@@ -3075,7 +3249,8 @@ def run_single_fixup(
                 layer,
                 label,
                 error_entries,
-                DEFAULT_ERROR_REPORT_LIMIT
+                DEFAULT_ERROR_REPORT_LIMIT,
+                max_sql_file_bytes
             )
             error_truncated = error_truncated or truncated
             results.append(result)
@@ -3087,73 +3262,23 @@ def run_single_fixup(
             )
             if auto_grant_ctx and obj_full and obj_type:
                 execute_auto_grant_for_object(auto_grant_ctx, obj_full, obj_type, label)
-            summary = execute_sql_statements(obclient_cmd, sql_text, timeout=ob_timeout)
-            if summary.statements == 0:
-                results.append(ScriptResult(relative_path, "SKIPPED", "文件为空", layer))
-                log.warning("%s %s -> SKIP (文件为空)", label, relative_path)
+            result, summary = execute_script_with_summary(
+                obclient_cmd,
+                sql_path,
+                repo_root,
+                done_dir,
+                ob_timeout,
+                layer,
+                label,
+                max_sql_file_bytes
+            )
+            if result.status == "SUCCESS":
+                results.append(result)
                 continue
 
-            if summary.success:
-                move_note = ""
-                try:
-                    target_dir = done_dir / sql_path.parent.name
-                    target_dir.mkdir(parents=True, exist_ok=True)
-                    target_path = target_dir / sql_path.name
-                    shutil.move(str(sql_path), target_path)
-                    move_note = f"(已移至 done/{sql_path.parent.name}/)"
-                except Exception as exc:
-                    move_note = f"(移动失败: {exc})"
-
-                results.append(ScriptResult(relative_path, "SUCCESS", move_note.strip(), layer))
-                log.info("%s %s -> OK %s", label, relative_path, move_note)
-            else:
-                first_error = summary.failures[0].error if summary.failures else "执行失败"
-                error_type = classify_sql_error(first_error)
-                retried = False
-                if (
-                    auto_grant_ctx
-                    and obj_full
-                    and obj_type
-                    and error_type == FailureType.PERMISSION_DENIED
-                ):
-                    applied, _blocked = execute_auto_grant_for_object(
-                        auto_grant_ctx,
-                        obj_full,
-                        obj_type,
-                        f"{label} (retry)"
-                    )
-                    if applied > 0:
-                        retry_summary = execute_sql_statements(
-                            obclient_cmd,
-                            sql_text,
-                            timeout=ob_timeout
-                        )
-                        if retry_summary.success:
-                            retried = True
-                            move_note = ""
-                            try:
-                                target_dir = done_dir / sql_path.parent.name
-                                target_dir.mkdir(parents=True, exist_ok=True)
-                                target_path = target_dir / sql_path.name
-                                shutil.move(str(sql_path), target_path)
-                                move_note = f"(已移至 done/{sql_path.parent.name}/)"
-                            except Exception as exc:
-                                move_note = f"(移动失败: {exc})"
-                            results.append(ScriptResult(relative_path, "SUCCESS", move_note.strip(), layer))
-                            log.info("%s %s -> OK %s", label, relative_path, move_note)
-                        else:
-                            summary = retry_summary
-                if not retried:
-                    results.append(ScriptResult(relative_path, "FAILED", first_error, layer))
-                    log.error(
-                        "%s %s -> FAIL (%d/%d statements)",
-                        label,
-                        relative_path,
-                        len(summary.failures),
-                        summary.statements
-                    )
-                    for failure in summary.failures[:3]:
-                        log.error("  [%d] %s", failure.index, safe_first_line(failure.error, 200, "执行失败"))
+            if result.status in ("SKIPPED", "ERROR"):
+                results.append(result)
+                if result.status == "ERROR":
                     for failure in summary.failures:
                         if error_truncated:
                             break
@@ -3165,6 +3290,63 @@ def run_single_fixup(
                             failure.statement,
                             failure.error
                         )
+                continue
+
+            first_error = summary.failures[0].error if summary.failures else result.message
+            error_type = classify_sql_error(first_error)
+            handled = False
+            if (
+                auto_grant_ctx
+                and obj_full
+                and obj_type
+                and error_type == FailureType.PERMISSION_DENIED
+            ):
+                applied, _blocked = execute_auto_grant_for_object(
+                    auto_grant_ctx,
+                    obj_full,
+                    obj_type,
+                    f"{label} (grant)"
+                )
+                handled = applied > 0
+
+            if handled:
+                retry_result, retry_summary = execute_script_with_summary(
+                    obclient_cmd,
+                    sql_path,
+                    repo_root,
+                    done_dir,
+                    ob_timeout,
+                    layer,
+                    f"{label} (retry)",
+                    max_sql_file_bytes
+                )
+                results.append(retry_result)
+                if retry_result.status == "FAILED":
+                    for failure in retry_summary.failures:
+                        if error_truncated:
+                            break
+                        error_truncated = not record_error_entry(
+                            error_entries,
+                            DEFAULT_ERROR_REPORT_LIMIT,
+                            relative_path,
+                            failure.index,
+                            failure.statement,
+                            failure.error
+                        )
+                continue
+
+            results.append(result)
+            for failure in summary.failures:
+                if error_truncated:
+                    break
+                error_truncated = not record_error_entry(
+                    error_entries,
+                    DEFAULT_ERROR_REPORT_LIMIT,
+                    relative_path,
+                    failure.index,
+                    failure.statement,
+                    failure.error
+                )
     
     # Recompilation phase
     total_recompiled = 0
@@ -3262,7 +3444,8 @@ def run_view_chain_autofix(
     report_dir: Path,
     only_dirs: List[str],
     exclude_dirs: List[str],
-    fixup_settings: FixupAutoGrantSettings
+    fixup_settings: FixupAutoGrantSettings,
+    max_sql_file_bytes: Optional[int]
 ) -> None:
     log_section("VIEW 链路自动修复")
     log.info("配置文件: %s", Path(args.config).resolve())
@@ -3329,10 +3512,10 @@ def run_view_chain_autofix(
     ob_timeout = resolve_timeout_value(ob_cfg.get("timeout"))
 
     exists_cache: Dict[Tuple[str, str], bool] = {}
-    roles_cache: Dict[str, Set[str]] = {}
-    tab_privs_cache: Dict[Tuple[str, str, str], Set[str]] = {}
-    tab_privs_grantable_cache: Dict[Tuple[str, str, str], Set[str]] = {}
-    sys_privs_cache: Dict[str, Set[str]] = {}
+    roles_cache: Dict[str, Set[str]] = LimitedCache(fixup_settings.cache_limit)
+    tab_privs_cache: Dict[Tuple[str, str, str], Set[str]] = LimitedCache(fixup_settings.cache_limit)
+    tab_privs_grantable_cache: Dict[Tuple[str, str, str], Set[str]] = LimitedCache(fixup_settings.cache_limit)
+    sys_privs_cache: Dict[str, Set[str]] = LimitedCache(fixup_settings.cache_limit)
     planned_statements: Set[str] = set()
     planned_object_privs: Set[Tuple[str, str, str]] = set()
     planned_object_privs_with_option: Set[Tuple[str, str, str]] = set()
@@ -3395,7 +3578,8 @@ def run_view_chain_autofix(
                 planned_object_privs,
                 planned_object_privs_with_option,
                 planned_sys_privs,
-                planned_objects
+                planned_objects,
+                max_sql_file_bytes
             )
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3530,6 +3714,7 @@ def run_iterative_fixup(
     only_dirs: List[str],
     exclude_dirs: List[str],
     fixup_settings: FixupAutoGrantSettings,
+    max_sql_file_bytes: Optional[int],
     max_rounds: int = 10,
     min_progress: int = 1
 ) -> None:
@@ -3581,6 +3766,7 @@ def run_iterative_fixup(
     round_num = 0
     cumulative_success = 0
     cumulative_failed = 0
+    cumulative_failed_paths: Set[Path] = set()
     
     all_round_results = []
     
@@ -3636,7 +3822,8 @@ def run_iterative_fixup(
                     layer,
                     label,
                     error_entries,
-                    DEFAULT_ERROR_REPORT_LIMIT
+                    DEFAULT_ERROR_REPORT_LIMIT,
+                    max_sql_file_bytes
                 )
                 error_truncated = error_truncated or truncated
                 round_results.append(result)
@@ -3657,7 +3844,8 @@ def run_iterative_fixup(
                 done_dir,
                 ob_timeout,
                 layer,
-                label
+                label,
+                max_sql_file_bytes
             )
 
             if result.status == "SUCCESS":
@@ -3711,7 +3899,8 @@ def run_iterative_fixup(
                                 done_dir,
                                 ob_timeout,
                                 layer,
-                                "[DEPS]"
+                                "[DEPS]",
+                                max_sql_file_bytes
                             )
                             pre_executed.add(dep_path)
                             round_results.append(dep_result)
@@ -3746,7 +3935,8 @@ def run_iterative_fixup(
                     done_dir,
                     ob_timeout,
                     layer,
-                    f"{label} (retry)"
+                    f"{label} (retry)",
+                    max_sql_file_bytes
                 )
                 round_results.append(retry_result)
                 if retry_result.status == "FAILED":
@@ -3783,7 +3973,10 @@ def run_iterative_fixup(
         round_skipped = sum(1 for r in round_results if r.status == "SKIPPED")
         
         cumulative_success += round_success
-        cumulative_failed += round_failed
+        for item in round_results:
+            if item.status in ("FAILED", "ERROR"):
+                cumulative_failed_paths.add(item.path)
+        cumulative_failed = len(cumulative_failed_paths)
         
         log_subsection(f"第 {round_num} 轮结果")
         log.info("本轮成功: %d", round_success)

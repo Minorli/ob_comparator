@@ -55,10 +55,14 @@ class TestRunFixupConfig(unittest.TestCase):
                 ]) + "\n",
                 encoding="utf-8"
             )
-            ob_cfg, fixup_path, _repo_root, _log_level, _report_path, fixup_settings = rf.load_ob_config(cfg_path)
+            ob_cfg, fixup_path, _repo_root, _log_level, _report_path, fixup_settings, max_sql_bytes = rf.load_ob_config(cfg_path)
             self.assertEqual(ob_cfg["password"], "p%w")
             self.assertEqual(ob_cfg["timeout"], 77)
             self.assertTrue(fixup_settings.enabled)
+            self.assertEqual(
+                max_sql_bytes,
+                rf.DEFAULT_FIXUP_MAX_SQL_FILE_MB * 1024 * 1024
+            )
         self.assertEqual(fixup_path, (root / "fixup_scripts").resolve())
 
 
@@ -227,6 +231,92 @@ class TestRunFixupHelpers(unittest.TestCase):
         self.assertEqual(rf.safe_first_line("line1", 3, "n/a"), "lin")
 
 
+class TestLimitedCache(unittest.TestCase):
+    def test_eviction(self):
+        cache = rf.LimitedCache(2)
+        cache["a"] = 1
+        cache["b"] = 2
+        cache["c"] = 3
+        self.assertEqual(len(cache), 2)
+        self.assertNotIn("a", cache)
+
+
+class TestSqlFileSizeLimit(unittest.TestCase):
+    def test_large_sql_file_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sql_path = root / "big.sql"
+            sql_path.write_text("x" * 1024, encoding="utf-8")
+            result, summary = rf.execute_script_with_summary(
+                [],
+                sql_path,
+                root,
+                root,
+                None,
+                0,
+                "[TEST]",
+                max_sql_file_bytes=10
+            )
+            self.assertEqual(result.status, "ERROR")
+            self.assertIn("文件过大", result.message)
+            self.assertEqual(summary.statements, 0)
+
+
+class TestViewChainCycle(unittest.TestCase):
+    def test_build_view_chain_plan_blocks_cycle(self):
+        chains = [
+            [("A.V1", "VIEW"), ("B.V2", "VIEW")],
+            [("B.V2", "VIEW"), ("A.V1", "VIEW")],
+        ]
+        grant_index = rf.GrantIndex({}, {}, {})
+        plan, sql_lines, blocked = rf.build_view_chain_plan(
+            "A.V1",
+            chains,
+            [],
+            None,
+            {},
+            {},
+            {},
+            {},
+            grant_index,
+            grant_index,
+            False,
+            Path("."),
+            {},
+            {},
+            {},
+            {},
+            {},
+            set(),
+            set(),
+            set(),
+            set(),
+            set(),
+            None
+        )
+        self.assertTrue(blocked)
+        self.assertEqual(sql_lines, [])
+        self.assertTrue(any("CYCLE" in line for line in plan))
+
+
+class TestSqlParsing(unittest.TestCase):
+    def test_split_nested_block_comments(self):
+        sql = "/* outer /* inner */ still */\nSELECT 1 FROM dual;\n"
+        statements = rf.split_sql_statements(sql)
+        self.assertEqual(len(statements), 1)
+        self.assertIn("SELECT 1", statements[0])
+
+
+class TestErrorClassification(unittest.TestCase):
+    def test_extended_error_codes(self):
+        self.assertEqual(rf.classify_sql_error("ORA-00054: resource busy"), rf.FailureType.LOCK_TIMEOUT)
+        self.assertEqual(rf.classify_sql_error("ORA-01017: invalid username/password"), rf.FailureType.AUTH_FAILED)
+        self.assertEqual(rf.classify_sql_error("ORA-12170: TNS:Connect timeout"), rf.FailureType.CONNECTION_TIMEOUT)
+        self.assertEqual(rf.classify_sql_error("ORA-04031: unable to allocate"), rf.FailureType.RESOURCE_EXHAUSTED)
+        self.assertEqual(rf.classify_sql_error("ORA-01555: snapshot too old"), rf.FailureType.SNAPSHOT_ERROR)
+        self.assertEqual(rf.classify_sql_error("ORA-00060: deadlock detected"), rf.FailureType.DEADLOCK)
+
+
 class TestIterativeFixupSummary(unittest.TestCase):
     def test_cumulative_failed_counts_all_rounds(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -255,7 +345,12 @@ class TestIterativeFixupSummary(unittest.TestCase):
                 "user_string": "root@sys",
                 "password": "p",
             }
-            fixup_settings = rf.FixupAutoGrantSettings(enabled=False, types=set(), fallback=False)
+            fixup_settings = rf.FixupAutoGrantSettings(
+                enabled=False,
+                types=set(),
+                fallback=False,
+                cache_limit=0
+            )
 
             rounds = [
                 [(0, f1), (0, f2)],
@@ -287,6 +382,7 @@ class TestIterativeFixupSummary(unittest.TestCase):
                             [],
                             [],
                             fixup_settings,
+                            None,
                             max_rounds=2,
                             min_progress=1
                         )

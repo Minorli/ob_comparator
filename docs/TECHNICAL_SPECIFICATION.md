@@ -162,6 +162,12 @@
 ### 8.4 错误报告
 失败语句汇总到 `fixup_scripts/errors/`，便于集中排查。
 
+### 8.5 安全与保护
+- `fixup_max_sql_file_mb` 限制单个 SQL 文件读取大小，超限脚本会被跳过并记录错误。
+- `fixup_dir_allow_outside_repo=false` 时，run_fixup 不允许 fixup_dir 指向项目外目录。
+- 成功执行脚本移动到 `done/` 时会自动备份同名文件，避免覆盖历史结果。
+- 自动补权限缓存支持 `fixup_auto_grant_cache_limit` 控制，避免长时间运行内存膨胀。
+
 ---
 
 ## 9. 报告体系

@@ -57,6 +57,8 @@
   说明：report_to_db 写入表包含 DIFF_REPORT_SUMMARY / DIFF_REPORT_COUNTS / DIFF_REPORT_DETAIL / DIFF_REPORT_GRANT / DIFF_REPORT_USABILITY / DIFF_REPORT_PACKAGE_COMPARE / DIFF_REPORT_TRIGGER_STATUS。
         缺失/不支持明细不单独建表，使用 DIFF_REPORT_DETAIL 按 report_type + object_type 查询即可。
 - fixup_dir：修补脚本输出目录。默认：fixup_scripts。
+- fixup_dir_allow_outside_repo：是否允许 fixup_dir 指向项目目录外。默认：true。
+- fixup_max_sql_file_mb：run_fixup 单文件最大读取大小（MB）。默认：50；<=0 表示不限制。
 - fixup_force_clean：强制清理 fixup_dir（即使为项目外绝对路径）。默认：true。
   说明：开启后会删除 fixup_dir 下旧脚本；请确保路径配置正确，避免误删。
 - log_dir：运行日志目录。默认：logs。
@@ -149,6 +151,8 @@
   说明：仅对这些对象执行自动补权限；其他对象仍按原流程执行。
 - fixup_auto_grant_fallback：无匹配授权脚本时是否自动生成 GRANT。默认：true。
   说明：关闭后仅使用 grants_miss/grants_all，找不到授权则记录提示并继续执行。
+- fixup_auto_grant_cache_limit：自动补权限缓存大小（条目数）。默认：10000。
+  说明：限制 run_fixup 查询缓存占用，0/负数表示不限制。
 
 同义词与触发器
 - synonym_fixup_scope：同义词修补范围。默认：public_only。
