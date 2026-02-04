@@ -35,6 +35,70 @@
 
 ---
 
+### 🔴 P0-00: 序列迁移缺少 LAST_NUMBER 同步（RESTART WITH）
+
+**位置**: `schema_diff_reconciler.py:10133-10138`, `schema_diff_reconciler.py:8522-8527`
+
+**问题描述**:  
+序列元数据查询未包含 `LAST_NUMBER` 字段，导致迁移后的序列从 `START WITH` 值开始，而非源端当前值。
+
+**现有代码** (Oracle 端查询):
+```python
+sql_seq_tpl = """
+    SELECT SEQUENCE_OWNER, SEQUENCE_NAME,
+           INCREMENT_BY, MIN_VALUE, MAX_VALUE, CYCLE_FLAG, ORDER_FLAG, CACHE_SIZE
+    FROM DBA_SEQUENCES
+    WHERE SEQUENCE_OWNER IN ({owners_clause})
+"""
+```
+
+**缺失字段**: `LAST_NUMBER`（序列的当前值/下一个可用值）
+
+**风险场景**:
+
+| 阶段 | 源端序列 | 迁移后序列 | 结果 |
+|------|----------|------------|------|
+| 迁移前 | LAST_NUMBER = 50000 | - | - |
+| 迁移后 | - | START WITH = 1 | 序列从 1 开始 |
+| 数据写入 | - | NEXTVAL = 1, 2, 3... | **主键冲突！** |
+
+**影响范围**:
+1. **`schema_diff_reconciler.py`** - 序列元数据采集缺失 LAST_NUMBER
+2. **fixup 脚本** - 只生成 CREATE SEQUENCE，无后续 RESTART WITH
+3. **`run_fixup.py`** - 无法感知序列值同步需求
+
+**修复建议**:
+
+1. **修改元数据查询** (schema_diff_reconciler.py):
+```python
+sql_seq_tpl = """
+    SELECT SEQUENCE_OWNER, SEQUENCE_NAME,
+           INCREMENT_BY, MIN_VALUE, MAX_VALUE, CYCLE_FLAG, ORDER_FLAG, CACHE_SIZE,
+           LAST_NUMBER
+    FROM DBA_SEQUENCES
+    WHERE SEQUENCE_OWNER IN ({owners_clause})
+"""
+```
+
+2. **生成 RESTART WITH 脚本**:
+```python
+# 在 CREATE SEQUENCE 之后，生成同步脚本
+# fixup_scripts/sequence_restart/SCHEMA.SEQ_NAME.sql
+restart_ddl = f"ALTER SEQUENCE {tgt_schema}.{tgt_seq} RESTART WITH {last_number};"
+```
+
+3. **执行顺序调整** (run_fixup.py):
+```
+sequence (CREATE) → 数据迁移 → sequence_restart (ALTER RESTART WITH)
+```
+
+**注意事项**:
+- `LAST_NUMBER` 需要在数据迁移完成后再同步，否则可能不准确
+- 对于 CACHE 序列，`LAST_NUMBER` 可能有跳跃，需考虑安全边际
+- 建议采用 `LAST_NUMBER + (CACHE_SIZE * INCREMENT_BY)` 作为安全值
+
+---
+
 ### 🔴 P0-01: subprocess 异常捕获不完整
 
 **位置**: `run_fixup.py:1990-1999`
@@ -613,6 +677,7 @@ def parse_object_from_filename(path: Path) -> Tuple[Optional[str], Optional[str]
 
 | 编号 | 优先级 | 类型 | 位置 | 简述 |
 |------|--------|------|------|------|
+| P0-00 | 🔴 P0 | **功能缺失** | schema_diff_reconciler | **序列迁移缺少 LAST_NUMBER 同步** |
 | P0-01 | 🔴 P0 | 健壮性 | 1990-1999 | subprocess 异常捕获不完整 |
 | P0-02 | 🔴 P0 | 安全性 | 647-657 | 密码明文暴露在命令行 |
 | P0-03 | 🔴 P0 | 数据安全 | 3098-3105 | 文件移动存在覆盖风险 |
@@ -635,6 +700,7 @@ def parse_object_from_filename(path: Path) -> Tuple[Optional[str], Optional[str]
 ## 五、修复优先级建议
 
 ### 第一阶段（必须修复）
+0. **P0-00: 序列 LAST_NUMBER 同步** ⚠️ 最高优先级，涉及数据一致性
 1. P0-01: subprocess 异常捕获
 2. P0-02: 密码安全传递
 3. P0-03: 文件移动安全性
