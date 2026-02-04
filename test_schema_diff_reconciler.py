@@ -4659,6 +4659,49 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(extra_results["constraint_mismatched"], [])
         self.assertIn("TGT.T1", extra_results["constraint_ok"])
 
+    def test_classify_unsupported_check_constraints_self_ref_fk(self):
+        oracle_constraints = {
+            ("SRC", "T1"): {
+                "PK_T1": {
+                    "type": "P",
+                    "columns": ["C1"],
+                },
+                "FK_SELF": {
+                    "type": "R",
+                    "columns": ["C1"],
+                    "r_owner": "SRC",
+                    "r_constraint": "PK_T1",
+                    "ref_table_owner": "SRC",
+                    "ref_table_name": "T1",
+                },
+            }
+        }
+        oracle_meta = self._make_oracle_meta(constraints=oracle_constraints)
+        extra_results = {
+            "constraint_ok": [],
+            "constraint_mismatched": [
+                sdr.ConstraintMismatch(
+                    table="TGT.T1",
+                    missing_constraints={"FK_SELF"},
+                    extra_constraints=set(),
+                    detail_mismatch=[
+                        "FOREIGN KEY: 源约束 FK_SELF 在目标端未找到。"
+                    ],
+                    downgraded_pk_constraints=set()
+                )
+            ]
+        }
+        table_target_map = {("SRC", "T1"): ("TGT", "T1")}
+        rows = sdr.classify_unsupported_check_constraints(
+            extra_results,
+            oracle_meta,
+            table_target_map
+        )
+        reason_codes = {row.reason_code for row in rows}
+        self.assertEqual(reason_codes, {"FK_SELF_REF"})
+        self.assertEqual(extra_results["constraint_mismatched"], [])
+        self.assertIn("TGT.T1", extra_results["constraint_ok"])
+
     def test_build_unsupported_summary_counts_includes_extra(self):
         support_summary = sdr.SupportClassificationResult(
             support_state_map={},

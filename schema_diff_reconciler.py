@@ -7075,6 +7075,12 @@ def classify_unsupported_check_constraints(
     unsupported_rows: List[ConstraintUnsupportedDetail] = []
     updated_mismatches: List[ConstraintMismatch] = []
     ok_tables: Set[str] = set(extra_results.get("constraint_ok", []) or [])
+    ref_lookup: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    for (owner, table), cons_map in (oracle_meta.constraints or {}).items():
+        for cons_name, info in cons_map.items():
+            ctype = (info.get("type") or "").upper()
+            if ctype in ("P", "U"):
+                ref_lookup[(owner.upper(), cons_name.upper())] = (owner.upper(), table.upper())
 
     def _filter_detail_lines(lines: List[str], names: Set[str]) -> List[str]:
         if not lines or not names:
@@ -7104,6 +7110,27 @@ def classify_unsupported_check_constraints(
             ctype = (cons_meta.get("type") or "").upper()
             if ctype == "C" and is_system_notnull_check(cons_name, cons_meta.get("search_condition")):
                 continue
+            if ctype == "R":
+                ref_owner = (cons_meta.get("ref_table_owner") or "").upper()
+                ref_table = (cons_meta.get("ref_table_name") or "").upper()
+                if not ref_owner or not ref_table:
+                    r_owner = (cons_meta.get("r_owner") or "").upper()
+                    r_cons = (cons_meta.get("r_constraint") or "").upper()
+                    if r_owner and r_cons:
+                        ref_pair = ref_lookup.get((r_owner, r_cons))
+                        if ref_pair:
+                            ref_owner, ref_table = ref_pair
+                if ref_owner and ref_table and ref_owner == src_schema and ref_table == src_table:
+                    unsupported_names.add(cons_name)
+                    unsupported_rows.append(ConstraintUnsupportedDetail(
+                        table_full=f"{src_schema}.{src_table}",
+                        constraint_name=cons_name.upper(),
+                        search_condition="-",
+                        reason_code="FK_SELF_REF",
+                        reason="自引用外键，OceanBase 不支持。",
+                        ob_error_hint="ORA-00600(-5317)"
+                    ))
+                    continue
             reason = classify_unsupported_constraint(cons_meta)
             if not reason:
                 continue
@@ -22901,7 +22928,7 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
     if name.startswith("indexes_blocked_detail_"):
         return "DETAIL", "索引依赖阻断明细"
     if name.startswith("constraints_unsupported_detail_"):
-        return "DETAIL", "约束语法不支持明细(DEFERRABLE等)"
+        return "DETAIL", "约束语法不支持明细(DEFERRABLE/自引用外键等)"
     if name.startswith("constraints_blocked_detail_"):
         return "DETAIL", "约束依赖阻断明细"
     if name.startswith("triggers_blocked_detail_"):
@@ -23045,6 +23072,40 @@ def export_unsupported_objects_detail(
         for row in rows_sorted
     ]
     return write_pipe_report("不支持/阻断对象明细", header_fields, data_rows, output_path)
+
+
+def convert_constraint_unsupported_rows(
+    rows: List[ConstraintUnsupportedDetail]
+) -> List[ObjectSupportReportRow]:
+    """
+    将约束不支持明细转换为统一的支持性明细行，用于不支持总表输出。
+    """
+    if not rows:
+        return []
+    converted: List[ObjectSupportReportRow] = []
+    for row in rows:
+        table_full = row.table_full or "-"
+        table_schema, _table_name = parse_full_object_name(table_full) or ("", "")
+        schema_u = (table_schema or "").upper()
+        cons_name = (row.constraint_name or "").upper()
+        if schema_u and cons_name:
+            src_full = f"{schema_u}.{cons_name}"
+        else:
+            src_full = cons_name or table_full
+        reason_code = row.reason_code or "UNSUPPORTED"
+        converted.append(ObjectSupportReportRow(
+            obj_type="CONSTRAINT",
+            src_full=src_full,
+            tgt_full=src_full,
+            support_state=SUPPORT_STATE_UNSUPPORTED,
+            reason_code=reason_code,
+            reason=row.reason or "不支持",
+            dependency=table_full,
+            action="改造/不迁移",
+            detail=row.search_condition or "-",
+            root_cause=f"{src_full}({reason_code})" if reason_code else "-"
+        ))
+    return converted
 
 
 def export_view_constraint_cleaned_detail(
@@ -26047,6 +26108,10 @@ def print_final_report(
     extra_blocked_counts = dict(support_summary.extra_blocked_counts) if support_summary else {}
     view_constraint_cleaned_rows = list(support_summary.view_constraint_cleaned_rows) if support_summary else []
     view_constraint_uncleanable_rows = list(support_summary.view_constraint_uncleanable_rows) if support_summary else []
+    extra_constraint_unsupported = list(extra_results.get("constraint_unsupported") or [])
+    unsupported_detail_rows = list(unsupported_rows)
+    if extra_constraint_unsupported:
+        unsupported_detail_rows.extend(convert_constraint_unsupported_rows(extra_constraint_unsupported))
     unsupported_summary_counts = build_unsupported_summary_counts(support_summary, extra_results)
     blocked_index_rows = _filter_blocked_support_rows(unsupported_rows, "INDEX") if unsupported_rows else []
     blocked_constraint_rows = _filter_blocked_support_rows(unsupported_rows, "CONSTRAINT") if unsupported_rows else []
@@ -26427,7 +26492,7 @@ def print_final_report(
         if extra_results.get("constraint_unsupported"):
             suffix = f"_{report_ts}" if report_ts else ""
             detail_hint_lines.append(
-                f"约束语法不支持明细(DEFERRABLE等): constraints_unsupported_detail{suffix}.txt"
+                f"约束语法不支持明细(DEFERRABLE/自引用外键等): constraints_unsupported_detail{suffix}.txt"
             )
         if view_constraint_cleaned_rows:
             suffix = f"_{report_ts}" if report_ts else ""
@@ -26985,7 +27050,7 @@ def print_final_report(
                 report_ts
             )
             unsupported_detail_path = export_unsupported_objects_detail(
-                unsupported_rows,
+                unsupported_detail_rows,
                 report_path.parent,
                 report_ts
             )
@@ -27025,7 +27090,7 @@ def print_final_report(
         _add_index_entry(
             "DETAIL",
             unsupported_detail_path,
-            len(unsupported_rows or []),
+            len(unsupported_detail_rows or []),
             "不支持/阻断对象明细"
         )
         _add_index_entry(
@@ -27093,7 +27158,7 @@ def print_final_report(
             "DETAIL",
             constraint_unsupported_path,
             len(extra_results.get("constraint_unsupported", []) or []),
-            "约束语法不支持明细(DEFERRABLE等)"
+            "约束语法不支持明细(DEFERRABLE/自引用外键等)"
         )
         blocked_index_path = None
         blocked_constraint_path = None
