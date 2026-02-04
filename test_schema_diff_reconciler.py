@@ -2414,6 +2414,14 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertFalse(sampled)
         self.assertEqual(sample_cnt, 2000)
 
+    def test_build_usability_query_public_synonym(self):
+        sql_public = sdr._build_usability_query("PUBLIC.SYN_TEST", "SYNONYM")
+        self.assertEqual(sql_public, 'SELECT * FROM "SYN_TEST" WHERE 1=2')
+        sql_private = sdr._build_usability_query("OMS_USER.SYN_TEST", "SYNONYM")
+        self.assertEqual(sql_private, 'SELECT * FROM "OMS_USER"."SYN_TEST" WHERE 1=2')
+        sql_view = sdr._build_usability_query("OMS_USER.V1", "VIEW")
+        self.assertEqual(sql_view, 'SELECT * FROM "OMS_USER"."V1" WHERE 1=2')
+
     def test_dump_ob_metadata_infers_char_used_from_lengths(self):
         def fake_run(_cfg, sql):
             if "NLS_LENGTH_SEMANTICS" in sql.upper():

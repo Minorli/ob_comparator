@@ -14378,11 +14378,16 @@ def analyze_usability_error(error_msg: str) -> Tuple[str, str]:
     return "未知错误", "查看错误信息并人工定位"
 
 
-def _build_usability_query(full_name: str) -> Optional[str]:
+def _build_usability_query(full_name: str, obj_type: Optional[str] = None) -> Optional[str]:
     parsed = parse_full_object_name(full_name)
     if not parsed:
         return None
     schema, obj = parsed
+    obj_type_u = (obj_type or "").upper()
+    schema_u = (schema or "").upper()
+    # PUBLIC 同义词在 Oracle/OB 中都不支持 schema 形式引用，需使用非限定名
+    if obj_type_u == "SYNONYM" and schema_u == "PUBLIC":
+        return f"SELECT * FROM {quote_identifier(obj)} WHERE 1=2"
     return f"SELECT * FROM {quote_qualified_parts(schema, obj)} WHERE 1=2"
 
 
@@ -14594,8 +14599,8 @@ def check_object_usability(
             oracle_local.conn = conn
         return conn
 
-    def _oracle_check(full_name: str) -> Tuple[Optional[bool], str, int, bool]:
-        sql = _build_usability_query(full_name)
+    def _oracle_check(full_name: str, obj_type: str) -> Tuple[Optional[bool], str, int, bool]:
+        sql = _build_usability_query(full_name, obj_type)
         if not sql:
             return None, "INVALID_NAME", 0, False
         start = time.perf_counter()
@@ -14612,8 +14617,8 @@ def check_object_usability(
             timeout_hit = any(token in msg.upper() for token in ("DPY-4011", "ORA-01013", "TIMEOUT"))
             return False, msg, int((time.perf_counter() - start) * 1000), timeout_hit
 
-    def _ob_check(full_name: str) -> Tuple[Optional[bool], str, int, bool]:
-        sql = _build_usability_query(full_name)
+    def _ob_check(full_name: str, obj_type: str) -> Tuple[Optional[bool], str, int, bool]:
+        sql = _build_usability_query(full_name, obj_type)
         if not sql:
             return None, "INVALID_NAME", 0, False
         start = time.perf_counter()
@@ -14652,13 +14657,13 @@ def check_object_usability(
                 tgt_time_ms=0
             )
 
-        tgt_usable, tgt_err, tgt_ms, tgt_timeout = _ob_check(tgt_full)
+        tgt_usable, tgt_err, tgt_ms, tgt_timeout = _ob_check(tgt_full, obj_type_u)
         src_usable = None
         src_err = "-"
         src_ms = 0
         src_timeout = False
         if check_source:
-            src_usable, src_err, src_ms, src_timeout = _oracle_check(src_full)
+            src_usable, src_err, src_ms, src_timeout = _oracle_check(src_full, obj_type_u)
 
         timeout_hit = tgt_timeout or src_timeout
         status = classify_usability_status(check_source, src_usable, tgt_usable, timeout_hit)
