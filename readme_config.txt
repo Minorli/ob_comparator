@@ -41,7 +41,7 @@
 - report_detail_mode：报告内容模式。默认：split。
   可选值：full（主报告包含全部明细）、split（主报告仅概要，细节拆分为 *_detail_*.txt）、summary（仅概要，不生成细节文件）。
   说明：split 模式下的明细文件采用 `|` 分隔并包含 `# total/# 字段说明` 头，格式与 package_compare 相同，便于 Excel 直接分隔导入。
-  说明：若存在不支持的 CHECK 约束，会额外输出 constraints_unsupported_detail_<timestamp>.txt（不受 report_detail_mode 影响）。
+  说明：若存在不支持的约束（如 DEFERRABLE / CHECK SYS_CONTEXT / 自引用外键），会额外输出 constraints_unsupported_detail_<timestamp>.txt（不受 report_detail_mode 影响）。
 - report_to_db：是否将报告存储到 OceanBase（obclient 方式）。默认：true。
   说明：开启后仍会保留本地文本报告，写库失败时是否中断由 report_db_fail_abort 控制。
 - report_db_schema：报告存库 schema。默认：空（使用 OCEANBASE_TARGET 连接用户）。

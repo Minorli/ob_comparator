@@ -95,6 +95,7 @@
 - PK/UK/FK 按列序列匹配
 - 忽略 `_OBNOTNULL_` 约束
 - FK 额外比对 `DELETE_RULE` / `UPDATE_RULE`
+- 自引用外键（FK 引用自身表）视为不支持，输出到约束不支持明细
 
 ### 5.6 SEQUENCE
 - 按 schema 映射比较集合
