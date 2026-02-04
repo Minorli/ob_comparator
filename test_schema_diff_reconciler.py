@@ -2422,6 +2422,14 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         sql_view = sdr._build_usability_query("OMS_USER.V1", "VIEW")
         self.assertEqual(sql_view, 'SELECT * FROM "OMS_USER"."V1" WHERE 1=2')
 
+    def test_pick_dependency_issue_missing_target(self):
+        deps = [("SRC.T1", "TABLE")]
+        full_mapping = {"SRC.T1": {"TABLE": "TGT.T1"}}
+        missing_targets = {("TABLE", "TGT.T1")}
+        issue = sdr._pick_dependency_issue(deps, full_mapping, {}, missing_targets)
+        self.assertIsNotNone(issue)
+        self.assertIn("依赖对象缺失", issue[0])
+
     def test_dump_ob_metadata_infers_char_used_from_lengths(self):
         def fake_run(_cfg, sql):
             if "NLS_LENGTH_SEMANTICS" in sql.upper():

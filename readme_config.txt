@@ -88,6 +88,8 @@
   说明：仅在启用时比较列顺序，自动过滤 OMS/自动列/SYS_NC 等噪声列。
 - check_object_usability：是否校验 VIEW/SYNONYM 可用性。默认：false。
   说明：通过 `SELECT * FROM <obj> WHERE 1=2` 验证对象能否解析/查询；不会返回数据。
+  说明：可用性明细会结合依赖/不支持分类输出更精准根因（如依赖缺失、权限不足、同义词指向对象）。
+  说明：被标记为不支持/阻断的对象会以 SKIPPED 记录入明细，并写明阻断原因。
 - check_source_usability：是否同时校验源端可用性。默认：true。
   说明：用于判定“目标端不可用是否为预期行为”（源端也不可用）。
 - usability_check_timeout：可用性校验单对象超时（秒）。默认：10。

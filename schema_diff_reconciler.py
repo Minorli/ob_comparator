@@ -7538,6 +7538,21 @@ def obclient_run_sql(ob_cfg: ObConfig, sql_query: str, timeout: Optional[int] = 
         '-ss',  # Silent 模式
     ]
 
+    def _extract_obclient_error(text: str) -> str:
+        if not text:
+            return ""
+        for line in text.splitlines():
+            line_clean = line.strip()
+            if not line_clean:
+                continue
+            if re.search(r"^(warning|警告)\b", line_clean, flags=re.IGNORECASE):
+                continue
+            if re.search(r"(ORA-\d{5}|OB-\d+)", line_clean, flags=re.IGNORECASE):
+                return line_clean
+            if re.search(r"^ERROR(\s+\d+|\b)", line_clean, flags=re.IGNORECASE):
+                return line_clean
+        return ""
+
     try:
         result = subprocess.run(
             command_args,
@@ -7549,18 +7564,23 @@ def obclient_run_sql(ob_cfg: ObConfig, sql_query: str, timeout: Optional[int] = 
             timeout=timeout_val
         )
 
+        stdout_clean = (result.stdout or "").strip()
+        stderr_clean = (result.stderr or "").strip()
+
         if result.returncode != 0:
             log.error(f"  [OBClient 错误] SQL: {sql_query.strip()} | 错误: {result.stderr.strip()}")
             return False, "", result.stderr.strip()
-        if result.stderr:
-            stderr_clean = result.stderr.strip()
-            if stderr_clean:
-                if re.search(r"warning|警告", stderr_clean, flags=re.IGNORECASE):
-                    log.debug("  [OBClient 警告] SQL: %s | 警告: %s", sql_query.strip(), stderr_clean)
-                else:
-                    log.warning("  [OBClient STDERR] SQL: %s | 输出: %s", sql_query.strip(), stderr_clean)
+        err_line = _extract_obclient_error(stderr_clean) or _extract_obclient_error(stdout_clean)
+        if err_line:
+            log.error("  [OBClient 错误] SQL: %s | 错误: %s", sql_query.strip(), err_line)
+            return False, stdout_clean, err_line
+        if stderr_clean:
+            if re.search(r"warning|警告", stderr_clean, flags=re.IGNORECASE):
+                log.debug("  [OBClient 警告] SQL: %s | 警告: %s", sql_query.strip(), stderr_clean)
+            else:
+                log.warning("  [OBClient STDERR] SQL: %s | 输出: %s", sql_query.strip(), stderr_clean)
 
-        return True, result.stdout.strip(), ""
+        return True, stdout_clean, ""
 
     except subprocess.TimeoutExpired:
         log.error(f"严重错误: obclient 执行超时 (>{OBC_TIMEOUT} 秒)。请检查网络/OB 状态或调大 obclient_timeout。")
@@ -7572,6 +7592,23 @@ def obclient_run_sql(ob_cfg: ObConfig, sql_query: str, timeout: Optional[int] = 
     except Exception as e:
         log.error(f"严重错误: 执行 subprocess 时发生未知错误: {e}")
         return False, "", str(e)
+
+
+def obclient_run_sql_commit(
+    ob_cfg: ObConfig,
+    sql_query: str,
+    timeout: Optional[int] = None
+) -> Tuple[bool, str, str]:
+    """
+    执行 DML 后显式 COMMIT（用于 report_db 写库等场景）。
+    """
+    if not sql_query:
+        return False, "", "Empty SQL"
+    sql_payload = sql_query.strip()
+    if not sql_payload.endswith(";"):
+        sql_payload += ";"
+    sql_payload += "\nCOMMIT;"
+    return obclient_run_sql(ob_cfg, sql_payload, timeout=timeout)
 
 
 def obclient_query_by_owner_chunks(
@@ -14368,7 +14405,7 @@ def analyze_usability_error(error_msg: str) -> Tuple[str, str]:
     if "ORA-01031" in msg_upper:
         return "权限不足", "授予查询权限或执行 grant 修补脚本"
     if "ORA-04063" in msg_upper:
-        return "视图编译错误", "重新编译视图或修复依赖对象"
+        return "视图查询报错", "检查视图依赖对象或重新编译视图"
     if "TIMEOUT" in msg_upper or "DPY-4011" in msg_upper or "ORA-01013" in msg_upper:
         return "查询超时", "可增加超时或人工验证"
     if "ORA-00600" in msg_upper:
@@ -14376,6 +14413,136 @@ def analyze_usability_error(error_msg: str) -> Tuple[str, str]:
     if "ORA-00900" in msg_upper:
         return "SQL 语法错误", "检查 DDL 兼容性或清洗规则"
     return "未知错误", "查看错误信息并人工定位"
+
+
+def _lookup_support_row(
+    support_state_map: Optional[Dict[Tuple[str, str], ObjectSupportReportRow]],
+    obj_type: str,
+    src_full: str
+) -> Optional[ObjectSupportReportRow]:
+    if not support_state_map:
+        return None
+    obj_type_u = (obj_type or "").upper()
+    src_key = (src_full or "").upper()
+    return support_state_map.get((obj_type_u, src_key))
+
+
+def _format_support_row_reason(row: ObjectSupportReportRow) -> Tuple[str, str]:
+    parts: List[str] = []
+    if row.reason_code and row.reason_code != "-":
+        parts.append(row.reason_code)
+    if row.reason and row.reason != "-":
+        parts.append(row.reason)
+    if row.dependency and row.dependency != "-":
+        parts.append(f"依赖:{row.dependency}")
+    if row.detail and row.detail != "-":
+        parts.append(f"detail:{row.detail}")
+    if row.root_cause and row.root_cause != "-":
+        parts.append(f"root:{row.root_cause}")
+    root_cause = " ; ".join(parts) if parts else "对象不支持/阻断"
+
+    rec_parts: List[str] = []
+    if row.action and row.action != "-":
+        rec_parts.append(row.action)
+    if row.reason and row.reason != "-":
+        rec_parts.append(row.reason)
+    if row.dependency and row.dependency != "-":
+        rec_parts.append(f"依赖:{row.dependency}")
+    recommendation = " ; ".join(rec_parts) if rec_parts else "-"
+    return root_cause, recommendation
+
+
+def _infer_ref_types_from_source(
+    source_objects: Optional[SourceObjectMap],
+    ref_full: str
+) -> Set[str]:
+    if not source_objects or not ref_full:
+        return set()
+    return {t.upper() for t in (source_objects.get(ref_full.upper()) or set())}
+
+
+def _collect_usability_dependencies(
+    obj_type_u: str,
+    src_full: str,
+    dependency_graph: Optional[DependencyGraph],
+    synonym_meta_map: Optional[Dict[Tuple[str, str], SynonymMeta]],
+    source_objects: Optional[SourceObjectMap]
+) -> List[Tuple[str, str]]:
+    obj_type_u = (obj_type_u or "").upper()
+    src_full_u = (src_full or "").upper()
+    deps: List[Tuple[str, str]] = []
+    if obj_type_u == "VIEW" and dependency_graph:
+        for ref_full, ref_type in sorted(dependency_graph.get((src_full_u, "VIEW"), set())):
+            if ref_full:
+                deps.append((ref_full.upper(), (ref_type or "").upper()))
+        return deps
+    if obj_type_u == "SYNONYM" and synonym_meta_map:
+        parsed = parse_full_object_name(src_full_u)
+        if parsed:
+            meta = synonym_meta_map.get((parsed[0].upper(), parsed[1].upper()))
+            if meta and meta.table_owner and meta.table_name:
+                ref_full = f"{meta.table_owner.upper()}.{meta.table_name.upper()}"
+                ref_types = _infer_ref_types_from_source(source_objects, ref_full)
+                if ref_types:
+                    for ref_type in sorted(ref_types):
+                        deps.append((ref_full, ref_type))
+                else:
+                    deps.append((ref_full, ""))
+        return deps
+    return deps
+
+
+def _resolve_dependency_target(
+    ref_full: str,
+    ref_type: str,
+    full_object_mapping: Optional[FullObjectMapping]
+) -> Optional[str]:
+    if not ref_full or not full_object_mapping:
+        return None
+    if ref_type:
+        return get_mapped_target(full_object_mapping, ref_full, ref_type)
+    return find_mapped_target_any_type(
+        full_object_mapping,
+        ref_full,
+        ("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM", "SEQUENCE", "PACKAGE", "FUNCTION", "PROCEDURE", "TYPE")
+    )
+
+
+def _pick_dependency_issue(
+    deps: List[Tuple[str, str]],
+    full_object_mapping: Optional[FullObjectMapping],
+    support_state_map: Optional[Dict[Tuple[str, str], ObjectSupportReportRow]],
+    missing_targets: Set[Tuple[str, str]]
+) -> Optional[Tuple[str, str]]:
+    if not deps:
+        return None
+    for ref_full, ref_type in deps:
+        support_row = None
+        if support_state_map:
+            if ref_type:
+                support_row = support_state_map.get((ref_type, ref_full))
+            else:
+                for cand_type in ("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM"):
+                    support_row = support_state_map.get((cand_type, ref_full))
+                    if support_row:
+                        break
+        if support_row and support_row.support_state != SUPPORT_STATE_SUPPORTED:
+            root_cause, recommendation = _format_support_row_reason(support_row)
+            return (f"依赖对象不支持/阻断: {ref_full} ; {root_cause}", recommendation)
+
+        mapped = _resolve_dependency_target(ref_full, ref_type, full_object_mapping)
+        mapped_u = mapped.upper() if mapped else ""
+        if mapped_u:
+            if ref_type:
+                if (ref_type, mapped_u) in missing_targets:
+                    return (f"依赖对象缺失: {mapped_u}", "先修补依赖对象后再校验")
+            else:
+                for cand_type in ("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM"):
+                    if (cand_type, mapped_u) in missing_targets:
+                        return (f"依赖对象缺失: {mapped_u}", "先修补依赖对象后再校验")
+        else:
+            return (f"依赖对象未纳入受管范围: {ref_full}", "补充 remap 或纳入范围后再校验")
+    return None
 
 
 def _build_usability_query(full_name: str, obj_type: Optional[str] = None) -> Optional[str]:
@@ -14416,7 +14583,11 @@ def check_object_usability(
     ora_cfg: OraConfig,
     ob_meta: ObMetadata,
     enabled_primary_types: Set[str],
-    support_summary: Optional[SupportClassificationResult] = None
+    support_summary: Optional[SupportClassificationResult] = None,
+    dependency_graph: Optional[DependencyGraph] = None,
+    source_objects: Optional[SourceObjectMap] = None,
+    full_object_mapping: Optional[FullObjectMapping] = None,
+    synonym_meta_map: Optional[Dict[Tuple[str, str], SynonymMeta]] = None
 ) -> Optional[UsabilitySummary]:
     if not settings:
         return None
@@ -14456,8 +14627,10 @@ def check_object_usability(
         (obj_type.upper(), tgt_full.upper())
         for obj_type, _src_full, tgt_full in (tv_results.get("missing") or [])
     }
-    unsupported_map = support_summary.support_state_map if support_summary else {}
+    support_state_map = support_summary.support_state_map if support_summary else {}
     unsupported_views = support_summary.unsupported_view_keys if support_summary else set()
+    source_objects = source_objects or {}
+    synonym_meta_map = synonym_meta_map or {}
 
     candidates: List[Tuple[str, str, str]] = []
     results: List[UsabilityCheckResult] = []
@@ -14491,6 +14664,30 @@ def check_object_usability(
         tgt_schema, tgt_obj = tgt_parsed
         tgt_key = f"{tgt_schema}.{tgt_obj}"
         if (obj_type_u, tgt_key) in missing_targets:
+            support_row = _lookup_support_row(
+                support_state_map,
+                obj_type_u,
+                f"{src_schema}.{src_obj}"
+            )
+            if support_row and support_row.support_state != SUPPORT_STATE_SUPPORTED:
+                root_cause, recommendation = _format_support_row_reason(support_row)
+                results.append(UsabilityCheckResult(
+                    schema=tgt_schema,
+                    object_name=tgt_obj,
+                    object_type=obj_type_u,
+                    src_exists=True,
+                    src_usable=None,
+                    tgt_exists=False,
+                    tgt_usable=None,
+                    status=USABILITY_STATUS_SKIPPED,
+                    src_error="-",
+                    tgt_error="-",
+                    root_cause=root_cause,
+                    recommendation=recommendation,
+                    src_time_ms=0,
+                    tgt_time_ms=0
+                ))
+                continue
             results.append(UsabilityCheckResult(
                 schema=tgt_schema,
                 object_name=tgt_obj,
@@ -14509,6 +14706,15 @@ def check_object_usability(
             ))
             continue
         if obj_type_u == "VIEW" and (src_schema.upper(), src_obj.upper()) in unsupported_views:
+            support_row = _lookup_support_row(
+                support_state_map,
+                obj_type_u,
+                f"{src_schema}.{src_obj}"
+            )
+            if support_row and support_row.support_state != SUPPORT_STATE_SUPPORTED:
+                root_cause, recommendation = _format_support_row_reason(support_row)
+            else:
+                root_cause, recommendation = "视图被标记为不支持/需改造", "先处理视图兼容性问题"
             results.append(UsabilityCheckResult(
                 schema=tgt_schema,
                 object_name=tgt_obj,
@@ -14520,15 +14726,20 @@ def check_object_usability(
                 status=USABILITY_STATUS_SKIPPED,
                 src_error="-",
                 tgt_error="-",
-                root_cause="视图被标记为不支持/需改造",
-                recommendation="先处理视图兼容性问题",
+                root_cause=root_cause,
+                recommendation=recommendation,
                 src_time_ms=0,
                 tgt_time_ms=0
             ))
             continue
-        if unsupported_map:
-            support_row = unsupported_map.get((src_full, obj_type_u))
+        if support_state_map:
+            support_row = _lookup_support_row(
+                support_state_map,
+                obj_type_u,
+                f"{src_schema}.{src_obj}"
+            )
             if support_row and support_row.support_state != SUPPORT_STATE_SUPPORTED:
+                root_cause, recommendation = _format_support_row_reason(support_row)
                 results.append(UsabilityCheckResult(
                     schema=tgt_schema,
                     object_name=tgt_obj,
@@ -14540,8 +14751,8 @@ def check_object_usability(
                     status=USABILITY_STATUS_SKIPPED,
                     src_error="-",
                     tgt_error="-",
-                    root_cause="对象被标记为不支持/阻断",
-                    recommendation="先处理不支持原因再校验可用性",
+                    root_cause=root_cause,
+                    recommendation=recommendation,
                     src_time_ms=0,
                     tgt_time_ms=0
                 ))
@@ -14674,6 +14885,44 @@ def check_object_usability(
         else:
             err_msg = tgt_err if tgt_usable is False else src_err if src_usable is False else ""
             root_cause, recommendation = analyze_usability_error(err_msg)
+            deps = _collect_usability_dependencies(
+                obj_type_u,
+                src_full,
+                dependency_graph,
+                synonym_meta_map,
+                source_objects
+            )
+            issue = _pick_dependency_issue(
+                deps,
+                full_object_mapping,
+                support_state_map,
+                missing_targets
+            )
+            msg_upper = normalize_error_text(err_msg).upper() if err_msg else ""
+            if issue:
+                root_cause, recommendation = issue
+            elif "ORA-01031" in msg_upper and deps:
+                dep_targets: List[str] = []
+                for ref_full, ref_type in deps[:5]:
+                    mapped = _resolve_dependency_target(ref_full, ref_type, full_object_mapping)
+                    dep_targets.append(mapped or ref_full)
+                if dep_targets:
+                    uniq_targets = sorted({t.upper() for t in dep_targets if t})
+                    privs: Set[str] = set()
+                    for _ref_full, ref_type in deps[:5]:
+                        privs.add(GRANT_PRIVILEGE_BY_TYPE.get(ref_type or "TABLE", "SELECT"))
+                    priv_list = ",".join(sorted(privs)) if privs else "SELECT"
+                    root_cause = f"权限不足: 依赖对象 {','.join(uniq_targets[:5])}"
+                    recommendation = f"为 {tgt_schema.upper()} 授予 {priv_list} 权限 (对象: {','.join(uniq_targets[:5])})"
+            elif obj_type_u == "SYNONYM" and deps:
+                ref_full, ref_type = deps[0]
+                mapped = _resolve_dependency_target(ref_full, ref_type, full_object_mapping) or ref_full
+                root_cause = f"{root_cause}; 同义词指向 {mapped}"
+                if "ORA-00980" in msg_upper:
+                    recommendation = f"{recommendation}; 检查并重建同义词指向 {mapped}"
+            elif deps:
+                dep_list = ", ".join(ref_full for ref_full, _ in deps[:3])
+                root_cause = f"{root_cause}; 依赖:{dep_list}"
 
         return UsabilityCheckResult(
             schema=tgt_schema,
@@ -25161,7 +25410,7 @@ def _insert_report_detail_rows(
         insert_sql = _build_report_detail_insert_all(schema_prefix, report_id, batch)
         if not insert_sql:
             continue
-        ok, _out, err = obclient_run_sql(ob_cfg, insert_sql)
+        ok, _out, err = obclient_run_sql_commit(ob_cfg, insert_sql)
         if not ok:
             log.warning("[REPORT_DB] INSERT ALL 失败，回退单行插入: %s", err)
             ok_all = False
@@ -25169,7 +25418,7 @@ def _insert_report_detail_rows(
                 insert_sql = _build_report_detail_insert_all(schema_prefix, report_id, [row])
                 if not insert_sql:
                     continue
-                ok_single, _o, err_single = obclient_run_sql(ob_cfg, insert_sql)
+                ok_single, _o, err_single = obclient_run_sql_commit(ob_cfg, insert_sql)
                 if not ok_single:
                     ok_all = False
                     log.warning("[REPORT_DB] 单行写入失败: %s", err_single)
@@ -25204,7 +25453,7 @@ def _insert_report_usability_rows(
                 )
             )
         insert_sql = "INSERT ALL\n  " + "\n  ".join(values_sql) + "\nSELECT 1 FROM DUAL"
-        ok, _out, err = obclient_run_sql(ob_cfg, insert_sql)
+        ok, _out, err = obclient_run_sql_commit(ob_cfg, insert_sql)
         if not ok:
             ok_all = False
             log.warning("[REPORT_DB] 写入 usability 失败: %s", err)
@@ -25246,7 +25495,7 @@ def _insert_report_package_compare_rows(
                 )
             )
         insert_sql = "INSERT ALL\n  " + "\n  ".join(values_sql) + "\nSELECT 1 FROM DUAL"
-        ok, _out, err = obclient_run_sql(ob_cfg, insert_sql)
+        ok, _out, err = obclient_run_sql_commit(ob_cfg, insert_sql)
         if not ok:
             ok_all = False
             log.warning("[REPORT_DB] 写入 package_compare 失败: %s", err)
@@ -25286,7 +25535,7 @@ def _insert_report_trigger_status_rows(
                 )
             )
         insert_sql = "INSERT ALL\n  " + "\n  ".join(values_sql) + "\nSELECT 1 FROM DUAL"
-        ok, _out, err = obclient_run_sql(ob_cfg, insert_sql)
+        ok, _out, err = obclient_run_sql_commit(ob_cfg, insert_sql)
         if not ok:
             ok_all = False
             log.warning("[REPORT_DB] 写入 trigger_status 失败: %s", err)
@@ -25390,7 +25639,7 @@ def _insert_report_grant_rows(
                 )
             )
         insert_sql = "INSERT ALL\n  " + "\n  ".join(values_sql) + "\nSELECT 1 FROM DUAL"
-        ok, _out, err = obclient_run_sql(ob_cfg, insert_sql)
+        ok, _out, err = obclient_run_sql_commit(ob_cfg, insert_sql)
         if not ok:
             ok_all = False
             log.warning("[REPORT_DB] GRANT 批量写入失败: %s", err)
@@ -25451,7 +25700,7 @@ def _insert_report_counts_rows(
                 )
             )
         insert_sql = "INSERT ALL\n  " + "\n  ".join(values_sql) + "\nSELECT 1 FROM DUAL"
-        ok, _out, err = obclient_run_sql(ob_cfg, insert_sql)
+        ok, _out, err = obclient_run_sql_commit(ob_cfg, insert_sql)
         if not ok:
             ok_all = False
             log.warning("[REPORT_DB] COUNT 批量写入失败: %s", err)
@@ -25587,7 +25836,7 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
 )
 """
 
-    ok, _out, err = obclient_run_sql(ob_cfg, insert_sql)
+    ok, _out, err = obclient_run_sql_commit(ob_cfg, insert_sql)
     if not ok:
         log.error("[REPORT_DB] 写入主报告失败: %s", err)
         if settings.get("report_db_fail_abort"):
@@ -25619,7 +25868,7 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
             f"DELETE FROM {schema_prefix}{REPORT_DB_TABLES['summary']} "
             f"WHERE RUN_TIMESTAMP < SYSTIMESTAMP - INTERVAL '{retention_days}' DAY"
         )
-        obclient_run_sql(ob_cfg, delete_sql)
+        obclient_run_sql_commit(ob_cfg, delete_sql)
 
     log.info("[REPORT_DB] 报告已写入数据库: report_id=%s", report_id)
     return True, report_id
@@ -28143,7 +28392,11 @@ def main():
                 ora_cfg,
                 ob_meta,
                 enabled_primary_types,
-                support_summary=support_summary
+                support_summary=support_summary,
+                dependency_graph=dependency_graph,
+                source_objects=source_objects,
+                full_object_mapping=full_object_mapping,
+                synonym_meta_map=synonym_meta
             )
 
     extra_results_for_report = filter_trigger_results_for_unsupported_tables(
