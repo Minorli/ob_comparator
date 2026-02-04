@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import getpass
 import logging
 import re
 import subprocess
@@ -134,6 +135,47 @@ def build_obclient_command(ob_cfg: Dict[str, str]) -> List[str]:
         "--prompt", "init>",
         "--silent",
     ]
+
+
+def parse_source_schemas(raw_value: str) -> Set[str]:
+    if not raw_value:
+        return set()
+    tokens = re.split(r"[,\s]+", raw_value.strip())
+    return {token.strip().upper() for token in tokens if token.strip()}
+
+
+def read_source_schemas_from_config(path: Path) -> Set[str]:
+    parser = configparser.ConfigParser(interpolation=None)
+    if not parser.read(path):
+        raise ValueError(f"source config not found or unreadable: {path}")
+    if "SETTINGS" not in parser:
+        return set()
+    raw = parser.get("SETTINGS", "source_schemas", fallback="")
+    return parse_source_schemas(raw)
+
+
+def filter_role_grants_for_users(
+    role_grants: Sequence[Tuple[str, str, str]],
+    user_set: Set[str],
+) -> Tuple[List[Tuple[str, str, str]], Set[str]]:
+    required_grantees: Set[str] = set(user_set)
+    filtered: List[Tuple[str, str, str]] = []
+    seen: Set[Tuple[str, str, str]] = set()
+    changed = True
+    while changed:
+        changed = False
+        for grantee_u, role_u, admin_option in role_grants:
+            key = (grantee_u, role_u, admin_option)
+            if key in seen:
+                continue
+            if grantee_u not in required_grantees:
+                continue
+            filtered.append((grantee_u, role_u, admin_option))
+            seen.add(key)
+            if role_u not in required_grantees:
+                required_grantees.add(role_u)
+                changed = True
+    return filtered, required_grantees
 
 
 def run_sql(
@@ -466,6 +508,12 @@ def execute_statements(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Initialize users and roles in OceanBase.")
     parser.add_argument("config", nargs="?", default=CONFIG_DEFAULT_PATH, help="config.ini path")
+    parser.add_argument(
+        "-s",
+        "--source-config",
+        default="",
+        help="override source_schemas from another config file",
+    )
     parser.add_argument("--output-dir", default="", help="override output directory")
     args = parser.parse_args()
 
@@ -480,6 +528,19 @@ def main() -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+
+    source_schema_filter: Set[str] = set()
+    if args.source_config:
+        source_cfg_path = Path(args.source_config).expanduser()
+        try:
+            source_schema_filter = read_source_schemas_from_config(source_cfg_path)
+        except ValueError as exc:
+            log.error("%s", exc)
+            return 1
+        if not source_schema_filter:
+            log.error("source_config 未包含有效的 source_schemas。")
+            return 1
+        log.info("仅处理 source_schemas: %s", ",".join(sorted(source_schema_filter)))
 
     log_level = (settings.get("log_level") or "INFO").strip().upper()
     init_console_logging(getattr(logging, log_level, logging.INFO))
@@ -506,7 +567,14 @@ def main() -> int:
         log.error("obclient executable not found: %s", ob_executable)
         return 1
 
-    password_literal = format_password("Ob@sx2025")
+    if not sys.stdin.isatty():
+        log.error("非交互环境无法读取新用户密码，请在交互终端运行。")
+        return 1
+    user_password = getpass.getpass("请输入要为新创建用户设置的密码: ")
+    if not user_password:
+        log.error("用户密码不能为空。")
+        return 1
+    password_literal = format_password(user_password)
 
     try:
         with oracledb.connect(
@@ -535,17 +603,41 @@ def main() -> int:
             allowed_grantees = set(users_map) | set(roles_map)
             allowed_roles = set(roles_map)
 
-            role_grants = fetch_oracle_role_grants(
+            role_grants_all = fetch_oracle_role_grants(
                 conn,
                 allowed_grantees=allowed_grantees,
                 allowed_roles=allowed_roles,
                 use_maintained_filter=use_maintained_filter,
             )
-            sys_privs = fetch_oracle_sys_privs(
+            sys_privs_all = fetch_oracle_sys_privs(
                 conn,
                 allowed_grantees=allowed_grantees,
                 use_maintained_filter=use_maintained_filter,
             )
+
+            if source_schema_filter:
+                missing_users = sorted(source_schema_filter - set(users_map))
+                if missing_users:
+                    log.warning("source_schemas 中以下用户未在源库找到: %s", ", ".join(missing_users))
+                users = [name for name in users if name.upper() in source_schema_filter]
+                if not users:
+                    log.error("source_schemas 中的用户在源库均不存在，无法继续。")
+                    return 1
+                users_map = {name.upper(): name for name in users}
+                role_grants, required_grantees = filter_role_grants_for_users(
+                    role_grants_all,
+                    set(users_map),
+                )
+                roles_needed = {name for name in required_grantees if name not in users_map}
+                roles = [name for name in roles if name.upper() in roles_needed]
+                roles_map = {name.upper(): name for name in roles}
+                sys_privs = [
+                    entry for entry in sys_privs_all
+                    if entry[0].upper() in required_grantees
+                ]
+            else:
+                role_grants = role_grants_all
+                sys_privs = sys_privs_all
     except oracledb.Error as exc:
         log.error("Oracle connection/query failed: %s", exc)
         return 1
