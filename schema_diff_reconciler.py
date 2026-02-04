@@ -2961,6 +2961,8 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
 
         # fixup 脚本目录
         settings.setdefault('fixup_dir', 'fixup_scripts')
+        settings.setdefault('fixup_dir_allow_outside_repo', 'true')
+        settings.setdefault('fixup_max_sql_file_mb', '50')
         settings.setdefault('fixup_force_clean', 'true')
         settings.setdefault('fixup_drop_sys_c_columns', 'false')
         # obclient 超时时间 (秒)
@@ -2999,6 +3001,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             ",".join(FIXUP_AUTO_GRANT_DEFAULT_TYPES_ORDERED)
         )
         settings.setdefault('fixup_auto_grant_fallback', 'true')
+        settings.setdefault('fixup_auto_grant_cache_limit', '10000')
         settings.setdefault('synonym_fixup_scope', 'public_only')
         settings.setdefault('trigger_list', '')
         settings.setdefault('trigger_qualify_schema', 'true')
@@ -3302,6 +3305,22 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             settings.get('fixup_auto_grant_fallback', 'true'),
             True
         )
+        settings['fixup_dir_allow_outside_repo'] = parse_bool_flag(
+            settings.get('fixup_dir_allow_outside_repo', 'true'),
+            True
+        )
+        try:
+            settings['fixup_max_sql_file_mb'] = str(
+                int(settings.get('fixup_max_sql_file_mb', '50'))
+            )
+        except Exception:
+            settings['fixup_max_sql_file_mb'] = '50'
+        try:
+            settings['fixup_auto_grant_cache_limit'] = str(
+                int(settings.get('fixup_auto_grant_cache_limit', '10000'))
+            )
+        except Exception:
+            settings['fixup_auto_grant_cache_limit'] = '10000'
         settings['column_visibility_policy'] = normalize_column_visibility_policy(
             settings.get('column_visibility_policy', 'auto')
         )
@@ -3763,6 +3782,13 @@ def run_config_wizard(config_path: Path) -> None:
     )
     _prompt_field(
         "SETTINGS",
+        "fixup_auto_grant_cache_limit",
+        "自动补权限缓存大小（条目数，<=0 表示不限制）",
+        default=cfg.get("SETTINGS", "fixup_auto_grant_cache_limit", fallback="10000"),
+        validator=_validate_non_negative_int,
+    )
+    _prompt_field(
+        "SETTINGS",
         "synonym_fixup_scope",
         "同义词修补范围 (all/public_only)",
         default=cfg.get("SETTINGS", "synonym_fixup_scope", fallback="public_only"),
@@ -3940,6 +3966,20 @@ def run_config_wizard(config_path: Path) -> None:
         "fixup_dir",
         "订正 SQL 输出目录",
         default=cfg.get("SETTINGS", "fixup_dir", fallback="fixup_scripts"),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "fixup_dir_allow_outside_repo",
+        "是否允许 fixup_dir 指向项目目录外 (true/false)",
+        default=cfg.get("SETTINGS", "fixup_dir_allow_outside_repo", fallback="true"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "fixup_max_sql_file_mb",
+        "run_fixup 单文件最大读取大小（MB，<=0 不限制）",
+        default=cfg.get("SETTINGS", "fixup_max_sql_file_mb", fallback="50"),
+        validator=_validate_non_negative_int,
     )
     _prompt_field(
         "SETTINGS",
@@ -24490,9 +24530,7 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['detail']} (
     BLACKLIST_REASON    VARCHAR2(256),
     DETAIL_JSON         CLOB,
     CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP,
-    CONSTRAINT PK_DIFF_REPORT_DETAIL PRIMARY KEY (DETAIL_ID),
-    CONSTRAINT FK_DIFF_REPORT_DETAIL_SUMMARY FOREIGN KEY (REPORT_ID)
-        REFERENCES {schema_prefix}{REPORT_DB_TABLES['summary']}(REPORT_ID) ON DELETE CASCADE
+    CONSTRAINT PK_DIFF_REPORT_DETAIL PRIMARY KEY (DETAIL_ID)
 )
 """
     ddl_grants = f"""
@@ -24510,9 +24548,7 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['grants']} (
     STATUS              VARCHAR2(32),
     FILTER_REASON       VARCHAR2(256),
     CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP,
-    CONSTRAINT PK_DIFF_REPORT_GRANT PRIMARY KEY (GRANT_ID),
-    CONSTRAINT FK_DIFF_REPORT_GRANT_SUMMARY FOREIGN KEY (REPORT_ID)
-        REFERENCES {schema_prefix}{REPORT_DB_TABLES['summary']}(REPORT_ID) ON DELETE CASCADE
+    CONSTRAINT PK_DIFF_REPORT_GRANT PRIMARY KEY (GRANT_ID)
 )
 """
     ddl_counts = f"""
@@ -24525,9 +24561,7 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['counts']} (
     UNSUPPORTED_COUNT   NUMBER DEFAULT 0,
     EXTRA_COUNT         NUMBER DEFAULT 0,
     CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP,
-    CONSTRAINT PK_DIFF_REPORT_COUNTS PRIMARY KEY (REPORT_ID, OBJECT_TYPE),
-    CONSTRAINT FK_DIFF_REPORT_COUNTS_SUMMARY FOREIGN KEY (REPORT_ID)
-        REFERENCES {schema_prefix}{REPORT_DB_TABLES['summary']}(REPORT_ID) ON DELETE CASCADE
+    CONSTRAINT PK_DIFF_REPORT_COUNTS PRIMARY KEY (REPORT_ID, OBJECT_TYPE)
 )
 """
     ddl_usability = f"""
@@ -24540,9 +24574,7 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['usability']} (
     STATUS              VARCHAR2(32),
     REASON              VARCHAR2(1024),
     DETAIL_JSON         CLOB,
-    CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP,
-    CONSTRAINT FK_DIFF_REPORT_USABILITY_SUMMARY FOREIGN KEY (REPORT_ID)
-        REFERENCES {schema_prefix}{REPORT_DB_TABLES['summary']}(REPORT_ID) ON DELETE CASCADE
+    CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP
 )
 """
     ddl_package_compare = f"""
@@ -24557,9 +24589,7 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['package_compare']} (
     DIFF_HASH           VARCHAR2(64),
     DIFF_SUMMARY        VARCHAR2(4000),
     DIFF_PATH           VARCHAR2(512),
-    CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP,
-    CONSTRAINT FK_DIFF_REPORT_PKG_SUMMARY FOREIGN KEY (REPORT_ID)
-        REFERENCES {schema_prefix}{REPORT_DB_TABLES['summary']}(REPORT_ID) ON DELETE CASCADE
+    CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP
 )
 """
     ddl_trigger_status = f"""
@@ -24575,9 +24605,7 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['trigger_status']} (
     TGT_VALID           VARCHAR2(16),
     DIFF_STATUS         VARCHAR2(64),
     REASON              VARCHAR2(1024),
-    CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP,
-    CONSTRAINT FK_DIFF_REPORT_TRG_SUMMARY FOREIGN KEY (REPORT_ID)
-        REFERENCES {schema_prefix}{REPORT_DB_TABLES['summary']}(REPORT_ID) ON DELETE CASCADE
+    CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP
 )
 """
 
@@ -24623,6 +24651,39 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['trigger_status']} (
         to_create.append(("package_compare", ddl_package_compare))
     if REPORT_DB_TABLES["trigger_status"] not in existing:
         to_create.append(("trigger_status", ddl_trigger_status))
+
+    fk_constraints = [
+        (REPORT_DB_TABLES["detail"], "FK_DIFF_REPORT_DETAIL_SUMMARY"),
+        (REPORT_DB_TABLES["grants"], "FK_DIFF_REPORT_GRANT_SUMMARY"),
+        (REPORT_DB_TABLES["counts"], "FK_DIFF_REPORT_COUNTS_SUMMARY"),
+        (REPORT_DB_TABLES["usability"], "FK_DIFF_REPORT_USABILITY_SUMMARY"),
+        (REPORT_DB_TABLES["package_compare"], "FK_DIFF_REPORT_PKG_SUMMARY"),
+        (REPORT_DB_TABLES["trigger_status"], "FK_DIFF_REPORT_TRG_SUMMARY"),
+    ]
+    constraint_owner_clause = f"OWNER = '{schema}'" if schema else "OWNER = USER"
+    for table_name, constraint_name in fk_constraints:
+        if table_name not in existing:
+            continue
+        check_sql = (
+            "SELECT CONSTRAINT_NAME FROM ALL_CONSTRAINTS "
+            f"WHERE {constraint_owner_clause} "
+            f"AND TABLE_NAME = '{table_name}' "
+            f"AND CONSTRAINT_NAME = '{constraint_name}'"
+        )
+        ok_check, out_check, err_check = obclient_run_sql(ob_cfg, check_sql)
+        if not ok_check:
+            log.warning("[REPORT_DB] 检查外键 %s.%s 失败: %s", table_name, constraint_name, err_check)
+            continue
+        exists = any(line.strip() for line in (out_check or "").splitlines())
+        if not exists:
+            continue
+        drop_sql = (
+            f"ALTER TABLE {schema_prefix}{table_name} "
+            f"DROP CONSTRAINT {constraint_name}"
+        )
+        ok_drop, _o, err_drop = obclient_run_sql(ob_cfg, drop_sql)
+        if not ok_drop:
+            log.warning("[REPORT_DB] 删除外键 %s.%s 失败: %s", table_name, constraint_name, err_drop)
 
     if not to_create:
         return True, ""

@@ -5904,11 +5904,9 @@ class TestReportDbHelpers(unittest.TestCase):
         self.assertEqual(rows[0]["schema_name"], "TGT")
         self.assertEqual(rows[0]["trigger_name"], "TRG1")
 
-    def test_report_db_ddls_include_cascade(self):
+    def test_report_db_ddls_no_foreign_keys(self):
         source = inspect.getsource(sdr.ensure_report_db_tables_exist)
-        self.assertIn("FK_DIFF_REPORT_USABILITY_SUMMARY", source)
-        self.assertIn("FK_DIFF_REPORT_PKG_SUMMARY", source)
-        self.assertIn("FK_DIFF_REPORT_TRG_SUMMARY", source)
+        self.assertNotIn("FOREIGN KEY", source)
 
 
 if __name__ == "__main__":
