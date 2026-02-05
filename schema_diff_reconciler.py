@@ -7547,7 +7547,8 @@ def obclient_run_sql(ob_cfg: ObConfig, sql_query: str, timeout: Optional[int] = 
                 continue
             if re.search(r"^(warning|警告)\b", line_clean, flags=re.IGNORECASE):
                 continue
-            if re.search(r"(ORA-\d{5}|OB-\d+)", line_clean, flags=re.IGNORECASE):
+            # 仅当错误出现在行首时视为执行失败，避免 DBA_ERRORS TEXT 列中的 ORA-XXXX 被误判。
+            if re.search(r"^(ORA-\d{5}|OB-\d+)\b", line_clean, flags=re.IGNORECASE):
                 return line_clean
             if re.search(r"^ERROR(\s+\d+|\b)", line_clean, flags=re.IGNORECASE):
                 return line_clean
