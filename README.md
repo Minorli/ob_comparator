@@ -1,16 +1,16 @@
 # OceanBase Comparator Toolkit
 
-> 当前版本：V0.9.8.2  
+> 当前版本：V0.9.8.3  
 > 面向 Oracle → OceanBase (Oracle 模式) 的结构一致性校验与修补脚本生成工具  
 > 核心理念：一次转储、本地对比、脚本审计优先
 
-## 近期更新（0.9.8.2）
-- PUBLIC/`__public` 语义统一，报告与比对使用 Oracle 语义（PUBLIC）。
-- FK 约束比对补齐 `UPDATE_RULE`。
-- obclient SQL 执行改为 stdin 方式，特殊字符更稳定。
-- 致命错误收敛为异常链路，避免并发任务直接 `sys.exit`。
+## 近期更新（0.9.8.3）
+- report_to_db 覆盖范围扩展（支持 full 模式更多表）。
+- 新增 DIFF_REPORT_DETAIL_ITEM（明细行化），便于列级排查。
+- 新增 report_db_store_scope 与 report_db_detail_item_enable 配置。
+- HOW_TO_READ_REPORTS_IN_OB SQL 全量校验与修正。
 
-详见：`docs/RELEASE_NOTES_0.9.8.2.md`
+详见：`docs/RELEASE_NOTES_0.9.8.3.md`
 
 ## 核心能力
 - **对象覆盖完整**：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。

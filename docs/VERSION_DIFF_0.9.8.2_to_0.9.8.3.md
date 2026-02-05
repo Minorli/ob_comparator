@@ -1,0 +1,12 @@
+# 版本对比清单 — 0.9.8.2 → 0.9.8.3
+
+对比范围：V0.9.8.2 与 V0.9.8.3
+
+## 版本号
+- 版本号更新至 0.9.8.3
+
+## 主要变化
+- report_to_db 扩展写库范围（full 模式更多表）。
+- 新增 DIFF_REPORT_DETAIL_ITEM 细粒度差异入库。
+- 新增 report_db_store_scope / report_db_detail_item_enable。
+- HOW_TO_READ_REPORTS_IN_OB SQL 全量校验修正。

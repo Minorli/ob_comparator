@@ -2,6 +2,12 @@
 
 本文件记录 OceanBase Comparator Toolkit 的重要变更。
 
+## [0.9.8.3] - 2026-02-05
+- report_to_db 覆盖范围扩展（支持 full 模式更多表）
+- 新增明细行化表 DIFF_REPORT_DETAIL_ITEM，细粒度差异入库
+- 新增 report_db_store_scope 与 report_db_detail_item_enable 配置
+- HOW_TO_READ_REPORTS_IN_OB SQL 校验修正与完善
+
 ## [未发布]
 
 ### 新增
