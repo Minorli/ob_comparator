@@ -2,7 +2,7 @@
 ## 技术规格说明 (Technical Specification)
 
 **版本**：0.9.8.2  
-**日期**：2026-02-03  
+**日期**：2026-02-05  
 **适用场景**：Oracle → OceanBase（Oracle 模式）迁移后的结构一致性校验、对象补全、DDL 兼容性修复。
 
 ---
@@ -34,6 +34,11 @@
 - `ddl_format_enable` / `ddl_format_types` / `sqlcl_bin`（可选格式化）
 - `report_dir_layout` / `report_detail_mode`（报告目录与明细拆分）
 - `fixup_drop_sys_c_columns`（SYS_C* 额外列清理策略）
+
+### 2.4 默认规则与硬编码说明
+为保证大多数迁移场景的稳定性，程序内置了一批默认规则（如 OMS 列过滤、SYS_NC/SYS_C 处理、视图兼容性判断等）。  
+当前认为这些规则在 **Oracle → OceanBase（Oracle 模式）** 场景下适用面较广，默认保持开启且不强制暴露为配置项。  
+若未来 OceanBase 版本或业务场景发生明显变化，可按需将具体规则配置化并保持默认值不变，以避免破坏现有行为。
 
 ---
 
