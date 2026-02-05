@@ -124,16 +124,31 @@
 ### 5.3 报告存库（默认开启，obclient）
 - `report_to_db=true` 后，会将报告写入 OceanBase（仅 obclient；不影响本地报告文件）。
 - 支持 `report_db_schema` 指定存储 schema；留空使用目标连接用户。
+- 写库范围由 `report_db_store_scope` 控制：
+  - `summary`：仅写入 SUMMARY / COUNTS
+  - `core`：summary + DETAIL / GRANT / USABILITY / PACKAGE / TRIGGER
+  - `full`：core + ARTIFACT / DEPENDENCY / VIEW_CHAIN / REMAP_CONFLICT / OBJECT_MAPPING / BLACKLIST / FIXUP_SKIP / OMS_MISSING
 - 明细范围与规模控制：
   - `report_db_detail_mode=missing,mismatched,unsupported`（建议保留核心差异）
-  - `report_db_detail_max_rows=500000`（防止超大写入）
+  - `report_db_detail_max_rows=0`（不限制；按需设置）
+  - `report_db_detail_item_enable=`（空=auto，full 时启用行化表）
+  - `report_db_detail_item_max_rows=0`（行化表不限制；按需设置）
   - `report_db_insert_batch=200`（INSERT ALL 批量）
 - 清理策略：`report_retention_days=90`（0 表示不自动清理）。
 - 写库表清单：
   - `DIFF_REPORT_SUMMARY` / `DIFF_REPORT_COUNTS` / `DIFF_REPORT_DETAIL` / `DIFF_REPORT_GRANT`
+  - `DIFF_REPORT_DETAIL_ITEM`（明细行化表，便于逐项查询，store_scope=full 时写入）
   - `DIFF_REPORT_USABILITY`（可用性校验明细）
   - `DIFF_REPORT_PACKAGE_COMPARE`（PACKAGE/PKG BODY 对比摘要）
   - `DIFF_REPORT_TRIGGER_STATUS`（触发器状态差异）
+  - `DIFF_REPORT_ARTIFACT`（报告工件目录）
+  - `DIFF_REPORT_DEPENDENCY`（依赖链）
+  - `DIFF_REPORT_VIEW_CHAIN`（VIEW fixup 链路）
+  - `DIFF_REPORT_REMAP_CONFLICT`（remap 冲突）
+  - `DIFF_REPORT_OBJECT_MAPPING`（全量对象映射）
+  - `DIFF_REPORT_BLACKLIST`（黑名单明细）
+  - `DIFF_REPORT_FIXUP_SKIP`（fixup 跳过汇总）
+  - `DIFF_REPORT_OMS_MISSING`（OMS 缺失规则映射）
 - 缺失/不支持明细无需额外表，使用 `DIFF_REPORT_DETAIL` 按 `report_type/object_type` 查询。
 
 示例查询：

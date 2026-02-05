@@ -5941,6 +5941,163 @@ class TestReportDbHelpers(unittest.TestCase):
         self.assertEqual(rows[0]["schema_name"], "TGT")
         self.assertEqual(rows[0]["trigger_name"], "TRG1")
 
+    def test_build_report_dependency_rows(self):
+        report = {
+            "missing": [
+                sdr.DependencyIssue("SRC.V1", "VIEW", "SRC.T1", "TABLE", "missing")
+            ],
+            "unexpected": [],
+            "skipped": []
+        }
+        expected = {("SRC.V1", "VIEW", "SRC.T1", "TABLE")}
+        rows, truncated, truncated_count = sdr._build_report_dependency_rows(
+            report,
+            expected,
+            max_rows=0,
+            store_expected=True
+        )
+        self.assertFalse(truncated)
+        self.assertEqual(truncated_count, 0)
+        self.assertTrue(any(r["edge_status"] == "MISSING" for r in rows))
+        self.assertTrue(any(r["edge_status"] == "EXPECTED" for r in rows))
+
+    def test_build_report_view_chain_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "VIEWs_chain_20250101.txt"
+            path.write_text(
+                "00001. SCHEMA.V1[VIEW|EXISTS|GRANT_OK] -> SCHEMA.T1[TABLE|EXISTS|GRANT_OK]\n",
+                encoding="utf-8"
+            )
+            rows, truncated, truncated_count = sdr._build_report_view_chain_rows(path, max_rows=0)
+        self.assertFalse(truncated)
+        self.assertEqual(truncated_count, 0)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["view_schema"], "SCHEMA")
+        self.assertEqual(rows[0]["view_name"], "V1")
+
+    def test_build_report_remap_conflict_rows(self):
+        rows, truncated, truncated_count = sdr._build_report_remap_conflict_rows(
+            [("VIEW", "SRC.V1", "reason")],
+            max_rows=0
+        )
+        self.assertFalse(truncated)
+        self.assertEqual(truncated_count, 0)
+        self.assertEqual(rows[0]["object_type"], "VIEW")
+        self.assertEqual(rows[0]["source_schema"], "SRC")
+        self.assertEqual(rows[0]["source_name"], "V1")
+
+    def test_build_report_object_mapping_rows(self):
+        full_mapping = {"SRC.V1": {"VIEW": "TGT.V1"}}
+        remap_rules = {"SRC.V1": "TGT.V1"}
+        rows, truncated, truncated_count = sdr._build_report_object_mapping_rows(
+            full_mapping,
+            remap_rules,
+            max_rows=0
+        )
+        self.assertFalse(truncated)
+        self.assertEqual(truncated_count, 0)
+        self.assertEqual(rows[0]["map_source"], "rule")
+
+    def test_build_report_blacklist_rows(self):
+        row = sdr.BlacklistReportRow(
+            schema="SRC",
+            table="T1",
+            black_type="LONG",
+            data_type="LONG",
+            reason="LONG",
+            status="SKIPPED",
+            detail=""
+        )
+        rows, truncated, truncated_count = sdr._build_report_blacklist_rows([row], max_rows=0)
+        self.assertFalse(truncated)
+        self.assertEqual(truncated_count, 0)
+        self.assertEqual(rows[0]["schema_name"], "SRC")
+        self.assertEqual(rows[0]["table_name"], "T1")
+
+    def test_build_report_fixup_skip_rows(self):
+        summary = {
+            "TABLE": {
+                "missing_total": 2,
+                "task_total": 1,
+                "generated": 1,
+                "skipped": {"UNSUPPORTED": 1}
+            }
+        }
+        rows, truncated, truncated_count = sdr._build_report_fixup_skip_rows(summary, max_rows=0)
+        self.assertFalse(truncated)
+        self.assertEqual(truncated_count, 0)
+        self.assertEqual(rows[0]["object_type"], "TABLE")
+        self.assertEqual(rows[0]["skip_reason"], "UNSUPPORTED")
+
+    def test_build_report_oms_missing_rows(self):
+        tv_results = {"missing": [("TABLE", "TGT.S1", "SRC.S1")]}
+        rows, truncated, truncated_count = sdr._build_report_oms_missing_rows(
+            tv_results,
+            support_state_map={},
+            blacklisted_tables=set(),
+            max_rows=0
+        )
+        self.assertFalse(truncated)
+        self.assertEqual(truncated_count, 0)
+        self.assertEqual(rows[0]["object_type"], "TABLE")
+        self.assertEqual(rows[0]["src_schema"], "SRC")
+        self.assertEqual(rows[0]["tgt_schema"], "TGT")
+
+    def test_build_report_artifact_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_dir = Path(tmpdir)
+            sample = report_dir / "missing_objects_detail_20250101.txt"
+            sample.write_text("# 字段说明: A|B\nA|B\n", encoding="utf-8")
+            rows = sdr._build_report_artifact_rows(
+                report_dir,
+                "full",
+                {"missing", "mismatched", "unsupported"},
+                False
+            )
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["artifact_type"], "MISSING_DETAIL")
+
+    def test_build_report_detail_item_rows(self):
+        tv_results = {
+            "mismatched": [
+                (
+                    "TABLE",
+                    "TGT.T1",
+                    {"C1"},
+                    {"C2"},
+                    [("C3", 10, 20, 20, "LEN")],
+                    [("C4", "NUMBER", "VARCHAR2", "NUMBER", "TYPE")],
+                )
+            ],
+            "missing": [],
+        }
+        extra_results = {
+            "index_mismatched": [],
+            "constraint_mismatched": [],
+            "sequence_mismatched": [
+                sdr.SequenceMismatch("SRC", "TGT", {"SEQ1"}, set(), None, None, None)
+            ],
+            "trigger_mismatched": [],
+            "index_unsupported": [],
+            "constraint_unsupported": [],
+        }
+        table_target_map = {("SRC", "T1"): ("TGT", "T1")}
+        rows, truncated, truncated_count = sdr._build_report_detail_item_rows(
+            tv_results,
+            extra_results,
+            None,
+            table_target_map,
+            max_rows=0
+        )
+        self.assertFalse(truncated)
+        self.assertEqual(truncated_count, 0)
+        item_types = {row["item_type"] for row in rows}
+        self.assertIn("MISSING_COLUMN", item_types)
+        self.assertIn("EXTRA_COLUMN", item_types)
+        self.assertIn("LENGTH_MISMATCH", item_types)
+        self.assertIn("TYPE_MISMATCH", item_types)
+        self.assertIn("MISSING_SEQUENCE", item_types)
+
     def test_report_db_ddls_no_foreign_keys(self):
         source = inspect.getsource(sdr.ensure_report_db_tables_exist)
         self.assertNotIn("FOREIGN KEY", source)

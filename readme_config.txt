@@ -47,15 +47,24 @@
 - report_db_schema：报告存库 schema。默认：空（使用 OCEANBASE_TARGET 连接用户）。
 - report_retention_days：报告保留天数。默认：90；设为 0 表示不自动清理。
 - report_db_fail_abort：报告写库失败是否中止主流程。默认：false。
+- report_db_store_scope：写库范围（summary/core/full）。默认：full。
+  - summary：仅写入汇总与计数。
+  - core：写入汇总/计数/明细/授权/可用性/Package/Trigger。
+  - full：写入全部（含依赖/VIEW 链/映射/黑名单/fixup/OMS 规则/工件目录）。
 - report_db_detail_mode：写入明细范围。默认：missing,mismatched,unsupported。
   可选值：missing,mismatched,unsupported,ok,skipped,all（all 等同全量）。
   说明：建议仅保存关键明细，避免海量写库压力。
-- report_db_detail_max_rows：写入明细最大行数。默认：500000；0 表示不限制。
+- report_db_detail_max_rows：写入明细最大行数。默认：0（不限制）。
+- report_db_detail_item_enable：是否写入明细行化表 DIFF_REPORT_DETAIL_ITEM。默认：空（full 时自动启用）。
+- report_db_detail_item_max_rows：明细行化表最大行数。默认：0（不限制）。
 - report_db_insert_batch：写库批量大小（INSERT ALL）。默认：200。
 - report_db_save_full_json：是否保存完整报告 JSON。默认：false。
   说明：开启后会写入主报告 JSON（可能较大，影响性能）。
-  说明：report_to_db 写入表包含 DIFF_REPORT_SUMMARY / DIFF_REPORT_COUNTS / DIFF_REPORT_DETAIL / DIFF_REPORT_GRANT / DIFF_REPORT_USABILITY / DIFF_REPORT_PACKAGE_COMPARE / DIFF_REPORT_TRIGGER_STATUS。
-        缺失/不支持明细不单独建表，使用 DIFF_REPORT_DETAIL 按 report_type + object_type 查询即可。
+  说明：report_to_db 写入表范围受 report_db_store_scope 控制：
+  - summary: DIFF_REPORT_SUMMARY / DIFF_REPORT_COUNTS
+  - core: summary + DIFF_REPORT_DETAIL / DIFF_REPORT_GRANT / DIFF_REPORT_USABILITY / DIFF_REPORT_PACKAGE_COMPARE / DIFF_REPORT_TRIGGER_STATUS
+  - full: core + DIFF_REPORT_DETAIL_ITEM / DIFF_REPORT_ARTIFACT / DIFF_REPORT_DEPENDENCY / DIFF_REPORT_VIEW_CHAIN / DIFF_REPORT_REMAP_CONFLICT / DIFF_REPORT_OBJECT_MAPPING / DIFF_REPORT_BLACKLIST / DIFF_REPORT_FIXUP_SKIP / DIFF_REPORT_OMS_MISSING
+        缺失/不支持明细可通过 DIFF_REPORT_DETAIL 查询；若需行化细节，使用 DIFF_REPORT_DETAIL_ITEM。
 - fixup_dir：修补脚本输出目录。默认：fixup_scripts。
 - fixup_dir_allow_outside_repo：是否允许 fixup_dir 指向项目目录外。默认：true。
 - fixup_max_sql_file_mb：run_fixup 单文件最大读取大小（MB）。默认：50；<=0 表示不限制。

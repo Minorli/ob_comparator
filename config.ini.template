@@ -57,16 +57,25 @@ report_detail_mode      = split
 # report_db_schema: 存储 schema（留空使用目标连接用户）
 # report_retention_days: 历史保留天数（0 表示不清理）
 # report_db_fail_abort: 写库失败是否中止
+# report_db_store_scope: 写库范围（summary/core/full）
+#   summary: 仅写入汇总与计数
+#   core:    写入汇总/计数/明细/授权/可用性/Package/Trigger
+#   full:    写入全部（含依赖/VIEW 链/映射/黑名单/fixup/OMS 规则/工件目录）
 # report_db_detail_mode: 写入明细范围（missing/mismatched/unsupported/ok/skipped/all）
 # report_db_detail_max_rows: 明细最大行数（0 不限制）
+# report_db_detail_item_enable: 是否写入明细行化表（空=auto，full 时启用）
+# report_db_detail_item_max_rows: 明细行化表最大行数（0 不限制）
 # report_db_insert_batch: INSERT ALL 批量大小
 # report_db_save_full_json: 是否保存完整 JSON（可能很大）
 report_to_db            = true
 report_db_schema        =
 report_retention_days   = 90
 report_db_fail_abort    = false
+report_db_store_scope   = full
 report_db_detail_mode   = missing,mismatched,unsupported
-report_db_detail_max_rows = 500000
+report_db_detail_max_rows = 0
+report_db_detail_item_enable =
+report_db_detail_item_max_rows = 0
 report_db_insert_batch  = 200
 report_db_save_full_json = false
 # 日志目录与级别（日志文件与控制台输出）

@@ -21,14 +21,27 @@ OceanBase 报告表阅读指南（report_to_db）
 ----------------------------------------
 说明
 - 本文件适用于 report_to_db=true 写入 OB 的报告表。
+- 写库范围受 report_db_store_scope 控制：
+  - summary：仅 SUMMARY / COUNTS
+  - core：summary + DETAIL / GRANT / USABILITY / PACKAGE_COMPARE / TRIGGER_STATUS
+  - full：core + DETAIL_ITEM / ARTIFACT / DEPENDENCY / VIEW_CHAIN / REMAP_CONFLICT / OBJECT_MAPPING / BLACKLIST / FIXUP_SKIP / OMS_MISSING
 - 表名固定为：
   - DIFF_REPORT_SUMMARY
   - DIFF_REPORT_COUNTS
   - DIFF_REPORT_DETAIL
+  - DIFF_REPORT_DETAIL_ITEM
   - DIFF_REPORT_GRANT
   - DIFF_REPORT_USABILITY
   - DIFF_REPORT_PACKAGE_COMPARE
   - DIFF_REPORT_TRIGGER_STATUS
+  - DIFF_REPORT_ARTIFACT
+  - DIFF_REPORT_DEPENDENCY
+  - DIFF_REPORT_VIEW_CHAIN
+  - DIFF_REPORT_REMAP_CONFLICT
+  - DIFF_REPORT_OBJECT_MAPPING
+  - DIFF_REPORT_BLACKLIST
+  - DIFF_REPORT_FIXUP_SKIP
+  - DIFF_REPORT_OMS_MISSING
 - 报告明细表使用列名：
   - REPORT_TYPE: MISSING / UNSUPPORTED / MISMATCHED / OK / SKIPPED
   - STATUS: 用于区分细分状态（如 BLOCKED / UNSUPPORTED / MISMATCH / OK / SKIPPED）
@@ -40,6 +53,12 @@ SELECT report_id, run_timestamp, run_dir
   FROM DIFF_REPORT_SUMMARY
  ORDER BY run_timestamp DESC
  FETCH FIRST 5 ROWS ONLY;
+
+-- DB 覆盖范围提醒（哪些报告已入库，哪些仍在 TXT）
+SELECT report_id, artifact_type, status, note, row_count, file_path
+  FROM DIFF_REPORT_ARTIFACT
+ WHERE report_id = :report_id
+ ORDER BY artifact_type, status;
 
 ----------------------------------------
 3) 客户排查主线（推荐顺序）
@@ -171,6 +190,14 @@ SELECT source_schema, source_name, target_schema, target_name, object_type, reas
    AND report_type = 'MISMATCHED'
  ORDER BY object_type, target_schema, target_name;
 
+-- 明细行化（逐项查询，report_db_store_scope=full 推荐）
+SELECT report_type, object_type,
+       source_schema, source_name, target_schema, target_name,
+       item_type, item_key, src_value, tgt_value, item_value, status
+  FROM DIFF_REPORT_DETAIL_ITEM
+ WHERE report_id = :report_id
+ ORDER BY object_type, item_type, source_schema, source_name;
+
 ----------------------------------------
 6) 依赖与阻断深挖
 ----------------------------------------
@@ -190,6 +217,21 @@ SELECT source_schema, object_type, source_name, report_type, reason
    AND DBMS_LOB.INSTR(detail_json, 'dependency') > 0
  ORDER BY object_type, source_schema, source_name;
 
+6.3 依赖链明细（report_db_store_scope=full 推荐）
+SELECT dep_schema, dep_name, dep_type,
+       ref_schema, ref_name, ref_type,
+       edge_status, reason
+  FROM DIFF_REPORT_DEPENDENCY
+ WHERE report_id = :report_id
+ ORDER BY edge_status, dep_schema, dep_name;
+
+6.4 VIEW 链路节点（report_db_store_scope=full 推荐）
+SELECT view_schema, view_name, chain_id, node_index,
+       node_schema, node_name, node_type, node_exists, grant_status, cycle_flag
+  FROM DIFF_REPORT_VIEW_CHAIN
+ WHERE report_id = :report_id
+ ORDER BY view_schema, view_name, chain_id, node_index;
+
 ----------------------------------------
 7) remap 专项
 ----------------------------------------
@@ -208,6 +250,18 @@ SELECT source_schema, source_name, report_type, reason
    AND object_type = 'VIEW'
    AND DBMS_LOB.INSTR(detail_json, 'remap') > 0
  ORDER BY report_type, source_schema, source_name;
+
+7.3 remap 冲突清单（report_db_store_scope=full 推荐）
+SELECT object_type, source_schema, source_name, reason
+  FROM DIFF_REPORT_REMAP_CONFLICT
+ WHERE report_id = :report_id
+ ORDER BY object_type, source_schema, source_name;
+
+7.4 全量映射（report_db_store_scope=full 推荐）
+SELECT object_type, src_schema, src_name, tgt_schema, tgt_name, map_source
+  FROM DIFF_REPORT_OBJECT_MAPPING
+ WHERE report_id = :report_id
+ ORDER BY object_type, src_schema, src_name;
 
 ----------------------------------------
 8) 黑名单与不支持原因
@@ -229,6 +283,12 @@ SELECT reason, COUNT(*) AS cnt
    AND report_type = 'UNSUPPORTED'
  GROUP BY reason
  ORDER BY cnt DESC;
+
+8.3 黑名单明细（report_db_store_scope=full 推荐）
+SELECT schema_name, table_name, black_type, data_type, status, reason, detail
+  FROM DIFF_REPORT_BLACKLIST
+ WHERE report_id = :report_id
+ ORDER BY schema_name, table_name;
 
 ----------------------------------------
 9) 授权差异（GRANT）
@@ -271,6 +331,36 @@ SELECT schema_name, trigger_name, src_enabled, tgt_enabled, src_valid, tgt_valid
  WHERE report_id = :report_id
  ORDER BY schema_name, trigger_name;
 
+10.4 同义词专项（缺失/阻断/可用性/回溯）
+-- 同义词缺失/阻断/不支持明细
+SELECT report_type, status, source_schema, source_name, target_schema, target_name, reason
+  FROM DIFF_REPORT_DETAIL
+ WHERE report_id = :report_id
+   AND object_type = 'SYNONYM'
+ ORDER BY report_type, status, source_schema, source_name;
+
+-- 同义词可用性结果
+SELECT object_type, schema_name, object_name, status, usable, reason, detail_json
+  FROM DIFF_REPORT_USABILITY
+ WHERE report_id = :report_id
+   AND object_type = 'SYNONYM'
+   AND (status <> 'OK' OR usable IS NULL OR usable = 0)
+ ORDER BY status, schema_name, object_name;
+
+-- 可用性为 SKIPPED 时回溯原因
+SELECT u.schema_name, u.object_name, u.status, u.reason,
+       d.report_type, d.status AS detail_status, d.reason AS detail_reason, d.detail_json
+  FROM DIFF_REPORT_USABILITY u
+  LEFT JOIN DIFF_REPORT_DETAIL d
+    ON d.report_id = u.report_id
+   AND d.object_type = 'SYNONYM'
+   AND d.source_schema = u.schema_name
+   AND d.source_name = u.object_name
+ WHERE u.report_id = :report_id
+   AND u.object_type = 'SYNONYM'
+   AND u.status <> 'OK'
+ ORDER BY u.status, u.schema_name, u.object_name;
+
 ----------------------------------------
 11) 高级筛选与定位
 ----------------------------------------
@@ -297,6 +387,18 @@ SELECT source_schema, object_type, source_name, COUNT(*) AS cnt
 HAVING COUNT(*) > 1
  ORDER BY cnt DESC;
 
+11.4 fixup 跳过汇总（report_db_store_scope=full 推荐）
+SELECT object_type, missing_total, task_total, generated_total, skip_reason, skip_count
+  FROM DIFF_REPORT_FIXUP_SKIP
+ WHERE report_id = :report_id
+ ORDER BY object_type, skip_reason;
+
+11.5 OMS missing 规则映射（report_db_store_scope=full 推荐）
+SELECT target_schema, object_type, src_schema, src_name, tgt_schema, tgt_name
+  FROM DIFF_REPORT_OMS_MISSING
+ WHERE report_id = :report_id
+ ORDER BY target_schema, object_type, src_schema, src_name;
+
 ----------------------------------------
 12) 常见排查问答
 ----------------------------------------
@@ -312,6 +414,9 @@ Q3: 视图不支持原因怎么快速聚合？
 
 Q4: 是否能定位特定 schema 的问题？
 - 用 4.3 按 schema 汇总 + 5) 过滤 source_schema。
+
+Q5: 哪些报告未入库（需要看 TXT）？
+- 查询 DIFF_REPORT_ARTIFACT，status=TXT_ONLY 或 PARTIAL。
 
 ----------------------------------------
 附录 A: 按 schema + object_type 矩阵汇总
