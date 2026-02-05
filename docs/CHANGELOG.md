@@ -6,6 +6,8 @@
 - report_to_db 覆盖范围扩展（支持 full 模式更多表）
 - 新增明细行化表 DIFF_REPORT_DETAIL_ITEM，细粒度差异入库
 - 新增 report_db_store_scope 与 report_db_detail_item_enable 配置
+- 新增报告分析视图（ACTIONS / OBJECT_PROFILE / TRENDS / PENDING_ACTIONS / GRANT_CLASS / USABILITY_CLASS）
+- 新增写库失败追踪与闭环表（WRITE_ERRORS / RESOLUTION）
 - HOW_TO_READ_REPORTS_IN_OB SQL 校验修正与完善
 
 ## [未发布]
