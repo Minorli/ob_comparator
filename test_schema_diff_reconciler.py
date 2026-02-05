@@ -6048,6 +6048,8 @@ class TestReportDbHelpers(unittest.TestCase):
             report_dir = Path(tmpdir)
             sample = report_dir / "missing_objects_detail_20250101.txt"
             sample.write_text("# 字段说明: A|B\nA|B\n", encoding="utf-8")
+            sql_tpl = report_dir / "report_sql_20250101.txt"
+            sql_tpl.write_text("SELECT * FROM DIFF_REPORT_SUMMARY WHERE report_id='X';\n", encoding="utf-8")
             rows = sdr._build_report_artifact_rows(
                 report_dir,
                 "full",
@@ -6055,7 +6057,20 @@ class TestReportDbHelpers(unittest.TestCase):
                 False
             )
         self.assertTrue(rows)
-        self.assertEqual(rows[0]["artifact_type"], "MISSING_DETAIL")
+        types = {row["artifact_type"] for row in rows}
+        self.assertIn("MISSING_DETAIL", types)
+        self.assertIn("REPORT_SQL_TEMPLATE", types)
+
+    def test_render_report_sql_template(self):
+        content = "SELECT * FROM DIFF_REPORT_SUMMARY WHERE report_id = :report_id;"
+        rendered = sdr._render_report_sql_template(content, "R1")
+        self.assertIn("'R1'", rendered)
+
+    def test_build_report_db_view_ddls_phase_b_views(self):
+        ddls = sdr._build_report_db_view_ddls("")
+        self.assertIn(sdr.REPORT_DB_VIEWS["pending_actions"], ddls)
+        self.assertIn(sdr.REPORT_DB_VIEWS["grant_class"], ddls)
+        self.assertIn(sdr.REPORT_DB_VIEWS["usability_class"], ddls)
 
     def test_build_report_detail_item_rows(self):
         tv_results = {

@@ -25,6 +25,7 @@ OceanBase 报告表阅读指南（report_to_db）
   - summary：仅 SUMMARY / COUNTS
   - core：summary + DETAIL / GRANT / USABILITY / PACKAGE_COMPARE / TRIGGER_STATUS
   - full：core + DETAIL_ITEM / ARTIFACT / DEPENDENCY / VIEW_CHAIN / REMAP_CONFLICT / OBJECT_MAPPING / BLACKLIST / FIXUP_SKIP / OMS_MISSING
+  - 备注：WRITE_ERRORS / RESOLUTION 为写库追踪与闭环表，report_to_db 启用后默认创建
 - 表名固定为：
   - DIFF_REPORT_SUMMARY
   - DIFF_REPORT_COUNTS
@@ -42,9 +43,14 @@ OceanBase 报告表阅读指南（report_to_db）
   - DIFF_REPORT_BLACKLIST
   - DIFF_REPORT_FIXUP_SKIP
   - DIFF_REPORT_OMS_MISSING
+  - DIFF_REPORT_WRITE_ERRORS
+  - DIFF_REPORT_RESOLUTION
 - 报告明细表使用列名：
   - REPORT_TYPE: MISSING / UNSUPPORTED / MISMATCHED / OK / SKIPPED
   - STATUS: 用于区分细分状态（如 BLOCKED / UNSUPPORTED / MISMATCH / OK / SKIPPED）
+  - 视图（report_db_store_scope=core/full 时创建）：
+    DIFF_REPORT_ACTIONS_V / DIFF_REPORT_OBJECT_PROFILE_V / DIFF_REPORT_TRENDS_V
+    DIFF_REPORT_PENDING_ACTIONS_V / DIFF_REPORT_GRANT_CLASS_V / DIFF_REPORT_USABILITY_CLASS_V
 
 ----------------------------------------
 2) 入门：找到最新 report_id
@@ -53,6 +59,9 @@ SELECT report_id, run_timestamp, run_dir
   FROM DIFF_REPORT_SUMMARY
  ORDER BY run_timestamp DESC
  FETCH FIRST 5 ROWS ONLY;
+
+-- SQL 模板（预填 report_id）已输出到 run 目录：
+-- report_sql_<timestamp>.txt
 
 -- DB 覆盖范围提醒（哪些报告已入库，哪些仍在 TXT）
 SELECT report_id, artifact_type, status, note, row_count, file_path
@@ -78,6 +87,28 @@ SELECT object_type,
   FROM DIFF_REPORT_COUNTS
  WHERE report_id = :report_id
  ORDER BY unsupported_count DESC, missing_count DESC, extra_count DESC;
+
+-- 任务视图（可执行清单）
+-- 说明：仅在 report_db_store_scope=core/full 时生成
+SELECT action_type, object_type, schema_name, object_name, reason
+  FROM DIFF_REPORT_ACTIONS_V
+ WHERE report_id = :report_id
+ ORDER BY action_type, object_type, schema_name, object_name;
+
+-- 未完成清单（结合 resolution）
+SELECT action_type, object_type, schema_name, object_name, reason,
+       resolution_status, resolved_by, resolved_at
+  FROM DIFF_REPORT_PENDING_ACTIONS_V
+ WHERE report_id = :report_id
+ ORDER BY action_type, object_type, schema_name, object_name;
+
+-- 对象画像（统一看问题谱系）
+-- 说明：仅在 report_db_store_scope=core/full 时生成
+SELECT object_type, source_schema, source_name, detail_status, detail_reason,
+       usability_status, blacklist_type
+  FROM DIFF_REPORT_OBJECT_PROFILE_V
+ WHERE report_id = :report_id
+ ORDER BY object_type, source_schema, source_name;
 
 步骤 2: 先看不支持（需要改造）
 SELECT source_schema, source_name, target_schema, target_name,
@@ -157,6 +188,13 @@ SELECT c.report_id, s.run_timestamp, c.object_type,
   JOIN DIFF_REPORT_SUMMARY s
     ON c.report_id = s.report_id
  ORDER BY s.run_timestamp DESC, c.object_type;
+
+4.5 统一趋势视图（推荐）
+-- 说明：仅在 report_db_store_scope=core/full 时生成
+SELECT report_id, run_timestamp, object_type,
+       missing_count, unsupported_count, extra_count
+  FROM DIFF_REPORT_TRENDS_V
+ ORDER BY run_timestamp DESC, object_type;
 
 ----------------------------------------
 5) 缺失/不支持/阻断/不一致明细（核心）
@@ -301,6 +339,13 @@ SELECT target_schema, target_name, target_type,
  WHERE report_id = :report_id
  ORDER BY status, target_schema, target_name, grantee;
 
+9.1.1 授权分类视图
+SELECT grant_class, grant_type, grantee, privilege,
+       target_schema, target_name, with_grant_option
+  FROM DIFF_REPORT_GRANT_CLASS_V
+ WHERE report_id = :report_id
+ ORDER BY grant_class, grantee, target_schema, target_name;
+
 9.2 按 grantee 汇总
 SELECT grantee,
        SUM(CASE WHEN status='MISSING' THEN 1 ELSE 0 END) AS missing_cnt,
@@ -318,6 +363,13 @@ SELECT schema_name, object_name, object_type, usable, status, reason
   FROM DIFF_REPORT_USABILITY
  WHERE report_id = :report_id
  ORDER BY status, schema_name, object_name;
+
+10.1.1 可用性分类视图（快速定位权限/缺对象/语法/超时）
+SELECT reason_class, object_type, schema_name, object_name, reason
+  FROM DIFF_REPORT_USABILITY_CLASS_V
+ WHERE report_id = :report_id
+   AND reason_class <> 'OK'
+ ORDER BY reason_class, object_type, schema_name, object_name;
 
 10.2 PACKAGE 对比摘要
 SELECT schema_name, object_name, object_type, diff_status, diff_hash, diff_path
@@ -398,6 +450,20 @@ SELECT target_schema, object_type, src_schema, src_name, tgt_schema, tgt_name
   FROM DIFF_REPORT_OMS_MISSING
  WHERE report_id = :report_id
  ORDER BY target_schema, object_type, src_schema, src_name;
+
+11.6 写库失败追踪（写库异常快速定位）
+SELECT report_id, table_name, error_message, sql_snippet, created_at
+  FROM DIFF_REPORT_WRITE_ERRORS
+ WHERE report_id = :report_id
+ ORDER BY created_at DESC;
+
+11.7 标记已修复（resolution 示例）
+-- INSERT INTO DIFF_REPORT_RESOLUTION
+--   (REPORT_ID, OBJECT_TYPE, SCHEMA_NAME, OBJECT_NAME, ACTION_TYPE,
+--    RESOLUTION_STATUS, RESOLVED_BY, RESOLVED_AT, NOTE)
+-- VALUES
+--   (:report_id, 'TABLE', 'SRC_SCHEMA', 'T1', 'FIXUP',
+--    'RESOLVED', 'dba_user', SYSTIMESTAMP, '已修复');
 
 ----------------------------------------
 12) 常见排查问答

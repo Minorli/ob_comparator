@@ -24768,8 +24768,19 @@ REPORT_DB_TABLES = {
     "blacklist": "DIFF_REPORT_BLACKLIST",
     "fixup_skip": "DIFF_REPORT_FIXUP_SKIP",
     "oms_missing": "DIFF_REPORT_OMS_MISSING",
+    "write_errors": "DIFF_REPORT_WRITE_ERRORS",
+    "resolution": "DIFF_REPORT_RESOLUTION",
+}
+REPORT_DB_VIEWS = {
+    "actions": "DIFF_REPORT_ACTIONS_V",
+    "object_profile": "DIFF_REPORT_OBJECT_PROFILE_V",
+    "trends": "DIFF_REPORT_TRENDS_V",
+    "pending_actions": "DIFF_REPORT_PENDING_ACTIONS_V",
+    "grant_class": "DIFF_REPORT_GRANT_CLASS_V",
+    "usability_class": "DIFF_REPORT_USABILITY_CLASS_V",
 }
 REPORT_DB_CLOB_CHUNK_SIZE = 2000
+REPORT_DB_WRITE_ERROR_SNIPPET_MAX = 4000
 
 
 def sql_quote_literal(value: Optional[object]) -> str:
@@ -24788,6 +24799,46 @@ def sql_clob_literal(value: Optional[object], chunk_size: int = REPORT_DB_CLOB_C
     chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
     clob_parts = [f"TO_CLOB({sql_quote_literal(chunk)})" for chunk in chunks]
     return " || ".join(clob_parts)
+
+
+def _truncate_report_db_text(value: Optional[object], max_len: int = REPORT_DB_WRITE_ERROR_SNIPPET_MAX) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value)
+    if max_len <= 0 or len(text) <= max_len:
+        return text
+    if max_len <= 3:
+        return text[:max_len]
+    return text[:max_len - 3] + "..."
+
+
+def _record_report_db_write_error(
+    ob_cfg: ObConfig,
+    schema_prefix: str,
+    report_id: str,
+    table_name: str,
+    sql_snippet: Optional[str],
+    error_message: Optional[str]
+) -> None:
+    if not report_id:
+        return
+    error_id = f"{report_id}_{uuid.uuid4().hex[:12]}"
+    snippet = _truncate_report_db_text(sql_snippet)
+    err_text = _truncate_report_db_text(error_message, max_len=4000)
+    insert_sql = (
+        f"INSERT INTO {schema_prefix}{REPORT_DB_TABLES['write_errors']} "
+        "(ERROR_ID, REPORT_ID, TABLE_NAME, SQL_SNIPPET, ERROR_MESSAGE) "
+        "VALUES ({error_id}, {report_id}, {table_name}, {sql_snippet}, {error_message})".format(
+            error_id=sql_quote_literal(error_id),
+            report_id=sql_quote_literal(report_id),
+            table_name=sql_quote_literal(table_name) if table_name else "NULL",
+            sql_snippet=sql_clob_literal(snippet) if snippet else "NULL",
+            error_message=sql_clob_literal(err_text) if err_text else "NULL",
+        )
+    )
+    ok, _out, err = obclient_run_sql_commit(ob_cfg, insert_sql)
+    if not ok:
+        log.debug("[REPORT_DB] WRITE_ERRORS 写入失败: %s", err)
 
 
 def build_report_db_schema_prefix(settings: Dict) -> str:
@@ -25075,6 +25126,32 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['oms_missing']} (
     CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP
 )
 """
+    ddl_write_errors = f"""
+CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['write_errors']} (
+    ERROR_ID            VARCHAR2(64) NOT NULL,
+    REPORT_ID           VARCHAR2(64),
+    TABLE_NAME          VARCHAR2(128),
+    SQL_SNIPPET         CLOB,
+    ERROR_MESSAGE       CLOB,
+    CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP,
+    CONSTRAINT PK_DIFF_REPORT_WRITE_ERRORS PRIMARY KEY (ERROR_ID)
+)
+"""
+    ddl_resolution = f"""
+CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['resolution']} (
+    REPORT_ID           VARCHAR2(64) NOT NULL,
+    OBJECT_TYPE         VARCHAR2(32) NOT NULL,
+    SCHEMA_NAME         VARCHAR2(128) NOT NULL,
+    OBJECT_NAME         VARCHAR2(256) NOT NULL,
+    ACTION_TYPE         VARCHAR2(64) NOT NULL,
+    RESOLUTION_STATUS   VARCHAR2(32) DEFAULT 'OPEN',
+    RESOLVED_BY         VARCHAR2(128),
+    RESOLVED_AT         TIMESTAMP,
+    NOTE                VARCHAR2(1000),
+    CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP,
+    CONSTRAINT PK_DIFF_REPORT_RESOLUTION PRIMARY KEY (REPORT_ID, OBJECT_TYPE, SCHEMA_NAME, OBJECT_NAME, ACTION_TYPE)
+)
+"""
 
     ddl_index_sqls = [
         ("IDX_DIFF_REPORT_TS",
@@ -25133,6 +25210,14 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['oms_missing']} (
          f"CREATE INDEX IDX_DIFF_FIXUP_SKIP_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['fixup_skip']}(REPORT_ID)"),
         ("IDX_DIFF_OMS_MISSING_REPORT_ID",
          f"CREATE INDEX IDX_DIFF_OMS_MISSING_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['oms_missing']}(REPORT_ID)"),
+        ("IDX_DIFF_WRITE_ERRORS_REPORT_ID",
+         f"CREATE INDEX IDX_DIFF_WRITE_ERRORS_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['write_errors']}(REPORT_ID)"),
+        ("IDX_DIFF_WRITE_ERRORS_TABLE",
+         f"CREATE INDEX IDX_DIFF_WRITE_ERRORS_TABLE ON {schema_prefix}{REPORT_DB_TABLES['write_errors']}(TABLE_NAME)"),
+        ("IDX_DIFF_RESOLUTION_REPORT_ID",
+         f"CREATE INDEX IDX_DIFF_RESOLUTION_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['resolution']}(REPORT_ID)"),
+        ("IDX_DIFF_RESOLUTION_OBJECT",
+         f"CREATE INDEX IDX_DIFF_RESOLUTION_OBJECT ON {schema_prefix}{REPORT_DB_TABLES['resolution']}(OBJECT_TYPE, SCHEMA_NAME, OBJECT_NAME)"),
     ]
 
     to_create: List[Tuple[str, str]] = []
@@ -25168,6 +25253,10 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['oms_missing']} (
         to_create.append(("fixup_skip", ddl_fixup_skip))
     if REPORT_DB_TABLES["oms_missing"] not in existing:
         to_create.append(("oms_missing", ddl_oms_missing))
+    if REPORT_DB_TABLES["write_errors"] not in existing:
+        to_create.append(("write_errors", ddl_write_errors))
+    if REPORT_DB_TABLES["resolution"] not in existing:
+        to_create.append(("resolution", ddl_resolution))
 
     fk_constraints = [
         (REPORT_DB_TABLES["detail"], "FK_DIFF_REPORT_DETAIL_SUMMARY"),
@@ -25881,10 +25970,12 @@ def _scan_report_file(path: Path) -> Tuple[int, str]:
 
 def _infer_report_artifact_type(rel_path: str) -> str:
     name = Path(rel_path).name
-    if name.startswith("report_"):
-        return "REPORT_MAIN"
     if name.startswith("report_index_"):
         return "REPORT_INDEX"
+    if name.startswith("report_sql_"):
+        return "REPORT_SQL_TEMPLATE"
+    if name.startswith("report_"):
+        return "REPORT_MAIN"
     if name.startswith("missing_objects_detail_"):
         return "MISSING_DETAIL"
     if name.startswith("unsupported_objects_detail_"):
@@ -25945,6 +26036,8 @@ def _infer_artifact_status(
                          "BLACKLIST_TABLES", "FIXUP_SKIP_SUMMARY", "OMS_MISSING_RULES"}:
         return ("IN_DB", "") if store_scope == "full" else ("TXT_ONLY", "")
     if artifact_type == "REPORT_INDEX":
+        return "TXT_ONLY", ""
+    if artifact_type == "REPORT_SQL_TEMPLATE":
         return "TXT_ONLY", ""
     return ("IN_DB", "") if store_scope == "full" else ("TXT_ONLY", "")
 
@@ -26367,6 +26460,14 @@ def _insert_report_detail_rows(
         ok, _out, err = obclient_run_sql_commit(ob_cfg, insert_sql)
         if not ok:
             log.warning("[REPORT_DB] INSERT ALL 失败，回退单行插入: %s", err)
+            _record_report_db_write_error(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                REPORT_DB_TABLES["detail"],
+                insert_sql,
+                err
+            )
             ok_all = False
             for row in batch:
                 insert_sql = _build_report_detail_insert_all(schema_prefix, report_id, [row])
@@ -26376,6 +26477,14 @@ def _insert_report_detail_rows(
                 if not ok_single:
                     ok_all = False
                     log.warning("[REPORT_DB] 单行写入失败: %s", err_single)
+                    _record_report_db_write_error(
+                        ob_cfg,
+                        schema_prefix,
+                        report_id,
+                        REPORT_DB_TABLES["detail"],
+                        insert_sql,
+                        err_single
+                    )
     return ok_all
 
 
@@ -26420,6 +26529,14 @@ def _insert_report_detail_item_rows(
         if not ok:
             ok_all = False
             log.warning("[REPORT_DB] DETAIL_ITEM 批量写入失败: %s", err)
+            _record_report_db_write_error(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                REPORT_DB_TABLES["detail_item"],
+                insert_sql,
+                err
+            )
     return ok_all
 
 
@@ -26455,6 +26572,14 @@ def _insert_report_usability_rows(
         if not ok:
             ok_all = False
             log.warning("[REPORT_DB] 写入 usability 失败: %s", err)
+            _record_report_db_write_error(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                REPORT_DB_TABLES["usability"],
+                insert_sql,
+                err
+            )
     return ok_all
 
 
@@ -26497,6 +26622,14 @@ def _insert_report_package_compare_rows(
         if not ok:
             ok_all = False
             log.warning("[REPORT_DB] 写入 package_compare 失败: %s", err)
+            _record_report_db_write_error(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                REPORT_DB_TABLES["package_compare"],
+                insert_sql,
+                err
+            )
     return ok_all
 
 
@@ -26537,6 +26670,14 @@ def _insert_report_trigger_status_rows(
         if not ok:
             ok_all = False
             log.warning("[REPORT_DB] 写入 trigger_status 失败: %s", err)
+            _record_report_db_write_error(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                REPORT_DB_TABLES["trigger_status"],
+                insert_sql,
+                err
+            )
     return ok_all
 
 
@@ -26572,6 +26713,14 @@ def _insert_report_artifact_rows(
         if not ok:
             ok_all = False
             log.warning("[REPORT_DB] 写入 artifact 失败: %s", err)
+            _record_report_db_write_error(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                REPORT_DB_TABLES["artifact"],
+                insert_sql,
+                err
+            )
     return ok_all
 
 
@@ -26611,6 +26760,14 @@ def _insert_report_dependency_rows(
         if not ok:
             ok_all = False
             log.warning("[REPORT_DB] 写入 dependency 失败: %s", err)
+            _record_report_db_write_error(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                REPORT_DB_TABLES["dependency"],
+                insert_sql,
+                err
+            )
     return ok_all
 
 
@@ -26651,6 +26808,14 @@ def _insert_report_view_chain_rows(
         if not ok:
             ok_all = False
             log.warning("[REPORT_DB] 写入 view_chain 失败: %s", err)
+            _record_report_db_write_error(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                REPORT_DB_TABLES["view_chain"],
+                insert_sql,
+                err
+            )
     return ok_all
 
 
@@ -26687,6 +26852,14 @@ def _insert_report_remap_conflict_rows(
         if not ok:
             ok_all = False
             log.warning("[REPORT_DB] 写入 remap_conflict 失败: %s", err)
+            _record_report_db_write_error(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                REPORT_DB_TABLES["remap_conflict"],
+                insert_sql,
+                err
+            )
     return ok_all
 
 
@@ -26721,6 +26894,14 @@ def _insert_report_object_mapping_rows(
         if not ok:
             ok_all = False
             log.warning("[REPORT_DB] 写入 object_mapping 失败: %s", err)
+            _record_report_db_write_error(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                REPORT_DB_TABLES["object_mapping"],
+                insert_sql,
+                err
+            )
     return ok_all
 
 
@@ -26759,6 +26940,14 @@ def _insert_report_blacklist_rows(
         if not ok:
             ok_all = False
             log.warning("[REPORT_DB] 写入 blacklist 失败: %s", err)
+            _record_report_db_write_error(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                REPORT_DB_TABLES["blacklist"],
+                insert_sql,
+                err
+            )
     return ok_all
 
 
@@ -26793,6 +26982,14 @@ def _insert_report_fixup_skip_rows(
         if not ok:
             ok_all = False
             log.warning("[REPORT_DB] 写入 fixup_skip 失败: %s", err)
+            _record_report_db_write_error(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                REPORT_DB_TABLES["fixup_skip"],
+                insert_sql,
+                err
+            )
     return ok_all
 
 
@@ -26827,6 +27024,14 @@ def _insert_report_oms_missing_rows(
         if not ok:
             ok_all = False
             log.warning("[REPORT_DB] 写入 oms_missing 失败: %s", err)
+            _record_report_db_write_error(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                REPORT_DB_TABLES["oms_missing"],
+                insert_sql,
+                err
+            )
     return ok_all
 
 
@@ -26931,6 +27136,14 @@ def _insert_report_grant_rows(
         if not ok:
             ok_all = False
             log.warning("[REPORT_DB] GRANT 批量写入失败: %s", err)
+            _record_report_db_write_error(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                REPORT_DB_TABLES["grants"],
+                insert_sql,
+                err
+            )
     return ok_all
 
 
@@ -26992,7 +27205,316 @@ def _insert_report_counts_rows(
         if not ok:
             ok_all = False
             log.warning("[REPORT_DB] COUNT 批量写入失败: %s", err)
+            _record_report_db_write_error(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                REPORT_DB_TABLES["counts"],
+                insert_sql,
+                err
+            )
     return ok_all
+
+
+
+def _build_report_db_view_ddls(schema_prefix: str) -> Dict[str, str]:
+    detail = f"{schema_prefix}{REPORT_DB_TABLES['detail']}"
+    grants = f"{schema_prefix}{REPORT_DB_TABLES['grants']}"
+    usability = f"{schema_prefix}{REPORT_DB_TABLES['usability']}"
+    summary = f"{schema_prefix}{REPORT_DB_TABLES['summary']}"
+    counts = f"{schema_prefix}{REPORT_DB_TABLES['counts']}"
+    blacklist = f"{schema_prefix}{REPORT_DB_TABLES['blacklist']}"
+    resolution = f"{schema_prefix}{REPORT_DB_TABLES['resolution']}"
+
+    actions_view = f"{schema_prefix}{REPORT_DB_VIEWS['actions']}"
+    object_profile_view = f"{schema_prefix}{REPORT_DB_VIEWS['object_profile']}"
+    trends_view = f"{schema_prefix}{REPORT_DB_VIEWS['trends']}"
+    pending_actions_view = f"{schema_prefix}{REPORT_DB_VIEWS['pending_actions']}"
+    grant_class_view = f"{schema_prefix}{REPORT_DB_VIEWS['grant_class']}"
+    usability_class_view = f"{schema_prefix}{REPORT_DB_VIEWS['usability_class']}"
+
+    ddls: Dict[str, str] = {}
+    ddls[actions_view] = f"""
+CREATE OR REPLACE VIEW {actions_view} AS
+SELECT report_id,
+       'FIXUP' AS action_type,
+       object_type,
+       source_schema AS schema_name,
+       source_name AS object_name,
+       target_schema,
+       target_name,
+       report_type,
+       status,
+       reason
+  FROM {detail}
+ WHERE report_type IN ('MISSING','MISMATCHED')
+   AND (status IS NULL OR status NOT IN ('UNSUPPORTED','BLOCKED'))
+UNION ALL
+SELECT report_id,
+       'REFACTOR' AS action_type,
+       object_type,
+       source_schema,
+       source_name,
+       target_schema,
+       target_name,
+       report_type,
+       status,
+       reason
+  FROM {detail}
+ WHERE report_type = 'UNSUPPORTED'
+   AND status = 'UNSUPPORTED'
+UNION ALL
+SELECT report_id,
+       'DEPENDENCY' AS action_type,
+       object_type,
+       source_schema,
+       source_name,
+       target_schema,
+       target_name,
+       report_type,
+       status,
+       reason
+  FROM {detail}
+ WHERE report_type = 'UNSUPPORTED'
+   AND status = 'BLOCKED'
+UNION ALL
+SELECT report_id,
+       'GRANT_REQUIRED' AS action_type,
+       target_type AS object_type,
+       target_schema AS schema_name,
+       target_name AS object_name,
+       target_schema,
+       target_name,
+       'GRANT' AS report_type,
+       status,
+       NVL(filter_reason, privilege) AS reason
+  FROM {grants}
+ WHERE status = 'MISSING'
+UNION ALL
+SELECT report_id,
+       'VERIFY' AS action_type,
+       object_type,
+       schema_name,
+       object_name,
+       NULL AS target_schema,
+       NULL AS target_name,
+       'USABILITY' AS report_type,
+       status,
+       reason
+  FROM {usability}
+ WHERE status <> 'OK'
+"""
+
+    ddls[object_profile_view] = f"""
+CREATE OR REPLACE VIEW {object_profile_view} AS
+SELECT d.report_id,
+       d.object_type,
+       d.source_schema,
+       d.source_name,
+       d.target_schema,
+       d.target_name,
+       d.report_type,
+       d.status AS detail_status,
+       d.reason AS detail_reason,
+       u.status AS usability_status,
+       u.usable AS usability_usable,
+       u.reason AS usability_reason,
+       b.black_type AS blacklist_type,
+       b.status AS blacklist_status,
+       b.reason AS blacklist_reason
+  FROM {detail} d
+  LEFT JOIN {usability} u
+    ON u.report_id = d.report_id
+   AND u.object_type = d.object_type
+   AND u.schema_name = d.target_schema
+   AND u.object_name = d.target_name
+  LEFT JOIN {blacklist} b
+    ON b.report_id = d.report_id
+   AND b.schema_name = d.source_schema
+   AND b.table_name = d.source_name
+"""
+
+    ddls[trends_view] = f"""
+CREATE OR REPLACE VIEW {trends_view} AS
+SELECT s.report_id,
+       s.run_timestamp,
+       s.tool_version,
+       c.object_type,
+       c.oracle_count,
+       c.oceanbase_count,
+       c.missing_count,
+       c.unsupported_count,
+       c.extra_count
+  FROM {summary} s
+  JOIN {counts} c
+    ON s.report_id = c.report_id
+"""
+
+    ddls[pending_actions_view] = f"""
+CREATE OR REPLACE VIEW {pending_actions_view} AS
+SELECT a.report_id,
+       a.action_type,
+       a.object_type,
+       a.schema_name,
+       a.object_name,
+       a.target_schema,
+       a.target_name,
+       a.report_type,
+       a.status,
+       a.reason,
+       r.resolution_status,
+       r.resolved_by,
+       r.resolved_at,
+       r.note
+  FROM {actions_view} a
+  LEFT JOIN {resolution} r
+    ON r.report_id = a.report_id
+   AND r.object_type = a.object_type
+   AND r.schema_name = a.schema_name
+   AND r.object_name = a.object_name
+   AND r.action_type = a.action_type
+ WHERE NVL(r.resolution_status, 'OPEN') NOT IN ('RESOLVED','CLOSED')
+"""
+
+    ddls[grant_class_view] = f"""
+CREATE OR REPLACE VIEW {grant_class_view} AS
+SELECT report_id,
+       grant_type,
+       grantee,
+       grantor,
+       privilege,
+       target_schema,
+       target_name,
+       target_type,
+       with_grant_option,
+       status,
+       filter_reason,
+       CASE
+         WHEN status = 'MISSING' AND with_grant_option = 1 THEN 'MISSING_WITH_GRANT_OPTION'
+         WHEN status = 'MISSING' THEN 'MISSING'
+         WHEN status = 'EXTRA' THEN 'EXTRA'
+         WHEN status = 'FILTERED' THEN 'FILTERED'
+         WHEN status IS NULL THEN 'UNKNOWN'
+         ELSE status
+       END AS grant_class
+  FROM {grants}
+"""
+
+    ddls[usability_class_view] = f"""
+CREATE OR REPLACE VIEW {usability_class_view} AS
+SELECT report_id,
+       object_type,
+       schema_name,
+       object_name,
+       usable,
+       status,
+       reason,
+       CASE
+         WHEN status = 'OK' OR usable = 1 THEN 'OK'
+         WHEN reason IS NULL THEN 'UNKNOWN'
+         WHEN INSTR(UPPER(reason), 'ORA-00942') > 0
+              OR INSTR(UPPER(reason), 'NOT EXIST') > 0
+              OR INSTR(UPPER(reason), 'NO SUCH TABLE') > 0 THEN 'NOT_FOUND'
+         WHEN INSTR(UPPER(reason), 'ORA-01031') > 0
+              OR INSTR(UPPER(reason), 'INSUFFICIENT') > 0
+              OR INSTR(UPPER(reason), 'PERMISSION') > 0 THEN 'PERMISSION'
+         WHEN INSTR(UPPER(reason), 'ORA-00900') > 0
+              OR INSTR(UPPER(reason), 'ORA-00933') > 0
+              OR INSTR(UPPER(reason), 'ORA-00936') > 0
+              OR INSTR(UPPER(reason), 'ORA-00904') > 0 THEN 'SYNTAX'
+         WHEN INSTR(UPPER(reason), 'TIMEOUT') > 0
+              OR INSTR(UPPER(reason), 'TIMED OUT') > 0 THEN 'TIMEOUT'
+         WHEN INSTR(UPPER(reason), 'LOOPING CHAIN') > 0 THEN 'SYNONYM_LOOP'
+         WHEN INSTR(UPPER(reason), 'DEPEND') > 0
+              OR INSTR(UPPER(reason), 'BLOCK') > 0 THEN 'DEPENDENCY'
+         ELSE 'OTHER'
+       END AS reason_class
+  FROM {usability}
+"""
+    return ddls
+
+
+def ensure_report_db_views_exist(
+    ob_cfg: ObConfig,
+    settings: Dict
+) -> List[Dict[str, object]]:
+    artifacts: List[Dict[str, object]] = []
+    store_scope = settings.get("report_db_store_scope", "full")
+    schema_prefix = build_report_db_schema_prefix(settings)
+    ddls = _build_report_db_view_ddls(schema_prefix)
+    if store_scope not in {"core", "full"}:
+        for view_name in ddls:
+            artifacts.append({
+                "artifact_type": "REPORT_DB_VIEW",
+                "file_path": view_name,
+                "file_hash": "",
+                "row_count": 0,
+                "field_list": "",
+                "status": "SKIPPED",
+                "note": "store_scope=summary"
+            })
+        return artifacts
+
+    for view_name, ddl in ddls.items():
+        ok, _out, err = obclient_run_sql_commit(ob_cfg, ddl)
+        if ok:
+            artifacts.append({
+                "artifact_type": "REPORT_DB_VIEW",
+                "file_path": view_name,
+                "file_hash": "",
+                "row_count": 0,
+                "field_list": "",
+                "status": "IN_DB",
+                "note": ""
+            })
+        else:
+            note = normalize_error_text(err or "")
+            if len(note) > 900:
+                note = note[:900] + "..."
+            artifacts.append({
+                "artifact_type": "REPORT_DB_VIEW",
+                "file_path": view_name,
+                "file_hash": "",
+                "row_count": 0,
+                "field_list": "",
+                "status": "FAILED",
+                "note": note
+            })
+    return artifacts
+
+
+def _render_report_sql_template(content: str, report_id: str) -> str:
+    if not content:
+        return ""
+    rendered = content.replace(":report_id", f"'{report_id}'")
+    return f"# report_id={report_id}\n{rendered}"
+
+
+def build_report_sql_template_file(
+    report_dir: Optional[Path],
+    report_timestamp: str,
+    report_id: str
+) -> Optional[Path]:
+    if not report_dir:
+        return None
+    how_to = Path(__file__).resolve().parent / "HOW_TO_READ_REPORTS_IN_OB.txt"
+    if not how_to.exists():
+        return None
+    try:
+        content = how_to.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    rendered = _render_report_sql_template(content, report_id)
+    if not rendered:
+        return None
+    output = report_dir / f"report_sql_{report_timestamp}.txt"
+    try:
+        output.write_text(rendered, encoding="utf-8")
+    except OSError:
+        return None
+    return output
+
+
 
 
 def save_report_to_db(
@@ -27049,6 +27571,12 @@ def save_report_to_db(
     skipped_count = len(tv_results.get("skipped", []))
     unsupported_count = len(support_summary.unsupported_rows) if support_summary else 0
     unsupported_by_type = build_unsupported_summary_counts(support_summary, extra_results)
+
+    # SQL template file (pre-filled report_id) for DB report queries
+    build_report_sql_template_file(report_dir, report_timestamp, report_id)
+
+    # Ensure analytic views exist (read-only, report DB)
+    view_artifacts = ensure_report_db_views_exist(ob_cfg, settings)
 
     index_missing_total = sum(len(item.missing_indexes) for item in extra_results.get("index_mismatched", []))
     index_mismatch_total = len(extra_results.get("index_mismatched", []))
@@ -27159,6 +27687,14 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
     ok, _out, err = obclient_run_sql_commit(ob_cfg, insert_sql)
     if not ok:
         log.error("[REPORT_DB] 写入主报告失败: %s", err)
+        _record_report_db_write_error(
+            ob_cfg,
+            schema_prefix,
+            report_id,
+            REPORT_DB_TABLES["summary"],
+            insert_sql,
+            err
+        )
         if settings.get("report_db_fail_abort"):
             return False, err
         return True, report_id
@@ -27187,6 +27723,8 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
             _insert_report_trigger_status_rows(ob_cfg, schema_prefix, report_id, trigger_rows, batch_size)
 
     artifact_rows = _build_report_artifact_rows(report_dir, store_scope, detail_modes, detail_truncated)
+    if view_artifacts:
+        artifact_rows.extend(view_artifacts)
     if artifact_rows:
         _insert_report_artifact_rows(ob_cfg, schema_prefix, report_id, artifact_rows, batch_size)
 

@@ -123,11 +123,16 @@
 
 ### 5.3 报告存库（默认开启，obclient）
 - `report_to_db=true` 后，会将报告写入 OceanBase（仅 obclient；不影响本地报告文件）。
+- 运行后会在 run 目录输出 `report_sql_<timestamp>.txt`（预填 report_id 的 SQL 模板）。
+- 当 `report_db_store_scope=core/full` 时，会尝试创建只读分析视图：
+  `DIFF_REPORT_ACTIONS_V` / `DIFF_REPORT_OBJECT_PROFILE_V` / `DIFF_REPORT_TRENDS_V`
+  `DIFF_REPORT_PENDING_ACTIONS_V` / `DIFF_REPORT_GRANT_CLASS_V` / `DIFF_REPORT_USABILITY_CLASS_V`。
 - 支持 `report_db_schema` 指定存储 schema；留空使用目标连接用户。
 - 写库范围由 `report_db_store_scope` 控制：
   - `summary`：仅写入 SUMMARY / COUNTS
   - `core`：summary + DETAIL / GRANT / USABILITY / PACKAGE / TRIGGER
   - `full`：core + ARTIFACT / DEPENDENCY / VIEW_CHAIN / REMAP_CONFLICT / OBJECT_MAPPING / BLACKLIST / FIXUP_SKIP / OMS_MISSING
+  - `DIFF_REPORT_WRITE_ERRORS` / `DIFF_REPORT_RESOLUTION` 为写库追踪与闭环表，report_to_db 启用后默认创建
 - 明细范围与规模控制：
   - `report_db_detail_mode=missing,mismatched,unsupported`（建议保留核心差异）
   - `report_db_detail_max_rows=0`（不限制；按需设置）
@@ -149,6 +154,8 @@
   - `DIFF_REPORT_BLACKLIST`（黑名单明细）
   - `DIFF_REPORT_FIXUP_SKIP`（fixup 跳过汇总）
   - `DIFF_REPORT_OMS_MISSING`（OMS 缺失规则映射）
+  - `DIFF_REPORT_WRITE_ERRORS`（写库失败追踪）
+  - `DIFF_REPORT_RESOLUTION`（整改闭环标记）
 - 缺失/不支持明细无需额外表，使用 `DIFF_REPORT_DETAIL` 按 `report_type/object_type` 查询。
 
 示例查询：
