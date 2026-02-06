@@ -3,36 +3,49 @@
   "rules": [
     {
       "id": "DIY_TYPES",
+      "enabled": true,
       "black_type": "DIY",
       "sql": "SELECT c.owner, c.table_name, c.data_type, 'DIY' AS black_type\nFROM dba_tab_columns c\nJOIN dba_types t ON c.data_type = t.type_name AND c.data_type_owner = t.owner\nWHERE t.owner <> 'SYS'\n  AND c.owner IN ({{owners_clause}})"
     },
     {
       "id": "UNSUPPORTED_TYPES",
+      "enabled": true,
       "black_type": "SPE",
       "sql": "SELECT owner, table_name, data_type, 'SPE' AS black_type\nFROM dba_tab_columns\nWHERE owner IN ({{owners_clause}})\n  AND data_type IN ('ROWID','BFILE','XMLTYPE','UROWID','UNDEFINED','UDT','ANYDATA')"
     },
     {
       "id": "LONG_TYPES",
+      "enabled": true,
       "black_type": "LONG",
       "sql": "SELECT owner, table_name, data_type, 'LONG' AS black_type\nFROM dba_tab_columns\nWHERE owner IN ({{owners_clause}})\n  AND data_type IN ('LONG','LONG RAW')"
     },
     {
       "id": "LOB_OVERSIZE",
+      "enabled": true,
       "black_type": "LOB_OVERSIZE",
       "sql": "SELECT t.owner, t.table_name, t.data_type, 'LOB_OVERSIZE' AS black_type\nFROM dba_segments a\nJOIN dba_lobs b ON a.owner = b.owner AND a.segment_name = b.segment_name\nJOIN dba_tab_columns t ON b.owner = t.owner AND b.table_name = t.table_name AND b.column_name = t.column_name\nWHERE t.data_type IN ('CLOB','BLOB')\n  AND t.owner IN ({{owners_clause}})\nGROUP BY t.owner, t.table_name, t.column_name, t.data_type, a.segment_name, a.segment_type\nHAVING SUM(a.bytes) / 1024 / 1024 > {{lob_max_mb}}"
     },
     {
+      "id": "RENAME_TABLES",
+      "enabled": true,
+      "black_type": "NAME_PATTERN",
+      "sql": "SELECT owner, table_name, 'NAME_PATTERN' AS data_type, 'NAME_PATTERN' AS black_type\nFROM dba_tables\nWHERE owner IN ({{owners_clause}})\n  AND ({{name_pattern_clause}})"
+    },
+    {
       "id": "TEMPORARY_TABLES",
+      "enabled": true,
       "black_type": "TEMPORARY_TABLE",
       "sql": "SELECT t.owner, t.table_name, 'TEMPORARY' AS data_type, 'TEMPORARY_TABLE' AS black_type\nFROM dba_tables t\nJOIN dba_users u ON t.owner = u.username\nWHERE t.temporary = 'Y'\n  AND u.oracle_maintained = 'N'\n  AND t.owner IN ({{owners_clause}})"
     },
     {
       "id": "EXTERNAL_TABLES",
+      "enabled": true,
       "black_type": "DBLINK",
       "sql": "SELECT owner, table_name, 'DBLINK' AS data_type, 'DBLINK' AS black_type\nFROM dba_external_tables\nWHERE owner IN ({{owners_clause}})"
     },
     {
       "id": "IOT_TABLES",
+      "enabled": true,
       "black_type": "DBLINK",
       "sql": "SELECT owner, table_name, 'IOT' AS data_type, 'DBLINK' AS black_type\nFROM dba_tables\nWHERE iot_type IS NOT NULL\n  AND owner IN ({{owners_clause}})"
     }

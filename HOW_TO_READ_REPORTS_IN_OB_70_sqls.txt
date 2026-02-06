@@ -229,6 +229,7 @@ SELECT source_schema, source_name, target_schema, target_name, object_type, reas
  ORDER BY object_type, target_schema, target_name;
 
 -- 明细行化（逐项查询，report_db_store_scope=full 推荐）
+-- 说明：同一对象会拆成多行（item_type=ROOT_CAUSE/ACTION/DEPENDENCY/DETAIL 等），属正常设计。
 SELECT report_type, object_type,
        source_schema, source_name, target_schema, target_name,
        item_type, item_key, src_value, tgt_value, item_value, status
@@ -236,16 +237,32 @@ SELECT report_type, object_type,
  WHERE report_id = :report_id
  ORDER BY object_type, item_type, source_schema, source_name;
 
+-- 明细聚合到单行（便于阅读，LISTAGG 可能遇到长度限制）
+SELECT report_type, object_type, source_schema, source_name,
+       LISTAGG(
+           item_type || ':' ||
+           COALESCE(item_key, '-') ||
+           CASE WHEN item_value IS NOT NULL THEN '=' || item_value ELSE '' END,
+           ' | '
+       ) WITHIN GROUP (ORDER BY item_type, item_key) AS items
+  FROM DIFF_REPORT_DETAIL_ITEM
+ WHERE report_id = :report_id
+ GROUP BY report_type, object_type, source_schema, source_name
+ ORDER BY report_type, object_type, source_schema, source_name;
+
 -- 目标端多余对象（主对象，排除同义词，基于映射反查）
 WITH expected AS (
   SELECT UPPER(tgt_schema) AS owner, UPPER(tgt_name) AS name, UPPER(object_type) AS object_type
     FROM DIFF_REPORT_OBJECT_MAPPING
    WHERE report_id = :report_id
 ),
+owners AS (
+  SELECT DISTINCT owner FROM expected
+),
 actual AS (
   SELECT UPPER(owner) AS owner, UPPER(object_name) AS name, UPPER(object_type) AS object_type
     FROM DBA_OBJECTS
-   WHERE UPPER(owner) IN ('SCHEMA1','SCHEMA2')
+   WHERE UPPER(owner) IN (SELECT owner FROM owners)
      AND UPPER(object_type) IN ('TABLE','VIEW','PROCEDURE','FUNCTION','PACKAGE','PACKAGE BODY','TYPE','TYPE BODY')
 )
 SELECT a.owner, a.object_type, a.name
@@ -472,7 +489,7 @@ SELECT u.schema_name, u.object_name, u.status, u.reason,
    AND u.status <> 'OK'
  ORDER BY u.status, u.schema_name, u.object_name;
 
--- 目标端多出的同义词（PUBLIC -> __public 映射）
+-- 目标端多出的同义词（PUBLIC -> __public 映射，大小写不敏感）
 WITH expected AS (
   SELECT CASE
            WHEN UPPER(tgt_schema) = 'PUBLIC' THEN '__PUBLIC'
@@ -483,12 +500,15 @@ WITH expected AS (
    WHERE report_id = :report_id
      AND object_type = 'SYNONYM'
 ),
+owners AS (
+  SELECT DISTINCT owner FROM expected
+),
 actual AS (
   SELECT UPPER(owner) AS owner,
          UPPER(synonym_name) AS name,
          table_owner, table_name
     FROM DBA_SYNONYMS
-   WHERE UPPER(owner) IN ('__PUBLIC','SCHEMA1','SCHEMA2')
+   WHERE UPPER(owner) IN (SELECT owner FROM owners)
 )
 SELECT a.owner, a.name, a.table_owner, a.table_name
   FROM actual a

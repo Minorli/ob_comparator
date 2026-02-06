@@ -1445,7 +1445,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             "TGT",
             "T1",
             missing_cols=set(),
-            extra_cols={"SYS_C00025_2025121711:29:07$", "EXTRA1"},
+            extra_cols={"SYS_C00025_2025121711:29:07$", "SYS_C_00019$", "EXTRA1"},
             length_mismatches=[],
             type_mismatches=[],
             drop_sys_c_columns=True
@@ -1454,6 +1454,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn('ALTER TABLE "TGT"."T1" FORCE;', sql)
         self.assertIn('-- ALTER TABLE "TGT"."T1" DROP COLUMN EXTRA1;', sql)
         self.assertNotIn('DROP COLUMN SYS_C00025', sql)
+        self.assertNotIn('DROP COLUMN SYS_C_00019', sql)
 
     def test_generate_alter_for_table_columns_sys_c_drop_disabled(self):
         oracle_meta = self._make_oracle_meta_with_columns({("SRC", "T1"): {}})
@@ -5066,6 +5067,12 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
                     "id": "SAMPLE",
                     "black_type": "SPE",
                     "sql": "SELECT OWNER, TABLE_NAME, DATA_TYPE, 'SPE' FROM DBA_TAB_COLUMNS WHERE OWNER IN ({{owners_clause}})"
+                },
+                {
+                    "id": "SAMPLE_DISABLED",
+                    "tag": "disabled",
+                    "black_type": "SPE",
+                    "sql": "SELECT OWNER, TABLE_NAME, DATA_TYPE, 'SPE' FROM DBA_TAB_COLUMNS WHERE OWNER IN ({{owners_clause}})"
                 }
             ]
         }
@@ -5076,8 +5083,11 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             rules = sdr.load_blacklist_rules(path)
         finally:
             Path(path).unlink(missing_ok=True)
-        self.assertEqual(len(rules), 1)
+        self.assertEqual(len(rules), 2)
         self.assertEqual(rules[0].rule_id, "SAMPLE")
+        self.assertTrue(rules[0].enabled)
+        self.assertEqual(rules[1].rule_id, "SAMPLE_DISABLED")
+        self.assertFalse(rules[1].enabled)
 
     def test_blacklist_rule_enable_disable_and_version(self):
         rule = sdr.BlacklistRule(
@@ -5103,6 +5113,23 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         enabled, reason = sdr.is_blacklist_rule_enabled(rule, {"R2"}, set(), "4.2.5.7")
         self.assertFalse(enabled)
         self.assertEqual(reason, "not_in_enable_set")
+
+    def test_build_blacklist_name_pattern_clause(self):
+        clause = sdr.build_blacklist_name_pattern_clause(["_RENAME", "AB%C", "X!Y"])
+        self.assertIn("UPPER(TABLE_NAME) LIKE '%!_RENAME%'", clause)
+        self.assertIn("UPPER(TABLE_NAME) LIKE '%AB!%C%'", clause)
+        self.assertIn("UPPER(TABLE_NAME) LIKE '%X!!Y%'", clause)
+        self.assertIn("ESCAPE '!'", clause)
+
+    def test_load_blacklist_name_patterns_inline_and_file(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as handle:
+            handle.write("#comment\n_RENAME\n;\n  \nAA_BB\n")
+            path = handle.name
+        try:
+            patterns = sdr.load_blacklist_name_patterns("_rename, cc_dd", path)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        self.assertEqual(patterns, ["_rename", "cc_dd", "AA_BB"])
 
     def test_clean_interval_partition_clause(self):
         ddl = (

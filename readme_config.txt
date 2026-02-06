@@ -124,8 +124,13 @@
   可选值：auto（TMP_BLACK_TABLE + 规则文件）、table_only、rules_only、disabled。
 - blacklist_rules_path：黑名单规则 JSON 路径。默认：blacklist_rules.json（内置规则）。
   注意：blacklist_mode=auto/rules_only 时需确保该文件随工具部署，否则规则将被跳过。
+  规则文件说明：每条 rule 使用 `enabled`（true/false）控制是否启用；程序兼容旧 `tag`（enabled/disabled）字段。运行时还会叠加 blacklist_rules_enable / blacklist_rules_disable。
 - blacklist_rules_enable：仅启用指定规则（逗号分隔）。默认：空（全量规则）。
 - blacklist_rules_disable：禁用指定规则（逗号分隔）。默认：空。
+- blacklist_name_patterns：表名黑名单关键字（逗号分隔，字面包含匹配）。默认：_RENAME。
+  说明：会自动转义 `%/_/!`，避免被当作通配符；命中后 black_type=NAME_PATTERN。
+- blacklist_name_patterns_file：表名黑名单关键字文件（每行一个关键字，支持 #/; 注释）。默认：空。
+- blacklist_name_patterns 与 blacklist_name_patterns_file：会合并去重；用于渲染规则中的 `{{name_pattern_clause}}`。
 - blacklist_lob_max_mb：LOB 体积阈值（MB），超过则标记为 LOB_OVERSIZE。默认：512。
 
 修补脚本生成（Fixup）

@@ -23,5 +23,5 @@
 ## Impact
 - Affected specs: `export-reports`, `configuration-control`
 - Affected code: `schema_diff_reconciler.py`（report_db 写库扩展、工件目录、数据落地逻辑）
-- Affected docs: `readme_config.txt`, `docs/ADVANCED_USAGE.md`, `HOW_TO_READ_REPORTS_IN_OB_67_sqls.txt`
+- Affected docs: `readme_config.txt`, `docs/ADVANCED_USAGE.md`, `HOW_TO_READ_REPORTS_IN_OB_70_sqls.txt`
 - Non-breaking: 默认行为保持一致（report_to_db=true 时扩展写库；report_to_db=false 不影响 TXT 报告）

@@ -219,11 +219,16 @@ column_visibility_policy = auto
 blacklist_mode          = auto
 # 黑名单规则文件（JSON），留空使用内置默认
 # 注意：blacklist_mode=auto/rules_only 时需保证该文件随工具一同部署，否则规则会被跳过
+# 规则级开关：blacklist_rules.json 每条 rule 使用 enabled=true/false（程序兼容旧 tag 字段）
 blacklist_rules_path    = blacklist_rules.json
 # 仅启用指定规则（逗号分隔，留空表示全量）
 blacklist_rules_enable  =
 # 禁用指定规则（逗号分隔）
 blacklist_rules_disable =
+# 表名黑名单关键字（逗号分隔，按“字面包含”匹配；默认命中 *_RENAME*）
+blacklist_name_patterns = _RENAME
+# 表名黑名单关键字文件（每行一个关键字；支持 #/; 注释）
+blacklist_name_patterns_file =
 # LOB 体积阈值（MB）；超过阈值则标记为 LOB_OVERSIZE
 blacklist_lob_max_mb    = 512
 # 是否启用 schema 推导（一对多场景下用于非表对象）

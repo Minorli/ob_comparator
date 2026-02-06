@@ -8,7 +8,7 @@
 - 新增 report_db_store_scope 与 report_db_detail_item_enable 配置
 - 新增报告分析视图（ACTIONS / OBJECT_PROFILE / TRENDS / PENDING_ACTIONS / GRANT_CLASS / USABILITY_CLASS）
 - 新增写库失败追踪与闭环表（WRITE_ERRORS / RESOLUTION）
-- HOW_TO_READ_REPORTS_IN_OB_67_sqls.txt SQL 校验修正与完善
+- HOW_TO_READ_REPORTS_IN_OB_70_sqls.txt SQL 校验修正与完善
 
 ## [未发布]
 

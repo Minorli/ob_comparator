@@ -86,7 +86,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple, Union
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
 __version__ = "0.9.8.3"
 __author__ = "Minor Li"
@@ -765,7 +765,9 @@ BLACKLIST_REASON_BY_TYPE: Dict[str, str] = {
     'DIY': "表中字段存在自定义类型，不支持创建，不需要生成DDL",
     'LOB_OVERSIZE': "表中存在的LOB字段体积超过512 MiB，可以在目标端创建表，但是 OMS 不支持同步",
     'LONG': "LONG/LONG RAW 需转换为 CLOB/BLOB",
-    'DBLINK': "源表可能是 IOT 表或者外部表，不需要生成DDL"
+    'DBLINK': "源表可能是 IOT 表或者外部表，不需要生成DDL",
+    'NAME_PATTERN': "表名命中黑名单关键字规则，建议排除迁移或人工确认",
+    'RENAME': "表名命中黑名单关键字规则，建议排除迁移或人工确认",
 }
 BLACKLIST_MODES: Set[str] = {"auto", "table_only", "rules_only", "disabled"}
 DEFAULT_BLACKLIST_RULES_PATH = str(Path(__file__).resolve().parent / "blacklist_rules.json")
@@ -884,7 +886,7 @@ SYS_NC_COLUMN_PATTERNS = (
 )
 # SYS_C* 可能带 $ 或其他后缀（目标端内部列），用前缀匹配避免漏判
 SYS_C_COLUMN_PATTERNS = (
-    re.compile(r"^SYS_C\d+", re.IGNORECASE),
+    re.compile(r"^SYS_C_?\d+", re.IGNORECASE),
 )
 NOISE_REASON_AUTO_COLUMN = "AUTO_COLUMN"
 NOISE_REASON_AUTO_SEQUENCE = "AUTO_SEQUENCE"
@@ -925,8 +927,13 @@ def is_sys_c_column_name(name: Optional[str]) -> bool:
         return False
     if any(pattern.match(name_u) for pattern in SYS_C_COLUMN_PATTERNS):
         return True
-    # 兜底：SYS_C + 数字开头（后缀可能包含时间戳等特殊字符）
-    return name_u.startswith("SYS_C") and len(name_u) > 5 and name_u[5].isdigit()
+    # 兜底：SYS_C 后面必须尽快出现数字（避免误伤 SYS_CUSTOMER 等业务列）
+    if not name_u.startswith("SYS_C"):
+        return False
+    probe = name_u[5:]
+    if probe.startswith("_"):
+        probe = probe[1:]
+    return bool(probe) and probe[0].isdigit()
 
 
 def classify_noise_column(name: Optional[str]) -> Optional[str]:
@@ -1100,6 +1107,8 @@ def summarize_blacklist_entries(
     prefer_order = [
         "TEMPORARY_TABLE",
         "TEMP_TABLE",
+        "NAME_PATTERN",
+        "RENAME",
         "SPE",
         "DIY",
         "LONG",
@@ -1902,6 +1911,69 @@ def parse_csv_set(raw_value: Optional[str]) -> Set[str]:
     return {item.strip().upper() for item in str(raw_value).split(',') if item.strip()}
 
 
+def parse_csv_list(raw_value: Optional[str]) -> List[str]:
+    if not raw_value or not str(raw_value).strip():
+        return []
+    return [item.strip() for item in str(raw_value).split(',') if item and item.strip()]
+
+
+def parse_blacklist_rule_tag_enabled(
+    tag_value: Optional[object],
+    default_enabled: bool = True
+) -> bool:
+    raw = (str(tag_value).strip().lower() if tag_value is not None else "")
+    if not raw:
+        return default_enabled
+    if raw in ("enabled", "enable", "on", "true", "1", "yes", "y"):
+        return True
+    if raw in ("disabled", "disable", "off", "false", "0", "no", "n"):
+        return False
+    return default_enabled
+
+
+def load_blacklist_name_patterns(
+    inline_value: Optional[str],
+    file_path: Optional[str]
+) -> List[str]:
+    patterns: List[str] = []
+    seen: Set[str] = set()
+    for item in parse_csv_list(inline_value):
+        key = item.upper()
+        if key not in seen:
+            seen.add(key)
+            patterns.append(item)
+    path_raw = (file_path or "").strip()
+    if path_raw:
+        path = Path(path_raw).expanduser()
+        if path.exists():
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    token = line.strip()
+                    if not token or token.startswith('#') or token.startswith(';'):
+                        continue
+                    key = token.upper()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    patterns.append(token)
+            except OSError as exc:
+                log.debug("读取 blacklist_name_patterns_file 失败: %s (%s)", path, exc)
+    return patterns
+
+
+def build_blacklist_name_pattern_clause(patterns: Sequence[str]) -> str:
+    clauses: List[str] = []
+    for pattern in patterns:
+        token = (pattern or "").strip()
+        if not token:
+            continue
+        # 关键字按“字面包含”处理，避免 %/_ 被当作通配符
+        escaped = token.upper()
+        escaped = escaped.replace("!", "!!").replace("%", "!%").replace("_", "!_").replace("'", "''")
+        clauses.append(f"UPPER(TABLE_NAME) LIKE '%{escaped}%' ESCAPE '!'")
+    return " OR ".join(clauses)
+
+
 def parse_interval_cutoff_date(value: Optional[str]) -> Optional[datetime]:
     raw = (value or "").strip()
     if not raw:
@@ -1934,6 +2006,7 @@ class BlacklistRule(NamedTuple):
     min_ob_version: Optional[str] = None
     max_ob_version: Optional[str] = None
     enabled: bool = True
+    tag: str = ""
 
 
 def extract_ob_version_number(raw: Optional[str]) -> Optional[str]:
@@ -1976,6 +2049,12 @@ def load_blacklist_rules(path_value: Optional[str]) -> List[BlacklistRule]:
             log.warning("黑名单规则缺少 id/sql(第%s条)，已跳过。", idx)
             continue
         black_type = str(raw_rule.get("black_type") or "").strip().upper() or "UNKNOWN"
+        tag = str(raw_rule.get("tag") or "").strip()
+        enabled_raw = raw_rule.get("enabled", None)
+        if enabled_raw is None:
+            enabled = parse_blacklist_rule_tag_enabled(tag, True)
+        else:
+            enabled = parse_bool_flag(str(enabled_raw), True)
         rules.append(
             BlacklistRule(
                 rule_id=rule_id,
@@ -1983,7 +2062,8 @@ def load_blacklist_rules(path_value: Optional[str]) -> List[BlacklistRule]:
                 sql=sql,
                 min_ob_version=str(raw_rule.get("min_ob_version") or "").strip() or None,
                 max_ob_version=str(raw_rule.get("max_ob_version") or "").strip() or None,
-                enabled=bool(raw_rule.get("enabled", True)),
+                enabled=enabled,
+                tag=tag,
             )
         )
     return rules
@@ -3056,6 +3136,8 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('blacklist_rules_path', '')
         settings.setdefault('blacklist_rules_enable', '')
         settings.setdefault('blacklist_rules_disable', '')
+        settings.setdefault('blacklist_name_patterns', '_RENAME')
+        settings.setdefault('blacklist_name_patterns_file', '')
         settings.setdefault('blacklist_lob_max_mb', '512')
         settings.setdefault('infer_schema_mapping', 'true')
         settings.setdefault('ddl_punct_sanitize', 'true')
@@ -3192,6 +3274,13 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings['blacklist_rules_disable_set'] = parse_csv_set(settings.get('blacklist_rules_disable', ''))
         rules_path = (settings.get('blacklist_rules_path') or "").strip()
         settings['blacklist_rules_path'] = rules_path or DEFAULT_BLACKLIST_RULES_PATH
+        settings['blacklist_name_patterns_list'] = load_blacklist_name_patterns(
+            settings.get('blacklist_name_patterns', ''),
+            settings.get('blacklist_name_patterns_file', '')
+        )
+        settings['blacklist_name_pattern_clause'] = build_blacklist_name_pattern_clause(
+            settings.get('blacklist_name_patterns_list', [])
+        )
         try:
             settings['blacklist_lob_max_mb'] = int(settings.get('blacklist_lob_max_mb', '512'))
         except (TypeError, ValueError):
@@ -3481,6 +3570,11 @@ def validate_runtime_paths(settings: Dict, ob_cfg: ObConfig) -> None:
             warnings.append(
                 f"blacklist_rules_path 不存在: {rules_path}（将跳过黑名单规则）。"
             )
+        patterns_file = settings.get('blacklist_name_patterns_file', '').strip()
+        if patterns_file and not Path(patterns_file).expanduser().exists():
+            warnings.append(
+                f"blacklist_name_patterns_file 不存在: {patterns_file}（将仅使用 blacklist_name_patterns 内联关键字）。"
+            )
 
     # dbcat / JAVA_HOME 仅在生成 fixup 时提示
     generate_fixup_enabled = settings.get('generate_fixup', 'true').strip().lower() in ('true', '1', 'yes')
@@ -3650,6 +3744,13 @@ def run_config_wizard(config_path: Path) -> None:
         if normalized in SEQUENCE_REMAP_POLICY_VALUES:
             return True, ""
         return False, "仅支持 infer/source_only/dominant_table"
+
+    def _validate_blacklist_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        if val.strip().lower() in BLACKLIST_MODES:
+            return True, ""
+        return False, "仅支持 auto/table_only/rules_only/disabled"
 
     def _validate_fixup_idempotent_mode(val: str) -> Tuple[bool, str]:
         if not val.strip():
@@ -3849,6 +3950,51 @@ def run_config_wizard(config_path: Path) -> None:
         default=cfg.get("SETTINGS", "sequence_remap_policy", fallback="source_only"),
         validator=_validate_sequence_remap_policy,
         transform=normalize_sequence_remap_policy,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "blacklist_mode",
+        "黑名单来源模式 (auto/table_only/rules_only/disabled)",
+        default=cfg.get("SETTINGS", "blacklist_mode", fallback="auto"),
+        validator=_validate_blacklist_mode,
+        transform=normalize_blacklist_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "blacklist_rules_path",
+        "黑名单规则文件路径（JSON）",
+        default=cfg.get("SETTINGS", "blacklist_rules_path", fallback="blacklist_rules.json"),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "blacklist_rules_enable",
+        "仅启用指定规则（逗号分隔，留空全量）",
+        default=cfg.get("SETTINGS", "blacklist_rules_enable", fallback=""),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "blacklist_rules_disable",
+        "禁用指定规则（逗号分隔）",
+        default=cfg.get("SETTINGS", "blacklist_rules_disable", fallback=""),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "blacklist_name_patterns",
+        "表名黑名单关键字（逗号分隔，默认 _RENAME）",
+        default=cfg.get("SETTINGS", "blacklist_name_patterns", fallback="_RENAME"),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "blacklist_name_patterns_file",
+        "表名黑名单关键字文件（每行一条，可选）",
+        default=cfg.get("SETTINGS", "blacklist_name_patterns_file", fallback=""),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "blacklist_lob_max_mb",
+        "LOB 超限阈值（MB）",
+        default=cfg.get("SETTINGS", "blacklist_lob_max_mb", fallback="512"),
+        validator=_validate_positive_int,
     )
     _prompt_field(
         "SETTINGS",
@@ -10132,6 +10278,7 @@ def dump_oracle_metadata(
                                 disable_set = settings.get("blacklist_rules_disable_set", set())
                                 ob_version = settings.get("ob_version")
                                 lob_max_mb = int(settings.get("blacklist_lob_max_mb", 512))
+                                name_pattern_clause = settings.get("blacklist_name_pattern_clause", "")
                                 rule_stats: Dict[str, int] = {}
                                 skipped: Dict[str, int] = defaultdict(int)
                                 for rule in rules:
@@ -10149,7 +10296,15 @@ def dump_oracle_metadata(
                                         log.warning("黑名单规则 %s 缺少 {{owners_clause}}，已跳过。", rule.rule_id)
                                         skipped["missing_owner_clause"] += 1
                                         continue
+                                    if "{{name_pattern_clause}}" in sql_tpl and not name_pattern_clause:
+                                        log.warning(
+                                            "黑名单规则 %s 依赖 {{name_pattern_clause}}，但未配置关键字（blacklist_name_patterns / blacklist_name_patterns_file），已跳过。",
+                                            rule.rule_id
+                                        )
+                                        skipped["missing_name_pattern_clause"] += 1
+                                        continue
                                     sql_tpl = sql_tpl.replace("{{lob_max_mb}}", str(lob_max_mb))
+                                    sql_tpl = sql_tpl.replace("{{name_pattern_clause}}", name_pattern_clause)
                                     added = 0
                                     try:
                                         with ora_conn.cursor() as cursor:
@@ -29714,6 +29869,8 @@ def parse_cli_args() -> argparse.Namespace:
             trigger_list            仅生成指定触发器清单 (每行 SCHEMA.TRIGGER_NAME)
             trigger_qualify_schema  触发器 DDL 是否强制补全 schema 前缀 (true/false)
             sequence_remap_policy   SEQUENCE 目标 schema 推导策略 (infer/source_only/dominant_table)
+            blacklist_name_patterns 表名黑名单关键字（逗号分隔，默认 _RENAME）
+            blacklist_name_patterns_file 表名黑名单关键字文件（每行一条）
             report_detail_mode      报告内容模式 (full/split/summary)
             report_dir_layout       报告目录布局 (flat/per_run)
             view_compat_rules_path  VIEW 兼容规则 JSON (可选)

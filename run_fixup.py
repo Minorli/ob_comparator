@@ -2267,6 +2267,18 @@ def execute_sql_statements(
     return ExecutionSummary(statements=len(statements), failures=failures)
 
 
+def check_obclient_connectivity(
+    obclient_cmd: List[str],
+    timeout: Optional[int]
+) -> Tuple[bool, str]:
+    """Run a lightweight connectivity check for obclient."""
+    summary = execute_sql_statements(obclient_cmd, "SELECT 1 FROM DUAL;", timeout)
+    if summary.failures:
+        err = summary.failures[0].error if summary.failures else "执行失败"
+        return False, err
+    return True, ""
+
+
 def run_query_lines(
     obclient_cmd: List[str],
     sql_text: str,
@@ -3241,6 +3253,11 @@ def run_single_fixup(
     
     obclient_cmd = build_obclient_command(ob_cfg)
     ob_timeout = resolve_timeout_value(ob_cfg.get("timeout"))
+    ok_conn, conn_err = check_obclient_connectivity(obclient_cmd, ob_timeout)
+    if not ok_conn:
+        log.error("OBClient 连接检查失败: %s", conn_err)
+        log.error("请确认网络连通性/账号权限/obclient 可用性后重试。")
+        sys.exit(1)
     auto_grant_ctx = init_auto_grant_context(
         fixup_settings,
         report_dir,
@@ -3738,11 +3755,11 @@ def run_view_chain_autofix(
         for view_key, status, reasons in view_results:
             if status == "SUCCESS":
                 continue
-            log.info("  %s [%s]", view_key, status)
+            log.warning("  %s [%s]", view_key, status)
             for reason in reasons[:5]:
-                log.info("    - %s", reason)
+                log.warning("    - %s", reason)
             if len(reasons) > 5:
-                log.info("    - ... 还有 %d 条", len(reasons) - 5)
+                log.warning("    - ... 还有 %d 条", len(reasons) - 5)
 
     exit_code = 0 if failed_views == 0 and blocked_views == 0 and partial_views == 0 else 1
     sys.exit(exit_code)
