@@ -11,7 +11,7 @@
 - [x] 3.3 Ensure store_scope + enable switch gating
 
 ## 4. Docs & Queries
-- [x] 4.1 Update HOW_TO_READ_REPORTS_IN_OB.txt with item queries
+- [x] 4.1 Update HOW_TO_READ_REPORTS_IN_OB_60_sqls.txt with item queries
 - [x] 4.2 Update readme_config.txt and docs/ADVANCED_USAGE.md
 
 ## 5. Tests

@@ -2984,7 +2984,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('fixup_dir_allow_outside_repo', 'true')
         settings.setdefault('fixup_max_sql_file_mb', '50')
         settings.setdefault('fixup_force_clean', 'true')
-        settings.setdefault('fixup_drop_sys_c_columns', 'false')
+        settings.setdefault('fixup_drop_sys_c_columns', 'true')
         # obclient 超时时间 (秒)
         settings.setdefault('obclient_timeout', '60')
         # 报告输出目录
@@ -3152,7 +3152,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         if settings['usability_sample_ratio'] < 0:
             settings['usability_sample_ratio'] = 0.0
         settings['fixup_drop_sys_c_columns'] = parse_bool_flag(
-            settings.get('fixup_drop_sys_c_columns', 'false'),
+            settings.get('fixup_drop_sys_c_columns', 'true'),
             False
         )
         settings['enable_column_order_check'] = parse_bool_flag(
@@ -3793,7 +3793,7 @@ def run_config_wizard(config_path: Path) -> None:
         "SETTINGS",
         "fixup_drop_sys_c_columns",
         "是否对 SYS_C* 列生成 ALTER TABLE FORCE (true/false)",
-        default=cfg.get("SETTINGS", "fixup_drop_sys_c_columns", fallback="false"),
+        default=cfg.get("SETTINGS", "fixup_drop_sys_c_columns", fallback="true"),
         transform=_bool_transform,
     )
     _prompt_field(
@@ -20026,7 +20026,11 @@ def generate_alter_for_table_columns(
     # 多余列：DROP（默认注释掉，供人工评估；SYS_C* 可选 FORCE）
     if extra_cols:
         lines.append("")
-        sys_c_cols = {col for col in extra_cols if is_sys_c_column_name(col)}
+        sys_c_cols = {
+            normalize_identifier_name(col)
+            for col in extra_cols
+            if is_sys_c_column_name(col)
+        }
         if drop_sys_c_columns and sys_c_cols:
             lines.append("-- 目标端存在而源端不存在的列：SYS_C* 无法 DROP，将通过 FORCE 清理。")
             lines.append(f"ALTER TABLE {table_full} FORCE;")
@@ -20034,7 +20038,7 @@ def generate_alter_for_table_columns(
             lines.append("-- 目标端存在而源端不存在的列，以下 DROP COLUMN 为建议操作，请谨慎执行：")
         for col in sorted(extra_cols):
             col_u = col.upper()
-            if drop_sys_c_columns and col in sys_c_cols:
+            if drop_sys_c_columns and normalize_identifier_name(col) in sys_c_cols:
                 continue
             lines.append(
                 f"-- ALTER TABLE {table_full} "
@@ -27490,6 +27494,25 @@ def _render_report_sql_template(content: str, report_id: str) -> str:
     return f"# report_id={report_id}\n{rendered}"
 
 
+def _find_report_sql_playbook() -> Optional[Path]:
+    base_dir = Path(__file__).resolve().parent
+    candidates = sorted(base_dir.glob("HOW_TO_READ_REPORTS_IN_OB_*_sqls.txt"))
+    if candidates:
+        def _score(path: Path) -> int:
+            match = re.search(r"_([0-9]+)_sqls\\.txt$", path.name)
+            if match:
+                try:
+                    return int(match.group(1))
+                except ValueError:
+                    return -1
+            return -1
+        return max(candidates, key=_score)
+    legacy = base_dir / "HOW_TO_READ_REPORTS_IN_OB.txt"
+    if legacy.exists():
+        return legacy
+    return None
+
+
 def build_report_sql_template_file(
     report_dir: Optional[Path],
     report_timestamp: str,
@@ -27497,8 +27520,8 @@ def build_report_sql_template_file(
 ) -> Optional[Path]:
     if not report_dir:
         return None
-    how_to = Path(__file__).resolve().parent / "HOW_TO_READ_REPORTS_IN_OB.txt"
-    if not how_to.exists():
+    how_to = _find_report_sql_playbook()
+    if not how_to or not how_to.exists():
         return None
     try:
         content = how_to.read_text(encoding="utf-8")

@@ -14,7 +14,7 @@
 - [x] 3.5 Persist fixup skip summary and OMS missing mapping
 
 ## 4. Docs & Queries
-- [x] 4.1 Update HOW_TO_READ_REPORTS_IN_OB.txt with SQL playbook
+- [x] 4.1 Update HOW_TO_READ_REPORTS_IN_OB_60_sqls.txt with SQL playbook
 - [x] 4.2 Update readme_config.txt and docs/ADVANCED_USAGE.md
 
 ## 5. Tests

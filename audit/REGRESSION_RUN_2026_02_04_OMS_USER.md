@@ -145,4 +145,4 @@ IDENTITY 元数据：
 
 ## 6. SQL 手册校验
 
-- `HOW_TO_READ_REPORTS_IN_OB.txt` 中 40 条 SQL 全部通过（latest report_id）
+- `HOW_TO_READ_REPORTS_IN_OB_60_sqls.txt` 中 60 条 SQL 全部通过（latest report_id）

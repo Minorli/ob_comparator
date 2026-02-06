@@ -20,5 +20,5 @@
 ## Impact
 - Affected specs: `export-reports`, `configuration-control`
 - Affected code: `schema_diff_reconciler.py`（写库扩展 + 行化生成）
-- Affected docs: `readme_config.txt`, `docs/ADVANCED_USAGE.md`, `HOW_TO_READ_REPORTS_IN_OB.txt`
+- Affected docs: `readme_config.txt`, `docs/ADVANCED_USAGE.md`, `HOW_TO_READ_REPORTS_IN_OB_60_sqls.txt`
 - Non-breaking: 旧表结构不变；新增表和开关可控
