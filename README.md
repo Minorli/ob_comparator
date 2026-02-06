@@ -10,7 +10,7 @@
 - 新增 report_db_store_scope 与 report_db_detail_item_enable 配置。
 - 新增报告分析视图（actions/profile/trends/pending/grant/usability）。
 - 新增写库失败追踪与整改闭环表（WRITE_ERRORS / RESOLUTION）。
-- HOW_TO_READ_REPORTS_IN_OB_60_sqls.txt SQL 全量校验与修正。
+- HOW_TO_READ_REPORTS_IN_OB_67_sqls.txt SQL 全量校验与修正。
 
 详见：`docs/RELEASE_NOTES_0.9.8.3.md`
 

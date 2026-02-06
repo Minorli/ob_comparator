@@ -21432,23 +21432,22 @@ def generate_fixup_scripts(
     if report_dir and report_timestamp and view_missing_supported:
         view_targets = [f"{tgt_schema}.{tgt_obj}" for _, _, tgt_schema, tgt_obj in view_missing_supported]
         dep_pairs = expected_dependency_pairs or set()
-        if dep_pairs:
-            view_chain_path = Path(report_dir) / f"VIEWs_chain_{report_timestamp}.txt"
-            view_chain_file = export_view_fixup_chains(
-                view_targets,
-                dep_pairs,
-                view_chain_path,
-                full_object_mapping,
-                remap_rules,
-                synonym_meta=synonym_meta_map,
-                ob_meta=ob_meta,
-                ob_grant_catalog=ob_grant_catalog,
-                view_grant_targets=grant_plan.view_grant_targets if grant_plan else None
-            )
-            if view_chain_file:
-                log.info("VIEW fixup 依赖链已输出: %s", view_chain_file)
-            else:
-                log.info("VIEW fixup 依赖链输出已跳过（无链路或写入失败）。")
+        view_chain_path = Path(report_dir) / f"VIEWs_chain_{report_timestamp}.txt"
+        view_chain_file = export_view_fixup_chains(
+            view_targets,
+            dep_pairs,
+            view_chain_path,
+            full_object_mapping,
+            remap_rules,
+            synonym_meta=synonym_meta_map,
+            ob_meta=ob_meta,
+            ob_grant_catalog=ob_grant_catalog,
+            view_grant_targets=grant_plan.view_grant_targets if grant_plan else None
+        )
+        if view_chain_file:
+            log.info("VIEW fixup 依赖链已输出: %s", view_chain_file)
+        else:
+            log.info("VIEW fixup 依赖链输出已跳过（无链路或写入失败）。")
 
     dbcat_data, ddl_source_meta = fetch_dbcat_schema_objects(ora_cfg, settings, schema_requests)
 

@@ -236,6 +236,65 @@ SELECT report_type, object_type,
  WHERE report_id = :report_id
  ORDER BY object_type, item_type, source_schema, source_name;
 
+-- 目标端多余对象（主对象，排除同义词，基于映射反查）
+WITH expected AS (
+  SELECT UPPER(tgt_schema) AS owner, UPPER(tgt_name) AS name, UPPER(object_type) AS object_type
+    FROM DIFF_REPORT_OBJECT_MAPPING
+   WHERE report_id = :report_id
+),
+actual AS (
+  SELECT UPPER(owner) AS owner, UPPER(object_name) AS name, UPPER(object_type) AS object_type
+    FROM DBA_OBJECTS
+   WHERE UPPER(owner) IN ('SCHEMA1','SCHEMA2')
+     AND UPPER(object_type) IN ('TABLE','VIEW','PROCEDURE','FUNCTION','PACKAGE','PACKAGE BODY','TYPE','TYPE BODY')
+)
+SELECT a.owner, a.object_type, a.name
+  FROM actual a
+  LEFT JOIN expected e
+    ON a.owner = e.owner AND a.name = e.name AND a.object_type = e.object_type
+ WHERE e.name IS NULL
+ ORDER BY a.owner, a.object_type, a.name;
+
+-- 目标端多余列（表字段）
+SELECT target_schema, target_name AS table_name, item_key AS column_name
+  FROM DIFF_REPORT_DETAIL_ITEM
+ WHERE report_id = :report_id
+   AND object_type = 'TABLE'
+   AND item_type = 'EXTRA_COLUMN'
+ ORDER BY target_schema, target_name, item_key;
+
+-- 目标端多余索引
+SELECT target_schema, target_name AS table_name, item_key AS index_name
+  FROM DIFF_REPORT_DETAIL_ITEM
+ WHERE report_id = :report_id
+   AND object_type = 'INDEX'
+   AND item_type = 'EXTRA_INDEX'
+ ORDER BY target_schema, target_name, item_key;
+
+-- 目标端多余约束
+SELECT target_schema, target_name AS table_name, item_key AS constraint_name
+  FROM DIFF_REPORT_DETAIL_ITEM
+ WHERE report_id = :report_id
+   AND object_type = 'CONSTRAINT'
+   AND item_type = 'EXTRA_CONSTRAINT'
+ ORDER BY target_schema, target_name, item_key;
+
+-- 目标端多余触发器
+SELECT target_schema, target_name AS table_name, item_key AS trigger_name
+  FROM DIFF_REPORT_DETAIL_ITEM
+ WHERE report_id = :report_id
+   AND object_type = 'TRIGGER'
+   AND item_type = 'EXTRA_TRIGGER'
+ ORDER BY target_schema, target_name, item_key;
+
+-- 目标端多余序列
+SELECT target_schema, target_name AS schema_map, item_key AS sequence_name
+  FROM DIFF_REPORT_DETAIL_ITEM
+ WHERE report_id = :report_id
+   AND object_type = 'SEQUENCE'
+   AND item_type = 'EXTRA_SEQUENCE'
+ ORDER BY target_schema, item_key;
+
 ----------------------------------------
 6) 依赖与阻断深挖
 ----------------------------------------
@@ -412,6 +471,31 @@ SELECT u.schema_name, u.object_name, u.status, u.reason,
    AND u.object_type = 'SYNONYM'
    AND u.status <> 'OK'
  ORDER BY u.status, u.schema_name, u.object_name;
+
+-- 目标端多出的同义词（PUBLIC -> __public 映射）
+WITH expected AS (
+  SELECT CASE
+           WHEN UPPER(tgt_schema) = 'PUBLIC' THEN '__PUBLIC'
+           ELSE UPPER(tgt_schema)
+         END AS owner,
+         UPPER(tgt_name) AS name
+    FROM DIFF_REPORT_OBJECT_MAPPING
+   WHERE report_id = :report_id
+     AND object_type = 'SYNONYM'
+),
+actual AS (
+  SELECT UPPER(owner) AS owner,
+         UPPER(synonym_name) AS name,
+         table_owner, table_name
+    FROM DBA_SYNONYMS
+   WHERE UPPER(owner) IN ('__PUBLIC','SCHEMA1','SCHEMA2')
+)
+SELECT a.owner, a.name, a.table_owner, a.table_name
+  FROM actual a
+  LEFT JOIN expected e
+    ON a.owner = e.owner AND a.name = e.name
+ WHERE e.name IS NULL
+ ORDER BY a.owner, a.name;
 
 ----------------------------------------
 11) 高级筛选与定位
