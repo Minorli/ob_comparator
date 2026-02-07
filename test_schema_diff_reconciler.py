@@ -2831,7 +2831,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(sdr.normalize_report_dir_layout("flat"), "flat")
         self.assertEqual(sdr.normalize_report_dir_layout("per-run"), "per_run")
 
-    def test_ensure_trigger_mappings_for_extra_checks_follow_table_target_schema(self):
+    def test_ensure_trigger_mappings_for_extra_checks_keeps_source_schema_by_default(self):
         oracle_meta = self._make_oracle_meta(
             triggers={
                 ("SRC", "T1"): {
@@ -2847,7 +2847,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertEqual(
             sdr.get_mapped_target(mapping, "SRC.TRG_BI", "TRIGGER"),
-            "TGT.TRG_BI"
+            "SRC.TRG_BI"
         )
 
     def test_ensure_trigger_mappings_for_extra_checks_respects_existing_mapping(self):

@@ -12950,18 +12950,13 @@ def ensure_trigger_mappings_for_extra_checks(
     oracle_meta: OracleMetadata,
     full_object_mapping: FullObjectMapping
 ) -> None:
-    for src_name, tgt_name, obj_type in master_list:
+    for src_name, _tgt_name, obj_type in master_list:
         if (obj_type or "").upper() != "TABLE":
             continue
         try:
             src_schema, src_table = src_name.split('.', 1)
         except ValueError:
             continue
-        tgt_schema: Optional[str] = None
-        try:
-            tgt_schema, _ = tgt_name.split('.', 1)
-        except ValueError:
-            tgt_schema = None
         src_key = (src_schema.upper(), src_table.upper())
         src_trg = oracle_meta.triggers.get(src_key) or {}
         for trg_name, info in src_trg.items():
@@ -12973,7 +12968,8 @@ def ensure_trigger_mappings_for_extra_checks(
             mapped = get_mapped_target(full_object_mapping, src_full, 'TRIGGER')
             if mapped and '.' in mapped:
                 continue
-            tgt_owner_u = (tgt_schema or "").upper() or trg_owner or src_schema.upper()
+            # 触发器默认保持源 schema，不跟随 table remap
+            tgt_owner_u = trg_owner or src_schema.upper()
             tgt_name_u = name_u
             ensure_mapping_entry(
                 full_object_mapping,
