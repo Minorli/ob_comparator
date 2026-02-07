@@ -86,7 +86,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
+from typing import Callable, Dict, Iterable, List, NamedTuple, NoReturn, Optional, Sequence, Set, Tuple, Union
 
 __version__ = "0.9.8.3"
 __author__ = "Minor Li"
@@ -125,7 +125,7 @@ class FatalError(RuntimeError):
     """致命错误：用于替代 sys.exit 以便并发任务可回传异常。"""
 
 
-def abort_run(message: Optional[str] = None) -> None:
+def abort_run(message: Optional[str] = None) -> NoReturn:
     raise FatalError(message or "fatal error")
 
 
@@ -7841,9 +7841,13 @@ def obclient_query_by_owner_chunks(
     """
     if not owners:
         return True, [], ""
+
+    def _quote_owner(value: str) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
     lines: List[str] = []
     for chunk in chunk_list(owners, chunk_size):
-        owners_in = ",".join(f"'{s}'" for s in chunk)
+        owners_in = ",".join(_quote_owner(s) for s in chunk)
         sql = sql_tpl.format(owners_in=owners_in)
         ok, out, err = obclient_run_sql(ob_cfg, sql)
         if not ok:
@@ -7864,9 +7868,13 @@ def ob_has_dba_column(
     owner_u = (owner or "SYS").upper()
     if not table_u or not column_u or not owner_u:
         return False
+    def _quote_literal(value: str) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
     sql = (
         "SELECT 1 FROM DBA_TAB_COLUMNS "
-        f"WHERE OWNER='{owner_u}' AND TABLE_NAME='{table_u}' AND COLUMN_NAME='{column_u}' "
+        f"WHERE OWNER={_quote_literal(owner_u)} AND TABLE_NAME={_quote_literal(table_u)} "
+        f"AND COLUMN_NAME={_quote_literal(column_u)} "
         "AND ROWNUM = 1"
     )
     ok, out, err = obclient_run_sql(ob_cfg, sql)
@@ -7890,13 +7898,17 @@ def obclient_query_by_owner_pairs(
     """
     if not owners or not ref_owners:
         return True, [], ""
+
+    def _quote_owner(value: str) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
     lines: List[str] = []
     owner_chunks = chunk_list(owners, chunk_size)
     ref_chunks = chunk_list(ref_owners, chunk_size)
     for owner_chunk in owner_chunks:
-        owners_in = ",".join(f"'{s}'" for s in owner_chunk)
+        owners_in = ",".join(_quote_owner(s) for s in owner_chunk)
         for ref_chunk in ref_chunks:
-            ref_in = ",".join(f"'{s}'" for s in ref_chunk)
+            ref_in = ",".join(_quote_owner(s) for s in ref_chunk)
             sql = sql_tpl.format(owners_in=owners_in, ref_owners_in=ref_in)
             ok, out, err = obclient_run_sql(ob_cfg, sql)
             if not ok:
@@ -12938,13 +12950,18 @@ def ensure_trigger_mappings_for_extra_checks(
     oracle_meta: OracleMetadata,
     full_object_mapping: FullObjectMapping
 ) -> None:
-    for src_name, _tgt_name, obj_type in master_list:
+    for src_name, tgt_name, obj_type in master_list:
         if (obj_type or "").upper() != "TABLE":
             continue
         try:
             src_schema, src_table = src_name.split('.', 1)
         except ValueError:
             continue
+        tgt_schema: Optional[str] = None
+        try:
+            tgt_schema, _ = tgt_name.split('.', 1)
+        except ValueError:
+            tgt_schema = None
         src_key = (src_schema.upper(), src_table.upper())
         src_trg = oracle_meta.triggers.get(src_key) or {}
         for trg_name, info in src_trg.items():
@@ -12956,7 +12973,7 @@ def ensure_trigger_mappings_for_extra_checks(
             mapped = get_mapped_target(full_object_mapping, src_full, 'TRIGGER')
             if mapped and '.' in mapped:
                 continue
-            tgt_owner_u = trg_owner or src_schema.upper()
+            tgt_owner_u = (tgt_schema or "").upper() or trg_owner or src_schema.upper()
             tgt_name_u = name_u
             ensure_mapping_entry(
                 full_object_mapping,
@@ -19106,6 +19123,7 @@ DDL_CLEANUP_RULES = {
         ]
     }
 }
+DDL_CLEANUP_RULES_LOCK = threading.RLock()
 
 
 def apply_ddl_cleanup_rules(ddl: str, obj_type: str) -> str:
@@ -19124,16 +19142,16 @@ def apply_ddl_cleanup_rules(ddl: str, obj_type: str) -> str:
     
     obj_type_upper = obj_type.upper()
     
-    # 确定使用哪套规则
-    rules_to_apply = []
-    
-    for _rule_set_name, rule_set in DDL_CLEANUP_RULES.items():
-        if obj_type_upper in rule_set['types']:
-            rules_to_apply.extend(rule_set['rules'])
-    
-    # 如果没有匹配的规则，使用通用规则
-    if not rules_to_apply:
-        rules_to_apply = DDL_CLEANUP_RULES['GENERAL_OBJECTS']['rules']
+    # 确定使用哪套规则（先快照，避免并发修改字典导致迭代异常）
+    rules_to_apply: List[Callable[[str], str]] = []
+    with DDL_CLEANUP_RULES_LOCK:
+        rule_sets_snapshot = list(DDL_CLEANUP_RULES.items())
+        for _rule_set_name, rule_set in rule_sets_snapshot:
+            if obj_type_upper in rule_set['types']:
+                rules_to_apply.extend(list(rule_set['rules']))
+        # 如果没有匹配的规则，使用通用规则
+        if not rules_to_apply:
+            rules_to_apply = list(DDL_CLEANUP_RULES['GENERAL_OBJECTS']['rules'])
     
     # 依次应用所有规则
     cleaned_ddl = ddl
@@ -19166,14 +19184,14 @@ def add_custom_cleanup_rule(rule_name: str, obj_types: List[str], rule_func: Cal
     # 创建新的规则集或更新现有规则集
     rule_set_name = f"CUSTOM_{rule_name.upper()}"
     
-    if rule_set_name not in DDL_CLEANUP_RULES:
-        DDL_CLEANUP_RULES[rule_set_name] = {
-            'types': [t.upper() for t in obj_types],
-            'rules': []
-        }
-    
-    # 添加规则函数
-    DDL_CLEANUP_RULES[rule_set_name]['rules'].append(rule_func)
+    with DDL_CLEANUP_RULES_LOCK:
+        if rule_set_name not in DDL_CLEANUP_RULES:
+            DDL_CLEANUP_RULES[rule_set_name] = {
+                'types': [t.upper() for t in obj_types],
+                'rules': []
+            }
+        # 添加规则函数
+        DDL_CLEANUP_RULES[rule_set_name]['rules'].append(rule_func)
     
     log.info("已添加自定义DDL清理规则: %s，适用于对象类型: %s", rule_name, obj_types)
 

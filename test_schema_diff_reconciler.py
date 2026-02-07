@@ -2408,6 +2408,27 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         finally:
             sdr.obclient_run_sql = orig
 
+    def test_obclient_query_by_owner_chunks_escapes_quote(self):
+        calls = []
+        def fake_run(_cfg, sql):
+            calls.append(sql)
+            return True, sql, ""
+        orig = sdr.obclient_run_sql
+        sdr.obclient_run_sql = fake_run
+        try:
+            ok, _lines, err = sdr.obclient_query_by_owner_chunks(
+                {},
+                "SELECT * FROM T WHERE OWNER IN ({owners_in})",
+                ["A", "B'X"],
+                chunk_size=10
+            )
+            self.assertTrue(ok)
+            self.assertEqual(err, "")
+            self.assertEqual(len(calls), 1)
+            self.assertIn("OWNER IN ('A','B''X')", calls[0])
+        finally:
+            sdr.obclient_run_sql = orig
+
     def test_obclient_query_by_owner_pairs_splits(self):
         calls = []
         def fake_run(_cfg, sql):
@@ -2430,6 +2451,29 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             self.assertIn("REFERENCED_OWNER IN ('X','Y')", lines[0])
             self.assertIn("OWNER IN ('C')", lines[1])
             self.assertIn("REFERENCED_OWNER IN ('X','Y')", lines[1])
+        finally:
+            sdr.obclient_run_sql = orig
+
+    def test_obclient_query_by_owner_pairs_escapes_quote(self):
+        calls = []
+        def fake_run(_cfg, sql):
+            calls.append(sql)
+            return True, sql, ""
+        orig = sdr.obclient_run_sql
+        sdr.obclient_run_sql = fake_run
+        try:
+            ok, _lines, err = sdr.obclient_query_by_owner_pairs(
+                {},
+                "SELECT * FROM D WHERE OWNER IN ({owners_in}) AND REFERENCED_OWNER IN ({ref_owners_in})",
+                ["A'1"],
+                ["B'2"],
+                chunk_size=10
+            )
+            self.assertTrue(ok)
+            self.assertEqual(err, "")
+            self.assertEqual(len(calls), 1)
+            self.assertIn("OWNER IN ('A''1')", calls[0])
+            self.assertIn("REFERENCED_OWNER IN ('B''2')", calls[0])
         finally:
             sdr.obclient_run_sql = orig
 
@@ -2786,6 +2830,48 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(sdr.normalize_report_dir_layout(None), "per_run")
         self.assertEqual(sdr.normalize_report_dir_layout("flat"), "flat")
         self.assertEqual(sdr.normalize_report_dir_layout("per-run"), "per_run")
+
+    def test_ensure_trigger_mappings_for_extra_checks_follow_table_target_schema(self):
+        oracle_meta = self._make_oracle_meta(
+            triggers={
+                ("SRC", "T1"): {
+                    "TRG_BI": {"owner": "SRC", "event": "INSERT", "status": "ENABLED"}
+                }
+            }
+        )
+        mapping = {}
+        sdr.ensure_trigger_mappings_for_extra_checks(
+            [("SRC.T1", "TGT.T1", "TABLE")],
+            oracle_meta,
+            mapping
+        )
+        self.assertEqual(
+            sdr.get_mapped_target(mapping, "SRC.TRG_BI", "TRIGGER"),
+            "TGT.TRG_BI"
+        )
+
+    def test_ensure_trigger_mappings_for_extra_checks_respects_existing_mapping(self):
+        oracle_meta = self._make_oracle_meta(
+            triggers={
+                ("SRC", "T1"): {
+                    "TRG_BI": {"owner": "SRC", "event": "INSERT", "status": "ENABLED"}
+                }
+            }
+        )
+        mapping = {
+            "SRC.TRG_BI": {
+                "TRIGGER": "KEEP.TRG_BI"
+            }
+        }
+        sdr.ensure_trigger_mappings_for_extra_checks(
+            [("SRC.T1", "TGT.T1", "TABLE")],
+            oracle_meta,
+            mapping
+        )
+        self.assertEqual(
+            sdr.get_mapped_target(mapping, "SRC.TRG_BI", "TRIGGER"),
+            "KEEP.TRG_BI"
+        )
 
     def test_remap_trigger_object_references(self):
         ddl = (
