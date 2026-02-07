@@ -1667,7 +1667,7 @@ def normalize_ob_metadata_public_owner(meta: ObMetadata) -> ObMetadata:
 def is_index_expression_token(token: Optional[str]) -> bool:
     if not token:
         return False
-    return bool(re.search(r"[()\s'\"+\-*/]|\\bCASE\\b", token, flags=re.IGNORECASE))
+    return bool(re.search(r"[()\s'\"+\-*/]|\bCASE\b", token, flags=re.IGNORECASE))
 
 
 def normalize_number_meta(prec: Optional[object], scale: Optional[object]) -> Tuple[Optional[int], Optional[int]]:
@@ -2753,7 +2753,6 @@ GRANT_PRIVILEGE_BY_TYPE: Dict[str, str] = {
     'FUNCTION': 'EXECUTE',
     'PACKAGE': 'EXECUTE',
     'PACKAGE BODY': 'EXECUTE',
-    'TRIGGER': 'EXECUTE',
     'JOB': 'EXECUTE',
     'SCHEDULE': 'EXECUTE'
 }
@@ -4110,7 +4109,7 @@ def run_config_wizard(config_path: Path) -> None:
     _prompt_field(
         "SETTINGS",
         "infer_schema_mapping",
-        "是否自动推导 schema 映射 (true/false，默认 false，建议保持 false)",
+        "是否自动推导 schema 映射 (true/false，默认 true，建议按 remap 需求决定)",
         default=cfg.get("SETTINGS", "infer_schema_mapping", fallback="true"),
         transform=_bool_transform,
     )
@@ -7783,8 +7782,10 @@ def obclient_run_sql(ob_cfg: ObConfig, sql_query: str, timeout: Optional[int] = 
         stderr_clean = (result.stderr or "").strip()
 
         if result.returncode != 0:
-            log.error(f"  [OBClient 错误] SQL: {sql_query.strip()} | 错误: {result.stderr.strip()}")
-            return False, "", result.stderr.strip()
+            err_line = _extract_obclient_error(stderr_clean) or _extract_obclient_error(stdout_clean)
+            err_text = err_line or stderr_clean or stdout_clean or f"obclient return code {result.returncode}"
+            log.error("  [OBClient 错误] SQL: %s | 错误: %s", sql_query.strip(), err_text)
+            return False, stdout_clean, err_text
         err_line = _extract_obclient_error(stderr_clean) or _extract_obclient_error(stdout_clean)
         if err_line:
             log.error("  [OBClient 错误] SQL: %s | 错误: %s", sql_query.strip(), err_line)
@@ -7798,7 +7799,7 @@ def obclient_run_sql(ob_cfg: ObConfig, sql_query: str, timeout: Optional[int] = 
         return True, stdout_clean, ""
 
     except subprocess.TimeoutExpired:
-        log.error(f"严重错误: obclient 执行超时 (>{OBC_TIMEOUT} 秒)。请检查网络/OB 状态或调大 obclient_timeout。")
+        log.error(f"严重错误: obclient 执行超时 (>{timeout_val} 秒)。请检查网络/OB 状态或调大 obclient_timeout。")
         return False, "", "TimeoutExpired"
     except FileNotFoundError:
         log.error(f"严重错误: 未找到 obclient 可执行文件: {ob_cfg['executable']}")
@@ -14355,11 +14356,28 @@ def check_extra_objects(
                     initializer=_init_extra_check_worker,
                     initargs=(oracle_meta, ob_meta, full_object_mapping, table_check_types)
                 ) as executor:
-                    for result in executor.map(
-                        _extra_check_worker,
-                        table_entries,
-                        chunksize=chunk_size
-                    ):
+                    future_to_entry = {
+                        executor.submit(_extra_check_worker, entry): entry
+                        for entry in table_entries
+                    }
+                    for future in as_completed(future_to_entry):
+                        entry = future_to_entry[future]
+                        try:
+                            result = future.result()
+                        except Exception as exc:
+                            log.warning(
+                                "[EXTRA] 并发任务失败，已回退串行重试 %s.%s: %s",
+                                entry[2],
+                                entry[3],
+                                exc
+                            )
+                            result = run_extra_check_for_table(
+                                entry,
+                                oracle_meta,
+                                ob_meta,
+                                full_object_mapping,
+                                table_check_types
+                            )
                         done_tables += 1
                         _accumulate_result(result)
                         now = time.monotonic()
@@ -14373,12 +14391,35 @@ def check_extra_objects(
                             last_log = now
             else:
                 with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                    for result in executor.map(
-                        lambda entry: run_extra_check_for_table(
-                            entry, oracle_meta, ob_meta, full_object_mapping, table_check_types
-                        ),
-                        table_entries
-                    ):
+                    future_to_entry = {
+                        executor.submit(
+                            run_extra_check_for_table,
+                            entry,
+                            oracle_meta,
+                            ob_meta,
+                            full_object_mapping,
+                            table_check_types
+                        ): entry
+                        for entry in table_entries
+                    }
+                    for future in as_completed(future_to_entry):
+                        entry = future_to_entry[future]
+                        try:
+                            result = future.result()
+                        except Exception as exc:
+                            log.warning(
+                                "[EXTRA] 线程任务失败，已回退串行重试 %s.%s: %s",
+                                entry[2],
+                                entry[3],
+                                exc
+                            )
+                            result = run_extra_check_for_table(
+                                entry,
+                                oracle_meta,
+                                ob_meta,
+                                full_object_mapping,
+                                table_check_types
+                            )
                         done_tables += 1
                         _accumulate_result(result)
                         now = time.monotonic()
@@ -16180,8 +16221,14 @@ def get_oceanbase_version(ob_cfg: ObConfig) -> Optional[str]:
 def compare_version(version1: str, version2: str) -> int:
     """比较版本号，返回 -1(v1<v2), 0(v1==v2), 1(v1>v2)"""
     try:
-        v1_parts = [int(x) for x in version1.split('.')]
-        v2_parts = [int(x) for x in version2.split('.')]
+        v1_parts = [int(x) for x in re.findall(r'\d+', version1 or "")]
+        v2_parts = [int(x) for x in re.findall(r'\d+', version2 or "")]
+        if not v1_parts and not v2_parts:
+            return 0
+        if not v1_parts:
+            return -1
+        if not v2_parts:
+            return 1
         
         # 补齐长度
         max_len = max(len(v1_parts), len(v2_parts))
@@ -17948,9 +17995,8 @@ def clean_plsql_ending(ddl: str) -> str:
     
     while i < len(lines):
         line = lines[i].strip()
-        
-        # 检查是否是 END 语句
-        if re.match(r'^\s*END\s+\w+\s*;\s*$', line, re.IGNORECASE):
+        # 检查是否是 END 语句（支持 END "OBJ"; / END OBJ; / END;）
+        if re.match(r'^\s*END(?:\s+(?:"[^"]+"|[A-Z0-9_$#]+))?\s*;\s*$', line, re.IGNORECASE):
             cleaned_lines.append(lines[i])  # 保留原始格式的 END 语句
             i += 1
             
@@ -17994,7 +18040,7 @@ def clean_end_schema_prefix(ddl: str) -> str:
 
 
 FOR_LOOP_RANGE_SINGLE_DOT_PATTERN = re.compile(
-    r'(\bIN\s+-?\d+)\s*\.(\s*)(?=(?:"[^"]+"|[A-Z_]))',
+    r'(\bIN\s+-?\d+)\s*\.(\s*)(?P<right>"[^"]+"|[A-Z_][A-Z0-9_$#]*)',
     re.IGNORECASE
 )
 
@@ -18006,7 +18052,14 @@ def clean_for_loop_single_dot_range(ddl: str) -> str:
     """
     if not ddl:
         return ddl
-    return FOR_LOOP_RANGE_SINGLE_DOT_PATTERN.sub(r"\1..\2", ddl)
+    def _repl(match: re.Match) -> str:
+        right_token = (match.group("right") or "").strip().strip('"').upper()
+        # 避免将科学计数法误判为范围（例如 IN 1.E10）
+        if re.fullmatch(r"E[+-]?\d+", right_token):
+            return match.group(0)
+        return f"{match.group(1)}..{match.group(2)}{match.group('right')}"
+
+    return FOR_LOOP_RANGE_SINGLE_DOT_PATTERN.sub(_repl, ddl)
 
 
 FOR_LOOP_COLLECTION_ATTR_PATTERN = re.compile(
@@ -18033,10 +18086,98 @@ def clean_extra_semicolons(ddl: str) -> str:
     """
     if not ddl:
         return ddl
-    
-    # 替换连续的分号为单个分号
-    cleaned = re.sub(r';+', ';', ddl)
-    return cleaned
+
+    out: List[str] = []
+    in_single = False
+    in_double = False
+    in_line_comment = False
+    in_block_comment = False
+    prev_semicolon = False
+
+    i = 0
+    n = len(ddl)
+    while i < n:
+        ch = ddl[i]
+        nxt = ddl[i + 1] if i + 1 < n else ''
+
+        if in_line_comment:
+            out.append(ch)
+            if ch == '\n':
+                in_line_comment = False
+                prev_semicolon = False
+            i += 1
+            continue
+
+        if in_block_comment:
+            out.append(ch)
+            if ch == '*' and nxt == '/':
+                out.append(nxt)
+                i += 2
+                in_block_comment = False
+                prev_semicolon = False
+                continue
+            i += 1
+            continue
+
+        if not in_single and not in_double:
+            if ch == '-' and nxt == '-':
+                out.append(ch)
+                out.append(nxt)
+                i += 2
+                in_line_comment = True
+                prev_semicolon = False
+                continue
+            if ch == '/' and nxt == '*':
+                out.append(ch)
+                out.append(nxt)
+                i += 2
+                in_block_comment = True
+                prev_semicolon = False
+                continue
+
+        if not in_double and ch == "'":
+            out.append(ch)
+            if in_single and nxt == "'":
+                out.append(nxt)
+                i += 2
+                continue
+            in_single = not in_single
+            prev_semicolon = False
+            i += 1
+            continue
+
+        if not in_single and ch == '"':
+            out.append(ch)
+            if in_double and nxt == '"':
+                out.append(nxt)
+                i += 2
+                continue
+            in_double = not in_double
+            prev_semicolon = False
+            i += 1
+            continue
+
+        if not in_single and not in_double and ch == ';':
+            if prev_semicolon:
+                i += 1
+                continue
+            out.append(ch)
+            prev_semicolon = True
+            i += 1
+            continue
+
+        out.append(ch)
+        if not ch.isspace():
+            prev_semicolon = False
+        i += 1
+
+    return "".join(out)
+
+
+EXTRA_DOTS_PATTERN = re.compile(
+    r'(?P<left>"[^"]+"|[A-Z_][A-Z0-9_$#]*)\s*\.(?:\s*\.){2,}\s*(?P<right>"[^"]+"|[A-Z_][A-Z0-9_$#]*)',
+    re.IGNORECASE
+)
 
 
 def clean_extra_dots(ddl: str) -> str:
@@ -18048,13 +18189,9 @@ def clean_extra_dots(ddl: str) -> str:
     """
     if not ddl:
         return ddl
-    
-    # 仅处理对象标识符之间的多余点号，避免误伤 PL/SQL 的 .. 运算符
-    pattern = re.compile(
-        r'(?P<left>"[^"]+"|[A-Z_][A-Z0-9_$#]*)\s*\.(?:\s*\.)+\s*(?P<right>"[^"]+"|[A-Z_][A-Z0-9_$#]*)',
-        re.IGNORECASE
-    )
-    cleaned = pattern.sub(r"\g<left>.\g<right>", ddl)
+
+    # 仅收敛 3 个及以上连续点号，避免破坏 PL/SQL 合法范围运算符 ".."
+    cleaned = EXTRA_DOTS_PATTERN.sub(r"\g<left>.\g<right>", ddl)
     return cleaned
 
 
@@ -18094,33 +18231,37 @@ def extract_trigger_table_references(ddl: str) -> Set[str]:
     """
     if not ddl:
         return set()
-    
-    table_refs = set()
-    
-    # 提取 ON 子句中的表名（触发器定义的表）
-    on_pattern = r'\bON\s+("?[A-Z0-9_\$#]+"?(?:\s*\.\s*"?[A-Z0-9_\$#]+"?)?)'
-    matches = re.findall(on_pattern, ddl, re.IGNORECASE)
-    for match in matches:
-        table_name = match.strip().strip('"').upper()
-        if '.' in table_name:
-            table_refs.add(table_name)
-    
-    # 提取触发器体中的表引用（INSERT INTO, UPDATE, DELETE FROM等）
+
+    table_refs: Set[str] = set()
+    masker = SqlMasker(ddl)
+    working_sql = masker.masked_sql
+
+    qname_pattern = r'(?P<schema>"[^"]+"|[A-Z0-9_$#]+)\s*\.\s*(?P<name>"[^"]+"|[A-Z0-9_$#]+)'
+    on_pattern = re.compile(rf'\bON\s+{qname_pattern}', re.IGNORECASE)
     body_patterns = [
-        r'\bINSERT\s+INTO\s+("?[A-Z0-9_\$#]+"?(?:\s*\.\s*"?[A-Z0-9_\$#]+"?)?)',
-        r'\bUPDATE\s+("?[A-Z0-9_\$#]+"?(?:\s*\.\s*"?[A-Z0-9_\$#]+"?)?)',
-        r'\bDELETE\s+FROM\s+("?[A-Z0-9_\$#]+"?(?:\s*\.\s*"?[A-Z0-9_\$#]+"?)?)',
-        r'\bFROM\s+("?[A-Z0-9_\$#]+"?(?:\s*\.\s*"?[A-Z0-9_\$#]+"?)?)',
-        r'\bJOIN\s+("?[A-Z0-9_\$#]+"?(?:\s*\.\s*"?[A-Z0-9_\$#]+"?)?)',
+        re.compile(rf'\bINSERT\s+INTO\s+{qname_pattern}', re.IGNORECASE),
+        re.compile(rf'\bUPDATE\s+{qname_pattern}', re.IGNORECASE),
+        re.compile(rf'\bDELETE\s+FROM\s+{qname_pattern}', re.IGNORECASE),
+        re.compile(rf'\bFROM\s+{qname_pattern}', re.IGNORECASE),
+        re.compile(rf'\bJOIN\s+{qname_pattern}', re.IGNORECASE),
     ]
-    
+
+    def _normalize(match: re.Match) -> str:
+        schema = (match.group("schema") or "").strip().strip('"').upper()
+        name = (match.group("name") or "").strip().strip('"').upper()
+        return f"{schema}.{name}" if schema and name else ""
+
+    for m in on_pattern.finditer(working_sql):
+        normalized = _normalize(m)
+        if normalized:
+            table_refs.add(normalized)
+
     for pattern in body_patterns:
-        matches = re.findall(pattern, ddl, re.IGNORECASE)
-        for match in matches:
-            table_name = match.strip().strip('"').upper()
-            if '.' in table_name and not table_name.startswith(':'):  # 排除绑定变量
-                table_refs.add(table_name)
-    
+        for m in pattern.finditer(working_sql):
+            normalized = _normalize(m)
+            if normalized:
+                table_refs.add(normalized)
+
     return table_refs
 
 
@@ -18140,31 +18281,40 @@ def remap_trigger_table_references(
     """
     if not ddl:
         return ddl
-    
-    # 提取表引用
+
     table_refs = extract_trigger_table_references(ddl)
-    
-    # 构建替换映射
-    replacements = {}
+    replacements: Dict[str, str] = {}
     for table_ref in table_refs:
-        # 查找该表的目标映射
         tgt_name = find_mapped_target_any_type(
             full_object_mapping,
             table_ref,
             preferred_types=("TABLE",)
         )
         if tgt_name:
-            replacements[table_ref] = ensure_quoted_qualified(tgt_name)
+            replacements[table_ref.upper()] = ensure_quoted_qualified(tgt_name)
 
-    # 执行替换
-    result_ddl = ddl
-    for src_ref, tgt_ref in replacements.items():
-        # 使用词边界确保精确匹配，避免部分匹配
-        pattern = r'\b' + re.escape(src_ref) + r'\b'
-        result_ddl = re.sub(pattern, tgt_ref, result_ddl, flags=re.IGNORECASE)
+    if not replacements:
+        return ddl
+
+    masker = SqlMasker(ddl)
+    working_sql = masker.masked_sql
+    result_sql = working_sql
+
+    for src_ref, tgt_ref in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
+        try:
+            src_schema, src_name = src_ref.split(".", 1)
+        except ValueError:
+            continue
+        pattern = re.compile(
+            rf'(?<![A-Z0-9_$#"])'
+            rf'(?:"?{re.escape(src_schema)}"?\s*\.\s*"?{re.escape(src_name)}"?)'
+            rf'(?![A-Z0-9_$#"])',
+            re.IGNORECASE
+        )
+        result_sql = pattern.sub(tgt_ref, result_sql)
         log.debug("[TRIGGER] 重映射表引用: %s -> %s", src_ref, tgt_ref)
-    
-    return result_ddl
+
+    return masker.unmask(result_sql)
 
 
 TRIGGER_REF_PREFERRED_TYPES: Tuple[str, ...] = (
@@ -18826,11 +18976,13 @@ def clean_sequence_unsupported_options(ddl: str) -> str:
     """移除 OceanBase 不支持的 SEQUENCE 选项"""
     if not ddl:
         return ddl
-    cleaned = ddl
-    # 删除 NOKEEP / NOSCALE / GLOBAL 选项，保留其余内容
-    for token in ("NOKEEP", "NOSCALE", "GLOBAL"):
-        cleaned = re.sub(rf"\s*\b{token}\b", " ", cleaned, flags=re.IGNORECASE)
-    # 收敛多余空格
+    masked = mask_sql_for_scan(ddl)
+    cleaned_chars = list(ddl)
+    token_pattern = re.compile(r"\b(?:NOKEEP|NOSCALE|GLOBAL)\b", re.IGNORECASE)
+    for match in token_pattern.finditer(masked):
+        for idx in range(match.start(), match.end()):
+            cleaned_chars[idx] = " "
+    cleaned = "".join(cleaned_chars)
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
     cleaned = re.sub(r" \n", "\n", cleaned)
     return cleaned
@@ -18865,9 +19017,31 @@ def clean_long_types_in_table_ddl(ddl: str) -> str:
     """
     if not ddl:
         return ddl
-    ddl = re.sub(r'\bLONG\s+RAW\b', 'BLOB', ddl, flags=re.IGNORECASE)
-    ddl = re.sub(r'\bLONG\b', 'CLOB', ddl, flags=re.IGNORECASE)
-    return ddl
+    masked = mask_sql_for_scan(ddl)
+    edits: List[Tuple[int, int, str]] = []
+    occupied: List[Tuple[int, int]] = []
+
+    def _occupied(start: int, end: int) -> bool:
+        for s, e in occupied:
+            if start < e and end > s:
+                return True
+        return False
+
+    for m in re.finditer(r'\bLONG\s+RAW\b', masked, flags=re.IGNORECASE):
+        edits.append((m.start(), m.end(), 'BLOB'))
+        occupied.append((m.start(), m.end()))
+    for m in re.finditer(r'\bLONG\b', masked, flags=re.IGNORECASE):
+        if _occupied(m.start(), m.end()):
+            continue
+        edits.append((m.start(), m.end(), 'CLOB'))
+
+    if not edits:
+        return ddl
+
+    result = ddl
+    for start, end, replacement in sorted(edits, key=lambda x: x[0], reverse=True):
+        result = result[:start] + replacement + result[end:]
+    return result
 
 
 # DDL清理规则配置（更新为包含生产环境规则）
@@ -18953,10 +19127,9 @@ def apply_ddl_cleanup_rules(ddl: str, obj_type: str) -> str:
     # 确定使用哪套规则
     rules_to_apply = []
     
-    for rule_set_name, rule_set in DDL_CLEANUP_RULES.items():
+    for _rule_set_name, rule_set in DDL_CLEANUP_RULES.items():
         if obj_type_upper in rule_set['types']:
-            rules_to_apply = rule_set['rules']
-            break
+            rules_to_apply.extend(rule_set['rules'])
     
     # 如果没有匹配的规则，使用通用规则
     if not rules_to_apply:
@@ -18965,9 +19138,11 @@ def apply_ddl_cleanup_rules(ddl: str, obj_type: str) -> str:
     # 依次应用所有规则
     cleaned_ddl = ddl
     for rule_func in rules_to_apply:
+        previous = cleaned_ddl
         try:
             cleaned_ddl = rule_func(cleaned_ddl)
         except Exception as exc:
+            cleaned_ddl = previous
             log.warning("DDL清理规则 %s 执行失败: %s", rule_func.__name__, exc)
     
     return cleaned_ddl
@@ -19130,6 +19305,31 @@ def split_ddl_statements(ddl: str) -> List[str]:
                 current.append(ch)
                 current.append(nxt)
                 i += 2
+                continue
+
+        # 处理 Oracle q'...'-style 引用（如 q'[a;b]' / q'!a;b!'）
+        if not in_single and not in_double and (ch == 'q' or ch == 'Q') and nxt == "'" and i + 2 < n:
+            prev = ddl[i - 1] if i > 0 else ''
+            if not (prev.isalnum() or prev in ('_', '$', '#')):
+                open_delim = ddl[i + 2]
+                close_delim = {
+                    '[': ']',
+                    '{': '}',
+                    '(': ')',
+                    '<': '>',
+                }.get(open_delim, open_delim)
+                j = i + 3
+                found = False
+                while j < n - 1:
+                    if ddl[j] == close_delim and ddl[j + 1] == "'":
+                        current.append(ddl[i:j + 2])
+                        i = j + 2
+                        found = True
+                        break
+                    j += 1
+                if not found:
+                    current.append(ddl[i:])
+                    i = n
                 continue
 
         # 处理字符串（单/双引号）
@@ -27692,6 +27892,41 @@ def build_report_sql_template_file(
     return output
 
 
+def purge_report_db_retention(
+    ob_cfg: ObConfig,
+    schema_prefix: str,
+    retention_days: int
+) -> None:
+    """
+    按保留期清理报告数据。
+    先清理子表，再清理 summary，避免仅 summary 变更导致子表累计膨胀。
+    """
+    days = int(retention_days or 0)
+    if days <= 0:
+        return
+    cutoff_expr = f"SYSTIMESTAMP - INTERVAL '{days}' DAY"
+    summary_table = f"{schema_prefix}{REPORT_DB_TABLES['summary']}"
+    child_tables = [name for key, name in REPORT_DB_TABLES.items() if key != "summary"]
+
+    for table_name in child_tables:
+        delete_child_sql = (
+            f"DELETE FROM {schema_prefix}{table_name} "
+            f"WHERE REPORT_ID IN (SELECT REPORT_ID FROM {summary_table} "
+            f"WHERE RUN_TIMESTAMP < {cutoff_expr})"
+        )
+        ok_child, _o, err_child = obclient_run_sql_commit(ob_cfg, delete_child_sql)
+        if not ok_child:
+            log.warning("[REPORT_DB] 保留期清理子表失败 %s: %s", table_name, err_child)
+
+    delete_summary_sql = (
+        f"DELETE FROM {summary_table} "
+        f"WHERE RUN_TIMESTAMP < {cutoff_expr}"
+    )
+    ok_sum, _out, err_sum = obclient_run_sql_commit(ob_cfg, delete_summary_sql)
+    if not ok_sum:
+        log.warning("[REPORT_DB] 保留期清理 summary 失败: %s", err_sum)
+
+
 
 
 def save_report_to_db(
@@ -27962,11 +28197,7 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
 
     retention_days = int(settings.get("report_retention_days", 0) or 0)
     if retention_days > 0:
-        delete_sql = (
-            f"DELETE FROM {schema_prefix}{REPORT_DB_TABLES['summary']} "
-            f"WHERE RUN_TIMESTAMP < SYSTIMESTAMP - INTERVAL '{retention_days}' DAY"
-        )
-        obclient_run_sql_commit(ob_cfg, delete_sql)
+        purge_report_db_retention(ob_cfg, schema_prefix, retention_days)
 
     log.info("[REPORT_DB] 报告已写入数据库: report_id=%s", report_id)
     return True, report_id

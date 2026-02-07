@@ -2238,6 +2238,12 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn("END PKG_TEST;", cleaned)
         self.assertNotIn("END SCHEMA.PKG_TEST", cleaned)
 
+    def test_clean_plsql_ending_supports_quoted_end_name(self):
+        ddl = 'CREATE OR REPLACE PACKAGE BODY P AS\nBEGIN\nNULL;\nEND "P";\n;\n/\n'
+        cleaned = sdr.clean_plsql_ending(ddl)
+        self.assertIn('END "P";', cleaned)
+        self.assertNotIn('\n;\n/', cleaned)
+
     def test_clean_for_loop_single_dot_range(self):
         ddl = "BEGIN FOR i IN 1.v_tablen LOOP NULL; END LOOP; END;"
         cleaned = sdr.clean_for_loop_single_dot_range(ddl)
@@ -2248,6 +2254,9 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         ddl = "BEGIN FOR i IN 7.v_tablen LOOP NULL; END LOOP; END;"
         cleaned = sdr.clean_for_loop_single_dot_range(ddl)
         self.assertIn("IN 7..v_tablen", cleaned)
+        ddl = "BEGIN FOR i IN 1.E10 LOOP NULL; END LOOP; END;"
+        cleaned = sdr.clean_for_loop_single_dot_range(ddl)
+        self.assertIn("IN 1.E10", cleaned)
 
     def test_clean_for_loop_collection_attr_range(self):
         ddl = "BEGIN FOR i IN v_list.FIRST.v_list.LAST LOOP NULL; END LOOP; END;"
@@ -2260,6 +2269,52 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         cleaned = sdr.clean_for_loop_collection_attr_range(ddl)
         self.assertIn("v_list.FIRST..v_list.LAST", cleaned)
 
+    def test_clean_extra_dots_preserves_range_operator(self):
+        ddl = "BEGIN FOR i IN v_list.FIRST..v_list.LAST LOOP NULL; END LOOP; END;"
+        cleaned = sdr.clean_extra_dots(ddl)
+        self.assertIn("v_list.FIRST..v_list.LAST", cleaned)
+
+    def test_clean_extra_dots_collapses_three_or_more(self):
+        ddl = "SELECT * FROM SCHEMA...TABLE_NAME"
+        cleaned = sdr.clean_extra_dots(ddl)
+        self.assertIn("SCHEMA.TABLE_NAME", cleaned)
+        self.assertNotIn("...", cleaned)
+
+    def test_clean_extra_semicolons_preserves_string_literal(self):
+        ddl = "BEGIN\n  v_sql := 'cmd1;;cmd2';\nEND;"
+        cleaned = sdr.clean_extra_semicolons(ddl)
+        self.assertIn("'cmd1;;cmd2'", cleaned)
+
+    def test_is_index_expression_token_detects_case_keyword(self):
+        self.assertTrue(sdr.is_index_expression_token("CASE"))
+
+    def test_compare_version_with_suffix(self):
+        self.assertEqual(sdr.compare_version("4.2.5.7-bp1", "4.2.5.7"), 1)
+        self.assertEqual(sdr.compare_version("4.2.5.7", "4.2.5.7-bp1"), -1)
+
+    def test_add_custom_cleanup_rule_applies(self):
+        rule_name = "ut_replace_abc"
+        try:
+            sdr.add_custom_cleanup_rule(rule_name, ["PROCEDURE"], lambda d: d.replace("ABC_TOKEN", "XYZ_TOKEN"))
+            ddl = "CREATE OR REPLACE PROCEDURE P AS\nBEGIN\n  ABC_TOKEN;\nEND;\n/"
+            cleaned = sdr.apply_ddl_cleanup_rules(ddl, "PROCEDURE")
+            self.assertIn("XYZ_TOKEN", cleaned)
+        finally:
+            sdr.DDL_CLEANUP_RULES.pop(f"CUSTOM_{rule_name.upper()}", None)
+
+    def test_apply_ddl_cleanup_rules_keeps_previous_on_rule_exception(self):
+        rule_name = "ut_raise_after_replace"
+        try:
+            sdr.add_custom_cleanup_rule(rule_name, ["PROCEDURE"], lambda d: d.replace("ABC_TOKEN", "XYZ_TOKEN"))
+            def _raise_rule(_ddl):
+                raise RuntimeError("boom")
+            sdr.add_custom_cleanup_rule(rule_name, ["PROCEDURE"], _raise_rule)
+            ddl = "CREATE OR REPLACE PROCEDURE P AS\nBEGIN\n  ABC_TOKEN;\nEND;\n/"
+            cleaned = sdr.apply_ddl_cleanup_rules(ddl, "PROCEDURE")
+            self.assertIn("XYZ_TOKEN", cleaned)
+        finally:
+            sdr.DDL_CLEANUP_RULES.pop(f"CUSTOM_{rule_name.upper()}", None)
+
     def test_clean_long_types_in_table_ddl(self):
         ddl = "CREATE TABLE T_LONG (A LONG, B LONG RAW, C VARCHAR2(10));"
         cleaned = sdr.clean_long_types_in_table_ddl(ddl)
@@ -2267,6 +2322,33 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn("B BLOB", cleaned)
         self.assertNotIn("LONG RAW", cleaned.upper())
         self.assertNotIn(" LONG,", cleaned.upper())
+
+    def test_clean_long_types_in_table_ddl_ignores_comments_and_literals(self):
+        ddl = (
+            "CREATE TABLE T_LONG (\n"
+            "  A LONG,\n"
+            "  B VARCHAR2(50) DEFAULT 'LONG RAW',\n"
+            "  C VARCHAR2(50) -- LONG RAW should stay in comment\n"
+            ");"
+        )
+        cleaned = sdr.clean_long_types_in_table_ddl(ddl)
+        self.assertIn("A CLOB", cleaned)
+        self.assertIn("'LONG RAW'", cleaned)
+        self.assertIn("-- LONG RAW should stay in comment", cleaned)
+
+    def test_clean_sequence_unsupported_options_ignores_comments_and_literals(self):
+        ddl = (
+            "CREATE SEQUENCE S1 START WITH 1 INCREMENT BY 1 NOKEEP NOSCALE GLOBAL;\n"
+            "-- NOKEEP should stay in comment\n"
+            "SELECT 'NOKEEP' FROM DUAL;"
+        )
+        cleaned = sdr.clean_sequence_unsupported_options(ddl)
+        first_line = cleaned.splitlines()[0].upper()
+        self.assertNotIn(" NOKEEP ", first_line)
+        self.assertNotIn(" NOSCALE ", first_line)
+        self.assertNotIn(" GLOBAL ", first_line)
+        self.assertIn("-- NOKEEP should stay in comment", cleaned)
+        self.assertIn("'NOKEEP'", cleaned)
 
     def test_normalize_synonym_fixup_scope(self):
         self.assertEqual(sdr.normalize_synonym_fixup_scope(None), "public_only")
@@ -2375,6 +2457,33 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             self.assertTrue(ok)
             self.assertEqual(out, "OK")
             self.assertEqual(err, "")
+        finally:
+            sdr.subprocess.run = orig_run
+
+    def test_obclient_run_sql_nonzero_extracts_stdout_error_line(self):
+        class Dummy:
+            def __init__(self):
+                self.returncode = 1
+                self.stdout = "ORA-00942: table or view does not exist\n"
+                self.stderr = ""
+        def fake_run(*_args, **_kwargs):
+            return Dummy()
+        orig_run = sdr.subprocess.run
+        try:
+            sdr.subprocess.run = fake_run
+            ok, out, err = sdr.obclient_run_sql(
+                {
+                    "executable": "obclient",
+                    "host": "127.0.0.1",
+                    "port": "2881",
+                    "user_string": "root@sys",
+                    "password": "p"
+                },
+                "select 1 from dual"
+            )
+            self.assertFalse(ok)
+            self.assertIn("ORA-00942", err)
+            self.assertIn("ORA-00942", out)
         finally:
             sdr.subprocess.run = orig_run
 
@@ -2622,6 +2731,57 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             sdr.run_extra_check_for_table = orig_run
             sdr.EXTRA_CHECK_PROCESS_MAX_TABLES = orig_max
 
+    def test_check_extra_objects_threadpool_fallback_on_worker_exception(self):
+        oracle_meta = self._make_oracle_meta()
+        ob_meta = self._make_ob_meta()
+        master_list = [
+            ("S.T1", "T.T1", "TABLE"),
+            ("S.T2", "T.T2", "TABLE"),
+        ]
+        settings = {
+            "extra_check_workers": 2,
+            "extra_check_chunk_size": 1,
+            "extra_check_progress_interval": 1,
+        }
+        orig_max = sdr.EXTRA_CHECK_PROCESS_MAX_TABLES
+        orig_run = sdr.run_extra_check_for_table
+        calls: Dict[str, int] = {}
+        try:
+            sdr.EXTRA_CHECK_PROCESS_MAX_TABLES = 1
+
+            def flaky_run(entry, _ora, _ob, _map, _types):
+                key = f"{entry[2]}.{entry[3]}"
+                calls[key] = calls.get(key, 0) + 1
+                if key == "T.T1" and calls[key] == 1:
+                    raise RuntimeError("simulated worker failure")
+                return sdr.ExtraTableResult(
+                    tgt_name=key,
+                    index_ok=True,
+                    index_mismatch=None,
+                    constraint_ok=None,
+                    constraint_mismatch=None,
+                    trigger_ok=None,
+                    trigger_mismatch=None,
+                    index_time=0.0,
+                    constraint_time=0.0,
+                    trigger_time=0.0
+                )
+
+            sdr.run_extra_check_for_table = flaky_run
+            extra_results = sdr.check_extra_objects(
+                settings,
+                master_list,
+                ob_meta,
+                oracle_meta,
+                {},
+                enabled_extra_types={"INDEX"}
+            )
+            self.assertEqual(len(extra_results["index_ok"]), 2)
+            self.assertGreaterEqual(calls.get("T.T1", 0), 2)
+        finally:
+            sdr.EXTRA_CHECK_PROCESS_MAX_TABLES = orig_max
+            sdr.run_extra_check_for_table = orig_run
+
     def test_normalize_report_dir_layout(self):
         self.assertEqual(sdr.normalize_report_dir_layout(None), "per_run")
         self.assertEqual(sdr.normalize_report_dir_layout("flat"), "flat")
@@ -2656,6 +2816,39 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn('INSERT INTO "TGT"."T2"', remapped)
         self.assertIn('"TGT"."SEQ1".NEXTVAL', remapped)
         self.assertNotIn("TGT.TGT", remapped)
+
+    def test_extract_trigger_table_references_masks_comment_and_literal(self):
+        ddl = (
+            "CREATE OR REPLACE TRIGGER SRC.TRG_A BEFORE INSERT ON SRC.T1\n"
+            "BEGIN\n"
+            "  -- FROM SRC.TX in comment\n"
+            "  v_sql := 'DELETE FROM SRC.TY';\n"
+            "  INSERT INTO SRC.T2(col) VALUES (1);\n"
+            "END;\n"
+        )
+        refs = sdr.extract_trigger_table_references(ddl)
+        self.assertIn("SRC.T1", refs)
+        self.assertIn("SRC.T2", refs)
+        self.assertNotIn("SRC.TX", refs)
+        self.assertNotIn("SRC.TY", refs)
+
+    def test_remap_trigger_table_references_ignores_comments_and_literals(self):
+        ddl = (
+            "CREATE OR REPLACE TRIGGER SRC.TRG_A BEFORE INSERT ON SRC.T1\n"
+            "BEGIN\n"
+            "  -- INSERT INTO SRC.T2 should not be replaced in comment\n"
+            "  v_sql := 'UPDATE SRC.T2 SET C=1';\n"
+            "  INSERT INTO SRC.T2(col) VALUES (1);\n"
+            "END;\n"
+        )
+        mapping = {
+            "SRC.T1": {"TABLE": "TGT.T1"},
+            "SRC.T2": {"TABLE": "TGT.T2"},
+        }
+        remapped = sdr.remap_trigger_table_references(ddl, mapping)
+        self.assertIn('INSERT INTO "TGT"."T2"', remapped)
+        self.assertIn("-- INSERT INTO SRC.T2 should not be replaced in comment", remapped)
+        self.assertIn("'UPDATE SRC.T2 SET C=1'", remapped)
 
     def test_remap_trigger_object_references_preserves_quoted(self):
         ddl = (
@@ -3180,6 +3373,31 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         stmts = sdr.split_ddl_statements(ddl)
         self.assertEqual(len(stmts), 1)
         self.assertIn("EXECUTE IMMEDIATE", stmts[0].upper())
+
+    def test_split_ddl_statements_handles_q_quote_with_semicolon(self):
+        ddl = (
+            "CREATE VIEW V1 AS SELECT q'!A''B;C!' AS C FROM DUAL;\n"
+            "CREATE VIEW V2 AS SELECT 1 FROM DUAL;"
+        )
+        stmts = sdr.split_ddl_statements(ddl)
+        self.assertEqual(len(stmts), 2)
+        self.assertTrue(stmts[0].upper().startswith("CREATE VIEW V1"))
+        self.assertTrue(stmts[1].upper().startswith("CREATE VIEW V2"))
+
+    def test_purge_report_db_retention_cleans_children_and_summary(self):
+        calls = []
+
+        def _fake_commit(_ob_cfg, sql_query, timeout=None):
+            calls.append(sql_query)
+            return True, "", ""
+
+        with mock.patch.object(sdr, "obclient_run_sql_commit", side_effect=_fake_commit):
+            sdr.purge_report_db_retention({"executable": "/usr/bin/obclient"}, "RPT.", 90)
+
+        child_count = len(sdr.REPORT_DB_TABLES) - 1
+        self.assertEqual(len(calls), child_count + 1)
+        self.assertTrue(any("DELETE FROM RPT.DIFF_REPORT_DETAIL" in sql for sql in calls))
+        self.assertTrue(any("DELETE FROM RPT.DIFF_REPORT_SUMMARY" in sql for sql in calls))
 
     def test_apply_fixup_idempotency_replace(self):
         ddl = "CREATE VIEW V1 AS SELECT 1 FROM DUAL;"
@@ -5398,6 +5616,15 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn("APP", post)
         self.assertIn(sdr.ObjectGrantEntry("SELECT", "TGT.V1", False), post["APP"])
         self.assertEqual(remaining, {})
+
+    def test_compute_required_grants_skips_trigger_reference_type(self):
+        expected_pairs = {
+            ("A.P1", "PROCEDURE", "B.TRG_AUDIT", "TRIGGER"),
+            ("A.P1", "PROCEDURE", "B.PKG_UTIL", "PACKAGE"),
+        }
+        grants = sdr.compute_required_grants(expected_pairs)
+        self.assertNotIn(("EXECUTE", "B.TRG_AUDIT"), grants.get("A", set()))
+        self.assertIn(("EXECUTE", "B.PKG_UTIL"), grants.get("A", set()))
 
     def test_recursive_infer_target_schema_uses_indirect_tables(self):
         deps = {
