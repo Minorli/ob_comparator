@@ -25155,17 +25155,29 @@ REPORT_DB_CLOB_CHUNK_SIZE = 2000
 REPORT_DB_WRITE_ERROR_SNIPPET_MAX = 4000
 
 
+def _sanitize_sql_literal_text(value: str) -> str:
+    """
+    Sanitize SQL literal text for obclient INSERT ALL statements.
+    - Drop NUL bytes.
+    - Drop non-printable control chars except CR/LF/TAB.
+    """
+    if not value:
+        return ""
+    value = value.replace("\x00", "")
+    return "".join(ch for ch in value if ch.isprintable() or ch in "\r\n\t")
+
+
 def sql_quote_literal(value: Optional[object]) -> str:
     if value is None:
         return "NULL"
-    text = str(value)
+    text = _sanitize_sql_literal_text(str(value))
     return "'" + text.replace("'", "''") + "'"
 
 
 def sql_clob_literal(value: Optional[object], chunk_size: int = REPORT_DB_CLOB_CHUNK_SIZE) -> str:
     if value is None:
         return "NULL"
-    text = str(value)
+    text = _sanitize_sql_literal_text(str(value))
     if text == "":
         return "TO_CLOB('')"
     chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
@@ -26899,8 +26911,7 @@ def _insert_report_detail_item_rows(
         insert_sql = "INSERT ALL\n  " + "\n  ".join(values_sql) + "\nSELECT 1 FROM DUAL"
         ok, _out, err = obclient_run_sql_commit(ob_cfg, insert_sql)
         if not ok:
-            ok_all = False
-            log.warning("[REPORT_DB] DETAIL_ITEM 批量写入失败: %s", err)
+            log.warning("[REPORT_DB] DETAIL_ITEM 批量写入失败，回退单行插入: %s", err)
             _record_report_db_write_error(
                 ob_cfg,
                 schema_prefix,
@@ -26909,6 +26920,43 @@ def _insert_report_detail_item_rows(
                 insert_sql,
                 err
             )
+            ok_all = False
+            for row in batch:
+                item_id = f"{report_id}_{uuid.uuid4().hex[:12]}"
+                single_sql = (
+                    "INSERT INTO {table} (ITEM_ID, REPORT_ID, REPORT_TYPE, OBJECT_TYPE, SOURCE_SCHEMA, SOURCE_NAME, "
+                    "TARGET_SCHEMA, TARGET_NAME, ITEM_TYPE, ITEM_KEY, SRC_VALUE, TGT_VALUE, ITEM_VALUE, STATUS) "
+                    "VALUES ({item_id}, {report_id}, {report_type}, {object_type}, {source_schema}, {source_name}, "
+                    "{target_schema}, {target_name}, {item_type}, {item_key}, {src_value}, {tgt_value}, {item_value}, {status})".format(
+                        table=f"{schema_prefix}{REPORT_DB_TABLES['detail_item']}",
+                        item_id=sql_quote_literal(item_id),
+                        report_id=sql_quote_literal(report_id),
+                        report_type=sql_quote_literal(row.get("report_type")) if row.get("report_type") else "NULL",
+                        object_type=sql_quote_literal(row.get("object_type")) if row.get("object_type") else "NULL",
+                        source_schema=sql_quote_literal(row.get("source_schema")) if row.get("source_schema") else "NULL",
+                        source_name=sql_quote_literal(row.get("source_name")) if row.get("source_name") else "NULL",
+                        target_schema=sql_quote_literal(row.get("target_schema")) if row.get("target_schema") else "NULL",
+                        target_name=sql_quote_literal(row.get("target_name")) if row.get("target_name") else "NULL",
+                        item_type=sql_quote_literal(row.get("item_type")) if row.get("item_type") else "NULL",
+                        item_key=sql_quote_literal(row.get("item_key")) if row.get("item_key") else "NULL",
+                        src_value=sql_quote_literal(row.get("src_value")) if row.get("src_value") else "NULL",
+                        tgt_value=sql_quote_literal(row.get("tgt_value")) if row.get("tgt_value") else "NULL",
+                        item_value=sql_clob_literal(row.get("item_value")) if row.get("item_value") else "NULL",
+                        status=sql_quote_literal(row.get("status")) if row.get("status") else "NULL",
+                    )
+                )
+                ok_single, _o, err_single = obclient_run_sql_commit(ob_cfg, single_sql)
+                if not ok_single:
+                    ok_all = False
+                    log.warning("[REPORT_DB] DETAIL_ITEM 单行写入失败: %s", err_single)
+                    _record_report_db_write_error(
+                        ob_cfg,
+                        schema_prefix,
+                        report_id,
+                        REPORT_DB_TABLES["detail_item"],
+                        single_sql,
+                        err_single
+                    )
     return ok_all
 
 

@@ -2350,6 +2350,47 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn("-- NOKEEP should stay in comment", cleaned)
         self.assertIn("'NOKEEP'", cleaned)
 
+    def test_apply_ddl_cleanup_rules_plsql_pipeline_integration(self):
+        ddl = (
+            "CREATE OR REPLACE PACKAGE BODY PKG_DEMO AS\n"
+            "BEGIN\n"
+            "  FOR i IN v_list.FIRST.v_list.LAST LOOP\n"
+            "    NULL;\n"
+            "  END LOOP;\n"
+            "END DEMO_SCHEMA.PKG_DEMO;\n"
+            "/\n"
+        )
+        cleaned = sdr.apply_ddl_cleanup_rules(ddl, "PACKAGE BODY")
+        self.assertIn("v_list.FIRST..v_list.LAST", cleaned)
+        self.assertIn("END PKG_DEMO;", cleaned)
+        self.assertNotIn("END DEMO_SCHEMA.PKG_DEMO", cleaned)
+
+    def test_apply_ddl_cleanup_rules_table_pipeline_integration(self):
+        ddl = (
+            "CREATE TABLE T_INTEG (\n"
+            "  C1 LONG,\n"
+            "  C2 LONG RAW,\n"
+            "  C3 VARCHAR2(30) DEFAULT 'LONG',\n"
+            "  C4 VARCHAR2(30) -- LONG in comment\n"
+            ");"
+        )
+        cleaned = sdr.apply_ddl_cleanup_rules(ddl, "TABLE")
+        self.assertIn("C1 CLOB", cleaned)
+        self.assertIn("C2 BLOB", cleaned)
+        self.assertIn("'LONG'", cleaned)
+        self.assertIn("-- LONG in comment", cleaned)
+
+    def test_view_cleanup_pipeline_integration(self):
+        raw = (
+            "CREATE OR REPLACE FORCE EDITIONABLE VIEW V_DEMO AS\n"
+            "SELECT 1 AS C FROM DUAL\n"
+            "WITH CHECK OPTION CONSTRAINT CK_V_DEMO;"
+        )
+        view_clean = sdr.clean_view_ddl_for_oceanbase(raw, ob_version="4.2.5.7")
+        final = sdr.apply_ddl_cleanup_rules(view_clean, "VIEW")
+        self.assertTrue(final.upper().startswith("CREATE OR REPLACE VIEW"))
+        self.assertIn("WITH CHECK OPTION", final.upper())
+
     def test_normalize_synonym_fixup_scope(self):
         self.assertEqual(sdr.normalize_synonym_fixup_scope(None), "public_only")
         self.assertEqual(sdr.normalize_synonym_fixup_scope("all"), "all")
@@ -6153,6 +6194,8 @@ class TestReportDbHelpers(unittest.TestCase):
     def test_sql_quote_literal(self):
         self.assertEqual(sdr.sql_quote_literal(None), "NULL")
         self.assertEqual(sdr.sql_quote_literal("O'Reilly"), "'O''Reilly'")
+        self.assertEqual(sdr.sql_quote_literal("A\x00B"), "'AB'")
+        self.assertEqual(sdr.sql_quote_literal("A\x01B"), "'AB'")
 
     def test_sql_clob_literal_chunking(self):
         text = "a" * 4500
@@ -6452,6 +6495,58 @@ class TestReportDbHelpers(unittest.TestCase):
         self.assertIn("LENGTH_MISMATCH", item_types)
         self.assertIn("TYPE_MISMATCH", item_types)
         self.assertIn("MISSING_SEQUENCE", item_types)
+
+    def test_insert_report_detail_item_rows_fallback_single_row(self):
+        rows = [
+            {
+                "report_type": "MISSING",
+                "object_type": "TABLE",
+                "source_schema": "SRC",
+                "source_name": "T1",
+                "target_schema": "TGT",
+                "target_name": "T1",
+                "item_type": "DETAIL",
+                "item_key": "",
+                "src_value": "",
+                "tgt_value": "",
+                "item_value": "A",
+                "status": "SUPPORTED",
+            },
+            {
+                "report_type": "MISSING",
+                "object_type": "TABLE",
+                "source_schema": "SRC",
+                "source_name": "T2",
+                "target_schema": "TGT",
+                "target_name": "T2",
+                "item_type": "DETAIL",
+                "item_key": "",
+                "src_value": "",
+                "tgt_value": "",
+                "item_value": "B",
+                "status": "SUPPORTED",
+            },
+        ]
+        sql_calls = []
+
+        def _fake_exec(_cfg, sql, timeout=0):
+            sql_calls.append(sql)
+            if sql.startswith("INSERT ALL") and sql.count("\n  INTO ") >= 2:
+                return False, "", "batch failed"
+            return True, "", ""
+
+        with mock.patch.object(sdr, "obclient_run_sql_commit", side_effect=_fake_exec):
+            with mock.patch.object(sdr, "_record_report_db_write_error") as mocked_err:
+                ok = sdr._insert_report_detail_item_rows(
+                    {"executable": "/usr/bin/obclient"},
+                    "",
+                    "RID",
+                    rows,
+                    batch_size=10
+                )
+        self.assertFalse(ok)
+        self.assertGreaterEqual(len(sql_calls), 3)
+        self.assertEqual(mocked_err.call_count, 1)
 
     def test_report_db_ddls_no_foreign_keys(self):
         source = inspect.getsource(sdr.ensure_report_db_tables_exist)
