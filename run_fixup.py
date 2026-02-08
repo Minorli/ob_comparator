@@ -68,7 +68,7 @@ LOG_FILE_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
 LOG_SECTION_WIDTH = 80
 
 CURRENT_SCHEMA_PATTERN = re.compile(
-    r'ALTER\s+SESSION\s+SET\s+CURRENT_SCHEMA\s*=\s*(?P<schema>"[^"]+"|[A-Z0-9_$#]+)',
+    r'^\s*ALTER\s+SESSION\s+SET\s+CURRENT_SCHEMA\s*=\s*(?P<schema>"[^"]+"|[A-Z0-9_$#]+)\s*;?\s*$',
     re.IGNORECASE
 )
 
@@ -200,18 +200,33 @@ def classify_sql_error(stderr: str) -> str:
     stderr_upper = stderr.upper()
     
     # Missing object errors (retryable - object may be created in later rounds)
-    if any(code in stderr_upper for code in ['ORA-00942', 'ORA-04043', 'ORA-06512']):
+    if any(code in stderr_upper for code in ['ORA-00942', 'ORA-04043', 'OB-00942', 'OB-04043', 'ORA-06512']):
         if 'TABLE OR VIEW DOES NOT EXIST' in stderr_upper or 'OBJECT DOES NOT EXIST' in stderr_upper:
             return FailureType.MISSING_OBJECT
-    if 'TABLE OR VIEW DOES NOT EXIST' in stderr_upper or 'OBJECT DOES NOT EXIST' in stderr_upper:
+    if (
+        'TABLE OR VIEW DOES NOT EXIST' in stderr_upper
+        or 'OBJECT DOES NOT EXIST' in stderr_upper
+        or 'ERROR 1146' in stderr_upper
+    ):
         return FailureType.MISSING_OBJECT
     
     # Permission denied (needs grant scripts)
-    if 'ORA-01031' in stderr_upper or 'ORA-01720' in stderr_upper or 'INSUFFICIENT PRIVILEGES' in stderr_upper:
+    if (
+        'ORA-01031' in stderr_upper
+        or 'OB-01031' in stderr_upper
+        or 'ORA-01720' in stderr_upper
+        or 'INSUFFICIENT PRIVILEGES' in stderr_upper
+        or 'ERROR 1142' in stderr_upper
+        or 'ERROR 1227' in stderr_upper
+    ):
         return FailureType.PERMISSION_DENIED
 
     # Authentication failure
-    if 'ORA-01017' in stderr_upper or 'INVALID USERNAME/PASSWORD' in stderr_upper:
+    if (
+        'ORA-01017' in stderr_upper
+        or 'INVALID USERNAME/PASSWORD' in stderr_upper
+        or 'ERROR 1045' in stderr_upper
+    ):
         return FailureType.AUTH_FAILED
 
     # Connection timeout
@@ -219,7 +234,7 @@ def classify_sql_error(stderr: str) -> str:
         return FailureType.CONNECTION_TIMEOUT
 
     # Lock timeout / resource busy
-    if 'ORA-00054' in stderr_upper or 'RESOURCE BUSY' in stderr_upper:
+    if 'ORA-00054' in stderr_upper or 'RESOURCE BUSY' in stderr_upper or 'ERROR 1205' in stderr_upper:
         return FailureType.LOCK_TIMEOUT
 
     # Resource exhausted
@@ -231,7 +246,7 @@ def classify_sql_error(stderr: str) -> str:
         return FailureType.SNAPSHOT_ERROR
 
     # Deadlock
-    if 'ORA-00060' in stderr_upper:
+    if 'ORA-00060' in stderr_upper or 'ERROR 1213' in stderr_upper:
         return FailureType.DEADLOCK
     
     # Data conflict (unique constraint violation)
@@ -239,15 +254,21 @@ def classify_sql_error(stderr: str) -> str:
         return FailureType.DATA_CONFLICT
     
     # Invalid identifier (DDL needs fix)
-    if 'ORA-00904' in stderr_upper:
+    if 'ORA-00904' in stderr_upper or 'ERROR 1054' in stderr_upper:
         return FailureType.INVALID_IDENTIFIER
     
     # Name already in use (object exists)
-    if 'ORA-00955' in stderr_upper or 'NAME IS ALREADY USED' in stderr_upper:
+    if (
+        'ORA-00955' in stderr_upper
+        or 'OB-00955' in stderr_upper
+        or 'NAME IS ALREADY USED' in stderr_upper
+        or 'ALREADY EXISTS' in stderr_upper
+        or 'ERROR 1050' in stderr_upper
+    ):
         return FailureType.NAME_IN_USE
     
     # Syntax errors (DDL needs fix)
-    if any(code in stderr_upper for code in ['ORA-00900', 'ORA-00901', 'ORA-00902', 'ORA-00903']):
+    if any(code in stderr_upper for code in ['ORA-00900', 'ORA-00901', 'ORA-00902', 'ORA-00903', 'ERROR 1064']):
         return FailureType.SYNTAX_ERROR
     
     return FailureType.UNKNOWN
@@ -867,6 +888,16 @@ def build_obclient_command(ob_cfg: Dict[str, str]) -> List[str]:
     ]
 
 
+def iter_sql_files_recursive(base_dir: Path) -> List[Path]:
+    try:
+        return sorted(
+            [path for path in base_dir.rglob("*.sql") if path.is_file()],
+            key=lambda p: str(p)
+        )
+    except OSError:
+        return []
+
+
 def collect_sql_files_by_layer(
     fixup_dir: Path,
     smart_order: bool = False,
@@ -900,7 +931,7 @@ def collect_sql_files_by_layer(
                     for grant_dir in grant_dirs:
                         if grant_dir not in subdirs:
                             continue
-                        for sql_file in sorted(subdirs[grant_dir].glob("*.sql")):
+                        for sql_file in iter_sql_files_recursive(subdirs[grant_dir]):
                             if not sql_file.is_file():
                                 continue
                             rel_str = str(sql_file.relative_to(fixup_dir))
@@ -914,7 +945,7 @@ def collect_sql_files_by_layer(
                 if dir_name not in subdirs:
                     continue
 
-                for sql_file in sorted(subdirs[dir_name].glob("*.sql")):
+                for sql_file in iter_sql_files_recursive(subdirs[dir_name]):
                     if not sql_file.is_file():
                         continue
                     rel_str = str(sql_file.relative_to(fixup_dir))
@@ -934,7 +965,7 @@ def collect_sql_files_by_layer(
             if include_dirs and dir_name not in include_dirs:
                 continue
                 
-            for sql_file in sorted(subdirs[dir_name].glob("*.sql")):
+            for sql_file in iter_sql_files_recursive(subdirs[dir_name]):
                 if not sql_file.is_file():
                     continue
                 rel_str = str(sql_file.relative_to(fixup_dir))
@@ -943,13 +974,13 @@ def collect_sql_files_by_layer(
                     continue
                 files_with_layer.append((999, sql_file))  # Unknown layer
     else:
-        # Original priority order (backward compatible)
+        # Keep non-smart execution order aligned with dependency-aware layers.
         priority = [
-            "sequence", "table", "table_alter", "view_prereq_grants", "constraint", "index",
-            "view", "materialized_view", "synonym", "view_post_grants",
-            "procedure", "function", "package", "package_body",
-            "type", "type_body", "trigger",
-            "job", "schedule", "grants",
+            "sequence", "table", "table_alter", "view_prereq_grants", "grants",
+            "view", "synonym", "view_post_grants", "materialized_view",
+            "type", "package", "procedure", "function",
+            "type_body", "package_body", "constraint", "index", "trigger",
+            "job", "schedule",
         ]
         
         seen = set()
@@ -958,7 +989,7 @@ def collect_sql_files_by_layer(
                 for grant_dir in grant_dirs:
                     if grant_dir not in subdirs:
                         continue
-                    for sql_file in sorted(subdirs[grant_dir].glob("*.sql")):
+                    for sql_file in iter_sql_files_recursive(subdirs[grant_dir]):
                         if not sql_file.is_file():
                             continue
                         rel_str = str(sql_file.relative_to(fixup_dir))
@@ -971,7 +1002,7 @@ def collect_sql_files_by_layer(
             if include_dirs and name not in include_dirs:
                 continue
             if name in subdirs:
-                for sql_file in sorted(subdirs[name].glob("*.sql")):
+                for sql_file in iter_sql_files_recursive(subdirs[name]):
                     if not sql_file.is_file():
                         continue
                     rel_str = str(sql_file.relative_to(fixup_dir))
@@ -989,7 +1020,7 @@ def collect_sql_files_by_layer(
                 continue
             if include_dirs and name not in include_dirs:
                 continue
-            for sql_file in sorted(subdirs[name].glob("*.sql")):
+            for sql_file in iter_sql_files_recursive(subdirs[name]):
                 if not sql_file.is_file():
                     continue
                 rel_str = str(sql_file.relative_to(fixup_dir))
@@ -1086,18 +1117,74 @@ def is_create_view_statement(statement: str) -> bool:
 def is_comment_only_statement(statement: str) -> bool:
     if not statement.strip():
         return True
-    stripped = re.sub(r"/\*.*?\*/", "", statement, flags=re.DOTALL)
-    for line in stripped.splitlines():
-        line_strip = line.strip()
-        if not line_strip:
+    in_single = False
+    in_double = False
+    block_comment_depth = 0
+    idx = 0
+    length = len(statement)
+    has_code = False
+
+    while idx < length:
+        ch = statement[idx]
+        nxt = statement[idx + 1] if idx + 1 < length else ""
+
+        if block_comment_depth > 0:
+            if ch == "/" and nxt == "*":
+                block_comment_depth += 1
+                idx += 2
+                continue
+            if ch == "*" and nxt == "/":
+                block_comment_depth -= 1
+                idx += 2
+                continue
+            idx += 1
             continue
-        if line_strip.startswith("--"):
+
+        if not in_single and not in_double:
+            if ch == "/" and nxt == "*":
+                block_comment_depth = 1
+                idx += 2
+                continue
+            if ch == "-" and nxt == "-":
+                while idx < length and statement[idx] != "\n":
+                    idx += 1
+                continue
+
+        if ch == "'" and not in_double:
+            if in_single and nxt == "'":
+                has_code = True
+                idx += 2
+                continue
+            in_single = not in_single
+            has_code = True
+            idx += 1
             continue
-        if "--" in line_strip:
-            line_strip = line_strip.split("--", 1)[0].strip()
-        if line_strip:
-            return False
-    return True
+
+        if ch == '"' and not in_single:
+            if in_double and nxt == '"':
+                has_code = True
+                idx += 2
+                continue
+            in_double = not in_double
+            has_code = True
+            idx += 1
+            continue
+
+        if not ch.isspace():
+            has_code = True
+        idx += 1
+
+    return not has_code
+
+
+def extract_execution_error(result: subprocess.CompletedProcess) -> Optional[str]:
+    error_msg = extract_sql_error(result.stderr) or extract_sql_error(result.stdout)
+    if error_msg:
+        return error_msg
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        return stderr or "执行失败"
+    return None
 
 
 def parse_error_code(message: str) -> str:
@@ -2241,7 +2328,7 @@ def execute_sql_statements(
     for idx, statement in enumerate(statements, start=1):
         if not statement.strip():
             continue
-        match = CURRENT_SCHEMA_PATTERN.search(statement)
+        match = CURRENT_SCHEMA_PATTERN.match(statement.strip())
         if match:
             current_schema = match.group("schema")
         statement_to_run = statement
@@ -2254,15 +2341,9 @@ def execute_sql_statements(
             failures.append(StatementFailure(idx, f"执行超时 ({timeout_label})", statement_to_run))
             continue
 
-        error_msg = extract_sql_error(result.stderr) or extract_sql_error(result.stdout)
+        error_msg = extract_execution_error(result)
         if error_msg:
             failures.append(StatementFailure(idx, error_msg, statement_to_run))
-            continue
-
-        if result.returncode != 0:
-            stderr = (result.stderr or "").strip()
-            message = stderr or "执行失败"
-            failures.append(StatementFailure(idx, message, statement_to_run))
 
     return ExecutionSummary(statements=len(statements), failures=failures)
 
@@ -2288,12 +2369,9 @@ def run_query_lines(
         result = run_sql(obclient_cmd, sql_text, timeout)
     except subprocess.TimeoutExpired:
         return False, [], "TimeoutExpired"
-    error_msg = extract_sql_error(result.stderr) or extract_sql_error(result.stdout)
+    error_msg = extract_execution_error(result)
     if error_msg:
         return False, [], error_msg
-    if result.returncode != 0:
-        stderr = (result.stderr or "").strip()
-        return False, [], stderr or "执行失败"
     lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
     return True, lines, ""
 
@@ -2353,6 +2431,15 @@ def build_fixup_object_index(
     return dict(by_schema_obj), dict(by_name)
 
 
+def infer_recompile_owners(files_with_layer: List[Tuple[int, Path]]) -> Set[str]:
+    owners: Set[str] = set()
+    for _, path in files_with_layer:
+        schema, _name = parse_object_from_filename(path)
+        if schema:
+            owners.add(schema)
+    return owners
+
+
 def collect_sql_files_from_root(
     root_dir: Path,
     include_dirs: Optional[Set[str]] = None,
@@ -2370,7 +2457,7 @@ def collect_sql_files_from_root(
             continue
         if include_set and subdir.name.lower() not in include_set:
             continue
-        for sql_file in sorted(subdir.glob("*.sql")):
+        for sql_file in iter_sql_files_recursive(subdir):
             if sql_file.is_file():
                 files.append(sql_file)
     return files
@@ -2417,7 +2504,7 @@ def build_grant_index(
         grants_path = subdirs.get(grant_dir)
         if not grants_path:
             continue
-        for grant_file in sorted(grants_path.glob("*.sql")):
+        for grant_file in iter_sql_files_recursive(grants_path):
             try:
                 content = grant_file.read_text(encoding="utf-8")
             except Exception as exc:
@@ -2644,13 +2731,13 @@ def apply_grant_entries(
             failed += 1
             log.warning("[GRANT] 执行超时: %s", safe_first_line(entry.statement, 160, "执行超时"))
             continue
-        if result.returncode == 0:
+        error_msg = extract_execution_error(result)
+        if not error_msg:
             applied_grants.add(key)
             applied += 1
             continue
         failed += 1
-        stderr = (result.stderr or "").strip()
-        log.warning("[GRANT] 执行失败: %s", safe_first_line(stderr, 160, "执行失败"))
+        log.warning("[GRANT] 执行失败: %s", safe_first_line(error_msg, 160, "执行失败"))
 
     return applied, failed
 
@@ -2781,15 +2868,15 @@ def execute_grant_file_with_prune(
                 )
             continue
 
-        if result.returncode == 0:
+        error_msg = extract_execution_error(result)
+        if not error_msg:
             if is_grant:
                 removed_count += 1
             else:
                 kept_statements.append(statement)
             continue
 
-        stderr = (result.stderr or "").strip()
-        message = stderr or "执行失败"
+        message = error_msg
         failures.append(StatementFailure(executed_count, message, statement))
         kept_statements.append(statement)
         if not truncated:
@@ -2880,17 +2967,29 @@ def execute_script_with_summary(
     return ScriptResult(relative_path, "FAILED", first_error, layer), summary
 
 
-def query_invalid_objects(obclient_cmd: List[str], timeout: Optional[int]) -> List[Tuple[str, str, str]]:
+def query_invalid_objects(
+    obclient_cmd: List[str],
+    timeout: Optional[int],
+    allowed_owners: Optional[Set[str]] = None
+) -> List[Tuple[str, str, str]]:
     """
     Query INVALID objects from OceanBase.
     
     Returns:
         List of (owner, object_name, object_type) tuples
     """
-    sql = """
+    owner_filter = ""
+    if allowed_owners:
+        owners = sorted({owner.strip().upper() for owner in allowed_owners if owner and owner.strip()})
+        if owners:
+            owner_in = ", ".join(f"'{escape_sql_literal(owner)}'" for owner in owners)
+            owner_filter = f"\n      AND OWNER IN ({owner_in})"
+
+    sql = f"""
     SELECT OWNER, OBJECT_NAME, OBJECT_TYPE
     FROM DBA_OBJECTS
     WHERE STATUS = 'INVALID'
+      {owner_filter}
     ORDER BY OWNER, OBJECT_TYPE, OBJECT_NAME;
     """
     
@@ -2929,7 +3028,8 @@ def build_compile_statement(owner: str, obj_name: str, obj_type: str) -> Optiona
 def recompile_invalid_objects(
     obclient_cmd: List[str],
     timeout: Optional[int],
-    max_retries: int = MAX_RECOMPILE_RETRIES
+    max_retries: int = MAX_RECOMPILE_RETRIES,
+    allowed_owners: Optional[Set[str]] = None
 ) -> Tuple[int, int]:
     """
     Recompile INVALID objects multiple times until all are VALID or max retries reached.
@@ -2940,7 +3040,7 @@ def recompile_invalid_objects(
     total_recompiled = 0
     
     for retry in range(max_retries):
-        invalid_objects = query_invalid_objects(obclient_cmd, timeout)
+        invalid_objects = query_invalid_objects(obclient_cmd, timeout, allowed_owners=allowed_owners)
         if not invalid_objects:
             return total_recompiled, 0
         
@@ -2986,7 +3086,7 @@ def recompile_invalid_objects(
             break
     
     # Final check
-    final_invalid = query_invalid_objects(obclient_cmd, timeout)
+    final_invalid = query_invalid_objects(obclient_cmd, timeout, allowed_owners=allowed_owners)
     return total_recompiled, len(final_invalid)
 
 
@@ -3250,7 +3350,8 @@ def run_single_fixup(
     if not files_with_layer:
         log.warning("目录 %s 中未找到任何 *.sql 文件。", fixup_dir)
         return
-    
+    recompile_owners = infer_recompile_owners(files_with_layer)
+
     obclient_cmd = build_obclient_command(ob_cfg)
     ob_timeout = resolve_timeout_value(ob_cfg.get("timeout"))
     ok_conn, conn_err = check_obclient_connectivity(obclient_cmd, ob_timeout)
@@ -3414,7 +3515,7 @@ def run_single_fixup(
     if args.recompile:
         log_subsection("重编译阶段")
         total_recompiled, remaining_invalid = recompile_invalid_objects(
-            obclient_cmd, ob_timeout, args.max_retries
+            obclient_cmd, ob_timeout, args.max_retries, allowed_owners=recompile_owners
         )
 
     if auto_grant_ctx:
@@ -3570,6 +3671,11 @@ def run_view_chain_autofix(
 
     obclient_cmd = build_obclient_command(ob_cfg)
     ob_timeout = resolve_timeout_value(ob_cfg.get("timeout"))
+    ok_conn, conn_err = check_obclient_connectivity(obclient_cmd, ob_timeout)
+    if not ok_conn:
+        log.error("OBClient 连接检查失败: %s", conn_err)
+        log.error("请确认网络连通性/账号权限/obclient 可用性后重试。")
+        sys.exit(1)
 
     exists_cache: Dict[Tuple[str, str], bool] = {}
     roles_cache: Dict[str, Set[str]] = LimitedCache(fixup_settings.cache_limit)
@@ -3694,6 +3800,7 @@ def run_view_chain_autofix(
             continue
 
         summary = execute_sql_statements(obclient_cmd, sql_text, ob_timeout)
+        exists_cache.pop((view_key.upper(), normalize_object_type(root_type)), None)
         post_exists = check_object_exists(
             obclient_cmd,
             ob_timeout,
@@ -3812,6 +3919,11 @@ def run_iterative_fixup(
     
     obclient_cmd = build_obclient_command(ob_cfg)
     ob_timeout = resolve_timeout_value(ob_cfg.get("timeout"))
+    ok_conn, conn_err = check_obclient_connectivity(obclient_cmd, ob_timeout)
+    if not ok_conn:
+        log.error("OBClient 连接检查失败: %s", conn_err)
+        log.error("请确认网络连通性/账号权限/obclient 可用性后重试。")
+        sys.exit(1)
     auto_grant_ctx = init_auto_grant_context(
         fixup_settings,
         report_dir,
@@ -3826,7 +3938,8 @@ def run_iterative_fixup(
     round_num = 0
     cumulative_success = 0
     cumulative_failed = 0
-    cumulative_failed_paths: Set[Path] = set()
+    active_failed_paths: Set[Path] = set()
+    recompile_owners: Set[str] = set()
     
     all_round_results = []
     
@@ -3847,6 +3960,7 @@ def run_iterative_fixup(
         if not files_with_layer:
             log.info("✓ 所有脚本已成功执行！")
             break
+        recompile_owners.update(infer_recompile_owners(files_with_layer))
 
         object_index, name_index = build_fixup_object_index(files_with_layer)
         pre_executed: Set[Path] = set()
@@ -4035,8 +4149,10 @@ def run_iterative_fixup(
         cumulative_success += round_success
         for item in round_results:
             if item.status in ("FAILED", "ERROR"):
-                cumulative_failed_paths.add(item.path)
-        cumulative_failed = len(cumulative_failed_paths)
+                active_failed_paths.add(item.path)
+            else:
+                active_failed_paths.discard(item.path)
+        cumulative_failed = len(active_failed_paths)
         
         log_subsection(f"第 {round_num} 轮结果")
         log.info("本轮成功: %d", round_success)
@@ -4072,7 +4188,7 @@ def run_iterative_fixup(
         if args.recompile:
             log_subsection("轮次重编译")
             recomp, invalid = recompile_invalid_objects(
-                obclient_cmd, ob_timeout, 2  # Fewer retries per round
+                obclient_cmd, ob_timeout, 2, allowed_owners=recompile_owners  # Fewer retries per round
             )
             if recomp > 0:
                 log.info("重编译成功 %d 个对象", recomp)
@@ -4083,7 +4199,7 @@ def run_iterative_fixup(
     if args.recompile:
         log_section("最终重编译")
         total_recompiled, remaining_invalid = recompile_invalid_objects(
-            obclient_cmd, ob_timeout, args.max_retries
+            obclient_cmd, ob_timeout, args.max_retries, allowed_owners=recompile_owners
         )
 
     if auto_grant_ctx:
@@ -4132,7 +4248,7 @@ def run_iterative_fixup(
 
     log_section("执行结束")
     
-    exit_code = 0 if cumulative_failed == 0 else 1
+    exit_code = 0 if len(active_failed_paths) == 0 else 1
     sys.exit(exit_code)
 
 
