@@ -2,7 +2,7 @@
 ## 技术规格说明 (Technical Specification)
 
 **版本**：0.9.8.3  
-**日期**：2026-02-05  
+**日期**：2026-02-09  
 **适用场景**：Oracle → OceanBase（Oracle 模式）迁移后的结构一致性校验、对象补全、DDL 兼容性修复。
 
 ---
@@ -202,4 +202,12 @@
 
 ## 12. 已知限制
 - 对极端复杂 DDL（如 `q'[...]'` 字符串）需人工复核清洗结果。
-- init_users_roles 默认密码需后续改密。
+- `init_users_roles.py` 通过交互输入初始口令，仍建议上线后执行统一改密策略。
+
+---
+
+## 13. 交付前验证基线
+- 语法检查：`python3 -m py_compile $(git ls-files '*.py')`
+- 单元测试：`.venv/bin/python -m unittest discover -v`
+- 可选联调：`RUN_INTEGRATION_TESTS=1 .venv/bin/python -m unittest test_integration_visibility.py -v`
+- 当前基线（2026-02-09）：`unittest` 290 项通过，2 项联调测试默认跳过（需真实 Oracle/OB 环境）。

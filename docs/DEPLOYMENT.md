@@ -33,6 +33,7 @@ deployment_package/
 ├── requirements.txt
 ├── config.ini                 # 可保留模板
 ├── remap_rules.txt
+├── blacklist_rules.json
 ├── readme_config.txt
 ├── docs/
 ├── wheelhouse/
@@ -79,3 +80,20 @@ python run_fixup.py --smart-order --recompile
 ## 6. 安全提示
 - `config.ini` 中包含明文密码，部署前请妥善脱敏与限制访问权限。
 - `fixup_scripts/` 建议只保留必要脚本，执行前务必人工审核。
+
+## 7. 交付前验收建议
+```bash
+# 1) 语法
+python3 -m py_compile $(git ls-files '*.py')
+
+# 2) 单测
+.venv/bin/python -m unittest discover -v
+
+# 3) 可选联调（需真实库）
+RUN_INTEGRATION_TESTS=1 .venv/bin/python -m unittest test_integration_visibility.py -v
+```
+验收建议：
+- 生成一次主报告并确认 `main_reports/run_<ts>/report_<ts>.txt` 可读；
+- 若 `report_to_db=true`，确认 `DIFF_REPORT_SUMMARY` 出现新 `report_id`；
+- 执行 `run_fixup.py --smart-order --recompile` 前先人工审核 `fixup_scripts/`。
+- 若联调测试报 `ORA-12560` 或 OB socket 错误，优先排查客户端环境/网络连通性（非程序逻辑缺陷）。

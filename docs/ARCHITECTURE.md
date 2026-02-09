@@ -82,3 +82,9 @@
 - 主程序仅执行 SELECT，不直接执行 DDL。
 - 修补脚本需人工审核后执行。
 - 运行总结与关键清单确保可追溯。
+
+## 12. 交付前正确性基线
+- 静态语法：`python3 -m py_compile $(git ls-files '*.py')`
+- 单元测试：`.venv/bin/python -m unittest discover -v`
+- 可选联调：`RUN_INTEGRATION_TESTS=1 .venv/bin/python -m unittest test_integration_visibility.py -v`
+- 建议每次交付都记录本次测试结果（通过/失败/跳过项），并随交付包一并存档。

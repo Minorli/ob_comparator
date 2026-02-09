@@ -1,5 +1,5 @@
 配置说明 (config.ini)
-版本：0.9.8.3（更新日期：2026-02-05）
+版本：0.9.8.3（更新日期：2026-02-09）
 本文件为完整配置说明书，覆盖所有可配置项（含最近新增功能）。
 
 通用约定
@@ -239,3 +239,9 @@ dbcat 配置
 - 如果某个键缺失，将使用程序内置默认值。
 - 仅当 generate_fixup=true 时，dbcat 与 fixup 相关配置才会生效。
 - 仅当 check_dependencies=true 时，依赖链路相关输出才会生成。
+
+6) 交付前最小验收（建议固定执行）
+- 语法检查：`python3 -m py_compile $(git ls-files '*.py')`
+- 单元测试：`.venv/bin/python -m unittest discover -v`
+- 可选联调（需真实 Oracle/OB）：`RUN_INTEGRATION_TESTS=1 .venv/bin/python -m unittest test_integration_visibility.py -v`
+- 建议保留并随包分发：`blacklist_rules.json`（blacklist_mode=auto/rules_only 时需要）

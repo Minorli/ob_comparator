@@ -1,735 +1,676 @@
-========================================
-OceanBase 报告表阅读指南（report_to_db）
-========================================
+============================================================
+OceanBase 报告库排查手册（report_to_db）
+文件: HOW_TO_READ_REPORTS_IN_OB_70_sqls.txt
+============================================================
 
-目录
-1. 概览
-2. 入门：找到最新 report_id
-3. 客户排查主线（先汇总 → 不支持 → 阻断 → remap → 缺失/不一致）
-4. 汇总统计与趋势
-5. 缺失/不支持/阻断/不一致明细（核心）
-6. 依赖与阻断深挖
-7. remap 专项
-8. 黑名单与不支持原因
-9. 授权差异（GRANT）
-10. 可用性 / PACKAGE / TRIGGER 状态
-11. 高级筛选与定位
-12. 常见排查问答
+使用说明
+- 将 `:report_id` 替换为目标报告 ID（例如 `20260206_154154_61d1740b`）。
+- 先跑 SQL-01/02 找到 report_id，再按“汇总 -> 不支持/阻断 -> 缺失/不一致 -> 依赖/remap -> 授权/可用性”顺序排查。
+- `DIFF_REPORT_DETAIL_ITEM` 是“行化细节表”，同一对象出现多行是正常设计（item_type 不同，如 REASON_CODE/ACTION/DEPENDENCY/DETAIL/ROOT_CAUSE）。
+- 若某表不存在，请先确认 `report_db_store_scope`：
+  - `summary`: 仅 SUMMARY/COUNTS
+  - `core`: + DETAIL/GRANT/USABILITY/PACKAGE_COMPARE/TRIGGER_STATUS + 6个分析视图
+  - `full`: + DETAIL_ITEM/ARTIFACT/DEPENDENCY/VIEW_CHAIN/REMAP_CONFLICT/OBJECT_MAPPING/BLACKLIST/FIXUP_SKIP/OMS_MISSING
 
-----------------------------------------
-1) 概览
-----------------------------------------
-说明
-- 本文件适用于 report_to_db=true 写入 OB 的报告表。
-- 写库范围受 report_db_store_scope 控制：
-  - summary：仅 SUMMARY / COUNTS
-  - core：summary + DETAIL / GRANT / USABILITY / PACKAGE_COMPARE / TRIGGER_STATUS
-  - full：core + DETAIL_ITEM / ARTIFACT / DEPENDENCY / VIEW_CHAIN / REMAP_CONFLICT / OBJECT_MAPPING / BLACKLIST / FIXUP_SKIP / OMS_MISSING
-  - 备注：WRITE_ERRORS / RESOLUTION 为写库追踪与闭环表，report_to_db 启用后默认创建
-- 表名固定为：
-  - DIFF_REPORT_SUMMARY
-  - DIFF_REPORT_COUNTS
-  - DIFF_REPORT_DETAIL
-  - DIFF_REPORT_DETAIL_ITEM
-  - DIFF_REPORT_GRANT
-  - DIFF_REPORT_USABILITY
-  - DIFF_REPORT_PACKAGE_COMPARE
-  - DIFF_REPORT_TRIGGER_STATUS
-  - DIFF_REPORT_ARTIFACT
-  - DIFF_REPORT_DEPENDENCY
-  - DIFF_REPORT_VIEW_CHAIN
-  - DIFF_REPORT_REMAP_CONFLICT
-  - DIFF_REPORT_OBJECT_MAPPING
-  - DIFF_REPORT_BLACKLIST
-  - DIFF_REPORT_FIXUP_SKIP
-  - DIFF_REPORT_OMS_MISSING
-  - DIFF_REPORT_WRITE_ERRORS
-  - DIFF_REPORT_RESOLUTION
-- 报告明细表使用列名：
-  - REPORT_TYPE: MISSING / UNSUPPORTED / MISMATCHED / OK / SKIPPED
-  - STATUS: 用于区分细分状态（如 BLOCKED / UNSUPPORTED / MISMATCH / OK / SKIPPED）
-  - 视图（report_db_store_scope=core/full 时创建）：
-    DIFF_REPORT_ACTIONS_V / DIFF_REPORT_OBJECT_PROFILE_V / DIFF_REPORT_TRENDS_V
-    DIFF_REPORT_PENDING_ACTIONS_V / DIFF_REPORT_GRANT_CLASS_V / DIFF_REPORT_USABILITY_CLASS_V
+------------------------------------------------------------
+A. 入口与覆盖范围（SQL-01 ~ SQL-14）
+------------------------------------------------------------
 
-----------------------------------------
-2) 入门：找到最新 report_id
-----------------------------------------
-SELECT report_id, run_timestamp, run_dir
+-- SQL-01 最近10次运行（入口）
+SELECT report_id, run_timestamp, conclusion, conclusion_detail, run_dir
   FROM DIFF_REPORT_SUMMARY
  ORDER BY run_timestamp DESC
- FETCH FIRST 5 ROWS ONLY;
+ FETCH FIRST 10 ROWS ONLY;
 
--- SQL 模板（预填 report_id）已输出到 run 目录：
--- report_sql_<timestamp>.txt
+-- SQL-02 最新 report_id（单值）
+SELECT report_id
+  FROM DIFF_REPORT_SUMMARY
+ ORDER BY run_timestamp DESC
+ FETCH FIRST 1 ROW ONLY;
 
--- DB 覆盖范围提醒（哪些报告已入库，哪些仍在 TXT）
-SELECT report_id, artifact_type, status, note, row_count, file_path
+-- SQL-03 最近7天按结论统计
+SELECT conclusion, COUNT(*) AS cnt
+  FROM DIFF_REPORT_SUMMARY
+ WHERE run_timestamp >= SYSTIMESTAMP - INTERVAL '7' DAY
+ GROUP BY conclusion
+ ORDER BY cnt DESC;
+
+-- SQL-04 最近7天运行明细（时间窗）
+SELECT report_id, run_timestamp, duration_seconds,
+       total_checked, missing_count, mismatched_count, unsupported_count,
+       conclusion
+  FROM DIFF_REPORT_SUMMARY
+ WHERE run_timestamp >= SYSTIMESTAMP - INTERVAL '7' DAY
+ ORDER BY run_timestamp DESC;
+
+-- SQL-05 指定 report_id 的 DB 覆盖范围（哪些工件入库）
+SELECT artifact_type, status, note, row_count, file_path
   FROM DIFF_REPORT_ARTIFACT
  WHERE report_id = :report_id
  ORDER BY artifact_type, status;
 
-----------------------------------------
-3) 客户排查主线（推荐顺序）
-----------------------------------------
-步骤 1: 看“检查汇总”（总览 + 按类型）
--- 总览（主表）
-SELECT report_id, run_timestamp,
+-- SQL-06 指定 report_id 的“未入库/部分入库”提醒
+SELECT artifact_type, status, note, file_path
+  FROM DIFF_REPORT_ARTIFACT
+ WHERE report_id = :report_id
+   AND status IN ('TXT_ONLY', 'PARTIAL', 'FAILED', 'SKIPPED')
+ ORDER BY artifact_type;
+
+-- SQL-07 指定 report_id 的核心表行数体检
+SELECT 'DETAIL' AS table_name, COUNT(*) AS cnt FROM DIFF_REPORT_DETAIL WHERE report_id = :report_id
+UNION ALL
+SELECT 'DETAIL_ITEM', COUNT(*) FROM DIFF_REPORT_DETAIL_ITEM WHERE report_id = :report_id
+UNION ALL
+SELECT 'COUNTS', COUNT(*) FROM DIFF_REPORT_COUNTS WHERE report_id = :report_id
+UNION ALL
+SELECT 'GRANT', COUNT(*) FROM DIFF_REPORT_GRANT WHERE report_id = :report_id
+UNION ALL
+SELECT 'USABILITY', COUNT(*) FROM DIFF_REPORT_USABILITY WHERE report_id = :report_id
+UNION ALL
+SELECT 'PACKAGE_COMPARE', COUNT(*) FROM DIFF_REPORT_PACKAGE_COMPARE WHERE report_id = :report_id
+UNION ALL
+SELECT 'TRIGGER_STATUS', COUNT(*) FROM DIFF_REPORT_TRIGGER_STATUS WHERE report_id = :report_id
+UNION ALL
+SELECT 'DEPENDENCY', COUNT(*) FROM DIFF_REPORT_DEPENDENCY WHERE report_id = :report_id
+UNION ALL
+SELECT 'VIEW_CHAIN', COUNT(*) FROM DIFF_REPORT_VIEW_CHAIN WHERE report_id = :report_id;
+
+-- SQL-08 指定 report_id 的主汇总（检查汇总同源）
+SELECT report_id, run_timestamp, duration_seconds,
        total_checked, missing_count, mismatched_count, unsupported_count, skipped_count,
+       index_missing, index_mismatched,
+       constraint_missing, constraint_mismatch,
+       trigger_missing, sequence_missing,
+       detail_truncated, detail_truncated_count,
        conclusion, conclusion_detail
   FROM DIFF_REPORT_SUMMARY
  WHERE report_id = :report_id;
 
--- 按对象类型（计数表）
+-- SQL-09 指定 report_id 的问题率（缺失/不支持/不一致）
+SELECT report_id,
+       total_checked,
+       ROUND(100 * missing_count / NULLIF(total_checked, 0), 2) AS missing_pct,
+       ROUND(100 * unsupported_count / NULLIF(total_checked, 0), 2) AS unsupported_pct,
+       ROUND(100 * mismatched_count / NULLIF(total_checked, 0), 2) AS mismatched_pct
+  FROM DIFF_REPORT_SUMMARY
+ WHERE report_id = :report_id;
+
+-- SQL-10 按对象类型汇总（Oracle vs OB vs 差异）
+SELECT object_type, oracle_count, oceanbase_count,
+       missing_count, unsupported_count, extra_count
+  FROM DIFF_REPORT_COUNTS
+ WHERE report_id = :report_id
+ ORDER BY unsupported_count DESC, missing_count DESC, extra_count DESC, object_type;
+
+-- SQL-11 问题对象类型排名（missing+unsupported+extra）
+SELECT object_type,
+       (missing_count + unsupported_count + extra_count) AS total_gap,
+       missing_count, unsupported_count, extra_count
+  FROM DIFF_REPORT_COUNTS
+ WHERE report_id = :report_id
+ ORDER BY total_gap DESC, object_type;
+
+-- SQL-12 仅显示有差异的对象类型
 SELECT object_type,
        oracle_count, oceanbase_count,
        missing_count, unsupported_count, extra_count
   FROM DIFF_REPORT_COUNTS
  WHERE report_id = :report_id
- ORDER BY unsupported_count DESC, missing_count DESC, extra_count DESC;
-
--- 任务视图（可执行清单）
--- 说明：仅在 report_db_store_scope=core/full 时生成
-SELECT action_type, object_type, schema_name, object_name, reason
-  FROM DIFF_REPORT_ACTIONS_V
- WHERE report_id = :report_id
- ORDER BY action_type, object_type, schema_name, object_name;
-
--- 未完成清单（结合 resolution）
-SELECT action_type, object_type, schema_name, object_name, reason,
-       resolution_status, resolved_by, resolved_at
-  FROM DIFF_REPORT_PENDING_ACTIONS_V
- WHERE report_id = :report_id
- ORDER BY action_type, object_type, schema_name, object_name;
-
--- 对象画像（统一看问题谱系）
--- 说明：仅在 report_db_store_scope=core/full 时生成
-SELECT object_type, source_schema, source_name, detail_status, detail_reason,
-       usability_status, blacklist_type
-  FROM DIFF_REPORT_OBJECT_PROFILE_V
- WHERE report_id = :report_id
- ORDER BY object_type, source_schema, source_name;
-
-步骤 2: 先看不支持（需要改造）
-SELECT source_schema, source_name, target_schema, target_name,
-       object_type, status, reason
-  FROM DIFF_REPORT_DETAIL
- WHERE report_id = :report_id
-   AND report_type = 'UNSUPPORTED'
- ORDER BY object_type, source_schema, source_name;
-
-步骤 3: 再看阻断（依赖/黑名单）
--- 阻断行在 UNSUPPORTED 中，status=BLOCKED
-SELECT source_schema, source_name, target_schema, target_name,
-       object_type, status, reason, detail_json
-  FROM DIFF_REPORT_DETAIL
- WHERE report_id = :report_id
-   AND report_type = 'UNSUPPORTED'
-   AND status = 'BLOCKED'
- ORDER BY object_type, source_schema, source_name;
-
-步骤 4: 定位 remap 影响
-SELECT object_type, COUNT(*) AS cnt
-  FROM DIFF_REPORT_DETAIL
- WHERE report_id = :report_id
-   AND DBMS_LOB.INSTR(detail_json, 'remap') > 0
- GROUP BY object_type
- ORDER BY cnt DESC;
-
-步骤 5: 处理缺失（可修复）
-SELECT source_schema, source_name, target_schema, target_name,
-       object_type, reason
-  FROM DIFF_REPORT_DETAIL
- WHERE report_id = :report_id
-   AND report_type = 'MISSING'
- ORDER BY object_type, source_schema, source_name;
-
-步骤 6: 处理不一致（结构/约束/索引等）
-SELECT source_schema, source_name, target_schema, target_name,
-       object_type, reason, detail_json
-  FROM DIFF_REPORT_DETAIL
- WHERE report_id = :report_id
-   AND report_type = 'MISMATCHED'
- ORDER BY object_type, target_schema, target_name;
-
-----------------------------------------
-4) 汇总统计与趋势
-----------------------------------------
-4.1 按对象类型汇总（计数表）
-SELECT object_type,
-       oracle_count, oceanbase_count,
-       missing_count, unsupported_count, extra_count
-  FROM DIFF_REPORT_COUNTS
- WHERE report_id = :report_id
+   AND (missing_count > 0 OR unsupported_count > 0 OR extra_count > 0)
  ORDER BY object_type;
 
-4.2 不一致数量（按对象类型）
-SELECT object_type, COUNT(*) AS mismatched_cnt
+-- SQL-13 schema + object_type 矩阵（缺失/不支持/不一致）
+SELECT NVL(source_schema, target_schema) AS schema_name,
+       object_type,
+       SUM(CASE WHEN report_type = 'MISSING' THEN 1 ELSE 0 END) AS missing_cnt,
+       SUM(CASE WHEN report_type = 'UNSUPPORTED' THEN 1 ELSE 0 END) AS unsupported_cnt,
+       SUM(CASE WHEN report_type = 'MISMATCHED' THEN 1 ELSE 0 END) AS mismatched_cnt
   FROM DIFF_REPORT_DETAIL
  WHERE report_id = :report_id
-   AND report_type = 'MISMATCHED'
- GROUP BY object_type
- ORDER BY mismatched_cnt DESC;
+ GROUP BY NVL(source_schema, target_schema), object_type
+ ORDER BY schema_name, object_type;
 
-4.3 按 schema 汇总（缺失/不支持/不一致）
-SELECT COALESCE(source_schema, target_schema) AS schema_name,
-       SUM(CASE WHEN report_type='MISSING' THEN 1 ELSE 0 END) AS missing_cnt,
-       SUM(CASE WHEN report_type='UNSUPPORTED' THEN 1 ELSE 0 END) AS unsupported_cnt,
-       SUM(CASE WHEN report_type='MISMATCHED' THEN 1 ELSE 0 END) AS mismatched_cnt
+-- SQL-14 问题 schema Top20
+SELECT NVL(source_schema, target_schema) AS schema_name,
+       COUNT(*) AS issue_cnt
   FROM DIFF_REPORT_DETAIL
  WHERE report_id = :report_id
- GROUP BY COALESCE(source_schema, target_schema)
- ORDER BY missing_cnt DESC, unsupported_cnt DESC, mismatched_cnt DESC;
+   AND report_type IN ('MISSING', 'UNSUPPORTED', 'MISMATCHED')
+ GROUP BY NVL(source_schema, target_schema)
+ ORDER BY issue_cnt DESC, schema_name
+ FETCH FIRST 20 ROWS ONLY;
 
-4.4 多次运行趋势（按类型）
-SELECT c.report_id, s.run_timestamp, c.object_type,
-       c.missing_count, c.unsupported_count, c.extra_count
-  FROM DIFF_REPORT_COUNTS c
-  JOIN DIFF_REPORT_SUMMARY s
-    ON c.report_id = s.report_id
- ORDER BY s.run_timestamp DESC, c.object_type;
+------------------------------------------------------------
+B. 缺失对象（SQL-15 ~ SQL-24）
+------------------------------------------------------------
 
-4.5 统一趋势视图（推荐）
--- 说明：仅在 report_db_store_scope=core/full 时生成
-SELECT report_id, run_timestamp, object_type,
-       missing_count, unsupported_count, extra_count
-  FROM DIFF_REPORT_TRENDS_V
- ORDER BY run_timestamp DESC, object_type;
-
-----------------------------------------
-5) 缺失/不支持/阻断/不一致明细（核心）
-----------------------------------------
--- 缺失
-SELECT source_schema, source_name, target_schema, target_name, object_type, reason
+-- SQL-15 缺失对象明细
+SELECT object_type, source_schema, source_name, target_schema, target_name, status, reason
   FROM DIFF_REPORT_DETAIL
  WHERE report_id = :report_id
    AND report_type = 'MISSING'
  ORDER BY object_type, source_schema, source_name;
 
--- 不支持
-SELECT source_schema, source_name, target_schema, target_name, object_type, status, reason
+-- SQL-16 缺失对象按类型统计
+SELECT object_type, COUNT(*) AS missing_cnt
+  FROM DIFF_REPORT_DETAIL
+ WHERE report_id = :report_id
+   AND report_type = 'MISSING'
+ GROUP BY object_type
+ ORDER BY missing_cnt DESC, object_type;
+
+-- SQL-17 缺失对象按 schema 统计
+SELECT NVL(source_schema, target_schema) AS schema_name,
+       COUNT(*) AS missing_cnt
+  FROM DIFF_REPORT_DETAIL
+ WHERE report_id = :report_id
+   AND report_type = 'MISSING'
+ GROUP BY NVL(source_schema, target_schema)
+ ORDER BY missing_cnt DESC, schema_name;
+
+-- SQL-18 缺失中的 TABLE/VIEW（迁移高频）
+SELECT object_type, source_schema, source_name, target_schema, target_name, reason
+  FROM DIFF_REPORT_DETAIL
+ WHERE report_id = :report_id
+   AND report_type = 'MISSING'
+   AND object_type IN ('TABLE', 'VIEW')
+ ORDER BY object_type, source_schema, source_name;
+
+-- SQL-19 缺失对象 + remap 映射信息
+SELECT d.object_type,
+       d.source_schema, d.source_name,
+       d.target_schema, d.target_name,
+       m.map_source,
+       d.reason
+  FROM DIFF_REPORT_DETAIL d
+  LEFT JOIN DIFF_REPORT_OBJECT_MAPPING m
+    ON m.report_id = d.report_id
+   AND m.object_type = d.object_type
+   AND m.src_schema = d.source_schema
+   AND m.src_name = d.source_name
+ WHERE d.report_id = :report_id
+   AND d.report_type = 'MISSING'
+ ORDER BY d.object_type, d.source_schema, d.source_name;
+
+-- SQL-20 OMS 关注的缺失清单
+SELECT object_type, target_schema,
+       src_schema, src_name,
+       tgt_schema, tgt_name
+  FROM DIFF_REPORT_OMS_MISSING
+ WHERE report_id = :report_id
+ ORDER BY object_type, target_schema, src_schema, src_name;
+
+-- SQL-21 fixup 跳过汇总（按对象类型/原因）
+SELECT object_type, missing_total, task_total, generated_total,
+       skip_reason, skip_count
+  FROM DIFF_REPORT_FIXUP_SKIP
+ WHERE report_id = :report_id
+ ORDER BY object_type, skip_count DESC, skip_reason;
+
+-- SQL-22 缺失对象与 fixup 跳过原因关联（粗粒度）
+SELECT d.object_type,
+       COUNT(*) AS missing_cnt,
+       NVL(s.skip_reason, '-') AS skip_reason,
+       NVL(s.skip_count, 0) AS skip_count
+  FROM DIFF_REPORT_DETAIL d
+  LEFT JOIN DIFF_REPORT_FIXUP_SKIP s
+    ON s.report_id = d.report_id
+   AND s.object_type = d.object_type
+ WHERE d.report_id = :report_id
+   AND d.report_type = 'MISSING'
+ GROUP BY d.object_type, NVL(s.skip_reason, '-'), NVL(s.skip_count, 0)
+ ORDER BY d.object_type, skip_count DESC;
+
+-- SQL-23 缺失对象对应动作（FIXUP/REFACTOR/DEPENDENCY/GRANT_REQUIRED）
+SELECT a.action_type, a.object_type, a.schema_name, a.object_name, a.reason
+  FROM DIFF_REPORT_ACTIONS_V a
+ WHERE a.report_id = :report_id
+   AND a.report_type IN ('MISSING', 'MISMATCHED')
+ ORDER BY a.action_type, a.object_type, a.schema_name, a.object_name;
+
+-- SQL-24 缺失对象中“需要先补权限”的候选
+SELECT DISTINCT d.object_type,
+       d.target_schema, d.target_name,
+       g.grantee, g.privilege, g.with_grant_option
+  FROM DIFF_REPORT_DETAIL d
+  JOIN DIFF_REPORT_GRANT g
+    ON g.report_id = d.report_id
+   AND g.status = 'MISSING'
+   AND g.target_schema = d.target_schema
+   AND g.target_name = d.target_name
+ WHERE d.report_id = :report_id
+   AND d.report_type = 'MISSING'
+ ORDER BY d.object_type, d.target_schema, d.target_name;
+
+------------------------------------------------------------
+C. 不支持与阻断（SQL-25 ~ SQL-35）
+------------------------------------------------------------
+
+-- SQL-25 不支持/阻断明细
+SELECT object_type, source_schema, source_name, target_schema, target_name,
+       status, reason
   FROM DIFF_REPORT_DETAIL
  WHERE report_id = :report_id
    AND report_type = 'UNSUPPORTED'
  ORDER BY object_type, source_schema, source_name;
 
--- 阻断（UNSUPPORTED 中 status=BLOCKED）
-SELECT source_schema, source_name, target_schema, target_name, object_type, reason, detail_json
+-- SQL-26 不支持状态分布（UNSUPPORTED vs BLOCKED）
+SELECT status, COUNT(*) AS cnt
   FROM DIFF_REPORT_DETAIL
  WHERE report_id = :report_id
    AND report_type = 'UNSUPPORTED'
-   AND status = 'BLOCKED'
+ GROUP BY status
+ ORDER BY cnt DESC;
+
+-- SQL-27 不支持原因 Top30
+SELECT object_type, reason, COUNT(*) AS cnt
+  FROM DIFF_REPORT_DETAIL
+ WHERE report_id = :report_id
+   AND report_type = 'UNSUPPORTED'
+ GROUP BY object_type, reason
+ ORDER BY cnt DESC
+ FETCH FIRST 30 ROWS ONLY;
+
+-- SQL-28 不支持对象的 reason_code（行化）
+SELECT object_type, source_schema, source_name, target_schema, target_name,
+       item_value AS reason_code
+  FROM DIFF_REPORT_DETAIL_ITEM
+ WHERE report_id = :report_id
+   AND report_type = 'UNSUPPORTED'
+   AND item_type = 'REASON_CODE'
  ORDER BY object_type, source_schema, source_name;
 
--- 不一致（结构/约束/索引/序列/触发器等）
-SELECT source_schema, source_name, target_schema, target_name, object_type, reason, detail_json
+-- SQL-29 不支持对象的建议动作（行化）
+SELECT object_type, source_schema, source_name, target_schema, target_name,
+       item_value AS action_suggestion
+  FROM DIFF_REPORT_DETAIL_ITEM
+ WHERE report_id = :report_id
+   AND report_type = 'UNSUPPORTED'
+   AND item_type = 'ACTION'
+ ORDER BY object_type, source_schema, source_name;
+
+-- SQL-30 不支持对象的依赖对象（行化）
+SELECT object_type, source_schema, source_name, target_schema, target_name,
+       item_value AS dependency
+  FROM DIFF_REPORT_DETAIL_ITEM
+ WHERE report_id = :report_id
+   AND report_type = 'UNSUPPORTED'
+   AND item_type = 'DEPENDENCY'
+ ORDER BY object_type, source_schema, source_name;
+
+-- SQL-31 不支持对象的根因（行化）
+SELECT object_type, source_schema, source_name, target_schema, target_name,
+       item_value AS root_cause
+  FROM DIFF_REPORT_DETAIL_ITEM
+ WHERE report_id = :report_id
+   AND report_type = 'UNSUPPORTED'
+   AND item_type = 'ROOT_CAUSE'
+ ORDER BY object_type, source_schema, source_name;
+
+-- SQL-32 不支持对象与黑名单表关联
+SELECT d.object_type,
+       d.source_schema, d.source_name,
+       b.black_type, b.data_type, b.reason AS blacklist_reason,
+       d.reason AS detail_reason
+  FROM DIFF_REPORT_DETAIL d
+  JOIN DIFF_REPORT_BLACKLIST b
+    ON b.report_id = d.report_id
+   AND b.schema_name = d.source_schema
+   AND b.table_name = d.source_name
+ WHERE d.report_id = :report_id
+   AND d.report_type = 'UNSUPPORTED'
+ ORDER BY d.object_type, d.source_schema, d.source_name;
+
+-- SQL-33 黑名单汇总（按 BLACK_TYPE）
+SELECT black_type,
+       COUNT(*) AS table_cnt,
+       SUM(CASE WHEN status = 'UNSUPPORTED' THEN 1 ELSE 0 END) AS unsupported_cnt,
+       SUM(CASE WHEN status <> 'UNSUPPORTED' OR status IS NULL THEN 1 ELSE 0 END) AS converted_or_other_cnt
+  FROM DIFF_REPORT_BLACKLIST
+ WHERE report_id = :report_id
+ GROUP BY black_type
+ ORDER BY table_cnt DESC, black_type;
+
+-- SQL-34 黑名单明细（按状态）
+SELECT schema_name, table_name, black_type, data_type, status, reason, detail
+  FROM DIFF_REPORT_BLACKLIST
+ WHERE report_id = :report_id
+ ORDER BY status, black_type, schema_name, table_name;
+
+-- SQL-35 名称规则黑名单（如 _RENAME）
+SELECT schema_name, table_name, black_type, status, reason, detail
+  FROM DIFF_REPORT_BLACKLIST
+ WHERE report_id = :report_id
+   AND black_type = 'NAME_PATTERN'
+ ORDER BY schema_name, table_name;
+
+------------------------------------------------------------
+D. 不一致（MISMATCHED）深挖（SQL-36 ~ SQL-46）
+------------------------------------------------------------
+
+-- SQL-36 不一致对象明细
+SELECT object_type, source_schema, source_name, target_schema, target_name, reason
   FROM DIFF_REPORT_DETAIL
  WHERE report_id = :report_id
    AND report_type = 'MISMATCHED'
  ORDER BY object_type, target_schema, target_name;
 
--- 明细行化（逐项查询，report_db_store_scope=full 推荐）
--- 说明：同一对象会拆成多行（item_type=ROOT_CAUSE/ACTION/DEPENDENCY/DETAIL 等），属正常设计。
-SELECT report_type, object_type,
-       source_schema, source_name, target_schema, target_name,
-       item_type, item_key, src_value, tgt_value, item_value, status
+-- SQL-37 不一致对象按类型统计
+SELECT object_type, COUNT(*) AS mismatch_cnt
+  FROM DIFF_REPORT_DETAIL
+ WHERE report_id = :report_id
+   AND report_type = 'MISMATCHED'
+ GROUP BY object_type
+ ORDER BY mismatch_cnt DESC, object_type;
+
+-- SQL-38 TABLE: 缺列/多列
+SELECT source_schema, source_name, target_schema, target_name,
+       item_type, item_key
   FROM DIFF_REPORT_DETAIL_ITEM
  WHERE report_id = :report_id
- ORDER BY object_type, item_type, source_schema, source_name;
+   AND report_type = 'MISMATCHED'
+   AND object_type = 'TABLE'
+   AND item_type IN ('MISSING_COLUMN', 'EXTRA_COLUMN')
+ ORDER BY source_schema, source_name, item_type, item_key;
 
--- 明细聚合到单行（便于阅读，LISTAGG 可能遇到长度限制）
-SELECT report_type, object_type, source_schema, source_name,
-       LISTAGG(
-           item_type || ':' ||
-           COALESCE(item_key, '-') ||
-           CASE WHEN item_value IS NOT NULL THEN '=' || item_value ELSE '' END,
-           ' | '
-       ) WITHIN GROUP (ORDER BY item_type, item_key) AS items
+-- SQL-39 TABLE: 类型不一致
+SELECT source_schema, source_name, target_schema, target_name,
+       item_key AS column_name,
+       src_value AS src_type,
+       tgt_value AS tgt_type,
+       item_value AS rule_info
   FROM DIFF_REPORT_DETAIL_ITEM
  WHERE report_id = :report_id
- GROUP BY report_type, object_type, source_schema, source_name
- ORDER BY report_type, object_type, source_schema, source_name;
+   AND report_type = 'MISMATCHED'
+   AND object_type = 'TABLE'
+   AND item_type = 'TYPE_MISMATCH'
+ ORDER BY source_schema, source_name, item_key;
 
--- 目标端多余对象（主对象，排除同义词，基于映射反查）
-WITH expected AS (
-  SELECT UPPER(tgt_schema) AS owner, UPPER(tgt_name) AS name, UPPER(object_type) AS object_type
-    FROM DIFF_REPORT_OBJECT_MAPPING
-   WHERE report_id = :report_id
-),
-owners AS (
-  SELECT DISTINCT owner FROM expected
-),
-actual AS (
-  SELECT UPPER(owner) AS owner, UPPER(object_name) AS name, UPPER(object_type) AS object_type
-    FROM DBA_OBJECTS
-   WHERE UPPER(owner) IN (SELECT owner FROM owners)
-     AND UPPER(object_type) IN ('TABLE','VIEW','PROCEDURE','FUNCTION','PACKAGE','PACKAGE BODY','TYPE','TYPE BODY')
-)
-SELECT a.owner, a.object_type, a.name
-  FROM actual a
-  LEFT JOIN expected e
-    ON a.owner = e.owner AND a.name = e.name AND a.object_type = e.object_type
- WHERE e.name IS NULL
- ORDER BY a.owner, a.object_type, a.name;
-
--- 目标端多余列（表字段）
-SELECT target_schema, target_name AS table_name, item_key AS column_name
+-- SQL-40 TABLE: 长度不一致
+SELECT source_schema, source_name, target_schema, target_name,
+       item_key AS column_name,
+       src_value AS src_length,
+       tgt_value AS tgt_length,
+       item_value AS rule_info
   FROM DIFF_REPORT_DETAIL_ITEM
  WHERE report_id = :report_id
+   AND report_type = 'MISMATCHED'
+   AND object_type = 'TABLE'
+   AND item_type = 'LENGTH_MISMATCH'
+ ORDER BY source_schema, source_name, item_key;
+
+-- SQL-41 INDEX: 缺失/多余/细节
+SELECT source_schema, source_name, target_schema, target_name,
+       item_type, item_key, item_value
+  FROM DIFF_REPORT_DETAIL_ITEM
+ WHERE report_id = :report_id
+   AND report_type = 'MISMATCHED'
+   AND object_type = 'INDEX'
+ ORDER BY source_schema, source_name, item_type, item_key;
+
+-- SQL-42 CONSTRAINT: 缺失/多余/降级PK/细节
+SELECT source_schema, source_name, target_schema, target_name,
+       item_type, item_key, item_value
+  FROM DIFF_REPORT_DETAIL_ITEM
+ WHERE report_id = :report_id
+   AND report_type = 'MISMATCHED'
+   AND object_type = 'CONSTRAINT'
+ ORDER BY source_schema, source_name, item_type, item_key;
+
+-- SQL-43 SEQUENCE: 缺失/多余/映射/细节
+SELECT source_schema, source_name, target_schema, target_name,
+       item_type, item_key, item_value
+  FROM DIFF_REPORT_DETAIL_ITEM
+ WHERE report_id = :report_id
+   AND report_type = 'MISMATCHED'
+   AND object_type = 'SEQUENCE'
+ ORDER BY source_schema, source_name, item_type, item_key;
+
+-- SQL-44 TRIGGER: 缺失/多余/细节
+SELECT source_schema, source_name, target_schema, target_name,
+       item_type, item_key, item_value
+  FROM DIFF_REPORT_DETAIL_ITEM
+ WHERE report_id = :report_id
+   AND report_type = 'MISMATCHED'
+   AND object_type = 'TRIGGER'
+ ORDER BY source_schema, source_name, item_type, item_key;
+
+-- SQL-45 SYS_C 特殊列候选（预期走 ALTER TABLE ... FORCE）
+SELECT source_schema, source_name, target_schema, target_name,
+       item_type, item_key
+  FROM DIFF_REPORT_DETAIL_ITEM
+ WHERE report_id = :report_id
+   AND report_type = 'MISMATCHED'
    AND object_type = 'TABLE'
    AND item_type = 'EXTRA_COLUMN'
- ORDER BY target_schema, target_name, item_key;
+   AND UPPER(item_key) LIKE 'SYS_C%$'
+ ORDER BY source_schema, source_name, item_key;
 
--- 目标端多余索引
-SELECT target_schema, target_name AS table_name, item_key AS index_name
+-- SQL-46 NUMBER 精度相关疑似噪声（快速筛查）
+SELECT source_schema, source_name, target_schema, target_name,
+       item_key, src_value, tgt_value, item_value
   FROM DIFF_REPORT_DETAIL_ITEM
  WHERE report_id = :report_id
-   AND object_type = 'INDEX'
-   AND item_type = 'EXTRA_INDEX'
- ORDER BY target_schema, target_name, item_key;
+   AND report_type = 'MISMATCHED'
+   AND object_type = 'TABLE'
+   AND item_type = 'TYPE_MISMATCH'
+   AND (UPPER(NVL(src_value, '')) LIKE '%NUMBER%'
+        OR UPPER(NVL(tgt_value, '')) LIKE '%NUMBER%'
+        OR UPPER(NVL(item_value, '')) LIKE '%NUMBER%')
+ ORDER BY source_schema, source_name, item_key;
 
--- 目标端多余约束
-SELECT target_schema, target_name AS table_name, item_key AS constraint_name
-  FROM DIFF_REPORT_DETAIL_ITEM
- WHERE report_id = :report_id
-   AND object_type = 'CONSTRAINT'
-   AND item_type = 'EXTRA_CONSTRAINT'
- ORDER BY target_schema, target_name, item_key;
+------------------------------------------------------------
+E. 依赖 / 视图链 / remap 专项（SQL-47 ~ SQL-59）
+------------------------------------------------------------
 
--- 目标端多余触发器
-SELECT target_schema, target_name AS table_name, item_key AS trigger_name
-  FROM DIFF_REPORT_DETAIL_ITEM
- WHERE report_id = :report_id
-   AND object_type = 'TRIGGER'
-   AND item_type = 'EXTRA_TRIGGER'
- ORDER BY target_schema, target_name, item_key;
-
--- 目标端多余序列
-SELECT target_schema, target_name AS schema_map, item_key AS sequence_name
-  FROM DIFF_REPORT_DETAIL_ITEM
- WHERE report_id = :report_id
-   AND object_type = 'SEQUENCE'
-   AND item_type = 'EXTRA_SEQUENCE'
- ORDER BY target_schema, item_key;
-
-----------------------------------------
-6) 依赖与阻断深挖
-----------------------------------------
-6.1 仅看视图依赖阻断
-SELECT source_schema, source_name, reason, detail_json
-  FROM DIFF_REPORT_DETAIL
- WHERE report_id = :report_id
-   AND object_type = 'VIEW'
-   AND report_type = 'UNSUPPORTED'
-   AND status = 'BLOCKED'
- ORDER BY source_schema, source_name;
-
-6.2 依赖关键字过滤（依赖链通常写在 detail_json）
-SELECT source_schema, object_type, source_name, report_type, reason
-  FROM DIFF_REPORT_DETAIL
- WHERE report_id = :report_id
-   AND DBMS_LOB.INSTR(detail_json, 'dependency') > 0
- ORDER BY object_type, source_schema, source_name;
-
-6.3 依赖链明细（report_db_store_scope=full 推荐）
-SELECT dep_schema, dep_name, dep_type,
-       ref_schema, ref_name, ref_type,
-       edge_status, reason
+-- SQL-47 依赖边状态分布
+SELECT edge_status, COUNT(*) AS cnt
   FROM DIFF_REPORT_DEPENDENCY
  WHERE report_id = :report_id
- ORDER BY edge_status, dep_schema, dep_name;
+ GROUP BY edge_status
+ ORDER BY cnt DESC, edge_status;
 
-6.4 VIEW 链路节点（report_db_store_scope=full 推荐）
+-- SQL-48 缺失依赖边
+SELECT dep_schema, dep_name, dep_type,
+       ref_schema, ref_name, ref_type,
+       reason
+  FROM DIFF_REPORT_DEPENDENCY
+ WHERE report_id = :report_id
+   AND edge_status = 'MISSING'
+ ORDER BY dep_type, dep_schema, dep_name, ref_type, ref_schema, ref_name;
+
+-- SQL-49 跳过依赖边
+SELECT dep_schema, dep_name, dep_type,
+       ref_schema, ref_name, ref_type,
+       reason
+  FROM DIFF_REPORT_DEPENDENCY
+ WHERE report_id = :report_id
+   AND edge_status = 'SKIPPED'
+ ORDER BY dep_type, dep_schema, dep_name;
+
+-- SQL-50 多余依赖边（UNEXPECTED）
+SELECT dep_schema, dep_name, dep_type,
+       ref_schema, ref_name, ref_type,
+       reason
+  FROM DIFF_REPORT_DEPENDENCY
+ WHERE report_id = :report_id
+   AND edge_status = 'UNEXPECTED'
+ ORDER BY dep_type, dep_schema, dep_name;
+
+-- SQL-51 期望依赖边总量（基线）
+SELECT COUNT(*) AS expected_edges
+  FROM DIFF_REPORT_DEPENDENCY
+ WHERE report_id = :report_id
+   AND edge_status = 'EXPECTED';
+
+-- SQL-52 VIEW 链中“节点不存在”
 SELECT view_schema, view_name, chain_id, node_index,
        node_schema, node_name, node_type, node_exists, grant_status, cycle_flag
   FROM DIFF_REPORT_VIEW_CHAIN
  WHERE report_id = :report_id
+   AND NVL(node_exists, 'UNKNOWN') <> 'EXISTS'
  ORDER BY view_schema, view_name, chain_id, node_index;
 
-----------------------------------------
-7) remap 专项
-----------------------------------------
-7.1 remap 影响对象总览
-SELECT object_type, COUNT(*) AS cnt
-  FROM DIFF_REPORT_DETAIL
+-- SQL-53 VIEW 链中“授权缺失”
+SELECT view_schema, view_name, chain_id, node_index,
+       node_schema, node_name, node_type, node_exists, grant_status, cycle_flag
+  FROM DIFF_REPORT_VIEW_CHAIN
  WHERE report_id = :report_id
-   AND DBMS_LOB.INSTR(detail_json, 'remap') > 0
- GROUP BY object_type
- ORDER BY cnt DESC;
+   AND UPPER(NVL(grant_status, '')) LIKE 'GRANT_MISSING%'
+ ORDER BY view_schema, view_name, chain_id, node_index;
 
-7.2 remap 影响的视图
-SELECT source_schema, source_name, report_type, reason
-  FROM DIFF_REPORT_DETAIL
+-- SQL-54 VIEW 链循环
+SELECT view_schema, view_name, chain_id,
+       COUNT(*) AS cycle_nodes
+  FROM DIFF_REPORT_VIEW_CHAIN
  WHERE report_id = :report_id
-   AND object_type = 'VIEW'
-   AND DBMS_LOB.INSTR(detail_json, 'remap') > 0
- ORDER BY report_type, source_schema, source_name;
+   AND cycle_flag = 1
+ GROUP BY view_schema, view_name, chain_id
+ ORDER BY cycle_nodes DESC, view_schema, view_name, chain_id;
 
-7.3 remap 冲突清单（report_db_store_scope=full 推荐）
-SELECT object_type, source_schema, source_name, reason
+-- SQL-55 remap 冲突明细
+SELECT object_type, source_schema, source_name, reason, candidates
   FROM DIFF_REPORT_REMAP_CONFLICT
  WHERE report_id = :report_id
  ORDER BY object_type, source_schema, source_name;
 
-7.4 全量映射（report_db_store_scope=full 推荐）
-SELECT object_type, src_schema, src_name, tgt_schema, tgt_name, map_source
+-- SQL-56 映射来源分布（identity/rule/inferred）
+SELECT map_source, COUNT(*) AS cnt
   FROM DIFF_REPORT_OBJECT_MAPPING
  WHERE report_id = :report_id
+ GROUP BY map_source
+ ORDER BY cnt DESC, map_source;
+
+-- SQL-57 一个源对象映射到多个目标（潜在歧义）
+SELECT src_schema, src_name, object_type,
+       COUNT(DISTINCT tgt_schema || '.' || tgt_name) AS tgt_cnt
+  FROM DIFF_REPORT_OBJECT_MAPPING
+ WHERE report_id = :report_id
+ GROUP BY src_schema, src_name, object_type
+HAVING COUNT(DISTINCT tgt_schema || '.' || tgt_name) > 1
+ ORDER BY tgt_cnt DESC, src_schema, src_name, object_type;
+
+-- SQL-58 多个源对象映射到同一目标（潜在碰撞）
+SELECT tgt_schema, tgt_name, object_type,
+       COUNT(DISTINCT src_schema || '.' || src_name) AS src_cnt
+  FROM DIFF_REPORT_OBJECT_MAPPING
+ WHERE report_id = :report_id
+ GROUP BY tgt_schema, tgt_name, object_type
+HAVING COUNT(DISTINCT src_schema || '.' || src_name) > 1
+ ORDER BY src_cnt DESC, tgt_schema, tgt_name, object_type;
+
+-- SQL-59 PUBLIC/__public 相关映射检查（同义词常见）
+SELECT src_schema, src_name, object_type,
+       tgt_schema, tgt_name, map_source
+  FROM DIFF_REPORT_OBJECT_MAPPING
+ WHERE report_id = :report_id
+   AND (UPPER(src_schema) = 'PUBLIC' OR tgt_schema = '__public')
  ORDER BY object_type, src_schema, src_name;
 
-----------------------------------------
-8) 黑名单与不支持原因
-----------------------------------------
-8.1 黑名单原因统计（优先用 BLACKLIST_REASON，若为空则用 REASON）
-SELECT COALESCE(blacklist_reason, reason) AS blacklist_reason,
-       COUNT(*) AS cnt
-  FROM DIFF_REPORT_DETAIL
- WHERE report_id = :report_id
-   AND report_type = 'UNSUPPORTED'
-   AND (blacklist_reason IS NOT NULL OR reason LIKE '%BLACKLIST%')
- GROUP BY COALESCE(blacklist_reason, reason)
- ORDER BY cnt DESC;
+------------------------------------------------------------
+F. 授权 / 可用性 / 包 / 触发器 / 写库异常（SQL-60 ~ SQL-70）
+------------------------------------------------------------
 
-8.2 不支持原因 Top
-SELECT reason, COUNT(*) AS cnt
-  FROM DIFF_REPORT_DETAIL
+-- SQL-60 GRANT 分类汇总（推荐）
+SELECT grant_class, COUNT(*) AS cnt
+  FROM DIFF_REPORT_GRANT_CLASS_V
  WHERE report_id = :report_id
-   AND report_type = 'UNSUPPORTED'
- GROUP BY reason
- ORDER BY cnt DESC;
+ GROUP BY grant_class
+ ORDER BY cnt DESC, grant_class;
 
-8.3 黑名单明细（report_db_store_scope=full 推荐）
-SELECT schema_name, table_name, black_type, data_type, status, reason, detail
-  FROM DIFF_REPORT_BLACKLIST
+-- SQL-61 缺失授权明细
+SELECT grant_type, grantee, grantor,
+       privilege, target_schema, target_name, target_type,
+       with_grant_option, status, filter_reason
+  FROM DIFF_REPORT_GRANT
  WHERE report_id = :report_id
- ORDER BY schema_name, table_name;
+   AND status = 'MISSING'
+ ORDER BY grantee, target_schema, target_name, privilege;
 
-----------------------------------------
-9) 授权差异（GRANT）
-----------------------------------------
-9.1 授权差异明细
-SELECT target_schema, target_name, target_type,
-       grantee, privilege, with_grant_option,
+-- SQL-62 缺失且需要 WITH GRANT OPTION
+SELECT grant_type, grantee, privilege,
+       target_schema, target_name, target_type,
+       with_grant_option, status
+  FROM DIFF_REPORT_GRANT
+ WHERE report_id = :report_id
+   AND status = 'MISSING'
+   AND with_grant_option = 1
+ ORDER BY grantee, target_schema, target_name;
+
+-- SQL-63 被过滤授权及原因（含 PUBLIC 策略）
+SELECT grantee, privilege, target_schema, target_name, target_type,
        status, filter_reason
   FROM DIFF_REPORT_GRANT
  WHERE report_id = :report_id
- ORDER BY status, target_schema, target_name, grantee;
+   AND status = 'FILTERED'
+ ORDER BY filter_reason, grantee, target_schema, target_name;
 
-9.1.1 授权分类视图
-SELECT grant_class, grant_type, grantee, privilege,
-       target_schema, target_name, with_grant_option
-  FROM DIFF_REPORT_GRANT_CLASS_V
- WHERE report_id = :report_id
- ORDER BY grant_class, grantee, target_schema, target_name;
-
-9.2 按 grantee 汇总
+-- SQL-64 授权热点（按 grantee）
 SELECT grantee,
-       SUM(CASE WHEN status='MISSING' THEN 1 ELSE 0 END) AS missing_cnt,
-       SUM(CASE WHEN status='EXTRA' THEN 1 ELSE 0 END) AS extra_cnt
+       SUM(CASE WHEN status = 'MISSING' THEN 1 ELSE 0 END) AS missing_cnt,
+       SUM(CASE WHEN status = 'EXTRA' THEN 1 ELSE 0 END) AS extra_cnt,
+       SUM(CASE WHEN status = 'FILTERED' THEN 1 ELSE 0 END) AS filtered_cnt
   FROM DIFF_REPORT_GRANT
  WHERE report_id = :report_id
  GROUP BY grantee
- ORDER BY missing_cnt DESC, extra_cnt DESC;
+ ORDER BY missing_cnt DESC, filtered_cnt DESC, grantee;
 
-----------------------------------------
-10) 可用性 / PACKAGE / TRIGGER 状态
-----------------------------------------
-10.1 可用性校验明细
-SELECT schema_name, object_name, object_type, usable, status, reason
-  FROM DIFF_REPORT_USABILITY
+-- SQL-65 动作汇总（可执行工作面）
+SELECT action_type, object_type, COUNT(*) AS cnt
+  FROM DIFF_REPORT_ACTIONS_V
  WHERE report_id = :report_id
- ORDER BY status, schema_name, object_name;
+ GROUP BY action_type, object_type
+ ORDER BY action_type, cnt DESC, object_type;
 
-10.1.1 可用性分类视图（快速定位权限/缺对象/语法/超时）
-SELECT reason_class, object_type, schema_name, object_name, reason
+-- SQL-66 未闭环动作（pending）
+SELECT action_type, object_type, schema_name, object_name,
+       reason, resolution_status, resolved_by, resolved_at, note
+  FROM DIFF_REPORT_PENDING_ACTIONS_V
+ WHERE report_id = :report_id
+ ORDER BY action_type, object_type, schema_name, object_name;
+
+-- SQL-67 可用性异常（重点：VIEW/SYNONYM）
+SELECT object_type, schema_name, object_name,
+       status, usable, reason,
+       reason_class
   FROM DIFF_REPORT_USABILITY_CLASS_V
  WHERE report_id = :report_id
-   AND reason_class <> 'OK'
- ORDER BY reason_class, object_type, schema_name, object_name;
+   AND (status <> 'OK' OR NVL(usable, 0) = 0)
+ ORDER BY object_type, schema_name, object_name;
 
-10.2 PACKAGE 对比摘要
-SELECT schema_name, object_name, object_type, diff_status, diff_hash, diff_path
+-- SQL-68 PACKAGE / PACKAGE BODY 对比异常
+SELECT schema_name, object_name, object_type,
+       src_status, tgt_status, diff_status,
+       diff_hash, diff_summary, diff_path
   FROM DIFF_REPORT_PACKAGE_COMPARE
  WHERE report_id = :report_id
- ORDER BY schema_name, object_name;
+   AND NVL(diff_status, 'UNKNOWN') <> 'MATCH'
+ ORDER BY schema_name, object_name, object_type;
 
-10.3 触发器状态差异
-SELECT schema_name, trigger_name, src_enabled, tgt_enabled, src_valid, tgt_valid, diff_status, reason
+-- SQL-69 触发器状态差异
+SELECT schema_name, trigger_name,
+       src_event, tgt_event,
+       src_enabled, tgt_enabled,
+       src_valid, tgt_valid,
+       diff_status, reason
   FROM DIFF_REPORT_TRIGGER_STATUS
  WHERE report_id = :report_id
  ORDER BY schema_name, trigger_name;
 
-10.4 同义词专项（缺失/阻断/可用性/回溯）
--- 同义词缺失/阻断/不支持明细
-SELECT report_type, status, source_schema, source_name, target_schema, target_name, reason
-  FROM DIFF_REPORT_DETAIL
- WHERE report_id = :report_id
-   AND object_type = 'SYNONYM'
- ORDER BY report_type, status, source_schema, source_name;
-
--- 同义词可用性结果
-SELECT object_type, schema_name, object_name, status, usable, reason, detail_json
-  FROM DIFF_REPORT_USABILITY
- WHERE report_id = :report_id
-   AND object_type = 'SYNONYM'
-   AND (status <> 'OK' OR usable IS NULL OR usable = 0)
- ORDER BY status, schema_name, object_name;
-
--- 可用性为 SKIPPED 时回溯原因
-SELECT u.schema_name, u.object_name, u.status, u.reason,
-       d.report_type, d.status AS detail_status, d.reason AS detail_reason, d.detail_json
-  FROM DIFF_REPORT_USABILITY u
-  LEFT JOIN DIFF_REPORT_DETAIL d
-    ON d.report_id = u.report_id
-   AND d.object_type = 'SYNONYM'
-   AND d.source_schema = u.schema_name
-   AND d.source_name = u.object_name
- WHERE u.report_id = :report_id
-   AND u.object_type = 'SYNONYM'
-   AND u.status <> 'OK'
- ORDER BY u.status, u.schema_name, u.object_name;
-
--- 目标端多出的同义词（PUBLIC -> __public 映射，大小写不敏感）
-WITH expected AS (
-  SELECT CASE
-           WHEN UPPER(tgt_schema) = 'PUBLIC' THEN '__PUBLIC'
-           ELSE UPPER(tgt_schema)
-         END AS owner,
-         UPPER(tgt_name) AS name
-    FROM DIFF_REPORT_OBJECT_MAPPING
-   WHERE report_id = :report_id
-     AND object_type = 'SYNONYM'
-),
-owners AS (
-  SELECT DISTINCT owner FROM expected
-),
-actual AS (
-  SELECT UPPER(owner) AS owner,
-         UPPER(synonym_name) AS name,
-         table_owner, table_name
-    FROM DBA_SYNONYMS
-   WHERE UPPER(owner) IN (SELECT owner FROM owners)
-)
-SELECT a.owner, a.name, a.table_owner, a.table_name
-  FROM actual a
-  LEFT JOIN expected e
-    ON a.owner = e.owner AND a.name = e.name
- WHERE e.name IS NULL
- ORDER BY a.owner, a.name;
-
-----------------------------------------
-11) 高级筛选与定位
-----------------------------------------
-11.1 单对象全量异常
-SELECT report_type, reason, detail_json
-  FROM DIFF_REPORT_DETAIL
- WHERE report_id = :report_id
-   AND source_schema = :schema
-   AND source_name = :object
- ORDER BY report_type;
-
-11.2 关键字过滤（如 OBJ$ / DBLINK）
-SELECT source_schema, object_type, source_name, report_type, reason
-  FROM DIFF_REPORT_DETAIL
- WHERE report_id = :report_id
-   AND DBMS_LOB.INSTR(detail_json, 'OBJ$') > 0
- ORDER BY object_type, source_schema, source_name;
-
-11.3 对象重复记录排查
-SELECT source_schema, object_type, source_name, COUNT(*) AS cnt
-  FROM DIFF_REPORT_DETAIL
- WHERE report_id = :report_id
- GROUP BY source_schema, object_type, source_name
-HAVING COUNT(*) > 1
- ORDER BY cnt DESC;
-
-11.4 fixup 跳过汇总（report_db_store_scope=full 推荐）
-SELECT object_type, missing_total, task_total, generated_total, skip_reason, skip_count
-  FROM DIFF_REPORT_FIXUP_SKIP
- WHERE report_id = :report_id
- ORDER BY object_type, skip_reason;
-
-11.5 OMS missing 规则映射（report_db_store_scope=full 推荐）
-SELECT target_schema, object_type, src_schema, src_name, tgt_schema, tgt_name
-  FROM DIFF_REPORT_OMS_MISSING
- WHERE report_id = :report_id
- ORDER BY target_schema, object_type, src_schema, src_name;
-
-11.6 写库失败追踪（写库异常快速定位）
-SELECT report_id, table_name, error_message, sql_snippet, created_at
+-- SQL-70 report_to_db 写库异常（该 report_id）
+SELECT error_id, table_name, created_at,
+       DBMS_LOB.SUBSTR(error_message, 500, 1) AS error_message,
+       DBMS_LOB.SUBSTR(sql_snippet, 500, 1) AS sql_snippet
   FROM DIFF_REPORT_WRITE_ERRORS
  WHERE report_id = :report_id
  ORDER BY created_at DESC;
 
-11.7 标记已修复（resolution 示例）
--- INSERT INTO DIFF_REPORT_RESOLUTION
---   (REPORT_ID, OBJECT_TYPE, SCHEMA_NAME, OBJECT_NAME, ACTION_TYPE,
---    RESOLUTION_STATUS, RESOLVED_BY, RESOLVED_AT, NOTE)
--- VALUES
---   (:report_id, 'TABLE', 'SRC_SCHEMA', 'T1', 'FIXUP',
---    'RESOLVED', 'dba_user', SYSTIMESTAMP, '已修复');
-
-----------------------------------------
-12) 常见排查问答
-----------------------------------------
-Q1: 客户只关心“不支持”和“缺失”，怎么快速拿到？
-- 使用 5) 的缺失/不支持查询，或 3) 主线步骤 2/5。
-
-Q2: 为什么主报告里显示缺失很多，但 fixup 生成很少？
-- 优先检查是否为 UNSUPPORTED/BLOCKED，或被 fixup_types/fixup_schemas 过滤。
-- 使用 5) 缺失明细 + 6) 依赖阻断核对。
-
-Q3: 视图不支持原因怎么快速聚合？
-- 使用 8.2 不支持原因 Top + 7.2 remap 影响视图。
-
-Q4: 是否能定位特定 schema 的问题？
-- 用 4.3 按 schema 汇总 + 5) 过滤 source_schema。
-
-Q5: 哪些报告未入库（需要看 TXT）？
-- 查询 DIFF_REPORT_ARTIFACT，status=TXT_ONLY 或 PARTIAL。
-
-----------------------------------------
-附录 A: 按 schema + object_type 矩阵汇总
-----------------------------------------
--- A.1 缺失矩阵
-SELECT source_schema, object_type, COUNT(*) AS missing_cnt
-  FROM DIFF_REPORT_DETAIL
- WHERE report_id = :report_id
-   AND report_type = 'MISSING'
- GROUP BY source_schema, object_type
- ORDER BY source_schema, object_type;
-
--- A.2 不支持矩阵
-SELECT source_schema, object_type, COUNT(*) AS unsupported_cnt
-  FROM DIFF_REPORT_DETAIL
- WHERE report_id = :report_id
-   AND report_type = 'UNSUPPORTED'
- GROUP BY source_schema, object_type
- ORDER BY source_schema, object_type;
-
--- A.3 阻断矩阵（status=BLOCKED）
-SELECT source_schema, object_type, COUNT(*) AS blocked_cnt
-  FROM DIFF_REPORT_DETAIL
- WHERE report_id = :report_id
-   AND report_type = 'UNSUPPORTED'
-   AND status = 'BLOCKED'
- GROUP BY source_schema, object_type
- ORDER BY source_schema, object_type;
-
-----------------------------------------
-附录 B: 按时间窗口统计
-----------------------------------------
--- B.1 最近 N 天按对象类型汇总（例：近 7 天）
-SELECT c.object_type,
-       SUM(c.missing_count) AS missing_cnt,
-       SUM(c.unsupported_count) AS unsupported_cnt,
-       SUM(c.extra_count) AS extra_cnt
-  FROM DIFF_REPORT_COUNTS c
-  JOIN DIFF_REPORT_SUMMARY s
-    ON c.report_id = s.report_id
- WHERE s.run_timestamp >= SYSTIMESTAMP - INTERVAL '7' DAY
- GROUP BY c.object_type
- ORDER BY unsupported_cnt DESC, missing_cnt DESC;
-
--- B.2 最近 N 天按 schema 汇总（例：近 7 天）
-SELECT COALESCE(d.source_schema, d.target_schema) AS schema_name,
-       SUM(CASE WHEN d.report_type='MISSING' THEN 1 ELSE 0 END) AS missing_cnt,
-       SUM(CASE WHEN d.report_type='UNSUPPORTED' THEN 1 ELSE 0 END) AS unsupported_cnt
-  FROM DIFF_REPORT_DETAIL d
-  JOIN DIFF_REPORT_SUMMARY s
-    ON d.report_id = s.report_id
- WHERE s.run_timestamp >= SYSTIMESTAMP - INTERVAL '7' DAY
- GROUP BY COALESCE(d.source_schema, d.target_schema)
- ORDER BY unsupported_cnt DESC, missing_cnt DESC;
-
--- B.3 按日统计缺失数量趋势
-SELECT TRUNC(s.run_timestamp) AS run_day,
-       SUM(s.missing_count) AS missing_cnt,
-       SUM(s.unsupported_count) AS unsupported_cnt
-  FROM DIFF_REPORT_SUMMARY s
- GROUP BY TRUNC(s.run_timestamp)
- ORDER BY run_day DESC;
-
-----------------------------------------
-附录 C: 概况型 SQL（线/面视角）
-----------------------------------------
-C.1 整体体检总览（单条 SQL）
-SELECT
-  s.report_id,
-  s.run_timestamp,
-  s.conclusion,
-  s.total_checked,
-  s.missing_count,
-  s.mismatched_count,
-  s.unsupported_count,
-  (SELECT COUNT(*) FROM DIFF_REPORT_DETAIL d
-     WHERE d.report_id = s.report_id
-       AND d.report_type = 'UNSUPPORTED'
-       AND d.status = 'BLOCKED') AS blocked_count,
-  (SELECT COUNT(*) FROM DIFF_REPORT_DETAIL d
-     WHERE d.report_id = s.report_id
-       AND d.report_type = 'MISSING') AS missing_detail_count,
-  (SELECT COUNT(*) FROM DIFF_REPORT_DETAIL d
-     WHERE d.report_id = s.report_id
-       AND d.report_type = 'UNSUPPORTED') AS unsupported_detail_count
-FROM DIFF_REPORT_SUMMARY s
-WHERE s.report_id = :report_id;
-
-C.2 面板式汇总（按类型 + 状态）
-SELECT object_type,
-       SUM(CASE WHEN report_type='MISSING' THEN 1 ELSE 0 END) AS missing_cnt,
-       SUM(CASE WHEN report_type='MISMATCHED' THEN 1 ELSE 0 END) AS mismatched_cnt,
-       SUM(CASE WHEN report_type='UNSUPPORTED' THEN 1 ELSE 0 END) AS unsupported_cnt,
-       SUM(CASE WHEN report_type='UNSUPPORTED' AND status='BLOCKED' THEN 1 ELSE 0 END) AS blocked_cnt
-FROM DIFF_REPORT_DETAIL
-WHERE report_id = :report_id
-GROUP BY object_type
-ORDER BY unsupported_cnt DESC, missing_cnt DESC;
-
-C.3 迁移重点面板（按 schema：需改造 vs 可修复）
-SELECT COALESCE(source_schema, target_schema) AS schema_name,
-       SUM(CASE WHEN report_type='UNSUPPORTED' THEN 1 ELSE 0 END) AS need_rebuild,
-       SUM(CASE WHEN report_type='MISSING' THEN 1 ELSE 0 END) AS can_fixup
-FROM DIFF_REPORT_DETAIL
-WHERE report_id = :report_id
-GROUP BY COALESCE(source_schema, target_schema)
-ORDER BY need_rebuild DESC, can_fixup DESC;
-
-C.4 原因热力图（按原因聚合）
-SELECT object_type, reason, COUNT(*) AS cnt
-FROM DIFF_REPORT_DETAIL
-WHERE report_id = :report_id
-  AND report_type IN ('UNSUPPORTED','MISMATCHED')
-GROUP BY object_type, reason
-ORDER BY cnt DESC;
-
-----------------------------------------
-附录 D: DB 覆盖范围 vs 文本文件
-----------------------------------------
-说明：report_to_db 只入库结构化核心数据，部分细节仍在 run 目录的 txt 中。
-
-D.1 直接在 OB 查询即可的内容
-- 缺失/不支持/阻断/不一致明细：DIFF_REPORT_DETAIL
-- 触发器状态差异：DIFF_REPORT_TRIGGER_STATUS
-- PACKAGE/PKG BODY 对比摘要：DIFF_REPORT_PACKAGE_COMPARE
-- 可用性校验明细：DIFF_REPORT_USABILITY
-- 汇总与趋势：DIFF_REPORT_SUMMARY / DIFF_REPORT_COUNTS
-- 授权差异：DIFF_REPORT_GRANT
-
-D.2 仍需查看 txt 的内容（仅文本）
-- report_<ts>.txt（主报告全文）
-- report_index_<ts>.txt（明细索引）
-- object_mapping_<ts>.txt / remap_conflicts_<ts>.txt
-- dependency_chains_<ts>.txt / VIEWs_chain_<ts>.txt
-- ddl_format_report_<ts>.txt / ddl_punct_clean_<ts>.txt / ddl_hint_clean_<ts>.txt
-- migration_focus_<ts>.txt / blacklist_tables.txt / filtered_grants.txt
-- missed_tables_views_for_OMS/*
-
-D.3 快速定位对应 run 目录
-SELECT report_id, run_timestamp, run_dir
-  FROM DIFF_REPORT_SUMMARY
- WHERE report_id = :report_id;
-
-D.4 建议流程
-- 先看 OB 汇总与明细（DIFF_REPORT_*）
-- 如发现关键差异，需要深挖，再到 run_dir 对应 txt 查“链路/索引/清洗/格式化”等细节
+============================================================
+建议排查顺序（实战）
+1) SQL-01/02/08/10 先建立全局认知。
+2) SQL-25/26/27 + SQL-28~31 先消化“不支持/阻断”（改造项）。
+3) SQL-15/16/21/22 再看“可修复缺失”。
+4) SQL-36~46 处理结构不一致。
+5) SQL-47~59 定位依赖链、remap、同义词/public 特殊问题。
+6) SQL-60~70 收口权限、可用性、package/trigger 与写库异常。
+============================================================

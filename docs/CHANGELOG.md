@@ -13,8 +13,11 @@
 ## [未发布]
 
 ### 新增
+- 交付前正确性基线文档化：统一补充 `py_compile` + `unittest` + 可选联调命令。
 
 ### 变更
+- README / readme_config / ARCHITECTURE / ADVANCED_USAGE / TECHNICAL_SPECIFICATION / DEPLOYMENT 同步到当前实现。
+- 修正文档中过期描述：`init_users_roles.py` 已为交互输入初始口令，不再写死默认口令。
 
 ## [0.9.8.2] - 2026-02-03
 

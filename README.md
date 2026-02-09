@@ -95,6 +95,22 @@ python3 schema_diff_reconciler.py --wizard
 python3 run_fixup.py --smart-order --recompile
 ```
 
+## 交付前正确性自检
+建议在发版/交付前固定执行以下检查：
+```bash
+# 1) 语法检查
+python3 -m py_compile $(git ls-files '*.py')
+
+# 2) 单元测试
+.venv/bin/python -m unittest discover -v
+
+# 3) 可选：联调测试（需真实 Oracle/OB）
+RUN_INTEGRATION_TESTS=1 .venv/bin/python -m unittest test_integration_visibility.py -v
+```
+当前代码基线（2026-02-09）：
+- `py_compile` 通过
+- `unittest` 共 290 项，`OK (skipped=2)`
+
 ## Remap 规则速记
 - **显式规则优先级最高**，未写规则的对象按默认推导。
 - **TABLE 必须显式**：表的 remap 建议只写表规则。
@@ -129,8 +145,7 @@ python3 run_fixup.py --view-chain-autofix
 ## 额外工具
 - `init_users_roles.py`：以 Oracle 为准创建用户/角色并同步系统权限与角色授权。
 - `init_test.py`：基于 `test_scenarios/` 快速搭建测试场景。
-
-> 注意：`init_users_roles.py` 当前使用固定初始密码，需在上线前统一改密或二次调整。
+> 注意：`init_users_roles.py` 运行时会交互输入用户初始密码，不再在脚本中写死明文初始密码。
 
 ## 主要输出
 - `main_reports/run_<ts>/report_<ts>.txt`：完整对比报告（默认 per_run）
@@ -191,7 +206,7 @@ grant_merge_grantees = true
 
 ## 已知限制与注意事项
 - **字符串/注释中的特殊语法**：DDL 清洗与脚本拆分主要面向常见语法，遇到复杂 `q'[...]'` 或极端注释格式可能需要人工调整。
-- **默认密码策略**：用户/角色初始化脚本使用固定初始密码，需后续改密。
+- **初始化口令策略**：用户/角色初始化口令为运行时输入，请在操作流程中统一口令与改密策略。
 - **配置含 `%` 字符**：部分环境下 `configparser` 会对 `%` 做插值，建议避免直接使用或改为转义。
 
 ## 项目结构速览
