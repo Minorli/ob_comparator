@@ -2136,14 +2136,29 @@ def collect_fixup_config_diagnostics(
     return diagnostics
 
 
-SYNONYM_FIXUP_SCOPE_VALUES = {"all", "public_only"}
-SYNONYM_FIXUP_SCOPE_ALIASES = {
+SYNONYM_CHECK_SCOPE_VALUES = {"all", "public_only"}
+SYNONYM_CHECK_SCOPE_ALIASES = {
     "public": "public_only",
     "public-only": "public_only",
     "publiconly": "public_only",
     "all-synonyms": "all",
     "all_synonyms": "all",
 }
+
+
+def normalize_synonym_check_scope(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "public_only"
+    value = str(raw_value).strip().lower()
+    value = SYNONYM_CHECK_SCOPE_ALIASES.get(value, value)
+    if value not in SYNONYM_CHECK_SCOPE_VALUES:
+        log.warning("synonym_check_scope=%s 不在支持范围内，将回退为 public_only。", raw_value)
+        return "public_only"
+    return value
+
+
+SYNONYM_FIXUP_SCOPE_VALUES = {"all", "public_only"}
+SYNONYM_FIXUP_SCOPE_ALIASES = dict(SYNONYM_CHECK_SCOPE_ALIASES)
 
 
 def normalize_synonym_fixup_scope(raw_value: Optional[str]) -> str:
@@ -3104,6 +3119,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         )
         settings.setdefault('fixup_auto_grant_fallback', 'true')
         settings.setdefault('fixup_auto_grant_cache_limit', '10000')
+        settings.setdefault('synonym_check_scope', 'public_only')
         settings.setdefault('synonym_fixup_scope', 'public_only')
         settings.setdefault('trigger_list', '')
         settings.setdefault('trigger_qualify_schema', 'true')
@@ -3337,6 +3353,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             )
         else:
             settings['ddl_format_type_set'] = set()
+        settings['synonym_check_scope'] = normalize_synonym_check_scope(
+            settings.get('synonym_check_scope', 'public_only')
+        )
         settings['synonym_fixup_scope'] = normalize_synonym_fixup_scope(
             settings.get('synonym_fixup_scope', 'public_only')
         )
@@ -3736,6 +3755,14 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "仅支持 all 或 public_only"
 
+    def _validate_synonym_check_scope(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = SYNONYM_CHECK_SCOPE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in SYNONYM_CHECK_SCOPE_VALUES:
+            return True, ""
+        return False, "仅支持 all 或 public_only"
+
     def _validate_sequence_remap_policy(val: str) -> Tuple[bool, str]:
         if not val.strip():
             return True, ""
@@ -4125,6 +4152,14 @@ def run_config_wizard(config_path: Path) -> None:
         "check_primary_types",
         "主对象过滤 (留空为全量，例如 TABLE,VIEW)",
         default=cfg.get("SETTINGS", "check_primary_types", fallback=""),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "synonym_check_scope",
+        "同义词校验范围 (all/public_only)",
+        default=cfg.get("SETTINGS", "synonym_check_scope", fallback="public_only"),
+        validator=_validate_synonym_check_scope,
+        transform=normalize_synonym_check_scope,
     )
     _prompt_field(
         "SETTINGS",
@@ -5463,7 +5498,8 @@ def init_oracle_client_from_settings(settings: Dict) -> None:
 def get_source_objects(
     ora_cfg: OraConfig,
     schemas_list: List[str],
-    object_types: Optional[Set[str]] = None
+    object_types: Optional[Set[str]] = None,
+    synonym_check_scope: str = "all"
 ) -> SourceObjectMap:
     """
     从 Oracle 源端获取所有需要纳入 remap/依赖分析的对象：
@@ -5476,6 +5512,7 @@ def get_source_objects(
     enabled_types = {t.upper() for t in (object_types or set(ALL_TRACKED_OBJECT_TYPES))}
     enabled_types &= set(ALL_TRACKED_OBJECT_TYPES)
     include_synonyms = 'SYNONYM' in enabled_types
+    synonym_scope = normalize_synonym_check_scope(synonym_check_scope)
     object_types_for_objects = set(enabled_types)
     if include_synonyms:
         object_types_for_objects.discard('SYNONYM')
@@ -5526,7 +5563,10 @@ def get_source_objects(
                             full_name = f"{owner}.{obj_name}"
                             source_objects[full_name].add(obj_type)
             if include_synonyms:
-                synonym_owners = sorted(set(s.upper() for s in schemas_list) | {"PUBLIC"})
+                if synonym_scope == "public_only":
+                    synonym_owners = ["PUBLIC"]
+                else:
+                    synonym_owners = sorted(set(s.upper() for s in schemas_list) | {"PUBLIC"})
                 target_owners = sorted({s.upper() for s in schemas_list})
                 if target_owners:
                     synonym_chunks = chunk_list(synonym_owners, ORACLE_IN_BATCH_SIZE)
@@ -8015,6 +8055,7 @@ def dump_ob_metadata(
     ob_cfg: ObConfig,
     target_schemas: Set[str],
     tracked_object_types: Optional[Set[str]] = None,
+    synonym_check_scope: str = "all",
     include_tab_columns: bool = True,
     include_column_order: bool = False,
     include_indexes: bool = True,
@@ -8053,6 +8094,7 @@ def dump_ob_metadata(
             constraint_deferrable_supported=False
         )
 
+    synonym_scope = normalize_synonym_check_scope(synonym_check_scope)
     ob_default_char_used = "B"
     if include_tab_columns:
         ok, out, err = obclient_run_sql(
@@ -8114,6 +8156,8 @@ def dump_ob_metadata(
             status = parts[3].strip().upper() if len(parts) > 3 else "UNKNOWN"
             if obj_type == 'SYNONYM' and owner == '__PUBLIC':
                 owner = 'PUBLIC'
+            if obj_type == 'SYNONYM' and synonym_scope == 'public_only' and owner != 'PUBLIC':
+                continue
             full = f"{owner}.{name}"
             objects_by_type.setdefault(obj_type, set()).add(full)
             object_statuses[(owner, name, obj_type)] = status or "UNKNOWN"
@@ -30243,6 +30287,7 @@ def parse_cli_args() -> argparse.Namespace:
           可选开关：
             check_primary_types     限制主对象类型（默认全量）
             check_extra_types       限制扩展对象 (index,constraint,sequence,trigger)
+            synonym_check_scope     同义词校验范围 (all/public_only，默认 public_only)
             extra_check_workers     扩展对象校验并发进程数（默认 16）
             extra_check_chunk_size  扩展对象校验批量表数量（默认 200）
             extra_check_progress_interval 扩展对象校验进度日志间隔（秒）
@@ -30424,7 +30469,8 @@ def main():
         # 3) 加载源端主对象 (TABLE/VIEW/PROC/FUNC/PACKAGE/PACKAGE BODY/SYNONYM)
         source_objects = get_source_objects(
             ora_cfg,
-            settings['source_schemas_list']
+            settings['source_schemas_list'],
+            synonym_check_scope=settings.get('synonym_check_scope', 'public_only')
         )
 
         # 4) 验证 Remap 规则
@@ -30751,6 +30797,7 @@ def main():
             ob_cfg,
             target_schemas,
             tracked_object_types=tracked_types,
+            synonym_check_scope=settings.get('synonym_check_scope', 'public_only'),
             include_tab_columns='TABLE' in enabled_primary_types,
             include_column_order=enable_column_order_check,
             include_indexes='INDEX' in enabled_extra_types,

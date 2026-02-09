@@ -173,6 +173,9 @@
   说明：限制 run_fixup 查询缓存占用，0/负数表示不限制。
 
 同义词与触发器
+- synonym_check_scope：同义词校验范围。默认：public_only。
+  可选值：public_only（仅 PUBLIC 参与 missing/extra/汇总统计）、all（PUBLIC+私有全量校验）。
+  说明：该开关影响“校验与统计口径”；不影响同义词 fixup 输出范围。
 - synonym_fixup_scope：同义词修补范围。默认：public_only。
   可选值：all（PUBLIC+私有）、public_only（仅 PUBLIC）。
 - trigger_list：触发器清单文件（每行 SCHEMA.TRIGGER_NAME）。默认：空。

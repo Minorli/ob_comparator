@@ -69,6 +69,7 @@ password = xxx
 [SETTINGS]
 source_schemas = SCOTT,HR
 remap_file = remap_rules.txt
+synonym_check_scope = public_only
 synonym_fixup_scope = public_only
 sequence_remap_policy = source_only
 trigger_qualify_schema = true

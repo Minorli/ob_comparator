@@ -2397,6 +2397,12 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(sdr.normalize_synonym_fixup_scope("public"), "public_only")
         self.assertEqual(sdr.normalize_synonym_fixup_scope("PUBLIC_ONLY"), "public_only")
 
+    def test_normalize_synonym_check_scope(self):
+        self.assertEqual(sdr.normalize_synonym_check_scope(None), "public_only")
+        self.assertEqual(sdr.normalize_synonym_check_scope("all"), "all")
+        self.assertEqual(sdr.normalize_synonym_check_scope("public"), "public_only")
+        self.assertEqual(sdr.normalize_synonym_check_scope("PUBLIC_ONLY"), "public_only")
+
     def test_normalize_sequence_remap_policy(self):
         self.assertEqual(sdr.normalize_sequence_remap_policy(None), "source_only")
         self.assertEqual(sdr.normalize_sequence_remap_policy("infer"), "infer")
@@ -2758,6 +2764,117 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             sdr.obclient_run_sql = orig_run
             sdr.obclient_query_by_owner_chunks = orig_query
             sdr.ob_has_dba_column = orig_has_col
+
+    def test_dump_ob_metadata_filters_private_synonyms_when_public_only(self):
+        def fake_run(_cfg, _sql):
+            return True, "", ""
+
+        def fake_query(_cfg, sql_tpl, _owners, **_kwargs):
+            sql = sql_tpl.upper()
+            if "DBA_OBJECTS" in sql:
+                lines = [
+                    "A\tS_PRIV\tSYNONYM\tVALID",
+                    "__PUBLIC\tS_PUB\tSYNONYM\tVALID",
+                    "A\tT1\tTABLE\tVALID",
+                ]
+                return True, lines, ""
+            return True, [], ""
+
+        orig_run = sdr.obclient_run_sql
+        orig_query = sdr.obclient_query_by_owner_chunks
+        try:
+            sdr.obclient_run_sql = fake_run
+            sdr.obclient_query_by_owner_chunks = fake_query
+            ob_meta = sdr.dump_ob_metadata(
+                {"executable": "/bin/obclient", "host": "h", "port": "1", "user_string": "u", "password": "p"},
+                {"A", "PUBLIC"},
+                tracked_object_types={"TABLE", "SYNONYM"},
+                synonym_check_scope="public_only",
+                include_tab_columns=False,
+                include_column_order=False,
+                include_indexes=False,
+                include_constraints=False,
+                include_triggers=False,
+                include_sequences=False,
+                include_comments=False,
+                include_roles=False,
+            )
+            self.assertEqual(ob_meta.objects_by_type.get("SYNONYM", set()), {"PUBLIC.S_PUB"})
+            self.assertNotIn(("A", "S_PRIV", "SYNONYM"), ob_meta.object_statuses)
+            self.assertIn(("PUBLIC", "S_PUB", "SYNONYM"), ob_meta.object_statuses)
+        finally:
+            sdr.obclient_run_sql = orig_run
+            sdr.obclient_query_by_owner_chunks = orig_query
+
+    def test_get_source_objects_respects_synonym_check_scope(self):
+        class FakeCursor:
+            def __init__(self):
+                self._rows = []
+
+            def execute(self, sql, params=None):
+                sql_u = sql.upper()
+                binds = list(params or [])
+                if "FROM DBA_OBJECTS" in sql_u:
+                    self._rows = []
+                    return
+                if "FROM DBA_SYNONYMS" in sql_u:
+                    owner_binds = {str(x).upper() for x in binds[:-1]}
+                    target_binds = {str(x).upper() for x in binds[-1:]}
+                    all_rows = [
+                        ("A", "S_PRIV", "A", "T1"),
+                        ("PUBLIC", "S_PUB", "A", "T1"),
+                    ]
+                    self._rows = [
+                        row for row in all_rows
+                        if row[0].upper() in owner_binds and row[2].upper() in target_binds
+                    ]
+                    return
+                if "FROM DBA_MVIEWS" in sql_u or "FROM DBA_TABLES" in sql_u:
+                    self._rows = []
+                    return
+                self._rows = []
+
+            def __iter__(self):
+                return iter(self._rows)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeConnection:
+            def cursor(self):
+                return FakeCursor()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        orig_connect = sdr.oracledb.connect
+        try:
+            sdr.oracledb.connect = lambda **_kwargs: FakeConnection()
+            ora_cfg = {"user": "u", "password": "p", "dsn": "d"}
+            objs_public = sdr.get_source_objects(
+                ora_cfg,
+                ["A"],
+                object_types={"SYNONYM"},
+                synonym_check_scope="public_only",
+            )
+            objs_all = sdr.get_source_objects(
+                ora_cfg,
+                ["A"],
+                object_types={"SYNONYM"},
+                synonym_check_scope="all",
+            )
+            self.assertIn("PUBLIC.S_PUB", objs_public)
+            self.assertNotIn("A.S_PRIV", objs_public)
+            self.assertIn("PUBLIC.S_PUB", objs_all)
+            self.assertIn("A.S_PRIV", objs_all)
+        finally:
+            sdr.oracledb.connect = orig_connect
 
     def test_check_extra_objects_sequence_without_master_list(self):
         oracle_meta = self._make_oracle_meta(sequences={"A": {"SEQ1", "SEQ2"}})
