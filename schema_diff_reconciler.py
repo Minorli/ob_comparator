@@ -28180,8 +28180,8 @@ def save_report_to_db(
     mismatched_count = len(tv_results.get("mismatched", []))
     ok_count = len(tv_results.get("ok", []))
     skipped_count = len(tv_results.get("skipped", []))
-    unsupported_count = len(support_summary.unsupported_rows) if support_summary else 0
     unsupported_by_type = build_unsupported_summary_counts(support_summary, extra_results)
+    unsupported_count = sum(int(v or 0) for v in unsupported_by_type.values())
 
     # SQL template file (pre-filled report_id) for DB report queries
     build_report_sql_template_file(report_dir, report_timestamp, report_id)
@@ -28189,12 +28189,13 @@ def save_report_to_db(
     # Ensure analytic views exist (read-only, report DB)
     view_artifacts = ensure_report_db_views_exist(ob_cfg, settings)
 
-    index_missing_total = sum(len(item.missing_indexes) for item in extra_results.get("index_mismatched", []))
+    extra_missing_counts = summarize_extra_missing_counts(extra_results)
+    index_missing_total = int(extra_missing_counts.get("INDEX", 0) or 0)
     index_mismatch_total = len(extra_results.get("index_mismatched", []))
-    constraint_missing_total = sum(len(item.missing_constraints) for item in extra_results.get("constraint_mismatched", []))
+    constraint_missing_total = int(extra_missing_counts.get("CONSTRAINT", 0) or 0)
     constraint_mismatch_total = len(extra_results.get("constraint_mismatched", []))
-    trigger_missing_total = len(extra_results.get("trigger_mismatched", []))
-    sequence_missing_total = len(extra_results.get("sequence_mismatched", []))
+    trigger_missing_total = int(extra_missing_counts.get("TRIGGER", 0) or 0)
+    sequence_missing_total = int(extra_missing_counts.get("SEQUENCE", 0) or 0)
 
     if missing_count == 0 and mismatched_count == 0:
         conclusion = "PASS"
@@ -28446,6 +28447,34 @@ def build_unsupported_summary_counts(
     return dict(counts)
 
 
+def summarize_extra_missing_counts(
+    extra_results: Optional[ExtraCheckResults]
+) -> Dict[str, int]:
+    """
+    统一扩展对象“缺失对象数”口径（对象级），供 fixup/报告/写库复用。
+    """
+    if not extra_results:
+        return {"INDEX": 0, "CONSTRAINT": 0, "SEQUENCE": 0, "TRIGGER": 0}
+    return {
+        "INDEX": sum(
+            len(item.missing_indexes or set())
+            for item in (extra_results.get("index_mismatched", []) or [])
+        ),
+        "CONSTRAINT": sum(
+            len(item.missing_constraints or set())
+            for item in (extra_results.get("constraint_mismatched", []) or [])
+        ),
+        "SEQUENCE": sum(
+            len(item.missing_sequences or set())
+            for item in (extra_results.get("sequence_mismatched", []) or [])
+        ),
+        "TRIGGER": sum(
+            len(item.missing_triggers or set())
+            for item in (extra_results.get("trigger_mismatched", []) or [])
+        ),
+    }
+
+
 def build_run_summary(
     ctx: RunSummaryContext,
     tv_results: ReportResults,
@@ -28567,15 +28596,15 @@ def build_run_summary(
     cons_mis_cnt = len(extra_results.get("constraint_mismatched", []))
     seq_mis_cnt = len(extra_results.get("sequence_mismatched", []))
     trg_mis_cnt = len(extra_results.get("trigger_mismatched", []))
+    extra_missing_counts = summarize_extra_missing_counts(extra_results)
+    idx_missing_cnt = int(extra_missing_counts.get("INDEX", 0) or 0)
+    cons_missing_cnt = int(extra_missing_counts.get("CONSTRAINT", 0) or 0)
+    seq_missing_cnt = int(extra_missing_counts.get("SEQUENCE", 0) or 0)
+    trg_missing_cnt = int(extra_missing_counts.get("TRIGGER", 0) or 0)
     dep_missing_cnt = len(dependency_report.get("missing", []))
     dep_unexpected_cnt = len(dependency_report.get("unexpected", []))
     dep_skipped_cnt = len(dependency_report.get("skipped", []))
-    unsupported_by_type: Dict[str, int] = {}
-    if support_summary:
-        for obj_type, counts in (support_summary.missing_support_counts or {}).items():
-            unsupported_cnt = int(counts.get("unsupported", 0) or 0) + int(counts.get("blocked", 0) or 0)
-            if unsupported_cnt:
-                unsupported_by_type[obj_type] = unsupported_cnt
+    unsupported_by_type: Dict[str, int] = build_unsupported_summary_counts(support_summary, extra_results)
     findings: List[str] = [
         f"主对象: 缺失 {missing_count}, 不匹配 {mismatched_count}, 多余 {extra_target_cnt}, 仅打印 {skipped_count}"
     ]
@@ -28594,8 +28623,11 @@ def build_run_summary(
         findings.append(f"注释校验: 跳过 ({comment_skip_reason or '未启用'})")
     if ctx.enabled_extra_types:
         findings.append(
-            f"扩展对象差异: INDEX {idx_mis_cnt}, CONSTRAINT {cons_mis_cnt}, "
-            f"SEQUENCE {seq_mis_cnt}, TRIGGER {trg_mis_cnt}"
+            "扩展对象差异: "
+            f"INDEX 缺失对象 {idx_missing_cnt} (差异表 {idx_mis_cnt}), "
+            f"CONSTRAINT 缺失对象 {cons_missing_cnt} (差异表 {cons_mis_cnt}), "
+            f"SEQUENCE 缺失对象 {seq_missing_cnt} (差异表 {seq_mis_cnt}), "
+            f"TRIGGER 缺失对象 {trg_missing_cnt} (差异表 {trg_mis_cnt})"
         )
     if ctx.enable_dependencies_check:
         findings.append(f"依赖差异: 缺失 {dep_missing_cnt}, 额外 {dep_unexpected_cnt}, 跳过 {dep_skipped_cnt}")
@@ -28897,6 +28929,11 @@ def print_final_report(
     seq_mis_cnt = len(extra_results.get("sequence_mismatched", []))
     trg_ok_cnt = len(extra_results.get("trigger_ok", []))
     trg_mis_cnt = len(extra_results.get("trigger_mismatched", []))
+    extra_missing_counts = summarize_extra_missing_counts(extra_results)
+    idx_missing_cnt = int(extra_missing_counts.get("INDEX", 0) or 0)
+    cons_missing_cnt = int(extra_missing_counts.get("CONSTRAINT", 0) or 0)
+    seq_missing_cnt = int(extra_missing_counts.get("SEQUENCE", 0) or 0)
+    trg_missing_cnt = int(extra_missing_counts.get("TRIGGER", 0) or 0)
     comment_ok_cnt = len(comment_results.get("ok", []))
     comment_mis_cnt = len(comment_results.get("mismatched", []))
     comment_skip_reason = comment_results.get("skipped_reason")
@@ -29040,7 +29077,7 @@ def print_final_report(
     cons_unsupported_cnt = len(extra_results.get("constraint_unsupported", []) or [])
 
     def build_execution_conclusion() -> Panel:
-        ext_mismatch_cnt = idx_mis_cnt + cons_mis_cnt + seq_mis_cnt + trg_mis_cnt
+        ext_mismatch_cnt = idx_missing_cnt + cons_missing_cnt + seq_missing_cnt + trg_missing_cnt
         actionable_cnt = missing_count + mismatched_count + ext_mismatch_cnt
         blocked_total = (
             unsupported_total
@@ -29054,7 +29091,11 @@ def print_final_report(
         lines: List[str] = [
             f"状态: {status} | 总校验对象: {total_checked}",
             f"主对象: 缺失 {missing_count}, 不匹配 {mismatched_count}, 多余 {extra_target_cnt}",
-            f"扩展对象差异: 索引 {idx_mis_cnt}, 约束 {cons_mis_cnt}, 序列 {seq_mis_cnt}, 触发器 {trg_mis_cnt}",
+            (
+                "扩展对象差异(缺失对象): "
+                f"索引 {idx_missing_cnt}, 约束 {cons_missing_cnt}, "
+                f"序列 {seq_missing_cnt}, 触发器 {trg_missing_cnt}"
+            ),
         ]
         if missing_supported_cnt or unsupported_blocked_cnt:
             lines.append(
@@ -29196,8 +29237,9 @@ def print_final_report(
 
     ext_text = Text()
     ext_text.append("索引: ", style="info")
-    ext_text.append(f"一致 {idx_ok_cnt} / ", style="ok")
-    ext_text.append(f"差异 {idx_mis_cnt}", style="mismatch")
+    ext_text.append(f"一致表 {idx_ok_cnt} / ", style="ok")
+    ext_text.append(f"缺失对象 {idx_missing_cnt}", style="mismatch")
+    ext_text.append(f" (差异表 {idx_mis_cnt})", style="info")
     if idx_blocked_cnt or idx_unsupported_cnt:
         ext_text.append(
             f" (不支持/阻断 {idx_blocked_cnt + idx_unsupported_cnt})",
@@ -29205,8 +29247,9 @@ def print_final_report(
         )
     ext_text.append("\n")
     ext_text.append("约束: ", style="info")
-    ext_text.append(f"一致 {cons_ok_cnt} / ", style="ok")
-    ext_text.append(f"差异 {cons_mis_cnt}", style="mismatch")
+    ext_text.append(f"一致表 {cons_ok_cnt} / ", style="ok")
+    ext_text.append(f"缺失对象 {cons_missing_cnt}", style="mismatch")
+    ext_text.append(f" (差异表 {cons_mis_cnt})", style="info")
     if cons_blocked_cnt or cons_unsupported_cnt:
         ext_text.append(
             f" (不支持/阻断 {cons_blocked_cnt + cons_unsupported_cnt})",
@@ -29214,11 +29257,13 @@ def print_final_report(
         )
     ext_text.append("\n")
     ext_text.append("序列: ", style="info")
-    ext_text.append(f"一致 {seq_ok_cnt} / ", style="ok")
-    ext_text.append(f"差异 {seq_mis_cnt}\n", style="mismatch")
+    ext_text.append(f"一致 schema {seq_ok_cnt} / ", style="ok")
+    ext_text.append(f"缺失对象 {seq_missing_cnt}", style="mismatch")
+    ext_text.append(f" (差异 schema {seq_mis_cnt})\n", style="info")
     ext_text.append("触发器: ", style="info")
-    ext_text.append(f"一致 {trg_ok_cnt} / ", style="ok")
-    ext_text.append(f"差异 {trg_mis_cnt}", style="mismatch")
+    ext_text.append(f"一致表 {trg_ok_cnt} / ", style="ok")
+    ext_text.append(f"缺失对象 {trg_missing_cnt}", style="mismatch")
+    ext_text.append(f" (差异表 {trg_mis_cnt})", style="info")
     if trg_blocked_cnt:
         ext_text.append(f" (不支持/阻断 {trg_blocked_cnt})", style="mismatch")
     summary_table.add_row("[bold]扩展对象 (INDEX/SEQ/etc.)[/bold]", ext_text)

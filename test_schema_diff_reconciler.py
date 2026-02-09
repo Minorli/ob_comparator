@@ -7,6 +7,7 @@ import tempfile
 import json
 import inspect
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Set, List, Tuple
 
@@ -6573,6 +6574,88 @@ class TestReportDbHelpers(unittest.TestCase):
         self.assertEqual(rows[0]["object_type"], "TABLE")
         self.assertEqual(rows[0]["oracle_count"], 2)
         self.assertEqual(rows[0]["unsupported_count"], 1)
+
+    def test_summarize_extra_missing_counts(self):
+        extra_results = {
+            "index_mismatched": [
+                sdr.IndexMismatch("T.T1", {"I1", "I2"}, set(), []),
+                sdr.IndexMismatch("T.T2", {"I3"}, set(), []),
+            ],
+            "constraint_mismatched": [
+                sdr.ConstraintMismatch("T.T1", {"C1"}, set(), [], set()),
+            ],
+            "sequence_mismatched": [
+                sdr.SequenceMismatch("SRC", "TGT", {"S1", "S2"}, set(), None, None, None),
+            ],
+            "trigger_mismatched": [
+                sdr.TriggerMismatch("T.T1", {"TR1", "TR2"}, set(), [], None),
+            ],
+        }
+        counts = sdr.summarize_extra_missing_counts(extra_results)
+        self.assertEqual(counts["INDEX"], 3)
+        self.assertEqual(counts["CONSTRAINT"], 1)
+        self.assertEqual(counts["SEQUENCE"], 2)
+        self.assertEqual(counts["TRIGGER"], 2)
+
+    def test_build_run_summary_uses_object_level_extra_missing_counts(self):
+        ctx = sdr.RunSummaryContext(
+            start_time=datetime.now(),
+            start_perf=0.0,
+            phase_durations={},
+            phase_skip_reasons={},
+            enabled_primary_types={"TABLE"},
+            enabled_extra_types={"INDEX", "CONSTRAINT", "SEQUENCE", "TRIGGER"},
+            print_only_types=set(),
+            total_checked=1,
+            enable_dependencies_check=False,
+            enable_comment_check=False,
+            enable_grant_generation=False,
+            enable_schema_mapping_infer=False,
+            fixup_enabled=False,
+            fixup_dir="fixup_scripts",
+            dependency_chain_file=None,
+            view_chain_file=None,
+            trigger_list_summary=None,
+            report_start_perf=0.0,
+        )
+        tv_results = {"missing": [], "mismatched": [], "extra_targets": [], "skipped": [], "extraneous": []}
+        extra_results = {
+            "index_mismatched": [sdr.IndexMismatch("T.T1", {"I1", "I2"}, set(), [])],
+            "constraint_mismatched": [sdr.ConstraintMismatch("T.T1", {"C1"}, set(), [], set())],
+            "sequence_mismatched": [sdr.SequenceMismatch("SRC", "TGT", {"S1", "S2"}, set(), None, None, None)],
+            "trigger_mismatched": [sdr.TriggerMismatch("T.T1", {"TR1", "TR2"}, set(), [], None)],
+            "index_unsupported": [],
+            "constraint_unsupported": [],
+        }
+        support_summary = sdr.SupportClassificationResult(
+            support_state_map={},
+            missing_detail_rows=[],
+            unsupported_rows=[],
+            extra_missing_rows=[],
+            missing_support_counts={},
+            extra_blocked_counts={},
+            unsupported_table_keys=set(),
+            unsupported_view_keys=set(),
+            view_compat_map={},
+            view_constraint_cleaned_rows=[],
+            view_constraint_uncleanable_rows=[],
+        )
+        summary = sdr.build_run_summary(
+            ctx,
+            tv_results,
+            extra_results,
+            {"ok": [], "mismatched": [], "skipped_reason": "skip"},
+            {"missing": [], "unexpected": [], "skipped": []},
+            [],
+            [],
+            {},
+            None,
+            support_summary=support_summary,
+        )
+        joined = "\n".join(summary.findings)
+        self.assertIn("INDEX 缺失对象 2 (差异表 1)", joined)
+        self.assertIn("SEQUENCE 缺失对象 2 (差异表 1)", joined)
+        self.assertIn("TRIGGER 缺失对象 2 (差异表 1)", joined)
 
     def test_build_report_usability_rows(self):
         summary = sdr.UsabilitySummary(
