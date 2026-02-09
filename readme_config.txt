@@ -90,6 +90,9 @@
   注意：MATERIALIZED VIEW 默认仅打印不校验。
 - check_extra_types：限制扩展对象检查。默认：空（全部扩展对象）。
   可选值：INDEX, CONSTRAINT, SEQUENCE, TRIGGER。
+- check_status_drift_types：状态漂移检查范围。默认：trigger,constraint。
+  可选值：TRIGGER, CONSTRAINT。
+  说明：仅在对应类型已被 check_extra_types 启用时生效；用于检查“对象存在但状态不一致”。
 - check_dependencies：是否校验依赖与生成依赖报告。默认：true。
 - print_dependency_chains：输出依赖链路拓扑（仅当 check_dependencies=true）。默认：true。
   说明：开启后生成 dependency_chains_*.txt 与 dependency_detail_*.txt。
@@ -135,6 +138,14 @@
 
 修补脚本生成（Fixup）
 - generate_fixup：是否生成修补脚本。默认：true。
+- generate_status_fixup：是否生成“状态漂移”修补脚本。默认：false。
+  说明：仅处理已存在对象的状态差异，不负责对象创建；输出目录为 fixup_scripts/status/。
+- status_fixup_types：状态漂移修补脚本类型。默认：trigger,constraint。
+  可选值：TRIGGER, CONSTRAINT。
+- constraint_status_sync_mode：约束状态同步模式。默认：enabled_only。
+  可选值：enabled_only（仅同步 ENABLED/DISABLED）、full（额外同步 VALIDATED/NOT VALIDATED）。
+- trigger_validity_sync_mode：触发器有效性同步模式。默认：off。
+  可选值：off（不处理 VALID/INVALID）、compile（当源 VALID 且目标 INVALID 时生成 COMPILE）。
 - fixup_drop_sys_c_columns：是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE。默认：true。
   说明：仅对“目标端多出来且列名匹配 SYS_C\\d+”的列生成 FORCE 清理；其余多余列仍保持注释建议。
 - generate_interval_partition_fixup：是否生成 interval 分区补齐脚本。默认：true。

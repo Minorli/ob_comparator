@@ -827,6 +827,29 @@ EXTRA_OBJECT_CHECK_TYPES: Tuple[str, ...] = (
     'TRIGGER'
 )
 
+STATUS_DRIFT_CHECK_TYPES: Tuple[str, ...] = (
+    'TRIGGER',
+    'CONSTRAINT',
+)
+
+CONSTRAINT_STATUS_SYNC_MODE_VALUES: Set[str] = {"enabled_only", "full"}
+CONSTRAINT_STATUS_SYNC_MODE_ALIASES: Dict[str, str] = {
+    "enabled": "enabled_only",
+    "on": "enabled_only",
+    "true": "enabled_only",
+    "1": "enabled_only",
+    "all": "full",
+}
+
+TRIGGER_VALIDITY_SYNC_MODE_VALUES: Set[str] = {"off", "compile"}
+TRIGGER_VALIDITY_SYNC_MODE_ALIASES: Dict[str, str] = {
+    "on": "compile",
+    "true": "compile",
+    "1": "compile",
+    "false": "off",
+    "0": "off",
+}
+
 FIXUP_CREATE_REPLACE_TYPES: Set[str] = {
     'VIEW',
     'PROCEDURE',
@@ -2133,6 +2156,24 @@ def collect_fixup_config_diagnostics(
         if cutoff_numeric_raw and not settings.get("interval_partition_cutoff_numeric_value"):
             diagnostics.append("interval_partition_cutoff_numeric 非法，数值 interval 分区补齐将被跳过。")
 
+    status_check_types: Set[str] = set(settings.get("check_status_drift_type_set", set()) or set())
+    if "TRIGGER" in status_check_types and "TRIGGER" not in enabled_extra_types:
+        diagnostics.append("check_status_drift_types 包含 TRIGGER，但 check_extra_types 未启用 TRIGGER，状态漂移检查将被跳过。")
+    if "CONSTRAINT" in status_check_types and "CONSTRAINT" not in enabled_extra_types:
+        diagnostics.append("check_status_drift_types 包含 CONSTRAINT，但 check_extra_types 未启用 CONSTRAINT，状态漂移检查将被跳过。")
+
+    if settings.get("generate_status_fixup"):
+        if not parse_bool_flag(settings.get("generate_fixup", "true"), True):
+            diagnostics.append("generate_status_fixup=true 但 generate_fixup=false，状态修复脚本不会生成。")
+        status_fixup_types: Set[str] = set(settings.get("status_fixup_type_set", set()) or set())
+        if not status_fixup_types:
+            diagnostics.append("generate_status_fixup=true 但 status_fixup_types 为空，状态修复脚本不会生成。")
+        for obj_type in sorted(status_fixup_types):
+            if obj_type not in status_check_types:
+                diagnostics.append(
+                    f"status_fixup_types 包含 {obj_type}，但 check_status_drift_types 未启用该类型，状态修复脚本不会生成。"
+                )
+
     return diagnostics
 
 
@@ -2357,6 +2398,34 @@ def normalize_view_constraint_cleanup(raw_value: Optional[str]) -> str:
     return value
 
 
+def normalize_constraint_status_sync_mode(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "enabled_only"
+    value = str(raw_value).strip().lower()
+    value = CONSTRAINT_STATUS_SYNC_MODE_ALIASES.get(value, value)
+    if value not in CONSTRAINT_STATUS_SYNC_MODE_VALUES:
+        log.warning(
+            "constraint_status_sync_mode=%s 不在支持范围内，将回退为 enabled_only。",
+            raw_value
+        )
+        return "enabled_only"
+    return value
+
+
+def normalize_trigger_validity_sync_mode(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "off"
+    value = str(raw_value).strip().lower()
+    value = TRIGGER_VALIDITY_SYNC_MODE_ALIASES.get(value, value)
+    if value not in TRIGGER_VALIDITY_SYNC_MODE_VALUES:
+        log.warning(
+            "trigger_validity_sync_mode=%s 不在支持范围内，将回退为 off。",
+            raw_value
+        )
+        return "off"
+    return value
+
+
 def load_view_compat_rules(path_value: Optional[str]) -> Dict[str, object]:
     rules = {
         "unsupported_views": set(VIEW_UNSUPPORTED_DEFAULT_VIEWS),
@@ -2513,6 +2582,19 @@ class TriggerStatusReportRow(NamedTuple):
     src_valid: str
     tgt_valid: str
     detail: str
+
+
+class ConstraintStatusDriftRow(NamedTuple):
+    table_full: str
+    constraint_type: str
+    src_constraint: str
+    tgt_constraint: str
+    src_status: str
+    tgt_status: str
+    src_validated: str
+    tgt_validated: str
+    detail: str
+    action_sql: str
 
 
 class ReportIndexEntry(NamedTuple):
@@ -2717,6 +2799,24 @@ def index_has_desc(info: Optional[Dict]) -> bool:
 def normalize_trigger_status(value: Optional[str]) -> str:
     status = (value or "").strip().upper()
     return status or "UNKNOWN"
+
+
+def normalize_constraint_enabled_status(value: Optional[str]) -> str:
+    status = (value or "").strip().upper()
+    if status in {"ENABLED", "ENABLE"}:
+        return "ENABLED"
+    if status in {"DISABLED", "DISABLE"}:
+        return "DISABLED"
+    return "UNKNOWN"
+
+
+def normalize_constraint_validated_status(value: Optional[str]) -> str:
+    status = re.sub(r"\s+", " ", (value or "").strip().upper())
+    if status in {"VALIDATED", "VALIDATE"}:
+        return "VALIDATED"
+    if status in {"NOT VALIDATED", "NOVALIDATE", "NOT VALIDATE"}:
+        return "NOT VALIDATED"
+    return "UNKNOWN"
 
 
 def lookup_trigger_validity(
@@ -3123,6 +3223,11 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('synonym_fixup_scope', 'public_only')
         settings.setdefault('trigger_list', '')
         settings.setdefault('trigger_qualify_schema', 'true')
+        settings.setdefault('check_status_drift_types', 'trigger,constraint')
+        settings.setdefault('generate_status_fixup', 'false')
+        settings.setdefault('status_fixup_types', 'trigger,constraint')
+        settings.setdefault('constraint_status_sync_mode', 'enabled_only')
+        settings.setdefault('trigger_validity_sync_mode', 'off')
         settings.setdefault('sequence_remap_policy', 'source_only')
         settings.setdefault('generate_grants', 'true')
         settings.setdefault('grant_tab_privs_scope', 'owner')
@@ -3473,6 +3578,26 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings['trigger_qualify_schema'] = parse_bool_flag(
             settings.get('trigger_qualify_schema', 'true'),
             True
+        )
+        settings['check_status_drift_type_set'] = parse_type_list(
+            settings.get('check_status_drift_types', ''),
+            set(STATUS_DRIFT_CHECK_TYPES),
+            'check_status_drift_types'
+        )
+        settings['generate_status_fixup'] = parse_bool_flag(
+            settings.get('generate_status_fixup', 'false'),
+            False
+        )
+        settings['status_fixup_type_set'] = parse_type_list(
+            settings.get('status_fixup_types', ''),
+            set(STATUS_DRIFT_CHECK_TYPES),
+            'status_fixup_types'
+        )
+        settings['constraint_status_sync_mode'] = normalize_constraint_status_sync_mode(
+            settings.get('constraint_status_sync_mode', 'enabled_only')
+        )
+        settings['trigger_validity_sync_mode'] = normalize_trigger_validity_sync_mode(
+            settings.get('trigger_validity_sync_mode', 'off')
         )
         settings['print_dependency_chains'] = parse_bool_flag(
             settings.get('print_dependency_chains', 'true'),
@@ -3847,6 +3972,22 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "仅支持 auto/force/off"
 
+    def _validate_constraint_status_sync_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = CONSTRAINT_STATUS_SYNC_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in CONSTRAINT_STATUS_SYNC_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 enabled_only/full"
+
+    def _validate_trigger_validity_sync_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = TRIGGER_VALIDITY_SYNC_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in TRIGGER_VALIDITY_SYNC_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 off/compile"
+
     def _validate_ddl_format_fail_policy(val: str) -> Tuple[bool, str]:
         if not val.strip():
             return True, ""
@@ -4169,6 +4310,12 @@ def run_config_wizard(config_path: Path) -> None:
     )
     _prompt_field(
         "SETTINGS",
+        "check_status_drift_types",
+        "状态漂移检查类型 (留空或 trigger,constraint)",
+        default=cfg.get("SETTINGS", "check_status_drift_types", fallback="trigger,constraint"),
+    )
+    _prompt_field(
+        "SETTINGS",
         "extra_check_workers",
         "扩展对象校验并发进程数 (建议 8 或 16)",
         default=cfg.get("SETTINGS", "extra_check_workers", fallback="16"),
@@ -4253,6 +4400,35 @@ def run_config_wizard(config_path: Path) -> None:
         "触发器 DDL 是否强制补全 schema 前缀 (true/false)",
         default=cfg.get("SETTINGS", "trigger_qualify_schema", fallback="true"),
         transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "generate_status_fixup",
+        "是否生成状态漂移修复脚本 (true/false，默认 false)",
+        default=cfg.get("SETTINGS", "generate_status_fixup", fallback="false"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "status_fixup_types",
+        "状态修复脚本对象类型 (trigger,constraint)",
+        default=cfg.get("SETTINGS", "status_fixup_types", fallback="trigger,constraint"),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "constraint_status_sync_mode",
+        "约束状态同步模式 (enabled_only/full)",
+        default=cfg.get("SETTINGS", "constraint_status_sync_mode", fallback="enabled_only"),
+        validator=_validate_constraint_status_sync_mode,
+        transform=normalize_constraint_status_sync_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "trigger_validity_sync_mode",
+        "触发器有效性同步模式 (off/compile)",
+        default=cfg.get("SETTINGS", "trigger_validity_sync_mode", fallback="off"),
+        validator=_validate_trigger_validity_sync_mode,
+        transform=normalize_trigger_validity_sync_mode,
     )
     _prompt_field(
         "SETTINGS",
@@ -4857,6 +5033,273 @@ def collect_trigger_status_rows(
             tgt_valid=t_valid,
             detail=",".join(diffs) if diffs else "-"
         ))
+    return rows
+
+
+def build_trigger_status_fixup_sqls(
+    row: TriggerStatusReportRow,
+    validity_mode: str = "off"
+) -> List[str]:
+    trigger_full = (row.trigger_full or "").upper()
+    parsed = parse_full_object_name(trigger_full)
+    if not parsed:
+        return []
+    schema_u, trigger_u = parsed
+    trigger_full_quoted = quote_qualified_parts(schema_u, trigger_u)
+    statements: List[str] = []
+
+    src_enabled = normalize_trigger_status(row.src_enabled)
+    tgt_enabled = normalize_trigger_status(row.tgt_enabled)
+    if src_enabled in {"ENABLED", "DISABLED"} and tgt_enabled in {"ENABLED", "DISABLED"} and src_enabled != tgt_enabled:
+        action = "ENABLE" if src_enabled == "ENABLED" else "DISABLE"
+        statements.append(f"ALTER TRIGGER {trigger_full_quoted} {action};")
+
+    if normalize_trigger_validity_sync_mode(validity_mode) == "compile":
+        src_valid = normalize_trigger_status(row.src_valid)
+        tgt_valid = normalize_trigger_status(row.tgt_valid)
+        if src_valid == "VALID" and tgt_valid == "INVALID":
+            statements.append(f"ALTER TRIGGER {trigger_full_quoted} COMPILE;")
+
+    return statements
+
+
+def _build_constraint_semantic_key(
+    name: str,
+    meta: Dict,
+    *,
+    is_source: bool,
+    full_object_mapping: FullObjectMapping
+) -> Optional[Tuple]:
+    ctype = (meta.get("type") or "").upper()
+    if ctype not in {"P", "U", "R", "C"}:
+        return None
+    cols = tuple(col.upper() for col in (meta.get("columns") or []) if col)
+    if ctype in {"P", "U"}:
+        return (ctype, cols)
+    if ctype == "R":
+        ref_owner = (meta.get("ref_table_owner") or meta.get("r_owner") or "").upper()
+        ref_table = (meta.get("ref_table_name") or "").upper()
+        ref_target = ""
+        if ref_owner and ref_table:
+            ref_src_full = f"{ref_owner}.{ref_table}"
+            if is_source:
+                ref_target = (get_mapped_target(full_object_mapping, ref_src_full, "TABLE") or ref_src_full).upper()
+            else:
+                ref_target = ref_src_full
+        else:
+            r_owner = (meta.get("r_owner") or "").upper()
+            r_cons = (meta.get("r_constraint") or "").upper()
+            if r_owner and r_cons:
+                ref_target = f"{r_owner}.{r_cons}"
+        return (
+            ctype,
+            cols,
+            ref_target,
+            normalize_delete_rule(meta.get("delete_rule")),
+            normalize_update_rule(meta.get("update_rule")),
+        )
+    expr = normalize_check_constraint_expression(meta.get("search_condition"), name)
+    return (ctype, expr)
+
+
+def _build_constraint_status_drift_action_sql(
+    table_schema: str,
+    table_name: str,
+    constraint_name: str,
+    src_status: str,
+    tgt_status: str,
+    src_validated: str,
+    tgt_validated: str,
+    sync_mode: str
+) -> str:
+    sync_mode = normalize_constraint_status_sync_mode(sync_mode)
+    table_full_quoted = quote_qualified_parts(table_schema, table_name)
+    cons_quoted = quote_identifier(constraint_name)
+    src_status_n = normalize_constraint_enabled_status(src_status)
+    tgt_status_n = normalize_constraint_enabled_status(tgt_status)
+    src_validated_n = normalize_constraint_validated_status(src_validated)
+    tgt_validated_n = normalize_constraint_validated_status(tgt_validated)
+
+    if src_status_n != tgt_status_n and src_status_n in {"ENABLED", "DISABLED"} and tgt_status_n in {"ENABLED", "DISABLED"}:
+        if src_status_n == "DISABLED":
+            return f"ALTER TABLE {table_full_quoted} DISABLE CONSTRAINT {cons_quoted};"
+        if sync_mode == "full":
+            if src_validated_n == "VALIDATED":
+                return f"ALTER TABLE {table_full_quoted} ENABLE VALIDATE CONSTRAINT {cons_quoted};"
+            if src_validated_n == "NOT VALIDATED":
+                return f"ALTER TABLE {table_full_quoted} ENABLE NOVALIDATE CONSTRAINT {cons_quoted};"
+        return f"ALTER TABLE {table_full_quoted} ENABLE CONSTRAINT {cons_quoted};"
+
+    if (
+        sync_mode == "full"
+        and src_status_n == "ENABLED"
+        and tgt_status_n == "ENABLED"
+        and src_validated_n != tgt_validated_n
+    ):
+        if src_validated_n == "VALIDATED":
+            return f"ALTER TABLE {table_full_quoted} ENABLE VALIDATE CONSTRAINT {cons_quoted};"
+        if src_validated_n == "NOT VALIDATED":
+            return f"ALTER TABLE {table_full_quoted} ENABLE NOVALIDATE CONSTRAINT {cons_quoted};"
+    return ""
+
+
+def collect_constraint_status_drift_rows(
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata,
+    master_list: MasterCheckList,
+    full_object_mapping: FullObjectMapping,
+    sync_mode: str = "enabled_only",
+    unsupported_table_keys: Optional[Set[Tuple[str, str]]] = None
+) -> List[ConstraintStatusDriftRow]:
+    rows: List[ConstraintStatusDriftRow] = []
+    seen_tables: Set[Tuple[str, str, str, str]] = set()
+    unsupported_keys = {(s.upper(), t.upper()) for s, t in (unsupported_table_keys or set())}
+    sync_mode = normalize_constraint_status_sync_mode(sync_mode)
+
+    for src_full, tgt_full, obj_type in master_list:
+        if (obj_type or "").upper() != "TABLE":
+            continue
+        src_parsed = parse_full_object_name(src_full)
+        tgt_parsed = parse_full_object_name(tgt_full)
+        if not src_parsed or not tgt_parsed:
+            continue
+        src_schema, src_table = src_parsed
+        tgt_schema, tgt_table = tgt_parsed
+        table_key = (src_schema, src_table, tgt_schema, tgt_table)
+        if table_key in seen_tables:
+            continue
+        seen_tables.add(table_key)
+        if unsupported_keys and (src_schema.upper(), src_table.upper()) in unsupported_keys:
+            continue
+
+        src_map = oracle_meta.constraints.get((src_schema.upper(), src_table.upper()), {}) or {}
+        tgt_map = ob_meta.constraints.get((tgt_schema.upper(), tgt_table.upper()), {}) or {}
+        if not src_map or not tgt_map:
+            continue
+
+        src_entries: List[Dict[str, object]] = []
+        for src_name, src_meta in src_map.items():
+            src_name_u = (src_name or "").upper()
+            if not src_name_u:
+                continue
+            key = _build_constraint_semantic_key(
+                src_name_u,
+                src_meta or {},
+                is_source=True,
+                full_object_mapping=full_object_mapping
+            )
+            if key is None:
+                continue
+            src_entries.append({
+                "name": src_name_u,
+                "type": (src_meta.get("type") or "").upper(),
+                "key": key,
+                "status": normalize_constraint_enabled_status(src_meta.get("status")),
+                "validated": normalize_constraint_validated_status(src_meta.get("validated")),
+            })
+
+        tgt_entries: List[Dict[str, object]] = []
+        for tgt_name, tgt_meta in tgt_map.items():
+            tgt_name_u = (tgt_name or "").upper()
+            if not tgt_name_u:
+                continue
+            key = _build_constraint_semantic_key(
+                tgt_name_u,
+                tgt_meta or {},
+                is_source=False,
+                full_object_mapping=full_object_mapping
+            )
+            if key is None:
+                continue
+            tgt_entries.append({
+                "name": tgt_name_u,
+                "type": (tgt_meta.get("type") or "").upper(),
+                "key": key,
+                "status": normalize_constraint_enabled_status(tgt_meta.get("status")),
+                "validated": normalize_constraint_validated_status(tgt_meta.get("validated")),
+            })
+
+        if not src_entries or not tgt_entries:
+            continue
+
+        tgt_by_name: Dict[str, Dict[str, object]] = {entry["name"]: entry for entry in tgt_entries}
+        tgt_by_key: Dict[Tuple, List[Dict[str, object]]] = defaultdict(list)
+        for entry in tgt_entries:
+            tgt_by_key[entry["key"]].append(entry)
+        for candidate_list in tgt_by_key.values():
+            candidate_list.sort(key=lambda e: str(e.get("name") or ""))
+
+        used_tgt_names: Set[str] = set()
+        for src_entry in sorted(src_entries, key=lambda e: str(e.get("name") or "")):
+            src_name_u = str(src_entry.get("name") or "")
+            if not src_name_u:
+                continue
+            matched: Optional[Dict[str, object]] = None
+            direct = tgt_by_name.get(src_name_u)
+            if direct and direct.get("name") not in used_tgt_names:
+                matched = direct
+            if matched is None:
+                candidates = [
+                    item for item in tgt_by_key.get(src_entry.get("key"), [])
+                    if item.get("name") not in used_tgt_names
+                ]
+                if candidates:
+                    matched = candidates[0]
+            if not matched:
+                continue
+
+            tgt_name_u = str(matched.get("name") or "")
+            if not tgt_name_u:
+                continue
+            used_tgt_names.add(tgt_name_u)
+
+            src_status = str(src_entry.get("status") or "UNKNOWN")
+            tgt_status = str(matched.get("status") or "UNKNOWN")
+            src_validated = str(src_entry.get("validated") or "UNKNOWN")
+            tgt_validated = str(matched.get("validated") or "UNKNOWN")
+            status_diff = src_status != tgt_status
+            validated_diff = (
+                sync_mode == "full"
+                and src_status == "ENABLED"
+                and tgt_status == "ENABLED"
+                and src_validated != tgt_validated
+            )
+            if not status_diff and not validated_diff:
+                continue
+
+            drift_fields: List[str] = []
+            if status_diff:
+                drift_fields.append("ENABLED")
+            if validated_diff:
+                drift_fields.append("VALIDATED")
+
+            detail_parts = [",".join(drift_fields) if drift_fields else "-"]
+            if src_name_u != tgt_name_u:
+                detail_parts.append(f"MATCH={src_name_u}->{tgt_name_u}")
+            action_sql = _build_constraint_status_drift_action_sql(
+                tgt_schema,
+                tgt_table,
+                tgt_name_u,
+                src_status,
+                tgt_status,
+                src_validated,
+                tgt_validated,
+                sync_mode
+            )
+            rows.append(
+                ConstraintStatusDriftRow(
+                    table_full=f"{tgt_schema}.{tgt_table}",
+                    constraint_type=str(src_entry.get("type") or ""),
+                    src_constraint=src_name_u,
+                    tgt_constraint=tgt_name_u,
+                    src_status=src_status,
+                    tgt_status=tgt_status,
+                    src_validated=src_validated,
+                    tgt_validated=tgt_validated,
+                    detail="; ".join(part for part in detail_parts if part),
+                    action_sql=action_sql or "-"
+                )
+            )
     return rows
 
 
@@ -8663,13 +9106,15 @@ def dump_ob_metadata(
         )
         support_index_name = ob_has_dba_column(ob_cfg, "DBA_CONSTRAINTS", "INDEX_NAME")
         support_update_rule = ob_has_dba_column(ob_cfg, "DBA_CONSTRAINTS", "UPDATE_RULE")
+        support_validated = ob_has_dba_column(ob_cfg, "DBA_CONSTRAINTS", "VALIDATED")
         constraint_deferrable_supported = deferrable_supported
         deferrable_select = ", DEFERRABLE, DEFERRED" if deferrable_supported else ""
         index_name_select = ", INDEX_NAME" if support_index_name else ""
         update_rule_select = ", UPDATE_RULE" if support_update_rule else ""
+        validated_select = ", VALIDATED" if support_validated else ""
 
         sql_ext_tpl_vc = f"""
-            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, STATUS{index_name_select}, R_OWNER, R_CONSTRAINT_NAME,
+            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, STATUS{validated_select}{index_name_select}, R_OWNER, R_CONSTRAINT_NAME,
                    DELETE_RULE{update_rule_select},
                    REPLACE(REPLACE(REPLACE(SEARCH_CONDITION_VC, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS SEARCH_CONDITION
                    {deferrable_select}
@@ -8678,7 +9123,7 @@ def dump_ob_metadata(
               AND CONSTRAINT_TYPE IN ('P','U','R','C')
         """
         sql_ext_tpl = f"""
-            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, STATUS{index_name_select}, R_OWNER, R_CONSTRAINT_NAME,
+            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, STATUS{validated_select}{index_name_select}, R_OWNER, R_CONSTRAINT_NAME,
                    DELETE_RULE{update_rule_select},
                    REPLACE(REPLACE(REPLACE(SEARCH_CONDITION, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS SEARCH_CONDITION
                    {deferrable_select}
@@ -8706,7 +9151,7 @@ def dump_ob_metadata(
         if not ok:
             log.warning("读取 OB DBA_CONSTRAINTS(含条件)失败，将回退为中间字段：%s", err)
             sql_mid_tpl = f"""
-                SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, STATUS{index_name_select}, R_OWNER, R_CONSTRAINT_NAME, DELETE_RULE{update_rule_select}
+                SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, STATUS{validated_select}{index_name_select}, R_OWNER, R_CONSTRAINT_NAME, DELETE_RULE{update_rule_select}
                        {deferrable_select}
                 FROM DBA_CONSTRAINTS
                 WHERE OWNER IN ({{owners_in}})
@@ -8719,7 +9164,7 @@ def dump_ob_metadata(
         if not ok:
             log.warning("读取 OB DBA_CONSTRAINTS(含引用信息)失败，将回退为基础字段：%s", err)
             sql_tpl = f"""
-                SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, STATUS{index_name_select}
+                SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, STATUS{validated_select}{index_name_select}
                        {deferrable_select}
                 FROM DBA_CONSTRAINTS
                 WHERE OWNER IN ({{owners_in}})
@@ -8746,6 +9191,10 @@ def dump_ob_metadata(
                 idx += 1
                 cons_status = parts[idx].strip().upper() if len(parts) > idx else None
                 idx += 1
+                validated = None
+                if support_validated and len(parts) > idx:
+                    validated = parts[idx].strip().upper()
+                    idx += 1
                 index_name = None
                 if support_index_name and len(parts) > idx:
                     index_name = parts[idx].strip().upper()
@@ -8775,6 +9224,7 @@ def dump_ob_metadata(
                 constraints.setdefault(key, {})[cons_name] = {
                     "type": ctype,
                     "status": cons_status,
+                    "validated": validated,
                     "columns": [],
                     "index_name": index_name,
                     "r_owner": r_owner if ctype == "R" else None,
@@ -8816,6 +9266,7 @@ def dump_ob_metadata(
                     constraints[key][cons_name] = {
                         "type": "UNKNOWN",
                         "status": None,
+                        "validated": None,
                         "columns": [],
                         "index_name": None,
                         "r_owner": None,
@@ -9944,7 +10395,7 @@ def dump_oracle_metadata(
                         support_update_rule = False
                     update_rule_select = ", UPDATE_RULE" if support_update_rule else ""
                     sql_cons_tpl = f"""
-                        SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, R_OWNER, R_CONSTRAINT_NAME,
+                        SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, STATUS, VALIDATED, R_OWNER, R_CONSTRAINT_NAME,
                                DELETE_RULE{update_rule_select}, {search_condition_col}, DEFERRABLE, DEFERRED
                         FROM DBA_CONSTRAINTS
                         WHERE OWNER IN ({{owners_clause}})
@@ -9972,8 +10423,10 @@ def dump_oracle_metadata(
                                 name = _safe_upper(row[2])
                                 if not name:
                                     continue
+                                cons_status = (row[4] or "").strip().upper() if len(row) > 4 else None
+                                validated = (row[5] or "").strip().upper() if len(row) > 5 else None
                                 update_rule = None
-                                idx_base = 6
+                                idx_base = 8
                                 delete_rule = (row[idx_base] or "").strip().upper() if len(row) > idx_base else None
                                 idx_base += 1
                                 if support_update_rule:
@@ -9986,10 +10439,12 @@ def dump_oracle_metadata(
                                 deferred = str(row[idx_base]) if len(row) > idx_base and row[idx_base] is not None else None
                                 constraints.setdefault(key, {})[name] = {
                                     "type": (row[3] or "").upper(),
+                                    "status": cons_status,
+                                    "validated": validated,
                                     "columns": [],
                                     "index_name": None,
-                                    "r_owner": _safe_upper(row[4]) if row[4] else None,
-                                    "r_constraint": _safe_upper(row[5]) if row[5] else None,
+                                    "r_owner": _safe_upper(row[6]) if row[6] else None,
+                                    "r_constraint": _safe_upper(row[7]) if row[7] else None,
                                     "delete_rule": delete_rule,
                                     "update_rule": update_rule,
                                     "search_condition": search_condition,
@@ -10024,6 +10479,8 @@ def dump_oracle_metadata(
                                     cons_name,
                                     {
                                         "type": "UNKNOWN",
+                                        "status": None,
+                                        "validated": None,
                                         "columns": [],
                                         "index_name": None,
                                         "r_owner": None,
@@ -14408,6 +14865,8 @@ def check_extra_objects(
         "sequence_mismatched": [],
         "trigger_ok": [],
         "trigger_mismatched": [],
+        "trigger_status_drift": [],
+        "constraint_status_drift": [],
     }
 
     enabled_types = {t.upper() for t in (enabled_extra_types or set(EXTRA_OBJECT_CHECK_TYPES))}
@@ -20731,7 +21190,9 @@ def generate_fixup_scripts(
     support_state_map: Optional[Dict[Tuple[str, str], ObjectSupportReportRow]] = None,
     unsupported_table_keys: Optional[Set[Tuple[str, str]]] = None,
     view_compat_map: Optional[Dict[Tuple[str, str], ViewCompatResult]] = None,
-    view_dependency_map: Optional[Dict[Tuple[str, str], Set[str]]] = None
+    view_dependency_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
+    trigger_status_rows: Optional[List[TriggerStatusReportRow]] = None,
+    constraint_status_rows: Optional[List[ConstraintStatusDriftRow]] = None,
 ):
     """
     基于校验结果生成 fixup_scripts DDL 脚本，并按依赖顺序排列：
@@ -20755,10 +21216,17 @@ def generate_fixup_scripts(
     progress_log_interval = max(1.0, progress_log_interval)
     synonym_meta_map = synonym_metadata or {}
     view_dependency_map = view_dependency_map or {}
+    trigger_status_rows = trigger_status_rows or []
+    constraint_status_rows = constraint_status_rows or []
     trigger_filter_set = {t.upper() for t in (trigger_filter_entries or set())}
     support_state_map = support_state_map or {}
     unsupported_table_keys = {(s.upper(), t.upper()) for s, t in (unsupported_table_keys or set())}
     view_compat_map = view_compat_map or {}
+    check_status_drift_types = set(settings.get("check_status_drift_type_set", set()) or set())
+    status_fixup_types = set(settings.get("status_fixup_type_set", set()) or set())
+    generate_status_fixup = parse_bool_flag(settings.get("generate_status_fixup", "false"), False)
+    constraint_status_sync_mode = settings.get("constraint_status_sync_mode", "enabled_only")
+    trigger_validity_sync_mode = settings.get("trigger_validity_sync_mode", "off")
     invalid_view_keys: Set[Tuple[str, str]] = set()
     invalid_trigger_keys: Set[Tuple[str, str]] = set()
     for (owner, name, obj_type), status in (oracle_meta.object_statuses or {}).items():
@@ -23299,6 +23767,98 @@ def generate_fixup_scripts(
         trigger_jobs.append(_job)
     run_tasks(trigger_jobs, "TRIGGER")
 
+    if (
+        generate_status_fixup
+        and parse_bool_flag(settings.get("generate_fixup", "true"), True)
+        and status_fixup_types
+    ):
+        status_jobs: List[Callable[[], None]] = []
+        trigger_status_jobs: List[Tuple[TriggerStatusReportRow, List[str]]] = []
+        constraint_status_jobs: List[ConstraintStatusDriftRow] = []
+        if "TRIGGER" in status_fixup_types and "TRIGGER" in check_status_drift_types:
+            for row in trigger_status_rows:
+                sqls = build_trigger_status_fixup_sqls(row, trigger_validity_sync_mode)
+                if sqls:
+                    trigger_status_jobs.append((row, sqls))
+        if "CONSTRAINT" in status_fixup_types and "CONSTRAINT" in check_status_drift_types:
+            for row in constraint_status_rows:
+                action_sql = (row.action_sql or "").strip()
+                if action_sql and action_sql != "-":
+                    constraint_status_jobs.append(row)
+
+        total_status_jobs = len(trigger_status_jobs) + len(constraint_status_jobs)
+        log.info("[FIXUP] (7.5/9) 正在生成状态修复脚本...")
+        status_progress = build_progress_tracker(total_status_jobs, "[FIXUP] (7.5/9) STATUS")
+
+        for row, sqls in trigger_status_jobs:
+            def _job(_row=row, _sqls=sqls):
+                try:
+                    parsed = parse_full_object_name(_row.trigger_full or "")
+                    if not parsed:
+                        return
+                    schema_u, trigger_u = parsed
+                    if not allow_fixup("TRIGGER", schema_u, schema_u):
+                        return
+                    content = prepend_set_schema("\n".join(_sqls), schema_u)
+                    filename = f"{schema_u}.{trigger_u}.status.sql"
+                    header = f"状态修复 TRIGGER {schema_u}.{trigger_u}"
+                    extra_comments = [
+                        f"src_enabled={_row.src_enabled}",
+                        f"tgt_enabled={_row.tgt_enabled}",
+                        f"src_valid={_row.src_valid}",
+                        f"tgt_valid={_row.tgt_valid}",
+                        f"detail={_row.detail or '-'}",
+                    ]
+                    write_fixup_file(
+                        base_dir,
+                        "status/trigger",
+                        filename,
+                        content,
+                        header,
+                        extra_comments=extra_comments
+                    )
+                finally:
+                    status_progress()
+            status_jobs.append(_job)
+
+        for row in constraint_status_jobs:
+            def _job(_row=row):
+                try:
+                    table_parsed = parse_full_object_name(_row.table_full or "")
+                    if not table_parsed:
+                        return
+                    schema_u, table_u = table_parsed
+                    if not allow_fixup("CONSTRAINT", schema_u, schema_u):
+                        return
+                    content = prepend_set_schema(_row.action_sql, schema_u)
+                    filename = f"{schema_u}.{_row.tgt_constraint}.status.sql"
+                    header = f"状态修复 CONSTRAINT {_row.tgt_constraint} (表: {schema_u}.{table_u})"
+                    extra_comments = [
+                        f"src_constraint={_row.src_constraint}",
+                        f"tgt_constraint={_row.tgt_constraint}",
+                        f"constraint_type={_row.constraint_type}",
+                        f"src_status={_row.src_status}",
+                        f"tgt_status={_row.tgt_status}",
+                        f"src_validated={_row.src_validated}",
+                        f"tgt_validated={_row.tgt_validated}",
+                        f"detail={_row.detail or '-'}",
+                    ]
+                    write_fixup_file(
+                        base_dir,
+                        "status/constraint",
+                        filename,
+                        content,
+                        header,
+                        extra_comments=extra_comments
+                    )
+                finally:
+                    status_progress()
+            status_jobs.append(_job)
+
+        run_tasks(status_jobs, "STATUS_FIXUP")
+    elif generate_status_fixup:
+        log.info("[FIXUP] (7.5/9) 状态修复脚本已开启，但当前无可生成的状态差异。")
+
     dep_report = dependency_report or {}
     compile_tasks: Dict[Tuple[str, str, str], Set[str]] = defaultdict(set)
 
@@ -23831,6 +24391,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "注释差异明细"
     if name.startswith("extra_mismatch_detail_"):
         return "DETAIL", "扩展对象差异明细"
+    if name.startswith("status_drift_detail_"):
+        return "DETAIL", "触发器/约束状态漂移明细"
     if name.startswith("noise_suppressed_detail_"):
         return "DETAIL", "降噪明细"
     if name.startswith("dependency_detail_"):
@@ -24586,6 +25148,55 @@ def export_extra_mismatch_detail(
     if not rows:
         return None
     return write_pipe_report("扩展对象差异明细", header_fields, rows, output_path)
+
+
+def export_status_drift_detail(
+    trigger_rows: List[TriggerStatusReportRow],
+    constraint_rows: List[ConstraintStatusDriftRow],
+    report_dir: Path,
+    report_timestamp: Optional[str],
+    trigger_validity_mode: str = "off"
+) -> Optional[Path]:
+    if not report_dir or not report_timestamp:
+        return None
+    if not trigger_rows and not constraint_rows:
+        return None
+    output_path = Path(report_dir) / f"status_drift_detail_{report_timestamp}.txt"
+    header_fields = [
+        "OBJECT_TYPE",
+        "OBJECT",
+        "SRC_ENABLED",
+        "TGT_ENABLED",
+        "SRC_VALIDATED",
+        "TGT_VALIDATED",
+        "DETAIL",
+        "ACTION_SQL"
+    ]
+    rows: List[List[str]] = []
+    for row in sorted(trigger_rows, key=lambda r: (r.trigger_full, r.detail)):
+        action_sql = " ".join(build_trigger_status_fixup_sqls(row, trigger_validity_mode)) or "-"
+        rows.append([
+            "TRIGGER",
+            row.trigger_full,
+            row.src_enabled,
+            row.tgt_enabled,
+            row.src_valid,
+            row.tgt_valid,
+            row.detail or "-",
+            action_sql
+        ])
+    for row in sorted(constraint_rows, key=lambda r: (r.table_full, r.tgt_constraint)):
+        rows.append([
+            "CONSTRAINT",
+            f"{row.table_full}.{row.tgt_constraint}",
+            row.src_status,
+            row.tgt_status,
+            row.src_validated,
+            row.tgt_validated,
+            row.detail or "-",
+            row.action_sql or "-"
+        ])
+    return write_pipe_report("触发器/约束状态漂移明细", header_fields, rows, output_path)
 
 
 def export_noise_suppressed_detail(
@@ -25844,6 +26455,9 @@ def _build_report_detail_rows(
     extra_results: ExtraCheckResults,
     support_summary: Optional[SupportClassificationResult],
     table_target_map: Optional[Dict[Tuple[str, str], Tuple[str, str]]] = None,
+    trigger_status_rows: Optional[List[TriggerStatusReportRow]] = None,
+    constraint_status_rows: Optional[List[ConstraintStatusDriftRow]] = None,
+    trigger_validity_mode: str = "off",
 ) -> Tuple[List[Dict[str, object]], bool, int]:
     detail_modes = settings.get("report_db_detail_mode_set") or set(DEFAULT_REPORT_DB_DETAIL_MODES)
     max_rows = int(settings.get("report_db_detail_max_rows", 0) or 0)
@@ -25871,6 +26485,10 @@ def _build_report_detail_rows(
     extra_constraint_mismatched = extra_results.get("constraint_mismatched", []) or []
     extra_sequence_mismatched = extra_results.get("sequence_mismatched", []) or []
     extra_trigger_mismatched = extra_results.get("trigger_mismatched", []) or []
+    if trigger_status_rows is None:
+        trigger_status_rows = list(extra_results.get("trigger_status_drift", []) or [])
+    if constraint_status_rows is None:
+        constraint_status_rows = list(extra_results.get("constraint_status_drift", []) or [])
 
     total_count = 0
     if "missing" in detail_modes:
@@ -25882,6 +26500,7 @@ def _build_report_detail_rows(
         total_count += len(mismatch_rows)
         total_count += len(extra_index_mismatched) + len(extra_constraint_mismatched)
         total_count += len(extra_sequence_mismatched) + len(extra_trigger_mismatched)
+        total_count += len(trigger_status_rows or []) + len(constraint_status_rows or [])
     if "ok" in detail_modes:
         total_count += len(ok_rows)
     if "skipped" in detail_modes:
@@ -26077,6 +26696,50 @@ def _build_report_detail_rows(
                     "missing_mappings": row.missing_mappings,
                 }, ensure_ascii=False, default=str)
             })
+        for row in trigger_status_rows or []:
+            tgt_schema, tgt_name = parse_full_object_name(row.trigger_full or "") or ("", row.trigger_full or "")
+            _push({
+                "report_type": "MISMATCHED",
+                "object_type": "TRIGGER",
+                "source_schema": tgt_schema,
+                "source_name": tgt_name,
+                "target_schema": tgt_schema,
+                "target_name": tgt_name,
+                "status": "STATUS_DRIFT",
+                "reason": "TRIGGER status drift",
+                "detail_json": json.dumps({
+                    "src_event": row.src_event,
+                    "tgt_event": row.tgt_event,
+                    "src_enabled": row.src_enabled,
+                    "tgt_enabled": row.tgt_enabled,
+                    "src_valid": row.src_valid,
+                    "tgt_valid": row.tgt_valid,
+                    "detail": row.detail,
+                    "action_sql": build_trigger_status_fixup_sqls(row, trigger_validity_mode),
+                }, ensure_ascii=False, default=str)
+            })
+        for row in constraint_status_rows or []:
+            tgt_schema, tgt_table = parse_full_object_name(row.table_full or "") or ("", row.table_full or "")
+            _push({
+                "report_type": "MISMATCHED",
+                "object_type": "CONSTRAINT",
+                "source_schema": tgt_schema,
+                "source_name": row.src_constraint,
+                "target_schema": tgt_schema,
+                "target_name": row.tgt_constraint,
+                "status": "STATUS_DRIFT",
+                "reason": "CONSTRAINT status drift",
+                "detail_json": json.dumps({
+                    "table": row.table_full,
+                    "constraint_type": row.constraint_type,
+                    "src_status": row.src_status,
+                    "tgt_status": row.tgt_status,
+                    "src_validated": row.src_validated,
+                    "tgt_validated": row.tgt_validated,
+                    "detail": row.detail,
+                    "action_sql": row.action_sql,
+                }, ensure_ascii=False, default=str)
+            })
 
     if "ok" in detail_modes:
         for obj_type, tgt_name in ok_rows:
@@ -26120,7 +26783,10 @@ def _build_report_detail_item_rows(
     extra_results: ExtraCheckResults,
     support_summary: Optional[SupportClassificationResult],
     table_target_map: Optional[Dict[Tuple[str, str], Tuple[str, str]]],
-    max_rows: int
+    max_rows: int,
+    trigger_status_rows: Optional[List[TriggerStatusReportRow]] = None,
+    constraint_status_rows: Optional[List[ConstraintStatusDriftRow]] = None,
+    trigger_validity_mode: str = "off"
 ) -> Tuple[List[Dict[str, object]], bool, int]:
     rows: List[Dict[str, object]] = []
     truncated = False
@@ -26132,6 +26798,10 @@ def _build_report_detail_item_rows(
             f"{tgt_schema}.{tgt_name}".upper(): (src_schema, src_name)
             for (src_schema, src_name), (tgt_schema, tgt_name) in table_target_map.items()
         }
+    if trigger_status_rows is None:
+        trigger_status_rows = list(extra_results.get("trigger_status_drift", []) or [])
+    if constraint_status_rows is None:
+        constraint_status_rows = list(extra_results.get("constraint_status_drift", []) or [])
 
     def _push(row: Dict[str, object]) -> None:
         nonlocal truncated, truncated_count
@@ -26300,6 +26970,72 @@ def _build_report_detail_item_rows(
             _push({**base, "item_type": "EXTRA_TRIGGER", "item_key": name, "item_value": ""})
         for detail in item.detail_mismatch or []:
             _push({**base, "item_type": "TRIGGER_DETAIL", "item_key": "", "item_value": detail})
+
+    # 6.b) TRIGGER/CONSTRAINT 状态漂移
+    for row in trigger_status_rows or []:
+        schema_u, trigger_u = _split_full(row.trigger_full or "")
+        base = {
+            "report_type": "MISMATCHED",
+            "object_type": "TRIGGER",
+            "source_schema": schema_u,
+            "source_name": trigger_u,
+            "target_schema": schema_u,
+            "target_name": trigger_u,
+            "status": "STATUS_DRIFT",
+        }
+        if row.detail:
+            _push({**base, "item_type": "TRIGGER_STATUS_DRIFT", "item_key": "", "item_value": row.detail})
+        _push({
+            **base,
+            "item_type": "TRIGGER_ENABLED",
+            "item_key": "ENABLED",
+            "src_value": row.src_enabled,
+            "tgt_value": row.tgt_enabled,
+            "item_value": "",
+        })
+        _push({
+            **base,
+            "item_type": "TRIGGER_VALID",
+            "item_key": "VALID",
+            "src_value": row.src_valid,
+            "tgt_value": row.tgt_valid,
+            "item_value": "",
+        })
+        action_sql = " ".join(build_trigger_status_fixup_sqls(row, trigger_validity_mode))
+        if action_sql:
+            _push({**base, "item_type": "ACTION_SQL", "item_key": "", "item_value": action_sql})
+
+    for row in constraint_status_rows or []:
+        schema_u, table_u = _split_full(row.table_full or "")
+        base = {
+            "report_type": "MISMATCHED",
+            "object_type": "CONSTRAINT",
+            "source_schema": schema_u,
+            "source_name": row.src_constraint,
+            "target_schema": schema_u,
+            "target_name": row.tgt_constraint,
+            "status": "STATUS_DRIFT",
+        }
+        if row.detail:
+            _push({**base, "item_type": "CONSTRAINT_STATUS_DRIFT", "item_key": table_u, "item_value": row.detail})
+        _push({
+            **base,
+            "item_type": "CONSTRAINT_ENABLED",
+            "item_key": "ENABLED",
+            "src_value": row.src_status,
+            "tgt_value": row.tgt_status,
+            "item_value": "",
+        })
+        _push({
+            **base,
+            "item_type": "CONSTRAINT_VALIDATED",
+            "item_key": "VALIDATED",
+            "src_value": row.src_validated,
+            "tgt_value": row.tgt_validated,
+            "item_value": "",
+        })
+        if row.action_sql and row.action_sql != "-":
+            _push({**base, "item_type": "ACTION_SQL", "item_key": "", "item_value": row.action_sql})
 
     # 7) 不支持扩展对象细节
     for item in extra_results.get("index_unsupported", []) or []:
@@ -26502,6 +27238,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
     if name.startswith("unsupported_objects_detail_"):
         return "UNSUPPORTED_DETAIL"
     if name.startswith("extra_mismatch_detail_"):
+        return "MISMATCH_DETAIL"
+    if name.startswith("status_drift_detail_"):
         return "MISMATCH_DETAIL"
     if name.startswith("package_compare_"):
         return "PACKAGE_COMPARE"
@@ -28146,6 +28884,7 @@ def save_report_to_db(
     usability_summary: Optional[UsabilitySummary] = None,
     package_results: Optional[PackageCompareResults] = None,
     trigger_status_rows: Optional[List[TriggerStatusReportRow]] = None,
+    constraint_status_rows: Optional[List[ConstraintStatusDriftRow]] = None,
     dependency_report: Optional[DependencyReport] = None,
     expected_dependency_pairs: Optional[Set[Tuple[str, str, str, str]]] = None,
     view_chain_file: Optional[Path] = None,
@@ -28213,7 +28952,10 @@ def save_report_to_db(
             tv_results,
             extra_results,
             support_summary,
-            table_target_map
+            table_target_map,
+            trigger_status_rows=trigger_status_rows,
+            constraint_status_rows=constraint_status_rows,
+            trigger_validity_mode=settings.get("trigger_validity_sync_mode", "off")
         )
     else:
         detail_rows, detail_truncated, detail_truncated_count = [], False, 0
@@ -28226,7 +28968,10 @@ def save_report_to_db(
             extra_results,
             support_summary,
             table_target_map,
-            detail_item_max_rows
+            detail_item_max_rows,
+            trigger_status_rows=trigger_status_rows,
+            constraint_status_rows=constraint_status_rows,
+            trigger_validity_mode=settings.get("trigger_validity_sync_mode", "off")
         )
         if detail_item_truncated:
             detail_truncated = True
@@ -28845,6 +29590,7 @@ def print_final_report(
     trigger_list_summary: Optional[Dict[str, object]] = None,
     trigger_list_rows: Optional[List[TriggerListReportRow]] = None,
     trigger_status_rows: Optional[List[TriggerStatusReportRow]] = None,
+    constraint_status_rows: Optional[List[ConstraintStatusDriftRow]] = None,
     package_results: Optional[PackageCompareResults] = None,
     run_summary_ctx: Optional[RunSummaryContext] = None,
     filtered_grants: Optional[List[FilteredGrantEntry]] = None,
@@ -28889,6 +29635,7 @@ def print_final_report(
             "index_ok": [], "index_mismatched": [], "index_unsupported": [],
             "constraint_ok": [], "constraint_mismatched": [], "sequence_ok": [], "sequence_mismatched": [],
             "trigger_ok": [], "trigger_mismatched": [], "constraint_unsupported": [],
+            "trigger_status_drift": [], "constraint_status_drift": [],
         }
     if comment_results is None:
         comment_results = {
@@ -28903,6 +29650,7 @@ def print_final_report(
             "skipped": []
         }
     trigger_status_rows = trigger_status_rows or []
+    constraint_status_rows = constraint_status_rows or []
     noise_suppressed_details = noise_suppressed_details or []
     if schema_summary is None:
         schema_summary = {
@@ -28929,6 +29677,8 @@ def print_final_report(
     seq_mis_cnt = len(extra_results.get("sequence_mismatched", []))
     trg_ok_cnt = len(extra_results.get("trigger_ok", []))
     trg_mis_cnt = len(extra_results.get("trigger_mismatched", []))
+    trg_status_drift_cnt = len(trigger_status_rows)
+    cons_status_drift_cnt = len(constraint_status_rows)
     extra_missing_counts = summarize_extra_missing_counts(extra_results)
     idx_missing_cnt = int(extra_missing_counts.get("INDEX", 0) or 0)
     cons_missing_cnt = int(extra_missing_counts.get("CONSTRAINT", 0) or 0)
@@ -29300,13 +30050,16 @@ def print_final_report(
                 filter_text.append(str(not_missing_cnt), style="info")
         summary_table.add_row("[bold]触发器筛选[/bold]", filter_text)
 
-    if trigger_status_rows:
+    if trigger_status_rows or constraint_status_rows:
         status_text = Text()
-        status_text.append("差异: ", style="mismatch")
-        status_text.append(str(len(trigger_status_rows)), style="mismatch")
+        status_text.append("TRIGGER 差异: ", style="mismatch")
+        status_text.append(str(trg_status_drift_cnt), style="mismatch")
+        status_text.append("\nCONSTRAINT 差异: ", style="mismatch")
+        status_text.append(str(cons_status_drift_cnt), style="mismatch")
         if report_file:
-            status_text.append("\n详见: trigger_status_report.txt", style="info")
-        summary_table.add_row("[bold]触发器状态[/bold]", status_text)
+            status_text.append("\n详见: trigger_status_report.txt / ", style="info")
+            status_text.append(f"status_drift_detail_{report_ts or '*'}.txt", style="info")
+        summary_table.add_row("[bold]状态漂移[/bold]", status_text)
 
     dep_text = Text()
     dep_text.append("缺失依赖: ", style="missing")
@@ -29913,6 +30666,19 @@ def print_final_report(
             )
         trigger_row_count = (len(trigger_list_rows or []) + len(trigger_status_rows or [])) if trigger_report_path else None
         _add_index_entry("AUX", trigger_report_path, trigger_row_count, "触发器状态/清单报告")
+        status_drift_path = export_status_drift_detail(
+            trigger_status_rows or [],
+            constraint_status_rows or [],
+            report_path.parent,
+            report_ts,
+            trigger_validity_mode=settings.get("trigger_validity_sync_mode", "off") if settings else "off"
+        )
+        _add_index_entry(
+            "DETAIL",
+            status_drift_path,
+            len(trigger_status_rows or []) + len(constraint_status_rows or []),
+            "触发器/约束状态漂移明细"
+        )
         filtered_grants_path = export_filtered_grants(
             filtered_grants or [],
             report_path.parent
@@ -30239,6 +31005,8 @@ def print_final_report(
                 log.info("黑名单表清单已输出到: %s", blacklist_path)
             if trigger_report_path:
                 log.info("触发器状态/清单报告已输出到: %s", trigger_report_path)
+            if status_drift_path:
+                log.info("状态漂移明细已输出到: %s", status_drift_path)
             if filtered_grants_path:
                 log.info("过滤授权清单已输出到: %s", filtered_grants_path)
             if fixup_skip_path:
@@ -30344,6 +31112,11 @@ def parse_cli_args() -> argparse.Namespace:
             synonym_fixup_scope     同义词修补范围 (all/public_only，默认 public_only)
             trigger_list            仅生成指定触发器清单 (每行 SCHEMA.TRIGGER_NAME)
             trigger_qualify_schema  触发器 DDL 是否强制补全 schema 前缀 (true/false)
+            check_status_drift_types 状态漂移检查范围 (trigger,constraint)
+            generate_status_fixup   true/false 控制状态漂移修复脚本生成
+            status_fixup_types      状态修复对象类型 (trigger,constraint)
+            constraint_status_sync_mode 约束状态同步模式 (enabled_only/full)
+            trigger_validity_sync_mode 触发器有效性同步模式 (off/compile)
             sequence_remap_policy   SEQUENCE 目标 schema 推导策略 (infer/source_only/dominant_table)
             blacklist_name_patterns 表名黑名单关键字（逗号分隔，默认 _RENAME）
             blacklist_name_patterns_file 表名黑名单关键字文件（每行一条）
@@ -30378,6 +31151,7 @@ def parse_cli_args() -> argparse.Namespace:
           main_reports/run_<ts>/missed_tables_views_for_OMS/ 按 schema 输出缺失 TABLE/VIEW 规则 (schema_T.txt / schema_V.txt)
           main_reports/run_<ts>/blacklist_tables.txt 黑名单表清单 (含 LONG 转换校验状态)
           main_reports/run_<ts>/trigger_status_report.txt  触发器状态/清单报告 (trigger_list 或触发器状态差异时生成)
+          main_reports/run_<ts>/status_drift_detail_<ts>.txt 触发器/约束状态漂移明细
           main_reports/run_<ts>/filtered_grants.txt 过滤掉的不兼容 GRANT 权限清单
           main_reports/run_<ts>/ddl_format_report_<ts>.txt SQLcl DDL 格式化报告 (ddl_format_enable=true)
           main_reports/run_<ts>/missing_objects_detail_<ts>.txt 缺失对象支持性明细 (report_detail_mode=split)
@@ -30733,6 +31507,8 @@ def main():
             "sequence_mismatched": [],
             "trigger_ok": [],
             "trigger_mismatched": [],
+            "trigger_status_drift": [],
+            "constraint_status_drift": [],
         }
         comment_results = {
             "ok": [],
@@ -30999,14 +31775,28 @@ def main():
         package_results
     )
 
+    status_drift_types: Set[str] = set(settings.get("check_status_drift_type_set", set()) or set())
+
     trigger_status_rows: List[TriggerStatusReportRow] = []
-    if 'TRIGGER' in enabled_extra_types:
+    if 'TRIGGER' in enabled_extra_types and "TRIGGER" in status_drift_types:
         trigger_status_rows = collect_trigger_status_rows(
             oracle_meta,
             ob_meta,
             full_object_mapping,
             unsupported_table_keys=(support_summary.unsupported_table_keys if support_summary else None)
         )
+    constraint_status_rows: List[ConstraintStatusDriftRow] = []
+    if 'CONSTRAINT' in enabled_extra_types and "CONSTRAINT" in status_drift_types:
+        constraint_status_rows = collect_constraint_status_drift_rows(
+            oracle_meta,
+            ob_meta,
+            master_list,
+            full_object_mapping,
+            sync_mode=settings.get("constraint_status_sync_mode", "enabled_only"),
+            unsupported_table_keys=(support_summary.unsupported_table_keys if support_summary else None)
+        )
+    extra_results["trigger_status_drift"] = trigger_status_rows
+    extra_results["constraint_status_drift"] = constraint_status_rows
 
     trigger_list_summary: Optional[Dict[str, object]] = None
     trigger_list_rows: Optional[List[TriggerListReportRow]] = None
@@ -31205,6 +31995,8 @@ def main():
                 report_dir=report_dir,
                 report_timestamp=timestamp,
                 fixup_skip_summary=fixup_skip_summary,
+                trigger_status_rows=trigger_status_rows,
+                constraint_status_rows=constraint_status_rows,
                 support_state_map=support_summary.support_state_map,
                 unsupported_table_keys=support_summary.unsupported_table_keys,
                 view_compat_map=support_summary.view_compat_map,
@@ -31257,6 +32049,7 @@ def main():
         trigger_list_summary,
         trigger_list_rows,
         trigger_status_rows,
+        constraint_status_rows,
         package_results=package_results,
         run_summary_ctx=run_summary_ctx,
         filtered_grants=(grant_plan.filtered_grants if grant_plan else None),
@@ -31286,6 +32079,7 @@ def main():
             usability_summary=usability_summary,
             package_results=package_results,
             trigger_status_rows=trigger_status_rows,
+            constraint_status_rows=constraint_status_rows,
             dependency_report=dependency_report,
             expected_dependency_pairs=expected_dependency_pairs,
             view_chain_file=view_chain_file,

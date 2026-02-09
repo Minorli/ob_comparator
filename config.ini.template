@@ -177,6 +177,18 @@ trigger_qualify_schema  = true
 #   all         -> PUBLIC + 私有同义词全部纳入校验
 # check_extra_types 可选值：
 #   INDEX, CONSTRAINT, SEQUENCE, TRIGGER
+# check_status_drift_types 可选值：
+#   TRIGGER, CONSTRAINT（状态漂移检查范围；需对应类型已在 check_extra_types 启用）
+# generate_status_fixup：
+#   true/false，是否为状态漂移生成修复脚本（默认 false）
+# status_fixup_types 可选值：
+#   TRIGGER, CONSTRAINT（状态修复脚本生成范围）
+# constraint_status_sync_mode：
+#   enabled_only（仅同步 ENABLED/DISABLED，默认）
+#   full（同时同步 VALIDATED / NOT VALIDATED）
+# trigger_validity_sync_mode：
+#   off（不处理 VALID/INVALID，默认）
+#   compile（当源 VALID 且目标 INVALID 时生成 ALTER TRIGGER ... COMPILE）
 # 示例：
 #   只检查表 -> check_primary_types=TABLE
 #   检查表+视图 -> check_primary_types=TABLE,VIEW
@@ -184,6 +196,11 @@ trigger_qualify_schema  = true
 check_primary_types     =
 synonym_check_scope     = public_only
 check_extra_types       = index,constraint,sequence,trigger
+check_status_drift_types = trigger,constraint
+generate_status_fixup   = false
+status_fixup_types      = trigger,constraint
+constraint_status_sync_mode = enabled_only
+trigger_validity_sync_mode = off
 # 是否进行依赖关系校验
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 check_dependencies      = true

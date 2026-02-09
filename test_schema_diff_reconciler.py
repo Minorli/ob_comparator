@@ -6335,6 +6335,106 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn("--说明", cleaned)
         self.assertIn("\n (a.col2 - a.col3)", cleaned)
 
+    def test_normalize_status_sync_modes(self):
+        self.assertEqual(sdr.normalize_constraint_status_sync_mode("enabled"), "enabled_only")
+        self.assertEqual(sdr.normalize_constraint_status_sync_mode("full"), "full")
+        self.assertEqual(sdr.normalize_constraint_status_sync_mode("bad"), "enabled_only")
+        self.assertEqual(sdr.normalize_trigger_validity_sync_mode("on"), "compile")
+        self.assertEqual(sdr.normalize_trigger_validity_sync_mode("off"), "off")
+        self.assertEqual(sdr.normalize_trigger_validity_sync_mode("bad"), "off")
+
+    def test_build_trigger_status_fixup_sqls_compile_mode(self):
+        row = sdr.TriggerStatusReportRow(
+            trigger_full="OMS_USER.TRG_A",
+            src_event="INSERT",
+            tgt_event="INSERT",
+            src_enabled="ENABLED",
+            tgt_enabled="DISABLED",
+            src_valid="VALID",
+            tgt_valid="INVALID",
+            detail="ENABLED,VALID",
+        )
+        sqls_off = sdr.build_trigger_status_fixup_sqls(row, "off")
+        self.assertEqual(len(sqls_off), 1)
+        self.assertIn("ENABLE", sqls_off[0])
+
+        sqls_compile = sdr.build_trigger_status_fixup_sqls(row, "compile")
+        self.assertEqual(len(sqls_compile), 2)
+        self.assertIn("ENABLE", sqls_compile[0])
+        self.assertIn("COMPILE", sqls_compile[1])
+
+    def test_collect_constraint_status_drift_rows_semantic_match(self):
+        oracle_meta = self._make_oracle_meta(constraints={
+            ("OMS_USER", "T1"): {
+                "CK_SRC": {
+                    "type": "C",
+                    "columns": [],
+                    "search_condition": "VAL > 0",
+                    "status": "ENABLED",
+                    "validated": "VALIDATED",
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta(constraints={
+            ("OMS_USER", "T1"): {
+                "CK_TGT": {
+                    "type": "C",
+                    "columns": [],
+                    "search_condition": "(VAL > 0)",
+                    "status": "DISABLED",
+                    "validated": "NOT VALIDATED",
+                }
+            }
+        })
+        master_list = [("OMS_USER.T1", "OMS_USER.T1", "TABLE")]
+        rows = sdr.collect_constraint_status_drift_rows(
+            oracle_meta,
+            ob_meta,
+            master_list,
+            full_object_mapping={},
+            sync_mode="enabled_only",
+        )
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row.src_constraint, "CK_SRC")
+        self.assertEqual(row.tgt_constraint, "CK_TGT")
+        self.assertIn("MATCH=CK_SRC->CK_TGT", row.detail)
+        self.assertIn('ENABLE CONSTRAINT "CK_TGT"', row.action_sql)
+
+    def test_collect_constraint_status_drift_rows_full_validated(self):
+        oracle_meta = self._make_oracle_meta(constraints={
+            ("OMS_USER", "T1"): {
+                "CK_A": {
+                    "type": "C",
+                    "columns": [],
+                    "search_condition": "VAL > 0",
+                    "status": "ENABLED",
+                    "validated": "NOT VALIDATED",
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta(constraints={
+            ("OMS_USER", "T1"): {
+                "CK_A": {
+                    "type": "C",
+                    "columns": [],
+                    "search_condition": "VAL > 0",
+                    "status": "ENABLED",
+                    "validated": "VALIDATED",
+                }
+            }
+        })
+        rows = sdr.collect_constraint_status_drift_rows(
+            oracle_meta,
+            ob_meta,
+            [("OMS_USER.T1", "OMS_USER.T1", "TABLE")],
+            full_object_mapping={},
+            sync_mode="full",
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].detail, "VALIDATED")
+        self.assertIn("ENABLE NOVALIDATE", rows[0].action_sql)
+
 
 class TestNoiseSuppression(unittest.TestCase):
     def _empty_extra_results(self) -> Dict[str, List]:
