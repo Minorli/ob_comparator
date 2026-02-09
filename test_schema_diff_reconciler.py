@@ -2705,6 +2705,60 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             sdr.obclient_run_sql = orig_run
             sdr.obclient_query_by_owner_chunks = orig_query
 
+    def test_dump_ob_metadata_keeps_disabled_constraints(self):
+        def fake_run(_cfg, _sql):
+            return True, "", ""
+
+        def fake_query(_cfg, sql_tpl, _owners, **_kwargs):
+            sql = sql_tpl.upper()
+            if "DBA_OBJECTS" in sql:
+                return True, [], ""
+            if "FROM DBA_CONSTRAINTS" in sql:
+                # OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, STATUS, R_OWNER, R_CONSTRAINT_NAME, DELETE_RULE, SEARCH_CONDITION
+                lines = [
+                    "A\tT1\tFK1\tR\tDISABLED\tA\tPK_RT1\tNO ACTION\t",
+                    "A\tRT1\tPK_RT1\tP\tENABLED\t\t\t\t",
+                ]
+                return True, lines, ""
+            if "DBA_CONS_COLUMNS" in sql:
+                lines = [
+                    "A\tT1\tFK1\tC1\t1",
+                    "A\tRT1\tPK_RT1\tID\t1",
+                ]
+                return True, lines, ""
+            return True, [], ""
+
+        orig_run = sdr.obclient_run_sql
+        orig_query = sdr.obclient_query_by_owner_chunks
+        orig_has_col = sdr.ob_has_dba_column
+        try:
+            sdr.obclient_run_sql = fake_run
+            sdr.obclient_query_by_owner_chunks = fake_query
+            sdr.ob_has_dba_column = lambda *_a, **_k: False
+            ob_meta = sdr.dump_ob_metadata(
+                {"executable": "/bin/obclient", "host": "h", "port": "1", "user_string": "u", "password": "p"},
+                {"A"},
+                tracked_object_types={"TABLE"},
+                include_tab_columns=False,
+                include_column_order=False,
+                include_indexes=False,
+                include_constraints=True,
+                include_triggers=False,
+                include_sequences=False,
+                include_comments=False,
+                include_roles=False,
+            )
+            fk = ob_meta.constraints[("A", "T1")]["FK1"]
+            self.assertEqual(fk["type"], "R")
+            self.assertEqual(fk.get("status"), "DISABLED")
+            self.assertEqual(fk["columns"], ["C1"])
+            self.assertEqual(fk.get("ref_table_owner"), "A")
+            self.assertEqual(fk.get("ref_table_name"), "RT1")
+        finally:
+            sdr.obclient_run_sql = orig_run
+            sdr.obclient_query_by_owner_chunks = orig_query
+            sdr.ob_has_dba_column = orig_has_col
+
     def test_check_extra_objects_sequence_without_master_list(self):
         oracle_meta = self._make_oracle_meta(sequences={"A": {"SEQ1", "SEQ2"}})
         ob_meta = self._make_ob_meta(sequences={"A": {"SEQ2"}})
@@ -3068,6 +3122,172 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(summary.get("SOURCE_INVALID"), 1)
         self.assertEqual(summary.get("TARGET_INVALID"), 1)
         self.assertEqual(len(results["diff_rows"]), 2)
+
+    def test_check_primary_objects_does_not_mark_package_as_extra_target(self):
+        master_list = [
+            ("A.PKG1", "B.PKG1", "PACKAGE"),
+            ("A.PKG1", "B.PKG1", "PACKAGE BODY"),
+        ]
+        oracle_meta = self._make_oracle_meta()
+        ob_meta = self._make_ob_meta()._replace(objects_by_type={
+            "PACKAGE": {"B.PKG1"},
+            "PACKAGE BODY": {"B.PKG1"},
+        })
+
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"PACKAGE", "PACKAGE BODY"},
+            print_only_types=set(),
+            settings={},
+        )
+
+        self.assertEqual(results.get("extra_targets"), [])
+
+    def test_compute_object_counts_ignores_source_invalid_package_on_both_sides(self):
+        full_mapping = {
+            "A.P1": {"PACKAGE": "B.P1"},
+            "A.P2": {"PACKAGE": "B.P2"},
+        }
+        oracle_meta = self._make_oracle_meta()
+        oracle_meta = oracle_meta._replace(object_statuses={
+            ("A", "P1", "PACKAGE"): "INVALID",
+            ("A", "P2", "PACKAGE"): "VALID",
+        })
+        ob_meta = self._make_ob_meta()
+        ob_meta = ob_meta._replace(objects_by_type={
+            "PACKAGE": {"B.P1", "B.P2"},
+        })
+
+        summary = sdr.compute_object_counts(
+            full_mapping,
+            ob_meta,
+            oracle_meta,
+            monitored_types=("PACKAGE",),
+        )
+
+        self.assertEqual(summary["oracle"]["PACKAGE"], 1)
+        self.assertEqual(summary["oceanbase"]["PACKAGE"], 1)
+        self.assertEqual(summary["missing"]["PACKAGE"], 0)
+        self.assertEqual(summary["extra"]["PACKAGE"], 0)
+
+    def test_reconcile_object_counts_summary_prefers_final_results(self):
+        base_summary = {
+            "oracle": {
+                "TABLE": 3,
+                "INDEX": 10,
+                "CONSTRAINT": 8,
+                "SEQUENCE": 4,
+                "TRIGGER": 5,
+                "PACKAGE": 2,
+                "PACKAGE BODY": 2,
+            },
+            "oceanbase": {
+                "TABLE": 3,
+                "INDEX": 2,
+                "CONSTRAINT": 1,
+                "SEQUENCE": 2,
+                "TRIGGER": 1,
+                "PACKAGE": 1,
+                "PACKAGE BODY": 1,
+            },
+            "missing": {
+                "TABLE": 0,
+                "INDEX": 8,
+                "CONSTRAINT": 7,
+                "SEQUENCE": 2,
+                "TRIGGER": 4,
+                "PACKAGE": 1,
+                "PACKAGE BODY": 1,
+            },
+            "extra": {
+                "TABLE": 0,
+                "INDEX": 0,
+                "CONSTRAINT": 0,
+                "SEQUENCE": 0,
+                "TRIGGER": 0,
+                "PACKAGE": 5,
+                "PACKAGE BODY": 6,
+            },
+        }
+        tv_results = {
+            "missing": [("TABLE", "B.T2", "A.T2")],
+            "extra_targets": [("TABLE", "B.TX")],
+        }
+        extra_results = {
+            "index_mismatched": [
+                sdr.IndexMismatch(table="B.T1", missing_indexes={"I1", "I2"}, extra_indexes={"IX"}, detail_mismatch=[])
+            ],
+            "constraint_mismatched": [
+                sdr.ConstraintMismatch(
+                    table="B.T1",
+                    missing_constraints={"C1"},
+                    extra_constraints={"CX", "CY"},
+                    detail_mismatch=[],
+                    downgraded_pk_constraints=set()
+                )
+            ],
+            "sequence_mismatched": [
+                sdr.SequenceMismatch(
+                    src_schema="A",
+                    tgt_schema="B",
+                    missing_sequences={"S1"},
+                    extra_sequences={"SX"},
+                    missing_mappings=[]
+                )
+            ],
+            "trigger_mismatched": [
+                sdr.TriggerMismatch(
+                    table="B.T1",
+                    missing_triggers={"B.TRG1"},
+                    extra_triggers={"B.TRGX"},
+                    detail_mismatch=[],
+                    missing_mappings=[]
+                )
+            ],
+        }
+        package_results = {
+            "rows": [
+                sdr.PackageCompareRow(
+                    src_full="A.P1",
+                    obj_type="PACKAGE",
+                    src_status="VALID",
+                    tgt_full="B.P1",
+                    tgt_status="MISSING",
+                    result="MISSING_TARGET",
+                    error_count=0,
+                    first_error=""
+                ),
+                sdr.PackageCompareRow(
+                    src_full="A.P1",
+                    obj_type="PACKAGE BODY",
+                    src_status="VALID",
+                    tgt_full="B.P1",
+                    tgt_status="VALID",
+                    result="OK",
+                    error_count=0,
+                    first_error=""
+                ),
+            ]
+        }
+
+        out = sdr.reconcile_object_counts_summary(base_summary, tv_results, extra_results, package_results)
+        self.assertEqual(out["missing"]["TABLE"], 1)
+        self.assertEqual(out["extra"]["TABLE"], 1)
+        self.assertEqual(out["missing"]["INDEX"], 2)
+        self.assertEqual(out["extra"]["INDEX"], 1)
+        self.assertEqual(out["missing"]["CONSTRAINT"], 1)
+        self.assertEqual(out["extra"]["CONSTRAINT"], 2)
+        self.assertEqual(out["missing"]["SEQUENCE"], 1)
+        self.assertEqual(out["extra"]["SEQUENCE"], 1)
+        self.assertEqual(out["missing"]["TRIGGER"], 1)
+        self.assertEqual(out["extra"]["TRIGGER"], 1)
+        self.assertEqual(out["missing"]["PACKAGE"], 1)
+        self.assertEqual(out["extra"]["PACKAGE"], 5)  # package extra 仍沿用原口径
+        self.assertEqual(out["missing"]["PACKAGE BODY"], 0)
+        self.assertEqual(out["extra"]["PACKAGE BODY"], 6)
 
     def test_export_package_compare_report(self):
         rows = [

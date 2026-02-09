@@ -7675,9 +7675,13 @@ def compute_object_counts(
             }
         else:
             expected_set = expected_by_type.get(obj_type_u, set())
-            if obj_type_u in invalid_targets_by_type:
-                expected_set = expected_set - invalid_targets_by_type[obj_type_u]
             actual_set = actual_by_type.get(obj_type_u, set())
+            ignored_due_source_invalid = invalid_targets_by_type.get(obj_type_u, set())
+            if ignored_due_source_invalid:
+                # 源端 INVALID 的 PACKAGE/PACKAGE BODY 不参与“缺失/多余”数量统计：
+                # 需同时从 expected 和 actual 移除，避免被误计为 extra。
+                expected_set = expected_set - ignored_due_source_invalid
+                actual_set = actual_set - ignored_due_source_invalid
 
         # For constraints and indexes, names can be system-generated. A simple name comparison is not enough.
         # This count is a rough estimation. The detailed mismatch is more important.
@@ -7726,6 +7730,95 @@ def compute_object_counts(
         )
     else:
         log.info("检查汇总: 所有关注对象类型的数量与期望一致（不计入额外对象）。")
+
+    return summary
+
+
+def reconcile_object_counts_summary(
+    object_counts_summary: Optional[ObjectCountSummary],
+    tv_results: Optional[ReportResults],
+    extra_results: Optional[ExtraCheckResults],
+    package_results: Optional[PackageCompareResults]
+) -> Optional[ObjectCountSummary]:
+    """
+    将“检查汇总”口径与最终明细结果对齐。
+
+    说明：
+      - compute_object_counts 在 INDEX/CONSTRAINT 上是基于元数据总量的近似统计，
+        容易与语义比对结果（按列集/表达式/规则匹配）产生偏差。
+      - 降噪/过滤后，tv_results / extra_results 会变化，需同步刷新汇总。
+    """
+    if not object_counts_summary:
+        return object_counts_summary
+
+    summary: ObjectCountSummary = {
+        "oracle": dict(object_counts_summary.get("oracle", {})),
+        "oceanbase": dict(object_counts_summary.get("oceanbase", {})),
+        "missing": dict(object_counts_summary.get("missing", {})),
+        "extra": dict(object_counts_summary.get("extra", {})),
+    }
+
+    def _set_counts(obj_type: str, missing_cnt: int, extra_cnt: int, *, keep_extra: bool = False) -> None:
+        obj_type_u = (obj_type or "").upper()
+        if not obj_type_u:
+            return
+        missing_val = max(0, int(missing_cnt or 0))
+        extra_val = int(summary["extra"].get(obj_type_u, 0) or 0) if keep_extra else max(0, int(extra_cnt or 0))
+        oracle_val = max(0, int(summary["oracle"].get(obj_type_u, 0) or 0))
+        summary["missing"][obj_type_u] = missing_val
+        summary["extra"][obj_type_u] = extra_val
+        summary["oceanbase"][obj_type_u] = max(0, oracle_val - missing_val)
+
+    # 1) 主对象口径：按最终 tv_results 统计（已包含降噪后的结果）
+    missing_by_type: Dict[str, int] = defaultdict(int)
+    extra_by_type: Dict[str, int] = defaultdict(int)
+    if tv_results:
+        for obj_type, _tgt_name, _src_name in (tv_results.get("missing", []) or []):
+            missing_by_type[(obj_type or "").upper()] += 1
+        for obj_type, _tgt_name in (tv_results.get("extra_targets", []) or []):
+            extra_by_type[(obj_type or "").upper()] += 1
+    for obj_type in set(missing_by_type) | set(extra_by_type):
+        _set_counts(obj_type, missing_by_type.get(obj_type, 0), extra_by_type.get(obj_type, 0))
+
+    # 2) PACKAGE / PACKAGE BODY：缺失按 package compare，extra 保留原统计（无专门extra明细）
+    if package_results:
+        pkg_missing: Dict[str, int] = defaultdict(int)
+        for row in (package_results.get("rows", []) or []):
+            if (row.result or "").upper() == "MISSING_TARGET":
+                pkg_missing[(row.obj_type or "").upper()] += 1
+        for obj_type in PACKAGE_OBJECT_TYPES:
+            if obj_type in summary["oracle"]:
+                _set_counts(obj_type, pkg_missing.get(obj_type, 0), 0, keep_extra=True)
+
+    # 3) 扩展对象：按最终 extra_results 语义结果覆盖（而不是总量估算）
+    if extra_results:
+        index_missing = sum(len(item.missing_indexes or set()) for item in (extra_results.get("index_mismatched", []) or []))
+        index_extra = sum(len(item.extra_indexes or set()) for item in (extra_results.get("index_mismatched", []) or []))
+        _set_counts("INDEX", index_missing, index_extra)
+
+        constraint_missing = sum(
+            len(item.missing_constraints or set()) for item in (extra_results.get("constraint_mismatched", []) or [])
+        )
+        constraint_extra = sum(
+            len(item.extra_constraints or set()) for item in (extra_results.get("constraint_mismatched", []) or [])
+        )
+        _set_counts("CONSTRAINT", constraint_missing, constraint_extra)
+
+        sequence_missing = sum(
+            len(item.missing_sequences or set()) for item in (extra_results.get("sequence_mismatched", []) or [])
+        )
+        sequence_extra = sum(
+            len(item.extra_sequences or set()) for item in (extra_results.get("sequence_mismatched", []) or [])
+        )
+        _set_counts("SEQUENCE", sequence_missing, sequence_extra)
+
+        trigger_missing = sum(
+            len(item.missing_triggers or set()) for item in (extra_results.get("trigger_mismatched", []) or [])
+        )
+        trigger_extra = sum(
+            len(item.extra_triggers or set()) for item in (extra_results.get("trigger_mismatched", []) or [])
+        )
+        _set_counts("TRIGGER", trigger_missing, trigger_extra)
 
     return summary
 
@@ -8532,24 +8625,22 @@ def dump_ob_metadata(
         update_rule_select = ", UPDATE_RULE" if support_update_rule else ""
 
         sql_ext_tpl_vc = f"""
-            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE{index_name_select}, R_OWNER, R_CONSTRAINT_NAME,
+            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, STATUS{index_name_select}, R_OWNER, R_CONSTRAINT_NAME,
                    DELETE_RULE{update_rule_select},
                    REPLACE(REPLACE(REPLACE(SEARCH_CONDITION_VC, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS SEARCH_CONDITION
                    {deferrable_select}
             FROM DBA_CONSTRAINTS
             WHERE OWNER IN ({{owners_in}})
               AND CONSTRAINT_TYPE IN ('P','U','R','C')
-              AND STATUS = 'ENABLED'
         """
         sql_ext_tpl = f"""
-            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE{index_name_select}, R_OWNER, R_CONSTRAINT_NAME,
+            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, STATUS{index_name_select}, R_OWNER, R_CONSTRAINT_NAME,
                    DELETE_RULE{update_rule_select},
                    REPLACE(REPLACE(REPLACE(SEARCH_CONDITION, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS SEARCH_CONDITION
                    {deferrable_select}
             FROM DBA_CONSTRAINTS
             WHERE OWNER IN ({{owners_in}})
               AND CONSTRAINT_TYPE IN ('P','U','R','C')
-              AND STATUS = 'ENABLED'
         """
         ok = False
         lines: List[str] = []
@@ -8571,12 +8662,11 @@ def dump_ob_metadata(
         if not ok:
             log.warning("读取 OB DBA_CONSTRAINTS(含条件)失败，将回退为中间字段：%s", err)
             sql_mid_tpl = f"""
-                SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE{index_name_select}, R_OWNER, R_CONSTRAINT_NAME, DELETE_RULE{update_rule_select}
+                SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, STATUS{index_name_select}, R_OWNER, R_CONSTRAINT_NAME, DELETE_RULE{update_rule_select}
                        {deferrable_select}
                 FROM DBA_CONSTRAINTS
                 WHERE OWNER IN ({{owners_in}})
                   AND CONSTRAINT_TYPE IN ('P','U','R','C')
-                  AND STATUS = 'ENABLED'
             """
             ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_mid_tpl, owners_in_list)
             if ok:
@@ -8585,12 +8675,11 @@ def dump_ob_metadata(
         if not ok:
             log.warning("读取 OB DBA_CONSTRAINTS(含引用信息)失败，将回退为基础字段：%s", err)
             sql_tpl = f"""
-                SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE{index_name_select}
+                SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, STATUS{index_name_select}
                        {deferrable_select}
                 FROM DBA_CONSTRAINTS
                 WHERE OWNER IN ({{owners_in}})
                   AND CONSTRAINT_TYPE IN ('P','U','R','C')
-                  AND STATUS = 'ENABLED'
             """
             ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners_in_list)
             if not ok:
@@ -8610,6 +8699,8 @@ def dump_ob_metadata(
                 cons_name = parts[idx].strip().upper()
                 idx += 1
                 ctype = parts[idx].strip().upper()
+                idx += 1
+                cons_status = parts[idx].strip().upper() if len(parts) > idx else None
                 idx += 1
                 index_name = None
                 if support_index_name and len(parts) > idx:
@@ -8639,6 +8730,7 @@ def dump_ob_metadata(
                 key = (owner, table)
                 constraints.setdefault(key, {})[cons_name] = {
                     "type": ctype,
+                    "status": cons_status,
                     "columns": [],
                     "index_name": index_name,
                     "r_owner": r_owner if ctype == "R" else None,
@@ -8679,6 +8771,7 @@ def dump_ob_metadata(
                 if cons_name not in constraints[key]:
                     constraints[key][cons_name] = {
                         "type": "UNKNOWN",
+                        "status": None,
                         "columns": [],
                         "index_name": None,
                         "r_owner": None,
@@ -12542,7 +12635,7 @@ def check_primary_objects(
             continue
 
     # 记录目标端多出的对象（任何受管类型）
-    for obj_type in sorted(allowed_types - print_only_types_u):
+    for obj_type in sorted((allowed_types - print_only_types_u) - set(PACKAGE_OBJECT_TYPES)):
         actual = ob_meta.objects_by_type.get(obj_type, set())
         expected = expected_targets.get(obj_type, set())
         extras = sorted(actual - expected)
@@ -30806,6 +30899,12 @@ def main():
         extra_results,
         support_summary.unsupported_table_keys if support_summary else None,
         table_target_map
+    )
+    object_counts_summary = reconcile_object_counts_summary(
+        object_counts_summary,
+        tv_results,
+        extra_results_for_report,
+        package_results
     )
 
     trigger_status_rows: List[TriggerStatusReportRow] = []
