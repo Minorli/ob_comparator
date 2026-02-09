@@ -22,6 +22,10 @@ class TestViewChainParsing(unittest.TestCase):
             [("A.V1", "VIEW"), ("B.V2", "VIEW"), ("C.T1", "TABLE")]
         )
 
+    def test_parse_chain_node_meta_keeps_status_fields(self):
+        node = rf.parse_chain_node_meta("A.V1[VIEW|MISSING|GRANT_MISSING]")
+        self.assertEqual(node, ("A.V1", "VIEW", ("MISSING", "GRANT_MISSING")))
+
     def test_topo_sort_nodes_dependency_order(self):
         chains = [
             [("A.V1", "VIEW"), ("B.V2", "VIEW"), ("C.T1", "TABLE")],
@@ -92,6 +96,7 @@ class TestFixupAutoGrantTypes(unittest.TestCase):
         types = rf.parse_fixup_auto_grant_types("")
         self.assertIn("VIEW", types)
         self.assertIn("PACKAGE BODY", types)
+        self.assertNotIn("TRIGGER", types)
 
 
 class TestCurrentSchemaExecution(unittest.TestCase):
@@ -780,7 +785,11 @@ class TestRecompileSkipTypes(unittest.TestCase):
         self.assertEqual(recompiled, 1)
         self.assertEqual(remaining, 0)
         self.assertEqual(len(executed), 1)
-        self.assertIn("ALTER PROCEDURE APP.P1 COMPILE;", executed[0])
+        self.assertIn('ALTER PROCEDURE "APP"."P1" COMPILE;', executed[0])
+
+    def test_build_compile_statement_quotes_identifiers(self):
+        sql = rf.build_compile_statement("AppOwner", "Pkg.Name", "PACKAGE BODY")
+        self.assertEqual(sql, 'ALTER PACKAGE "AppOwner"."Pkg.Name" COMPILE BODY;')
 
 
 class TestSqlCollectionRecursive(unittest.TestCase):
@@ -798,6 +807,25 @@ class TestSqlCollectionRecursive(unittest.TestCase):
             rels = {str(path.relative_to(fixup_dir)) for _, path in files}
             self.assertIn("table_alter/A.T1.sql", rels)
             self.assertIn("table_alter/interval_add_20280301/A.T2.sql", rels)
+
+    def test_collect_sql_files_view_grant_dirs_not_duplicated(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fixup_dir = root / "fixup"
+            (fixup_dir / "view_prereq_grants").mkdir(parents=True)
+            (fixup_dir / "view_post_grants").mkdir(parents=True)
+            (fixup_dir / "grants_miss").mkdir(parents=True)
+            f1 = fixup_dir / "view_prereq_grants" / "A.grants.sql"
+            f2 = fixup_dir / "view_post_grants" / "A.grants.sql"
+            f3 = fixup_dir / "grants_miss" / "A.grants.sql"
+            for path in (f1, f2, f3):
+                path.write_text("GRANT SELECT ON A.T1 TO A;", encoding="utf-8")
+
+            files = rf.collect_sql_files_by_layer(fixup_dir, smart_order=True)
+            rels = [str(path.relative_to(fixup_dir)) for _, path in files]
+            self.assertEqual(rels.count("view_prereq_grants/A.grants.sql"), 1)
+            self.assertEqual(rels.count("view_post_grants/A.grants.sql"), 1)
+            self.assertEqual(rels.count("grants_miss/A.grants.sql"), 1)
 
 
 class TestInvalidObjectScope(unittest.TestCase):

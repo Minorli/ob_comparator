@@ -467,7 +467,9 @@ DEPENDENCY_LAYERS = [
     ["job", "schedule"],                             # Layer 13: Jobs
 ]
 
-GRANT_DIRS = {"grants", "grants_miss", "grants_all"}
+CORE_GRANT_DIRS_ORDER = ("grants_all", "grants_miss", "grants")
+VIEW_GRANT_DIRS_ORDER = ("view_prereq_grants", "view_post_grants")
+GRANT_DIRS = set(CORE_GRANT_DIRS_ORDER) | set(VIEW_GRANT_DIRS_ORDER)
 
 GRANT_PRIVILEGE_BY_TYPE = {
     "TABLE": "SELECT",
@@ -482,7 +484,6 @@ GRANT_PRIVILEGE_BY_TYPE = {
     "FUNCTION": "EXECUTE",
     "PACKAGE": "EXECUTE",
     "PACKAGE BODY": "EXECUTE",
-    "TRIGGER": "EXECUTE",
     "JOB": "EXECUTE",
     "SCHEDULE": "EXECUTE",
 }
@@ -497,7 +498,6 @@ DEFAULT_FIXUP_AUTO_GRANT_TYPES_ORDERED = (
     "FUNCTION",
     "PACKAGE",
     "PACKAGE BODY",
-    "TRIGGER",
     "TYPE",
     "TYPE BODY",
 )
@@ -545,11 +545,19 @@ def resolve_grant_dirs(
                 grant_dirs.append("grants_miss")
             elif "grants" in available and "grants" not in exclude_set:
                 grant_dirs.append("grants")
+        if "view_prereq_grants" in include_set and "view_prereq_grants" in available and "view_prereq_grants" not in exclude_set:
+            grant_dirs.append("view_prereq_grants")
+        if "view_post_grants" in include_set and "view_post_grants" in available and "view_post_grants" not in exclude_set:
+            grant_dirs.append("view_post_grants")
     else:
         if "grants_miss" in available and "grants_miss" not in exclude_set:
             grant_dirs.append("grants_miss")
         elif "grants" in available and "grants" not in exclude_set:
             grant_dirs.append("grants")
+        if "view_prereq_grants" in available and "view_prereq_grants" not in exclude_set:
+            grant_dirs.append("view_prereq_grants")
+        if "view_post_grants" in available and "view_post_grants" not in exclude_set:
+            grant_dirs.append("view_post_grants")
 
     # preserve order, remove duplicates
     return list(dict.fromkeys(grant_dirs))
@@ -920,6 +928,7 @@ def collect_sql_files_by_layer(
         if p.is_dir() and p.name != DONE_DIR_NAME and p.name.lower() not in exclude_dirs
     }
     grant_dirs = resolve_grant_dirs(subdirs, include_dirs, exclude_dirs)
+    core_grant_dirs = [d for d in grant_dirs if d in CORE_GRANT_DIRS_ORDER]
     
     files_with_layer: List[Tuple[int, Path]] = []
     
@@ -928,7 +937,7 @@ def collect_sql_files_by_layer(
         for layer_idx, layer_dirs in enumerate(DEPENDENCY_LAYERS):
             for dir_name in layer_dirs:
                 if dir_name == "grants":
-                    for grant_dir in grant_dirs:
+                    for grant_dir in core_grant_dirs:
                         if grant_dir not in subdirs:
                             continue
                         for sql_file in iter_sql_files_recursive(subdirs[grant_dir]):
@@ -956,7 +965,7 @@ def collect_sql_files_by_layer(
         
         # Add remaining directories not in DEPENDENCY_LAYERS
         all_layer_dirs = {d for layer in DEPENDENCY_LAYERS for d in layer}
-        all_layer_dirs.update(grant_dirs)
+        all_layer_dirs.update(core_grant_dirs)
         for dir_name in sorted(subdirs.keys()):
             if dir_name in all_layer_dirs:
                 continue
@@ -986,7 +995,7 @@ def collect_sql_files_by_layer(
         seen = set()
         for idx, name in enumerate(priority):
             if name == "grants":
-                for grant_dir in grant_dirs:
+                for grant_dir in core_grant_dirs:
                     if grant_dir not in subdirs:
                         continue
                     for sql_file in iter_sql_files_recursive(subdirs[grant_dir]):
@@ -1036,6 +1045,15 @@ def collect_sql_files_by_layer(
 
 def normalize_identifier(raw: str) -> str:
     return raw.strip().strip('"').upper()
+
+
+def quote_identifier(raw: str) -> str:
+    value = (raw or "").strip().strip('"')
+    return '"' + value.replace('"', '""') + '"'
+
+
+def quote_qualified_name(schema: str, name: str) -> str:
+    return f"{quote_identifier(schema)}.{quote_identifier(name)}"
 
 
 def parse_object_token(token: str) -> Tuple[Optional[str], str]:
@@ -1231,6 +1249,13 @@ def requires_grant_option(grantee: str, target_full: str, target_type: str) -> b
 
 
 def parse_chain_node(token: str) -> Optional[Tuple[str, str]]:
+    parsed = parse_chain_node_meta(token)
+    if not parsed:
+        return None
+    return parsed[0], parsed[1]
+
+
+def parse_chain_node_meta(token: str) -> Optional[Tuple[str, str, Tuple[str, ...]]]:
     match = RE_CHAIN_NODE.search(token or "")
     if not match:
         return None
@@ -1238,11 +1263,52 @@ def parse_chain_node(token: str) -> Optional[Tuple[str, str]]:
     raw_meta = (match.group("meta") or "").strip()
     if not raw_name or not raw_meta:
         return None
-    obj_type = raw_meta.split("|", 1)[0].strip().upper()
+    meta_parts = [p.strip().upper() for p in raw_meta.split("|") if p.strip()]
+    if not meta_parts:
+        return None
+    obj_type = meta_parts[0]
+    extra_meta = tuple(meta_parts[1:])
     name = normalize_identifier(raw_name)
     if not name or not obj_type:
         return None
-    return name, obj_type
+    return name, obj_type, extra_meta
+
+
+def parse_view_chain_line_meta(line: str) -> Optional[List[Tuple[str, str, Tuple[str, ...]]]]:
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or stripped.startswith("[") or stripped.startswith("-"):
+        return None
+    if ". " in stripped:
+        prefix, rest = stripped.split(". ", 1)
+        if prefix.isdigit():
+            stripped = rest.strip()
+    tokens = [t.strip() for t in stripped.split("->") if t.strip()]
+    if not tokens:
+        return None
+    nodes: List[Tuple[str, str, Tuple[str, ...]]] = []
+    for token in tokens:
+        node = parse_chain_node_meta(token)
+        if not node:
+            return None
+        nodes.append(node)
+    return nodes
+
+
+def parse_view_chain_file_meta(path: Path) -> Dict[str, List[List[Tuple[str, str, Tuple[str, ...]]]]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    chains_by_view: Dict[str, List[List[Tuple[str, str, Tuple[str, ...]]]]] = defaultdict(list)
+    for line in lines:
+        nodes = parse_view_chain_line_meta(line)
+        if not nodes:
+            continue
+        root = nodes[0][0]
+        chains_by_view[root].append(nodes)
+    return dict(chains_by_view)
 
 
 def parse_view_chain_line(line: str) -> Optional[List[Tuple[str, str]]]:
@@ -3014,14 +3080,13 @@ def build_compile_statement(owner: str, obj_name: str, obj_type: str) -> Optiona
     if not owner or not obj_name or not obj_type:
         return None
     obj_type_u = obj_type.strip().upper()
-    owner_u = owner.strip()
-    name_u = obj_name.strip()
+    qualified = quote_qualified_name(owner, obj_name)
     if obj_type_u in {"VIEW", "MATERIALIZED VIEW", "TYPE BODY"}:
         return None
     if obj_type_u == "PACKAGE BODY":
-        return f"ALTER PACKAGE {owner_u}.{name_u} COMPILE BODY;"
+        return f"ALTER PACKAGE {qualified} COMPILE BODY;"
     if obj_type_u in {"PACKAGE", "TYPE", "PROCEDURE", "FUNCTION", "TRIGGER"}:
-        return f"ALTER {obj_type_u} {owner_u}.{name_u} COMPILE;"
+        return f"ALTER {obj_type_u} {qualified} COMPILE;"
     return None
 
 
@@ -3626,6 +3691,7 @@ def run_view_chain_autofix(
     if not chains_by_view:
         log.error("依赖链文件解析为空: %s", chain_path)
         sys.exit(1)
+    chains_meta_by_view = parse_view_chain_file_meta(chain_path)
 
     files_with_layer = collect_sql_files_by_layer(
         fixup_dir,
@@ -3757,8 +3823,20 @@ def run_view_chain_autofix(
             f"# Generated: {timestamp}",
             "# Chains:",
         ]
-        for chain in chains:
-            chain_summary.append("# - " + " -> ".join(f"{n[0]}({n[1]})" for n in chain))
+        chain_meta_list = chains_meta_by_view.get(view_full) or []
+        for chain_idx, chain in enumerate(chains):
+            meta_chain = chain_meta_list[chain_idx] if chain_idx < len(chain_meta_list) else []
+            display_nodes: List[str] = []
+            for node_idx, node in enumerate(chain):
+                node_name, node_type = node
+                extra_meta: Tuple[str, ...] = ()
+                if node_idx < len(meta_chain):
+                    extra_meta = meta_chain[node_idx][2]
+                if extra_meta:
+                    display_nodes.append(f"{node_name}({node_type}|{'|'.join(extra_meta)})")
+                else:
+                    display_nodes.append(f"{node_name}({node_type})")
+            chain_summary.append("# - " + " -> ".join(display_nodes))
 
         plan_content = "\n".join(
             ["# VIEW chain autofix plan"] + chain_summary + ["", "# Steps:"] + plan_lines

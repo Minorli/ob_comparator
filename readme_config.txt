@@ -165,7 +165,7 @@
 - fixup_auto_grant：run_fixup 自动补权限。默认：true。
   说明：基于 dependency_chains 与 VIEWs_chain 预判依赖授权，执行前自动应用 grants_miss/grants_all 中的授权。
 - fixup_auto_grant_types：自动补权限对象类型（逗号分隔）。默认：
-  VIEW, MATERIALIZED VIEW, SYNONYM, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, TRIGGER, TYPE, TYPE BODY。
+  VIEW, MATERIALIZED VIEW, SYNONYM, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, TYPE, TYPE BODY。
   说明：仅对这些对象执行自动补权限；其他对象仍按原流程执行。
 - fixup_auto_grant_fallback：无匹配授权脚本时是否自动生成 GRANT。默认：true。
   说明：关闭后仅使用 grants_miss/grants_all，找不到授权则记录提示并继续执行。

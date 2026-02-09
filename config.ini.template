@@ -121,7 +121,7 @@ generate_grants         = true
 # fixup_auto_grant_fallback: 无匹配授权脚本时是否自动生成 GRANT (true/false)
 # fixup_auto_grant_cache_limit: 自动补权限缓存大小（条目数）
 fixup_auto_grant        = true
-fixup_auto_grant_types  = VIEW,MATERIALIZED VIEW,SYNONYM,PROCEDURE,FUNCTION,PACKAGE,PACKAGE BODY,TRIGGER,TYPE,TYPE BODY
+fixup_auto_grant_types  = VIEW,MATERIALIZED VIEW,SYNONYM,PROCEDURE,FUNCTION,PACKAGE,PACKAGE BODY,TYPE,TYPE BODY
 fixup_auto_grant_fallback = true
 fixup_auto_grant_cache_limit = 10000
 # 授权抽取范围（DBA_TAB_PRIVS）

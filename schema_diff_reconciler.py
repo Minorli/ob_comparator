@@ -23173,7 +23173,7 @@ def generate_fixup_scripts(
     def _compile_statements(obj_type: str, obj_name: str) -> List[str]:
         obj_type_u = obj_type.upper()
         obj_name_u = obj_name.upper()
-        if obj_type_u in ("VIEW", "MATERIALIZED VIEW", "TYPE BODY"):
+        if obj_type_u in ("VIEW", "MATERIALIZED VIEW"):
             return []
         if obj_type_u in ("FUNCTION", "PROCEDURE"):
             return [f"ALTER {obj_type_u} {obj_name_u} COMPILE;"]
