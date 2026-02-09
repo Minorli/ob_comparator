@@ -622,3 +622,369 @@ default_excludes = {"tables_unsupported", "unsupported"}
 - **RF-P1-02**: grant 执行需同时检查 returncode 和错误输出
 - **RF-P1-05**: 为所有执行模式添加连接性检查
 - **RF-P1-10**: 重写文件时保留 `ALTER SESSION SET CURRENT_SCHEMA`
+
+---
+
+# 混合深度审查报告：schema_diff_reconciler.py × run_fixup.py 端到端管线
+
+**审查范围**: 两个程序之间的数据契约、生成→消费管线一致性、共享逻辑、跨程序缺陷  
+**排除范围**: 密码存储问题、程序过大问题  
+**审查日期**: 2025-02  
+
+---
+
+## 审查摘要
+
+本报告聚焦于主程序（`schema_diff_reconciler.py`）与执行器（`run_fixup.py`）之间的**端到端管线一致性**。两个程序通过文件系统（fixup 目录结构、SQL 文件、依赖链报告）和配置文件（config.ini）进行隐式交互。本次审查发现 **25 个跨程序问题**，其中多数问题无法通过单独审查任何一个程序发现。
+
+| 级别 | 数量 | 说明 |
+|------|------|------|
+| XR-P0 - 跨程序严重缺陷 | 6 | 端到端管线断裂或产生错误结果 |
+| XR-P1 - 跨程序重要问题 | 8 | 一致性偏差影响正确性或健壮性 |
+| XR-P2 - 跨程序一般问题 | 7 | 架构和维护性问题 |
+| XR-P3 - 跨程序改进建议 | 4 | 工程化和可测试性 |
+
+---
+
+## 管线架构概览
+
+```
+schema_diff_reconciler.py                    run_fixup.py
+========================                     ============
+
+generate_fixup_scripts()                     collect_sql_files_by_layer()
+  +- write_fixup_file()  --[文件系统]--->      +- parse_object_from_filename()
+  |   +- {subdir}/{schema}.{name}.sql        |   +- stem.split(".", 1)
+  |   +- ALTER SESSION SET CURRENT_SCHEMA    +- execute_sql_statements()
+  |   +- DDL body                            |   +- split_sql_statements()
+  |   +- trailing ; or /                     |   +- CURRENT_SCHEMA detection
+  |   +- embedded grants                     |   +- run_sql() per statement
+  |                                          |
+  +- grants_all/{owner}.grants.sql           +- build_grant_index()
+  +- grants_miss/{owner}.grants.sql ------>  |   +- parse_grant_statement()
+  +- view_prereq_grants/                     |
+  +- view_post_grants/                       +- execute_grant_file_with_prune()
+  |                                          |
+  +- compile/{schema}.{obj}.compile.sql      +- DEPENDENCY_LAYERS ordering
+  |                                          |
+  +- export_view_fixup_chains()              +- view chain autofix
+      +- VIEWs_chain_{ts}.txt --[文件]--->       +- parse_view_chain_file()
+                                                  +- build_view_chain_plan()
+```
+
+---
+
+## XR-P0 - 跨程序严重缺陷（6个）
+
+### XR-P0-01: `compile` 目录在执行器中成为孤儿目录
+
+**生成端** (`schema_diff_reconciler.py:23222`):
+```python
+write_fixup_file(base_dir, 'compile', filename, content, header)
+```
+主程序将依赖重编译脚本生成到 `compile/` 目录。
+
+**消费端** (`run_fixup.py:424-468`):
+```python
+TYPE_DIR_MAP = { ... }          # 无 "compile" 条目
+DEPENDENCY_LAYERS = [ ... ]     # 无 "compile" 目录
+```
+
+**问题**: `compile` 目录既不在 `TYPE_DIR_MAP` 也不在 `DEPENDENCY_LAYERS` 中。在 smart-order 模式下，compile 脚本被归入 **layer 999**（未知层），在所有已知对象之后执行。在默认模式下同样落入 layer 999。
+
+真正的问题是：`DIR_OBJECT_TYPE_MAP` 没有 compile 映射，导致 `obj_type = None`，auto-grant 逻辑被跳过，且 `parse_object_identity_from_path` 对 `{schema}.{obj}.compile.sql` 文件名（3段式）解析为 `schema=SCHEMA, name=OBJ`，丢弃 `.compile` 后缀。  
+**影响**: 重编译脚本的对象身份解析碰巧正确，但缺少对象类型映射。如果 compile 脚本因权限不足失败，auto-grant 因 `obj_type=None` 而无法介入。
+
+### XR-P0-02: `view_prereq_grants` 和 `view_post_grants` 不被识别为 grant 目录
+
+**生成端** (`schema_diff_reconciler.py:23229-23283`):
+```python
+grant_dir_view_prereq = 'view_prereq_grants'
+grant_dir_view_post = 'view_post_grants'
+```
+
+**消费端** (`run_fixup.py:470`):
+```python
+GRANT_DIRS = {"grants", "grants_miss", "grants_all"}
+```
+
+**问题**: `is_grant_dir()` 检查 `GRANT_DIRS`，不包含 `view_prereq_grants` 和 `view_post_grants`。这两个目录虽然出现在 `DEPENDENCY_LAYERS` 中（layer 3 和 layer 5），但在执行时走 `execute_script_with_summary` 路径（普通对象执行），而非 `execute_grant_file_with_prune` 路径（grant 专用，支持成功语句自动剔除）。
+
+**影响**:
+1. 这两个目录中的 grant 文件**不会被自动剔除成功语句**：下次运行时已成功的 GRANT 会被重复执行
+2. 如果文件中有部分 GRANT 失败，整个文件被标记为 FAILED 而非像 grant 目录那样只保留失败语句
+3. 成功的 view_prereq_grants 文件会被移到 done/，但失败的文件保持原样不会被重写精简
+
+### XR-P0-03: `_compile_statements` (主程序) 与 `build_compile_statement` (执行器) 语义分歧
+
+**主程序** (`schema_diff_reconciler.py:23173-23191`):
+```python
+# PACKAGE -> 生成 COMPILE + COMPILE BODY 两条语句
+if obj_type_u in ("PACKAGE", "PACKAGE BODY"):
+    return [
+        f"ALTER PACKAGE {obj_name_u} COMPILE;",       # 不含 schema 前缀
+        f"ALTER PACKAGE {obj_name_u} COMPILE BODY;"    # 不含 schema 前缀
+    ]
+```
+
+**执行器** (`run_fixup.py:3013-3025`):
+```python
+# PACKAGE -> 仅生成 COMPILE，无 COMPILE BODY
+if obj_type_u == "PACKAGE BODY":
+    return f"ALTER PACKAGE {owner_u}.{name_u} COMPILE BODY;"
+if obj_type_u in {"PACKAGE", ...}:
+    return f"ALTER {obj_type_u} {owner_u}.{name_u} COMPILE;"
+```
+
+**差异总结**:
+
+| 维度 | 主程序 | 执行器 |
+|------|--------|--------|
+| PACKAGE 编译 | COMPILE + COMPILE BODY | 仅 COMPILE |
+| schema 前缀 | 无（依赖 CURRENT_SCHEMA） | `owner.name` 全限定 |
+| 标识符引用 | 未引用 | 未引用 |
+
+**影响**: 执行器的 `recompile_invalid_objects` 使用 `build_compile_statement`，对 PACKAGE 只做 COMPILE 不做 COMPILE BODY，**PACKAGE BODY 可能仍为 INVALID**。
+
+### XR-P0-04: 嵌入式 grant 与 auto-grant 形成双重执行路径
+
+**生成端** (`schema_diff_reconciler.py:19686-19689`):
+```python
+if grants_to_add:
+    f.write('\n-- 自动追加相关授权语句\n')
+    for grant_stmt in sorted(grants_to_add):
+        f.write(f"{grant_stmt}\n")
+```
+主程序将 GRANT 语句**嵌入到 DDL 文件末尾**（如 trigger 脚本内嵌 `GRANT SELECT ON X.Y TO Z;`）。
+
+**消费端** (`run_fixup.py:3419-3424`):
+```python
+if auto_grant_ctx and obj_full and obj_type:
+    execute_auto_grant_for_object(auto_grant_ctx, obj_full, obj_type, label)
+result, summary = execute_script_with_summary(...)
+```
+
+**问题**: 对于同一个对象，auto-grant 在执行文件前应用所需 grant，文件自身又包含嵌入的 GRANT 语句。两条路径独立工作：
+- 同一 GRANT 被执行两次（冗余）
+- **嵌入的 GRANT 失败时计入文件的 failure count**，导致本应 SUCCESS 的 DDL 文件被标记为 FAILED
+
+### XR-P0-05: auto-grant 对 constraint/index 文件指向错误对象
+
+**生成端** (`schema_diff_reconciler.py:22804, 23003`):
+```python
+# INDEX: filename = f"{ts}.{idx_name_u}.sql"      如 "HR.IDX_EMP_DEPT.sql"
+# CONSTRAINT: filename = f"{ts}.{cons_name_u}.sql" 如 "HR.PK_EMPLOYEES.sql"
+```
+
+**消费端** (`run_fixup.py:3417-3424`):
+```python
+obj_type = DIR_OBJECT_TYPE_MAP.get(sql_path.parent.name.lower())
+# "index" -> "INDEX", "constraint" -> "CONSTRAINT"
+obj_schema, obj_name = parse_object_identity_from_path(sql_path)
+# "HR.IDX_EMP_DEPT.sql" -> schema="HR", name="IDX_EMP_DEPT"
+obj_full = f"{obj_schema}.{obj_name}"
+# obj_full = "HR.IDX_EMP_DEPT", obj_type = "INDEX"
+```
+
+**问题**: auto-grant 以 `obj_full="HR.IDX_EMP_DEPT"` 和 `obj_type="INDEX"` 去查找所需权限。`GRANT_PRIVILEGE_BY_TYPE["INDEX"] = "SELECT"` 导致尝试找 `GRANT SELECT ON HR.IDX_EMP_DEPT TO ...`。但没有人对 INDEX 名做授权——授权的对象是**表**，不是索引。  
+**影响**: constraint/index 文件的 auto-grant 永远找不到匹配的 grant 条目，相当于失效。
+
+### XR-P0-06: `compile` 目录执行时机与主程序意图不符
+
+**主程序生成顺序** (`schema_diff_reconciler.py:20599-20611`):
+```
+1.SEQUENCE  2.TABLE  3.TABLE_ALTER  4.VIEW/MVIEW
+5.INDEX  6.CONSTRAINT  7.TRIGGER  8.COMPILE  9.GRANTS
+```
+主程序意图：compile 在 trigger 之前（第 8 步），因为 trigger 可能依赖已重编译的对象。
+
+**执行器**: `compile` 落入 layer 999（两种模式都如此），在 trigger（layer 12）和 job（layer 13）之后执行。  
+**影响**: trigger 可能因依赖未重编译的对象而执行失败。
+
+---
+
+## XR-P1 - 跨程序重要问题（8个）
+
+### XR-P1-01: `split_ddl_statements` (主程序) 与 `split_sql_statements` (执行器) PL/SQL 块处理机制不同
+
+**主程序** (`schema_diff_reconciler.py:19266-19405`):
+- 使用 `BEGIN/END` 深度计数识别 PL/SQL 块
+- 不处理 `/` 终结符
+- 支持 `q'...'` 引用
+
+**执行器** (`run_fixup.py:2207-2310`):
+- 使用 `RE_BLOCK_START` 正则检测 `CREATE PROCEDURE/FUNCTION/PACKAGE/TYPE/TRIGGER` 和 `DECLARE/BEGIN`
+- 使用独立行 `/` 作为 PL/SQL 块终结符
+- 支持 `q'...'` 引用
+
+**问题**: 主程序的 `write_fixup_file` 在写入 PL/SQL 对象时：
+```python
+tail = body.rstrip()
+if tail and not tail.endswith((';', '/')):
+    f.write(';\n')
+```
+如果 PL/SQL 块以 `END pkg_name;` 结尾（已有 `;`），不会追加 `/`。但执行器的 `split_sql_statements` 需要 `/` 来识别 PL/SQL 块的结束。
+
+**场景**: PACKAGE BODY 文件：
+```sql
+ALTER SESSION SET CURRENT_SCHEMA = HR;
+CREATE OR REPLACE PACKAGE BODY pkg AS ... END pkg;
+```
+执行器检测到 `CREATE ... PACKAGE BODY` 进入 `slash_block = True` 模式，等待独立行 `/` 来结束块。但文件中没有 `/`，整个文件成为一个超长语句。  
+**影响**: PL/SQL 对象（PACKAGE, PACKAGE BODY, TYPE, TYPE BODY, PROCEDURE, FUNCTION, TRIGGER）的 fixup 文件可能在执行器中被错误分割。
+
+### XR-P1-02: 主程序生成的 grant 文件命名与执行器的对象索引交互
+
+**主程序**: 生成 `{owner}.grants.sql` 和 `{grantee}.privs.sql`。  
+**执行器**: `parse_object_from_filename` 将 `HR.grants.sql` 解析为 `schema=HR, name=GRANTS`。
+
+虽然 grant 目录走 `execute_grant_file_with_prune` 路径（不需要对象身份），但 `view_prereq_grants` 和 `view_post_grants` 不在 `GRANT_DIRS` 中（见 XR-P0-02），其文件会被 `build_fixup_object_index` 尝试索引为创建对象，产生无意义的索引条目。
+
+### XR-P1-03: View chain 文件中的 EXISTS/GRANT_STATUS 元数据被丢弃
+
+**主程序** (`schema_diff_reconciler.py:10983`):
+```python
+parts.append(f"{node[0]}[{obj_type}|{exists}|{grant_status}]")
+# 输出: "HR.V_DEPT[VIEW|MISSING|GRANT_OK]"
+```
+
+**执行器** (`run_fixup.py:1241`):
+```python
+obj_type = raw_meta.split("|", 1)[0].strip().upper()
+# 只取第一段: "VIEW"，丢弃 "MISSING" 和 "GRANT_OK"
+```
+
+**问题**: 主程序花费数据库查询确定每个对象的存在状态和授权状态，但执行器完全忽略这些信息，在 `build_view_chain_plan` 中重新查询。  
+**影响**: 浪费已有信息，且重新查询时数据库状态可能已变化。
+
+### XR-P1-04: 超时配置优先级不同
+
+**主程序**: 使用 `obclient_timeout` 配置项。  
+**执行器** (`run_fixup.py:814-825`):
+```python
+fixup_raw = parser.get("SETTINGS", "fixup_cli_timeout", fallback="")
+if fixup_raw:
+    fixup_timeout = int(fixup_raw)
+else:
+    fixup_timeout = parser.getint("SETTINGS", "obclient_timeout", fallback=DEFAULT_FIXUP_TIMEOUT)
+```
+
+**问题**: 执行器优先使用 `fixup_cli_timeout`，主程序不识别此配置项。如果同时设置 `obclient_timeout=300` 和 `fixup_cli_timeout=60`，主程序用 300 秒，执行器用 60 秒。对大表 DDL 可能不够。
+
+### XR-P1-05: `GRANT_PRIVILEGE_BY_TYPE` 在两个程序中独立定义
+
+两份独立副本，任何一方修改后不会自动同步。两份都包含相同的错误（TRIGGER 映射为 EXECUTE），但如果只修正一方会导致行为分歧。  
+**类似重复**: `SYS_PRIV_IMPLICATIONS`、`obj_type_to_dir`/`TYPE_DIR_MAP` 也存在双副本问题。
+
+### XR-P1-06: `write_fixup_file` 的 `;` 追加逻辑与执行器的 PL/SQL 分割交互
+
+主程序在 DDL 末尾没有 `;` 或 `/` 时追加 `;`。但对于已以 `;` 结尾的 PL/SQL 块不追加 `/`。执行器的 `split_sql_statements` 中 `slash_block` 模式需要 `/` 来结束块。
+
+此外，嵌入 grants 写在 PL/SQL 块之后，执行器在 `slash_block=True` 时不在 `;` 处分割，导致整个文件（包括嵌入的 GRANT）成为一个语句。  
+**关联**: 与 XR-P1-01 同根同源，建议主程序对 PL/SQL 对象始终追加 `/` 终结符。
+
+### XR-P1-07: `unsupported/` 子目录的嵌套结构与用户预期
+
+**主程序** (`schema_diff_reconciler.py:22722`):
+```python
+subdir = f"unsupported/{obj_type_to_dir.get(ot, ot.lower())}"
+# 生成: unsupported/view/SCHEMA.NAME.sql (两层嵌套)
+```
+
+**执行器**: 默认排除 `unsupported`。如果用户通过 `--only-dirs unsupported` 尝试执行，`iter_sql_files_recursive` 递归搜索可找到文件，但 `sql_path.parent.name` 是 `"view"` 而非 `"unsupported"`，导致这些文件被当作普通 view 对象处理。  
+**影响**: 用户无法按类型选择性执行 unsupported 对象。
+
+### XR-P1-08: 主程序 `build_compile_order` 与执行器 `topo_sort_nodes` 有相同的 O(N^2) 内存问题
+
+**主程序** (`schema_diff_reconciler.py:21065`):
+```python
+dfs(dep, stack + [f"{node[0]}.{node[1]} ({node[2]})"])
+```
+
+**执行器** (`run_fixup.py:1354`): 相同的 `stack + [node]` 模式。
+
+两个程序的拓扑排序 DFS 都使用 `stack + [node]` 创建新列表，O(N^2) 内存。这是共享的代码模式缺陷。  
+**建议**: 统一为就地修改的 `stack.append(node)` / `stack.pop()` 实现。
+
+---
+
+## XR-P2 - 跨程序一般问题（7个）
+
+### XR-P2-01: 无共享常量模块
+
+`GRANT_PRIVILEGE_BY_TYPE`、`SYS_PRIV_IMPLICATIONS`、`TYPE_DIR_MAP`/`obj_type_to_dir`、`GRANT_OPTION_TYPES` 等常量在两个文件中独立定义。  
+**建议**: 提取到共享的 `constants.py` 模块中。
+
+### XR-P2-02: 无正式的文件格式契约
+
+`write_fixup_file` 的输出格式（注释头、DDL body、可选 `;`、可选嵌入 grants）是隐式的。执行器通过逆向工程式的解析来消费这些文件，任何格式变更都可能悄无声息地破坏管线。  
+**建议**: 定义正式的文件格式文档或 schema。
+
+### XR-P2-03: config.ini 配置项缺乏统一文档
+
+- `fixup_cli_timeout` 仅被 run_fixup 使用
+- `fixup_auto_grant` 仅被 run_fixup 使用
+- `fixup_dir` 被两个程序使用但解析路径逻辑不同
+- `report_dir` 被两个程序使用
+
+配置项无统一的 schema 文档，用户不知道哪些配置影响哪个程序。
+
+### XR-P2-04: 主程序的 `_compile_statements` 有死代码
+
+**位置** (`schema_diff_reconciler.py:23176, 23189-23190`):
+```python
+if obj_type_u in ("VIEW", "MATERIALIZED VIEW", "TYPE BODY"):
+    return []     # TYPE BODY 在这里返回空
+...
+if obj_type_u == "TYPE BODY":
+    return [f"ALTER TYPE {obj_name_u} COMPILE BODY;"]  # 死代码，永远不会执行
+```
+
+### XR-P2-05: 错误码分类覆盖范围差异
+
+主程序 `RE_SQL_ERROR` 检测 `ORA-`、`OB-`、`ERROR ` 模式用于提取错误信息。执行器 `classify_sql_error` 对部分 OB 错误码有分类（如 `OB-00942`、`OB-01031`），但大量 OB 特有错误码（如 `OB-00600`、`OB-04012`）未分类。  
+**影响**: 迭代模式的智能重试对 OB 特有错误效果有限。
+
+### XR-P2-06: 主程序并行生成 fixup 文件但无原子性保证
+
+主程序 `generate_fixup_scripts` 使用 `ThreadPoolExecutor` 并行生成 DDL 文件。如果在生成过程中崩溃，`fixup_dir` 中可能存在部分生成的文件集合。执行器假设文件集合完整一致，没有检查文件是否截断。
+
+### XR-P2-07: grant merge 策略影响执行器的 grant 解析
+
+主程序 `grant_merge_privileges=true` 时生成合并语句如 `GRANT SELECT, INSERT ON HR.T TO APP, BATCH;`。执行器 `RE_GRANT_OBJECT` 使用 `(?P<privs>.+?)` 非贪婪匹配。对象名包含 `ON` 子串时（如 `HR.PKG_ON_DELETE`）grant 解析可能失败。
+
+---
+
+## XR-P3 - 跨程序改进建议（4个）
+
+### XR-P3-01: 缺少端到端集成测试
+
+**建议**: 创建集成测试覆盖：PL/SQL 对象的生成到分割到执行、嵌入 grant 的生成到执行、view chain 的生成到解析到计划、constraint/index 的 auto-grant 路径。
+
+### XR-P3-02: 考虑生成 manifest 文件
+
+**建议**: 主程序在生成完成后写入 `fixup_manifest.json`，记录所有生成的文件、对象类型、schema 等元数据。执行器直接读取 manifest 而非从文件名逆向推导对象身份。
+
+### XR-P3-03: 统一 SQL 分割器
+
+两个程序各有 SQL 语句分割器（`split_ddl_statements` 和 `split_sql_statements`），处理逻辑不同。应统一到一个健壮的共享实现。
+
+### XR-P3-04: 统一 DFS 拓扑排序实现
+
+两个程序的拓扑排序 DFS 都有 O(N^2) 内存问题。应提取为共享实现并使用就地修改的 stack。
+
+---
+
+## 优先修复建议
+
+### 立即修复（XR-P0）
+1. **XR-P0-01/06**: 在 `TYPE_DIR_MAP` 和 `DEPENDENCY_LAYERS` 中添加 `compile` 映射，确保位于 trigger 之前
+2. **XR-P0-02**: 将 `view_prereq_grants`/`view_post_grants` 加入 `GRANT_DIRS`，或为它们实现 grant 专用执行逻辑
+3. **XR-P0-03**: `build_compile_statement` 对 PACKAGE 类型也生成 COMPILE BODY
+4. **XR-P0-04**: 在执行文件前检查并剔除嵌入的 GRANT（如果 auto-grant 已处理），或统一为单一路径
+5. **XR-P0-05**: constraint/index 的 auto-grant 需要从文件内容或元数据中获取**表名**而非索引/约束名
+
+### 近期修复（XR-P1）
+- **XR-P1-01/06**: 主程序 `write_fixup_file` 对 PL/SQL 对象始终追加 `/` 终结符
+- **XR-P1-05**: 提取共享常量模块，消除重复定义
+- **XR-P1-04**: 统一文档说明 `fixup_cli_timeout` 与 `obclient_timeout` 的优先级关系
