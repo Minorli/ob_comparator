@@ -1,19 +1,16 @@
 # OceanBase Comparator Toolkit
 
-> 当前版本：V0.9.8.3  
+> 当前版本：V0.9.8.4  
 > 面向 Oracle → OceanBase (Oracle 模式) 的结构一致性校验与修补脚本生成工具  
 > 核心理念：一次转储、本地对比、脚本审计优先
 
-## 近期更新（0.9.8.3）
-- report_to_db 覆盖范围扩展（支持 full 模式更多表）。
-- 新增 DIFF_REPORT_DETAIL_ITEM（明细行化），便于列级排查。
-- 新增 DIFF_REPORT_ARTIFACT_LINE（报告文本逐行入库），`full` 模式下支持 txt 100% DB 查询。
-- 新增 report_db_store_scope 与 report_db_detail_item_enable 配置。
-- 新增报告分析视图（actions/profile/trends/pending/grant/usability）。
-- 新增写库失败追踪与整改闭环表（WRITE_ERRORS / RESOLUTION）。
-- HOW_TO_READ_REPORTS_IN_OB_73_sqls.txt SQL 全量校验与修正。
+## 近期更新（0.9.8.4）
+- 触发器扩展校验降噪：按 `OWNER.TRIGGER_NAME` 比较，修复同表跨 schema 同名触发器误报 `EXTRA_TRIGGER`。
+- 约束扩展校验降噪：在签名层与对比层双重忽略 OceanBase 自动 `*_OBNOTNULL_*` 约束，降低 `NOT NULL` 命名差异噪声。
+- report_to_db `full` 模式继续增强：支持 `DIFF_REPORT_ARTIFACT_LINE` 报告逐行入库，提升数据库侧闭环排查能力。
+- 文档与版本全面同步到 `0.9.8.4`。
 
-详见：`docs/RELEASE_NOTES_0.9.8.3.md`
+详见：`docs/RELEASE_NOTES_0.9.8.4.md`
 
 ## 核心能力
 - **对象覆盖完整**：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。

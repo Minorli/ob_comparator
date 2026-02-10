@@ -2,6 +2,20 @@
 
 本文件记录 OceanBase Comparator Toolkit 的重要变更。
 
+## [0.9.8.4] - 2026-02-10
+
+### 新增
+- 交付前正确性基线文档化：统一补充 `py_compile` + `unittest` + 可选联调命令。
+- report_to_db 增强：`report_db_store_scope=full` 下新增 `DIFF_REPORT_ARTIFACT_LINE`，run 目录 txt 报告逐行入库，支持数据库侧 100% 文本复盘。
+
+### 修复
+- TRIGGER 扩展校验修复：按 `OWNER.TRIGGER_NAME` 比较，避免同表跨 schema 同名触发器误报 `EXTRA_TRIGGER`。
+- CONSTRAINT 扩展校验降噪：在签名层与对比层双重忽略 OceanBase 自动 `*_OBNOTNULL_*` 约束，减少 `NOT NULL` 命名差异噪声。
+
+### 变更
+- README / readme_config / ARCHITECTURE / ADVANCED_USAGE / TECHNICAL_SPECIFICATION / DEPLOYMENT 同步到当前实现并升级至 `0.9.8.4`。
+- 修正文档中过期描述：`init_users_roles.py` 已为交互输入初始口令，不再写死默认口令。
+
 ## [0.9.8.3] - 2026-02-05
 - report_to_db 覆盖范围扩展（支持 full 模式更多表）
 - 新增明细行化表 DIFF_REPORT_DETAIL_ITEM，细粒度差异入库
@@ -11,14 +25,7 @@
 - HOW_TO_READ_REPORTS_IN_OB_73_sqls.txt SQL 校验修正与完善
 
 ## [未发布]
-
-### 新增
-- 交付前正确性基线文档化：统一补充 `py_compile` + `unittest` + 可选联调命令。
-- report_to_db 增强：`report_db_store_scope=full` 下新增 `DIFF_REPORT_ARTIFACT_LINE`，run 目录 txt 报告逐行入库，支持数据库侧 100% 文本复盘。
-
-### 变更
-- README / readme_config / ARCHITECTURE / ADVANCED_USAGE / TECHNICAL_SPECIFICATION / DEPLOYMENT 同步到当前实现。
-- 修正文档中过期描述：`init_users_roles.py` 已为交互输入初始口令，不再写死默认口令。
+- 暂无
 
 ## [0.9.8.2] - 2026-02-03
 
