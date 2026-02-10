@@ -988,3 +988,317 @@ if obj_type_u == "TYPE BODY":
 - **XR-P1-01/06**: 主程序 `write_fixup_file` 对 PL/SQL 对象始终追加 `/` 终结符
 - **XR-P1-05**: 提取共享常量模块，消除重复定义
 - **XR-P1-04**: 统一文档说明 `fixup_cli_timeout` 与 `obclient_timeout` 的优先级关系
+
+---
+
+# Oracle 迁移遗漏对象审查报告
+
+**审查范围**: 主程序 `schema_diff_reconciler.py` 当前校验覆盖范围 vs Oracle 数据库中所有可迁移对象类型和属性  
+**审查目标**: 识别人工迁移中可能被遗漏、且主程序尚未校验的对象类型和属性  
+**审查日期**: 2025-02  
+
+---
+
+## 1. 当前校验覆盖范围总结
+
+### 1.1 已覆盖的对象类型
+
+| 对象类型 | 校验深度 | 数据源 |
+|---------|---------|--------|
+| TABLE | 列名集合 + VARCHAR长度窗口 + NUMBER精度 + 虚拟列 + Identity + Default On Null + Invisible | DBA_TAB_COLUMNS |
+| VIEW | 存在性 + DDL兼容性分析 | DBA_OBJECTS + DBA_VIEWS |
+| MATERIALIZED VIEW | 仅打印（不校验不生成fixup） | DBA_MVIEWS |
+| PROCEDURE / FUNCTION | 存在性 + VALID/INVALID状态 | DBA_OBJECTS |
+| PACKAGE / PACKAGE BODY | 存在性 + VALID/INVALID + 错误信息 | DBA_OBJECTS + DBA_ERRORS |
+| TYPE / TYPE BODY | 存在性 + VALID/INVALID | DBA_OBJECTS + DBA_TYPES + DBA_SOURCE |
+| SYNONYM | 存在性 | DBA_SYNONYMS |
+| JOB / SCHEDULE | 存在性 | DBA_OBJECTS |
+| INDEX | 列组合 + 唯一性 | DBA_INDEXES + DBA_IND_COLUMNS |
+| CONSTRAINT (PK/UK/FK/CK) | 列组合 + 引用表 + 删除/更新规则 + Deferrable | DBA_CONSTRAINTS + DBA_CONS_COLUMNS |
+| SEQUENCE | 仅存在性（不比较属性） | DBA_SEQUENCES |
+| TRIGGER | 存在性 + 事件 + 启用状态 + 有效性 | DBA_TRIGGERS |
+| TABLE/COLUMN COMMENTS | 注释文本比较 | DBA_TAB_COMMENTS + DBA_COL_COMMENTS |
+| GRANTS | 对象权限 + 系统权限 + 角色权限 | DBA_TAB_PRIVS + DBA_SYS_PRIVS + DBA_ROLE_PRIVS |
+| DEPENDENCIES | 依赖关系 | DBA_DEPENDENCIES |
+| INTERVAL PARTITIONS | 分区边界补齐（仅interval类型） | DBA_PART_TABLES + DBA_TAB_PARTITIONS |
+
+### 1.2 已加载但未比较的属性
+
+以下属性已从 Oracle/OB 加载到内存，但**未执行源→目标对比**：
+
+| 属性 | 加载位置 | 当前用途 | 是否比较 |
+|------|---------|---------|---------|
+| `DATA_DEFAULT`（列默认值） | OracleMetadata.table_columns / ObMetadata.tab_columns | 仅用于 ALTER ADD 生成 | **未比较** |
+| `NULLABLE` | 同上 | 仅用于 ALTER ADD 生成 | **未比较** |
+| `sequence_attrs`（INCREMENT_BY, MIN/MAX_VALUE, CACHE_SIZE, CYCLE_FLAG, ORDER_FLAG） | OracleMetadata.sequence_attrs / ObMetadata.sequence_attrs | 已加载，未使用 | **未比较** |
+| `partition_key_columns` | OracleMetadata/ObMetadata | 仅用于PK降级判定和interval补齐 | **未比较分区方案** |
+
+---
+
+## 2. 遗漏对象类型和属性分析
+
+### GAP-P0 - 高优先级遗漏（生产环境常见，数据正确性风险）
+
+#### GAP-P0-01: 列默认值（DATA_DEFAULT）未比较
+
+**现状**: 主程序从 `DBA_TAB_COLUMNS` 加载 `DATA_DEFAULT` 到 `OracleMetadata.table_columns` 和 `ObMetadata.tab_columns`，但表对比逻辑（`schema_diff_reconciler.py:12862-13084`）**完全不比较**此属性。
+
+**Oracle 查询**:
+```sql
+REPLACE(REPLACE(REPLACE(DATA_DEFAULT, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS DATA_DEFAULT
+```
+
+**影响**: 如果 OMS 迁移时丢失或修改了列默认值：
+- `INSERT` 不带该列时产生不同的值（NULL vs 预期默认值）
+- `SYSDATE`、`SYS_GUID()`、`USER` 等函数型默认值在迁移后可能语法不兼容
+- `DEFAULT ON NULL` 属性虽已校验，但基础 DEFAULT 值本身未校验
+
+**常见场景**: OMS 迁移大表后手动重建，忘记带 DEFAULT 子句；或 OceanBase 不支持某些默认值表达式导致静默丢失。
+
+**修复建议**: 在列级比较的 `common_cols` 循环中，增加 `data_default` 标准化后的比较。需要处理：
+- 去空格/换行标准化
+- `NULL` vs 空字符串
+- `SYSDATE` vs `CURRENT_TIMESTAMP` 等 OB 替代表达式
+- 表达式中的 schema 前缀 remap
+
+#### GAP-P0-02: 列可空性（NULLABLE）未比较
+
+**现状**: `NULLABLE` 属性已加载（`Y`/`N`），但列级对比中没有 nullable 比较逻辑。
+
+**影响**: 如果源端 `NOT NULL` 列在目标端变成了 `NULL`：
+- 数据完整性约束丢失
+- 应用程序假设非空的列可能插入 NULL
+- NOT NULL 约束在 `DBA_CONSTRAINTS` 中以 `C` 类型 `SYS_C*` 名称存在，虽然 CHECK 约束比较会过滤掉 `is_system_notnull_check`，但这是**有意为之**的——因为它假设 NULLABLE 属性会在列级比较中处理。**然而实际上列级比较并没有处理它**。
+
+**修复建议**: 在列级比较中增加 `nullable` 属性对比。源端 `N`（NOT NULL）而目标端 `Y`（NULLABLE）应报告为 mismatch。
+
+#### GAP-P0-03: 序列属性未比较
+
+**现状**: `DBA_SEQUENCES` 的 `INCREMENT_BY`、`MIN_VALUE`、`MAX_VALUE`、`CYCLE_FLAG`、`ORDER_FLAG`、`CACHE_SIZE` 已加载到 `OracleMetadata.sequence_attrs` 和 `ObMetadata.sequence_attrs`，但 `compare_sequences_for_schema`（line 14424）仅比较序列**存在性**。
+
+**影响**:
+- `INCREMENT_BY` 不同：自增步长错误，主键可能冲突（如果切换前后交替写入）
+- `CACHE_SIZE` 不同：性能差异，且 OB 默认 CACHE 可能与 Oracle 不同
+- `CYCLE_FLAG` 不同：序列到达 MAX_VALUE 后行为不同
+- `MIN_VALUE`/`MAX_VALUE` 不同：序列范围不一致
+
+**修复建议**: 扩展 `SequenceMismatch` 增加 `attr_mismatches` 字段，在存在性检查通过后，对公共序列逐一比较属性。
+
+#### GAP-P0-04: 分区定义未比较（仅覆盖 interval 补齐）
+
+**现状**: 主程序仅对 `INTERVAL` 分区表检查边界并生成补齐脚本。`RANGE`、`LIST`、`HASH` 分区定义**完全不比较**。分区键列虽已加载（`partition_key_columns`）但仅用于 PK 降级判定。
+
+**影响**:
+- 表可能在 OB 端完全没有分区（OMS 不迁移分区定义的情况）
+- 分区键列不同：查询性能剧烈下降，分区裁剪失效
+- RANGE 分区边界不同：数据路由错误
+- LIST 分区值列表不同：插入可能失败（DEFAULT 分区缺失）
+- 子分区模板丢失
+
+**修复建议**: 增加 `DBA_PART_TABLES` 分区方案比较（分区类型 + 分区数 + 分区键列 + 关键边界值），至少做"分区类型和分区键列"级别的校验。
+
+#### GAP-P0-05: PL/SQL 源代码未比较（仅校验存在性和状态）
+
+**现状**: 对于 PROCEDURE、FUNCTION、PACKAGE、PACKAGE BODY、TYPE、TYPE BODY，主程序仅校验：
+1. 对象是否存在（`DBA_OBJECTS`）
+2. 状态是否为 VALID/INVALID
+3. 错误信息（仅 PACKAGE 类型通过 `DBA_ERRORS`）
+
+**未覆盖**: 源代码文本（`DBA_SOURCE`）的一致性**完全不比较**。
+
+**影响**:
+- 人工迁移时可能使用了旧版本的存储过程
+- OMS 迁移 PL/SQL 后可能因兼容性改写导致逻辑变化
+- 手动修改的 PL/SQL 代码不会被发现
+- 两端都 VALID 但**逻辑完全不同**的情况不会被检测到
+
+**常见场景**: 开发团队在 Oracle 端更新了存储过程，但忘记同步到 OB 端。因为对象 VALID，主程序报告一切正常。
+
+**修复建议**: 增加可选的源代码哈希比较（`DBA_SOURCE` 按 OWNER+NAME+TYPE+LINE 拼接后取 MD5/SHA256），标记为 `check_plsql_source=true` 可选开关。不需要逐行比较，哈希不一致即报告 mismatch。
+
+#### GAP-P0-06: DATABASE LINK 未校验
+
+**现状**: 主程序对视图中的 DBLINK 引用有检测（`view_dblink_policy`），但**不校验 DATABASE LINK 对象本身**是否存在于目标端。
+
+**Oracle 数据源**: `DBA_DB_LINKS`（OWNER, DB_LINK, HOST, USERNAME）
+
+**影响**:
+- 存储过程中引用 `table@dblink_name` 的代码在运行时才会失败
+- 同义词指向的 DB LINK 目标不可达
+- JOB 中调用跨库过程失败
+
+**修复建议**: 从 `DBA_DB_LINKS` 加载 DB LINK 清单，对比源端和目标端的 DB_LINK 名称存在性。如果 DB LINK 不存在，将引用它的对象标记为 UNSUPPORTED。
+
+---
+
+### GAP-P1 - 中优先级遗漏（影响功能完整性或运维）
+
+#### GAP-P1-01: MATERIALIZED VIEW LOG 未校验
+
+**现状**: `MATERIALIZED VIEW` 在主程序中被归为 `PRINT_ONLY_PRIMARY_TYPES`（仅打印不校验）。与 MVIEW 配套的 **MVIEW LOG**（物化视图日志表）完全未被追踪。
+
+**Oracle 数据源**: `DBA_MVIEW_LOGS`（LOG_OWNER, MASTER, LOG_TABLE）
+
+**影响**:
+- 如果目标端使用快速刷新（FAST REFRESH）的物化视图，缺少 MVIEW LOG 会导致刷新失败
+- MVIEW LOG 表可能被 OMS 当作普通表迁移了数据，但结构可能不完整
+
+**修复建议**: 在 `EXTRA_OBJECT_CHECK_TYPES` 中增加 `MATERIALIZED VIEW LOG` 或作为 `MATERIALIZED VIEW` 校验的附属检查。
+
+#### GAP-P1-02: 索引属性未深度比较
+
+**现状**: INDEX 比较仅校验**列组合**和**唯一性**。以下属性未比较：
+
+| 索引属性 | 影响 |
+|---------|------|
+| COMPRESSION | 存储空间和查询性能 |
+| VISIBILITY (INVISIBLE) | 优化器是否使用该索引 |
+| LOCAL/GLOBAL (分区索引) | 分区表性能关键 |
+| REVERSE | 热点消除 |
+| FUNCTION-BASED 表达式细节 | 函数索引的正确性 |
+| TABLESPACE | 存储位置 |
+| PARALLEL | 并行度 |
+
+**影响**: 索引"存在"但属性不同，可能导致：
+- LOCAL 分区索引变成 GLOBAL 索引，分区维护操作 (DROP/TRUNCATE PARTITION) 会失败或极慢
+- INVISIBLE 索引在目标端变成 VISIBLE，影响执行计划
+- FUNCTION-BASED 表达式不同导致查询无法利用索引
+
+**修复建议**: 优先增加 LOCAL/GLOBAL 和 INVISIBLE 属性比较，这两个属性影响最大且容易实现。
+
+#### GAP-P1-03: 约束启用/禁用状态校验不完整
+
+**现状**: 约束的 `STATUS`（ENABLED/DISABLED）和 `VALIDATED`/`NOT VALIDATED` 状态仅通过 `check_status_drift_types` 开关做有限检查（`STATUS_DRIFT_CHECK_TYPES` 仅含 TRIGGER 和 CONSTRAINT）。但状态漂移检查是**可选的**，默认可能未启用 CONSTRAINT。
+
+**影响**:
+- 源端 DISABLED 的 FK 约束在目标端变成 ENABLED：插入/更新可能因约束违反而失败
+- 源端 ENABLED 的约束在目标端变成 DISABLED：数据完整性保证丢失
+
+#### GAP-P1-04: 数据类型深度比较不足
+
+**现状**: 列类型比较仅覆盖 VARCHAR/VARCHAR2 长度和 NUMBER 精度。以下类型变化未检测：
+
+| 类型场景 | 风险 |
+|---------|------|
+| CHAR(N) ↔ VARCHAR2(N) | 语义不同（CHAR 补空格） |
+| NCHAR/NVARCHAR2 ↔ CHAR/VARCHAR2 | 字符集语义变化 |
+| DATE ↔ TIMESTAMP | 精度丢失（DATE 无毫秒） |
+| TIMESTAMP 精度差异 | 微秒/纳秒精度丢失 |
+| RAW(N) 长度 | 二进制数据截断 |
+| CLOB ↔ VARCHAR2 | 长度限制和接口差异 |
+| FLOAT ↔ NUMBER | 精度语义不同 |
+| LONG/LONG RAW → CLOB/BLOB | 已检测，但转换完整性未验证 |
+
+**修复建议**: 增加通用的 `data_type` 标准化比较，至少检测基础类型名称是否一致（忽略 Oracle→OB 的已知映射规则）。
+
+#### GAP-P1-05: 表存储属性和表级特性未比较
+
+**未校验的表级属性**:
+- **LOGGING/NOLOGGING**: 影响恢复和性能
+- **ROW MOVEMENT**: 分区表 UPDATE 分区键时需要
+- **TABLE COMPRESSION**: 存储和性能
+- **PARALLEL DEGREE**: 查询并行度
+- **CACHE**: 小表全缓存特性
+- **RESULT_CACHE**: 结果缓存策略
+
+#### GAP-P1-06: 用户/Schema 创建状态未校验
+
+**现状**: 主程序假设目标端 schema 已存在。如果 schema 不存在，所有该 schema 下的对象校验都会失败，但错误信息分散在各对象的 MISSING 报告中，难以定位根因。
+
+**修复建议**: 在元数据加载阶段，先验证目标端所有 remap 后的 schema 是否存在（`DBA_USERS` 查询），不存在则立即报告并提示建 schema。
+
+#### GAP-P1-07: VPD/RLS 行级安全策略未校验
+
+**Oracle 数据源**: `DBA_POLICIES`（OBJECT_OWNER, OBJECT_NAME, POLICY_NAME, FUNCTION, ENABLE）
+
+**影响**: 如果源端表有行级安全策略，迁移后：
+- 查询返回全部数据（安全策略丢失）
+- 应用程序依赖 VPD 的多租户隔离失效
+
+**注**: OceanBase Oracle 模式已支持 DBMS_RLS，但需要手动迁移策略。
+
+---
+
+### GAP-P2 - 低优先级遗漏（较少见但可能造成问题）
+
+#### GAP-P2-01: DIRECTORY 对象未校验
+
+**Oracle 数据源**: `DBA_DIRECTORIES`（DIRECTORY_NAME, DIRECTORY_PATH）
+
+**影响**: `UTL_FILE`、`DATAPUMP`、外部表依赖 DIRECTORY 对象。缺失会导致运行时错误。
+
+#### GAP-P2-02: 表空间映射未校验
+
+**影响**: 对象可能创建在错误的表空间中，影响存储管理和性能隔离。虽然 OceanBase 的表空间语义与 Oracle 不完全相同，但在 Oracle 兼容模式下仍有意义。
+
+#### GAP-P2-03: PROFILE（资源配置文件）未校验
+
+**Oracle 数据源**: `DBA_PROFILES`（PROFILE, RESOURCE_NAME, LIMIT）
+
+**影响**: 密码策略（密码过期时间、登录失败锁定次数）和资源限制（CPU_PER_SESSION、SESSIONS_PER_USER）丢失。
+
+#### GAP-P2-04: CONTEXT（应用上下文）未校验
+
+**Oracle 数据源**: `DBA_CONTEXT`（NAMESPACE, SCHEMA, PACKAGE）
+
+**影响**: 使用 `SYS_CONTEXT('namespace', 'attribute')` 的 PL/SQL 代码会在运行时失败。主程序已有 `CHECK_SYS_CONTEXT_USERENV_RE` 检测 CHECK 约束中的 `SYS_CONTEXT`，但不检查 CONTEXT 对象本身。
+
+#### GAP-P2-05: 行数/数据量粗粒度校验
+
+**现状**: 主程序不校验源端和目标端的数据行数或数据量。
+
+**影响**: 数据迁移可能不完整（部分表数据丢失），但因为只校验结构不校验数据，无法发现。
+
+**修复建议**: 增加可选的 `check_row_counts=true` 开关，对已匹配的表执行 `SELECT COUNT(*) FROM table` 粗粒度行数比较。
+
+#### GAP-P2-06: AUDIT 配置未校验
+
+**Oracle 数据源**: `DBA_AUDIT_TRAIL` / `DBA_STMT_AUDIT_OPTS` / `DBA_OBJ_AUDIT_OPTS`
+
+**影响**: 审计策略丢失意味着合规性要求无法满足。
+
+#### GAP-P2-07: JAVA 对象未校验
+
+**Oracle 数据源**: `DBA_JAVA_CLASSES` / `DBA_JAVA_METHODS`
+
+**影响**: Java 存储过程在 OceanBase 中不支持。如果有 PL/SQL 代码调用 Java 过程，应标记为 UNSUPPORTED。
+
+---
+
+## 3. 优先级矩阵
+
+| 编号 | 遗漏项 | 数据已加载 | 实现难度 | 生产影响 | 建议优先级 |
+|------|--------|-----------|---------|---------|-----------|
+| GAP-P0-01 | 列默认值 | ✅ 已加载 | 中（需标准化） | **高** | **立即** |
+| GAP-P0-02 | 列可空性 | ✅ 已加载 | **低** | **高** | **立即** |
+| GAP-P0-03 | 序列属性 | ✅ 已加载 | **低** | **高** | **立即** |
+| GAP-P0-04 | 分区定义 | 部分加载 | 中 | **高** | 尽快 |
+| GAP-P0-05 | PL/SQL 源码 | 未加载 | 中 | **高** | 尽快 |
+| GAP-P0-06 | DATABASE LINK | 未加载 | 低 | 高 | 尽快 |
+| GAP-P1-01 | MVIEW LOG | 未加载 | 低 | 中 | 近期 |
+| GAP-P1-02 | 索引属性深度 | 部分加载 | 中 | 中 | 近期 |
+| GAP-P1-03 | 约束启用状态 | 部分实现 | 低 | 中 | 近期 |
+| GAP-P1-04 | 数据类型深度 | ✅ 已加载 | 中 | 中 | 近期 |
+| GAP-P1-05 | 表存储属性 | 未加载 | 中 | 低-中 | 后续 |
+| GAP-P1-06 | Schema 存在性 | 未加载 | **低** | 中 | 近期 |
+| GAP-P1-07 | VPD/RLS | 未加载 | 中 | 中 | 后续 |
+| GAP-P2-01~07 | DIRECTORY/TABLESPACE/PROFILE/CONTEXT/AUDIT/JAVA/行数 | 未加载 | 各异 | 低 | 后续 |
+
+---
+
+## 4. 快速收益建议（投入产出比最高的前 3 项）
+
+### 第一优先：GAP-P0-02 列可空性比较
+- **投入**: ~20 行代码
+- **实现**: 在 `common_cols` 循环中增加 `src_nullable != tgt_nullable` 判断
+- **收益**: 立即发现所有 NOT NULL → NULL 的退化，这是人工迁移中最常见的遗漏之一
+
+### 第二优先：GAP-P0-03 序列属性比较
+- **投入**: ~50 行代码
+- **实现**: 数据已在 `sequence_attrs` 中，只需在 `check_extra_objects` 的序列校验部分增加属性比对循环
+- **收益**: 发现 INCREMENT_BY / CACHE_SIZE 不一致，防止自增主键冲突
+
+### 第三优先：GAP-P0-01 列默认值比较
+- **投入**: ~80 行代码（含标准化逻辑）
+- **实现**: 标准化 `data_default` 后比较，需要处理 NULL/空字符串、函数名映射
+- **收益**: 发现默认值丢失，防止 INSERT 行为异常
