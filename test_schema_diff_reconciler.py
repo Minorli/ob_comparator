@@ -1526,6 +1526,40 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertEqual(rows, [])
 
+    def test_compare_triggers_cross_owner_same_name_matches(self):
+        oracle_meta = self._make_oracle_meta(triggers={
+            ("A", "T1"): {
+                "A.TR_X": {"event": "INSERT", "status": "ENABLED", "owner": "A", "name": "TR_X"},
+                "B.TR_X": {"event": "INSERT", "status": "ENABLED", "owner": "B", "name": "TR_X"},
+            }
+        })
+        ob_meta = self._make_ob_meta(triggers={
+            ("A", "T1"): {
+                "A.TR_X": {"event": "INSERT", "status": "ENABLED", "owner": "A", "name": "TR_X"},
+                "B.TR_X": {"event": "INSERT", "status": "ENABLED", "owner": "B", "name": "TR_X"},
+            }
+        })
+        ok, mismatch = sdr.compare_triggers_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+            {},
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(mismatch)
+
+    def test_build_trigger_full_set_handles_full_key(self):
+        trigger_meta = {
+            ("A", "T1"): {
+                "A.TR_X": {"event": "INSERT", "status": "ENABLED", "owner": "A", "name": "TR_X"},
+                "B.TR_X": {"event": "UPDATE", "status": "ENABLED", "owner": "B", "name": "TR_X"},
+            }
+        }
+        self.assertEqual(sdr.build_trigger_full_set(trigger_meta), {"A.TR_X", "B.TR_X"})
+
     def test_classify_missing_objects_marks_invalid_and_blocks_synonym(self):
         tv_results = {
             "missing": [
@@ -5789,6 +5823,126 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         }
         oracle_meta = self._make_oracle_meta(indexes=oracle_indexes)
         ob_meta = self._make_ob_meta(indexes=ob_indexes, constraints=ob_constraints)
+        ok, mismatch = sdr.compare_indexes_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(mismatch)
+
+    def test_compare_indexes_ob_gtt_internal_and_sys_session_id_normalized(self):
+        oracle_indexes = {
+            ("A", "T1"): {
+                "IX_BIZ": {
+                    "columns": ["C1"],
+                    "expressions": {},
+                    "uniqueness": "NONUNIQUE",
+                }
+            }
+        }
+        ob_indexes = {
+            ("A", "T1"): {
+                "IDX_FOR_HEAP_GTT_T1": {
+                    "columns": ["SYS_SESSION_ID"],
+                    "expressions": {},
+                    "uniqueness": "NONUNIQUE",
+                },
+                "IX_BIZ": {
+                    "columns": ["SYS_SESSION_ID", "C1"],
+                    "expressions": {},
+                    "uniqueness": "NONUNIQUE",
+                },
+            }
+        }
+        oracle_meta = self._make_oracle_meta(indexes=oracle_indexes)
+        ob_meta = self._make_ob_meta(indexes=ob_indexes)
+
+        cache = sdr.build_index_cache_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+        )
+        ok, mismatch = sdr.compare_indexes_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+            cache=cache,
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(mismatch)
+
+    def test_compare_indexes_non_gtt_sys_session_id_not_normalized(self):
+        oracle_indexes = {
+            ("A", "T1"): {
+                "IX_BIZ": {
+                    "columns": ["C1"],
+                    "expressions": {},
+                    "uniqueness": "NONUNIQUE",
+                }
+            }
+        }
+        ob_indexes = {
+            ("A", "T1"): {
+                "IX_BIZ": {
+                    "columns": ["SYS_SESSION_ID", "C1"],
+                    "expressions": {},
+                    "uniqueness": "NONUNIQUE",
+                },
+            }
+        }
+        oracle_meta = self._make_oracle_meta(indexes=oracle_indexes)
+        ob_meta = self._make_ob_meta(indexes=ob_indexes)
+
+        ok, mismatch = sdr.compare_indexes_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+        )
+        self.assertFalse(ok)
+        self.assertIsNotNone(mismatch)
+        self.assertIn("IX_BIZ", mismatch.missing_indexes)
+        self.assertIn("IX_BIZ", mismatch.extra_indexes)
+
+    def test_compare_indexes_ob_gtt_expression_index_normalized(self):
+        oracle_indexes = {
+            ("A", "T1"): {
+                "IX_EXPR": {
+                    "columns": ["SYS_NC00004$"],
+                    "expressions": {1: "UPPER(C4)"},
+                    "uniqueness": "NONUNIQUE",
+                }
+            }
+        }
+        ob_indexes = {
+            ("A", "T1"): {
+                "IDX_FOR_HEAP_GTT_T1": {
+                    "columns": ["SYS_SESSION_ID"],
+                    "expressions": {},
+                    "uniqueness": "NONUNIQUE",
+                },
+                "IX_EXPR": {
+                    "columns": ["SYS_SESSION_ID", "SYS_NC20$"],
+                    "expressions": {2: "UPPER(C4)"},
+                    "uniqueness": "NONUNIQUE",
+                },
+            }
+        }
+        oracle_meta = self._make_oracle_meta(indexes=oracle_indexes)
+        ob_meta = self._make_ob_meta(indexes=ob_indexes)
+
         ok, mismatch = sdr.compare_indexes_for_table(
             oracle_meta,
             ob_meta,

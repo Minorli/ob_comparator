@@ -2801,6 +2801,37 @@ def normalize_trigger_status(value: Optional[str]) -> str:
     return status or "UNKNOWN"
 
 
+def normalize_trigger_identity(
+    trigger_key: Optional[str],
+    info: Optional[Dict],
+    default_owner: Optional[str]
+) -> Tuple[str, str]:
+    """
+    Normalize trigger identity from either:
+      1) key = TRIGGER_NAME + info.owner
+      2) key = OWNER.TRIGGER_NAME (new canonical form)
+    Returns (OWNER, TRIGGER_NAME).
+    """
+    info_dict = info if isinstance(info, dict) else {}
+    key_u = (trigger_key or "").strip().upper()
+    owner_u = ((info_dict.get("owner")) or default_owner or "").strip().upper()
+    name_u = ((info_dict.get("name")) or "").strip().upper()
+    if "." in key_u:
+        key_owner, key_name = key_u.split(".", 1)
+        if not owner_u:
+            owner_u = key_owner
+        if not name_u:
+            name_u = key_name
+    else:
+        if not name_u:
+            name_u = key_u
+    if not owner_u and "." in key_u:
+        owner_u = key_u.split(".", 1)[0]
+    if not name_u and "." in key_u:
+        name_u = key_u.split(".", 1)[1]
+    return owner_u, name_u
+
+
 def normalize_constraint_enabled_status(value: Optional[str]) -> str:
     status = (value or "").strip().upper()
     if status in {"ENABLED", "ENABLE"}:
@@ -4778,8 +4809,7 @@ def build_trigger_full_set(
     for (owner, _), trg_map in triggers.items():
         owner_u = (owner or "").upper()
         for trg_name, info in (trg_map or {}).items():
-            trg_owner = (info.get("owner") or owner_u).upper()
-            name_u = (trg_name or "").upper()
+            trg_owner, name_u = normalize_trigger_identity(trg_name, info, owner_u)
             if trg_owner and name_u:
                 full_set.add(f"{trg_owner}.{name_u}")
     return full_set
@@ -4793,8 +4823,7 @@ def build_trigger_full_map(
     for (owner, _), trg_map in triggers.items():
         owner_u = (owner or "").upper()
         for trg_name, info in (trg_map or {}).items():
-            trg_owner = (info.get("owner") or owner_u).upper()
-            name_u = (trg_name or "").upper()
+            trg_owner, name_u = normalize_trigger_identity(trg_name, info, owner_u)
             if trg_owner and name_u:
                 full_map[f"{trg_owner}.{name_u}"] = info
     return full_map
@@ -4999,9 +5028,8 @@ def collect_trigger_status_rows(
     if unsupported_keys:
         for (owner, table), trg_map in (oracle_meta.triggers or {}).items():
             table_key = (owner.upper(), table.upper())
-            for trg_name, info in (trg_map or {}).items():
-                trg_owner = (info.get("owner") or owner).upper()
-                name_u = (trg_name or "").upper()
+            for trigger_key, info in (trg_map or {}).items():
+                trg_owner, name_u = normalize_trigger_identity(trigger_key, info, owner)
                 if not name_u:
                     continue
                 trigger_parent_map[f"{trg_owner}.{name_u}"] = table_key
@@ -5780,6 +5808,38 @@ def classify_missing_objects(
             unsupported_rows.append(row)
             extra_blocked_counts["CONSTRAINT"] += 1
 
+    def _iter_missing_trigger_full_pairs(
+        item: TriggerMismatch,
+        src_schema: str,
+        tgt_schema: str
+    ) -> Iterable[Tuple[str, str]]:
+        """
+        统一输出缺失触发器的 (SRC_FULL, TGT_FULL)：
+        - 优先使用 compare 阶段产出的 missing_mappings
+        - 回退到 missing_triggers 时兼容 OWNER.NAME 与 NAME 两种格式
+        """
+        if item.missing_mappings:
+            for src_full, tgt_full in item.missing_mappings:
+                src_u = (src_full or "").strip().upper()
+                tgt_u = (tgt_full or "").strip().upper()
+                if src_u and tgt_u and "." in src_u and "." in tgt_u:
+                    yield src_u, tgt_u
+            return
+
+        for trg_name in sorted(item.missing_triggers or set()):
+            trg_owner_u, trg_name_u = normalize_trigger_identity(trg_name, None, src_schema)
+            if not trg_name_u:
+                continue
+            src_owner_u = (trg_owner_u or src_schema).upper()
+            src_full = f"{src_owner_u}.{trg_name_u}"
+            mapped = get_mapped_target(full_object_mapping, src_full, 'TRIGGER')
+            if mapped and "." in mapped:
+                tgt_full = mapped.upper()
+            else:
+                tgt_owner_u = src_owner_u or tgt_schema.upper()
+                tgt_full = f"{tgt_owner_u}.{trg_name_u}"
+            yield src_full, tgt_full
+
     for item in extra_results.get('trigger_mismatched', []):
         table_str = item.table.split()[0]
         if '.' not in table_str:
@@ -5792,11 +5852,11 @@ def classify_missing_objects(
             continue
         tgt_schema, _ = table_str.split('.', 1)
         root_cause = _root_cause_label((f"{src_schema.upper()}.{src_table.upper()}", "TABLE"))
-        for trg_name in sorted(item.missing_triggers):
+        for src_full, tgt_full in _iter_missing_trigger_full_pairs(item, src_schema, tgt_schema):
             row = ObjectSupportReportRow(
                 obj_type="TRIGGER",
-                src_full=f"{src_schema.upper()}.{trg_name.upper()}",
-                tgt_full=f"{tgt_schema.upper()}.{trg_name.upper()}",
+                src_full=src_full,
+                tgt_full=tgt_full,
                 support_state=SUPPORT_STATE_BLOCKED,
                 reason_code="DEPENDENCY_UNSUPPORTED",
                 reason="依赖不支持表",
@@ -5883,11 +5943,11 @@ def classify_missing_objects(
         if (src_schema.upper(), src_table.upper()) in unsupported_table_keys:
             continue
         tgt_schema, _ = table_str.split('.', 1)
-        for trg_name in sorted(item.missing_triggers):
+        for src_full, tgt_full in _iter_missing_trigger_full_pairs(item, src_schema, tgt_schema):
             _add_extra_missing_row(
                 "TRIGGER",
-                f"{src_schema.upper()}.{trg_name.upper()}",
-                f"{tgt_schema.upper()}.{trg_name.upper()}",
+                src_full,
+                tgt_full,
                 table_str.upper(),
                 "TRIGGER"
             )
@@ -9354,10 +9414,13 @@ def dump_ob_metadata(
                 ev = parts[4].strip()
                 status = parts[5].strip() if len(parts) > 5 else ""
                 key = (t_owner, t_name)
-                triggers.setdefault(key, {})[trg_name] = {
+                trg_owner_u = trg_owner or t_owner
+                trg_key = f"{trg_owner_u}.{trg_name}" if trg_owner_u and trg_name else trg_name
+                triggers.setdefault(key, {})[trg_key] = {
                     "event": ev,
                     "status": status,
-                    "owner": trg_owner or t_owner
+                    "owner": trg_owner_u,
+                    "name": trg_name
                 }
 
     # --- 8. DBA_SEQUENCES ---
@@ -10681,10 +10744,13 @@ def dump_oracle_metadata(
                                 trg_name = _safe_upper(row[3])
                                 if not trg_name:
                                     continue
-                                triggers.setdefault(key, {})[trg_name] = {
+                                trg_owner_u = trg_owner or owner
+                                trg_key = f"{trg_owner_u}.{trg_name}" if trg_owner_u and trg_name else trg_name
+                                triggers.setdefault(key, {})[trg_key] = {
                                     "event": row[4],
                                     "status": row[5],
-                                    "owner": trg_owner or owner
+                                    "owner": trg_owner_u,
+                                    "name": trg_name
                                 }
 
                 status_types: Set[str] = set()
@@ -13307,16 +13373,45 @@ def compare_package_objects(
     }
 
 
-def build_index_map(entries: Dict[str, Dict]) -> Dict[Tuple[str, ...], Dict[str, Set[str]]]:
+def is_ob_gtt_internal_index_name(index_name: Optional[str]) -> bool:
+    name_u = (index_name or "").strip().upper()
+    return bool(name_u) and name_u.startswith("IDX_FOR_HEAP_GTT_")
+
+
+def should_normalize_ob_gtt_indexes(entries: Optional[Dict[str, Dict]]) -> bool:
+    return any(is_ob_gtt_internal_index_name(name) for name in (entries or {}).keys())
+
+
+def normalize_ob_gtt_index_columns(
+    cols: Tuple[str, ...],
+    *,
+    normalize_ob_gtt: bool
+) -> Tuple[str, ...]:
+    if not normalize_ob_gtt:
+        return cols
+    if cols and cols[0] == "SYS_SESSION_ID":
+        return cols[1:]
+    return cols
+
+
+def build_index_map(
+    entries: Dict[str, Dict],
+    *,
+    normalize_ob_gtt: bool = False
+) -> Dict[Tuple[str, ...], Dict[str, Set[str]]]:
     result: Dict[Tuple[str, ...], Dict[str, Set[str]]] = {}
     for name, info in (entries or {}).items():
+        name_u = (name or "").upper()
+        if normalize_ob_gtt and is_ob_gtt_internal_index_name(name_u):
+            # OB GTT internal helper index should not participate in semantic diff.
+            continue
         expr_map = info.get("expressions") or {}
         cols = normalize_index_columns(info.get("columns") or [], expr_map)
+        cols = normalize_ob_gtt_index_columns(cols, normalize_ob_gtt=normalize_ob_gtt)
         if not cols:
             continue
         uniq = (info.get("uniqueness") or "").upper()
         bucket = result.setdefault(cols, {"names": set(), "uniq": set()})
-        name_u = (name or "").upper()
         if name_u:
             bucket["names"].add(name_u)
         bucket["uniq"].add(uniq)
@@ -13334,7 +13429,9 @@ def build_index_signature(
 
 def build_constraint_index_cols(
     tgt_constraints: Optional[Dict[str, Dict]],
-    tgt_indexes: Optional[Dict[str, Dict]]
+    tgt_indexes: Optional[Dict[str, Dict]],
+    *,
+    normalize_ob_gtt: bool = False
 ) -> Set[Tuple[str, ...]]:
     cols_set: Set[Tuple[str, ...]] = set()
     for cons in (tgt_constraints or {}).values():
@@ -13347,6 +13444,7 @@ def build_constraint_index_cols(
             if idx_info:
                 expr_map = idx_info.get("expressions") or {}
                 cols = normalize_index_columns(idx_info.get("columns") or [], expr_map)
+                cols = normalize_ob_gtt_index_columns(cols, normalize_ob_gtt=normalize_ob_gtt)
                 if cols:
                     cols_set.add(cols)
                     continue
@@ -13418,12 +13516,17 @@ def build_index_cache_for_table(
     if src_idx is None:
         src_idx = {}
     tgt_idx = ob_meta.indexes.get(tgt_key, {})
+    normalize_ob_gtt = should_normalize_ob_gtt_indexes(tgt_idx)
     src_map = build_index_map(src_idx)
-    tgt_map = build_index_map(tgt_idx)
+    tgt_map = build_index_map(tgt_idx, normalize_ob_gtt=normalize_ob_gtt)
     src_sig = build_index_signature(src_map)
     tgt_sig = build_index_signature(tgt_map)
     tgt_constraints = ob_meta.constraints.get(tgt_key, {})
-    constraint_index_cols = build_constraint_index_cols(tgt_constraints, tgt_idx)
+    constraint_index_cols = build_constraint_index_cols(
+        tgt_constraints,
+        tgt_idx,
+        normalize_ob_gtt=normalize_ob_gtt
+    )
     return IndexCompareCache(
         src_map=src_map,
         tgt_map=tgt_map,
@@ -13495,9 +13598,8 @@ def build_trigger_cache_for_table(
     src_sig: Set[Tuple[str, str, str, str]] = set()
     tgt_sig: Set[Tuple[str, str, str, str]] = set()
 
-    for name, info in src_trg.items():
-        trg_owner = (info.get("owner") or src_schema).upper()
-        name_u = (name or "").upper()
+    for trigger_key, info in src_trg.items():
+        trg_owner, name_u = normalize_trigger_identity(trigger_key, info, src_schema)
         if not name_u:
             continue
         src_full = f"{trg_owner}.{name_u}"
@@ -13530,9 +13632,8 @@ def build_trigger_cache_for_table(
         }
         src_sig.add((tgt_full, event, status, valid))
 
-    for name, info in tgt_trg.items():
-        owner_u = (info.get("owner") or tgt_schema).upper()
-        name_u = (name or "").upper()
+    for trigger_key, info in tgt_trg.items():
+        owner_u, name_u = normalize_trigger_identity(trigger_key, info, tgt_schema)
         if not name_u:
             continue
         full = f"{owner_u}.{name_u}"
@@ -13565,11 +13666,10 @@ def ensure_trigger_mappings_for_extra_checks(
             continue
         src_key = (src_schema.upper(), src_table.upper())
         src_trg = oracle_meta.triggers.get(src_key) or {}
-        for trg_name, info in src_trg.items():
-            name_u = (trg_name or "").upper()
+        for trigger_key, info in src_trg.items():
+            trg_owner, name_u = normalize_trigger_identity(trigger_key, info, src_schema)
             if not name_u:
                 continue
-            trg_owner = (info.get("owner") or src_schema).upper()
             src_full = f"{trg_owner}.{name_u}"
             mapped = get_mapped_target(full_object_mapping, src_full, 'TRIGGER')
             if mapped and '.' in mapped:
@@ -13698,9 +13798,14 @@ def compare_indexes_for_table(
         src_idx = {}
     tgt_idx = ob_meta.indexes.get(tgt_key, {})
     tgt_constraints = ob_meta.constraints.get(tgt_key, {})
-    constraint_index_cols = build_constraint_index_cols(tgt_constraints, tgt_idx)
+    normalize_ob_gtt = should_normalize_ob_gtt_indexes(tgt_idx)
+    constraint_index_cols = build_constraint_index_cols(
+        tgt_constraints,
+        tgt_idx,
+        normalize_ob_gtt=normalize_ob_gtt
+    )
     src_map = build_index_map(src_idx)
-    tgt_map = build_index_map(tgt_idx)
+    tgt_map = build_index_map(tgt_idx, normalize_ob_gtt=normalize_ob_gtt)
     if build_index_signature(src_map) == build_index_signature(tgt_map):
         return True, None
     return compare_index_maps(src_map, tgt_map, constraint_index_cols, tgt_schema, tgt_table)
@@ -14537,87 +14642,24 @@ def compare_triggers_for_table(
     full_object_mapping: FullObjectMapping,
     cache: Optional[TriggerCompareCache] = None
 ) -> Tuple[bool, Optional[TriggerMismatch]]:
-    if cache:
-        if cache.src_sig == cache.tgt_sig:
-            return True, None
-        src_info_map = cache.src_info_map
-        tgt_info_map = cache.tgt_info_map
-        if not src_info_map:
-            if not tgt_info_map:
-                return True, None
-            extra_triggers = set(tgt_info_map.keys())
-            return False, TriggerMismatch(
-                table=f"{tgt_schema}.{tgt_table}",
-                missing_triggers=set(),
-                extra_triggers=extra_triggers,
-                detail_mismatch=[f"源端无触发器，目标端存在额外触发器: {', '.join(sorted(extra_triggers))}"],
-                missing_mappings=[]
-            )
-        missing = set(src_info_map.keys()) - set(tgt_info_map.keys())
-        extra = set(tgt_info_map.keys()) - set(src_info_map.keys())
-        detail_mismatch: List[str] = []
-        missing_mappings: List[Tuple[str, str]] = []
-        for tgt_full in sorted(missing):
-            src_info = src_info_map.get(tgt_full, {})
-            missing_mappings.append(
-                (
-                    f"{src_info.get('src_owner', src_schema.upper())}.{src_info.get('src_name', tgt_full.split('.', 1)[-1])}",
-                    f"{src_info.get('tgt_owner', tgt_schema.upper())}.{src_info.get('tgt_name', tgt_full.split('.', 1)[-1])}"
-                )
-            )
-        common = set(src_info_map.keys()) & set(tgt_info_map.keys())
-        for tgt_full in common:
-            src_info = src_info_map.get(tgt_full, {})
-            tgt_info = tgt_info_map.get(tgt_full, {})
-            s_event = (src_info.get("event") or "").strip()
-            s_status = normalize_trigger_status(src_info.get("status"))
-            s_owner = (src_info.get("src_owner") or src_schema).upper()
-            s_name = (src_info.get("src_name") or "").upper()
-            s_valid = normalize_trigger_status(
-                src_info.get("valid") or lookup_trigger_validity(oracle_meta, s_owner, s_name)
-            )
-            t_event = (tgt_info.get("event") or "").strip()
-            t_status = normalize_trigger_status(tgt_info.get("status"))
-            t_owner = (tgt_info.get("owner") or tgt_schema).upper()
-            t_name = (tgt_full.split(".", 1)[1] if "." in tgt_full else tgt_full).upper()
-            t_valid = normalize_trigger_status(
-                tgt_info.get("valid") or lookup_trigger_validity(ob_meta, t_owner, t_name)
-            )
-            if s_event != t_event:
-                detail_mismatch.append(
-                    f"{tgt_full}: 触发事件不一致 (src={s_event}, tgt={t_event})"
-                )
-            if s_status != t_status:
-                detail_mismatch.append(
-                    f"{tgt_full}: 启用状态不一致 (src={s_status}, tgt={t_status})"
-                )
-            if s_valid != t_valid:
-                detail_mismatch.append(
-                    f"{tgt_full}: 有效性不一致 (src={s_valid}, tgt={t_valid})"
-                )
-        all_good = (not missing) and (not extra) and not detail_mismatch
-        if all_good:
-            return True, None
-        return False, TriggerMismatch(
-            table=f"{tgt_schema}.{tgt_table}",
-            missing_triggers=missing,
-            extra_triggers=extra,
-            detail_mismatch=detail_mismatch,
-            missing_mappings=missing_mappings
+    if cache is None:
+        cache = build_trigger_cache_for_table(
+            oracle_meta,
+            ob_meta,
+            src_schema,
+            src_table,
+            tgt_schema,
+            tgt_table,
+            full_object_mapping
         )
-
-    src_key = (src_schema.upper(), src_table.upper())
-    src_trg = oracle_meta.triggers.get(src_key) or {}
-    tgt_key = (tgt_schema.upper(), tgt_table.upper())
-    tgt_trg = ob_meta.triggers.get(tgt_key, {})
-
-    if not src_trg:
-        if not tgt_trg:
+    if cache.src_sig == cache.tgt_sig:
+        return True, None
+    src_info_map = cache.src_info_map
+    tgt_info_map = cache.tgt_info_map
+    if not src_info_map:
+        if not tgt_info_map:
             return True, None
-        extra_triggers: Set[str] = set()
-        for name, info in tgt_trg.items():
-            owner_u = (info.get("owner") or tgt_schema).upper()
-            extra_triggers.add(f"{owner_u}.{name.upper()}")
+        extra_triggers = set(tgt_info_map.keys())
         return False, TriggerMismatch(
             table=f"{tgt_schema}.{tgt_table}",
             missing_triggers=set(),
@@ -14625,105 +14667,58 @@ def compare_triggers_for_table(
             detail_mismatch=[f"源端无触发器，目标端存在额外触发器: {', '.join(sorted(extra_triggers))}"],
             missing_mappings=[]
         )
-
-    src_names_raw = set(src_trg.keys())
-    tgt_full_names: Set[str] = set()
-    tgt_info_map: Dict[str, Dict] = {}
-    for name, info in tgt_trg.items():
-        owner_u = (info.get("owner") or tgt_schema).upper()
-        name_u = name.upper()
-        full = f"{owner_u}.{name_u}"
-        tgt_full_names.add(full)
-        tgt_info_map[full] = info
-
-    src_target_full: Set[str] = set()
-    target_name_map: Dict[str, Tuple[str, str, str, str]] = {}
-    for name in src_names_raw:
-        info = src_trg.get(name) or {}
-        trg_owner = (info.get("owner") or src_schema).upper()
-        name_u = name.upper()
-        src_full = f"{trg_owner}.{name_u}"
-        mapped = get_mapped_target(full_object_mapping, src_full, 'TRIGGER')
-        if mapped and '.' in mapped:
-            tgt_owner, tgt_name = mapped.split('.', 1)
-            tgt_owner_u = tgt_owner.upper()
-            tgt_name_u = tgt_name.upper()
-        else:
-            tgt_owner_u = trg_owner or src_schema.upper()
-            tgt_name_u = name_u
-            ensure_mapping_entry(
-                full_object_mapping,
-                src_full,
-                'TRIGGER',
-                f"{tgt_owner_u}.{tgt_name_u}"
-            )
-        tgt_full = f"{tgt_owner_u}.{tgt_name_u}"
-        src_target_full.add(tgt_full)
-        target_name_map[tgt_full] = (trg_owner, name_u, tgt_owner_u, tgt_name_u)
-
-    missing = src_target_full - tgt_full_names
-    extra = tgt_full_names - src_target_full
+    missing = set(src_info_map.keys()) - set(tgt_info_map.keys())
+    extra = set(tgt_info_map.keys()) - set(src_info_map.keys())
     detail_mismatch: List[str] = []
     missing_mappings: List[Tuple[str, str]] = []
-
     for tgt_full in sorted(missing):
-        tgt_parts = tgt_full.split('.', 1)
-        tgt_name_fallback = tgt_parts[1] if len(tgt_parts) > 1 else tgt_full
-        src_owner, src_name, tgt_owner, tgt_name = target_name_map.get(
-            tgt_full,
-            (src_schema.upper(), tgt_name_fallback, tgt_schema.upper(), tgt_name_fallback)
-        )
+        src_info = src_info_map.get(tgt_full, {})
         missing_mappings.append(
             (
-                f"{src_owner}.{src_name}",
-                f"{tgt_owner}.{tgt_name}"
+                f"{src_info.get('src_owner', src_schema.upper())}.{src_info.get('src_name', tgt_full.split('.', 1)[-1])}",
+                f"{src_info.get('tgt_owner', tgt_schema.upper())}.{src_info.get('tgt_name', tgt_full.split('.', 1)[-1])}"
             )
         )
-
-    common = src_target_full & tgt_full_names
+    common = set(src_info_map.keys()) & set(tgt_info_map.keys())
     for tgt_full in common:
-        src_info = target_name_map.get(tgt_full)
-        src_info_name = src_info[1] if src_info else tgt_full.split('.', 1)[1]
-        s = src_trg.get(src_info_name) or {}
-        t = tgt_info_map.get(tgt_full, {})
-        display_name = tgt_full
-        s_event = (s.get("event") or "").strip()
-        t_event = (t.get("event") or "").strip()
-        s_status = normalize_trigger_status(s.get("status"))
-        t_status = normalize_trigger_status(t.get("status"))
-        s_owner = (s.get("owner") or src_schema).upper()
-        t_owner = (t.get("owner") or tgt_schema).upper()
-        t_name = tgt_full.split(".", 1)[1] if "." in tgt_full else tgt_full
+        src_info = src_info_map.get(tgt_full, {})
+        tgt_info = tgt_info_map.get(tgt_full, {})
+        s_event = (src_info.get("event") or "").strip()
+        s_status = normalize_trigger_status(src_info.get("status"))
+        s_owner = (src_info.get("src_owner") or src_schema).upper()
+        s_name = (src_info.get("src_name") or "").upper()
         s_valid = normalize_trigger_status(
-            s.get("valid") or lookup_trigger_validity(oracle_meta, s_owner, src_info_name)
+            src_info.get("valid") or lookup_trigger_validity(oracle_meta, s_owner, s_name)
         )
+        t_event = (tgt_info.get("event") or "").strip()
+        t_status = normalize_trigger_status(tgt_info.get("status"))
+        t_owner = (tgt_info.get("owner") or tgt_schema).upper()
+        t_name = (tgt_full.split(".", 1)[1] if "." in tgt_full else tgt_full).upper()
         t_valid = normalize_trigger_status(
-            t.get("valid") or lookup_trigger_validity(ob_meta, t_owner, t_name)
+            tgt_info.get("valid") or lookup_trigger_validity(ob_meta, t_owner, t_name)
         )
         if s_event != t_event:
             detail_mismatch.append(
-                f"{display_name}: 触发事件不一致 (src={s_event}, tgt={t_event})"
+                f"{tgt_full}: 触发事件不一致 (src={s_event}, tgt={t_event})"
             )
         if s_status != t_status:
             detail_mismatch.append(
-                f"{display_name}: 启用状态不一致 (src={s_status}, tgt={t_status})"
+                f"{tgt_full}: 启用状态不一致 (src={s_status}, tgt={t_status})"
             )
         if s_valid != t_valid:
             detail_mismatch.append(
-                f"{display_name}: 有效性不一致 (src={s_valid}, tgt={t_valid})"
+                f"{tgt_full}: 有效性不一致 (src={s_valid}, tgt={t_valid})"
             )
-
-    all_good = (not missing) and (not extra) and (not detail_mismatch)
+    all_good = (not missing) and (not extra) and not detail_mismatch
     if all_good:
         return True, None
-    else:
-        return False, TriggerMismatch(
-            table=f"{tgt_schema}.{tgt_table}",
-            missing_triggers=missing,
-            extra_triggers=extra,
-            detail_mismatch=detail_mismatch,
-            missing_mappings=missing_mappings
-        )
+    return False, TriggerMismatch(
+        table=f"{tgt_schema}.{tgt_table}",
+        missing_triggers=missing,
+        extra_triggers=extra,
+        detail_mismatch=detail_mismatch,
+        missing_mappings=missing_mappings
+    )
 
 
 _EXTRA_CHECK_CONTEXT: Dict[str, object] = {}
@@ -22295,21 +22290,24 @@ def generate_fixup_scripts(
                 trigger_tasks.append((src_schema_u, src_trg, tgt_schema_final, tgt_obj, src_table, tgt_schema, tgt_table))
         else:
             for trg_name in sorted(item.missing_triggers):
-                trg_name_u = trg_name.upper()
-                src_full = f"{src_schema.upper()}.{trg_name_u}"
+                src_owner_u, src_trg_u = normalize_trigger_identity(trg_name, None, src_schema)
+                if not src_trg_u:
+                    continue
+                src_owner_u = (src_owner_u or src_schema).upper()
+                src_full = f"{src_owner_u}.{src_trg_u}"
                 mapped = get_mapped_target(full_object_mapping, src_full, 'TRIGGER')
                 if mapped and '.' in mapped:
                     tgt_schema_final, tgt_obj = mapped.split('.')
                 else:
-                    tgt_schema_final = tgt_schema.upper()
-                    tgt_obj = trg_name_u
+                    tgt_schema_final = src_owner_u
+                    tgt_obj = src_trg_u
                 tgt_full = f"{tgt_schema_final}.{tgt_obj}"
                 if not _trigger_allowed(src_full, tgt_full):
                     continue
-                if not allow_fixup('TRIGGER', tgt_schema_final, src_schema):
+                if not allow_fixup('TRIGGER', tgt_schema_final, src_owner_u):
                     continue
-                queue_request(src_schema, 'TRIGGER', trg_name_u)
-                trigger_tasks.append((src_schema, trg_name_u, tgt_schema_final, tgt_obj, src_table, tgt_schema, tgt_table))
+                queue_request(src_owner_u, 'TRIGGER', src_trg_u)
+                trigger_tasks.append((src_owner_u, src_trg_u, tgt_schema_final, tgt_obj, src_table, tgt_schema, tgt_table))
 
     if invalid_trigger_keys:
         before_count = len(trigger_tasks)
