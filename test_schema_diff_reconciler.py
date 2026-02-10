@@ -5233,6 +5233,44 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIsNone(mismatch)
 
+    def test_compare_constraints_for_table_ignores_obnotnull_only_difference(self):
+        oracle_constraints = {
+            ("A", "T1"): {
+                "CK_SRC": {
+                    "type": "C",
+                    "columns": ["C1"],
+                    "search_condition": "C1 > 0",
+                }
+            }
+        }
+        ob_constraints = {
+            ("A", "T1"): {
+                "CK_TGT": {
+                    "type": "C",
+                    "columns": ["C1"],
+                    "search_condition": "C1 > 0",
+                },
+                "T1_OBNOTNULL_12345": {
+                    "type": "C",
+                    "columns": ["C2"],
+                    "search_condition": "\"C2\" IS NOT NULL",
+                }
+            }
+        }
+        oracle_meta = self._make_oracle_meta(constraints=oracle_constraints)
+        ob_meta = self._make_ob_meta(constraints=ob_constraints)
+        ok, mismatch = sdr.compare_constraints_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+            {}
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(mismatch)
+
     def test_classify_unsupported_check_constraints_filters_extra(self):
         oracle_meta = self._make_oracle_meta(
             constraints={

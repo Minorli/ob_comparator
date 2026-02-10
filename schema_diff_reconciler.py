@@ -13488,6 +13488,8 @@ def build_constraint_signature(
                     ref_full = ref_full_raw.upper()
             fk.add((cols, ref_full, delete_rule, update_rule))
         elif ctype == "C":
+            if is_ob_notnull_constraint(name):
+                continue
             if is_system_notnull_check(name, cons.get("search_condition")):
                 continue
             expr_norm = normalize_check_constraint_expression(cons.get("search_condition"), name)
@@ -14278,6 +14280,8 @@ def compare_constraints_for_table(
         for name, cons in cons_dict.items():
             ctype = (cons.get("type") or "").upper()
             if ctype != "C":
+                continue
+            if is_ob_notnull_constraint(name):
                 continue
             raw_expr = cons.get("search_condition")
             if is_system_notnull_check(name, raw_expr):
