@@ -131,8 +131,9 @@
 - 写库范围由 `report_db_store_scope` 控制：
   - `summary`：仅写入 SUMMARY / COUNTS
   - `core`：summary + DETAIL / GRANT / USABILITY / PACKAGE / TRIGGER
-  - `full`：core + ARTIFACT / DEPENDENCY / VIEW_CHAIN / REMAP_CONFLICT / OBJECT_MAPPING / BLACKLIST / FIXUP_SKIP / OMS_MISSING
+  - `full`：core + ARTIFACT / ARTIFACT_LINE / DEPENDENCY / VIEW_CHAIN / REMAP_CONFLICT / OBJECT_MAPPING / BLACKLIST / FIXUP_SKIP / OMS_MISSING
   - `DIFF_REPORT_WRITE_ERRORS` / `DIFF_REPORT_RESOLUTION` 为写库追踪与闭环表，report_to_db 启用后默认创建
+  - `full` 下会将 run 目录 txt 逐行写入 `DIFF_REPORT_ARTIFACT_LINE`，可直接在库中复盘全部文本报告
 - 明细范围与规模控制：
   - `report_db_detail_mode=missing,mismatched,unsupported`（建议保留核心差异）
   - `report_db_detail_max_rows=0`（不限制；按需设置）
@@ -147,6 +148,7 @@
   - `DIFF_REPORT_PACKAGE_COMPARE`（PACKAGE/PKG BODY 对比摘要）
   - `DIFF_REPORT_TRIGGER_STATUS`（触发器状态差异）
   - `DIFF_REPORT_ARTIFACT`（报告工件目录）
+  - `DIFF_REPORT_ARTIFACT_LINE`（报告文本逐行明细，含空行）
   - `DIFF_REPORT_DEPENDENCY`（依赖链）
   - `DIFF_REPORT_VIEW_CHAIN`（VIEW fixup 链路）
   - `DIFF_REPORT_REMAP_CONFLICT`（remap 冲突）
@@ -270,7 +272,7 @@ A: `check_primary_types` 限制后，未包含的类型不会加载/推导/生�
 ## 9. 交付执行模板（建议）
 1) 先跑主程序生成报告与脚本：`python3 schema_diff_reconciler.py`  
 2) 先看 `report_*.txt` 的执行结论与 `report_index_*.txt` 的工件索引。  
-3) 如启用 `report_to_db=true`，优先用 `HOW_TO_READ_REPORTS_IN_OB_70_sqls.txt` 查询问题。  
+3) 如启用 `report_to_db=true`，优先用 `HOW_TO_READ_REPORTS_IN_OB_73_sqls.txt` 查询问题。  
 4) 人工审核 `fixup_scripts/` 后执行：`python3 run_fixup.py --smart-order --recompile`。  
 5) 复杂 VIEW 依赖场景再执行：`python3 run_fixup.py --view-chain-autofix`。  
 6) 完成后再次运行主程序做收敛验证（确保缺失/不支持数量符合预期）。

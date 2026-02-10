@@ -7051,6 +7051,61 @@ class TestReportDbHelpers(unittest.TestCase):
         self.assertIn("MISSING_DETAIL", types)
         self.assertIn("REPORT_SQL_TEMPLATE", types)
 
+    def test_infer_artifact_status_full_marks_in_db(self):
+        status, note = sdr._infer_artifact_status(
+            "REPORT_SQL_TEMPLATE",
+            "full",
+            {"missing", "mismatched", "unsupported"},
+            False
+        )
+        self.assertEqual(status, "IN_DB")
+        self.assertEqual(note, "")
+
+    def test_iter_report_artifact_line_rows_preserves_blank_lines(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_dir = Path(tmpdir)
+            sample = report_dir / "report_20250101.txt"
+            sample.write_text("A\n\n#C\nD\n", encoding="utf-8")
+            rows = list(sdr._iter_report_artifact_line_rows(report_dir))
+        self.assertEqual(len(rows), 4)
+        self.assertEqual([r["line_no"] for r in rows], [1, 2, 3, 4])
+        self.assertEqual(rows[1]["line_text"], "")
+        self.assertEqual(rows[2]["line_text"], "#C")
+
+    def test_insert_report_artifact_line_rows(self):
+        calls = []
+
+        def _fake_exec(_cfg, sql, timeout=0):
+            calls.append(sql)
+            return True, "", ""
+
+        rows = iter([
+            {
+                "artifact_type": "REPORT_MAIN",
+                "file_path": "/tmp/a.txt",
+                "line_no": 1,
+                "line_text": "L1",
+            },
+            {
+                "artifact_type": "REPORT_MAIN",
+                "file_path": "/tmp/a.txt",
+                "line_no": 2,
+                "line_text": "L2",
+            },
+        ])
+        with mock.patch.object(sdr, "obclient_run_sql_commit", side_effect=_fake_exec):
+            ok, inserted = sdr._insert_report_artifact_line_rows(
+                {"executable": "/usr/bin/obclient"},
+                "",
+                "RPT1",
+                rows,
+                batch_size=1
+            )
+        self.assertTrue(ok)
+        self.assertEqual(inserted, 2)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all("DIFF_REPORT_ARTIFACT_LINE" in sql for sql in calls))
+
     def test_render_report_sql_template(self):
         content = "SELECT * FROM DIFF_REPORT_SUMMARY WHERE report_id = :report_id;"
         rendered = sdr._render_report_sql_template(content, "R1")

@@ -45,6 +45,7 @@
 - report_to_db：是否将报告存储到 OceanBase（obclient 方式）。默认：true。
   说明：开启后仍会保留本地文本报告，写库失败时是否中断由 report_db_fail_abort 控制。
   说明：开启后会在 run 目录输出 report_sql_<timestamp>.txt（预填 report_id 的 SQL 模板），并尝试创建只读分析视图（actions/profile/trends/pending/grant/usability）。
+  说明：当 report_db_store_scope=full 时，会将 run 目录下所有 txt 逐行写入 DIFF_REPORT_ARTIFACT_LINE，实现 txt 内容 100% 可查询覆盖。
 - report_db_schema：报告存库 schema。默认：空（使用 OCEANBASE_TARGET 连接用户）。
 - report_retention_days：报告保留天数。默认：90；设为 0 表示不自动清理。
 - report_db_fail_abort：报告写库失败是否中止主流程。默认：false。
@@ -64,7 +65,7 @@
   说明：report_to_db 写入表范围受 report_db_store_scope 控制：
   - summary: DIFF_REPORT_SUMMARY / DIFF_REPORT_COUNTS
   - core: summary + DIFF_REPORT_DETAIL / DIFF_REPORT_GRANT / DIFF_REPORT_USABILITY / DIFF_REPORT_PACKAGE_COMPARE / DIFF_REPORT_TRIGGER_STATUS
-  - full: core + DIFF_REPORT_DETAIL_ITEM / DIFF_REPORT_ARTIFACT / DIFF_REPORT_DEPENDENCY / DIFF_REPORT_VIEW_CHAIN / DIFF_REPORT_REMAP_CONFLICT / DIFF_REPORT_OBJECT_MAPPING / DIFF_REPORT_BLACKLIST / DIFF_REPORT_FIXUP_SKIP / DIFF_REPORT_OMS_MISSING
+  - full: core + DIFF_REPORT_DETAIL_ITEM / DIFF_REPORT_ARTIFACT / DIFF_REPORT_ARTIFACT_LINE / DIFF_REPORT_DEPENDENCY / DIFF_REPORT_VIEW_CHAIN / DIFF_REPORT_REMAP_CONFLICT / DIFF_REPORT_OBJECT_MAPPING / DIFF_REPORT_BLACKLIST / DIFF_REPORT_FIXUP_SKIP / DIFF_REPORT_OMS_MISSING
   - 备注：DIFF_REPORT_WRITE_ERRORS / DIFF_REPORT_RESOLUTION 为写库追踪与闭环表，report_to_db 启用后默认创建。
         缺失/不支持明细可通过 DIFF_REPORT_DETAIL 查询；若需行化细节，使用 DIFF_REPORT_DETAIL_ITEM。
 - fixup_dir：修补脚本输出目录。默认：fixup_scripts。

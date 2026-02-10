@@ -86,7 +86,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, NamedTuple, NoReturn, Optional, Sequence, Set, Tuple, Union
+from typing import Callable, Dict, Iterable, Iterator, List, NamedTuple, NoReturn, Optional, Sequence, Set, Tuple, Union
 
 __version__ = "0.9.8.3"
 __author__ = "Minor Li"
@@ -26036,6 +26036,7 @@ REPORT_DB_TABLES = {
     "package_compare": "DIFF_REPORT_PACKAGE_COMPARE",
     "trigger_status": "DIFF_REPORT_TRIGGER_STATUS",
     "artifact": "DIFF_REPORT_ARTIFACT",
+    "artifact_line": "DIFF_REPORT_ARTIFACT_LINE",
     "dependency": "DIFF_REPORT_DEPENDENCY",
     "view_chain": "DIFF_REPORT_VIEW_CHAIN",
     "remap_conflict": "DIFF_REPORT_REMAP_CONFLICT",
@@ -26323,6 +26324,16 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['artifact']} (
     CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP
 )
 """
+    ddl_artifact_line = f"""
+CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['artifact_line']} (
+    REPORT_ID           VARCHAR2(64) NOT NULL,
+    ARTIFACT_TYPE       VARCHAR2(64) NOT NULL,
+    FILE_PATH           VARCHAR2(512) NOT NULL,
+    LINE_NO             NUMBER NOT NULL,
+    LINE_TEXT           CLOB,
+    CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP
+)
+"""
     ddl_dependency = f"""
 CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['dependency']} (
     REPORT_ID           VARCHAR2(64) NOT NULL,
@@ -26473,6 +26484,10 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['resolution']} (
          f"CREATE INDEX IDX_DIFF_ARTIFACT_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['artifact']}(REPORT_ID)"),
         ("IDX_DIFF_ARTIFACT_TYPE",
          f"CREATE INDEX IDX_DIFF_ARTIFACT_TYPE ON {schema_prefix}{REPORT_DB_TABLES['artifact']}(ARTIFACT_TYPE)"),
+        ("IDX_DIFF_ART_LINE_REPORT_ID",
+         f"CREATE INDEX IDX_DIFF_ART_LINE_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['artifact_line']}(REPORT_ID)"),
+        ("IDX_DIFF_ART_LINE_FILE",
+         f"CREATE INDEX IDX_DIFF_ART_LINE_FILE ON {schema_prefix}{REPORT_DB_TABLES['artifact_line']}(REPORT_ID, FILE_PATH, LINE_NO)"),
         ("IDX_DIFF_DEP_REPORT_ID",
          f"CREATE INDEX IDX_DIFF_DEP_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['dependency']}(REPORT_ID)"),
         ("IDX_DIFF_DEP_TYPE",
@@ -26526,6 +26541,8 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['resolution']} (
         to_create.append(("trigger_status", ddl_trigger_status))
     if REPORT_DB_TABLES["artifact"] not in existing:
         to_create.append(("artifact", ddl_artifact))
+    if REPORT_DB_TABLES["artifact_line"] not in existing:
+        to_create.append(("artifact_line", ddl_artifact_line))
     if REPORT_DB_TABLES["dependency"] not in existing:
         to_create.append(("dependency", ddl_dependency))
     if REPORT_DB_TABLES["view_chain"] not in existing:
@@ -27428,6 +27445,10 @@ def _infer_artifact_status(
     detail_truncated: bool
 ) -> Tuple[str, str]:
     note = ""
+    if store_scope == "full":
+        if artifact_type in {"MISSING_DETAIL", "MISMATCH_DETAIL", "UNSUPPORTED_DETAIL"} and detail_truncated:
+            return "PARTIAL", "detail_truncated"
+        return "IN_DB", ""
     if store_scope == "summary":
         if artifact_type == "REPORT_MAIN":
             return "IN_DB", ""
@@ -27487,6 +27508,35 @@ def _build_report_artifact_rows(
             "note": note
         })
     return rows
+
+
+def _iter_report_artifact_line_rows(report_dir: Optional[Path]) -> Iterator[Dict[str, object]]:
+    """
+    Yield line-level rows for all txt artifacts in run directory.
+    Preserve line order and blank lines for exact replay in DB.
+    """
+    if not report_dir or not report_dir.exists():
+        return
+    for path in sorted(report_dir.rglob("*.txt")):
+        if not path.is_file():
+            continue
+        rel = _report_index_relpath(report_dir, path)
+        artifact_type = _infer_report_artifact_type(rel)
+        abs_path = str(path.resolve())
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as f:
+                for line_no, raw_line in enumerate(f, start=1):
+                    line_text = raw_line.rstrip("\n")
+                    if line_text.endswith("\r"):
+                        line_text = line_text[:-1]
+                    yield {
+                        "artifact_type": artifact_type,
+                        "file_path": abs_path,
+                        "line_no": line_no,
+                        "line_text": line_text,
+                    }
+        except OSError as exc:
+            log.warning("[REPORT_DB] 读取 artifact 文本失败 %s: %s", path, exc)
 
 
 def _build_report_dependency_rows(
@@ -28172,6 +28222,88 @@ def _insert_report_artifact_rows(
                 err
             )
     return ok_all
+
+
+def _insert_report_artifact_line_rows(
+    ob_cfg: ObConfig,
+    schema_prefix: str,
+    report_id: str,
+    row_iter: Iterator[Dict[str, object]],
+    batch_size: int
+) -> Tuple[bool, int]:
+    ok_all = True
+    inserted = 0
+    batch: List[Dict[str, object]] = []
+
+    def _flush(rows_batch: List[Dict[str, object]]) -> bool:
+        if not rows_batch:
+            return True
+        values_sql: List[str] = []
+        for row in rows_batch:
+            values_sql.append(
+                "INTO {table} (REPORT_ID, ARTIFACT_TYPE, FILE_PATH, LINE_NO, LINE_TEXT) "
+                "VALUES ({report_id}, {artifact_type}, {file_path}, {line_no}, {line_text})".format(
+                    table=f"{schema_prefix}{REPORT_DB_TABLES['artifact_line']}",
+                    report_id=sql_quote_literal(report_id),
+                    artifact_type=sql_quote_literal(row.get("artifact_type")),
+                    file_path=sql_quote_literal(row.get("file_path")) if row.get("file_path") else "NULL",
+                    line_no=int(row.get("line_no", 0) or 0),
+                    line_text=sql_clob_literal(row.get("line_text")),
+                )
+            )
+        insert_sql = "INSERT ALL\n  " + "\n  ".join(values_sql) + "\nSELECT 1 FROM DUAL"
+        ok, _out, err = obclient_run_sql_commit(ob_cfg, insert_sql)
+        if not ok:
+            log.warning("[REPORT_DB] 写入 artifact_line 失败: %s", err)
+            _record_report_db_write_error(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                REPORT_DB_TABLES["artifact_line"],
+                insert_sql,
+                err
+            )
+            return False
+        return True
+
+    for row in row_iter:
+        batch.append(row)
+        if len(batch) >= batch_size:
+            if not _flush(batch):
+                ok_all = False
+            inserted += len(batch)
+            batch = []
+    if batch:
+        if not _flush(batch):
+            ok_all = False
+        inserted += len(batch)
+    return ok_all, inserted
+
+
+def _mark_artifact_line_partial(
+    ob_cfg: ObConfig,
+    schema_prefix: str,
+    report_id: str
+) -> None:
+    """
+    Downgrade artifact status when full-scope line persistence fails.
+    """
+    update_sql = (
+        f"UPDATE {schema_prefix}{REPORT_DB_TABLES['artifact']} "
+        "SET STATUS = 'PARTIAL', NOTE = 'artifact_line_insert_failed' "
+        f"WHERE REPORT_ID = {sql_quote_literal(report_id)}"
+    )
+    ok, _out, err = obclient_run_sql_commit(ob_cfg, update_sql)
+    if not ok:
+        log.warning("[REPORT_DB] 更新 artifact 覆盖状态失败: %s", err)
+        _record_report_db_write_error(
+            ob_cfg,
+            schema_prefix,
+            report_id,
+            REPORT_DB_TABLES["artifact"],
+            update_sql,
+            err
+        )
 
 
 def _insert_report_dependency_rows(
@@ -29239,6 +29371,21 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
         artifact_rows.extend(view_artifacts)
     if artifact_rows:
         _insert_report_artifact_rows(ob_cfg, schema_prefix, report_id, artifact_rows, batch_size)
+    if store_scope == "full":
+        line_iter = _iter_report_artifact_line_rows(report_dir)
+        ok_art_lines, art_line_count = _insert_report_artifact_line_rows(
+            ob_cfg,
+            schema_prefix,
+            report_id,
+            line_iter,
+            batch_size
+        )
+        if not ok_art_lines and settings.get("report_db_fail_abort"):
+            return False, "写入 DIFF_REPORT_ARTIFACT_LINE 失败"
+        if not ok_art_lines:
+            _mark_artifact_line_partial(ob_cfg, schema_prefix, report_id)
+        if art_line_count > 0:
+            log.info("[REPORT_DB] artifact 行级文本已写入: %d", art_line_count)
 
     if store_scope == "full":
         dep_rows, _dep_trunc, _dep_trunc_cnt = _build_report_dependency_rows(
@@ -30259,10 +30406,17 @@ def print_final_report(
         ]
         if settings.get("report_to_db", False):
             report_dir_effective = settings.get("report_dir_effective") or ""
-            db_hint = (
-                "DB 覆盖范围提醒: 缺失/不支持/阻断/可用性/触发器状态/包对比摘要已入库；"
-                "依赖链/格式化/黑名单/索引等细节仍在 run 目录文本中。"
-            )
+            store_scope = str(settings.get("report_db_store_scope", "full") or "full").strip().lower()
+            if store_scope == "full":
+                db_hint = (
+                    "DB 覆盖范围提醒: full 模式下 run 目录 txt 已逐行入库 "
+                    "(DIFF_REPORT_ARTIFACT_LINE)；可在数据库内完整查询文本报告。"
+                )
+            else:
+                db_hint = (
+                    "DB 覆盖范围提醒: 缺失/不支持/阻断/可用性/触发器状态/包对比摘要已入库；"
+                    "依赖链/格式化/黑名单/索引等细节仍在 run 目录文本中。"
+                )
             if report_dir_effective:
                 db_hint = f"{db_hint} run_dir={report_dir_effective}"
             detail_hint_lines.append(db_hint)

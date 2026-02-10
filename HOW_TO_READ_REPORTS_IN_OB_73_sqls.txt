@@ -1,6 +1,6 @@
 ============================================================
 OceanBase 报告库排查手册（report_to_db）
-文件: HOW_TO_READ_REPORTS_IN_OB_70_sqls.txt
+文件: HOW_TO_READ_REPORTS_IN_OB_73_sqls.txt
 ============================================================
 
 使用说明
@@ -10,7 +10,7 @@ OceanBase 报告库排查手册（report_to_db）
 - 若某表不存在，请先确认 `report_db_store_scope`：
   - `summary`: 仅 SUMMARY/COUNTS
   - `core`: + DETAIL/GRANT/USABILITY/PACKAGE_COMPARE/TRIGGER_STATUS + 6个分析视图
-  - `full`: + DETAIL_ITEM/ARTIFACT/DEPENDENCY/VIEW_CHAIN/REMAP_CONFLICT/OBJECT_MAPPING/BLACKLIST/FIXUP_SKIP/OMS_MISSING
+  - `full`: + DETAIL_ITEM/ARTIFACT/ARTIFACT_LINE/DEPENDENCY/VIEW_CHAIN/REMAP_CONFLICT/OBJECT_MAPPING/BLACKLIST/FIXUP_SKIP/OMS_MISSING
 
 ------------------------------------------------------------
 A. 入口与覆盖范围（SQL-01 ~ SQL-14）
@@ -70,6 +70,10 @@ UNION ALL
 SELECT 'PACKAGE_COMPARE', COUNT(*) FROM DIFF_REPORT_PACKAGE_COMPARE WHERE report_id = :report_id
 UNION ALL
 SELECT 'TRIGGER_STATUS', COUNT(*) FROM DIFF_REPORT_TRIGGER_STATUS WHERE report_id = :report_id
+UNION ALL
+SELECT 'ARTIFACT', COUNT(*) FROM DIFF_REPORT_ARTIFACT WHERE report_id = :report_id
+UNION ALL
+SELECT 'ARTIFACT_LINE', COUNT(*) FROM DIFF_REPORT_ARTIFACT_LINE WHERE report_id = :report_id
 UNION ALL
 SELECT 'DEPENDENCY', COUNT(*) FROM DIFF_REPORT_DEPENDENCY WHERE report_id = :report_id
 UNION ALL
@@ -568,7 +572,7 @@ SELECT src_schema, src_name, object_type,
  ORDER BY object_type, src_schema, src_name;
 
 ------------------------------------------------------------
-F. 授权 / 可用性 / 包 / 触发器 / 写库异常（SQL-60 ~ SQL-70）
+F. 授权 / 可用性 / 包 / 触发器 / 写库异常（SQL-60 ~ SQL-73）
 ------------------------------------------------------------
 
 -- SQL-60 GRANT 分类汇总（推荐）
@@ -665,6 +669,38 @@ SELECT error_id, table_name, created_at,
  WHERE report_id = :report_id
  ORDER BY created_at DESC;
 
+-- SQL-71 逐行查看某个 txt 报告（完全替代本地 cat）
+SELECT line_no, line_text
+  FROM DIFF_REPORT_ARTIFACT_LINE
+ WHERE report_id = :report_id
+   AND file_path = :file_path
+ ORDER BY line_no;
+
+-- SQL-72 按 artifact_type 统计逐行入库规模（验证 100% 覆盖）
+SELECT artifact_type, COUNT(*) AS line_cnt
+  FROM DIFF_REPORT_ARTIFACT_LINE
+ WHERE report_id = :report_id
+ GROUP BY artifact_type
+ ORDER BY line_cnt DESC, artifact_type;
+
+-- SQL-73 工件目录 vs 逐行表一致性校验（按文件）
+SELECT a.artifact_type,
+       a.file_path,
+       a.status,
+       a.row_count AS logical_rows,
+       NVL(l.line_cnt, 0) AS stored_lines
+  FROM DIFF_REPORT_ARTIFACT a
+  LEFT JOIN (
+      SELECT report_id, file_path, COUNT(*) AS line_cnt
+        FROM DIFF_REPORT_ARTIFACT_LINE
+       WHERE report_id = :report_id
+       GROUP BY report_id, file_path
+  ) l
+    ON l.report_id = a.report_id
+   AND l.file_path = a.file_path
+ WHERE a.report_id = :report_id
+ ORDER BY a.artifact_type, a.file_path;
+
 ============================================================
 建议排查顺序（实战）
 1) SQL-01/02/08/10 先建立全局认知。
@@ -672,5 +708,5 @@ SELECT error_id, table_name, created_at,
 3) SQL-15/16/21/22 再看“可修复缺失”。
 4) SQL-36~46 处理结构不一致。
 5) SQL-47~59 定位依赖链、remap、同义词/public 特殊问题。
-6) SQL-60~70 收口权限、可用性、package/trigger 与写库异常。
+6) SQL-60~73 收口权限、可用性、package/trigger 与写库异常。
 ============================================================

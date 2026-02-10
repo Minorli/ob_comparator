@@ -1337,7 +1337,7 @@ for obj_type in sorted((allowed_types - print_only_types_u) - set(PACKAGE_OBJECT
 
 **现状**: `compute_object_counts` 对 INDEX 和 CONSTRAINT 使用总数差值 `max(0, tgt_count - src_count)` 计算"多余"数量，**不是精确的名称级比较**。系统生成的索引/约束名在源端和目标端可能不同，导致名称级别的多余/缺失统计偏高。
 
-**注**: 实际的名称级多余检测由 `IndexMismatch.extra_indexes` / `ConstraintMismatch.extra_constraints` 完成，这部分是准确的（按列组合匹配后取差集）。但汇总数量可能不一致。
+**注**: 实际细项检测由 `IndexMismatch.extra_indexes` / `ConstraintMismatch.extra_constraints` 提供，采用列组合与表达式等语义规则进行比对，结果更接近业务等价而非纯名称逐字匹配。因此明细与汇总数量可能存在口径差异。
 
 #### EXTRA-GAP-03: 多余对象不生成清理脚本
 
@@ -1349,11 +1349,11 @@ for obj_type in sorted((allowed_types - print_only_types_u) - set(PACKAGE_OBJECT
 - 多余的约束可能阻止合法的数据插入
 - 多余的存储过程/函数可能被应用误调用
 
-**建议**: 增加可选的 `generate_extra_cleanup=true` 开关，为多余对象生成 `DROP` 脚本（放入 `fixup_scripts/cleanup/` 目录），但**默认关闭**以避免误删。脚本应包含注释说明该对象在源端不存在。
+**建议**: 增加可选的 `generate_extra_cleanup=true` 开关，为多余对象生成清理候选脚本（如放入 `fixup_scripts/cleanup/` 目录），但**默认关闭**。启用时应增加安全前置条件：依赖链校验通过、系统对象保护（含 `PUBLIC/__public`）、黑名单对象保护、并在脚本中明确标注“该对象在源端不存在，需人工确认后执行”。
 
-#### EXTRA-GAP-04: 未追踪类型的多余对象完全不可见
+#### EXTRA-GAP-04: 未追踪类型的多余对象在对象级 extra 统计中不可见
 
-与"遗漏对象"（第 2 章）对应，以下类型的多余对象同样无法检测：
+与"遗漏对象"（第 2 章）对应，以下类型的多余对象当前不会进入对象级 extra 统计：
 
 | 类型 | 多余风险说明 |
 |------|------------|

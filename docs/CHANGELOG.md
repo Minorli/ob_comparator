@@ -8,12 +8,13 @@
 - 新增 report_db_store_scope 与 report_db_detail_item_enable 配置
 - 新增报告分析视图（ACTIONS / OBJECT_PROFILE / TRENDS / PENDING_ACTIONS / GRANT_CLASS / USABILITY_CLASS）
 - 新增写库失败追踪与闭环表（WRITE_ERRORS / RESOLUTION）
-- HOW_TO_READ_REPORTS_IN_OB_70_sqls.txt SQL 校验修正与完善
+- HOW_TO_READ_REPORTS_IN_OB_73_sqls.txt SQL 校验修正与完善
 
 ## [未发布]
 
 ### 新增
 - 交付前正确性基线文档化：统一补充 `py_compile` + `unittest` + 可选联调命令。
+- report_to_db 增强：`report_db_store_scope=full` 下新增 `DIFF_REPORT_ARTIFACT_LINE`，run 目录 txt 报告逐行入库，支持数据库侧 100% 文本复盘。
 
 ### 变更
 - README / readme_config / ARCHITECTURE / ADVANCED_USAGE / TECHNICAL_SPECIFICATION / DEPLOYMENT 同步到当前实现。

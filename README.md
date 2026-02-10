@@ -7,10 +7,11 @@
 ## 近期更新（0.9.8.3）
 - report_to_db 覆盖范围扩展（支持 full 模式更多表）。
 - 新增 DIFF_REPORT_DETAIL_ITEM（明细行化），便于列级排查。
+- 新增 DIFF_REPORT_ARTIFACT_LINE（报告文本逐行入库），`full` 模式下支持 txt 100% DB 查询。
 - 新增 report_db_store_scope 与 report_db_detail_item_enable 配置。
 - 新增报告分析视图（actions/profile/trends/pending/grant/usability）。
 - 新增写库失败追踪与整改闭环表（WRITE_ERRORS / RESOLUTION）。
-- HOW_TO_READ_REPORTS_IN_OB_70_sqls.txt SQL 全量校验与修正。
+- HOW_TO_READ_REPORTS_IN_OB_73_sqls.txt SQL 全量校验与修正。
 
 详见：`docs/RELEASE_NOTES_0.9.8.3.md`
 
