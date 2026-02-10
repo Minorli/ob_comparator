@@ -1302,3 +1302,86 @@ REPLACE(REPLACE(REPLACE(DATA_DEFAULT, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ')
 - **投入**: ~80 行代码（含标准化逻辑）
 - **实现**: 标准化 `data_default` 后比较，需要处理 NULL/空字符串、函数名映射
 - **收益**: 发现默认值丢失，防止 INSERT 行为异常
+
+---
+
+## 5. "多余对象"检测能力分析（目标端有、源端无）
+
+### 5.1 当前已具备的多余对象检测
+
+主程序**已具备**多余对象（目标端存在但源端不存在）的检测能力，覆盖范围如下：
+
+| 检测层级 | 实现位置 | 输出方式 | 粒度 |
+|---------|---------|---------|------|
+| **主对象（TABLE/VIEW/PROCEDURE 等）** | `check_primary_objects` → `extra_targets` (line 13138-13144) | `extra_targets_detail_{timestamp}.txt` + 控制台 "目标端多出的对象" | **具体对象名** |
+| **INDEX** | `IndexMismatch.extra_indexes` | 报告 mismatch 明细 | **具体索引名（按表）** |
+| **CONSTRAINT** | `ConstraintMismatch.extra_constraints` | 报告 mismatch 明细 | **具体约束名（按表）** |
+| **SEQUENCE** | `SequenceMismatch.extra_sequences` | 报告 mismatch 明细 | **具体序列名（按 schema）** |
+| **TRIGGER** | `TriggerMismatch.extra_triggers` | 报告 mismatch 明细 | **具体触发器名（按表）** |
+| **TABLE 列** | `extra_in_tgt`（列名集合差集） | mismatched 报告 | **具体列名** |
+| **各类型数量汇总** | `compute_object_counts` → `summary["extra"]` | 报告汇总 + Report DB | **仅数量（INDEX/CONSTRAINT 为近似值）** |
+
+### 5.2 多余对象检测的盲区
+
+#### EXTRA-GAP-01: `print_only` 类型的多余对象不检测
+
+**现状**: `MATERIALIZED VIEW` 被归入 `PRINT_ONLY_PRIMARY_TYPES`，`check_primary_objects` 中对 `print_only` 类型只记录 `skipped`，**不参与 `extra_targets` 检测**（line 13139 排除了 `print_only_types_u`）。
+
+```python
+for obj_type in sorted((allowed_types - print_only_types_u) - set(PACKAGE_OBJECT_TYPES)):
+```
+
+**影响**: 如果 OB 端存在源端不存在的 MATERIALIZED VIEW，不会被报告为多余对象。
+
+#### EXTRA-GAP-02: INDEX/CONSTRAINT 的多余数量为近似值
+
+**现状**: `compute_object_counts` 对 INDEX 和 CONSTRAINT 使用总数差值 `max(0, tgt_count - src_count)` 计算"多余"数量，**不是精确的名称级比较**。系统生成的索引/约束名在源端和目标端可能不同，导致名称级别的多余/缺失统计偏高。
+
+**注**: 实际的名称级多余检测由 `IndexMismatch.extra_indexes` / `ConstraintMismatch.extra_constraints` 完成，这部分是准确的（按列组合匹配后取差集）。但汇总数量可能不一致。
+
+#### EXTRA-GAP-03: 多余对象不生成清理脚本
+
+**现状**: 对于检测到的多余对象，主程序**仅报告不处理**。不生成 `DROP` 脚本来清理目标端的多余对象。
+
+**影响**:
+- 多余的触发器可能在 DML 时执行非预期逻辑
+- 多余的索引影响写入性能和存储空间
+- 多余的约束可能阻止合法的数据插入
+- 多余的存储过程/函数可能被应用误调用
+
+**建议**: 增加可选的 `generate_extra_cleanup=true` 开关，为多余对象生成 `DROP` 脚本（放入 `fixup_scripts/cleanup/` 目录），但**默认关闭**以避免误删。脚本应包含注释说明该对象在源端不存在。
+
+#### EXTRA-GAP-04: 未追踪类型的多余对象完全不可见
+
+与"遗漏对象"（第 2 章）对应，以下类型的多余对象同样无法检测：
+
+| 类型 | 多余风险说明 |
+|------|------------|
+| DATABASE LINK | OB 端可能残留测试环境的 DB LINK，指向错误目标 |
+| DIRECTORY | 残留的 DIRECTORY 可能指向不存在的路径 |
+| VPD POLICY | 目标端可能有测试策略未清理，导致查询行为异常 |
+| PROFILE | 多余的 PROFILE 不影响功能，风险低 |
+| CONTEXT | 多余的 CONTEXT 不影响功能，风险低 |
+
+### 5.3 多余对象检测的改进建议
+
+| 优先级 | 改进项 | 投入 |
+|--------|--------|------|
+| **高** | EXTRA-GAP-03: 为多余 TRIGGER / INDEX / CONSTRAINT 生成可选的 DROP 脚本 | ~100 行 |
+| 中 | EXTRA-GAP-01: 将 MATERIALIZED VIEW 纳入 `extra_targets` 检测 | ~5 行 |
+| 中 | EXTRA-GAP-02: INDEX/CONSTRAINT 汇总数量改为精确统计 | ~30 行 |
+| 低 | EXTRA-GAP-04: 扩展对 DB LINK / DIRECTORY 的多余对象检测 | ~60 行 |
+
+---
+
+## 6. 总结
+
+本报告从两个方向审查了 `schema_diff_reconciler.py` 的校验覆盖范围：
+
+**方向一：遗漏对象（源端有、目标端无/不一致）**
+- 发现 **6 项 P0 高优先级**遗漏，其中 3 项（列可空性、序列属性、列默认值）数据已在内存，实现成本极低
+- 发现 **7 项 P1** 和 **7 项 P2** 遗漏，覆盖索引深度属性、数据类型、DB LINK、MVIEW LOG 等
+
+**方向二：多余对象（目标端有、源端无）**
+- 主程序已具备名称级多余对象检测（覆盖主要类型 + INDEX/CONSTRAINT/SEQUENCE/TRIGGER）
+- 发现 **4 项盲区**，最关键的是**多余对象不生成清理脚本**（EXTRA-GAP-03），可能导致多余触发器/约束在生产环境造成非预期行为
