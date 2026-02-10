@@ -6341,7 +6341,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(sdr.normalize_constraint_status_sync_mode("bad"), "enabled_only")
         self.assertEqual(sdr.normalize_trigger_validity_sync_mode("on"), "compile")
         self.assertEqual(sdr.normalize_trigger_validity_sync_mode("off"), "off")
-        self.assertEqual(sdr.normalize_trigger_validity_sync_mode("bad"), "off")
+        self.assertEqual(sdr.normalize_trigger_validity_sync_mode("bad"), "compile")
 
     def test_build_trigger_status_fixup_sqls_compile_mode(self):
         row = sdr.TriggerStatusReportRow(

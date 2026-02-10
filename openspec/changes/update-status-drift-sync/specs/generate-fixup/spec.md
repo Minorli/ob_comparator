@@ -2,7 +2,7 @@
 ### Requirement: Missing object DDL generation
 The system SHALL generate CREATE DDL scripts for missing objects by type and store them in fixup_scripts subdirectories.
 
-#### Scenario: Status drift fixup disabled by default
+#### Scenario: Status drift fixup explicitly disabled
 - **WHEN** status drift checks detect trigger/constraint status differences
 - **AND** `generate_status_fixup=false`
 - **THEN** no status-fixup SQL files are generated

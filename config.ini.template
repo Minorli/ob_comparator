@@ -197,10 +197,10 @@ check_primary_types     =
 synonym_check_scope     = public_only
 check_extra_types       = index,constraint,sequence,trigger
 check_status_drift_types = trigger,constraint
-generate_status_fixup   = false
+generate_status_fixup   = true
 status_fixup_types      = trigger,constraint
 constraint_status_sync_mode = enabled_only
-trigger_validity_sync_mode = off
+trigger_validity_sync_mode = compile
 # 是否进行依赖关系校验
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 check_dependencies      = true

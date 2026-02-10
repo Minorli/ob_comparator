@@ -8,10 +8,10 @@
   - TRIGGER：ENABLED/DISABLED、VALID/INVALID。
   - CONSTRAINT：ENABLED/DISABLED（可选扩展到 VALIDATED）。
 - 新增状态差异明细报告：`status_drift_detail_<ts>.txt`（`|` 分隔）。
-- 新增可选状态修复脚本生成（默认关闭）：
+- 新增可选状态修复脚本生成（默认开启，可通过配置关闭）：
   - `fixup_scripts/status/trigger/*.sql`
   - `fixup_scripts/status/constraint/*.sql`
-- 新增配置开关与默认值（保守策略，避免误改业务状态）。
+- 新增配置开关与默认值（支持按类型/模式精细控制）。
 
 ## Impact
 - Affected specs: `compare-objects`, `generate-fixup`, `export-reports`, `configuration-control`

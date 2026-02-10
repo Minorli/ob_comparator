@@ -2414,15 +2414,15 @@ def normalize_constraint_status_sync_mode(raw_value: Optional[str]) -> str:
 
 def normalize_trigger_validity_sync_mode(raw_value: Optional[str]) -> str:
     if not raw_value or not str(raw_value).strip():
-        return "off"
+        return "compile"
     value = str(raw_value).strip().lower()
     value = TRIGGER_VALIDITY_SYNC_MODE_ALIASES.get(value, value)
     if value not in TRIGGER_VALIDITY_SYNC_MODE_VALUES:
         log.warning(
-            "trigger_validity_sync_mode=%s 不在支持范围内，将回退为 off。",
+            "trigger_validity_sync_mode=%s 不在支持范围内，将回退为 compile。",
             raw_value
         )
-        return "off"
+        return "compile"
     return value
 
 
@@ -3224,10 +3224,10 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('trigger_list', '')
         settings.setdefault('trigger_qualify_schema', 'true')
         settings.setdefault('check_status_drift_types', 'trigger,constraint')
-        settings.setdefault('generate_status_fixup', 'false')
+        settings.setdefault('generate_status_fixup', 'true')
         settings.setdefault('status_fixup_types', 'trigger,constraint')
         settings.setdefault('constraint_status_sync_mode', 'enabled_only')
-        settings.setdefault('trigger_validity_sync_mode', 'off')
+        settings.setdefault('trigger_validity_sync_mode', 'compile')
         settings.setdefault('sequence_remap_policy', 'source_only')
         settings.setdefault('generate_grants', 'true')
         settings.setdefault('grant_tab_privs_scope', 'owner')
@@ -3585,8 +3585,8 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             'check_status_drift_types'
         )
         settings['generate_status_fixup'] = parse_bool_flag(
-            settings.get('generate_status_fixup', 'false'),
-            False
+            settings.get('generate_status_fixup', 'true'),
+            True
         )
         settings['status_fixup_type_set'] = parse_type_list(
             settings.get('status_fixup_types', ''),
@@ -3597,7 +3597,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             settings.get('constraint_status_sync_mode', 'enabled_only')
         )
         settings['trigger_validity_sync_mode'] = normalize_trigger_validity_sync_mode(
-            settings.get('trigger_validity_sync_mode', 'off')
+            settings.get('trigger_validity_sync_mode', 'compile')
         )
         settings['print_dependency_chains'] = parse_bool_flag(
             settings.get('print_dependency_chains', 'true'),
@@ -4404,8 +4404,8 @@ def run_config_wizard(config_path: Path) -> None:
     _prompt_field(
         "SETTINGS",
         "generate_status_fixup",
-        "是否生成状态漂移修复脚本 (true/false，默认 false)",
-        default=cfg.get("SETTINGS", "generate_status_fixup", fallback="false"),
+        "是否生成状态漂移修复脚本 (true/false，默认 true)",
+        default=cfg.get("SETTINGS", "generate_status_fixup", fallback="true"),
         transform=_bool_transform,
     )
     _prompt_field(
@@ -4426,7 +4426,7 @@ def run_config_wizard(config_path: Path) -> None:
         "SETTINGS",
         "trigger_validity_sync_mode",
         "触发器有效性同步模式 (off/compile)",
-        default=cfg.get("SETTINGS", "trigger_validity_sync_mode", fallback="off"),
+        default=cfg.get("SETTINGS", "trigger_validity_sync_mode", fallback="compile"),
         validator=_validate_trigger_validity_sync_mode,
         transform=normalize_trigger_validity_sync_mode,
     )
@@ -21224,9 +21224,9 @@ def generate_fixup_scripts(
     view_compat_map = view_compat_map or {}
     check_status_drift_types = set(settings.get("check_status_drift_type_set", set()) or set())
     status_fixup_types = set(settings.get("status_fixup_type_set", set()) or set())
-    generate_status_fixup = parse_bool_flag(settings.get("generate_status_fixup", "false"), False)
+    generate_status_fixup = parse_bool_flag(settings.get("generate_status_fixup", "true"), True)
     constraint_status_sync_mode = settings.get("constraint_status_sync_mode", "enabled_only")
-    trigger_validity_sync_mode = settings.get("trigger_validity_sync_mode", "off")
+    trigger_validity_sync_mode = settings.get("trigger_validity_sync_mode", "compile")
     invalid_view_keys: Set[Tuple[str, str]] = set()
     invalid_trigger_keys: Set[Tuple[str, str]] = set()
     for (owner, name, obj_type), status in (oracle_meta.object_statuses or {}).items():
@@ -28955,7 +28955,7 @@ def save_report_to_db(
             table_target_map,
             trigger_status_rows=trigger_status_rows,
             constraint_status_rows=constraint_status_rows,
-            trigger_validity_mode=settings.get("trigger_validity_sync_mode", "off")
+            trigger_validity_mode=settings.get("trigger_validity_sync_mode", "compile")
         )
     else:
         detail_rows, detail_truncated, detail_truncated_count = [], False, 0
@@ -28971,7 +28971,7 @@ def save_report_to_db(
             detail_item_max_rows,
             trigger_status_rows=trigger_status_rows,
             constraint_status_rows=constraint_status_rows,
-            trigger_validity_mode=settings.get("trigger_validity_sync_mode", "off")
+            trigger_validity_mode=settings.get("trigger_validity_sync_mode", "compile")
         )
         if detail_item_truncated:
             detail_truncated = True
@@ -30671,7 +30671,7 @@ def print_final_report(
             constraint_status_rows or [],
             report_path.parent,
             report_ts,
-            trigger_validity_mode=settings.get("trigger_validity_sync_mode", "off") if settings else "off"
+            trigger_validity_mode=settings.get("trigger_validity_sync_mode", "compile") if settings else "compile"
         )
         _add_index_entry(
             "DETAIL",
