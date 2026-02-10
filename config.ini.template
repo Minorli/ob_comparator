@@ -105,6 +105,9 @@ dbcat_chunk_size        = 150
 # 是否在对比后生成修复脚本（dbcat 抽取，VIEW 走 DBMS_METADATA）
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 generate_fixup          = true
+# 是否生成目标端“多余对象”清理候选（仅输出注释候选，不自动执行）
+# 可选值：true/false/1/0/yes/no（大小写不敏感）
+generate_extra_cleanup  = false
 # interval 分区补齐脚本（默认开启）
 # generate_interval_partition_fixup: true/false
 # interval_partition_cutoff: 截止日期，格式 YYYYMMDD（默认 20280301）

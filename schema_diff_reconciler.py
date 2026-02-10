@@ -3179,6 +3179,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('fixup_max_sql_file_mb', '50')
         settings.setdefault('fixup_force_clean', 'true')
         settings.setdefault('fixup_drop_sys_c_columns', 'true')
+        settings.setdefault('generate_extra_cleanup', 'false')
         # obclient 超时时间 (秒)
         settings.setdefault('obclient_timeout', '60')
         # 报告输出目录
@@ -3322,6 +3323,10 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings['enable_comment_check'] = parse_bool_flag(
             settings.get('check_comments', 'true'),
             True
+        )
+        settings['generate_extra_cleanup'] = parse_bool_flag(
+            settings.get('generate_extra_cleanup', 'false'),
+            False
         )
         settings['check_object_usability'] = parse_bool_flag(
             settings.get('check_object_usability', 'false'),
@@ -4055,6 +4060,13 @@ def run_config_wizard(config_path: Path) -> None:
         "generate_fixup",
         "是否生成目标端订正 SQL (true/false)",
         default=cfg.get("SETTINGS", "generate_fixup", fallback="true"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "generate_extra_cleanup",
+        "是否生成目标端多余对象清理候选（仅注释，不自动执行）(true/false)",
+        default=cfg.get("SETTINGS", "generate_extra_cleanup", fallback="false"),
         transform=_bool_transform,
     )
     _prompt_field(
@@ -8167,7 +8179,8 @@ def compute_object_counts(
                 actual_set = actual_set - ignored_due_source_invalid
 
         # For constraints and indexes, names can be system-generated. A simple name comparison is not enough.
-        # This count is a rough estimation. The detailed mismatch is more important.
+        # This count is a rough estimation. Final report counts are reconciled later from semantic mismatch details
+        # (see reconcile_object_counts_summary), so we avoid raising early "issue_types" noise from this stage.
         # Here we count based on what's found in meta, not remapped names, for simplicity.
         if obj_type_u in ('CONSTRAINT', 'INDEX'):
             if obj_type_u == 'CONSTRAINT':
@@ -8190,8 +8203,7 @@ def compute_object_counts(
             summary["oceanbase"][obj_type_u] = tgt_count
             summary["missing"][obj_type_u] = max(0, src_count - tgt_count)
             summary["extra"][obj_type_u] = max(0, tgt_count - src_count)
-            if src_count != tgt_count:
-                issue_types.append(obj_type_u)
+            # NOTE: do not add INDEX/CONSTRAINT to early issue_types warning list.
             continue
 
         matched = expected_set & actual_set
@@ -12848,16 +12860,16 @@ def check_primary_objects(
         if obj_type_u not in allowed_types:
             continue
 
-        if obj_type_u in print_only_types_u:
-            reason = PRINT_ONLY_PRIMARY_REASONS.get(obj_type_u, "仅打印不校验")
-            results['skipped'].append((obj_type_u, full_tgt, src_name, reason))
-            continue
-
         if obj_type_u in PACKAGE_OBJECT_TYPES:
             # PACKAGE/PKG BODY 使用独立有效性对比逻辑
             continue
 
         expected_targets[obj_type_u].add(full_tgt)
+
+        if obj_type_u in print_only_types_u:
+            reason = PRINT_ONLY_PRIMARY_REASONS.get(obj_type_u, "仅打印不校验")
+            results['skipped'].append((obj_type_u, full_tgt, src_name, reason))
+            continue
 
         if obj_type_u == 'TABLE':
             # 1) OB 是否存在 TABLE
@@ -13135,8 +13147,8 @@ def check_primary_objects(
             # 不在主对比范围的类型直接忽略
             continue
 
-    # 记录目标端多出的对象（任何受管类型）
-    for obj_type in sorted((allowed_types - print_only_types_u) - set(PACKAGE_OBJECT_TYPES)):
+    # 记录目标端多出的对象（任何受管类型；print-only 类型也纳入 extra 统计）
+    for obj_type in sorted(allowed_types - set(PACKAGE_OBJECT_TYPES)):
         actual = ob_meta.objects_by_type.get(obj_type, set())
         expected = expected_targets.get(obj_type, set())
         extras = sorted(actual - expected)
@@ -20121,6 +20133,136 @@ def _build_drop_statement(obj_type: str, schema: str, name: str, parent_table: O
     return None
 
 
+def _build_extra_cleanup_drop_statement(
+    obj_type: str,
+    schema: str,
+    name: str,
+    parent_table: Optional[str] = None
+) -> Optional[str]:
+    obj_type_u = (obj_type or "").upper()
+    schema_u = (schema or "").strip().upper()
+    name_u = (name or "").strip().upper()
+    if not obj_type_u or not schema_u or not name_u:
+        return None
+    if obj_type_u in PACKAGE_OBJECT_TYPES:
+        return None
+    if obj_type_u == "SYNONYM" and schema_u in ("PUBLIC", "__PUBLIC"):
+        return f"DROP PUBLIC SYNONYM {name_u}"
+    return _build_drop_statement(obj_type_u, schema_u, name_u, parent_table=parent_table)
+
+
+def collect_extra_cleanup_candidates(
+    tv_results: Optional[ReportResults],
+    extra_results: Optional[ExtraCheckResults]
+) -> List[Tuple[str, str, str, str]]:
+    """
+    汇总目标端“多余对象”的清理候选语句（默认仅输出注释候选，不直接执行）。
+    返回字段: (OBJECT_TYPE, TARGET_FULL, SOURCE, SQL)
+    """
+    candidates: Dict[Tuple[str, str], Tuple[str, str, str, str]] = {}
+
+    def _add_candidate(obj_type: str, target_full: str, sql_stmt: Optional[str], source: str) -> None:
+        obj_type_u = (obj_type or "").upper()
+        target_u = (target_full or "").upper()
+        if not obj_type_u or not target_u or not sql_stmt:
+            return
+        key = (obj_type_u, target_u)
+        if key not in candidates:
+            candidates[key] = (obj_type_u, target_u, source, sql_stmt.rstrip(";") + ";")
+
+    if tv_results:
+        for obj_type, tgt_name in (tv_results.get("extra_targets", []) or []):
+            parsed = parse_full_object_name(tgt_name)
+            if not parsed:
+                continue
+            schema_u, name_u = parsed
+            stmt = _build_extra_cleanup_drop_statement(obj_type, schema_u, name_u)
+            _add_candidate(obj_type, f"{schema_u}.{name_u}", stmt, "PRIMARY_EXTRA")
+
+    if extra_results:
+        for item in (extra_results.get("index_mismatched", []) or []):
+            parsed = parse_full_object_name(item.table)
+            if not parsed:
+                continue
+            schema_u, _table_u = parsed
+            for idx_name in sorted(item.extra_indexes or set()):
+                idx_u = (idx_name or "").upper()
+                stmt = _build_extra_cleanup_drop_statement("INDEX", schema_u, idx_u)
+                _add_candidate("INDEX", f"{schema_u}.{idx_u}", stmt, "EXTRA_INDEX")
+
+        for item in (extra_results.get("constraint_mismatched", []) or []):
+            parsed = parse_full_object_name(item.table)
+            if not parsed:
+                continue
+            schema_u, table_u = parsed
+            for cons_name in sorted(item.extra_constraints or set()):
+                cons_u = (cons_name or "").upper()
+                stmt = _build_extra_cleanup_drop_statement(
+                    "CONSTRAINT",
+                    schema_u,
+                    cons_u,
+                    parent_table=table_u
+                )
+                _add_candidate("CONSTRAINT", f"{schema_u}.{cons_u}", stmt, "EXTRA_CONSTRAINT")
+
+        for item in (extra_results.get("sequence_mismatched", []) or []):
+            schema_u = (item.tgt_schema or "").upper()
+            if not schema_u:
+                continue
+            for seq_name in sorted(item.extra_sequences or set()):
+                seq_u = (seq_name or "").upper()
+                stmt = _build_extra_cleanup_drop_statement("SEQUENCE", schema_u, seq_u)
+                _add_candidate("SEQUENCE", f"{schema_u}.{seq_u}", stmt, "EXTRA_SEQUENCE")
+
+        for item in (extra_results.get("trigger_mismatched", []) or []):
+            for trg_full in sorted(item.extra_triggers or set()):
+                parsed = parse_full_object_name(trg_full)
+                if not parsed:
+                    continue
+                schema_u, trg_u = parsed
+                stmt = _build_extra_cleanup_drop_statement("TRIGGER", schema_u, trg_u)
+                _add_candidate("TRIGGER", f"{schema_u}.{trg_u}", stmt, "EXTRA_TRIGGER")
+
+    return [candidates[key] for key in sorted(candidates.keys())]
+
+
+def export_extra_cleanup_candidates(
+    base_dir: Path,
+    candidates: List[Tuple[str, str, str, str]]
+) -> Optional[Path]:
+    if not base_dir or not candidates:
+        return None
+    output_dir = Path(base_dir) / "cleanup_candidates"
+    ensure_dir(output_dir)
+    output_path = output_dir / "extra_cleanup_candidates.txt"
+    lines: List[str] = [
+        "# EXTRA 清理候选脚本（仅供人工审核）",
+        "# 说明：以下 SQL 默认以注释形式输出，不会被 run_fixup 自动执行。",
+        "# 字段分隔符: |",
+        "# OBJECT_TYPE|TARGET_FULL|SOURCE|CANDIDATE_SQL",
+        "",
+        "DETAIL"
+    ]
+    for obj_type_u, target_u, source, sql_stmt in candidates:
+        lines.append(
+            "|".join([
+                sanitize_pipe_field(obj_type_u),
+                sanitize_pipe_field(target_u),
+                sanitize_pipe_field(source),
+                sanitize_pipe_field(sql_stmt),
+            ])
+        )
+
+    lines.append("")
+    lines.append("CANDIDATE_SQL_COMMENTS")
+    for _obj_type_u, target_u, _source, sql_stmt in candidates:
+        lines.append(f"-- {target_u}")
+        lines.append(f"-- {sql_stmt}")
+
+    output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return output_path
+
+
 def _build_guard_block(obj_type: str, schema: str, name: str, ddl: str) -> str:
     exist_sql = _build_exist_check_sql(obj_type, schema, name)
     ddl_body = _strip_trailing_ddl_delimiters(ddl)
@@ -21225,6 +21367,7 @@ def generate_fixup_scripts(
     check_status_drift_types = set(settings.get("check_status_drift_type_set", set()) or set())
     status_fixup_types = set(settings.get("status_fixup_type_set", set()) or set())
     generate_status_fixup = parse_bool_flag(settings.get("generate_status_fixup", "true"), True)
+    generate_extra_cleanup = parse_bool_flag(settings.get("generate_extra_cleanup", "false"), False)
     constraint_status_sync_mode = settings.get("constraint_status_sync_mode", "enabled_only")
     trigger_validity_sync_mode = settings.get("trigger_validity_sync_mode", "compile")
     invalid_view_keys: Set[Tuple[str, str]] = set()
@@ -24074,6 +24217,18 @@ def generate_fixup_scripts(
                 log.info("[FIXUP] (9/9) 无需生成授权脚本。")
     else:
         log.info("[FIXUP] (9/9) 授权脚本生成已关闭。")
+
+    if generate_extra_cleanup:
+        cleanup_candidates = collect_extra_cleanup_candidates(tv_results, extra_results)
+        cleanup_path = export_extra_cleanup_candidates(base_dir, cleanup_candidates)
+        if cleanup_path:
+            log.info(
+                "[FIXUP] 额外对象清理候选已输出: %s (count=%d, 注释候选不自动执行)",
+                cleanup_path,
+                len(cleanup_candidates)
+            )
+        else:
+            log.info("[FIXUP] 未发现可输出的额外对象清理候选。")
 
     if oracle_conn:
         try:

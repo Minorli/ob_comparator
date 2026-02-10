@@ -138,6 +138,8 @@
 
 修补脚本生成（Fixup）
 - generate_fixup：是否生成修补脚本。默认：true。
+- generate_extra_cleanup：是否生成“目标端多余对象”的清理候选。默认：false。
+  说明：仅输出注释候选文件 `fixup_scripts/cleanup_candidates/extra_cleanup_candidates.txt`，不会被 run_fixup 自动执行；用于人工审核后再处理。
 - generate_status_fixup：是否生成“状态漂移”修补脚本。默认：true。
   说明：仅处理已存在对象的状态差异，不负责对象创建；输出目录为 fixup_scripts/status/。
 - status_fixup_types：状态漂移修补脚本类型。默认：trigger,constraint。

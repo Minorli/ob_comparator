@@ -3264,6 +3264,93 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
 
         self.assertEqual(results.get("extra_targets"), [])
 
+    def test_check_primary_objects_marks_print_only_mview_extra_target(self):
+        master_list = [
+            ("A.MV1", "B.MV1", "MATERIALIZED VIEW"),
+        ]
+        oracle_meta = self._make_oracle_meta()
+        ob_meta = self._make_ob_meta()._replace(objects_by_type={
+            "MATERIALIZED VIEW": {"B.MV1", "B.MV_EXTRA"},
+        })
+
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"MATERIALIZED VIEW"},
+            print_only_types={"MATERIALIZED VIEW"},
+            settings={},
+        )
+
+        self.assertEqual(len(results.get("skipped", [])), 1)
+        self.assertIn(("MATERIALIZED VIEW", "B.MV_EXTRA"), results.get("extra_targets", []))
+        self.assertNotIn(("MATERIALIZED VIEW", "B.MV1"), results.get("extra_targets", []))
+
+    def test_collect_and_export_extra_cleanup_candidates(self):
+        tv_results = {
+            "extra_targets": [
+                ("MATERIALIZED VIEW", "B.MV_EXTRA"),
+                ("PACKAGE", "B.PKG_EXTRA"),
+                ("SYNONYM", "PUBLIC.SYN_PUB"),
+            ]
+        }
+        extra_results = {
+            "index_mismatched": [
+                sdr.IndexMismatch(
+                    table="B.T1",
+                    missing_indexes=set(),
+                    extra_indexes={"IX_T1_X"},
+                    detail_mismatch=[]
+                )
+            ],
+            "constraint_mismatched": [
+                sdr.ConstraintMismatch(
+                    table="B.T1",
+                    missing_constraints=set(),
+                    extra_constraints={"CK_T1_X"},
+                    detail_mismatch=[],
+                    downgraded_pk_constraints=set()
+                )
+            ],
+            "sequence_mismatched": [
+                sdr.SequenceMismatch(
+                    src_schema="A",
+                    tgt_schema="B",
+                    missing_sequences=set(),
+                    extra_sequences={"SEQ_EXTRA"},
+                    note=None,
+                    missing_mappings=[]
+                )
+            ],
+            "trigger_mismatched": [
+                sdr.TriggerMismatch(
+                    table="B.T1",
+                    missing_triggers=set(),
+                    extra_triggers={"B.TRG_T1_X"},
+                    detail_mismatch=[],
+                    missing_mappings=[]
+                )
+            ],
+        }
+
+        candidates = sdr.collect_extra_cleanup_candidates(tv_results, extra_results)
+        target_map = {target: sql for _obj_type, target, _source, sql in candidates}
+
+        self.assertIn("B.MV_EXTRA", target_map)
+        self.assertIn("PUBLIC.SYN_PUB", target_map)
+        self.assertNotIn("B.PKG_EXTRA", target_map)
+        self.assertEqual(target_map["PUBLIC.SYN_PUB"], "DROP PUBLIC SYNONYM SYN_PUB;")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = sdr.export_extra_cleanup_candidates(Path(tmpdir), candidates)
+            self.assertIsNotNone(output_path)
+            self.assertTrue(output_path.exists())
+            text = output_path.read_text(encoding="utf-8")
+            self.assertIn("DETAIL", text)
+            self.assertIn("CANDIDATE_SQL_COMMENTS", text)
+            self.assertIn("-- DROP INDEX", text)
+
     def test_compute_object_counts_ignores_source_invalid_package_on_both_sides(self):
         full_mapping = {
             "A.P1": {"PACKAGE": "B.P1"},
