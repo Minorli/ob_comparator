@@ -88,7 +88,7 @@
 校验范围与依赖
 - check_primary_types：限制主对象类型。默认：空（全部主对象）。
   可选值：TABLE, VIEW, MATERIALIZED VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, SYNONYM, JOB, SCHEDULE, TYPE, TYPE BODY。
-  注意：MATERIALIZED VIEW 默认仅打印不校验。
+  注意：MATERIALIZED VIEW 实际行为由 `mview_check_fixup_mode` + OB 版本门控决定。
 - check_extra_types：限制扩展对象检查。默认：空（全部扩展对象）。
   可选值：INDEX, CONSTRAINT, SEQUENCE, TRIGGER。
 - check_status_drift_types：状态漂移检查范围。默认：trigger,constraint。
@@ -139,6 +139,9 @@
 
 修补脚本生成（Fixup）
 - generate_fixup：是否生成修补脚本。默认：true。
+- mview_check_fixup_mode：MATERIALIZED VIEW 校验/修补模式。默认：auto。
+  可选值：auto（OB>=4.4.2 开启校验+修补；低版本仅打印）、on（强制开启校验+修补）、off（强制仅打印）。
+  说明：当 mode=auto 且 OB 版本无法识别时，为兼容旧行为会回退为“仅打印”并在日志提示。
 - generate_extra_cleanup：是否生成“目标端多余对象”的清理候选。默认：false。
   说明：仅输出注释候选文件 `fixup_scripts/cleanup_candidates/extra_cleanup_candidates.txt`，不会被 run_fixup 自动执行；用于人工审核后再处理。
 - generate_status_fixup：是否生成“状态漂移”修补脚本。默认：true。
@@ -151,7 +154,9 @@
   可选值：off（不处理 VALID/INVALID）、compile（当源 VALID 且目标 INVALID 时生成 COMPILE）。
 - fixup_drop_sys_c_columns：是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE。默认：true。
   说明：仅对“目标端多出来且列名匹配 SYS_C\\d+”的列生成 FORCE 清理；其余多余列仍保持注释建议。
-- generate_interval_partition_fixup：是否生成 interval 分区补齐脚本。默认：true。
+- generate_interval_partition_fixup：interval 分区补齐模式。默认：auto。
+  可选值：auto（OB>=4.4.2 默认关闭；低版本默认开启）、true（强制开启）、false（强制关闭）。
+  说明：当 mode=auto 且 OB 版本无法识别时，为兼容旧行为会回退为“开启”并在日志提示。
 - interval_partition_cutoff：interval 分区补齐截止日期（YYYYMMDD）。默认：20280301。
 - interval_partition_cutoff_numeric：数值型 interval 分区补齐上限（仅数值分区键生效）。默认：空（不补齐数值 interval）。注意：必须为正数。
 - fixup_schemas：仅为指定目标 schema 生成修补脚本。默认：空（全量）。

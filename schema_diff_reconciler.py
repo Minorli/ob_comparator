@@ -706,11 +706,35 @@ PRIMARY_OBJECT_TYPES: Tuple[str, ...] = (
 )
 
 PRINT_ONLY_PRIMARY_TYPES: Tuple[str, ...] = (
-    'MATERIALIZED VIEW'
+    'MATERIALIZED VIEW',
 )
 
 PRINT_ONLY_PRIMARY_REASONS: Dict[str, str] = {
     'MATERIALIZED VIEW': "OB 暂不支持 MATERIALIZED VIEW，仅打印不校验"
+}
+
+OB_FEATURE_GATE_VERSION = "4.4.2"
+INTERVAL_PARTITION_FIXUP_MODE_VALUES: Set[str] = {"auto", "true", "false"}
+INTERVAL_PARTITION_FIXUP_MODE_ALIASES: Dict[str, str] = {
+    "on": "true",
+    "yes": "true",
+    "1": "true",
+    "off": "false",
+    "no": "false",
+    "0": "false",
+}
+MVIEW_CHECK_FIXUP_MODE_VALUES: Set[str] = {"auto", "on", "off"}
+MVIEW_CHECK_FIXUP_MODE_ALIASES: Dict[str, str] = {
+    "true": "on",
+    "1": "on",
+    "yes": "on",
+    "enable": "on",
+    "enabled": "on",
+    "false": "off",
+    "0": "off",
+    "no": "off",
+    "disable": "off",
+    "disabled": "off",
 }
 
 PACKAGE_OBJECT_TYPES: Tuple[str, ...] = (
@@ -1798,6 +1822,34 @@ def parse_bool_flag(value: Optional[str], default: bool = True) -> bool:
     return str(value).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
 
 
+def normalize_interval_partition_fixup_mode(raw_value: Optional[str]) -> str:
+    value = (raw_value or "").strip().lower()
+    if not value:
+        return "auto"
+    value = INTERVAL_PARTITION_FIXUP_MODE_ALIASES.get(value, value)
+    if value not in INTERVAL_PARTITION_FIXUP_MODE_VALUES:
+        log.warning(
+            "generate_interval_partition_fixup=%s 不在支持范围内，将回退为 auto。",
+            raw_value
+        )
+        return "auto"
+    return value
+
+
+def normalize_mview_check_fixup_mode(raw_value: Optional[str]) -> str:
+    value = (raw_value or "").strip().lower()
+    if not value:
+        return "auto"
+    value = MVIEW_CHECK_FIXUP_MODE_ALIASES.get(value, value)
+    if value not in MVIEW_CHECK_FIXUP_MODE_VALUES:
+        log.warning(
+            "mview_check_fixup_mode=%s 不在支持范围内，将回退为 auto。",
+            raw_value
+        )
+        return "auto"
+    return value
+
+
 def parse_type_list(
     raw_value: str,
     allowed: Set[str],
@@ -2129,7 +2181,7 @@ def collect_fixup_config_diagnostics(
 
     primary_types = set(PRIMARY_OBJECT_TYPES)
     extra_types = set(EXTRA_OBJECT_CHECK_TYPES)
-    print_only_types = set(PRINT_ONLY_PRIMARY_TYPES)
+    print_only_types = set(settings.get("effective_print_only_primary_types") or PRINT_ONLY_PRIMARY_TYPES)
 
     for obj_type in sorted(fixup_types):
         if obj_type in print_only_types:
@@ -2147,14 +2199,29 @@ def collect_fixup_config_diagnostics(
     if trigger_list_path and "TRIGGER" not in enabled_extra_types:
         diagnostics.append("trigger_list 已配置，但 check_extra_types 未启用 TRIGGER，仅进行清单格式校验。")
 
-    if settings.get("generate_interval_partition_fixup"):
+    interval_enabled = bool(
+        settings.get(
+            "effective_interval_fixup_enabled",
+            settings.get("generate_interval_partition_fixup", False)
+        )
+    )
+    if interval_enabled:
         if "TABLE" not in enabled_primary_types:
             diagnostics.append("已启用 interval 分区补齐，但 check_primary_types 未启用 TABLE，相关脚本将无法生成。")
-        if not settings.get("interval_partition_cutoff_date"):
+        if not settings.get("interval_partition_cutoff_date") and not settings.get("interval_partition_cutoff_numeric_value"):
             diagnostics.append("interval_partition_cutoff 非法，interval 分区补齐将被跳过。")
         cutoff_numeric_raw = (settings.get("interval_partition_cutoff_numeric") or "").strip()
         if cutoff_numeric_raw and not settings.get("interval_partition_cutoff_numeric_value"):
             diagnostics.append("interval_partition_cutoff_numeric 非法，数值 interval 分区补齐将被跳过。")
+
+    if settings.get("generate_interval_partition_fixup_mode") == "auto" and not settings.get("ob_version_known"):
+        diagnostics.append(
+            "generate_interval_partition_fixup=auto 但 OB 版本不可识别，已按旧行为回退为启用。"
+        )
+    if settings.get("mview_check_fixup_mode") == "auto" and not settings.get("ob_version_known"):
+        diagnostics.append(
+            "mview_check_fixup_mode=auto 但 OB 版本不可识别，已按旧行为回退为仅打印。"
+        )
 
     status_check_types: Set[str] = set(settings.get("check_status_drift_type_set", set()) or set())
     if "TRIGGER" in status_check_types and "TRIGGER" not in enabled_extra_types:
@@ -3281,7 +3348,8 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('usability_check_workers', '10')
         settings.setdefault('max_usability_objects', '')
         settings.setdefault('usability_sample_ratio', '')
-        settings.setdefault('generate_interval_partition_fixup', 'true')
+        settings.setdefault('generate_interval_partition_fixup', 'auto')
+        settings.setdefault('mview_check_fixup_mode', 'auto')
         settings.setdefault('interval_partition_cutoff', '20280301')
         settings.setdefault('interval_partition_cutoff_numeric', '')
         settings.setdefault('blacklist_mode', 'auto')
@@ -3397,9 +3465,15 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             settings.get('check_column_order', 'false'),
             False
         )
-        settings['generate_interval_partition_fixup'] = parse_bool_flag(
-            settings.get('generate_interval_partition_fixup', 'true'),
-            True
+        settings['generate_interval_partition_fixup_mode'] = normalize_interval_partition_fixup_mode(
+            settings.get('generate_interval_partition_fixup', 'auto')
+        )
+        settings['mview_check_fixup_mode'] = normalize_mview_check_fixup_mode(
+            settings.get('mview_check_fixup_mode', 'auto')
+        )
+        # 运行态会基于 OB 版本重新计算该布尔值；这里保留预估值供前置逻辑使用。
+        settings['generate_interval_partition_fixup'] = (
+            settings['generate_interval_partition_fixup_mode'] != 'false'
         )
         cutoff_raw = (settings.get('interval_partition_cutoff', '20280301') or '').strip()
         settings['interval_partition_cutoff'] = cutoff_raw or '20280301'
@@ -3411,20 +3485,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings['interval_partition_cutoff_numeric_value'] = parse_interval_cutoff_numeric(
             cutoff_numeric_raw
         )
-        if settings['generate_interval_partition_fixup'] and not settings['interval_partition_cutoff_date']:
-            log.warning(
-                "interval_partition_cutoff=%s 非法，将跳过 interval 分区补齐脚本生成。",
-                settings.get('interval_partition_cutoff')
-            )
-        if (
-            settings['generate_interval_partition_fixup']
-            and cutoff_numeric_raw
-            and not settings.get('interval_partition_cutoff_numeric_value')
-        ):
-            log.warning(
-                "interval_partition_cutoff_numeric=%s 非法，将跳过数值 interval 分区补齐脚本生成。",
-                cutoff_numeric_raw
-            )
+        # interval 相关校验在主流程应用版本门控后再做，避免 auto 模式误报。
         settings['blacklist_mode'] = normalize_blacklist_mode(settings.get('blacklist_mode', 'auto'))
         settings['blacklist_rules_enable_set'] = parse_csv_set(settings.get('blacklist_rules_enable', ''))
         settings['blacklist_rules_disable_set'] = parse_csv_set(settings.get('blacklist_rules_disable', ''))
@@ -3947,6 +4008,22 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "仅支持 off/guard/replace/drop_create"
 
+    def _validate_interval_fixup_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = INTERVAL_PARTITION_FIXUP_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in INTERVAL_PARTITION_FIXUP_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 auto/true/false"
+
+    def _validate_mview_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = MVIEW_CHECK_FIXUP_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in MVIEW_CHECK_FIXUP_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 auto/on/off"
+
     def _validate_column_visibility_policy(val: str) -> Tuple[bool, str]:
         if not val.strip():
             return True, ""
@@ -4092,6 +4169,34 @@ def run_config_wizard(config_path: Path) -> None:
         "是否生成目标端订正 SQL (true/false)",
         default=cfg.get("SETTINGS", "generate_fixup", fallback="true"),
         transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "mview_check_fixup_mode",
+        "MATERIALIZED VIEW 校验/修补模式 (auto/on/off)",
+        default=cfg.get("SETTINGS", "mview_check_fixup_mode", fallback="auto"),
+        validator=_validate_mview_mode,
+        transform=normalize_mview_check_fixup_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "generate_interval_partition_fixup",
+        "interval 分区补齐脚本模式 (auto/true/false)",
+        default=cfg.get("SETTINGS", "generate_interval_partition_fixup", fallback="auto"),
+        validator=_validate_interval_fixup_mode,
+        transform=normalize_interval_partition_fixup_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "interval_partition_cutoff",
+        "interval 分区补齐截止日期 (YYYYMMDD)",
+        default=cfg.get("SETTINGS", "interval_partition_cutoff", fallback="20280301"),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "interval_partition_cutoff_numeric",
+        "数值 interval 分区补齐上限（可选，留空跳过）",
+        default=cfg.get("SETTINGS", "interval_partition_cutoff_numeric", fallback=""),
     )
     _prompt_field(
         "SETTINGS",
@@ -12840,6 +12945,7 @@ def check_primary_objects(
     oracle_meta: OracleMetadata,
     enabled_primary_types: Optional[Set[str]] = None,
     print_only_types: Optional[Set[str]] = None,
+    print_only_reasons: Optional[Dict[str, str]] = None,
     settings: Optional[Dict] = None
 ) -> ReportResults:
     """
@@ -12847,7 +12953,7 @@ def check_primary_objects(
       - TABLE: 存在性 + 列名集合 (忽略 OMS_OBJECT_NUMBER/OMS_RELATIVE_FNO/OMS_BLOCK_NUMBER/OMS_ROW_NUMBER)
       - LONG/LONG RAW 列要求目标端类型为 CLOB/BLOB
       - VIEW / PROCEDURE / FUNCTION / SYNONYM: 只校验存在性
-      - MATERIALIZED VIEW: 默认仅打印不校验（若未被禁用）
+      - MATERIALIZED VIEW: 可由版本门控/配置切换为仅打印或正常校验
       - PACKAGE / PACKAGE BODY: 单独走包有效性对比，不在这里处理
     """
     results: ReportResults = {
@@ -12901,6 +13007,16 @@ def check_primary_objects(
 
     allowed_types = enabled_primary_types or set(PRIMARY_OBJECT_TYPES)
     print_only_types_u = {t.upper() for t in (print_only_types or set())}
+    print_only_reasons_u = {
+        str(k).upper(): str(v)
+        for k, v in (print_only_reasons or PRINT_ONLY_PRIMARY_REASONS).items()
+    }
+    package_types_u = {t.upper() for t in PACKAGE_OBJECT_TYPES}
+    primary_existence_only_types = {
+        t.upper()
+        for t in allowed_types
+        if t.upper() != "TABLE" and t.upper() not in package_types_u and t.upper() not in print_only_types_u
+    }
 
     total = len(master_list)
     expected_targets: Dict[str, Set[str]] = defaultdict(set)
@@ -12933,7 +13049,7 @@ def check_primary_objects(
         expected_targets[obj_type_u].add(full_tgt)
 
         if obj_type_u in print_only_types_u:
-            reason = PRINT_ONLY_PRIMARY_REASONS.get(obj_type_u, "仅打印不校验")
+            reason = print_only_reasons_u.get(obj_type_u, "仅打印不校验")
             results['skipped'].append((obj_type_u, full_tgt, src_name, reason))
             continue
 
@@ -13202,7 +13318,7 @@ def check_primary_objects(
                     type_mismatches
                 ))
 
-        elif obj_type_u in PRIMARY_EXISTENCE_ONLY_TYPES:
+        elif obj_type_u in primary_existence_only_types:
             ob_set = ob_meta.objects_by_type.get(obj_type_u, set())
             if full_tgt in ob_set:
                 results['ok'].append((obj_type_u, full_tgt))
@@ -16863,6 +16979,80 @@ def compare_version(version1: str, version2: str) -> int:
         return 0
     except (ValueError, AttributeError):
         return 0
+
+
+def apply_ob_feature_gates(settings: Dict, ob_version: Optional[str]) -> Dict[str, object]:
+    """
+    根据 OB 版本与配置计算运行态门控生效值。
+    - interval: auto 在 OB>=4.4.2 默认关闭，低版本默认开启
+    - mview: auto 在 OB>=4.4.2 默认开启，低版本默认仅打印
+    """
+    version_value = extract_ob_version_number(ob_version)
+    version_known = bool(version_value)
+    is_ob_442_plus = bool(version_known and compare_version(version_value, OB_FEATURE_GATE_VERSION) >= 0)
+
+    interval_mode = normalize_interval_partition_fixup_mode(
+        settings.get("generate_interval_partition_fixup_mode")
+        or settings.get("generate_interval_partition_fixup")
+    )
+    mview_mode = normalize_mview_check_fixup_mode(settings.get("mview_check_fixup_mode", "auto"))
+
+    if interval_mode == "auto":
+        interval_enabled = (not is_ob_442_plus) if version_known else True
+        interval_reason = (
+            f"auto(OB {'>=' if is_ob_442_plus else '<'} {OB_FEATURE_GATE_VERSION})"
+            if version_known else "auto(version_unknown_fallback)"
+        )
+    else:
+        interval_enabled = (interval_mode == "true")
+        interval_reason = f"manual({interval_mode})"
+
+    if mview_mode == "auto":
+        mview_enabled = is_ob_442_plus if version_known else False
+        mview_reason = (
+            f"auto(OB {'>=' if is_ob_442_plus else '<'} {OB_FEATURE_GATE_VERSION})"
+            if version_known else "auto(version_unknown_fallback)"
+        )
+    else:
+        mview_enabled = (mview_mode == "on")
+        mview_reason = f"manual({mview_mode})"
+
+    print_only_types = set(PRINT_ONLY_PRIMARY_TYPES)
+    print_only_reasons = dict(PRINT_ONLY_PRIMARY_REASONS)
+    if mview_enabled:
+        print_only_types.discard("MATERIALIZED VIEW")
+        print_only_reasons.pop("MATERIALIZED VIEW", None)
+    else:
+        print_only_reasons["MATERIALIZED VIEW"] = (
+            f"MATERIALIZED VIEW 当前按 {mview_reason} 仅打印不校验"
+        )
+
+    settings["generate_interval_partition_fixup_mode"] = interval_mode
+    settings["mview_check_fixup_mode"] = mview_mode
+    settings["ob_version"] = version_value or ""
+    settings["ob_version_known"] = version_known
+    settings["ob_is_442_plus"] = is_ob_442_plus
+    settings["effective_interval_fixup_enabled"] = interval_enabled
+    settings["effective_mview_enabled"] = mview_enabled
+    settings["effective_print_only_primary_types"] = print_only_types
+    settings["effective_print_only_primary_reasons"] = print_only_reasons
+    # 保持旧键为布尔值，减少下游改动
+    settings["generate_interval_partition_fixup"] = interval_enabled
+    settings["ob_feature_gate_decisions"] = {
+        "interval": interval_reason,
+        "mview": mview_reason,
+    }
+    return {
+        "version": version_value,
+        "version_known": version_known,
+        "is_ob_442_plus": is_ob_442_plus,
+        "interval_mode": interval_mode,
+        "interval_enabled": interval_enabled,
+        "interval_reason": interval_reason,
+        "mview_mode": mview_mode,
+        "mview_enabled": mview_enabled,
+        "mview_reason": mview_reason,
+    }
 
 
 def clean_view_ddl_for_oceanbase(ddl: str, ob_version: Optional[str] = None) -> str:
@@ -30217,6 +30407,34 @@ def print_final_report(
         primary_text.append(f"{remap_conflict_cnt}")
     summary_table.add_row("[bold]主对象 (TABLE/VIEW/etc.)[/bold]", primary_text)
 
+    if settings is not None:
+        gate_text = Text()
+        ob_version_text = (settings.get("ob_version") or "").strip() or "unknown"
+        gate_text.append("OB版本: ", style="info")
+        gate_text.append(ob_version_text)
+        gate_text.append("\ninterval分区补齐: ", style="info")
+        gate_text.append(
+            "开启" if settings.get("effective_interval_fixup_enabled") else "关闭",
+            style="ok" if settings.get("effective_interval_fixup_enabled") else "mismatch"
+        )
+        gate_text.append(
+            f" (mode={settings.get('generate_interval_partition_fixup_mode', '-')}, "
+            f"{(settings.get('ob_feature_gate_decisions') or {}).get('interval', '-')})",
+            style="info"
+        )
+        gate_text.append("\nMATERIALIZED VIEW: ", style="info")
+        mview_enabled = bool(settings.get("effective_mview_enabled"))
+        gate_text.append(
+            "校验+修补" if mview_enabled else "仅打印",
+            style="ok" if mview_enabled else "mismatch"
+        )
+        gate_text.append(
+            f" (mode={settings.get('mview_check_fixup_mode', '-')}, "
+            f"{(settings.get('ob_feature_gate_decisions') or {}).get('mview', '-')})",
+            style="info"
+        )
+        summary_table.add_row("[bold]版本门控[/bold]", gate_text)
+
     focus_text = Text()
     focus_text.append("缺失可修补: ", style="missing")
     focus_text.append(f"{missing_supported_cnt}")
@@ -30868,6 +31086,16 @@ def print_final_report(
         render_dep_rows("跳过", dependency_report.get("skipped", []), "info")
         console.print(dep_table)
 
+    mview_fixup_line = "fixup_scripts/materialized_view : MATERIALIZED VIEW 缺失对象修补脚本\n"
+    if settings is not None and not bool(settings.get("effective_mview_enabled", False)):
+        mview_fixup_line = "fixup_scripts/materialized_view : MATERIALIZED VIEW 当前仅打印不生成\n"
+
+    interval_fixup_line = "fixup_scripts/table_alter/interval_add_<cutoff> : interval 分区补齐脚本\n\n"
+    if settings is not None and not bool(settings.get("effective_interval_fixup_enabled", False)):
+        interval_fixup_line = (
+            "fixup_scripts/table_alter/interval_add_<cutoff> : interval 分区补齐脚本（当前门控关闭）\n\n"
+        )
+
     # --- 提示 ---
     fixup_panel = Panel.fit(
         "[bold]Fixup 脚本生成目录[/bold]\n\n"
@@ -30877,7 +31105,7 @@ def print_final_report(
         "fixup_scripts/view_prereq_grants : VIEW 前置授权 (依赖对象)\n"
         "fixup_scripts/view          : 缺失 VIEW 的 CREATE 脚本\n"
         "fixup_scripts/view_post_grants : VIEW 创建后授权 (同步源端权限)\n"
-        "fixup_scripts/materialized_view : MATERIALIZED VIEW 默认仅打印不生成\n"
+        + mview_fixup_line +
         "fixup_scripts/procedure     : 缺失 PROCEDURE 的 CREATE 脚本\n"
         "fixup_scripts/function      : 缺失 FUNCTION 的 CREATE 脚本\n"
         "fixup_scripts/package       : 缺失 PACKAGE 的 CREATE 脚本\n"
@@ -30896,7 +31124,7 @@ def print_final_report(
         "fixup_scripts/grants_miss   : 缺失授权脚本 (对象/角色/系统)\n"
         "fixup_scripts/grants_all    : 全量授权脚本 (对象/角色/系统)\n"
         "fixup_scripts/table_alter   : 列不匹配 TABLE 的 ALTER 修补脚本\n"
-        "fixup_scripts/table_alter/interval_add_<cutoff> : interval 分区补齐脚本\n\n"
+        + interval_fixup_line +
         "[bold]请在 OceanBase 执行前逐一人工审核上述脚本。[/bold]",
         title="[info]提示",
         border_style="info"
@@ -31524,15 +31752,28 @@ def main():
         log.info("项目主页: %s (问题反馈: %s)", REPO_URL, REPO_ISSUES_URL)
         enabled_primary_types: Set[str] = set(settings.get('enabled_primary_types') or set(PRIMARY_OBJECT_TYPES))
         enabled_extra_types: Set[str] = set(settings.get('enabled_extra_types') or set(EXTRA_OBJECT_CHECK_TYPES))
-        print_only_primary_types = set(PRINT_ONLY_PRIMARY_TYPES)
-        print_only_types = enabled_primary_types & print_only_primary_types
-        checked_primary_types = enabled_primary_types - print_only_types
-        enabled_object_types = enabled_primary_types | enabled_extra_types
         enable_dependencies_check: bool = bool(settings.get('enable_dependencies_check', True))
         enable_comment_check: bool = bool(settings.get('enable_comment_check', True))
         enable_column_order_check: bool = bool(settings.get('enable_column_order_check', False))
         enable_grant_generation: bool = bool(settings.get('enable_grant_generation', True))
         enable_usability_check: bool = bool(settings.get('check_object_usability', False))
+
+        # 初始化 Oracle Instant Client (Thick Mode)
+        init_oracle_client_from_settings(settings)
+
+        oracle_env_info = collect_oracle_env_info(ora_cfg)
+        ob_env_info = collect_ob_env_info(ob_cfg)
+        endpoint_info = {
+            "oracle": oracle_env_info,
+            "oceanbase": ob_env_info
+        }
+        ob_version = extract_ob_version_number(ob_env_info.get("version", ""))
+        gate_info = apply_ob_feature_gates(settings, ob_version)
+
+        print_only_primary_types = set(settings.get("effective_print_only_primary_types") or PRINT_ONLY_PRIMARY_TYPES)
+        print_only_types = enabled_primary_types & print_only_primary_types
+        checked_primary_types = enabled_primary_types - print_only_types
+        enabled_object_types = enabled_primary_types | enabled_extra_types
 
         log.info(
             "本次启用的主对象类型: %s",
@@ -31557,6 +31798,19 @@ def main():
             log.info("已根据配置关闭授权脚本生成。")
         if enable_usability_check:
             log.info("已开启 VIEW/SYNONYM 可用性校验。")
+        log.info(
+            "OB 特性门控: ob_version=%s, gate=%s, interval(mode=%s)->%s, mview(mode=%s)->%s",
+            gate_info.get("version") or "unknown",
+            OB_FEATURE_GATE_VERSION,
+            gate_info.get("interval_mode"),
+            "enabled" if gate_info.get("interval_enabled") else "disabled",
+            gate_info.get("mview_mode"),
+            "enabled" if gate_info.get("mview_enabled") else "print-only",
+        )
+        if not gate_info.get("version_known"):
+            log.warning(
+                "OB 版本不可识别，auto 门控已回退旧行为：interval=enabled, mview=print-only。"
+            )
 
         config_diagnostics = collect_fixup_config_diagnostics(
             settings,
@@ -31567,19 +31821,6 @@ def main():
             log_subsection("配置诊断")
             for item in config_diagnostics:
                 log.warning("[CONFIG] %s", item)
-
-        # 初始化 Oracle Instant Client (Thick Mode)
-        init_oracle_client_from_settings(settings)
-
-        oracle_env_info = collect_oracle_env_info(ora_cfg)
-        ob_env_info = collect_ob_env_info(ob_cfg)
-        endpoint_info = {
-            "oracle": oracle_env_info,
-            "oceanbase": ob_env_info
-        }
-        settings["ob_version"] = extract_ob_version_number(ob_env_info.get("version", ""))
-        if settings.get("ob_version"):
-            log.info("OceanBase 版本(解析): %s", settings["ob_version"])
 
     generate_fixup_enabled = settings.get('generate_fixup', 'true').strip().lower() in ('true', '1', 'yes')
     if not enabled_extra_types:
@@ -31996,6 +32237,7 @@ def main():
             oracle_meta,
             enabled_primary_types,
             print_only_types,
+            settings.get("effective_print_only_primary_reasons"),
             settings=settings
         )
         supplement_missing_views_from_mapping(

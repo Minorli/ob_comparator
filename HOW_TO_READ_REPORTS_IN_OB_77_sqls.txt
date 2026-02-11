@@ -1,6 +1,6 @@
 ============================================================
 OceanBase 报告库排查手册（report_to_db）
-文件: HOW_TO_READ_REPORTS_IN_OB_73_sqls.txt
+文件: HOW_TO_READ_REPORTS_IN_OB_77_sqls.txt
 ============================================================
 
 使用说明
@@ -701,6 +701,110 @@ SELECT a.artifact_type,
  WHERE a.report_id = :report_id
  ORDER BY a.artifact_type, a.file_path;
 
+------------------------------------------------------------
+G. 多余对象 / 同义词专项（SQL-74 ~ SQL-77）
+------------------------------------------------------------
+
+-- SQL-74 主对象“多余清单”总览（来自 extra_targets_detail_* 入库行）
+WITH f AS (
+    SELECT MAX(file_path) KEEP (DENSE_RANK LAST ORDER BY file_path) AS file_path
+      FROM DIFF_REPORT_ARTIFACT
+     WHERE report_id = :report_id
+       AND file_path LIKE '%/extra_targets_detail_%'
+)
+SELECT REGEXP_SUBSTR(al.line_text, '[^|]+', 1, 1) AS object_type,
+       REGEXP_SUBSTR(al.line_text, '[^|]+', 1, 2) AS target_full,
+       al.line_no
+  FROM DIFF_REPORT_ARTIFACT_LINE al
+  JOIN f ON al.file_path = f.file_path
+ WHERE al.report_id = :report_id
+   AND al.line_text IS NOT NULL
+   AND al.line_text NOT LIKE '#%'
+   AND al.line_text <> 'TYPE|TARGET_FULL'
+ ORDER BY object_type, target_full;
+
+-- SQL-75 仅看“多余同义词”列表（兼容 Oracle PUBLIC / OB __public）
+WITH f AS (
+    SELECT MAX(file_path) KEEP (DENSE_RANK LAST ORDER BY file_path) AS file_path
+      FROM DIFF_REPORT_ARTIFACT
+     WHERE report_id = :report_id
+       AND file_path LIKE '%/extra_targets_detail_%'
+),
+x AS (
+    SELECT REGEXP_SUBSTR(al.line_text, '[^|]+', 1, 1) AS object_type,
+           REGEXP_SUBSTR(al.line_text, '[^|]+', 1, 2) AS target_full
+      FROM DIFF_REPORT_ARTIFACT_LINE al
+      JOIN f ON al.file_path = f.file_path
+     WHERE al.report_id = :report_id
+       AND al.line_text IS NOT NULL
+       AND al.line_text NOT LIKE '#%'
+       AND al.line_text <> 'TYPE|TARGET_FULL'
+)
+SELECT target_full
+  FROM x
+ WHERE UPPER(object_type) = 'SYNONYM'
+ ORDER BY target_full;
+
+-- SQL-76 多余同义词按 schema 统计（可快速定位 __public / 业务 schema）
+WITH f AS (
+    SELECT MAX(file_path) KEEP (DENSE_RANK LAST ORDER BY file_path) AS file_path
+      FROM DIFF_REPORT_ARTIFACT
+     WHERE report_id = :report_id
+       AND file_path LIKE '%/extra_targets_detail_%'
+),
+x AS (
+    SELECT REGEXP_SUBSTR(al.line_text, '[^|]+', 1, 1) AS object_type,
+           REGEXP_SUBSTR(al.line_text, '[^|]+', 1, 2) AS target_full
+      FROM DIFF_REPORT_ARTIFACT_LINE al
+      JOIN f ON al.file_path = f.file_path
+     WHERE al.report_id = :report_id
+       AND al.line_text IS NOT NULL
+       AND al.line_text NOT LIKE '#%'
+       AND al.line_text <> 'TYPE|TARGET_FULL'
+),
+s AS (
+    SELECT target_full,
+           CASE
+             WHEN INSTR(target_full, '.') > 0 THEN SUBSTR(target_full, 1, INSTR(target_full, '.') - 1)
+             ELSE '(NO_SCHEMA)'
+           END AS target_schema
+      FROM x
+     WHERE UPPER(object_type) = 'SYNONYM'
+)
+SELECT target_schema, COUNT(*) AS extra_synonym_cnt
+  FROM s
+ GROUP BY target_schema
+ ORDER BY extra_synonym_cnt DESC, target_schema;
+
+-- SQL-77 多余同义词“是否在映射期望内”复核（正常应多数为 NOT_IN_MAPPING）
+WITH f AS (
+    SELECT MAX(file_path) KEEP (DENSE_RANK LAST ORDER BY file_path) AS file_path
+      FROM DIFF_REPORT_ARTIFACT
+     WHERE report_id = :report_id
+       AND file_path LIKE '%/extra_targets_detail_%'
+),
+x AS (
+    SELECT REGEXP_SUBSTR(al.line_text, '[^|]+', 1, 2) AS target_full
+      FROM DIFF_REPORT_ARTIFACT_LINE al
+      JOIN f ON al.file_path = f.file_path
+     WHERE al.report_id = :report_id
+       AND al.line_text IS NOT NULL
+       AND al.line_text NOT LIKE '#%'
+       AND al.line_text <> 'TYPE|TARGET_FULL'
+       AND UPPER(REGEXP_SUBSTR(al.line_text, '[^|]+', 1, 1)) = 'SYNONYM'
+),
+m AS (
+    SELECT UPPER(tgt_schema || '.' || tgt_name) AS target_full
+      FROM DIFF_REPORT_OBJECT_MAPPING
+     WHERE report_id = :report_id
+       AND object_type = 'SYNONYM'
+)
+SELECT x.target_full,
+       CASE WHEN m.target_full IS NULL THEN 'NOT_IN_MAPPING' ELSE 'IN_MAPPING' END AS mapping_flag
+  FROM x
+  LEFT JOIN m ON UPPER(x.target_full) = m.target_full
+ ORDER BY mapping_flag DESC, x.target_full;
+
 ============================================================
 建议排查顺序（实战）
 1) SQL-01/02/08/10 先建立全局认知。
@@ -709,4 +813,5 @@ SELECT a.artifact_type,
 4) SQL-36~46 处理结构不一致。
 5) SQL-47~59 定位依赖链、remap、同义词/public 特殊问题。
 6) SQL-60~73 收口权限、可用性、package/trigger 与写库异常。
+7) SQL-74~77 专项核查“多余对象/多余同义词”。
 ============================================================

@@ -7406,6 +7406,70 @@ class TestReportDbHelpers(unittest.TestCase):
         source = inspect.getsource(sdr.ensure_report_db_tables_exist)
         self.assertNotIn("FOREIGN KEY", source)
 
+    def test_apply_ob_feature_gates_auto_ob_442_plus(self):
+        settings = {
+            "generate_interval_partition_fixup": "auto",
+            "mview_check_fixup_mode": "auto",
+        }
+        result = sdr.apply_ob_feature_gates(settings, "4.4.2.1")
+        self.assertTrue(result["version_known"])
+        self.assertTrue(result["is_ob_442_plus"])
+        self.assertFalse(result["interval_enabled"])
+        self.assertTrue(result["mview_enabled"])
+        self.assertFalse(settings["effective_interval_fixup_enabled"])
+        self.assertTrue(settings["effective_mview_enabled"])
+        self.assertNotIn("MATERIALIZED VIEW", settings["effective_print_only_primary_types"])
+
+    def test_apply_ob_feature_gates_auto_ob_below_442(self):
+        settings = {
+            "generate_interval_partition_fixup": "auto",
+            "mview_check_fixup_mode": "auto",
+        }
+        result = sdr.apply_ob_feature_gates(settings, "4.2.5.7")
+        self.assertTrue(result["version_known"])
+        self.assertFalse(result["is_ob_442_plus"])
+        self.assertTrue(result["interval_enabled"])
+        self.assertFalse(result["mview_enabled"])
+        self.assertTrue(settings["effective_interval_fixup_enabled"])
+        self.assertFalse(settings["effective_mview_enabled"])
+        self.assertIn("MATERIALIZED VIEW", settings["effective_print_only_primary_types"])
+
+    def test_apply_ob_feature_gates_auto_unknown_version_fallback(self):
+        settings = {
+            "generate_interval_partition_fixup": "auto",
+            "mview_check_fixup_mode": "auto",
+        }
+        result = sdr.apply_ob_feature_gates(settings, None)
+        self.assertFalse(result["version_known"])
+        self.assertEqual(result["interval_reason"], "auto(version_unknown_fallback)")
+        self.assertEqual(result["mview_reason"], "auto(version_unknown_fallback)")
+        self.assertTrue(result["interval_enabled"])
+        self.assertFalse(result["mview_enabled"])
+
+    def test_apply_ob_feature_gates_manual_override(self):
+        settings = {
+            "generate_interval_partition_fixup": "false",
+            "mview_check_fixup_mode": "on",
+        }
+        result = sdr.apply_ob_feature_gates(settings, "4.2.5.7")
+        self.assertFalse(result["interval_enabled"])
+        self.assertTrue(result["mview_enabled"])
+        self.assertEqual(result["interval_reason"], "manual(false)")
+        self.assertEqual(result["mview_reason"], "manual(on)")
+        self.assertEqual(settings["generate_interval_partition_fixup"], False)
+        self.assertTrue(settings["effective_mview_enabled"])
+
+    def test_apply_ob_feature_gates_normalize_legacy_values(self):
+        settings = {
+            "generate_interval_partition_fixup": "yes",
+            "mview_check_fixup_mode": "OFF",
+        }
+        result = sdr.apply_ob_feature_gates(settings, "4.4.2.0")
+        self.assertEqual(result["interval_mode"], "true")
+        self.assertEqual(result["mview_mode"], "off")
+        self.assertTrue(result["interval_enabled"])
+        self.assertFalse(result["mview_enabled"])
+
 
 if __name__ == "__main__":
     unittest.main()

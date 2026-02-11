@@ -105,13 +105,21 @@ dbcat_chunk_size        = 150
 # 是否在对比后生成修复脚本（dbcat 抽取，VIEW 走 DBMS_METADATA）
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 generate_fixup          = true
+# MATERIALIZED VIEW 校验/修补模式（版本门控）
+# auto: OB>=4.4.2 默认开启校验+修补；低版本默认仅打印
+# on  : 强制开启校验+修补
+# off : 强制仅打印不校验
+mview_check_fixup_mode  = auto
 # 是否生成目标端“多余对象”清理候选（仅输出注释候选，不自动执行）
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 generate_extra_cleanup  = false
-# interval 分区补齐脚本（默认开启）
-# generate_interval_partition_fixup: true/false
+# interval 分区补齐脚本（版本门控）
+# generate_interval_partition_fixup:
+#   auto  -> OB>=4.4.2 默认关闭；低版本默认开启
+#   true  -> 强制开启
+#   false -> 强制关闭
 # interval_partition_cutoff: 截止日期，格式 YYYYMMDD（默认 20280301）
-generate_interval_partition_fixup = true
+generate_interval_partition_fixup = auto
 interval_partition_cutoff = 20280301
 # interval_partition_cutoff_numeric: 数值型 interval 分区补齐上限（仅数值分区键使用），如 100000
 interval_partition_cutoff_numeric =
@@ -174,7 +182,7 @@ trigger_qualify_schema  = true
 # check_primary_types 可选值：
 #   TABLE, VIEW, MATERIALIZED VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY,
 #   SYNONYM, JOB, SCHEDULE, TYPE, TYPE BODY
-#   注意：MATERIALIZED VIEW 默认仅打印不校验（仍会在报告中展示）
+#   注意：MATERIALIZED VIEW 由 mview_check_fixup_mode + OB 版本共同决定
 # synonym_check_scope（同义词校验范围）可选值：
 #   public_only -> 仅将 PUBLIC 同义词纳入主校验与检查汇总（默认）
 #   all         -> PUBLIC + 私有同义词全部纳入校验
