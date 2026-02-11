@@ -18242,7 +18242,7 @@ def remap_view_dependencies(
     根据remap规则重写VIEW DDL中的依赖对象引用
     改进：
     - 使用 SqlMasker 确保只替换 SQL 代码，不替换注释/字符串
-    - 支持 PUBLIC 同义词解析到基表后再 remap
+    - 支持 PUBLIC/私有同义词解析到基表后再 remap
     - 当 SQL 提取不足时可使用依赖元数据 fallback
     """
     if not ddl:
@@ -18263,8 +18263,8 @@ def remap_view_dependencies(
     synonym_meta = synonym_meta or {}
     preferred_types = ("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM", "FUNCTION")
 
-    def _resolve_public_synonym(dep_obj: str) -> Optional[str]:
-        meta = synonym_meta.get(("PUBLIC", dep_obj))
+    def _resolve_synonym(owner: str, dep_obj: str) -> Optional[str]:
+        meta = synonym_meta.get((owner.upper(), dep_obj.upper()))
         if not meta or meta.db_link:
             return None
         base_full = f"{meta.table_owner}.{meta.table_name}"
@@ -18286,15 +18286,23 @@ def remap_view_dependencies(
 
         mapped_target: Optional[str] = None
         if dep_schema == "PUBLIC":
-            mapped_target = _resolve_public_synonym(dep_obj)
+            mapped_target = _resolve_synonym("PUBLIC", dep_obj)
         else:
             mapped_target = find_mapped_target_any_type(
                 full_object_mapping,
                 dep_u,
                 preferred_types=preferred_types
             ) or remap_rules.get(dep_u)
-            if not mapped_target and dep_schema == view_schema_u:
-                mapped_target = _resolve_public_synonym(dep_obj)
+            # 若直接映射缺失，或落在 identity 映射，尝试同 schema 私有同义词
+            if (not mapped_target) or (mapped_target.upper() == dep_u):
+                mapped_syn = _resolve_synonym(dep_schema, dep_obj)
+                if mapped_syn:
+                    mapped_target = mapped_syn
+            # 对当前 VIEW schema 的裸名引用，继续兜底 PUBLIC 同义词
+            if ((not mapped_target) or (mapped_target.upper() == dep_u)) and dep_schema == view_schema_u:
+                mapped_public = _resolve_synonym("PUBLIC", dep_obj)
+                if mapped_public:
+                    mapped_target = mapped_public
         if not mapped_target:
             continue
         tgt_u = mapped_target.upper()
@@ -18803,7 +18811,17 @@ def adjust_ddl_for_object(
         replacement_dict: Dict[Tuple[str, str], Tuple[str, str]] = {}
         for (src_pair, tgt_pair) in extra_identifiers:
             key = (src_pair[0].upper(), src_pair[1].upper())
-            replacement_dict[key] = (tgt_pair[0].upper(), tgt_pair[1].upper())
+            candidate = (tgt_pair[0].upper(), tgt_pair[1].upper())
+            existing = replacement_dict.get(key)
+            # 同一源对象出现多条映射时，优先保留“非自映射”目标，避免被 A=A 覆盖。
+            if existing is None:
+                replacement_dict[key] = candidate
+                continue
+            src_identity = key
+            existing_is_identity = existing == src_identity
+            candidate_is_identity = candidate == src_identity
+            if existing_is_identity and not candidate_is_identity:
+                replacement_dict[key] = candidate
         
         # 只对字典中存在的对象执行替换（避免循环所有规则）
         # 使用原有的 replace_identifier 逻辑，但只处理实际需要替换的

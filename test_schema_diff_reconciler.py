@@ -4239,6 +4239,34 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertIn("TGT.T1", rewritten.upper())
 
+    def test_remap_view_dependencies_resolves_private_synonym(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW LIFELOGTMP.V1 AS\n"
+            "SELECT * FROM LIFELOGTMP.BENEFICIARY_INFO_DELETE\n"
+        )
+        synonym_meta = {
+            ("LIFELOGTMP", "BENEFICIARY_INFO_DELETE"): sdr.SynonymMeta(
+                "LIFELOGTMP",
+                "BENEFICIARY_INFO_DELETE",
+                "LIFEDATA",
+                "BENEFICIARY_INFO_DELETE",
+                None,
+            )
+        }
+        remap_rules = {
+            "LIFEDATA.BENEFICIARY_INFO_DELETE": "PASDATA.BENEFICIARY_INFO_DELETE"
+        }
+        rewritten = sdr.remap_view_dependencies(
+            ddl,
+            "LIFELOGTMP",
+            "V1",
+            remap_rules,
+            {},
+            synonym_meta=synonym_meta
+        )
+        self.assertIn("PASDATA.BENEFICIARY_INFO_DELETE", rewritten.upper())
+        self.assertNotIn("FROM LIFELOGTMP.BENEFICIARY_INFO_DELETE", rewritten.upper())
+
     def test_remap_view_dependencies_fallback_uses_dependency_map(self):
         ddl = (
             "CREATE OR REPLACE VIEW A.V AS\n"
@@ -6615,6 +6643,23 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             obj_type="VIEW",
         )
         self.assertIn("A.T2", adjusted.upper())
+
+    def test_adjust_ddl_prefers_non_identity_mapping(self):
+        ddl = "CREATE OR REPLACE VIEW A.V AS SELECT * FROM A.T1;"
+        adjusted = sdr.adjust_ddl_for_object(
+            ddl,
+            "A",
+            "V",
+            "A",
+            "V",
+            extra_identifiers=[
+                (("A", "T1"), ("A", "T1")),
+                (("A", "T1"), ("B", "T1")),
+            ],
+            obj_type="VIEW",
+        )
+        self.assertIn("B.T1", adjusted.upper())
+        self.assertNotIn("FROM A.T1", adjusted.upper())
 
     def test_build_expected_dependency_pairs_skips_builtin_dual(self):
         deps = [
