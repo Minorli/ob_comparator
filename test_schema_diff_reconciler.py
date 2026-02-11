@@ -6331,6 +6331,49 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             Path(path).unlink(missing_ok=True)
         self.assertEqual(patterns, ["_rename", "cc_dd", "AA_BB"])
 
+    def test_is_rename_only_blacklist(self):
+        rename_entries = {
+            ("RENAME", "RENAME"): sdr.BlacklistEntry("RENAME", "RENAME", "RULE=R1")
+        }
+        mixed_entries = {
+            ("RENAME", "RENAME"): sdr.BlacklistEntry("RENAME", "RENAME", "RULE=R1"),
+            ("SPE", "XMLTYPE"): sdr.BlacklistEntry("SPE", "XMLTYPE", "RULE=R2"),
+        }
+        self.assertTrue(sdr.is_rename_only_blacklist(rename_entries))
+        self.assertFalse(sdr.is_rename_only_blacklist(mixed_entries))
+
+    def test_filter_nodes_for_rename_blacklist_exclusion(self):
+        source_objects = {
+            "A.T_RENAME_1": {"TABLE"},
+            "A.V_RENAME_DEP": {"VIEW"},
+            "A.P_RENAME_DEP": {"PROCEDURE"},
+            "A.KEEP_T": {"TABLE"},
+        }
+        dependency_graph = {
+            ("A.V_RENAME_DEP", "VIEW"): {("A.T_RENAME_1", "TABLE")},
+            ("A.P_RENAME_DEP", "PROCEDURE"): {("A.V_RENAME_DEP", "VIEW")},
+        }
+        seed_nodes = {("A.T_RENAME_1", "TABLE")}
+        blocked = sdr.build_blocked_dependency_map(
+            dependency_graph,
+            seed_nodes,
+            source_objects=source_objects,
+            object_parent_map={}
+        )
+        excluded_nodes = set(seed_nodes) | set(blocked.keys())
+
+        master_list = [
+            ("A.T_RENAME_1", "A.T_RENAME_1", "TABLE"),
+            ("A.V_RENAME_DEP", "A.V_RENAME_DEP", "VIEW"),
+            ("A.P_RENAME_DEP", "A.P_RENAME_DEP", "PROCEDURE"),
+            ("A.KEEP_T", "A.KEEP_T", "TABLE"),
+        ]
+        filtered_master = sdr.filter_master_list_by_nodes(master_list, excluded_nodes)
+        self.assertEqual(filtered_master, [("A.KEEP_T", "A.KEEP_T", "TABLE")])
+
+        filtered_source = sdr.filter_source_objects_by_nodes(source_objects, excluded_nodes)
+        self.assertEqual(filtered_source, {"A.KEEP_T": {"TABLE"}})
+
     def test_clean_interval_partition_clause(self):
         ddl = (
             "CREATE TABLE T1 (ID NUMBER) PARTITION BY RANGE (DT) "

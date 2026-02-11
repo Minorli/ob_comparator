@@ -133,6 +133,7 @@
 - blacklist_rules_disable：禁用指定规则（逗号分隔）。默认：空。
 - blacklist_name_patterns：表名黑名单关键字（逗号分隔，字面包含匹配）。默认：_RENAME。
   说明：会自动转义 `%/_/!`，避免被当作通配符；命中后 black_type=NAME_PATTERN。
+  说明：命中 `RENAME/NAME_PATTERN` 的表按“全排除”处理：不校验、不输出差异、不生成 fixup，并连带排除其依赖对象。
 - blacklist_name_patterns_file：表名黑名单关键字文件（每行一个关键字，支持 #/; 注释）。默认：空。
 - blacklist_name_patterns 与 blacklist_name_patterns_file：会合并去重；用于渲染规则中的 `{{name_pattern_clause}}`。
 - blacklist_lob_max_mb：LOB 体积阈值（MB），超过则标记为 LOB_OVERSIZE。默认：512。

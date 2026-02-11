@@ -1224,6 +1224,26 @@ def is_long_only_blacklist(entries: Optional[Dict[Tuple[str, str], BlacklistEntr
     return True
 
 
+def is_rename_blacklist_type(black_type: Optional[str]) -> bool:
+    bt = (black_type or "").strip().upper()
+    return bt in {"RENAME", "NAME_PATTERN"}
+
+
+def is_rename_only_blacklist(entries: Optional[Dict[Tuple[str, str], BlacklistEntry]]) -> bool:
+    """
+    判断黑名单条目是否全部为 RENAME/NAME_PATTERN 类型。
+    """
+    if not entries:
+        return False
+    for (black_type, _data_type), entry in entries.items():
+        bt = (black_type or "").strip().upper()
+        if not bt and entry and entry.black_type:
+            bt = entry.black_type.strip().upper()
+        if not is_rename_blacklist_type(bt):
+            return False
+    return True
+
+
 def map_long_type_to_ob(data_type: Optional[str]) -> str:
     dt = (data_type or "").strip().upper()
     if dt == "LONG":
@@ -5608,6 +5628,200 @@ def build_blocked_dependency_map(
                 queue.append(dep)
 
     return dict(blocked_by)
+
+
+def _normalize_excluded_nodes(excluded_nodes: Optional[Set[DependencyNode]]) -> Dict[str, Set[str]]:
+    node_map: Dict[str, Set[str]] = defaultdict(set)
+    for full, obj_type in (excluded_nodes or set()):
+        full_u = (full or "").upper()
+        type_u = (obj_type or "").upper()
+        if full_u and type_u:
+            node_map[full_u].add(type_u)
+    return node_map
+
+
+def _is_node_excluded(full_name: str, obj_type: str, excluded_map: Dict[str, Set[str]]) -> bool:
+    return (obj_type or "").upper() in excluded_map.get((full_name or "").upper(), set())
+
+
+def filter_source_objects_by_nodes(
+    source_objects: SourceObjectMap,
+    excluded_nodes: Optional[Set[DependencyNode]]
+) -> SourceObjectMap:
+    excluded_map = _normalize_excluded_nodes(excluded_nodes)
+    if not source_objects or not excluded_map:
+        return source_objects
+    filtered: SourceObjectMap = {}
+    for full, obj_types in source_objects.items():
+        full_u = (full or "").upper()
+        keep_types = {
+            (obj_type or "").upper()
+            for obj_type in (obj_types or set())
+            if not _is_node_excluded(full_u, obj_type, excluded_map)
+        }
+        if keep_types:
+            filtered[full_u] = keep_types
+    return filtered
+
+
+def filter_full_object_mapping_by_nodes(
+    full_object_mapping: FullObjectMapping,
+    excluded_nodes: Optional[Set[DependencyNode]]
+) -> FullObjectMapping:
+    excluded_map = _normalize_excluded_nodes(excluded_nodes)
+    if not full_object_mapping or not excluded_map:
+        return full_object_mapping
+    filtered: FullObjectMapping = {}
+    for src_full, type_map in full_object_mapping.items():
+        src_full_u = (src_full or "").upper()
+        new_map: Dict[str, str] = {}
+        for obj_type, tgt_full in (type_map or {}).items():
+            type_u = (obj_type or "").upper()
+            if _is_node_excluded(src_full_u, type_u, excluded_map):
+                continue
+            new_map[type_u] = tgt_full
+        if new_map:
+            filtered[src_full_u] = new_map
+    return filtered
+
+
+def filter_master_list_by_nodes(
+    master_list: MasterCheckList,
+    excluded_nodes: Optional[Set[DependencyNode]]
+) -> MasterCheckList:
+    excluded_map = _normalize_excluded_nodes(excluded_nodes)
+    if not master_list or not excluded_map:
+        return master_list
+    filtered: MasterCheckList = []
+    for src_full, tgt_full, obj_type in master_list:
+        src_full_u = (src_full or "").upper()
+        if _is_node_excluded(src_full_u, obj_type, excluded_map):
+            continue
+        filtered.append((src_full, tgt_full, obj_type))
+    return filtered
+
+
+def filter_source_dependencies_by_nodes(
+    source_dependencies: Optional[SourceDependencySet],
+    excluded_nodes: Optional[Set[DependencyNode]]
+) -> Optional[SourceDependencySet]:
+    excluded_map = _normalize_excluded_nodes(excluded_nodes)
+    if not source_dependencies or not excluded_map:
+        return source_dependencies
+    filtered: SourceDependencySet = set()
+    for dep_owner, dep_name, dep_type, ref_owner, ref_name, ref_type in source_dependencies:
+        dep_full = f"{(dep_owner or '').upper()}.{(dep_name or '').upper()}"
+        ref_full = f"{(ref_owner or '').upper()}.{(ref_name or '').upper()}"
+        if _is_node_excluded(dep_full, dep_type, excluded_map):
+            continue
+        if _is_node_excluded(ref_full, ref_type, excluded_map):
+            continue
+        filtered.add((dep_owner, dep_name, dep_type, ref_owner, ref_name, ref_type))
+    return filtered
+
+
+def filter_dependency_records_by_nodes(
+    dependency_records: Optional[List[DependencyRecord]],
+    excluded_nodes: Optional[Set[DependencyNode]]
+) -> Optional[List[DependencyRecord]]:
+    excluded_map = _normalize_excluded_nodes(excluded_nodes)
+    if not dependency_records or not excluded_map:
+        return dependency_records
+    filtered: List[DependencyRecord] = []
+    for dep in dependency_records:
+        dep_full = f"{(dep.owner or '').upper()}.{(dep.name or '').upper()}"
+        ref_full = f"{(dep.referenced_owner or '').upper()}.{(dep.referenced_name or '').upper()}"
+        if _is_node_excluded(dep_full, dep.object_type, excluded_map):
+            continue
+        if _is_node_excluded(ref_full, dep.referenced_type, excluded_map):
+            continue
+        filtered.append(dep)
+    return filtered
+
+
+def filter_expected_dependency_pairs_by_nodes(
+    expected_dependency_pairs: Optional[Set[Tuple[str, str, str, str]]],
+    excluded_nodes: Optional[Set[DependencyNode]]
+) -> Optional[Set[Tuple[str, str, str, str]]]:
+    excluded_map = _normalize_excluded_nodes(excluded_nodes)
+    if not expected_dependency_pairs or not excluded_map:
+        return expected_dependency_pairs
+    filtered: Set[Tuple[str, str, str, str]] = set()
+    for dep_full, dep_type, ref_full, ref_type in expected_dependency_pairs:
+        if _is_node_excluded(dep_full, dep_type, excluded_map):
+            continue
+        if _is_node_excluded(ref_full, ref_type, excluded_map):
+            continue
+        filtered.add((dep_full, dep_type, ref_full, ref_type))
+    return filtered
+
+
+def filter_object_parent_map_by_nodes(
+    object_parent_map: Optional["ObjectParentMap"],
+    source_objects: Optional[SourceObjectMap],
+    excluded_nodes: Optional[Set[DependencyNode]]
+) -> Optional["ObjectParentMap"]:
+    excluded_map = _normalize_excluded_nodes(excluded_nodes)
+    if not object_parent_map or not excluded_map:
+        return object_parent_map
+    source_objects = source_objects or {}
+    excluded_table_full = {
+        full for full, types in excluded_map.items()
+        if "TABLE" in types
+    }
+    filtered: "ObjectParentMap" = {}
+    for dep_full, parent_full in object_parent_map.items():
+        dep_full_u = (dep_full or "").upper()
+        parent_full_u = (parent_full or "").upper()
+        if parent_full_u in excluded_table_full:
+            continue
+        dep_types = {
+            (obj_type or "").upper()
+            for obj_type in source_objects.get(dep_full_u, set())
+            if obj_type
+        }
+        if dep_types and all(_is_node_excluded(dep_full_u, obj_type, excluded_map) for obj_type in dep_types):
+            continue
+        filtered[dep_full_u] = parent_full_u
+    return filtered
+
+
+def filter_view_dependency_map_by_nodes(
+    view_dependency_map: Optional[Dict[Tuple[str, str], Set[str]]],
+    excluded_nodes: Optional[Set[DependencyNode]]
+) -> Optional[Dict[Tuple[str, str], Set[str]]]:
+    excluded_map = _normalize_excluded_nodes(excluded_nodes)
+    if not view_dependency_map or not excluded_map:
+        return view_dependency_map
+    excluded_full = set(excluded_map.keys())
+    filtered: Dict[Tuple[str, str], Set[str]] = {}
+    for key, deps in view_dependency_map.items():
+        schema, view_name = key
+        full_u = f"{(schema or '').upper()}.{(view_name or '').upper()}"
+        if _is_node_excluded(full_u, "VIEW", excluded_map):
+            continue
+        dep_set = {
+            (dep_full or "").upper()
+            for dep_full in (deps or set())
+            if (dep_full or "").upper() and (dep_full or "").upper() not in excluded_full
+        }
+        filtered[(schema.upper(), view_name.upper())] = dep_set
+    return filtered
+
+
+def filter_remap_conflicts_by_nodes(
+    remap_conflicts: RemapConflictMap,
+    excluded_nodes: Optional[Set[DependencyNode]]
+) -> RemapConflictMap:
+    excluded_map = _normalize_excluded_nodes(excluded_nodes)
+    if not remap_conflicts or not excluded_map:
+        return remap_conflicts
+    filtered: RemapConflictMap = {}
+    for (src_full, obj_type), reason in remap_conflicts.items():
+        if _is_node_excluded(src_full, obj_type, excluded_map):
+            continue
+        filtered[(src_full, obj_type)] = reason
+    return filtered
 
 
 def classify_missing_objects(
@@ -32606,6 +32820,114 @@ def main():
                 settings.get("generate_interval_partition_fixup", False)
             ) and generate_fixup_enabled
         )
+
+        rename_excluded_table_keys: Set[Tuple[str, str]] = set()
+        rename_excluded_nodes: Set[DependencyNode] = set()
+        if oracle_meta.blacklist_tables:
+            rename_excluded_table_keys = {
+                (schema.upper(), table.upper())
+                for (schema, table), entries in oracle_meta.blacklist_tables.items()
+                if is_rename_only_blacklist(entries)
+            }
+        if rename_excluded_table_keys:
+            unsupported_seed_nodes: Set[DependencyNode] = {
+                (f"{schema}.{table}", "TABLE")
+                for schema, table in rename_excluded_table_keys
+            }
+            blocked_by = build_blocked_dependency_map(
+                dependency_graph,
+                unsupported_seed_nodes,
+                source_objects=source_objects,
+                object_parent_map=object_parent_map
+            )
+            rename_excluded_nodes = set(unsupported_seed_nodes) | set(blocked_by.keys())
+            before_master_cnt = len(master_list)
+            before_mapping_cnt = sum(len(v) for v in full_object_mapping.values())
+
+            source_objects = filter_source_objects_by_nodes(source_objects, rename_excluded_nodes)
+            full_object_mapping = filter_full_object_mapping_by_nodes(full_object_mapping, rename_excluded_nodes)
+            master_list = filter_master_list_by_nodes(master_list, rename_excluded_nodes)
+            source_dependencies_set = filter_source_dependencies_by_nodes(source_dependencies_set, rename_excluded_nodes)
+            oracle_dependencies_internal = filter_dependency_records_by_nodes(
+                oracle_dependencies_internal,
+                rename_excluded_nodes
+            ) or []
+            oracle_dependencies_for_grants = filter_dependency_records_by_nodes(
+                oracle_dependencies_for_grants,
+                rename_excluded_nodes
+            ) or []
+            object_parent_map = filter_object_parent_map_by_nodes(
+                object_parent_map,
+                source_objects,
+                rename_excluded_nodes
+            ) or {}
+            expected_dependency_pairs = filter_expected_dependency_pairs_by_nodes(
+                expected_dependency_pairs,
+                rename_excluded_nodes
+            ) or set()
+            if skipped_dependency_pairs:
+                excluded_map = _normalize_excluded_nodes(rename_excluded_nodes)
+                filtered_skipped: List[DependencyIssue] = []
+                for item in skipped_dependency_pairs:
+                    dep_full = (item.dependent or "").upper()
+                    dep_type = (item.dependent_type or "").upper()
+                    ref_full = (item.referenced or "").upper()
+                    ref_type = (item.referenced_type or "").upper()
+                    if _is_node_excluded(dep_full, dep_type, excluded_map):
+                        continue
+                    if _is_node_excluded(ref_full, ref_type, excluded_map):
+                        continue
+                    filtered_skipped.append(item)
+                skipped_dependency_pairs = filtered_skipped
+            dependency_report["skipped"] = skipped_dependency_pairs
+            remap_conflicts = filter_remap_conflicts_by_nodes(remap_conflicts, rename_excluded_nodes)
+            remap_conflict_items = [
+                (obj_type, src_full, reason)
+                for (src_full, obj_type), reason in sorted(remap_conflicts.items())
+            ]
+
+            dependency_graph = build_dependency_graph(source_dependencies_set) if source_dependencies_set else {}
+            view_dependency_map = build_view_dependency_map(source_dependencies_set) if source_dependencies_set else {}
+            view_dependency_map = filter_view_dependency_map_by_nodes(
+                view_dependency_map,
+                rename_excluded_nodes
+            ) or {}
+            if settings.get("enable_schema_mapping_infer") and dependency_graph:
+                transitive_table_cache = precompute_transitive_table_cache(
+                    dependency_graph,
+                    object_parent_map=object_parent_map
+                )
+            else:
+                transitive_table_cache = None
+
+            for key in rename_excluded_table_keys:
+                oracle_meta.blacklist_tables.pop(key, None)
+
+            conflict_path = report_dir / f"remap_conflicts_{timestamp}.txt"
+            if remap_conflicts:
+                conflict_written = export_remap_conflicts(remap_conflicts, conflict_path)
+                if conflict_written:
+                    log.info("已按黑名单过滤更新 remap 冲突清单: %s", conflict_written)
+            elif conflict_path.exists():
+                try:
+                    conflict_path.unlink()
+                except Exception:
+                    pass
+
+            mapping_written = export_full_object_mapping(full_object_mapping, mapping_path)
+            if mapping_written:
+                log.info("已按黑名单过滤更新对象映射清单: %s", mapping_written)
+
+            after_mapping_cnt = sum(len(v) for v in full_object_mapping.values())
+            log.info(
+                "[BLACKLIST] RENAME 规则生效: 表=%d, 连带对象=%d, 主对象 %d -> %d, 映射项 %d -> %d。",
+                len(rename_excluded_table_keys),
+                len(rename_excluded_nodes),
+                before_master_cnt,
+                len(master_list),
+                before_mapping_cnt,
+                after_mapping_cnt
+            )
 
         table_target_map = build_table_target_map(master_list)
         blacklist_report_rows = build_blacklist_report_rows(
