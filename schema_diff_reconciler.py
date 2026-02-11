@@ -865,6 +865,22 @@ CONSTRAINT_STATUS_SYNC_MODE_ALIASES: Dict[str, str] = {
     "all": "full",
 }
 
+CONSTRAINT_MISSING_FIXUP_VALIDATE_MODE_VALUES: Set[str] = {
+    "safe_novalidate",
+    "source",
+    "force_validate",
+}
+CONSTRAINT_MISSING_FIXUP_VALIDATE_MODE_ALIASES: Dict[str, str] = {
+    "safe": "safe_novalidate",
+    "novalidate": "safe_novalidate",
+    "safe_no_validate": "safe_novalidate",
+    "source_only": "source",
+    "auto": "source",
+    "validate": "force_validate",
+    "force": "force_validate",
+    "always_validate": "force_validate",
+}
+
 TRIGGER_VALIDITY_SYNC_MODE_VALUES: Set[str] = {"off", "compile"}
 TRIGGER_VALIDITY_SYNC_MODE_ALIASES: Dict[str, str] = {
     "on": "compile",
@@ -941,6 +957,7 @@ NOISE_REASON_SYS_NC_COLUMN = "SYS_NC_COLUMN"
 NOISE_REASON_OMS_HELPER_COLUMN = "OMS_HELPER_COLUMN"
 NOISE_REASON_OMS_ROWID_INDEX = "OMS_ROWID_INDEX"
 NOISE_REASON_OBNOTNULL_CONSTRAINT = "OBNOTNULL_CONSTRAINT"
+OB_OBCHECK_NAME_PATTERN = re.compile(r"_OBCHECK_\d+$", re.IGNORECASE)
 
 
 def normalize_identifier_name(name: Optional[str]) -> str:
@@ -1253,12 +1270,40 @@ def extract_constraint_name(value: Optional[object]) -> str:
     return extract_name_value(value)
 
 
-def is_ob_notnull_constraint(name: Optional[object]) -> bool:
+def is_notnull_check_condition(search_condition: Optional[str]) -> bool:
+    if not search_condition:
+        return False
+    cond = normalize_sql_expression(search_condition)
+    if not cond:
+        return False
+    cond_u = cond.upper().strip()
+    while cond_u.startswith("(") and cond_u.endswith(")"):
+        stripped = strip_wrapping_parentheses(cond_u)
+        if stripped == cond_u:
+            break
+        cond_u = stripped.strip()
+    cond_u = re.sub(r'"([A-Z0-9_#$]+)"', r"\1", cond_u)
+    return bool(re.match(r"^[A-Z0-9_#$]+\s+IS\s+NOT\s+NULL$", cond_u))
+
+
+def is_ob_notnull_constraint(
+    name: Optional[object],
+    search_condition: Optional[str] = None
+) -> bool:
     """
-    识别 OceanBase Oracle 模式下自动生成的 *_OBNOTNULL_* CHECK 约束。
-    这些约束用于保证 PK 列非空，Oracle 侧不会显式出现，报告统计应忽略以避免误判“多余约束”。
+    识别 OceanBase Oracle 模式下自动生成的 NOT NULL 类 CHECK 约束。
+    典型命名：
+      - *_OBNOTNULL_*
+      - *_OBCHECK_<digits>   (仅在条件为单列 IS NOT NULL 时识别)
     """
-    return "OBNOTNULL" in extract_constraint_name(name).upper()
+    name_u = extract_constraint_name(name).upper()
+    if "OBNOTNULL" in name_u:
+        return True
+    if OB_OBCHECK_NAME_PATTERN.search(name_u):
+        if search_condition is None:
+            return True
+        return is_notnull_check_condition(search_condition)
+    return False
 
 
 def strip_wrapping_parentheses(text: str) -> str:
@@ -1501,14 +1546,22 @@ def is_system_notnull_check(cons_name: Optional[str], search_condition: Optional
     name_u = cons_name.upper()
     if not name_u.startswith("SYS_"):
         return False
-    cond = normalize_sql_expression(search_condition)
-    if not cond:
-        return False
-    cond_u = cond.upper()
-    return bool(re.match(r"^[A-Z0-9_#$]+\s+IS\s+NOT\s+NULL$", cond_u))
+    return is_notnull_check_condition(search_condition)
 
 
 CHECK_SYS_CONTEXT_USERENV_RE = re.compile(r"SYS_CONTEXT\s*\(\s*['\"]USERENV['\"]", flags=re.IGNORECASE)
+CHECK_LIKE_ESCAPE_REWRITE_RE = re.compile(
+    r"([A-Z0-9_#$]+\s+LIKE)\s+REPLACE\('((?:''|[^'])*)','\\\\','\\\\\\\\'\)\s+ESCAPE\s+'\\\\'",
+    flags=re.IGNORECASE
+)
+CHECK_RANGE_REWRITE_RE = re.compile(
+    r"^([A-Z0-9_#$]+)\s*>=\s*(.+)\s+AND\s+\1\s*<=\s*(.+)$",
+    flags=re.IGNORECASE
+)
+CHECK_RANGE_REWRITE_REV_RE = re.compile(
+    r"^([A-Z0-9_#$]+)\s*<=\s*(.+)\s+AND\s+\1\s*>=\s*(.+)$",
+    flags=re.IGNORECASE
+)
 
 
 def normalize_deferrable_flag(value: Optional[object]) -> str:
@@ -1540,6 +1593,16 @@ def normalize_check_constraint_expression(
     expr_norm = normalize_sql_expression_casefold(expr)
     expr_norm = strip_redundant_predicate_parentheses(expr_norm)
     expr_norm = uppercase_outside_single_quotes(normalize_sql_expression(expr_norm))
+    # OceanBase 可能将 LIKE 常量重写为 REPLACE(... ) ESCAPE '\\'，此处回归到字面量语义。
+    expr_norm = CHECK_LIKE_ESCAPE_REWRITE_RE.sub(r"\1 '\2'", expr_norm)
+    # OceanBase 可能将 BETWEEN 展开为 >= AND <=，统一回 BETWEEN 以便跨库语义匹配。
+    m = CHECK_RANGE_REWRITE_RE.fullmatch(expr_norm)
+    if m:
+        expr_norm = f"{m.group(1)} BETWEEN {m.group(2)} AND {m.group(3)}"
+    else:
+        m = CHECK_RANGE_REWRITE_REV_RE.fullmatch(expr_norm)
+        if m:
+            expr_norm = f"{m.group(1)} BETWEEN {m.group(3)} AND {m.group(2)}"
     name_u = (cons_name or "").upper()
     if not expr_norm:
         return f"__NO_EXPR__:{name_u}"
@@ -2241,6 +2304,13 @@ def collect_fixup_config_diagnostics(
                     f"status_fixup_types 包含 {obj_type}，但 check_status_drift_types 未启用该类型，状态修复脚本不会生成。"
                 )
 
+    if normalize_constraint_missing_fixup_validate_mode(
+        settings.get("constraint_missing_fixup_validate_mode", "safe_novalidate")
+    ) == "force_validate":
+        diagnostics.append(
+            "constraint_missing_fixup_validate_mode=force_validate，缺失约束修补遇到目标端脏数据时可能触发 ORA-02298。"
+        )
+
     return diagnostics
 
 
@@ -2479,6 +2549,20 @@ def normalize_constraint_status_sync_mode(raw_value: Optional[str]) -> str:
     return value
 
 
+def normalize_constraint_missing_fixup_validate_mode(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "safe_novalidate"
+    value = str(raw_value).strip().lower()
+    value = CONSTRAINT_MISSING_FIXUP_VALIDATE_MODE_ALIASES.get(value, value)
+    if value not in CONSTRAINT_MISSING_FIXUP_VALIDATE_MODE_VALUES:
+        log.warning(
+            "constraint_missing_fixup_validate_mode=%s 不在支持范围内，将回退为 safe_novalidate。",
+            raw_value
+        )
+        return "safe_novalidate"
+    return value
+
+
 def normalize_trigger_validity_sync_mode(raw_value: Optional[str]) -> str:
     if not raw_value or not str(raw_value).strip():
         return "compile"
@@ -2662,6 +2746,17 @@ class ConstraintStatusDriftRow(NamedTuple):
     tgt_validated: str
     detail: str
     action_sql: str
+
+
+class ConstraintValidateDeferredRow(NamedTuple):
+    schema_name: str
+    table_name: str
+    constraint_name: str
+    constraint_type: str
+    src_validated: str
+    applied_mode: str
+    reason: str
+    validate_sql: str
 
 
 class ReportIndexEntry(NamedTuple):
@@ -3326,6 +3421,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('generate_status_fixup', 'true')
         settings.setdefault('status_fixup_types', 'trigger,constraint')
         settings.setdefault('constraint_status_sync_mode', 'enabled_only')
+        settings.setdefault('constraint_missing_fixup_validate_mode', 'safe_novalidate')
         settings.setdefault('trigger_validity_sync_mode', 'compile')
         settings.setdefault('sequence_remap_policy', 'source_only')
         settings.setdefault('generate_grants', 'true')
@@ -3692,6 +3788,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         )
         settings['constraint_status_sync_mode'] = normalize_constraint_status_sync_mode(
             settings.get('constraint_status_sync_mode', 'enabled_only')
+        )
+        settings['constraint_missing_fixup_validate_mode'] = normalize_constraint_missing_fixup_validate_mode(
+            settings.get('constraint_missing_fixup_validate_mode', 'safe_novalidate')
         )
         settings['trigger_validity_sync_mode'] = normalize_trigger_validity_sync_mode(
             settings.get('trigger_validity_sync_mode', 'compile')
@@ -4092,6 +4191,17 @@ def run_config_wizard(config_path: Path) -> None:
         if normalized in CONSTRAINT_STATUS_SYNC_MODE_VALUES:
             return True, ""
         return False, "仅支持 enabled_only/full"
+
+    def _validate_constraint_missing_fixup_validate_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = CONSTRAINT_MISSING_FIXUP_VALIDATE_MODE_ALIASES.get(
+            val.strip().lower(),
+            val.strip().lower()
+        )
+        if normalized in CONSTRAINT_MISSING_FIXUP_VALIDATE_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 safe_novalidate/source/force_validate"
 
     def _validate_trigger_validity_sync_mode(val: str) -> Tuple[bool, str]:
         if not val.strip():
@@ -4569,6 +4679,14 @@ def run_config_wizard(config_path: Path) -> None:
         default=cfg.get("SETTINGS", "constraint_status_sync_mode", fallback="enabled_only"),
         validator=_validate_constraint_status_sync_mode,
         transform=normalize_constraint_status_sync_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "constraint_missing_fixup_validate_mode",
+        "缺失约束修补 VALIDATE 策略 (safe_novalidate/source/force_validate)",
+        default=cfg.get("SETTINGS", "constraint_missing_fixup_validate_mode", fallback="safe_novalidate"),
+        validator=_validate_constraint_missing_fixup_validate_mode,
+        transform=normalize_constraint_missing_fixup_validate_mode,
     )
     _prompt_field(
         "SETTINGS",
@@ -5231,11 +5349,7 @@ def _build_constraint_semantic_key(
                 ref_target = (get_mapped_target(full_object_mapping, ref_src_full, "TABLE") or ref_src_full).upper()
             else:
                 ref_target = ref_src_full
-        else:
-            r_owner = (meta.get("r_owner") or "").upper()
-            r_cons = (meta.get("r_constraint") or "").upper()
-            if r_owner and r_cons:
-                ref_target = f"{r_owner}.{r_cons}"
+        # 不再回退到 R_CONSTRAINT_NAME（SYS_C*/OBPK* 跨库命名差异会制造噪声）
         return (
             ctype,
             cols,
@@ -9484,14 +9598,14 @@ def dump_ob_metadata(
             for key, cons_map in constraints.items():
                 kept: Dict[str, Dict] = {}
                 for cons_name, info in cons_map.items():
-                    if is_ob_notnull_constraint(cons_name):
+                    if is_ob_notnull_constraint(cons_name, info.get("search_condition")):
                         removed_cnt += 1
                         continue
                     kept[cons_name] = info
                 if kept:
                     pruned_constraints[key] = kept
             if removed_cnt:
-                log.info("[CONSTRAINT] 已忽略 %d 条 OceanBase 自动 OBNOTNULL 约束。", removed_cnt)
+                log.info("[CONSTRAINT] 已忽略 %d 条 OceanBase 自动 NOT NULL 类约束（OBNOTNULL/OBCHECK）。", removed_cnt)
             constraints = pruned_constraints
 
     # --- 7. DBA_TRIGGERS ---
@@ -10580,7 +10694,6 @@ def dump_oracle_metadata(
                         FROM DBA_CONSTRAINTS
                         WHERE OWNER IN ({{owners_clause}})
                           AND CONSTRAINT_TYPE IN ('P','U','R','C')
-                          AND STATUS = 'ENABLED'
                     """
                     with ora_conn.cursor() as cursor:
                         if search_condition_col == "SEARCH_CONDITION" and hasattr(cursor, "longfetchsize"):
@@ -13494,8 +13607,37 @@ def is_ob_gtt_internal_index_name(index_name: Optional[str]) -> bool:
     return bool(name_u) and name_u.startswith("IDX_FOR_HEAP_GTT_")
 
 
-def should_normalize_ob_gtt_indexes(entries: Optional[Dict[str, Dict]]) -> bool:
-    return any(is_ob_gtt_internal_index_name(name) for name in (entries or {}).keys())
+def should_normalize_ob_gtt_indexes(
+    entries: Optional[Dict[str, Dict]],
+    constraints: Optional[Dict[str, Dict]] = None
+) -> bool:
+    """
+    判定是否启用 OB GTT 索引归一化（剥离 SYS_SESSION_ID 前缀列）。
+
+    规则：
+    1) 命中 IDX_FOR_HEAP_GTT_* 内部索引名；
+    2) 或者 P/U 约束背靠索引首列为 SYS_SESSION_ID（部分版本无内部索引名也会出现）。
+    """
+    idx_entries = entries or {}
+    if any(is_ob_gtt_internal_index_name(name) for name in idx_entries.keys()):
+        return True
+    cons_map = constraints or {}
+    if not idx_entries or not cons_map:
+        return False
+    for cons in cons_map.values():
+        ctype = (cons.get("type") or "").upper()
+        if ctype not in {"P", "U"}:
+            continue
+        idx_name = (cons.get("index_name") or "").upper()
+        if not idx_name:
+            continue
+        idx_info = idx_entries.get(idx_name)
+        if not idx_info:
+            continue
+        cols = [str(c).upper() for c in (idx_info.get("columns") or []) if c]
+        if cols and cols[0] == "SYS_SESSION_ID":
+            return True
+    return False
 
 
 def normalize_ob_gtt_index_columns(
@@ -13604,7 +13746,7 @@ def build_constraint_signature(
                     ref_full = ref_full_raw.upper()
             fk.add((cols, ref_full, delete_rule, update_rule))
         elif ctype == "C":
-            if is_ob_notnull_constraint(name):
+            if is_ob_notnull_constraint(name, cons.get("search_condition")):
                 continue
             if is_system_notnull_check(name, cons.get("search_condition")):
                 continue
@@ -13634,12 +13776,12 @@ def build_index_cache_for_table(
     if src_idx is None:
         src_idx = {}
     tgt_idx = ob_meta.indexes.get(tgt_key, {})
-    normalize_ob_gtt = should_normalize_ob_gtt_indexes(tgt_idx)
+    tgt_constraints = ob_meta.constraints.get(tgt_key, {})
+    normalize_ob_gtt = should_normalize_ob_gtt_indexes(tgt_idx, tgt_constraints)
     src_map = build_index_map(src_idx)
     tgt_map = build_index_map(tgt_idx, normalize_ob_gtt=normalize_ob_gtt)
     src_sig = build_index_signature(src_map)
     tgt_sig = build_index_signature(tgt_map)
-    tgt_constraints = ob_meta.constraints.get(tgt_key, {})
     constraint_index_cols = build_constraint_index_cols(
         tgt_constraints,
         tgt_idx,
@@ -13916,7 +14058,7 @@ def compare_indexes_for_table(
         src_idx = {}
     tgt_idx = ob_meta.indexes.get(tgt_key, {})
     tgt_constraints = ob_meta.constraints.get(tgt_key, {})
-    normalize_ob_gtt = should_normalize_ob_gtt_indexes(tgt_idx)
+    normalize_ob_gtt = should_normalize_ob_gtt_indexes(tgt_idx, tgt_constraints)
     constraint_index_cols = build_constraint_index_cols(
         tgt_constraints,
         tgt_idx,
@@ -14397,9 +14539,9 @@ def compare_constraints_for_table(
             ctype = (cons.get("type") or "").upper()
             if ctype != "C":
                 continue
-            if is_ob_notnull_constraint(name):
-                continue
             raw_expr = cons.get("search_condition")
+            if is_ob_notnull_constraint(name, raw_expr):
+                continue
             if is_system_notnull_check(name, raw_expr):
                 continue
             expr_norm = normalize_check_constraint_expression(raw_expr, name)
@@ -20041,6 +20183,14 @@ ENABLE_NOVALIDATE_PATTERN = re.compile(
     r'\s*\bENABLE\s+NOVALIDATE\b',
     re.IGNORECASE
 )
+TRAILING_VALIDATE_TOKEN_PATTERN = re.compile(
+    r'\s+(?:ENABLE\s+)?(?:NO)?VALIDATE\s*$',
+    re.IGNORECASE
+)
+ALTER_TABLE_ADD_CONSTRAINT_PATTERN = re.compile(
+    r'^\s*ALTER\s+TABLE\b.*\bADD\s+CONSTRAINT\b',
+    re.IGNORECASE | re.DOTALL
+)
 
 
 def strip_constraint_enable(ddl: str) -> str:
@@ -20058,6 +20208,65 @@ def strip_enable_novalidate(ddl: str) -> str:
         cleaned = ENABLE_NOVALIDATE_PATTERN.sub('', line)
         cleaned_lines.append(cleaned.rstrip())
     return "\n".join(cleaned_lines)
+
+
+def resolve_constraint_missing_validate_keyword(
+    mode: str,
+    src_validated: Optional[str]
+) -> Tuple[str, str]:
+    """
+    返回缺失约束 fixup 应采用的 VALIDATE 关键字及原因标签。
+    """
+    mode_n = normalize_constraint_missing_fixup_validate_mode(mode)
+    src_valid_n = normalize_constraint_validated_status(src_validated)
+    if mode_n == "force_validate":
+        return "VALIDATE", "force_validate"
+    if mode_n == "source":
+        if src_valid_n == "VALIDATED":
+            return "VALIDATE", "source_validated"
+        if src_valid_n == "NOT VALIDATED":
+            return "NOVALIDATE", "source_not_validated"
+        return "NOVALIDATE", "source_unknown_fallback"
+    return "NOVALIDATE", "safe_novalidate"
+
+
+def apply_constraint_missing_validate_mode_to_ddl(
+    ddl: str,
+    mode: str,
+    src_validated: Optional[str],
+    src_status: Optional[str] = None
+) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    对缺失约束 DDL 应用 VALIDATE/NOVALIDATE 策略。
+
+    Returns:
+        (new_ddl, applied_keyword, reason_tag)
+    """
+    if not ddl:
+        return ddl, None, None
+    if not ALTER_TABLE_ADD_CONSTRAINT_PATTERN.search(ddl):
+        return ddl, None, None
+
+    src_status_n = normalize_constraint_enabled_status(src_status)
+    keyword, reason = resolve_constraint_missing_validate_keyword(mode, src_validated)
+    stmt = ddl.strip()
+    had_semicolon = stmt.endswith(";")
+    if had_semicolon:
+        stmt = stmt[:-1].rstrip()
+    while True:
+        stripped = TRAILING_VALIDATE_TOKEN_PATTERN.sub("", stmt)
+        if stripped == stmt:
+            break
+        stmt = stripped.rstrip()
+    if src_status_n == "DISABLED":
+        stmt = f"{stmt} DISABLE"
+        keyword = "DISABLE"
+        reason = "source_disabled"
+    else:
+        stmt = f"{stmt} ENABLE {keyword}"
+    if had_semicolon:
+        stmt += ";"
+    return stmt, keyword, reason
 
 
 def split_ddl_statements(ddl: str) -> List[str]:
@@ -21109,8 +21318,9 @@ def inflate_table_varchar_lengths(
         col_pat = re.escape(col_name)
         pattern = re.compile(
             rf'(?P<prefix>"{col_pat}"\s+|{col_pat}\s+)'
-            rf'(?P<dtype>VARCHAR2|VARCHAR)\s*\(\s*(?P<len>\d+)\s*\)'
-            rf'(?P<suffix>\s*(?:BYTE|CHAR)?)',
+            rf'(?P<dtype>VARCHAR2|VARCHAR)\s*'
+            rf'\(\s*(?P<len>\d+)\s*(?P<inner_sem>(?:BYTE|CHAR)?)\s*\)'
+            rf'(?P<outer_sem>\s*(?:BYTE|CHAR)?)',
             re.IGNORECASE
         )
 
@@ -21119,11 +21329,20 @@ def inflate_table_varchar_lengths(
             current_len = int(match.group("len"))
             if current_len >= min_len:
                 return match.group(0)
+            inner_sem_raw = (match.group("inner_sem") or "").strip()
+            outer_sem_raw = (match.group("outer_sem") or "").strip()
+            effective_sem = (inner_sem_raw or outer_sem_raw).upper()
+            # DDL 中显式 CHAR 语义时不放大，避免改变语义
+            if effective_sem == "CHAR":
+                return match.group(0)
             replacements += 1
             prefix = match.group("prefix")
             dtype_literal = match.group("dtype")
-            suffix = match.group("suffix") or ""
-            return f"{prefix}{dtype_literal}({min_len}){suffix}"
+            if inner_sem_raw:
+                return f"{prefix}{dtype_literal}({min_len} {inner_sem_raw})"
+            if outer_sem_raw:
+                return f"{prefix}{dtype_literal}({min_len}) {outer_sem_raw}"
+            return f"{prefix}{dtype_literal}({min_len})"
 
         updated, _ = pattern.subn(_repl, updated, count=1)
 
@@ -21558,7 +21777,12 @@ def generate_fixup_scripts(
     generate_status_fixup = parse_bool_flag(settings.get("generate_status_fixup", "true"), True)
     generate_extra_cleanup = parse_bool_flag(settings.get("generate_extra_cleanup", "false"), False)
     constraint_status_sync_mode = settings.get("constraint_status_sync_mode", "enabled_only")
+    constraint_missing_validate_mode = normalize_constraint_missing_fixup_validate_mode(
+        settings.get("constraint_missing_fixup_validate_mode", "safe_novalidate")
+    )
     trigger_validity_sync_mode = settings.get("trigger_validity_sync_mode", "compile")
+    deferred_validation_rows: List[ConstraintValidateDeferredRow] = []
+    deferred_validation_lock = threading.Lock()
     invalid_view_keys: Set[Tuple[str, str]] = set()
     invalid_trigger_keys: Set[Tuple[str, str]] = set()
     for (owner, name, obj_type), status in (oracle_meta.object_statuses or {}).items():
@@ -21592,6 +21816,10 @@ def generate_fixup_scripts(
             normalize_fixup_idempotent_mode(idempotent_mode),
             ",".join(sorted(idempotent_types)) if idempotent_types else "-"
         )
+    log.info(
+        "[FIXUP] 缺失约束 VALIDATE 策略: %s",
+        constraint_missing_validate_mode
+    )
     view_chain_file: Optional[Path] = None
     visibility_policy = normalize_column_visibility_policy(
         settings.get("column_visibility_policy", "auto")
@@ -23781,6 +24009,8 @@ def generate_fixup_scripts(
                     source_label = "DBCAT" if statements else "META"
                     cons_meta = oracle_meta.constraints.get((ss.upper(), st.upper()), {}).get(cons_name_u)
                     ctype = (cons_meta or {}).get("type", "").upper()
+                    src_validated = (cons_meta or {}).get("validated")
+                    src_status = (cons_meta or {}).get("status")
                     downgrade_pk = cons_name_u in it.downgraded_pk_constraints
                     cols = cons_meta.get("columns") if cons_meta else []
                     # FK 引用表的 remap 映射，用于替换 DDL 中的 REFERENCES 子句
@@ -23913,6 +24143,7 @@ def generate_fixup_scripts(
                         log.warning("[FIXUP] 未在 TABLE %s.%s 的 DDL 中找到约束 %s。", ss, st, cons_name_u)
                         continue
                     ddl_lines: List[str] = []
+                    deferred_recorded = False
                     # 合并相关的 replacements 和 FK 引用表的映射
                     constraint_replacements = get_relevant_replacements(ss) + fk_ref_replacements
                     for stmt in statements:
@@ -23929,6 +24160,34 @@ def generate_fixup_scripts(
                         ddl_adj = normalize_ddl_for_ob(ddl_adj)
                         ddl_adj = strip_constraint_enable(ddl_adj)
                         ddl_adj = strip_enable_novalidate(ddl_adj)
+                        ddl_adj, applied_keyword, applied_reason = apply_constraint_missing_validate_mode_to_ddl(
+                            ddl_adj,
+                            constraint_missing_validate_mode,
+                            src_validated,
+                            src_status
+                        )
+                        if (
+                            applied_keyword == "NOVALIDATE"
+                            and not deferred_recorded
+                        ):
+                            validate_sql = (
+                                f"ALTER TABLE {table_full} ENABLE VALIDATE CONSTRAINT "
+                                f"{quote_identifier(cons_name_u)};"
+                            )
+                            with deferred_validation_lock:
+                                deferred_validation_rows.append(
+                                    ConstraintValidateDeferredRow(
+                                        schema_name=ts.upper(),
+                                        table_name=tt.upper(),
+                                        constraint_name=cons_name_u,
+                                        constraint_type=ctype or "UNKNOWN",
+                                        src_validated=normalize_constraint_validated_status(src_validated),
+                                        applied_mode=constraint_missing_validate_mode,
+                                        reason=applied_reason or "safe_novalidate",
+                                        validate_sql=validate_sql,
+                                    )
+                                )
+                            deferred_recorded = True
                         ddl_adj = apply_fixup_idempotency(
                             ddl_adj,
                             'CONSTRAINT',
@@ -23959,6 +24218,48 @@ def generate_fixup_scripts(
                     constraint_progress()
         constraint_jobs.append(_job)
     run_tasks(constraint_jobs, "CONSTRAINT")
+
+    deferred_validate_report_path: Optional[Path] = None
+    if deferred_validation_rows:
+        validate_dir = "constraint_validate_later"
+        grouped_validate_sql: Dict[str, Set[str]] = defaultdict(set)
+        for row in deferred_validation_rows:
+            grouped_validate_sql[row.schema_name].add(row.validate_sql)
+        for schema_u, sql_set in sorted(grouped_validate_sql.items()):
+            stmts = sorted(sql_set)
+            content = prepend_set_schema("\n".join(stmts), schema_u)
+            write_fixup_file(
+                base_dir,
+                validate_dir,
+                f"{schema_u}.constraint_validate.sql",
+                content,
+                f"缺失约束后置校验（清理脏数据后执行） {schema_u}",
+                extra_comments=[
+                    "NOTE: 本目录脚本用于数据清理后的二次收敛，默认不建议在首次 fixup 执行。"
+                ]
+            )
+        log.info(
+            "[FIXUP] 已生成后置约束 VALIDATE 脚本: %d 条, 目录=%s/%s",
+            len(deferred_validation_rows),
+            base_dir,
+            validate_dir
+        )
+        if report_dir and report_timestamp:
+            deferred_validate_report_path = export_constraint_validate_deferred_detail(
+                deferred_validation_rows,
+                report_dir,
+                report_timestamp
+            )
+            if deferred_validate_report_path:
+                log.info(
+                    "[FIXUP] 后置约束 VALIDATE 明细已输出: %s",
+                    deferred_validate_report_path
+                )
+    settings["_constraint_validate_deferred_count"] = len(deferred_validation_rows)
+    if deferred_validate_report_path:
+        settings["_constraint_validate_deferred_report_path"] = str(deferred_validate_report_path)
+    else:
+        settings.pop("_constraint_validate_deferred_report_path", None)
 
     log.info("[FIXUP] (7/9) 正在生成 TRIGGER 脚本...")
     trigger_progress = build_progress_tracker(len(trigger_tasks), "[FIXUP] (7/9) TRIGGER")
@@ -24720,6 +25021,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "索引依赖阻断明细"
     if name.startswith("constraints_unsupported_detail_"):
         return "DETAIL", "约束语法不支持明细(DEFERRABLE/自引用外键等)"
+    if name.startswith("constraint_validate_deferred_detail_"):
+        return "DETAIL", "缺失约束后置 VALIDATE 明细"
     if name.startswith("constraints_blocked_detail_"):
         return "DETAIL", "约束依赖阻断明细"
     if name.startswith("triggers_blocked_detail_"):
@@ -25071,6 +25374,47 @@ def export_constraints_unsupported_detail(
         for row in rows_sorted
     ]
     return write_pipe_report("约束不支持明细", header_fields, data_rows, output_path)
+
+
+def export_constraint_validate_deferred_detail(
+    rows: List[ConstraintValidateDeferredRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出缺失约束采用 NOVALIDATE 的后置校验明细。
+    """
+    if not report_dir or not rows or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"constraint_validate_deferred_detail_{report_timestamp}.txt"
+    rows_sorted = sorted(
+        rows,
+        key=lambda r: (r.schema_name, r.table_name, r.constraint_name)
+    )
+    header_fields = [
+        "SCHEMA",
+        "TABLE",
+        "CONSTRAINT_NAME",
+        "CONSTRAINT_TYPE",
+        "SRC_VALIDATED",
+        "APPLIED_MODE",
+        "REASON",
+        "VALIDATE_SQL"
+    ]
+    data_rows = [
+        [
+            row.schema_name,
+            row.table_name,
+            row.constraint_name,
+            row.constraint_type,
+            row.src_validated,
+            row.applied_mode,
+            row.reason,
+            row.validate_sql
+        ]
+        for row in rows_sorted
+    ]
+    return write_pipe_report("约束后置 VALIDATE 明细", header_fields, data_rows, output_path)
 
 
 def export_indexes_unsupported_detail(
@@ -27604,6 +27948,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
     if name.startswith("extra_mismatch_detail_"):
         return "MISMATCH_DETAIL"
     if name.startswith("status_drift_detail_"):
+        return "MISMATCH_DETAIL"
+    if name.startswith("constraint_validate_deferred_detail_"):
         return "MISMATCH_DETAIL"
     if name.startswith("package_compare_"):
         return "PACKAGE_COMPARE"
@@ -31119,6 +31465,7 @@ def print_final_report(
         "fixup_scripts/constraint    : 缺失约束的 CREATE 脚本\n"
         "fixup_scripts/sequence      : 缺失 SEQUENCE 的 CREATE 脚本\n"
         "fixup_scripts/trigger       : 缺失 TRIGGER 的 CREATE 脚本\n"
+        "fixup_scripts/constraint_validate_later : 约束后置 VALIDATE 脚本（脏数据清理后执行）\n"
         "fixup_scripts/unsupported/* : 不支持/阻断对象 DDL (默认不执行)\n"
         "fixup_scripts/compile       : 依赖重编译脚本 (ALTER ... COMPILE)\n"
         "fixup_scripts/grants_miss   : 缺失授权脚本 (对象/角色/系统)\n"
@@ -31352,6 +31699,21 @@ def print_final_report(
             constraint_unsupported_path,
             len(extra_results.get("constraint_unsupported", []) or []),
             "约束语法不支持明细(DEFERRABLE/自引用外键等)"
+        )
+        deferred_validate_detail_path = None
+        deferred_validate_count = int((settings or {}).get("_constraint_validate_deferred_count", 0) or 0)
+        deferred_validate_path_raw = str((settings or {}).get("_constraint_validate_deferred_report_path", "") or "").strip()
+        if deferred_validate_path_raw:
+            deferred_validate_detail_path = Path(deferred_validate_path_raw)
+        elif report_ts:
+            candidate = report_path.parent / f"constraint_validate_deferred_detail_{report_ts}.txt"
+            if candidate.exists():
+                deferred_validate_detail_path = candidate
+        _add_index_entry(
+            "DETAIL",
+            deferred_validate_detail_path,
+            deferred_validate_count or None,
+            "缺失约束后置 VALIDATE 明细"
         )
         blocked_index_path = None
         blocked_constraint_path = None
@@ -31655,6 +32017,7 @@ def parse_cli_args() -> argparse.Namespace:
             generate_status_fixup   true/false 控制状态漂移修复脚本生成
             status_fixup_types      状态修复对象类型 (trigger,constraint)
             constraint_status_sync_mode 约束状态同步模式 (enabled_only/full)
+            constraint_missing_fixup_validate_mode 缺失约束 VALIDATE 策略 (safe_novalidate/source/force_validate)
             trigger_validity_sync_mode 触发器有效性同步模式 (off/compile)
             sequence_remap_policy   SEQUENCE 目标 schema 推导策略 (infer/source_only/dominant_table)
             blacklist_name_patterns 表名黑名单关键字（逗号分隔，默认 _RENAME）

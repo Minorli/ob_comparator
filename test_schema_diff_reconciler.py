@@ -1475,6 +1475,40 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn('-- ALTER TABLE "TGT"."T1" DROP COLUMN SYS_C000123;', sql)
         self.assertNotIn('\nALTER TABLE "TGT"."T1" FORCE;', "\n" + sql)
 
+    def test_inflate_table_varchar_lengths_handles_byte_inside_parentheses(self):
+        oracle_meta = self._make_oracle_meta_with_columns(
+            {
+                ("SRC", "T1"): {
+                    "C1": {
+                        "data_type": "VARCHAR2",
+                        "data_length": 10,
+                        "char_length": 10,
+                        "char_used": "B",
+                    }
+                }
+            }
+        )
+        ddl = 'CREATE TABLE "SRC"."T1" ("C1" VARCHAR2(10 BYTE));'
+        adjusted = sdr.inflate_table_varchar_lengths(ddl, "SRC", "T1", oracle_meta)
+        self.assertIn('VARCHAR2(15 BYTE)', adjusted)
+
+    def test_inflate_table_varchar_lengths_keeps_char_semantics(self):
+        oracle_meta = self._make_oracle_meta_with_columns(
+            {
+                ("SRC", "T1"): {
+                    "C1": {
+                        "data_type": "VARCHAR2",
+                        "data_length": 10,
+                        "char_length": 10,
+                        "char_used": "C",
+                    }
+                }
+            }
+        )
+        ddl = 'CREATE TABLE "SRC"."T1" ("C1" VARCHAR2(10 CHAR));'
+        adjusted = sdr.inflate_table_varchar_lengths(ddl, "SRC", "T1", oracle_meta)
+        self.assertEqual(adjusted, ddl)
+
     def test_filter_trigger_results_for_unsupported_tables(self):
         extra_results = {
             "index_ok": [],
@@ -4438,6 +4472,24 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
     def test_is_ob_notnull_constraint_handles_tuple(self):
         self.assertTrue(sdr.is_ob_notnull_constraint(("ZZ_OBNOTNULL_1", "extra")))
         self.assertFalse(sdr.is_ob_notnull_constraint(("ZZ_NORMAL", "extra")))
+        self.assertTrue(
+            sdr.is_ob_notnull_constraint(
+                "T1_OBCHECK_1761134849332186",
+                '("C1" is not null)'
+            )
+        )
+        self.assertFalse(
+            sdr.is_ob_notnull_constraint(
+                "T1_OBCHECK_1761134849332186",
+                '("C1" > 0)'
+            )
+        )
+        self.assertTrue(
+            sdr.is_ob_notnull_constraint(
+                "T1_OBCHECK_1761134849332186",
+                '(("C1" is not null))'
+            )
+        )
 
     def test_normalize_extra_results_names_handles_tuple(self):
         extra_results = {
@@ -5271,6 +5323,87 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIsNone(mismatch)
 
+    def test_compare_constraints_for_table_ignores_obcheck_notnull_only_difference(self):
+        oracle_constraints = {
+            ("A", "T1"): {
+                "CK_SRC": {
+                    "type": "C",
+                    "columns": ["C1"],
+                    "search_condition": "C1 > 0",
+                }
+            }
+        }
+        ob_constraints = {
+            ("A", "T1"): {
+                "CK_TGT": {
+                    "type": "C",
+                    "columns": ["C1"],
+                    "search_condition": "C1 > 0",
+                },
+                "T1_OBCHECK_1761134849332186": {
+                    "type": "C",
+                    "columns": ["C2"],
+                    "search_condition": '("C2" is not null)',
+                }
+            }
+        }
+        oracle_meta = self._make_oracle_meta(constraints=oracle_constraints)
+        ob_meta = self._make_ob_meta(constraints=ob_constraints)
+        ok, mismatch = sdr.compare_constraints_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+            {}
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(mismatch)
+
+    def test_compare_constraints_for_table_check_ob_rewrite_between_like(self):
+        oracle_constraints = {
+            ("A", "T1"): {
+                "SYS_C1": {
+                    "type": "C",
+                    "columns": ["QTY"],
+                    "search_condition": "QTY BETWEEN 0 AND 999",
+                },
+                "SYS_C2": {
+                    "type": "C",
+                    "columns": ["CODE"],
+                    "search_condition": "CODE IS NULL OR CODE LIKE 'X%'",
+                },
+            }
+        }
+        ob_constraints = {
+            ("A", "T1"): {
+                "T1_OBCHECK_1": {
+                    "type": "C",
+                    "columns": ["QTY"],
+                    "search_condition": '(("QTY" >= 0) and ("QTY" <= 999))',
+                },
+                "T1_OBCHECK_2": {
+                    "type": "C",
+                    "columns": ["CODE"],
+                    "search_condition": '(("CODE" is null) or ("CODE" like replace(\'X%\',\'\\\\\',\'\\\\\\\\\') escape \'\\\\\'))',
+                },
+            }
+        }
+        oracle_meta = self._make_oracle_meta(constraints=oracle_constraints)
+        ob_meta = self._make_ob_meta(constraints=ob_constraints)
+        ok, mismatch = sdr.compare_constraints_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+            {}
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(mismatch)
+
     def test_classify_unsupported_check_constraints_filters_extra(self):
         oracle_meta = self._make_oracle_meta(
             constraints={
@@ -5992,6 +6125,59 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIsNone(mismatch)
 
+    def test_compare_indexes_ob_gtt_normalized_by_constraint_backing_index(self):
+        # 无 IDX_FOR_HEAP_GTT_* 内部索引名时，也应识别到 GTT 风格的 SYS_SESSION_ID 前缀
+        oracle_indexes = {
+            ("A", "T1"): {
+                "PK_T1": {
+                    "columns": ["ID"],
+                    "expressions": {},
+                    "uniqueness": "UNIQUE",
+                },
+                "UK_T1": {
+                    "columns": ["CODE"],
+                    "expressions": {},
+                    "uniqueness": "UNIQUE",
+                },
+            }
+        }
+        ob_indexes = {
+            ("A", "T1"): {
+                "UK_T1": {
+                    "columns": ["SYS_SESSION_ID", "CODE"],
+                    "expressions": {},
+                    "uniqueness": "UNIQUE",
+                },
+            }
+        }
+        ob_constraints = {
+            ("A", "T1"): {
+                "PK_T1": {
+                    "type": "P",
+                    "columns": ["ID"],
+                    "index_name": "PK_T1",
+                },
+                "UK_T1": {
+                    "type": "U",
+                    "columns": ["CODE"],
+                    "index_name": "UK_T1",
+                },
+            }
+        }
+        oracle_meta = self._make_oracle_meta(indexes=oracle_indexes)
+        ob_meta = self._make_ob_meta(indexes=ob_indexes, constraints=ob_constraints)
+
+        ok, mismatch = sdr.compare_indexes_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(mismatch)
+
     def test_collect_blacklisted_missing_tables(self):
         tv_results = {
             "missing": [
@@ -6211,6 +6397,20 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
     def test_normalize_check_constraint_expression_redundant_parentheses(self):
         expr_oracle = "A > 0 AND B IN (1,2,3)"
         expr_ob = '("A" > 0) and ("B" in (1,2,3))'
+        norm_oracle = sdr.normalize_check_constraint_expression(expr_oracle, "C1")
+        norm_ob = sdr.normalize_check_constraint_expression(expr_ob, "C2")
+        self.assertEqual(norm_oracle, norm_ob)
+
+    def test_normalize_check_constraint_expression_between_equivalence(self):
+        expr_oracle = "QTY BETWEEN 0 AND 999"
+        expr_ob = '(("QTY" >= 0) and ("QTY" <= 999))'
+        norm_oracle = sdr.normalize_check_constraint_expression(expr_oracle, "C1")
+        norm_ob = sdr.normalize_check_constraint_expression(expr_ob, "C2")
+        self.assertEqual(norm_oracle, norm_ob)
+
+    def test_normalize_check_constraint_expression_like_escape_rewrite(self):
+        expr_oracle = "CODE LIKE 'X%'"
+        expr_ob = '("CODE" like replace(\'X%\',\'\\\\\',\'\\\\\\\\\') escape \'\\\\\')'
         norm_oracle = sdr.normalize_check_constraint_expression(expr_oracle, "C1")
         norm_ob = sdr.normalize_check_constraint_expression(expr_ob, "C2")
         self.assertEqual(norm_oracle, norm_ob)
@@ -6618,9 +6818,60 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(sdr.normalize_constraint_status_sync_mode("enabled"), "enabled_only")
         self.assertEqual(sdr.normalize_constraint_status_sync_mode("full"), "full")
         self.assertEqual(sdr.normalize_constraint_status_sync_mode("bad"), "enabled_only")
+        self.assertEqual(
+            sdr.normalize_constraint_missing_fixup_validate_mode("safe"),
+            "safe_novalidate"
+        )
+        self.assertEqual(
+            sdr.normalize_constraint_missing_fixup_validate_mode("source"),
+            "source"
+        )
+        self.assertEqual(
+            sdr.normalize_constraint_missing_fixup_validate_mode("force"),
+            "force_validate"
+        )
+        self.assertEqual(
+            sdr.normalize_constraint_missing_fixup_validate_mode("bad"),
+            "safe_novalidate"
+        )
         self.assertEqual(sdr.normalize_trigger_validity_sync_mode("on"), "compile")
         self.assertEqual(sdr.normalize_trigger_validity_sync_mode("off"), "off")
         self.assertEqual(sdr.normalize_trigger_validity_sync_mode("bad"), "compile")
+
+    def test_apply_constraint_missing_validate_mode_to_ddl(self):
+        ddl = (
+            'ALTER TABLE "A"."T1" ADD CONSTRAINT "FK_T1" '
+            'FOREIGN KEY ("C1") REFERENCES "A"."T2" ("ID")'
+        )
+        adjusted, keyword, reason = sdr.apply_constraint_missing_validate_mode_to_ddl(
+            ddl,
+            "safe_novalidate",
+            "VALIDATED"
+        )
+        self.assertEqual(keyword, "NOVALIDATE")
+        self.assertEqual(reason, "safe_novalidate")
+        self.assertIn("ENABLE NOVALIDATE", adjusted.upper())
+
+        adjusted_src, keyword_src, reason_src = sdr.apply_constraint_missing_validate_mode_to_ddl(
+            ddl,
+            "source",
+            "VALIDATED"
+        )
+        self.assertEqual(keyword_src, "VALIDATE")
+        self.assertEqual(reason_src, "source_validated")
+        self.assertIn("ENABLE VALIDATE", adjusted_src.upper())
+
+        adjusted_disabled, keyword_disabled, reason_disabled = sdr.apply_constraint_missing_validate_mode_to_ddl(
+            ddl,
+            "source",
+            "VALIDATED",
+            "DISABLED"
+        )
+        self.assertEqual(keyword_disabled, "DISABLE")
+        self.assertEqual(reason_disabled, "source_disabled")
+        self.assertIn("ADD CONSTRAINT", adjusted_disabled.upper())
+        self.assertIn("DISABLE", adjusted_disabled.upper())
+        self.assertNotIn("ENABLE VALIDATE", adjusted_disabled.upper())
 
     def test_build_trigger_status_fixup_sqls_compile_mode(self):
         row = sdr.TriggerStatusReportRow(
