@@ -28,8 +28,8 @@
     {
       "id": "RENAME_TABLES",
       "enabled": true,
-      "black_type": "NAME_PATTERN",
-      "sql": "SELECT owner, table_name, 'NAME_PATTERN' AS data_type, 'NAME_PATTERN' AS black_type\nFROM dba_tables\nWHERE owner IN ({{owners_clause}})\n  AND ({{name_pattern_clause}})"
+      "black_type": "RENAME",
+      "sql": "SELECT owner, table_name, 'RENAME' AS data_type, 'RENAME' AS black_type\nFROM dba_tables\nWHERE owner IN ({{owners_clause}})\n  AND UPPER(table_name) LIKE '%RENAME%'"
     },
     {
       "id": "TEMPORARY_TABLES",

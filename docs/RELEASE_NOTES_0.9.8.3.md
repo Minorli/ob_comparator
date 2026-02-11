@@ -9,7 +9,7 @@
 - 新增 report_db_store_scope / report_db_detail_item_enable 等配置。
 - 新增报告分析视图：ACTIONS / OBJECT_PROFILE / TRENDS / PENDING_ACTIONS / GRANT_CLASS / USABILITY_CLASS。
 - 新增写库失败追踪与闭环表：DIFF_REPORT_WRITE_ERRORS / DIFF_REPORT_RESOLUTION。
-- HOW_TO_READ_REPORTS_IN_OB_77_sqls.txt SQL 全量校验并修正，并补充新视图/写库追踪查询模板。
+- HOW_TO_READ_REPORTS_IN_OB_latest.txt SQL 全量校验并修正，并补充新视图/写库追踪查询模板。
 
 ## 兼容性
 - 保持与 0.9.8.x 系列兼容；新增表仅在 report_to_db=true 时创建。

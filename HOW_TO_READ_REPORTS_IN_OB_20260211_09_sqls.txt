@@ -1,6 +1,6 @@
 ============================================================
 OceanBase 报告库排查手册（report_to_db）
-文件: HOW_TO_READ_REPORTS_IN_OB_77_sqls.txt
+文件: HOW_TO_READ_REPORTS_IN_OB_20260211_09_sqls.txt
 ============================================================
 
 使用说明
@@ -11,6 +11,42 @@ OceanBase 报告库排查手册（report_to_db）
   - `summary`: 仅 SUMMARY/COUNTS
   - `core`: + DETAIL/GRANT/USABILITY/PACKAGE_COMPARE/TRIGGER_STATUS + 6个分析视图
   - `full`: + DETAIL_ITEM/ARTIFACT/ARTIFACT_LINE/DEPENDENCY/VIEW_CHAIN/REMAP_CONFLICT/OBJECT_MAPPING/BLACKLIST/FIXUP_SKIP/OMS_MISSING
+
+------------------------------------------------------------
+L0. 快速入口（新手只看这 12 条）
+------------------------------------------------------------
+
+固定顺序（建议直接照抄执行）：
+1) SQL-01, SQL-02：确认本次 `report_id`
+2) SQL-08, SQL-10：看总体差异面
+3) SQL-26, SQL-27：看不支持/阻断原因
+4) SQL-16, SQL-37：看缺失与不一致主类型
+5) SQL-60, SQL-61, SQL-62, SQL-63：看权限缺失/不一致/不支持
+6) SQL-67：看 VIEW/SYNONYM 可用性
+7) SQL-47：看依赖边状态分布
+
+------------------------------------------------------------
+L1. 场景剧本（按问题类型排查）
+------------------------------------------------------------
+
+剧本 A：为什么“缺失很多”
+- SQL-10 -> SQL-16 -> SQL-17 -> SQL-21 -> SQL-23
+
+剧本 B：为什么“不可支持对象很多”
+- SQL-26 -> SQL-27 -> SQL-28 -> SQL-29 -> SQL-32 -> SQL-33
+
+剧本 C：为什么“多余对象很多（extra）”
+- SQL-11 -> SQL-74 -> SQL-75 -> SQL-76 -> SQL-77
+
+剧本 D：为什么“视图/同义词不可用”
+- SQL-67 -> SQL-52 -> SQL-53 -> SQL-54 -> SQL-47
+
+剧本 E：为什么“授权问题导致失败”
+- SQL-60 -> SQL-61 -> SQL-62 -> SQL-63 -> SQL-64
+
+------------------------------------------------------------
+L2. 全量 SQL 索引（A ~ G，保留全部）
+------------------------------------------------------------
 
 ------------------------------------------------------------
 A. 入口与覆盖范围（SQL-01 ~ SQL-14）
@@ -575,49 +611,320 @@ SELECT src_schema, src_name, object_type,
 F. 授权 / 可用性 / 包 / 触发器 / 写库异常（SQL-60 ~ SQL-73）
 ------------------------------------------------------------
 
--- SQL-60 GRANT 分类汇总（推荐）
-SELECT grant_class, COUNT(*) AS cnt
-  FROM DIFF_REPORT_GRANT_CLASS_V
- WHERE report_id = :report_id
- GROUP BY grant_class
- ORDER BY cnt DESC, grant_class;
+-- SQL-60 GRANT 三分类汇总（缺失 / 缺选项 / 不支持）
+WITH g AS (
+    SELECT *
+      FROM DIFF_REPORT_GRANT
+     WHERE report_id = :report_id
+),
+planned AS (
+    SELECT *
+      FROM g
+     WHERE status = 'PLANNED'
+),
+filtered AS (
+    SELECT *
+      FROM g
+     WHERE status = 'FILTERED'
+),
+obj_now AS (
+    SELECT UPPER(grantee) AS grantee,
+           UPPER(privilege) AS privilege,
+           UPPER(owner) AS owner,
+           UPPER(table_name) AS table_name,
+           MAX(CASE WHEN UPPER(NVL(grantable, 'NO')) = 'YES' THEN 1 ELSE 0 END) AS has_wgo
+      FROM dba_tab_privs
+     GROUP BY UPPER(grantee), UPPER(privilege), UPPER(owner), UPPER(table_name)
+),
+sys_now AS (
+    SELECT UPPER(grantee) AS grantee,
+           UPPER(privilege) AS privilege,
+           MAX(CASE WHEN UPPER(NVL(admin_option, 'NO')) = 'YES' THEN 1 ELSE 0 END) AS has_admin
+      FROM dba_sys_privs
+     GROUP BY UPPER(grantee), UPPER(privilege)
+),
+role_now AS (
+    SELECT UPPER(grantee) AS grantee,
+           UPPER(granted_role) AS granted_role,
+           MAX(CASE WHEN UPPER(NVL(admin_option, 'NO')) = 'YES' THEN 1 ELSE 0 END) AS has_admin
+      FROM dba_role_privs
+     GROUP BY UPPER(grantee), UPPER(granted_role)
+),
+diag AS (
+    SELECT p.grant_type,
+           CASE
+             WHEN n.grantee IS NULL THEN 'MISSING'
+             WHEN p.with_grant_option = 1 AND n.has_wgo = 0 THEN 'MISSING_WITH_GRANT_OPTION'
+             ELSE 'ALREADY_OK'
+           END AS diagnose
+      FROM planned p
+      LEFT JOIN obj_now n
+        ON p.grant_type = 'OBJECT'
+       AND n.grantee = UPPER(p.grantee)
+       AND n.privilege = UPPER(p.privilege)
+       AND n.owner = UPPER(NVL(p.target_schema, ''))
+       AND n.table_name = UPPER(NVL(p.target_name, ''))
+    UNION ALL
+    SELECT p.grant_type,
+           CASE
+             WHEN n.grantee IS NULL THEN 'MISSING'
+             WHEN p.with_grant_option = 1 AND n.has_admin = 0 THEN 'MISSING_WITH_ADMIN_OPTION'
+             ELSE 'ALREADY_OK'
+           END AS diagnose
+      FROM planned p
+      LEFT JOIN sys_now n
+        ON p.grant_type = 'SYSTEM'
+       AND n.grantee = UPPER(p.grantee)
+       AND n.privilege = UPPER(p.privilege)
+    UNION ALL
+    SELECT p.grant_type,
+           CASE
+             WHEN n.grantee IS NULL THEN 'MISSING'
+             WHEN p.with_grant_option = 1 AND n.has_admin = 0 THEN 'MISSING_WITH_ADMIN_OPTION'
+             ELSE 'ALREADY_OK'
+           END AS diagnose
+      FROM planned p
+      LEFT JOIN role_now n
+        ON p.grant_type = 'ROLE'
+       AND n.grantee = UPPER(p.grantee)
+       AND n.granted_role = UPPER(p.privilege)
+),
+merged AS (
+    SELECT grant_type, diagnose FROM diag
+    UNION ALL
+    SELECT grant_type, 'UNSUPPORTED_FILTERED' AS diagnose FROM filtered
+)
+SELECT grant_type, diagnose, COUNT(*) AS cnt
+  FROM merged
+ GROUP BY grant_type, diagnose
+ ORDER BY grant_type, cnt DESC, diagnose;
 
--- SQL-61 缺失授权明细
-SELECT grant_type, grantee, grantor,
-       privilege, target_schema, target_name, target_type,
-       with_grant_option, status, filter_reason
-  FROM DIFF_REPORT_GRANT
- WHERE report_id = :report_id
-   AND status = 'MISSING'
- ORDER BY grantee, target_schema, target_name, privilege;
+-- SQL-61 缺失授权明细（目标端完全不存在）
+WITH g AS (
+    SELECT *
+      FROM DIFF_REPORT_GRANT
+     WHERE report_id = :report_id
+       AND status = 'PLANNED'
+),
+obj_now AS (
+    SELECT UPPER(grantee) AS grantee,
+           UPPER(privilege) AS privilege,
+           UPPER(owner) AS owner,
+           UPPER(table_name) AS table_name
+      FROM dba_tab_privs
+     GROUP BY UPPER(grantee), UPPER(privilege), UPPER(owner), UPPER(table_name)
+),
+sys_now AS (
+    SELECT UPPER(grantee) AS grantee,
+           UPPER(privilege) AS privilege
+      FROM dba_sys_privs
+     GROUP BY UPPER(grantee), UPPER(privilege)
+),
+role_now AS (
+    SELECT UPPER(grantee) AS grantee,
+           UPPER(granted_role) AS granted_role
+      FROM dba_role_privs
+     GROUP BY UPPER(grantee), UPPER(granted_role)
+)
+SELECT p.grant_type, p.grantee, p.privilege,
+       p.target_schema, p.target_name, p.target_type,
+       p.with_grant_option, p.status
+  FROM g p
+  LEFT JOIN obj_now n
+    ON p.grant_type = 'OBJECT'
+   AND n.grantee = UPPER(p.grantee)
+   AND n.privilege = UPPER(p.privilege)
+   AND n.owner = UPPER(NVL(p.target_schema, ''))
+   AND n.table_name = UPPER(NVL(p.target_name, ''))
+ WHERE p.grant_type = 'OBJECT'
+   AND n.grantee IS NULL
+UNION ALL
+SELECT p.grant_type, p.grantee, p.privilege,
+       p.target_schema, p.target_name, p.target_type,
+       p.with_grant_option, p.status
+  FROM g p
+  LEFT JOIN sys_now n
+    ON p.grant_type = 'SYSTEM'
+   AND n.grantee = UPPER(p.grantee)
+   AND n.privilege = UPPER(p.privilege)
+ WHERE p.grant_type = 'SYSTEM'
+   AND n.grantee IS NULL
+UNION ALL
+SELECT p.grant_type, p.grantee, p.privilege,
+       p.target_schema, p.target_name, p.target_type,
+       p.with_grant_option, p.status
+  FROM g p
+  LEFT JOIN role_now n
+    ON p.grant_type = 'ROLE'
+   AND n.grantee = UPPER(p.grantee)
+   AND n.granted_role = UPPER(p.privilege)
+ WHERE p.grant_type = 'ROLE'
+   AND n.grantee IS NULL
+ORDER BY grant_type, grantee, target_schema, target_name, privilege;
 
--- SQL-62 缺失且需要 WITH GRANT OPTION
+-- SQL-62 权限不一致明细（已存在但缺少 WITH GRANT/ADMIN OPTION）
+WITH g AS (
+    SELECT *
+      FROM DIFF_REPORT_GRANT
+     WHERE report_id = :report_id
+       AND status = 'PLANNED'
+       AND with_grant_option = 1
+),
+obj_now AS (
+    SELECT UPPER(grantee) AS grantee,
+           UPPER(privilege) AS privilege,
+           UPPER(owner) AS owner,
+           UPPER(table_name) AS table_name,
+           MAX(CASE WHEN UPPER(NVL(grantable, 'NO')) = 'YES' THEN 1 ELSE 0 END) AS has_wgo
+      FROM dba_tab_privs
+     GROUP BY UPPER(grantee), UPPER(privilege), UPPER(owner), UPPER(table_name)
+),
+sys_now AS (
+    SELECT UPPER(grantee) AS grantee,
+           UPPER(privilege) AS privilege,
+           MAX(CASE WHEN UPPER(NVL(admin_option, 'NO')) = 'YES' THEN 1 ELSE 0 END) AS has_admin
+      FROM dba_sys_privs
+     GROUP BY UPPER(grantee), UPPER(privilege)
+),
+role_now AS (
+    SELECT UPPER(grantee) AS grantee,
+           UPPER(granted_role) AS granted_role,
+           MAX(CASE WHEN UPPER(NVL(admin_option, 'NO')) = 'YES' THEN 1 ELSE 0 END) AS has_admin
+      FROM dba_role_privs
+     GROUP BY UPPER(grantee), UPPER(granted_role)
+)
+SELECT p.grant_type, p.grantee, p.privilege,
+       p.target_schema, p.target_name, p.target_type,
+       'MISSING_WITH_GRANT_OPTION' AS mismatch_type
+  FROM g p
+  JOIN obj_now n
+    ON p.grant_type = 'OBJECT'
+   AND n.grantee = UPPER(p.grantee)
+   AND n.privilege = UPPER(p.privilege)
+   AND n.owner = UPPER(NVL(p.target_schema, ''))
+   AND n.table_name = UPPER(NVL(p.target_name, ''))
+ WHERE n.has_wgo = 0
+UNION ALL
+SELECT p.grant_type, p.grantee, p.privilege,
+       p.target_schema, p.target_name, p.target_type,
+       'MISSING_WITH_ADMIN_OPTION' AS mismatch_type
+  FROM g p
+  JOIN sys_now n
+    ON p.grant_type = 'SYSTEM'
+   AND n.grantee = UPPER(p.grantee)
+   AND n.privilege = UPPER(p.privilege)
+ WHERE n.has_admin = 0
+UNION ALL
+SELECT p.grant_type, p.grantee, p.privilege,
+       p.target_schema, p.target_name, p.target_type,
+       'MISSING_WITH_ADMIN_OPTION' AS mismatch_type
+  FROM g p
+  JOIN role_now n
+    ON p.grant_type = 'ROLE'
+   AND n.grantee = UPPER(p.grantee)
+   AND n.granted_role = UPPER(p.privilege)
+ WHERE n.has_admin = 0
+ORDER BY grant_type, grantee, target_schema, target_name, privilege;
+
+-- SQL-63 被过滤授权及原因（= 不支持或策略过滤）
 SELECT grant_type, grantee, privilege,
        target_schema, target_name, target_type,
-       with_grant_option, status
-  FROM DIFF_REPORT_GRANT
- WHERE report_id = :report_id
-   AND status = 'MISSING'
-   AND with_grant_option = 1
- ORDER BY grantee, target_schema, target_name;
-
--- SQL-63 被过滤授权及原因（含 PUBLIC 策略）
-SELECT grantee, privilege, target_schema, target_name, target_type,
        status, filter_reason
   FROM DIFF_REPORT_GRANT
  WHERE report_id = :report_id
    AND status = 'FILTERED'
- ORDER BY filter_reason, grantee, target_schema, target_name;
+ ORDER BY filter_reason, grant_type, grantee, target_schema, target_name;
 
--- SQL-64 授权热点（按 grantee）
+-- SQL-64 授权热点（按 grantee，分缺失/缺选项/不支持）
+WITH g AS (
+    SELECT *
+      FROM DIFF_REPORT_GRANT
+     WHERE report_id = :report_id
+),
+planned AS (
+    SELECT *
+      FROM g
+     WHERE status = 'PLANNED'
+),
+filtered AS (
+    SELECT grant_type, grantee
+      FROM g
+     WHERE status = 'FILTERED'
+),
+obj_now AS (
+    SELECT UPPER(grantee) AS grantee,
+           UPPER(privilege) AS privilege,
+           UPPER(owner) AS owner,
+           UPPER(table_name) AS table_name,
+           MAX(CASE WHEN UPPER(NVL(grantable, 'NO')) = 'YES' THEN 1 ELSE 0 END) AS has_wgo
+      FROM dba_tab_privs
+     GROUP BY UPPER(grantee), UPPER(privilege), UPPER(owner), UPPER(table_name)
+),
+sys_now AS (
+    SELECT UPPER(grantee) AS grantee,
+           UPPER(privilege) AS privilege,
+           MAX(CASE WHEN UPPER(NVL(admin_option, 'NO')) = 'YES' THEN 1 ELSE 0 END) AS has_admin
+      FROM dba_sys_privs
+     GROUP BY UPPER(grantee), UPPER(privilege)
+),
+role_now AS (
+    SELECT UPPER(grantee) AS grantee,
+           UPPER(granted_role) AS granted_role,
+           MAX(CASE WHEN UPPER(NVL(admin_option, 'NO')) = 'YES' THEN 1 ELSE 0 END) AS has_admin
+      FROM dba_role_privs
+     GROUP BY UPPER(grantee), UPPER(granted_role)
+),
+diag AS (
+    SELECT p.grantee,
+           CASE
+             WHEN n.grantee IS NULL THEN 'MISSING'
+             WHEN p.with_grant_option = 1 AND n.has_wgo = 0 THEN 'MISMATCH_OPTION'
+             ELSE 'ALREADY_OK'
+           END AS diagnose
+      FROM planned p
+      LEFT JOIN obj_now n
+        ON p.grant_type = 'OBJECT'
+       AND n.grantee = UPPER(p.grantee)
+       AND n.privilege = UPPER(p.privilege)
+       AND n.owner = UPPER(NVL(p.target_schema, ''))
+       AND n.table_name = UPPER(NVL(p.target_name, ''))
+    UNION ALL
+    SELECT p.grantee,
+           CASE
+             WHEN n.grantee IS NULL THEN 'MISSING'
+             WHEN p.with_grant_option = 1 AND n.has_admin = 0 THEN 'MISMATCH_OPTION'
+             ELSE 'ALREADY_OK'
+           END AS diagnose
+      FROM planned p
+      LEFT JOIN sys_now n
+        ON p.grant_type = 'SYSTEM'
+       AND n.grantee = UPPER(p.grantee)
+       AND n.privilege = UPPER(p.privilege)
+    UNION ALL
+    SELECT p.grantee,
+           CASE
+             WHEN n.grantee IS NULL THEN 'MISSING'
+             WHEN p.with_grant_option = 1 AND n.has_admin = 0 THEN 'MISMATCH_OPTION'
+             ELSE 'ALREADY_OK'
+           END AS diagnose
+      FROM planned p
+      LEFT JOIN role_now n
+        ON p.grant_type = 'ROLE'
+       AND n.grantee = UPPER(p.grantee)
+       AND n.granted_role = UPPER(p.privilege)
+),
+all_diag AS (
+    SELECT grantee, diagnose FROM diag
+    UNION ALL
+    SELECT grantee, 'UNSUPPORTED_FILTERED' AS diagnose FROM filtered
+)
 SELECT grantee,
-       SUM(CASE WHEN status = 'MISSING' THEN 1 ELSE 0 END) AS missing_cnt,
-       SUM(CASE WHEN status = 'EXTRA' THEN 1 ELSE 0 END) AS extra_cnt,
-       SUM(CASE WHEN status = 'FILTERED' THEN 1 ELSE 0 END) AS filtered_cnt
-  FROM DIFF_REPORT_GRANT
- WHERE report_id = :report_id
+       SUM(CASE WHEN diagnose = 'MISSING' THEN 1 ELSE 0 END) AS missing_cnt,
+       SUM(CASE WHEN diagnose = 'MISMATCH_OPTION' THEN 1 ELSE 0 END) AS mismatch_option_cnt,
+       SUM(CASE WHEN diagnose = 'UNSUPPORTED_FILTERED' THEN 1 ELSE 0 END) AS unsupported_cnt
+  FROM all_diag
  GROUP BY grantee
- ORDER BY missing_cnt DESC, filtered_cnt DESC, grantee;
+ ORDER BY missing_cnt DESC, mismatch_option_cnt DESC, unsupported_cnt DESC, grantee;
 
 -- SQL-65 动作汇总（可执行工作面）
 SELECT action_type, object_type, COUNT(*) AS cnt

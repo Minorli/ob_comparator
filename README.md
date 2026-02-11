@@ -144,7 +144,19 @@ python3 run_fixup.py --view-chain-autofix
 ## 额外工具
 - `init_users_roles.py`：以 Oracle 为准创建用户/角色并同步系统权限与角色授权。
 - `init_test.py`：基于 `test_scenarios/` 快速搭建测试场景。
+- `expert_swarm.py`：生成并可选执行多专家蜂群（架构/代码审查/编程/数据库/性能/安全/测试）。
 > 注意：`init_users_roles.py` 运行时会交互输入用户初始密码，不再在脚本中写死明文初始密码。
+
+## 专家蜂群（可选）
+```bash
+# 仅生成蜂群蓝图
+.venv/bin/python expert_swarm.py --print-blueprint
+
+# 可选：执行蜂群（并行子团队 + 仲裁器；需 OPENAI_API_KEY 与 openai-agents）
+.venv/bin/python expert_swarm.py --execute
+```
+
+详细说明见 `docs/EXPERT_SWARM.md`。
 
 ## 主要输出
 - `main_reports/run_<ts>/report_<ts>.txt`：完整对比报告（默认 per_run）

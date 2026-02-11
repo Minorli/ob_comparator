@@ -171,6 +171,15 @@ class TestExecuteSqlErrorDetection(unittest.TestCase):
         self.assertIn("ERROR 1064", err)
 
 
+class TestFailureClassification(unittest.TestCase):
+    def test_classify_sql_error_detects_constraint_validate_failure(self):
+        error_text = "ORA-02298: cannot validate (SCHEMA.FK_TEST) - parent keys not found"
+        self.assertEqual(
+            rf.classify_sql_error(error_text),
+            rf.FailureType.CONSTRAINT_VALIDATE_FAIL
+        )
+
+
 class TestViewChainDdlSanitize(unittest.TestCase):
     def test_sanitize_view_chain_view_ddl_removes_force(self):
         ddl = 'CREATE OR REPLACE FORCE EDITIONABLE VIEW "A"."V1" AS SELECT 1 FROM dual;'

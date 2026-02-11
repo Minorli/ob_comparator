@@ -150,6 +150,13 @@
   可选值：TRIGGER, CONSTRAINT。
 - constraint_status_sync_mode：约束状态同步模式。默认：enabled_only。
   可选值：enabled_only（仅同步 ENABLED/DISABLED）、full（额外同步 VALIDATED/NOT VALIDATED）。
+- constraint_missing_fixup_validate_mode：缺失约束修补时的 VALIDATE 策略。默认：safe_novalidate。
+  可选值：
+  safe_novalidate（默认，统一生成 ENABLE NOVALIDATE，降低 ORA-02298 风险）、
+  source（跟随源端 VALIDATED 状态；源端状态未知时回退 NOVALIDATE）、
+  force_validate（统一生成 ENABLE VALIDATE，可能因目标脏数据失败）。
+  说明：当采用 NOVALIDATE 时，程序会额外输出 `fixup_scripts/constraint_validate_later/` 与
+  `constraint_validate_deferred_detail_<ts>.txt`，用于数据清理后执行二次 VALIDATE。
 - trigger_validity_sync_mode：触发器有效性同步模式。默认：compile。
   可选值：off（不处理 VALID/INVALID）、compile（当源 VALID 且目标 INVALID 时生成 COMPILE）。
 - fixup_drop_sys_c_columns：是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE。默认：true。

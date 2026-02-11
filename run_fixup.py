@@ -171,6 +171,7 @@ class FailureType:
     PERMISSION_DENIED = "permission_denied"  # Insufficient privileges -> needs grants
     SYNTAX_ERROR = "syntax_error"            # SQL syntax error -> needs DDL fix
     DATA_CONFLICT = "data_conflict"          # Unique/constraint violation -> needs data cleanup
+    CONSTRAINT_VALIDATE_FAIL = "constraint_validate_fail"  # ORA-02298 validation failed
     DUPLICATE_OBJECT = "duplicate_object"    # Object already exists -> can skip
     INVALID_IDENTIFIER = "invalid_identifier" # Column/table name error -> needs DDL fix
     NAME_IN_USE = "name_in_use"              # Name already used -> needs resolution
@@ -252,6 +253,13 @@ def classify_sql_error(stderr: str) -> str:
     # Data conflict (unique constraint violation)
     if 'ORA-00001' in stderr_upper or 'UNIQUE CONSTRAINT' in stderr_upper:
         return FailureType.DATA_CONFLICT
+
+    # Constraint validate failure (target data quality issue)
+    if (
+        'ORA-02298' in stderr_upper
+        or 'CANNOT VALIDATE' in stderr_upper
+    ):
+        return FailureType.CONSTRAINT_VALIDATE_FAIL
     
     # Invalid identifier (DDL needs fix)
     if 'ORA-00904' in stderr_upper or 'ERROR 1054' in stderr_upper:
@@ -350,6 +358,15 @@ def log_failure_analysis(failures_by_type: Dict[str, List['ScriptResult']]) -> N
         items = failures_by_type[FailureType.DATA_CONFLICT]
         log.info("❌ 数据冲突/唯一约束违反: %d 个", len(items))
         log.info("   建议: 清理重复数据后重试相关DDL")
+        if len(items) <= 3:
+            for item in items[:3]:
+                log.info("     - %s", item.path.name)
+
+    # Constraint validate failures
+    if FailureType.CONSTRAINT_VALIDATE_FAIL in failures_by_type:
+        items = failures_by_type[FailureType.CONSTRAINT_VALIDATE_FAIL]
+        log.info("❌ 约束校验失败(ORA-02298): %d 个", len(items))
+        log.info("   建议: 先清理脏数据，再执行 constraint_validate_later 下的脚本完成 ENABLE VALIDATE")
         if len(items) <= 3:
             for item in items[:3]:
                 log.info("     - %s", item.path.name)
@@ -3316,7 +3333,7 @@ def main() -> None:
         only_dirs = [d.lower() for d in only_dirs] if only_dirs else []
     
     exclude_dirs = [d.lower() for d in exclude_dirs]
-    default_excludes = {"tables_unsupported", "unsupported"}
+    default_excludes = {"tables_unsupported", "unsupported", "constraint_validate_later"}
     exclude_set = set(exclude_dirs) | default_excludes
     if only_dirs:
         exclude_set -= set(only_dirs)

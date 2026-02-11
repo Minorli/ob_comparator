@@ -42,3 +42,8 @@ gha-creds-*.json
 .github/
 compatibility_suite/
 .claude
+
+# Agent team and swarm files
+expert_swarm.py
+test_expert_swarm.py
+audit/swarm/

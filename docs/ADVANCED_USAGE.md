@@ -272,7 +272,7 @@ A: `check_primary_types` 限制后，未包含的类型不会加载/推导/生�
 ## 9. 交付执行模板（建议）
 1) 先跑主程序生成报告与脚本：`python3 schema_diff_reconciler.py`  
 2) 先看 `report_*.txt` 的执行结论与 `report_index_*.txt` 的工件索引。  
-3) 如启用 `report_to_db=true`，优先用 `HOW_TO_READ_REPORTS_IN_OB_77_sqls.txt` 查询问题。  
+3) 如启用 `report_to_db=true`，优先用 `HOW_TO_READ_REPORTS_IN_OB_latest.txt` 查询问题。  
 4) 人工审核 `fixup_scripts/` 后执行：`python3 run_fixup.py --smart-order --recompile`。  
 5) 复杂 VIEW 依赖场景再执行：`python3 run_fixup.py --view-chain-autofix`。  
 6) 完成后再次运行主程序做收敛验证（确保缺失/不支持数量符合预期）。

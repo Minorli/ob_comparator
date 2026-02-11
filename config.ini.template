@@ -191,12 +191,16 @@ trigger_qualify_schema  = true
 # check_status_drift_types 可选值：
 #   TRIGGER, CONSTRAINT（状态漂移检查范围；需对应类型已在 check_extra_types 启用）
 # generate_status_fixup：
-#   true/false，是否为状态漂移生成修复脚本（默认 false）
+#   true/false，是否为状态漂移生成修复脚本（默认 true）
 # status_fixup_types 可选值：
 #   TRIGGER, CONSTRAINT（状态修复脚本生成范围）
 # constraint_status_sync_mode：
 #   enabled_only（仅同步 ENABLED/DISABLED，默认）
 #   full（同时同步 VALIDATED / NOT VALIDATED）
+# constraint_missing_fixup_validate_mode：
+#   safe_novalidate（默认，缺失约束使用 ENABLE NOVALIDATE，降低 ORA-02298 风险）
+#   source（跟随源端 VALIDATED 状态；未知时回退 NOVALIDATE）
+#   force_validate（强制 ENABLE VALIDATE，可能因脏数据失败）
 # trigger_validity_sync_mode：
 #   off（不处理 VALID/INVALID，默认）
 #   compile（当源 VALID 且目标 INVALID 时生成 ALTER TRIGGER ... COMPILE）
@@ -211,6 +215,7 @@ check_status_drift_types = trigger,constraint
 generate_status_fixup   = true
 status_fixup_types      = trigger,constraint
 constraint_status_sync_mode = enabled_only
+constraint_missing_fixup_validate_mode = safe_novalidate
 trigger_validity_sync_mode = compile
 # 是否进行依赖关系校验
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
