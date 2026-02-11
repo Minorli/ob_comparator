@@ -18272,7 +18272,13 @@ def remap_view_dependencies(
             full_object_mapping,
             base_full,
             preferred_types=preferred_types
-        ) or remap_rules.get(base_full)
+        )
+        explicit = remap_rules.get(base_full)
+        # 当 full_object_mapping 因冲突回退为 1:1 时，显式 remap 规则优先。
+        if mapped and explicit and mapped.upper() == base_full and explicit.upper() != base_full:
+            mapped = explicit
+        if not mapped:
+            mapped = explicit
         return (mapped or base_full).upper()
 
     for dep in dependencies:
@@ -18292,7 +18298,13 @@ def remap_view_dependencies(
                 full_object_mapping,
                 dep_u,
                 preferred_types=preferred_types
-            ) or remap_rules.get(dep_u)
+            )
+            explicit = remap_rules.get(dep_u)
+            # 当 full_object_mapping 因冲突回退为 1:1 时，显式 remap 规则优先。
+            if mapped_target and explicit and mapped_target.upper() == dep_u and explicit.upper() != dep_u:
+                mapped_target = explicit
+            if not mapped_target:
+                mapped_target = explicit
             # 若直接映射缺失，或落在 identity 映射，尝试同 schema 私有同义词
             if (not mapped_target) or (mapped_target.upper() == dep_u):
                 mapped_syn = _resolve_synonym(dep_schema, dep_obj)

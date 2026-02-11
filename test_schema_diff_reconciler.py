@@ -4267,6 +4267,30 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn("PASDATA.BENEFICIARY_INFO_DELETE", rewritten.upper())
         self.assertNotIn("FROM LIFELOGTMP.BENEFICIARY_INFO_DELETE", rewritten.upper())
 
+    def test_remap_view_dependencies_prefers_explicit_rule_over_identity_mapping(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW LIFELOGTMP.V2 AS\n"
+            "SELECT * FROM LIFELOGTMP.BENEFICIARY_INFO_DELETE\n"
+        )
+        # 模拟 full_object_mapping 因冲突回退为 1:1，但 remap_rules 里存在显式映射
+        full_mapping = {
+            "LIFELOGTMP.BENEFICIARY_INFO_DELETE": {
+                "TABLE": "LIFELOGTMP.BENEFICIARY_INFO_DELETE"
+            }
+        }
+        remap_rules = {
+            "LIFELOGTMP.BENEFICIARY_INFO_DELETE": "PASDATA.BENEFICIARY_INFO_DELETE"
+        }
+        rewritten = sdr.remap_view_dependencies(
+            ddl,
+            "LIFELOGTMP",
+            "V2",
+            remap_rules,
+            full_mapping
+        )
+        self.assertIn("PASDATA.BENEFICIARY_INFO_DELETE", rewritten.upper())
+        self.assertNotIn("FROM LIFELOGTMP.BENEFICIARY_INFO_DELETE", rewritten.upper())
+
     def test_remap_view_dependencies_fallback_uses_dependency_map(self):
         ddl = (
             "CREATE OR REPLACE VIEW A.V AS\n"
