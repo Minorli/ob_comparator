@@ -15253,17 +15253,15 @@ def compare_triggers_for_table(
     extra = set(tgt_info_map.keys()) - set(src_info_map.keys())
     detail_mismatch: List[str] = []
     missing_mappings: List[Tuple[str, str]] = []
-    for tgt_full in sorted(missing):
-        src_info = src_info_map.get(tgt_full, {})
-        missing_mappings.append(
-            (
-                f"{src_info.get('src_owner', src_schema.upper())}.{src_info.get('src_name', tgt_full.split('.', 1)[-1])}",
-                f"{src_info.get('tgt_owner', tgt_schema.upper())}.{src_info.get('tgt_name', tgt_full.split('.', 1)[-1])}"
-            )
-        )
-    common = set(src_info_map.keys()) & set(tgt_info_map.keys())
-    for tgt_full in common:
-        src_info = src_info_map.get(tgt_full, {})
+
+    def _owner_and_name(trigger_full: str) -> Tuple[str, str]:
+        if "." in trigger_full:
+            owner, name = trigger_full.split(".", 1)
+            return owner.upper(), name.upper()
+        return "", (trigger_full or "").upper()
+
+    def _append_detail_for_pair(src_full: str, tgt_full: str) -> None:
+        src_info = src_info_map.get(src_full, {})
         tgt_info = tgt_info_map.get(tgt_full, {})
         s_event = (src_info.get("event") or "").strip()
         s_status = normalize_trigger_status(src_info.get("status"))
@@ -15275,22 +15273,76 @@ def compare_triggers_for_table(
         t_event = (tgt_info.get("event") or "").strip()
         t_status = normalize_trigger_status(tgt_info.get("status"))
         t_owner = (tgt_info.get("owner") or tgt_schema).upper()
-        t_name = (tgt_full.split(".", 1)[1] if "." in tgt_full else tgt_full).upper()
+        t_name = (_owner_and_name(tgt_full)[1]).upper()
         t_valid = normalize_trigger_status(
             tgt_info.get("valid") or lookup_trigger_validity(ob_meta, t_owner, t_name)
         )
+        label = src_full if src_full == tgt_full else f"{src_full}->{tgt_full}"
         if s_event != t_event:
             detail_mismatch.append(
-                f"{tgt_full}: 触发事件不一致 (src={s_event}, tgt={t_event})"
+                f"{label}: 触发事件不一致 (src={s_event}, tgt={t_event})"
             )
         if s_status != t_status:
             detail_mismatch.append(
-                f"{tgt_full}: 启用状态不一致 (src={s_status}, tgt={t_status})"
+                f"{label}: 启用状态不一致 (src={s_status}, tgt={t_status})"
             )
         if s_valid != t_valid:
             detail_mismatch.append(
-                f"{tgt_full}: 有效性不一致 (src={s_valid}, tgt={t_valid})"
+                f"{label}: 有效性不一致 (src={s_valid}, tgt={t_valid})"
             )
+
+    # 同表同名(仅 owner 不同)的触发器按语义匹配，不计入 missing/extra，避免统计误报。
+    owner_drift_pairs: List[Tuple[str, str]] = []
+    if missing and extra:
+        extra_by_name: Dict[str, List[str]] = defaultdict(list)
+        for tgt_full in sorted(extra):
+            _owner, trg_name = _owner_and_name(tgt_full)
+            if trg_name:
+                extra_by_name[trg_name].append(tgt_full)
+        matched_missing: Set[str] = set()
+        matched_extra: Set[str] = set()
+        for src_full in sorted(missing):
+            src_owner_u, src_name_u = _owner_and_name(src_full)
+            if not src_name_u:
+                continue
+            candidates = [name for name in extra_by_name.get(src_name_u, []) if name not in matched_extra]
+            if not candidates:
+                continue
+            src_event = (src_info_map.get(src_full, {}).get("event") or "").strip()
+            if src_event:
+                event_candidates = [
+                    name for name in candidates
+                    if (tgt_info_map.get(name, {}).get("event") or "").strip() == src_event
+                ]
+                if event_candidates:
+                    candidates = event_candidates
+            chosen_tgt = sorted(candidates)[0]
+            matched_missing.add(src_full)
+            matched_extra.add(chosen_tgt)
+            owner_drift_pairs.append((src_full, chosen_tgt))
+            tgt_owner_u, _ = _owner_and_name(chosen_tgt)
+            if src_owner_u and tgt_owner_u and src_owner_u != tgt_owner_u:
+                detail_mismatch.append(
+                    f"{src_full}: OWNER 不一致，目标端命中 {chosen_tgt}。"
+                )
+
+        if matched_missing or matched_extra:
+            missing -= matched_missing
+            extra -= matched_extra
+
+    for tgt_full in sorted(missing):
+        src_info = src_info_map.get(tgt_full, {})
+        missing_mappings.append(
+            (
+                f"{src_info.get('src_owner', src_schema.upper())}.{src_info.get('src_name', tgt_full.split('.', 1)[-1])}",
+                f"{src_info.get('tgt_owner', tgt_schema.upper())}.{src_info.get('tgt_name', tgt_full.split('.', 1)[-1])}"
+            )
+        )
+    common = set(src_info_map.keys()) & set(tgt_info_map.keys())
+    for tgt_full in common:
+        _append_detail_for_pair(tgt_full, tgt_full)
+    for src_full, tgt_full in owner_drift_pairs:
+        _append_detail_for_pair(src_full, tgt_full)
     all_good = (not missing) and (not extra) and not detail_mismatch
     if all_good:
         return True, None
@@ -27149,6 +27201,8 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['summary']} (
     GRANT_ENABLED       NUMBER(1) DEFAULT 0,
     TOTAL_CHECKED       NUMBER DEFAULT 0,
     MISSING_COUNT       NUMBER DEFAULT 0,
+    MISSING_FIXABLE_COUNT NUMBER DEFAULT 0,
+    EXCLUDED_COUNT      NUMBER DEFAULT 0,
     MISMATCHED_COUNT    NUMBER DEFAULT 0,
     OK_COUNT            NUMBER DEFAULT 0,
     SKIPPED_COUNT       NUMBER DEFAULT 0,
@@ -27235,6 +27289,8 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['counts']} (
     ORACLE_COUNT        NUMBER DEFAULT 0,
     OCEANBASE_COUNT     NUMBER DEFAULT 0,
     MISSING_COUNT       NUMBER DEFAULT 0,
+    MISSING_FIXABLE_COUNT NUMBER DEFAULT 0,
+    EXCLUDED_COUNT      NUMBER DEFAULT 0,
     UNSUPPORTED_COUNT   NUMBER DEFAULT 0,
     EXTRA_COUNT         NUMBER DEFAULT 0,
     CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP,
@@ -27586,6 +27642,41 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['resolution']} (
         ok_drop, _o, err_drop = obclient_run_sql(ob_cfg, drop_sql)
         if not ok_drop:
             log.warning("[REPORT_DB] 删除外键 %s.%s 失败: %s", table_name, constraint_name, err_drop)
+
+    def _ensure_column_if_missing(table_name: str, column_name: str, column_ddl: str) -> Tuple[bool, str]:
+        if table_name not in existing:
+            return True, ""
+        check_col_sql = (
+            "SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS "
+            f"WHERE {owner_clause} "
+            f"AND TABLE_NAME = '{table_name}' "
+            f"AND COLUMN_NAME = '{column_name.upper()}'"
+        )
+        ok_col, out_col, err_col = obclient_run_sql(ob_cfg, check_col_sql)
+        if not ok_col:
+            return False, f"检查列失败({table_name}.{column_name}): {err_col}"
+        col_exists = any(line.strip() for line in (out_col or "").splitlines())
+        if col_exists:
+            return True, ""
+        alter_sql = (
+            f"ALTER TABLE {schema_prefix}{table_name} "
+            f"ADD ({column_name} {column_ddl})"
+        )
+        ok_alter, _out_alter, err_alter = obclient_run_sql_commit(ob_cfg, alter_sql)
+        if not ok_alter:
+            return False, f"补充列失败({table_name}.{column_name}): {err_alter}"
+        log.info("[REPORT_DB] 已补充列 %s.%s", table_name, column_name.upper())
+        return True, ""
+
+    for table_name, col_name, col_ddl in [
+        (REPORT_DB_TABLES["summary"], "EXCLUDED_COUNT", "NUMBER DEFAULT 0"),
+        (REPORT_DB_TABLES["summary"], "MISSING_FIXABLE_COUNT", "NUMBER DEFAULT 0"),
+        (REPORT_DB_TABLES["counts"], "EXCLUDED_COUNT", "NUMBER DEFAULT 0"),
+        (REPORT_DB_TABLES["counts"], "MISSING_FIXABLE_COUNT", "NUMBER DEFAULT 0"),
+    ]:
+        ok_mig, err_mig = _ensure_column_if_missing(table_name, col_name, col_ddl)
+        if not ok_mig:
+            return False, err_mig
 
     if not to_create:
         return True, ""
@@ -29799,16 +29890,28 @@ def _insert_report_grant_rows(
 
 def _build_report_counts_rows(
     object_counts_summary: Optional[ObjectCountSummary],
-    unsupported_counts: Optional[Dict[str, int]]
+    unsupported_counts: Optional[Dict[str, int]],
+    fixable_missing_counts: Optional[Dict[str, int]],
+    excluded_counts: Optional[Dict[str, int]] = None
 ) -> List[Dict[str, object]]:
     if not object_counts_summary:
         return []
     oracle_counts = dict(object_counts_summary.get("oracle", {}))
     ob_counts = dict(object_counts_summary.get("oceanbase", {}))
     missing_counts = dict(object_counts_summary.get("missing", {}))
+    fixable_missing_counts = dict(fixable_missing_counts or {})
     extra_counts = dict(object_counts_summary.get("extra", {}))
     unsupported_counts = dict(unsupported_counts or {})
-    all_types = sorted(set(oracle_counts) | set(ob_counts) | set(missing_counts) | set(extra_counts) | set(unsupported_counts))
+    excluded_counts = dict(excluded_counts or {})
+    all_types = sorted(
+        set(oracle_counts)
+        | set(ob_counts)
+        | set(missing_counts)
+        | set(fixable_missing_counts)
+        | set(extra_counts)
+        | set(unsupported_counts)
+        | set(excluded_counts)
+    )
     rows: List[Dict[str, object]] = []
     for obj_type in all_types:
         rows.append({
@@ -29816,6 +29919,8 @@ def _build_report_counts_rows(
             "oracle_count": int(oracle_counts.get(obj_type, 0) or 0),
             "oceanbase_count": int(ob_counts.get(obj_type, 0) or 0),
             "missing_count": int(missing_counts.get(obj_type, 0) or 0),
+            "missing_fixable_count": int(fixable_missing_counts.get(obj_type, 0) or 0),
+            "excluded_count": int(excluded_counts.get(obj_type, 0) or 0),
             "unsupported_count": int(unsupported_counts.get(obj_type, 0) or 0),
             "extra_count": int(extra_counts.get(obj_type, 0) or 0),
         })
@@ -29837,15 +29942,17 @@ def _insert_report_counts_rows(
         for row in batch:
             values_sql.append(
                 "INTO {table} (REPORT_ID, OBJECT_TYPE, ORACLE_COUNT, OCEANBASE_COUNT, "
-                "MISSING_COUNT, UNSUPPORTED_COUNT, EXTRA_COUNT) "
+                "MISSING_COUNT, MISSING_FIXABLE_COUNT, EXCLUDED_COUNT, UNSUPPORTED_COUNT, EXTRA_COUNT) "
                 "VALUES ({report_id}, {object_type}, {oracle_count}, {oceanbase_count}, "
-                "{missing_count}, {unsupported_count}, {extra_count})".format(
+                "{missing_count}, {missing_fixable_count}, {excluded_count}, {unsupported_count}, {extra_count})".format(
                     table=f"{schema_prefix}{REPORT_DB_TABLES['counts']}",
                     report_id=sql_quote_literal(report_id),
                     object_type=sql_quote_literal(row.get("object_type")),
                     oracle_count=int(row.get("oracle_count", 0)),
                     oceanbase_count=int(row.get("oceanbase_count", 0)),
                     missing_count=int(row.get("missing_count", 0)),
+                    missing_fixable_count=int(row.get("missing_fixable_count", 0)),
+                    excluded_count=int(row.get("excluded_count", 0)),
                     unsupported_count=int(row.get("unsupported_count", 0)),
                     extra_count=int(row.get("extra_count", 0)),
                 )
@@ -29993,6 +30100,8 @@ SELECT s.report_id,
        c.oracle_count,
        c.oceanbase_count,
        c.missing_count,
+       c.missing_fixable_count,
+       c.excluded_count,
        c.unsupported_count,
        c.extra_count
   FROM {summary} s
@@ -30336,8 +30445,15 @@ def save_report_to_db(
     mismatched_count = len(tv_results.get("mismatched", []))
     ok_count = len(tv_results.get("ok", []))
     skipped_count = len(tv_results.get("skipped", []))
-    unsupported_by_type = build_unsupported_summary_counts(support_summary, extra_results)
+    _missing_by_type, unsupported_by_type, fixable_missing_by_type = build_missing_breakdown_counts(
+        object_counts_summary,
+        support_summary,
+        extra_results
+    )
     unsupported_count = sum(int(v or 0) for v in unsupported_by_type.values())
+    missing_fixable_count = sum(int(v or 0) for v in fixable_missing_by_type.values())
+    excluded_by_type = build_excluded_summary_counts(excluded_object_rows)
+    excluded_count = sum(int(v or 0) for v in excluded_by_type.values())
 
     # SQL template file (pre-filled report_id) for DB report queries
     build_report_sql_template_file(report_dir, report_timestamp, report_id)
@@ -30413,7 +30529,7 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
     SOURCE_HOST, SOURCE_PORT, SOURCE_SERVICE, SOURCE_USER, SOURCE_SCHEMAS,
     TARGET_HOST, TARGET_PORT, TARGET_TENANT, TARGET_USER, TARGET_SCHEMAS,
     CHECK_PRIMARY_TYPES, CHECK_EXTRA_TYPES, FIXUP_ENABLED, GRANT_ENABLED,
-    TOTAL_CHECKED, MISSING_COUNT, MISMATCHED_COUNT, OK_COUNT, SKIPPED_COUNT, UNSUPPORTED_COUNT,
+    TOTAL_CHECKED, MISSING_COUNT, MISSING_FIXABLE_COUNT, EXCLUDED_COUNT, MISMATCHED_COUNT, OK_COUNT, SKIPPED_COUNT, UNSUPPORTED_COUNT,
     INDEX_MISSING, INDEX_MISMATCHED, CONSTRAINT_MISSING, CONSTRAINT_MISMATCH,
     TRIGGER_MISSING, SEQUENCE_MISSING, DETAIL_TRUNCATED, DETAIL_TRUNCATED_COUNT,
     CONCLUSION, CONCLUSION_DETAIL, FULL_REPORT_JSON, TOOL_VERSION, HOSTNAME, RUN_DIR
@@ -30437,6 +30553,8 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
     {1 if run_summary_ctx.enable_grant_generation else 0},
     {run_summary_ctx.total_checked},
     {missing_count},
+    {missing_fixable_count},
+    {excluded_count},
     {mismatched_count},
     {ok_count},
     {skipped_count},
@@ -30475,7 +30593,12 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
 
     batch_size = int(settings.get("report_db_insert_batch", 200) or 200)
     max_rows = int(settings.get("report_db_detail_max_rows", 0) or 0)
-    count_rows = _build_report_counts_rows(object_counts_summary, unsupported_by_type)
+    count_rows = _build_report_counts_rows(
+        object_counts_summary,
+        unsupported_by_type,
+        fixable_missing_by_type,
+        excluded_by_type
+    )
     if count_rows:
         ok_counts = _insert_report_counts_rows(ob_cfg, schema_prefix, report_id, count_rows, batch_size)
         if not ok_counts and settings.get("report_db_fail_abort"):
@@ -30630,6 +30753,57 @@ def build_unsupported_summary_counts(
     return dict(counts)
 
 
+def build_excluded_summary_counts(
+    excluded_rows: Optional[List[Dict[str, object]]]
+) -> Dict[str, int]:
+    """
+    汇总显式排除对象数量（对象级，按类型聚合）。
+    仅统计实际生效的排除状态：
+      - APPLIED: 规则命中
+      - CASCADED: 依赖连带排除
+      - APPLIED_LEGACY_RENAME: 历史 RENAME 规则命中
+    """
+    counts: Dict[str, int] = defaultdict(int)
+    if not excluded_rows:
+        return {}
+
+    effective_statuses = {"APPLIED", "CASCADED", "APPLIED_LEGACY_RENAME"}
+    for row in excluded_rows:
+        status = str(row.get("status") or "").upper()
+        if status not in effective_statuses:
+            continue
+        obj_type = str(row.get("object_type") or "").upper()
+        if not obj_type:
+            continue
+        counts[obj_type] += 1
+    return dict(counts)
+
+
+def build_missing_breakdown_counts(
+    object_counts_summary: Optional[ObjectCountSummary],
+    support_summary: Optional[SupportClassificationResult],
+    extra_results: Optional[ExtraCheckResults]
+) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, int]]:
+    """
+    计算缺失口径分解：
+      - total_missing_by_type: 总缺失（保持历史口径）
+      - unsupported_missing_by_type: 不支持/阻断（与总缺失同口径裁剪）
+      - fixable_missing_by_type: 可修补缺失（total - unsupported）
+    """
+    total_missing = dict((object_counts_summary or {}).get("missing", {}) or {})
+    unsupported_raw = build_unsupported_summary_counts(support_summary, extra_results)
+    types = set(total_missing) | set(unsupported_raw)
+    unsupported: Dict[str, int] = {}
+    fixable: Dict[str, int] = {}
+    for obj_type in types:
+        total = int(total_missing.get(obj_type, 0) or 0)
+        uns = int(unsupported_raw.get(obj_type, 0) or 0)
+        uns_clamped = min(total, max(0, uns)) if total > 0 else max(0, uns)
+        unsupported[obj_type] = uns_clamped
+        fixable[obj_type] = max(0, total - uns_clamped)
+    return total_missing, unsupported, fixable
+
+
 def summarize_extra_missing_counts(
     extra_results: Optional[ExtraCheckResults]
 ) -> Dict[str, int]:
@@ -30674,7 +30848,8 @@ def build_run_summary(
     fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None,
     support_summary: Optional[SupportClassificationResult] = None,
     noise_suppressed_count: int = 0,
-    noise_suppressed_path: Optional[Path] = None
+    noise_suppressed_path: Optional[Path] = None,
+    excluded_object_rows: Optional[List[Dict[str, object]]] = None
 ) -> RunSummary:
     end_time = datetime.now()
     total_seconds = time.perf_counter() - ctx.start_perf
@@ -30788,9 +30963,13 @@ def build_run_summary(
     dep_unexpected_cnt = len(dependency_report.get("unexpected", []))
     dep_skipped_cnt = len(dependency_report.get("skipped", []))
     unsupported_by_type: Dict[str, int] = build_unsupported_summary_counts(support_summary, extra_results)
+    excluded_by_type: Dict[str, int] = build_excluded_summary_counts(excluded_object_rows)
     findings: List[str] = [
         f"主对象: 缺失 {missing_count}, 不匹配 {mismatched_count}, 多余 {extra_target_cnt}, 仅打印 {skipped_count}"
     ]
+    if excluded_by_type:
+        items = ", ".join(f"{k}={v}" for k, v in sorted(excluded_by_type.items()))
+        findings.append(f"显式排除对象(EXCLUDED): {items}")
     if unsupported_by_type:
         items = ", ".join(f"{k}={v}" for k, v in sorted(unsupported_by_type.items()))
         findings.append(f"缺失中不支持/阻断: {items}")
@@ -31036,7 +31215,8 @@ def print_final_report(
     fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None,
     support_summary: Optional[SupportClassificationResult] = None,
     noise_suppressed_details: Optional[List[NoiseSuppressedDetail]] = None,
-    usability_summary: Optional[UsabilitySummary] = None
+    usability_summary: Optional[UsabilitySummary] = None,
+    excluded_object_rows: Optional[List[Dict[str, object]]] = None
 ):
     custom_theme = Theme({
         "ok": "green",
@@ -31180,7 +31360,12 @@ def print_final_report(
     unsupported_detail_rows = list(unsupported_rows)
     if extra_constraint_unsupported:
         unsupported_detail_rows.extend(convert_constraint_unsupported_rows(extra_constraint_unsupported))
-    unsupported_summary_counts = build_unsupported_summary_counts(support_summary, extra_results)
+    _missing_total_counts, unsupported_summary_counts, fixable_missing_counts = build_missing_breakdown_counts(
+        object_counts_summary,
+        support_summary,
+        extra_results
+    )
+    excluded_summary_counts = build_excluded_summary_counts(excluded_object_rows)
     blocked_index_rows = _filter_blocked_support_rows(unsupported_rows, "INDEX") if unsupported_rows else []
     blocked_constraint_rows = _filter_blocked_support_rows(unsupported_rows, "CONSTRAINT") if unsupported_rows else []
     blocked_trigger_rows = _filter_blocked_support_rows(unsupported_rows, "TRIGGER") if unsupported_rows else []
@@ -31726,26 +31911,35 @@ def print_final_report(
         count_table.add_column("对象类型", style="info", width=TYPE_COL_WIDTH)
         count_table.add_column("Oracle (应校验)", justify="right", width=18)
         count_table.add_column("OceanBase (命中)", justify="right", width=18)
-        count_table.add_column("缺失", justify="right", width=8)
-        count_table.add_column("不支持/阻断", justify="right", width=12)
+        count_table.add_column("缺失(可修补)", justify="right", width=12)
+        count_table.add_column("缺失(不支持/阻断)", justify="right", width=16)
+        count_table.add_column("排除(EXCLUDED)", justify="right", width=14)
         count_table.add_column("多余", justify="right", width=8)
         oracle_counts = dict(object_counts_summary.get("oracle", {}))
         ob_counts = dict(object_counts_summary.get("oceanbase", {}))
-        missing_counts = dict(object_counts_summary.get("missing", {}))
         extra_counts = dict(object_counts_summary.get("extra", {}))
-        count_types = sorted(set(oracle_counts) | set(ob_counts) | set(missing_counts) | set(extra_counts))
+        count_types = sorted(
+            set(oracle_counts)
+            | set(ob_counts)
+            | set(fixable_missing_counts)
+            | set(unsupported_summary_counts)
+            | set(excluded_summary_counts)
+            | set(extra_counts)
+        )
         for obj_type in count_types:
             ora_val = oracle_counts.get(obj_type, 0)
             ob_val = ob_counts.get(obj_type, 0)
-            miss_val = missing_counts.get(obj_type, 0)
+            miss_fixable_val = int(fixable_missing_counts.get(obj_type, 0) or 0)
             extra_val = extra_counts.get(obj_type, 0)
             unsupported_val = int(unsupported_summary_counts.get(obj_type, 0) or 0)
+            excluded_val = int(excluded_summary_counts.get(obj_type, 0) or 0)
             count_table.add_row(
                 obj_type,
                 str(ora_val),
                 str(ob_val),
-                f"[missing]{miss_val}[/missing]" if miss_val else "0",
+                f"[missing]{miss_fixable_val}[/missing]" if miss_fixable_val else "0",
                 f"[mismatch]{unsupported_val}[/mismatch]" if unsupported_val else "0",
+                f"[info]{excluded_val}[/info]" if excluded_val else "0",
                 f"[mismatch]{extra_val}[/mismatch]" if extra_val else "0"
             )
         console.print(count_table)
@@ -32101,7 +32295,8 @@ def print_final_report(
             fixup_skip_summary=fixup_skip_summary,
             support_summary=support_summary,
             noise_suppressed_count=noise_suppressed_count,
-            noise_suppressed_path=noise_detail_path
+            noise_suppressed_path=noise_detail_path,
+            excluded_object_rows=excluded_object_rows
         )
         console.print(render_run_summary_panel(run_summary, section_width))
 
@@ -33159,7 +33354,7 @@ def main():
         )
 
     # 7) 主对象校验
-    explicit_excluded_report_rows: List[Dict[str, object]] = []
+    excluded_object_report_rows: List[Dict[str, object]] = []
     with phase_timer("Oracle 元数据转储", phase_durations):
         log_subsection("Oracle 元数据")
         oracle_meta = dump_oracle_metadata(
@@ -33200,7 +33395,7 @@ def main():
                 if obj_type == "TABLE":
                     explicit_excluded_table_keys.add((schema, obj_name))
 
-            explicit_excluded_report_rows = [
+            excluded_object_report_rows.extend([
                 {
                     "status": "APPLIED",
                     "line_no": line_no,
@@ -33220,19 +33415,7 @@ def main():
                     "detail": reason,
                 }
                 for line_no, obj_type, schema, obj_name, reason in explicit_skipped_rules
-            ]
-
-            detail_path = report_dir / f"excluded_objects_detail_{timestamp}.txt"
-            detail_lines = ["# status|line|type|schema|object|detail"]
-            for line_no, obj_type, schema, obj_name in explicit_applied_rules:
-                detail_lines.append(f"APPLIED|{line_no}|{obj_type}|{schema}|{obj_name}|MATCHED")
-            for line_no, obj_type, schema, obj_name, reason in explicit_skipped_rules:
-                detail_lines.append(f"SKIPPED|{line_no}|{obj_type}|{schema}|{obj_name}|{reason}")
-            try:
-                detail_path.write_text("\n".join(detail_lines) + "\n", encoding="utf-8")
-                log.info("显式排除对象明细已输出: %s", detail_path)
-            except OSError as exc:
-                log.warning("写入显式排除对象明细失败: %s (%s)", detail_path, exc)
+            ])
 
         # 兼容历史：当黑名单中存在 RENAME 类型时，仍可参与剪裁
         rename_excluded_table_keys: Set[Tuple[str, str]] = set()
@@ -33246,6 +33429,18 @@ def main():
             (f"{schema}.{table}", "TABLE")
             for schema, table in rename_excluded_table_keys
         }
+        if rename_excluded_table_keys:
+            for schema, table in sorted(rename_excluded_table_keys):
+                excluded_object_report_rows.append(
+                    {
+                        "status": "APPLIED_LEGACY_RENAME",
+                        "line_no": 0,
+                        "object_type": "TABLE",
+                        "schema_name": schema,
+                        "object_name": table,
+                        "detail": "BLACKLIST_RENAME_RULE",
+                    }
+                )
 
         excluded_seed_nodes: Set[DependencyNode] = set(rename_seed_nodes) | set(explicit_seed_nodes)
         excluded_nodes: Set[DependencyNode] = set()
@@ -33257,6 +33452,42 @@ def main():
                 object_parent_map=object_parent_map
             )
             excluded_nodes = set(excluded_seed_nodes) | set(blocked_by.keys())
+            effective_keys: Set[Tuple[str, str, str]] = set()
+            for row in excluded_object_report_rows:
+                status_u = str(row.get("status") or "").upper()
+                if status_u not in {"APPLIED", "APPLIED_LEGACY_RENAME", "CASCADED"}:
+                    continue
+                key = (
+                    str(row.get("object_type") or "").upper(),
+                    str(row.get("schema_name") or "").upper(),
+                    str(row.get("object_name") or "").upper(),
+                )
+                if key[0] and key[1] and key[2]:
+                    effective_keys.add(key)
+            cascaded_nodes = sorted(
+                (node for node in excluded_nodes if node not in excluded_seed_nodes),
+                key=lambda x: (x[1], x[0])
+            )
+            for full, obj_type in cascaded_nodes:
+                parsed = parse_full_object_name(full)
+                if parsed:
+                    schema_u, name_u = parsed[0].upper(), parsed[1].upper()
+                else:
+                    schema_u, name_u = "", full.upper()
+                row_key = ((obj_type or "").upper(), schema_u, name_u)
+                if row_key in effective_keys:
+                    continue
+                excluded_object_report_rows.append(
+                    {
+                        "status": "CASCADED",
+                        "line_no": 0,
+                        "object_type": (obj_type or "").upper(),
+                        "schema_name": schema_u,
+                        "object_name": name_u,
+                        "detail": "DEPENDENCY_CASCADE",
+                    }
+                )
+                effective_keys.add(row_key)
             before_master_cnt = len(master_list)
             before_mapping_cnt = sum(len(v) for v in full_object_mapping.values())
 
@@ -33355,6 +33586,35 @@ def main():
                     cascaded_count
                 )
 
+        if excluded_object_report_rows:
+            detail_path = report_dir / f"excluded_objects_detail_{timestamp}.txt"
+            detail_lines = ["# status|line|type|schema|object|detail"]
+            for row in sorted(
+                excluded_object_report_rows,
+                key=lambda x: (
+                    str(x.get("status") or ""),
+                    int(x.get("line_no") or 0),
+                    str(x.get("object_type") or ""),
+                    str(x.get("schema_name") or ""),
+                    str(x.get("object_name") or ""),
+                )
+            ):
+                detail_lines.append(
+                    "{status}|{line_no}|{obj_type}|{schema}|{obj_name}|{detail}".format(
+                        status=str(row.get("status") or "").upper(),
+                        line_no=int(row.get("line_no") or 0),
+                        obj_type=str(row.get("object_type") or "").upper(),
+                        schema=str(row.get("schema_name") or "").upper(),
+                        obj_name=str(row.get("object_name") or "").upper(),
+                        detail=str(row.get("detail") or "")
+                    )
+                )
+            try:
+                detail_path.write_text("\n".join(detail_lines) + "\n", encoding="utf-8")
+                log.info("显式排除对象明细已输出: %s", detail_path)
+            except OSError as exc:
+                log.warning("写入显式排除对象明细失败: %s (%s)", detail_path, exc)
+
         table_target_map = build_table_target_map(master_list)
         blacklist_report_rows = build_blacklist_report_rows(
             oracle_meta.blacklist_tables,
@@ -33418,6 +33678,12 @@ def main():
             enabled_extra_types
         )
 
+    noise_result = apply_noise_suppression(tv_results, extra_results, comment_results)
+    tv_results = noise_result.tv_results
+    extra_results = noise_result.extra_results
+    comment_results = noise_result.comment_results
+    noise_suppressed_details = noise_result.suppressed_details
+
     support_summary = classify_missing_objects(
         ora_cfg,
         settings,
@@ -33432,12 +33698,6 @@ def main():
         table_target_map,
         synonym_meta
     )
-
-    noise_result = apply_noise_suppression(tv_results, extra_results, comment_results)
-    tv_results = noise_result.tv_results
-    extra_results = noise_result.extra_results
-    comment_results = noise_result.comment_results
-    noise_suppressed_details = noise_result.suppressed_details
 
     usability_summary: Optional[UsabilitySummary] = None
     if enable_usability_check:
@@ -33751,7 +34011,8 @@ def main():
         fixup_skip_summary=fixup_skip_summary,
         support_summary=support_summary,
         noise_suppressed_details=noise_suppressed_details,
-        usability_summary=usability_summary
+        usability_summary=usability_summary,
+        excluded_object_rows=excluded_object_report_rows
     )
     if run_summary:
         log_run_summary(run_summary)
@@ -33783,7 +34044,7 @@ def main():
             blacklist_report_rows=blacklist_report_rows,
             fixup_skip_summary=fixup_skip_summary,
             blacklisted_table_keys=blacklisted_table_keys,
-            excluded_object_rows=explicit_excluded_report_rows
+            excluded_object_rows=excluded_object_report_rows
         )
         if not db_ok:
             abort_run()
