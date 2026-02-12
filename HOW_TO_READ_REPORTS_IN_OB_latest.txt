@@ -965,6 +965,39 @@ SELECT object_type, schema_name, object_name,
    AND (status <> 'OK' OR NVL(usable, 0) = 0)
  ORDER BY object_type, schema_name, object_name;
 
+-- SQL-67A VIEW 因 DBLINK 被判不支持（reason_code=VIEW_DBLINK）
+SELECT d.source_schema, d.source_name, d.status, d.reason
+  FROM DIFF_REPORT_DETAIL d
+ WHERE d.report_id = :report_id
+   AND d.report_type = 'UNSUPPORTED'
+   AND d.object_type = 'VIEW'
+   AND EXISTS (
+       SELECT 1
+         FROM DIFF_REPORT_DETAIL_ITEM i
+        WHERE i.report_id = d.report_id
+          AND i.report_type = d.report_type
+          AND i.object_type = d.object_type
+          AND i.source_schema = d.source_schema
+          AND i.source_name = d.source_name
+          AND i.item_type = 'REASON_CODE'
+          AND DBMS_LOB.SUBSTR(i.item_value, 4000, 1) = 'VIEW_DBLINK'
+   )
+ ORDER BY d.source_schema, d.source_name;
+
+-- SQL-67B VIEW_DBLINK 根因与建议（REASON_CODE/ROOT_CAUSE/ACTION/DETAIL）
+SELECT source_schema, source_name,
+       MAX(CASE WHEN item_type='REASON_CODE' THEN DBMS_LOB.SUBSTR(item_value, 4000, 1) END) AS reason_code,
+       MAX(CASE WHEN item_type='ROOT_CAUSE'  THEN DBMS_LOB.SUBSTR(item_value, 4000, 1) END) AS root_cause,
+       MAX(CASE WHEN item_type='ACTION'      THEN DBMS_LOB.SUBSTR(item_value, 4000, 1) END) AS action,
+       MAX(CASE WHEN item_type='DETAIL'      THEN DBMS_LOB.SUBSTR(item_value, 4000, 1) END) AS detail
+  FROM DIFF_REPORT_DETAIL_ITEM
+ WHERE report_id = :report_id
+   AND report_type = 'UNSUPPORTED'
+   AND object_type = 'VIEW'
+ GROUP BY source_schema, source_name
+HAVING MAX(CASE WHEN item_type='REASON_CODE' THEN DBMS_LOB.SUBSTR(item_value, 4000, 1) END) = 'VIEW_DBLINK'
+ ORDER BY source_schema, source_name;
+
 -- SQL-68 PACKAGE / PACKAGE BODY 对比异常
 SELECT schema_name, object_name, object_type,
        src_status, tgt_status, diff_status,
@@ -1030,38 +1063,42 @@ G. 多余对象 / 同义词专项（SQL-74 ~ SQL-77）
 
 -- SQL-74 主对象“多余清单”总览（来自 extra_targets_detail_* 入库行）
 WITH f AS (
-    SELECT MAX(file_path) KEEP (DENSE_RANK LAST ORDER BY file_path) AS file_path
+    SELECT file_path
       FROM DIFF_REPORT_ARTIFACT
      WHERE report_id = :report_id
        AND file_path LIKE '%/extra_targets_detail_%'
+     ORDER BY file_path DESC
+     FETCH FIRST 1 ROW ONLY
 )
-SELECT REGEXP_SUBSTR(al.line_text, '[^|]+', 1, 1) AS object_type,
-       REGEXP_SUBSTR(al.line_text, '[^|]+', 1, 2) AS target_full,
+SELECT REGEXP_SUBSTR(DBMS_LOB.SUBSTR(al.line_text, 4000, 1), '[^|]+', 1, 1) AS object_type,
+       REGEXP_SUBSTR(DBMS_LOB.SUBSTR(al.line_text, 4000, 1), '[^|]+', 1, 2) AS target_full,
        al.line_no
   FROM DIFF_REPORT_ARTIFACT_LINE al
   JOIN f ON al.file_path = f.file_path
  WHERE al.report_id = :report_id
    AND al.line_text IS NOT NULL
-   AND al.line_text NOT LIKE '#%'
-   AND al.line_text <> 'TYPE|TARGET_FULL'
+   AND DBMS_LOB.SUBSTR(al.line_text, 4000, 1) NOT LIKE '#%'
+   AND DBMS_LOB.SUBSTR(al.line_text, 4000, 1) <> 'TYPE|TARGET_FULL'
  ORDER BY object_type, target_full;
 
 -- SQL-75 仅看“多余同义词”列表（兼容 Oracle PUBLIC / OB __public）
 WITH f AS (
-    SELECT MAX(file_path) KEEP (DENSE_RANK LAST ORDER BY file_path) AS file_path
+    SELECT file_path
       FROM DIFF_REPORT_ARTIFACT
      WHERE report_id = :report_id
        AND file_path LIKE '%/extra_targets_detail_%'
+     ORDER BY file_path DESC
+     FETCH FIRST 1 ROW ONLY
 ),
 x AS (
-    SELECT REGEXP_SUBSTR(al.line_text, '[^|]+', 1, 1) AS object_type,
-           REGEXP_SUBSTR(al.line_text, '[^|]+', 1, 2) AS target_full
+    SELECT REGEXP_SUBSTR(DBMS_LOB.SUBSTR(al.line_text, 4000, 1), '[^|]+', 1, 1) AS object_type,
+           REGEXP_SUBSTR(DBMS_LOB.SUBSTR(al.line_text, 4000, 1), '[^|]+', 1, 2) AS target_full
       FROM DIFF_REPORT_ARTIFACT_LINE al
       JOIN f ON al.file_path = f.file_path
      WHERE al.report_id = :report_id
        AND al.line_text IS NOT NULL
-       AND al.line_text NOT LIKE '#%'
-       AND al.line_text <> 'TYPE|TARGET_FULL'
+       AND DBMS_LOB.SUBSTR(al.line_text, 4000, 1) NOT LIKE '#%'
+       AND DBMS_LOB.SUBSTR(al.line_text, 4000, 1) <> 'TYPE|TARGET_FULL'
 )
 SELECT target_full
   FROM x
@@ -1070,20 +1107,22 @@ SELECT target_full
 
 -- SQL-76 多余同义词按 schema 统计（可快速定位 __public / 业务 schema）
 WITH f AS (
-    SELECT MAX(file_path) KEEP (DENSE_RANK LAST ORDER BY file_path) AS file_path
+    SELECT file_path
       FROM DIFF_REPORT_ARTIFACT
      WHERE report_id = :report_id
        AND file_path LIKE '%/extra_targets_detail_%'
+     ORDER BY file_path DESC
+     FETCH FIRST 1 ROW ONLY
 ),
 x AS (
-    SELECT REGEXP_SUBSTR(al.line_text, '[^|]+', 1, 1) AS object_type,
-           REGEXP_SUBSTR(al.line_text, '[^|]+', 1, 2) AS target_full
+    SELECT REGEXP_SUBSTR(DBMS_LOB.SUBSTR(al.line_text, 4000, 1), '[^|]+', 1, 1) AS object_type,
+           REGEXP_SUBSTR(DBMS_LOB.SUBSTR(al.line_text, 4000, 1), '[^|]+', 1, 2) AS target_full
       FROM DIFF_REPORT_ARTIFACT_LINE al
       JOIN f ON al.file_path = f.file_path
      WHERE al.report_id = :report_id
        AND al.line_text IS NOT NULL
-       AND al.line_text NOT LIKE '#%'
-       AND al.line_text <> 'TYPE|TARGET_FULL'
+       AND DBMS_LOB.SUBSTR(al.line_text, 4000, 1) NOT LIKE '#%'
+       AND DBMS_LOB.SUBSTR(al.line_text, 4000, 1) <> 'TYPE|TARGET_FULL'
 ),
 s AS (
     SELECT target_full,
@@ -1101,20 +1140,22 @@ SELECT target_schema, COUNT(*) AS extra_synonym_cnt
 
 -- SQL-77 多余同义词“是否在映射期望内”复核（正常应多数为 NOT_IN_MAPPING）
 WITH f AS (
-    SELECT MAX(file_path) KEEP (DENSE_RANK LAST ORDER BY file_path) AS file_path
+    SELECT file_path
       FROM DIFF_REPORT_ARTIFACT
      WHERE report_id = :report_id
        AND file_path LIKE '%/extra_targets_detail_%'
+     ORDER BY file_path DESC
+     FETCH FIRST 1 ROW ONLY
 ),
 x AS (
-    SELECT REGEXP_SUBSTR(al.line_text, '[^|]+', 1, 2) AS target_full
+    SELECT REGEXP_SUBSTR(DBMS_LOB.SUBSTR(al.line_text, 4000, 1), '[^|]+', 1, 2) AS target_full
       FROM DIFF_REPORT_ARTIFACT_LINE al
       JOIN f ON al.file_path = f.file_path
      WHERE al.report_id = :report_id
        AND al.line_text IS NOT NULL
-       AND al.line_text NOT LIKE '#%'
-       AND al.line_text <> 'TYPE|TARGET_FULL'
-       AND UPPER(REGEXP_SUBSTR(al.line_text, '[^|]+', 1, 1)) = 'SYNONYM'
+       AND DBMS_LOB.SUBSTR(al.line_text, 4000, 1) NOT LIKE '#%'
+       AND DBMS_LOB.SUBSTR(al.line_text, 4000, 1) <> 'TYPE|TARGET_FULL'
+       AND UPPER(REGEXP_SUBSTR(DBMS_LOB.SUBSTR(al.line_text, 4000, 1), '[^|]+', 1, 1)) = 'SYNONYM'
 ),
 m AS (
     SELECT UPPER(tgt_schema || '.' || tgt_name) AS target_full
