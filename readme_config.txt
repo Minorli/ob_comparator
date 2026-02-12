@@ -273,5 +273,5 @@ dbcat 配置
 6) 交付前最小验收（建议固定执行）
 - 语法检查：`python3 -m py_compile $(git ls-files '*.py')`
 - 单元测试：`.venv/bin/python -m unittest discover -v`
-- 可选联调（需真实 Oracle/OB）：`RUN_INTEGRATION_TESTS=1 .venv/bin/python -m unittest test_integration_visibility.py -v`
+- 可选联调（需真实 Oracle/OB）：`schema_diff_reconciler.py config.ini` 后执行 `run_fixup.py config.ini --glob "__NO_MATCH__"` 做链路冒烟验证。
 - 建议保留并随包分发：`blacklist_rules.json`（blacklist_mode=auto/rules_only 时需要）

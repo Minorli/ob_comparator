@@ -28,14 +28,6 @@ docs/*
 !docs/TECHNICAL_SPECIFICATION.md
 !docs/DEPLOYMENT.md
 !docs/CHANGELOG.md
-!docs/RELEASE_NOTES_0.9.8.1.md
-!docs/RELEASE_NOTES_0.9.8.2.md
-!docs/RELEASE_NOTES_0.9.8.3.md
-!docs/RELEASE_NOTES_0.9.8.4.md
-!docs/VERSION_DIFF_0.9.8_to_0.9.8.1.md
-!docs/VERSION_DIFF_0.9.8.1_to_0.9.8.2.md
-!docs/VERSION_DIFF_0.9.8.2_to_0.9.8.3.md
-!docs/VERSION_DIFF_0.9.8.3_to_0.9.8.4.md
 
 .gemini/
 gha-creds-*.json
@@ -47,3 +39,9 @@ compatibility_suite/
 expert_swarm.py
 test_expert_swarm.py
 audit/swarm/
+
+# Internal engineering assets not shipped to customer
+openspec/
+audit/
+scripts/
+test_*.py

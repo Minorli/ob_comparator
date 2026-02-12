@@ -29,7 +29,6 @@ deployment_package/
 ├── schema_diff_reconciler.py
 ├── run_fixup.py
 ├── init_users_roles.py
-├── init_test.py
 ├── requirements.txt
 ├── config.ini                 # 可保留模板
 ├── remap_rules.txt
@@ -90,7 +89,8 @@ python3 -m py_compile $(git ls-files '*.py')
 .venv/bin/python -m unittest discover -v
 
 # 3) 可选联调（需真实库）
-RUN_INTEGRATION_TESTS=1 .venv/bin/python -m unittest test_integration_visibility.py -v
+.venv/bin/python schema_diff_reconciler.py config.ini
+.venv/bin/python run_fixup.py config.ini --glob "__NO_MATCH__"
 ```
 验收建议：
 - 生成一次主报告并确认 `main_reports/run_<ts>/report_<ts>.txt` 可读；

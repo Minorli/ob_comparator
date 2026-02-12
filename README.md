@@ -10,8 +10,6 @@
 - report_to_db `full` 模式继续增强：支持 `DIFF_REPORT_ARTIFACT_LINE` 报告逐行入库，提升数据库侧闭环排查能力。
 - 文档与版本全面同步到 `0.9.8.4`。
 
-详见：`docs/RELEASE_NOTES_0.9.8.4.md`
-
 ## 核心能力
 - **对象覆盖完整**：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。
 - **Dump-Once 架构**：Oracle Thick Mode + 少量 obclient 调用，元数据一次性落本地内存。
@@ -100,15 +98,12 @@ python3 run_fixup.py --smart-order --recompile
 # 1) 语法检查
 python3 -m py_compile $(git ls-files '*.py')
 
-# 2) 单元测试
-.venv/bin/python -m unittest discover -v
+# 2) 运行主程序（建议先在测试库验证）
+.venv/bin/python schema_diff_reconciler.py config.ini
 
-# 3) 可选：联调测试（需真实 Oracle/OB）
-RUN_INTEGRATION_TESTS=1 .venv/bin/python -m unittest test_integration_visibility.py -v
+# 3) 修补执行器冒烟（不执行真实 SQL）
+.venv/bin/python run_fixup.py config.ini --glob "__NO_MATCH__"
 ```
-当前代码基线（2026-02-09）：
-- `py_compile` 通过
-- `unittest` 共 290 项，`OK (skipped=2)`
 
 ## Remap 规则速记
 - **显式规则优先级最高**，未写规则的对象按默认推导。
@@ -143,20 +138,7 @@ python3 run_fixup.py --view-chain-autofix
 
 ## 额外工具
 - `init_users_roles.py`：以 Oracle 为准创建用户/角色并同步系统权限与角色授权。
-- `init_test.py`：基于 `test_scenarios/` 快速搭建测试场景。
-- `expert_swarm.py`：生成并可选执行多专家蜂群（架构/代码审查/编程/数据库/性能/安全/测试）。
 > 注意：`init_users_roles.py` 运行时会交互输入用户初始密码，不再在脚本中写死明文初始密码。
-
-## 专家蜂群（可选）
-```bash
-# 仅生成蜂群蓝图
-.venv/bin/python expert_swarm.py --print-blueprint
-
-# 可选：执行蜂群（并行子团队 + 仲裁器；需 OPENAI_API_KEY 与 openai-agents）
-.venv/bin/python expert_swarm.py --execute
-```
-
-详细说明见 `docs/EXPERT_SWARM.md`。
 
 ## 主要输出
 - `main_reports/run_<ts>/report_<ts>.txt`：完整对比报告（默认 per_run）
@@ -226,7 +208,6 @@ grant_merge_grantees = true
 | `schema_diff_reconciler.py` | 主程序：对比、推导、报告、fixup 生成 |
 | `run_fixup.py` | 修复脚本执行器（smart-order/迭代/view-chain） |
 | `init_users_roles.py` | 用户/角色初始化 |
-| `init_test.py` | 测试场景初始化 |
 | `docs/` | 详细文档 |
 | `readme_config.txt` | 配置项完整说明 |
 

@@ -12,7 +12,6 @@
 - **`schema_diff_reconciler.py`**：主流程，负责元数据采集、差异对比、修补脚本生成、报告输出。
 - **`run_fixup.py`**：修补脚本执行器（smart-order/迭代/VIEW 链路）。
 - **`init_users_roles.py`**：用户/角色初始化与授权同步。
-- **`init_test.py`**：测试场景初始化（基于 `test_scenarios/`）。
 
 ## 3. 总体流程
 ```
@@ -86,5 +85,5 @@
 ## 12. 交付前正确性基线
 - 静态语法：`python3 -m py_compile $(git ls-files '*.py')`
 - 单元测试：`.venv/bin/python -m unittest discover -v`
-- 可选联调：`RUN_INTEGRATION_TESTS=1 .venv/bin/python -m unittest test_integration_visibility.py -v`
+- 可选联调：在测试环境执行 `schema_diff_reconciler.py` + `run_fixup.py --glob "__NO_MATCH__"` 验证链路可达。
 - 建议每次交付都记录本次测试结果（通过/失败/跳过项），并随交付包一并存档。

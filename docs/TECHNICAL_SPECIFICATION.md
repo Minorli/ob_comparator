@@ -209,5 +209,5 @@
 ## 13. 交付前验证基线
 - 语法检查：`python3 -m py_compile $(git ls-files '*.py')`
 - 单元测试：`.venv/bin/python -m unittest discover -v`
-- 可选联调：`RUN_INTEGRATION_TESTS=1 .venv/bin/python -m unittest test_integration_visibility.py -v`
+- 可选联调：在测试库执行 `schema_diff_reconciler.py` 与 `run_fixup.py --glob "__NO_MATCH__"` 验证整体链路。
 - 当前基线（2026-02-09）：`unittest` 290 项通过，2 项联调测试默认跳过（需真实 Oracle/OB 环境）。
