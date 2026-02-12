@@ -1,7 +1,7 @@
 ============================================================
 OceanBase 报告库排查手册（report_to_db）
 文件: HOW_TO_READ_REPORTS_IN_OB_latest.txt
-快照: HOW_TO_READ_REPORTS_IN_OB_20260211_09_sqls.txt
+快照: HOW_TO_READ_REPORTS_IN_OB_20260212_14_sqls.txt
 ============================================================
 
 使用说明
@@ -384,6 +384,21 @@ SELECT schema_name, table_name, black_type, status, reason, detail
  WHERE report_id = :report_id
    AND black_type = 'NAME_PATTERN'
  ORDER BY schema_name, table_name;
+
+-- SQL-35A 显式排除对象（exclude_objects_file）汇总
+SELECT status,
+       object_type,
+       COUNT(*) AS cnt
+  FROM DIFF_REPORT_EXCLUDED_OBJECT
+ WHERE report_id = :report_id
+ GROUP BY status, object_type
+ ORDER BY status, object_type;
+
+-- SQL-35B 显式排除对象（exclude_objects_file）明细
+SELECT status, line_no, object_type, schema_name, object_name, detail
+  FROM DIFF_REPORT_EXCLUDED_OBJECT
+ WHERE report_id = :report_id
+ ORDER BY line_no, status, object_type, schema_name, object_name;
 
 ------------------------------------------------------------
 D. 不一致（MISMATCHED）深挖（SQL-36 ~ SQL-46）

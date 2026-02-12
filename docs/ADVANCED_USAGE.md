@@ -154,6 +154,7 @@
   - `DIFF_REPORT_REMAP_CONFLICT`（remap 冲突）
   - `DIFF_REPORT_OBJECT_MAPPING`（全量对象映射）
   - `DIFF_REPORT_BLACKLIST`（黑名单明细）
+  - `DIFF_REPORT_EXCLUDED_OBJECT`（显式排除对象明细，来自 exclude_objects_file）
   - `DIFF_REPORT_FIXUP_SKIP`（fixup 跳过汇总）
   - `DIFF_REPORT_OMS_MISSING`（OMS 缺失规则映射）
   - `DIFF_REPORT_WRITE_ERRORS`（写库失败追踪）

@@ -26936,6 +26936,7 @@ REPORT_DB_TABLES = {
     "remap_conflict": "DIFF_REPORT_REMAP_CONFLICT",
     "object_mapping": "DIFF_REPORT_OBJECT_MAPPING",
     "blacklist": "DIFF_REPORT_BLACKLIST",
+    "excluded_objects": "DIFF_REPORT_EXCLUDED_OBJECT",
     "fixup_skip": "DIFF_REPORT_FIXUP_SKIP",
     "oms_missing": "DIFF_REPORT_OMS_MISSING",
     "write_errors": "DIFF_REPORT_WRITE_ERRORS",
@@ -27294,6 +27295,18 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['blacklist']} (
     CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP
 )
 """
+    ddl_excluded_objects = f"""
+CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['excluded_objects']} (
+    REPORT_ID           VARCHAR2(64) NOT NULL,
+    STATUS              VARCHAR2(16) NOT NULL,
+    LINE_NO             NUMBER,
+    OBJECT_TYPE         VARCHAR2(32),
+    SCHEMA_NAME         VARCHAR2(128),
+    OBJECT_NAME         VARCHAR2(256),
+    DETAIL              VARCHAR2(1000),
+    CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP
+)
+"""
     ddl_fixup_skip = f"""
 CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['fixup_skip']} (
     REPORT_ID           VARCHAR2(64) NOT NULL,
@@ -27402,6 +27415,10 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['resolution']} (
          f"CREATE INDEX IDX_DIFF_BLACKLIST_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['blacklist']}(REPORT_ID)"),
         ("IDX_DIFF_BLACKLIST_TABLE",
          f"CREATE INDEX IDX_DIFF_BLACKLIST_TABLE ON {schema_prefix}{REPORT_DB_TABLES['blacklist']}(SCHEMA_NAME, TABLE_NAME)"),
+        ("IDX_DIFF_EXCL_REPORT_ID",
+         f"CREATE INDEX IDX_DIFF_EXCL_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['excluded_objects']}(REPORT_ID)"),
+        ("IDX_DIFF_EXCL_OBJ",
+         f"CREATE INDEX IDX_DIFF_EXCL_OBJ ON {schema_prefix}{REPORT_DB_TABLES['excluded_objects']}(OBJECT_TYPE, SCHEMA_NAME, OBJECT_NAME)"),
         ("IDX_DIFF_FIXUP_SKIP_REPORT_ID",
          f"CREATE INDEX IDX_DIFF_FIXUP_SKIP_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['fixup_skip']}(REPORT_ID)"),
         ("IDX_DIFF_OMS_MISSING_REPORT_ID",
@@ -27447,6 +27464,8 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['resolution']} (
         to_create.append(("object_mapping", ddl_object_mapping))
     if REPORT_DB_TABLES["blacklist"] not in existing:
         to_create.append(("blacklist", ddl_blacklist))
+    if REPORT_DB_TABLES["excluded_objects"] not in existing:
+        to_create.append(("excluded_objects", ddl_excluded_objects))
     if REPORT_DB_TABLES["fixup_skip"] not in existing:
         to_create.append(("fixup_skip", ddl_fixup_skip))
     if REPORT_DB_TABLES["oms_missing"] not in existing:
@@ -28325,6 +28344,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "REMAP_CONFLICT"
     if name == "blacklist_tables.txt":
         return "BLACKLIST_TABLES"
+    if name.startswith("excluded_objects_detail_"):
+        return "EXCLUDED_OBJECTS_DETAIL"
     if name.startswith("fixup_skip_summary_"):
         return "FIXUP_SKIP_SUMMARY"
     if name.startswith("filtered_grants"):
@@ -28366,6 +28387,8 @@ def _infer_artifact_status(
     if artifact_type in {"DEPENDENCY_CHAINS", "VIEW_CHAIN", "REMAP_CONFLICT", "OBJECT_MAPPING",
                          "BLACKLIST_TABLES", "FIXUP_SKIP_SUMMARY", "OMS_MISSING_RULES"}:
         return ("IN_DB", "") if store_scope == "full" else ("TXT_ONLY", "")
+    if artifact_type == "EXCLUDED_OBJECTS_DETAIL":
+        return ("IN_DB", "") if store_scope in {"core", "full"} else ("TXT_ONLY", "")
     if artifact_type == "REPORT_INDEX":
         return "TXT_ONLY", ""
     if artifact_type == "REPORT_SQL_TEMPLATE":
@@ -28669,6 +28692,31 @@ def _build_report_blacklist_rows(
             "status": row.status,
             "reason": row.reason,
             "detail": row.detail
+        })
+    truncated = False
+    truncated_count = 0
+    if max_rows and len(rows) > max_rows:
+        truncated = True
+        truncated_count = len(rows) - max_rows
+        rows = rows[:max_rows]
+    return rows, truncated, truncated_count
+
+
+def _build_report_excluded_objects_rows(
+    excluded_rows: Optional[List[Dict[str, object]]],
+    max_rows: int
+) -> Tuple[List[Dict[str, object]], bool, int]:
+    if not excluded_rows:
+        return [], False, 0
+    rows: List[Dict[str, object]] = []
+    for row in excluded_rows:
+        rows.append({
+            "status": (row.get("status") or "").upper(),
+            "line_no": int(row.get("line_no", 0) or 0),
+            "object_type": (row.get("object_type") or "").upper(),
+            "schema_name": (row.get("schema_name") or "").upper(),
+            "object_name": (row.get("object_name") or "").upper(),
+            "detail": str(row.get("detail") or ""),
         })
     truncated = False
     truncated_count = 0
@@ -29429,6 +29477,51 @@ def _insert_report_blacklist_rows(
     return ok_all
 
 
+def _insert_report_excluded_objects_rows(
+    ob_cfg: ObConfig,
+    schema_prefix: str,
+    report_id: str,
+    rows: List[Dict[str, object]],
+    batch_size: int
+) -> bool:
+    if not rows:
+        return True
+    ok_all = True
+    for batch in chunk_list(rows, batch_size):
+        values_sql: List[str] = []
+        for row in batch:
+            detail = (row.get("detail") or "")
+            if len(detail) > 1000:
+                detail = detail[:997] + "..."
+            values_sql.append(
+                "INTO {table} (REPORT_ID, STATUS, LINE_NO, OBJECT_TYPE, SCHEMA_NAME, OBJECT_NAME, DETAIL) "
+                "VALUES ({report_id}, {status}, {line_no}, {object_type}, {schema_name}, {object_name}, {detail})".format(
+                    table=f"{schema_prefix}{REPORT_DB_TABLES['excluded_objects']}",
+                    report_id=sql_quote_literal(report_id),
+                    status=sql_quote_literal(row.get("status")) if row.get("status") else "NULL",
+                    line_no=int(row.get("line_no", 0) or 0),
+                    object_type=sql_quote_literal(row.get("object_type")) if row.get("object_type") else "NULL",
+                    schema_name=sql_quote_literal(row.get("schema_name")) if row.get("schema_name") else "NULL",
+                    object_name=sql_quote_literal(row.get("object_name")) if row.get("object_name") else "NULL",
+                    detail=sql_quote_literal(detail) if detail else "NULL",
+                )
+            )
+        insert_sql = "INSERT ALL\n  " + "\n  ".join(values_sql) + "\nSELECT 1 FROM DUAL"
+        ok, _out, err = obclient_run_sql_commit(ob_cfg, insert_sql)
+        if not ok:
+            ok_all = False
+            log.warning("[REPORT_DB] 写入 excluded_objects 失败: %s", err)
+            _record_report_db_write_error(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                REPORT_DB_TABLES["excluded_objects"],
+                insert_sql,
+                err
+            )
+    return ok_all
+
+
 def _insert_report_fixup_skip_rows(
     ob_cfg: ObConfig,
     schema_prefix: str,
@@ -30076,7 +30169,8 @@ def save_report_to_db(
     remap_rules: Optional[RemapRules] = None,
     blacklist_report_rows: Optional[List[BlacklistReportRow]] = None,
     fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None,
-    blacklisted_table_keys: Optional[Set[Tuple[str, str]]] = None
+    blacklisted_table_keys: Optional[Set[Tuple[str, str]]] = None,
+    excluded_object_rows: Optional[List[Dict[str, object]]] = None,
 ) -> Tuple[bool, Optional[str]]:
     if not settings.get("report_to_db", False):
         return True, None
@@ -30261,6 +30355,12 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
         trigger_rows = _build_report_trigger_status_rows(trigger_status_rows)
         if trigger_rows:
             _insert_report_trigger_status_rows(ob_cfg, schema_prefix, report_id, trigger_rows, batch_size)
+        excluded_rows, _ex_trunc, _ex_trunc_cnt = _build_report_excluded_objects_rows(
+            excluded_object_rows,
+            max_rows
+        )
+        if excluded_rows:
+            _insert_report_excluded_objects_rows(ob_cfg, schema_prefix, report_id, excluded_rows, batch_size)
 
     artifact_rows = _build_report_artifact_rows(report_dir, store_scope, detail_modes, detail_truncated)
     if view_artifacts:
@@ -32919,6 +33019,7 @@ def main():
         )
 
     # 7) 主对象校验
+    explicit_excluded_report_rows: List[Dict[str, object]] = []
     with phase_timer("Oracle 元数据转储", phase_durations):
         log_subsection("Oracle 元数据")
         oracle_meta = dump_oracle_metadata(
@@ -32958,6 +33059,28 @@ def main():
                 explicit_applied_rules.append((line_no, obj_type, schema, obj_name))
                 if obj_type == "TABLE":
                     explicit_excluded_table_keys.add((schema, obj_name))
+
+            explicit_excluded_report_rows = [
+                {
+                    "status": "APPLIED",
+                    "line_no": line_no,
+                    "object_type": obj_type,
+                    "schema_name": schema,
+                    "object_name": obj_name,
+                    "detail": "MATCHED",
+                }
+                for line_no, obj_type, schema, obj_name in explicit_applied_rules
+            ] + [
+                {
+                    "status": "SKIPPED",
+                    "line_no": line_no,
+                    "object_type": obj_type,
+                    "schema_name": schema,
+                    "object_name": obj_name,
+                    "detail": reason,
+                }
+                for line_no, obj_type, schema, obj_name, reason in explicit_skipped_rules
+            ]
 
             detail_path = report_dir / f"excluded_objects_detail_{timestamp}.txt"
             detail_lines = ["# status|line|type|schema|object|detail"]
@@ -33519,7 +33642,8 @@ def main():
             remap_rules=remap_rules,
             blacklist_report_rows=blacklist_report_rows,
             fixup_skip_summary=fixup_skip_summary,
-            blacklisted_table_keys=blacklisted_table_keys
+            blacklisted_table_keys=blacklisted_table_keys,
+            excluded_object_rows=explicit_excluded_report_rows
         )
         if not db_ok:
             abort_run()
