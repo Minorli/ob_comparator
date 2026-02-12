@@ -17616,30 +17616,102 @@ class SqlMasker:
         self._mask()
 
     def _mask(self):
-        # 1. Mask String Literals: 'text'
-        # 注意: Oracle 字符串内部的单引号转义为 ''
-        def mask_str(match):
-            key = f"###STR_{len(self.literals)}###"
-            self.literals[key] = match.group(0)
-            return key
-        
-        self.masked_sql = re.sub(r"'(?:''|[^'])*'", mask_str, self.masked_sql)
+        """
+        使用词法扫描替代简单正则，正确处理：
+        - 普通字符串 '...'
+        - Oracle Q-quote 字符串 q'[...]' / q'!...!' 等
+        - 块注释、行注释
+        """
+        text = self.masked_sql
+        if not text:
+            return
+        q_quote_pairs = {
+            "[": "]",
+            "{": "}",
+            "(": ")",
+            "<": ">",
+        }
+        out: List[str] = []
+        i = 0
+        n = len(text)
 
-        # 2. Mask Block Comments: /* ... */
-        def mask_block_cmt(match):
-            key = f"###CMT_BLK_{len(self.comments)}###"
-            self.comments[key] = match.group(0)
-            return key
-        
-        self.masked_sql = re.sub(r'/\*.*?\*/', mask_block_cmt, self.masked_sql, flags=re.DOTALL)
+        while i < n:
+            ch = text[i]
+            nxt = text[i + 1] if i + 1 < n else ""
 
-        # 3. Mask Line Comments: -- ...
-        def mask_line_cmt(match):
-            key = f"###CMT_LN_{len(self.comments)}###"
-            self.comments[key] = match.group(0)
-            return key
-        
-        self.masked_sql = re.sub(r'--.*?$', mask_line_cmt, self.masked_sql, flags=re.MULTILINE)
+            # line comment
+            if ch == "-" and nxt == "-":
+                j = i + 2
+                while j < n and text[j] not in ("\n", "\r"):
+                    j += 1
+                key = f"###CMT_LN_{len(self.comments)}###"
+                self.comments[key] = text[i:j]
+                out.append(key)
+                i = j
+                continue
+
+            # block comment (support nested blocks to avoid premature stop)
+            if ch == "/" and nxt == "*":
+                j = i + 2
+                depth = 1
+                while j < n and depth > 0:
+                    c = text[j]
+                    nn = text[j + 1] if j + 1 < n else ""
+                    if c == "/" and nn == "*":
+                        depth += 1
+                        j += 2
+                        continue
+                    if c == "*" and nn == "/":
+                        depth -= 1
+                        j += 2
+                        continue
+                    j += 1
+                key = f"###CMT_BLK_{len(self.comments)}###"
+                self.comments[key] = text[i:j]
+                out.append(key)
+                i = j
+                continue
+
+            # q-quote string: q'<d>...<d>'
+            if ch in ("q", "Q") and nxt == "'" and i + 2 < n:
+                delim = text[i + 2]
+                if not delim.isspace():
+                    end_delim = q_quote_pairs.get(delim, delim)
+                    j = i + 3
+                    while j + 1 < n:
+                        if text[j] == end_delim and text[j + 1] == "'":
+                            j += 2
+                            break
+                        j += 1
+                    else:
+                        j = n
+                    key = f"###STR_{len(self.literals)}###"
+                    self.literals[key] = text[i:j]
+                    out.append(key)
+                    i = j
+                    continue
+
+            # regular string literal
+            if ch == "'":
+                j = i + 1
+                while j < n:
+                    if text[j] == "'":
+                        if j + 1 < n and text[j + 1] == "'":
+                            j += 2
+                            continue
+                        j += 1
+                        break
+                    j += 1
+                key = f"###STR_{len(self.literals)}###"
+                self.literals[key] = text[i:j]
+                out.append(key)
+                i = j
+                continue
+
+            out.append(ch)
+            i += 1
+
+        self.masked_sql = "".join(out)
 
     def unmask(self, sql: str) -> str:
         # 恢复掩码内容
@@ -18493,7 +18565,7 @@ def replace_unqualified_table_refs(
         k = j
         while k < part_end:
             ch = masked[segment_offset + k]
-            if ch.isspace() or ch == ',' or ch == ')':
+            if ch.isspace() or ch in {',', ')', ';'}:
                 break
             k += 1
         if k <= j:
@@ -19831,7 +19903,8 @@ def remap_plsql_object_references(
     working_sql = masker.masked_sql
     
     # 收集需要替换的引用
-    replacements = {}
+    replacements_qualified: Dict[str, str] = {}
+    replacements_unqualified: Dict[str, str] = {}
     preferred_types = (
         "TABLE", "VIEW", "MATERIALIZED VIEW", "SEQUENCE",
         "SYNONYM", "PACKAGE", "PACKAGE BODY", "FUNCTION",
@@ -19850,7 +19923,7 @@ def remap_plsql_object_references(
                 preferred_types=preferred_types
             )
             if tgt_name and tgt_name.upper() != ref_name:
-                replacements[ref_name] = tgt_name.upper()
+                replacements_qualified[ref_name] = tgt_name.upper()
 
     # 2. 查找未限定引用 (如果提供了 source_schema)
     if source_schema:
@@ -19879,24 +19952,21 @@ def remap_plsql_object_references(
                 # 例如 TAB -> TGT.TAB
                 tgt_u = tgt_name.upper()
                 if tgt_u != cand_u:
-                     replacements[cand_u] = tgt_u
+                    replacements_unqualified[cand_u] = tgt_u
 
     # 执行替换
-    if replacements:
-        for src_ref in sorted(replacements.keys(), key=len, reverse=True):
-            tgt_ref = replacements[src_ref]
-            
-            if '.' in src_ref:
-                pattern = r'\b' + re.escape(src_ref) + r'\b'
-                working_sql = re.sub(pattern, tgt_ref, working_sql, flags=re.IGNORECASE)
-            else:
-                 # 未限定引用，需确保不匹配已限定引用的尾部
-                 pattern = r'(?<![A-Z0-9_\$#"\.])\b' + re.escape(src_ref) + r'\b'
-                 working_sql = re.sub(pattern, tgt_ref, working_sql, flags=re.IGNORECASE)
-            
-            log.debug("[%s] 重映射对象引用: %s -> %s", obj_type_upper, src_ref, tgt_ref)
-    
-    return masker.unmask(working_sql)
+    if replacements_qualified:
+        for src_ref in sorted(replacements_qualified.keys(), key=len, reverse=True):
+            tgt_ref = replacements_qualified[src_ref]
+            pattern = r'\b' + re.escape(src_ref) + r'\b'
+            working_sql = re.sub(pattern, tgt_ref, working_sql, flags=re.IGNORECASE)
+            log.debug("[%s] 重映射对象引用(限定): %s -> %s", obj_type_upper, src_ref, tgt_ref)
+
+    rewritten = masker.unmask(working_sql)
+    # 未限定名称仅在 DML 对象位置替换，避免误替换局部变量/参数名。
+    if replacements_unqualified:
+        rewritten = replace_unqualified_table_refs(rewritten, replacements_unqualified)
+    return rewritten
 
 
 _HINT_KEYWORD_RE = re.compile(r'([A-Z_][A-Z0-9_$#]*)(?:@[\w$#]+)?', re.IGNORECASE)
@@ -20186,14 +20256,23 @@ def clean_pragma_statements(ddl: str) -> str:
     """移除OceanBase不支持的PRAGMA语句"""
     if not ddl:
         return ddl
-    
-    # 移除PRAGMA AUTONOMOUS_TRANSACTION
-    cleaned = re.sub(r'\s*PRAGMA\s+AUTONOMOUS_TRANSACTION\s*;', '', ddl, flags=re.IGNORECASE)
-    
-    # 移除其他可能的PRAGMA语句
-    cleaned = re.sub(r'\s*PRAGMA\s+\w+[^;]*;', '', cleaned, flags=re.IGNORECASE)
-    
-    return cleaned
+
+    unsupported_pragmas = {
+        "AUTONOMOUS_TRANSACTION",
+        "SERIALLY_REUSABLE",
+    }
+    pragma_pattern = re.compile(
+        r'(^|\n)([ \t]*PRAGMA\s+([A-Z_][A-Z0-9_]*)\b[^;]*;)',
+        flags=re.IGNORECASE
+    )
+
+    def _repl(match: re.Match) -> str:
+        pragma_name = (match.group(3) or "").upper()
+        if pragma_name in unsupported_pragmas:
+            return match.group(1)
+        return match.group(0)
+
+    return pragma_pattern.sub(_repl, ddl)
 
 
 def clean_oracle_specific_syntax(ddl: str) -> str:
@@ -30192,6 +30271,67 @@ def save_report_to_db(
         detail_item_enable = False
     detail_item_max_rows = int(settings.get("report_db_detail_item_max_rows", 0) or 0)
 
+    # 兼容两种形态：
+    # 1) 嵌套结构: {"oracle": {...}, "oceanbase": {...}}
+    # 2) 扁平结构: {"source_host": "...", ...}
+    endpoint_flat = {
+        "source_host": "",
+        "source_port": 0,
+        "source_service": "",
+        "source_user": "",
+        "target_host": "",
+        "target_port": 0,
+        "target_tenant": "",
+        "target_user": "",
+    }
+
+    def _safe_int(value: object) -> int:
+        try:
+            return int(value or 0)
+        except Exception:
+            return 0
+
+    if isinstance(endpoint_info, dict):
+        if "oracle" in endpoint_info or "oceanbase" in endpoint_info:
+            src_info = endpoint_info.get("oracle") or {}
+            tgt_info = endpoint_info.get("oceanbase") or {}
+            endpoint_flat["source_host"] = str(src_info.get("host") or "")
+            endpoint_flat["source_port"] = _safe_int(src_info.get("port"))
+            endpoint_flat["source_service"] = str(
+                src_info.get("service_name")
+                or src_info.get("source_service")
+                or src_info.get("dsn")
+                or ""
+            )
+            endpoint_flat["source_user"] = str(
+                src_info.get("user")
+                or src_info.get("current_user")
+                or src_info.get("configured_user")
+                or ""
+            )
+            endpoint_flat["target_host"] = str(tgt_info.get("host") or "")
+            endpoint_flat["target_port"] = _safe_int(tgt_info.get("port"))
+            endpoint_flat["target_tenant"] = str(
+                tgt_info.get("current_database")
+                or tgt_info.get("target_tenant")
+                or ""
+            )
+            endpoint_flat["target_user"] = str(
+                tgt_info.get("current_user")
+                or tgt_info.get("configured_user")
+                or tgt_info.get("target_user")
+                or ""
+            )
+        else:
+            endpoint_flat["source_host"] = str(endpoint_info.get("source_host") or "")
+            endpoint_flat["source_port"] = _safe_int(endpoint_info.get("source_port"))
+            endpoint_flat["source_service"] = str(endpoint_info.get("source_service") or "")
+            endpoint_flat["source_user"] = str(endpoint_info.get("source_user") or "")
+            endpoint_flat["target_host"] = str(endpoint_info.get("target_host") or "")
+            endpoint_flat["target_port"] = _safe_int(endpoint_info.get("target_port"))
+            endpoint_flat["target_tenant"] = str(endpoint_info.get("target_tenant") or "")
+            endpoint_flat["target_user"] = str(endpoint_info.get("target_user") or "")
+
     missing_count = len(tv_results.get("missing", []))
     mismatched_count = len(tv_results.get("mismatched", []))
     ok_count = len(tv_results.get("ok", []))
@@ -30281,15 +30421,15 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
     {sql_quote_literal(report_id)},
     TO_TIMESTAMP({sql_quote_literal(report_timestamp.replace('_', ''))}, 'YYYYMMDDHH24MISS'),
     {run_summary.total_seconds:.2f},
-    {sql_quote_literal(endpoint_info.get("source_host", ""))},
-    {int(endpoint_info.get("source_port", 0) or 0)},
-    {sql_quote_literal(endpoint_info.get("source_service", ""))},
-    {sql_quote_literal(endpoint_info.get("source_user", ""))},
+    {sql_quote_literal(endpoint_flat.get("source_host", ""))},
+    {int(endpoint_flat.get("source_port", 0) or 0)},
+    {sql_quote_literal(endpoint_flat.get("source_service", ""))},
+    {sql_quote_literal(endpoint_flat.get("source_user", ""))},
     {sql_clob_literal(",".join(settings.get("source_schemas_list", [])))},
-    {sql_quote_literal(endpoint_info.get("target_host", ""))},
-    {int(endpoint_info.get("target_port", 0) or 0)},
-    {sql_quote_literal(endpoint_info.get("target_tenant", ""))},
-    {sql_quote_literal(endpoint_info.get("target_user", ""))},
+    {sql_quote_literal(endpoint_flat.get("target_host", ""))},
+    {int(endpoint_flat.get("target_port", 0) or 0)},
+    {sql_quote_literal(endpoint_flat.get("target_tenant", ""))},
+    {sql_quote_literal(endpoint_flat.get("target_user", ""))},
     {sql_clob_literal(",".join(target_schema_list))},
     {sql_quote_literal(",".join(sorted(enabled_primary_types)))},
     {sql_quote_literal(",".join(sorted(enabled_extra_types)))},

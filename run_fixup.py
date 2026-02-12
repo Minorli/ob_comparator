@@ -703,6 +703,7 @@ def move_sql_to_done(sql_path: Path, done_dir: Path) -> str:
                 backup_note = f" (已备份: {backup_path.name})"
             except Exception as exc:
                 log.warning("已存在文件备份失败: %s (%s)", target_path, str(exc)[:200])
+                return f"(移动失败: 目标已存在且备份失败: {exc})"
         shutil.move(str(sql_path), target_path)
         return f"(已移至 done/{sql_path.parent.name}/){backup_note}"
     except Exception as exc:
@@ -2975,6 +2976,10 @@ def execute_grant_file_with_prune(
 
     if summary.success:
         move_note = move_sql_to_done(sql_path, done_dir)
+        if "移动失败" in move_note:
+            log.error("%s %s -> ERROR %s", label_prefix, relative_path, move_note)
+            failure = StatementFailure(0, move_note.strip("()"), "")
+            return ScriptResult(relative_path, "ERROR", move_note.strip(), layer), ExecutionSummary(executed_count, [failure]), removed_count, 0, truncated
         log.info(
             "%s %s -> OK %s (已清理授权 %d 条)",
             label_prefix,
@@ -3034,6 +3039,10 @@ def execute_script_with_summary(
 
     if summary.success:
         move_note = move_sql_to_done(sql_path, done_dir)
+        if "移动失败" in move_note:
+            log.error("%s %s -> ERROR %s", label_prefix, relative_path, move_note)
+            failure = StatementFailure(0, move_note.strip("()"), "")
+            return ScriptResult(relative_path, "ERROR", move_note.strip(), layer), ExecutionSummary(summary.statements, [failure])
         log.info("%s %s -> OK %s", label_prefix, relative_path, move_note)
         return ScriptResult(relative_path, "SUCCESS", move_note.strip(), layer), summary
 
