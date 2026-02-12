@@ -1,0 +1,33 @@
+# exclude_objects.txt
+# 用途：
+# - 手工维护“明确不参与校验/不生成修补”的对象清单（优先推荐 TABLE）。
+# - 本文件建议和 remap_rules.txt 一起维护，避免基于关键字黑名单误杀。
+#
+# 行格式（可直接由 SQL 查询结果复制粘贴）：
+#   TYPE|SCHEMA|OBJECT
+# 例如：
+#   TABLE|LIFEDATA|BENEFICIARY_INFO_DELETE_RENAME20250101
+#
+# 建议：先按 source_schemas 过滤，再按关键字筛选，结果列可直接粘贴到本文件。
+#
+# SQL 模板 1：查找表名含 RENAME 的表（输出即本文件格式）
+# ------------------------------------------------------------
+# SELECT 'TABLE|' || owner || '|' || table_name AS exclude_line
+#   FROM dba_tables
+#  WHERE owner IN ('SCHEMA_A','SCHEMA_B')   -- 替换为 config.ini 的 source_schemas
+#    AND UPPER(table_name) LIKE '%RENAME%'
+#  ORDER BY owner, table_name;
+#
+# SQL 模板 2：多个关键字（RENAME/BAK/TMP）
+# ------------------------------------------------------------
+# SELECT 'TABLE|' || owner || '|' || table_name AS exclude_line
+#   FROM dba_tables
+#  WHERE owner IN ('SCHEMA_A','SCHEMA_B')   -- 替换为 config.ini 的 source_schemas
+#    AND (
+#      UPPER(table_name) LIKE '%RENAME%'
+#      OR UPPER(table_name) LIKE '%BAK%'
+#      OR UPPER(table_name) LIKE 'TMP%'
+#    )
+#  ORDER BY owner, table_name;
+#
+# 在此处粘贴排除条目（每行一个）：

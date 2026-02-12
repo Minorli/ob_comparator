@@ -197,10 +197,13 @@ trigger_qualify_schema  = true
 # constraint_status_sync_mode：
 #   enabled_only（仅同步 ENABLED/DISABLED，默认）
 #   full（同时同步 VALIDATED / NOT VALIDATED）
+#   注意：OB 4.2.5.x 对 PK/UK 不支持 ENABLE/DISABLE/VALIDATE 状态语法，
+#         程序会仅报告 PK/UK 状态漂移，不生成状态修复 SQL。
 # constraint_missing_fixup_validate_mode：
-#   safe_novalidate（默认，缺失约束使用 ENABLE NOVALIDATE，降低 ORA-02298 风险）
-#   source（跟随源端 VALIDATED 状态；未知时回退 NOVALIDATE）
-#   force_validate（强制 ENABLE VALIDATE，可能因脏数据失败）
+#   safe_novalidate（默认，FK/CHECK 使用 ENABLE NOVALIDATE，降低 ORA-02298 风险）
+#   source（FK/CHECK 跟随源端 VALIDATED 状态；未知时回退 NOVALIDATE）
+#   force_validate（FK/CHECK 强制 ENABLE VALIDATE，可能因脏数据失败）
+#   注意：PK/UK 固定生成 plain ADD CONSTRAINT，不追加 ENABLE/VALIDATE。
 # trigger_validity_sync_mode：
 #   off（不处理 VALID/INVALID，默认）
 #   compile（当源 VALID 且目标 INVALID 时生成 ALTER TRIGGER ... COMPILE）
@@ -266,6 +269,11 @@ blacklist_rules_disable =
 blacklist_name_patterns = _RENAME
 # 表名黑名单关键字文件（每行一个关键字；支持 #/; 注释）
 blacklist_name_patterns_file =
+# 显式排除对象清单文件（可选）：
+#   每行格式: TYPE|SCHEMA|OBJECT
+#   例如: TABLE|LIFEDATA|BENEFICIARY_INFO_DELETE_RENAME20250101
+# 说明：未配置或文件不存在时，不生效，继续走原有校验逻辑
+exclude_objects_file    =
 # LOB 体积阈值（MB）；超过阈值则标记为 LOB_OVERSIZE
 blacklist_lob_max_mb    = 512
 # 是否启用 schema 推导（一对多场景下用于非表对象）

@@ -851,6 +851,8 @@ EXTRA_OBJECT_CHECK_TYPES: Tuple[str, ...] = (
     'TRIGGER'
 )
 
+EXCLUDE_OBJECT_ALLOWED_TYPES: Set[str] = set(PRIMARY_OBJECT_TYPES) | set(EXTRA_OBJECT_CHECK_TYPES)
+
 STATUS_DRIFT_CHECK_TYPES: Tuple[str, ...] = (
     'TRIGGER',
     'CONSTRAINT',
@@ -2130,6 +2132,80 @@ def build_blacklist_name_pattern_clause(patterns: Sequence[str]) -> str:
         escaped = escaped.replace("!", "!!").replace("%", "!%").replace("_", "!_").replace("'", "''")
         clauses.append(f"UPPER(TABLE_NAME) LIKE '%{escaped}%' ESCAPE '!'")
     return " OR ".join(clauses)
+
+
+def load_exclude_object_rules(
+    file_path: Optional[str],
+    allowed_schemas: Optional[Set[str]] = None
+) -> List[Tuple[int, str, str, str]]:
+    """
+    读取显式排除对象清单，格式: TYPE|SCHEMA|OBJECT
+    返回: [(line_no, obj_type, schema, object_name), ...]
+    说明:
+    - 未配置或文件不存在时返回空列表（不中断流程）
+    - 仅接受 EXCLUDE_OBJECT_ALLOWED_TYPES 中的对象类型
+    - 若提供 allowed_schemas，则仅保留该范围内 schema 条目
+    """
+    path_raw = (file_path or "").strip()
+    if not path_raw:
+        return []
+
+    path = Path(path_raw).expanduser()
+    if not path.exists():
+        log.warning("exclude_objects_file 不存在: %s（将忽略显式排除规则）", path)
+        return []
+
+    schema_set = {s.upper() for s in (allowed_schemas or set()) if s}
+    rules: List[Tuple[int, str, str, str]] = []
+    seen: Set[Tuple[str, str, str]] = set()
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        log.warning("读取 exclude_objects_file 失败: %s (%s)，将忽略显式排除规则。", path, exc)
+        return []
+
+    for line_no, raw_line in enumerate(lines, start=1):
+        line = (raw_line or "").strip()
+        if not line or line.startswith('#') or line.startswith(';'):
+            continue
+
+        parts = [p.strip() for p in line.split('|')]
+        if len(parts) != 3:
+            log.warning("exclude_objects_file 第 %d 行格式无效（需 TYPE|SCHEMA|OBJECT），已跳过: %s", line_no, line)
+            continue
+
+        obj_type = parts[0].upper()
+        schema = parts[1].upper()
+        obj_name = parts[2].upper()
+        if not obj_type or not schema or not obj_name:
+            log.warning("exclude_objects_file 第 %d 行存在空字段，已跳过: %s", line_no, line)
+            continue
+        if obj_type not in EXCLUDE_OBJECT_ALLOWED_TYPES:
+            log.warning(
+                "exclude_objects_file 第 %d 行对象类型不支持: %s（允许: %s）",
+                line_no,
+                obj_type,
+                ",".join(sorted(EXCLUDE_OBJECT_ALLOWED_TYPES))
+            )
+            continue
+        if schema_set and schema not in schema_set:
+            log.warning(
+                "exclude_objects_file 第 %d 行 schema=%s 不在 source_schemas 范围内，已跳过。",
+                line_no,
+                schema
+            )
+            continue
+
+        key = (obj_type, schema, obj_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        rules.append((line_no, obj_type, schema, obj_name))
+
+    if rules:
+        log.info("已加载显式排除规则 %d 条: %s", len(rules), path)
+    return rules
 
 
 def parse_interval_cutoff_date(value: Optional[str]) -> Optional[datetime]:
@@ -3475,6 +3551,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('blacklist_name_patterns', '_RENAME')
         settings.setdefault('blacklist_name_patterns_file', '')
         settings.setdefault('blacklist_lob_max_mb', '512')
+        settings.setdefault('exclude_objects_file', '')
         settings.setdefault('infer_schema_mapping', 'true')
         settings.setdefault('ddl_punct_sanitize', 'true')
         settings.setdefault('ddl_hint_policy', DDL_HINT_POLICY_DEFAULT)
@@ -3613,6 +3690,11 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         )
         settings['blacklist_name_pattern_clause'] = build_blacklist_name_pattern_clause(
             settings.get('blacklist_name_patterns_list', [])
+        )
+        settings['exclude_objects_file'] = (settings.get('exclude_objects_file') or '').strip()
+        settings['exclude_object_rules'] = load_exclude_object_rules(
+            settings.get('exclude_objects_file', ''),
+            set(settings.get('source_schemas_list', []))
         )
         try:
             settings['blacklist_lob_max_mb'] = int(settings.get('blacklist_lob_max_mb', '512'))
@@ -3920,6 +4002,12 @@ def validate_runtime_paths(settings: Dict, ob_cfg: ObConfig) -> None:
     if trigger_list_path and not Path(trigger_list_path).expanduser().exists():
         warnings.append(
             f"trigger_list 文件不存在: {trigger_list_path}（将记录在报告中并回退全量触发器生成）。"
+        )
+
+    exclude_objects_file = settings.get('exclude_objects_file', '').strip()
+    if exclude_objects_file and not Path(exclude_objects_file).expanduser().exists():
+        warnings.append(
+            f"exclude_objects_file 不存在: {exclude_objects_file}（将忽略显式排除规则，继续原有校验逻辑）。"
         )
 
     blacklist_mode = settings.get('blacklist_mode', 'auto')
@@ -4433,6 +4521,12 @@ def run_config_wizard(config_path: Path) -> None:
         "blacklist_name_patterns_file",
         "表名黑名单关键字文件（每行一条，可选）",
         default=cfg.get("SETTINGS", "blacklist_name_patterns_file", fallback=""),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "exclude_objects_file",
+        "显式排除对象清单（TYPE|SCHEMA|OBJECT，每行一条，可选）",
+        default=cfg.get("SETTINGS", "exclude_objects_file", fallback=""),
     )
     _prompt_field(
         "SETTINGS",
@@ -5385,6 +5479,7 @@ def _build_constraint_status_drift_action_sql(
     table_schema: str,
     table_name: str,
     constraint_name: str,
+    constraint_type: str,
     src_status: str,
     tgt_status: str,
     src_validated: str,
@@ -5394,10 +5489,15 @@ def _build_constraint_status_drift_action_sql(
     sync_mode = normalize_constraint_status_sync_mode(sync_mode)
     table_full_quoted = quote_qualified_parts(table_schema, table_name)
     cons_quoted = quote_identifier(constraint_name)
+    cons_type = (constraint_type or "").upper()
     src_status_n = normalize_constraint_enabled_status(src_status)
     tgt_status_n = normalize_constraint_enabled_status(tgt_status)
     src_validated_n = normalize_constraint_validated_status(src_validated)
     tgt_validated_n = normalize_constraint_validated_status(tgt_validated)
+
+    # OB 4.2.5.x 对 PK/UK 不支持 ENABLE/DISABLE/VALIDATE 语法，避免生成会失败的状态修复 SQL。
+    if cons_type in {"P", "U"}:
+        return ""
 
     if src_status_n != tgt_status_n and src_status_n in {"ENABLED", "DISABLED"} and tgt_status_n in {"ENABLED", "DISABLED"}:
         if src_status_n == "DISABLED":
@@ -5536,12 +5636,17 @@ def collect_constraint_status_drift_rows(
             tgt_status = str(matched.get("status") or "UNKNOWN")
             src_validated = str(src_entry.get("validated") or "UNKNOWN")
             tgt_validated = str(matched.get("validated") or "UNKNOWN")
-            status_diff = src_status != tgt_status
+            ctype = str(src_entry.get("type") or matched.get("type") or "").upper()
+            src_status_n = normalize_constraint_enabled_status(src_status)
+            tgt_status_n = normalize_constraint_enabled_status(tgt_status)
+            status_diff = src_status_n != tgt_status_n
             validated_diff = (
                 sync_mode == "full"
-                and src_status == "ENABLED"
-                and tgt_status == "ENABLED"
-                and src_validated != tgt_validated
+                and ctype in {"R", "C"}
+                and src_status_n == "ENABLED"
+                and tgt_status_n == "ENABLED"
+                and normalize_constraint_validated_status(src_validated)
+                != normalize_constraint_validated_status(tgt_validated)
             )
             if not status_diff and not validated_diff:
                 continue
@@ -5559,6 +5664,7 @@ def collect_constraint_status_drift_rows(
                 tgt_schema,
                 tgt_table,
                 tgt_name_u,
+                ctype,
                 src_status,
                 tgt_status,
                 src_validated,
@@ -5568,7 +5674,7 @@ def collect_constraint_status_drift_rows(
             rows.append(
                 ConstraintStatusDriftRow(
                     table_full=f"{tgt_schema}.{tgt_table}",
-                    constraint_type=str(src_entry.get("type") or ""),
+                    constraint_type=ctype,
                     src_constraint=src_name_u,
                     tgt_constraint=tgt_name_u,
                     src_status=src_status,
@@ -20478,7 +20584,8 @@ def apply_constraint_missing_validate_mode_to_ddl(
     ddl: str,
     mode: str,
     src_validated: Optional[str],
-    src_status: Optional[str] = None
+    src_status: Optional[str] = None,
+    constraint_type: Optional[str] = None,
 ) -> Tuple[str, Optional[str], Optional[str]]:
     """
     对缺失约束 DDL 应用 VALIDATE/NOVALIDATE 策略。
@@ -20492,6 +20599,7 @@ def apply_constraint_missing_validate_mode_to_ddl(
         return ddl, None, None
 
     src_status_n = normalize_constraint_enabled_status(src_status)
+    constraint_type_n = (constraint_type or "").upper()
     keyword, reason = resolve_constraint_missing_validate_keyword(mode, src_validated)
     stmt = ddl.strip()
     had_semicolon = stmt.endswith(";")
@@ -20502,6 +20610,11 @@ def apply_constraint_missing_validate_mode_to_ddl(
         if stripped == stmt:
             break
         stmt = stripped.rstrip()
+    if constraint_type_n in {"P", "U"}:
+        # PK/UK 在 OB 上仅支持 plain ADD CONSTRAINT，不追加 ENABLE/[NO]VALIDATE。
+        if had_semicolon:
+            stmt += ";"
+        return stmt, None, "pkuk_plain_add"
     if src_status_n == "DISABLED":
         stmt = f"{stmt} DISABLE"
         keyword = "DISABLE"
@@ -24408,7 +24521,8 @@ def generate_fixup_scripts(
                             ddl_adj,
                             constraint_missing_validate_mode,
                             src_validated,
-                            src_status
+                            src_status,
+                            ctype
                         )
                         if (
                             applied_keyword == "NOVALIDATE"
@@ -32266,6 +32380,7 @@ def parse_cli_args() -> argparse.Namespace:
             sequence_remap_policy   SEQUENCE 目标 schema 推导策略 (infer/source_only/dominant_table)
             blacklist_name_patterns 表名黑名单关键字（逗号分隔，默认 _RENAME）
             blacklist_name_patterns_file 表名黑名单关键字文件（每行一条）
+            exclude_objects_file    显式排除对象清单文件（TYPE|SCHEMA|OBJECT）
             report_detail_mode      报告内容模式 (full/split/summary)
             report_dir_layout       报告目录布局 (flat/per_run)
             view_compat_rules_path  VIEW 兼容规则 JSON (可选)
@@ -32821,52 +32936,90 @@ def main():
             ) and generate_fixup_enabled
         )
 
+        exclude_rules = settings.get("exclude_object_rules", []) or []
+        explicit_seed_nodes: Set[DependencyNode] = set()
+        explicit_excluded_table_keys: Set[Tuple[str, str]] = set()
+        explicit_applied_rules: List[Tuple[int, str, str, str]] = []
+        explicit_skipped_rules: List[Tuple[int, str, str, str, str]] = []
+
+        if exclude_rules:
+            for line_no, obj_type, schema, obj_name in exclude_rules:
+                src_full = f"{schema}.{obj_name}"
+                src_types = {t.upper() for t in source_objects.get(src_full, set()) if t}
+                if not src_types:
+                    explicit_skipped_rules.append((line_no, obj_type, schema, obj_name, "NOT_FOUND_IN_SOURCE_SCOPE"))
+                    continue
+                if obj_type not in src_types:
+                    explicit_skipped_rules.append(
+                        (line_no, obj_type, schema, obj_name, f"TYPE_MISMATCH({','.join(sorted(src_types))})")
+                    )
+                    continue
+                explicit_seed_nodes.add((src_full, obj_type))
+                explicit_applied_rules.append((line_no, obj_type, schema, obj_name))
+                if obj_type == "TABLE":
+                    explicit_excluded_table_keys.add((schema, obj_name))
+
+            detail_path = report_dir / f"excluded_objects_detail_{timestamp}.txt"
+            detail_lines = ["# status|line|type|schema|object|detail"]
+            for line_no, obj_type, schema, obj_name in explicit_applied_rules:
+                detail_lines.append(f"APPLIED|{line_no}|{obj_type}|{schema}|{obj_name}|MATCHED")
+            for line_no, obj_type, schema, obj_name, reason in explicit_skipped_rules:
+                detail_lines.append(f"SKIPPED|{line_no}|{obj_type}|{schema}|{obj_name}|{reason}")
+            try:
+                detail_path.write_text("\n".join(detail_lines) + "\n", encoding="utf-8")
+                log.info("显式排除对象明细已输出: %s", detail_path)
+            except OSError as exc:
+                log.warning("写入显式排除对象明细失败: %s (%s)", detail_path, exc)
+
+        # 兼容历史：当黑名单中存在 RENAME 类型时，仍可参与剪裁
         rename_excluded_table_keys: Set[Tuple[str, str]] = set()
-        rename_excluded_nodes: Set[DependencyNode] = set()
         if oracle_meta.blacklist_tables:
             rename_excluded_table_keys = {
                 (schema.upper(), table.upper())
                 for (schema, table), entries in oracle_meta.blacklist_tables.items()
                 if is_rename_only_blacklist(entries)
             }
-        if rename_excluded_table_keys:
-            unsupported_seed_nodes: Set[DependencyNode] = {
-                (f"{schema}.{table}", "TABLE")
-                for schema, table in rename_excluded_table_keys
-            }
+        rename_seed_nodes: Set[DependencyNode] = {
+            (f"{schema}.{table}", "TABLE")
+            for schema, table in rename_excluded_table_keys
+        }
+
+        excluded_seed_nodes: Set[DependencyNode] = set(rename_seed_nodes) | set(explicit_seed_nodes)
+        excluded_nodes: Set[DependencyNode] = set()
+        if excluded_seed_nodes:
             blocked_by = build_blocked_dependency_map(
                 dependency_graph,
-                unsupported_seed_nodes,
+                excluded_seed_nodes,
                 source_objects=source_objects,
                 object_parent_map=object_parent_map
             )
-            rename_excluded_nodes = set(unsupported_seed_nodes) | set(blocked_by.keys())
+            excluded_nodes = set(excluded_seed_nodes) | set(blocked_by.keys())
             before_master_cnt = len(master_list)
             before_mapping_cnt = sum(len(v) for v in full_object_mapping.values())
 
-            source_objects = filter_source_objects_by_nodes(source_objects, rename_excluded_nodes)
-            full_object_mapping = filter_full_object_mapping_by_nodes(full_object_mapping, rename_excluded_nodes)
-            master_list = filter_master_list_by_nodes(master_list, rename_excluded_nodes)
-            source_dependencies_set = filter_source_dependencies_by_nodes(source_dependencies_set, rename_excluded_nodes)
+            source_objects = filter_source_objects_by_nodes(source_objects, excluded_nodes)
+            full_object_mapping = filter_full_object_mapping_by_nodes(full_object_mapping, excluded_nodes)
+            master_list = filter_master_list_by_nodes(master_list, excluded_nodes)
+            source_dependencies_set = filter_source_dependencies_by_nodes(source_dependencies_set, excluded_nodes)
             oracle_dependencies_internal = filter_dependency_records_by_nodes(
                 oracle_dependencies_internal,
-                rename_excluded_nodes
+                excluded_nodes
             ) or []
             oracle_dependencies_for_grants = filter_dependency_records_by_nodes(
                 oracle_dependencies_for_grants,
-                rename_excluded_nodes
+                excluded_nodes
             ) or []
             object_parent_map = filter_object_parent_map_by_nodes(
                 object_parent_map,
                 source_objects,
-                rename_excluded_nodes
+                excluded_nodes
             ) or {}
             expected_dependency_pairs = filter_expected_dependency_pairs_by_nodes(
                 expected_dependency_pairs,
-                rename_excluded_nodes
+                excluded_nodes
             ) or set()
             if skipped_dependency_pairs:
-                excluded_map = _normalize_excluded_nodes(rename_excluded_nodes)
+                excluded_map = _normalize_excluded_nodes(excluded_nodes)
                 filtered_skipped: List[DependencyIssue] = []
                 for item in skipped_dependency_pairs:
                     dep_full = (item.dependent or "").upper()
@@ -32880,7 +33033,7 @@ def main():
                     filtered_skipped.append(item)
                 skipped_dependency_pairs = filtered_skipped
             dependency_report["skipped"] = skipped_dependency_pairs
-            remap_conflicts = filter_remap_conflicts_by_nodes(remap_conflicts, rename_excluded_nodes)
+            remap_conflicts = filter_remap_conflicts_by_nodes(remap_conflicts, excluded_nodes)
             remap_conflict_items = [
                 (obj_type, src_full, reason)
                 for (src_full, obj_type), reason in sorted(remap_conflicts.items())
@@ -32890,7 +33043,7 @@ def main():
             view_dependency_map = build_view_dependency_map(source_dependencies_set) if source_dependencies_set else {}
             view_dependency_map = filter_view_dependency_map_by_nodes(
                 view_dependency_map,
-                rename_excluded_nodes
+                excluded_nodes
             ) or {}
             if settings.get("enable_schema_mapping_infer") and dependency_graph:
                 transitive_table_cache = precompute_transitive_table_cache(
@@ -32900,14 +33053,15 @@ def main():
             else:
                 transitive_table_cache = None
 
-            for key in rename_excluded_table_keys:
+            blacklist_pop_keys = set(rename_excluded_table_keys) | set(explicit_excluded_table_keys)
+            for key in blacklist_pop_keys:
                 oracle_meta.blacklist_tables.pop(key, None)
 
             conflict_path = report_dir / f"remap_conflicts_{timestamp}.txt"
             if remap_conflicts:
                 conflict_written = export_remap_conflicts(remap_conflicts, conflict_path)
                 if conflict_written:
-                    log.info("已按黑名单过滤更新 remap 冲突清单: %s", conflict_written)
+                    log.info("已按排除规则更新 remap 冲突清单: %s", conflict_written)
             elif conflict_path.exists():
                 try:
                     conflict_path.unlink()
@@ -32916,18 +33070,27 @@ def main():
 
             mapping_written = export_full_object_mapping(full_object_mapping, mapping_path)
             if mapping_written:
-                log.info("已按黑名单过滤更新对象映射清单: %s", mapping_written)
+                log.info("已按排除规则更新对象映射清单: %s", mapping_written)
 
             after_mapping_cnt = sum(len(v) for v in full_object_mapping.values())
-            log.info(
-                "[BLACKLIST] RENAME 规则生效: 表=%d, 连带对象=%d, 主对象 %d -> %d, 映射项 %d -> %d。",
-                len(rename_excluded_table_keys),
-                len(rename_excluded_nodes),
-                before_master_cnt,
-                len(master_list),
-                before_mapping_cnt,
-                after_mapping_cnt
-            )
+            cascaded_count = max(len(excluded_nodes) - len(excluded_seed_nodes), 0)
+            if explicit_seed_nodes or explicit_skipped_rules:
+                log.info(
+                    "[EXCLUDE] 显式排除生效: 命中=%d, 跳过=%d, 连带对象=%d, 主对象 %d -> %d, 映射项 %d -> %d。",
+                    len(explicit_seed_nodes),
+                    len(explicit_skipped_rules),
+                    cascaded_count,
+                    before_master_cnt,
+                    len(master_list),
+                    before_mapping_cnt,
+                    after_mapping_cnt
+                )
+            if rename_seed_nodes:
+                log.info(
+                    "[BLACKLIST] RENAME 规则生效: 表=%d, 连带对象=%d。",
+                    len(rename_excluded_table_keys),
+                    cascaded_count
+                )
 
         table_target_map = build_table_target_map(master_list)
         blacklist_report_rows = build_blacklist_report_rows(

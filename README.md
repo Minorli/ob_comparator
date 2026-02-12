@@ -166,6 +166,7 @@ python3 run_fixup.py --view-chain-autofix
 - 可通过 `blacklist_mode` 切换来源（table_only/rules_only/disabled），或用 `blacklist_rules_enable/disable` 精细控制规则。
 - LOB 体积阈值由 `blacklist_lob_max_mb` 控制（默认 512MB）。
 - 当使用 `blacklist_mode=auto` 或 `rules_only` 时，请确保 `blacklist_rules.json` 随工具部署；缺失时规则会被跳过。
+- 推荐用 `exclude_objects_file` 维护“明确不参与校验”的对象清单（`TYPE|SCHEMA|OBJECT`）；未配置时不生效，继续原有逻辑。
 
 ## 常见配置片段
 **只看表结构，不生成修复：**

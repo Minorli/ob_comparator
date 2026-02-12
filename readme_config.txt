@@ -132,10 +132,13 @@
 - blacklist_rules_enable：仅启用指定规则（逗号分隔）。默认：空（全量规则）。
 - blacklist_rules_disable：禁用指定规则（逗号分隔）。默认：空。
 - blacklist_name_patterns：表名黑名单关键字（逗号分隔，字面包含匹配）。默认：_RENAME。
-  说明：会自动转义 `%/_/!`，避免被当作通配符；命中后 black_type=NAME_PATTERN。
-  说明：命中 `RENAME/NAME_PATTERN` 的表按“全排除”处理：不校验、不输出差异、不生成 fixup，并连带排除其依赖对象。
+  说明：会自动转义 `%/_/!`，避免被当作通配符；仅当规则 SQL 使用 `{{name_pattern_clause}}` 时生效。
 - blacklist_name_patterns_file：表名黑名单关键字文件（每行一个关键字，支持 #/; 注释）。默认：空。
 - blacklist_name_patterns 与 blacklist_name_patterns_file：会合并去重；用于渲染规则中的 `{{name_pattern_clause}}`。
+- exclude_objects_file：显式排除对象清单文件（每行 `TYPE|SCHEMA|OBJECT`，精确匹配）。默认：空（不生效）。
+  说明：建议用于“明确不参与校验/修补”的对象（优先 TABLE）；程序在读取源端元数据后先按清单剪裁，再做 remap/依赖与差异校验。
+  说明：仅对“source_schemas 范围内且类型匹配”的对象生效；未命中条目会记录为 SKIPPED，不会误杀。
+  说明：命中对象及其依赖链会被一并排除；并输出 `excluded_objects_detail_<ts>.txt` 供核对。
 - blacklist_lob_max_mb：LOB 体积阈值（MB），超过则标记为 LOB_OVERSIZE。默认：512。
 
 修补脚本生成（Fixup）
@@ -151,12 +154,14 @@
   可选值：TRIGGER, CONSTRAINT。
 - constraint_status_sync_mode：约束状态同步模式。默认：enabled_only。
   可选值：enabled_only（仅同步 ENABLED/DISABLED）、full（额外同步 VALIDATED/NOT VALIDATED）。
+  说明：OB 4.2.5.x 对 PK/UK 不支持 ENABLE/DISABLE/VALIDATE 状态语法，程序会仅报告状态漂移，不为 PK/UK 生成状态修复 SQL。
 - constraint_missing_fixup_validate_mode：缺失约束修补时的 VALIDATE 策略。默认：safe_novalidate。
   可选值：
-  safe_novalidate（默认，统一生成 ENABLE NOVALIDATE，降低 ORA-02298 风险）、
-  source（跟随源端 VALIDATED 状态；源端状态未知时回退 NOVALIDATE）、
-  force_validate（统一生成 ENABLE VALIDATE，可能因目标脏数据失败）。
-  说明：当采用 NOVALIDATE 时，程序会额外输出 `fixup_scripts/constraint_validate_later/` 与
+  safe_novalidate（默认，FK/CHECK 生成 ENABLE NOVALIDATE，降低 ORA-02298 风险）、
+  source（FK/CHECK 跟随源端 VALIDATED 状态；源端状态未知时回退 NOVALIDATE）、
+  force_validate（FK/CHECK 统一生成 ENABLE VALIDATE，可能因目标脏数据失败）。
+  说明：PK/UK 在 OB 侧固定生成 plain ADD CONSTRAINT，不追加 ENABLE/VALIDATE 关键字。
+  说明：当 FK/CHECK 采用 NOVALIDATE 时，程序会额外输出 `fixup_scripts/constraint_validate_later/` 与
   `constraint_validate_deferred_detail_<ts>.txt`，用于数据清理后执行二次 VALIDATE。
 - trigger_validity_sync_mode：触发器有效性同步模式。默认：compile。
   可选值：off（不处理 VALID/INVALID）、compile（当源 VALID 且目标 INVALID 时生成 COMPILE）。
