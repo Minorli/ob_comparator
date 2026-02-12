@@ -45,3 +45,5 @@ openspec/
 audit/
 scripts/
 test_*.py
+collect_source_object_stats.py
+init_test.py
