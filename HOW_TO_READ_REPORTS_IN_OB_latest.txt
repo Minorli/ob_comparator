@@ -283,11 +283,10 @@ SELECT DISTINCT d.object_type,
    AND d.report_type = 'MISSING'
  ORDER BY d.object_type, d.target_schema, d.target_name;
 
-------------------------------------------------------------
-C. 不支持与阻断（SQL-25 ~ SQL-35）
+C. 不支持/阻断/待确认（SQL-25 ~ SQL-35）
 ------------------------------------------------------------
 
--- SQL-25 不支持/阻断明细
+-- SQL-25 不支持/阻断/待确认明细
 SELECT object_type, source_schema, source_name, target_schema, target_name,
        status, reason
   FROM DIFF_REPORT_DETAIL
@@ -295,7 +294,7 @@ SELECT object_type, source_schema, source_name, target_schema, target_name,
    AND report_type = 'UNSUPPORTED'
  ORDER BY object_type, source_schema, source_name;
 
--- SQL-26 不支持状态分布（UNSUPPORTED vs BLOCKED）
+-- SQL-26 不支持状态分布（UNSUPPORTED / BLOCKED / RISKY）
 SELECT status, COUNT(*) AS cnt
   FROM DIFF_REPORT_DETAIL
  WHERE report_id = :report_id

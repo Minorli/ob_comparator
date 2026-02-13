@@ -587,6 +587,9 @@ class SynonymMeta(NamedTuple):
 DependencyReport = Dict[str, List[DependencyIssue]]
 
 
+_DBA_VIEWS_HAS_CHECK_OPTION: Optional[bool] = None
+
+
 class OracleObjectPrivilege(NamedTuple):
     grantee: str
     owner: str
@@ -799,6 +802,7 @@ DEFAULT_BLACKLIST_RULES_PATH = str(Path(__file__).resolve().parent / "blacklist_
 SUPPORT_STATE_SUPPORTED = "SUPPORTED"
 SUPPORT_STATE_UNSUPPORTED = "UNSUPPORTED"
 SUPPORT_STATE_BLOCKED = "BLOCKED"
+SUPPORT_STATE_RISKY = "RISKY"
 
 VIEW_UNSUPPORTED_DEFAULT_VIEWS: Set[str] = {
     "DBA_DATA_FILES",
@@ -827,6 +831,18 @@ VIEW_CONSTRAINT_CLEANUP_ALIASES = {
     "false": "off",
     "0": "off",
 }
+
+VIEW_FIXUP_RISK_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
+    ("VIEW_DBLINK_RESIDUAL", re.compile(r'@')),
+    ("VIEW_SYS_OBJ_RESIDUAL", re.compile(r'(?<!\w)"?SYS"?\s*\.\s*"?OBJ\$"?(?!\w)', re.IGNORECASE)),
+    ("VIEW_FORCE_RESIDUAL", re.compile(r'\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:.*?)\bFORCE\s+(?:MATERIALIZED\s+)?VIEW\b', re.IGNORECASE | re.DOTALL)),
+    ("VIEW_EDITIONABLE_RESIDUAL", re.compile(r'\b(?:NON)?EDITIONABLE\b', re.IGNORECASE)),
+    ("VIEW_BEQUEATH_RESIDUAL", re.compile(r'\bBEQUEATH\b', re.IGNORECASE)),
+    ("VIEW_SHARING_RESIDUAL", re.compile(r'\bSHARING\s*=', re.IGNORECASE)),
+    ("VIEW_DEFAULT_COLLATION_RESIDUAL", re.compile(r'\bDEFAULT\s+COLLATION\b', re.IGNORECASE)),
+    ("VIEW_CONTAINER_RESIDUAL", re.compile(r'\bCONTAINER_MAP\b|\bCONTAINERS_DEFAULT\b', re.IGNORECASE)),
+    ("VIEW_CHECK_OPTION_CONSTRAINT_RESIDUAL", re.compile(r'\bWITH\s+CHECK\s+OPTION\s+CONSTRAINT\b', re.IGNORECASE)),
+)
 
 # 主对象中除 TABLE 外均做存在性验证
 PRIMARY_EXISTENCE_ONLY_TYPES: Tuple[str, ...] = tuple(
@@ -5942,7 +5958,10 @@ def classify_missing_objects(
     dependency_graph: Optional[DependencyGraph],
     object_parent_map: Optional["ObjectParentMap"],
     table_target_map: Dict[Tuple[str, str], Tuple[str, str]],
-    synonym_meta_map: Dict[Tuple[str, str], SynonymMeta]
+    synonym_meta_map: Dict[Tuple[str, str], SynonymMeta],
+    remap_rules: Optional[RemapRules] = None,
+    view_dependency_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
+    ob_version: Optional[str] = None,
 ) -> SupportClassificationResult:
     """
     对缺失对象进行支持性分类，并输出支持/不支持/被阻断的统计与明细。
@@ -5950,7 +5969,9 @@ def classify_missing_objects(
     support_state_map: Dict[Tuple[str, str], ObjectSupportReportRow] = {}
     missing_detail_rows: List[ObjectSupportReportRow] = []
     unsupported_rows: List[ObjectSupportReportRow] = []
-    missing_support_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: {"supported": 0, "unsupported": 0, "blocked": 0})
+    missing_support_counts: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: {"supported": 0, "unsupported": 0, "blocked": 0, "risky": 0}
+    )
     extra_blocked_counts: Dict[str, int] = defaultdict(int)
     unsupported_table_keys: Set[Tuple[str, str]] = set()
     unsupported_view_keys: Set[Tuple[str, str]] = set()
@@ -5960,6 +5981,8 @@ def classify_missing_objects(
     view_compat_map: Dict[Tuple[str, str], ViewCompatResult] = {}
     invalid_nodes: Set[DependencyNode] = set()
     invalid_full_types: Dict[str, Set[str]] = defaultdict(set)
+    remap_rules = remap_rules or {}
+    view_dependency_map = view_dependency_map or {}
 
     view_rules = settings.get("view_compat_rules") or {}
     dblink_policy = settings.get("view_dblink_policy", "block")
@@ -6186,6 +6209,7 @@ def classify_missing_objects(
         src_full = src_name.upper()
         tgt_full = tgt_name.upper()
         src_schema, src_obj = src_full.split(".", 1)
+        tgt_schema, tgt_obj = tgt_full.split(".", 1)
 
         support_state = SUPPORT_STATE_SUPPORTED
         reason_code = ""
@@ -6219,6 +6243,51 @@ def classify_missing_objects(
                 detail = compat.detail
                 dependency = "-"
                 action = "改造/授权"
+            elif compat and compat.support_state == SUPPORT_STATE_SUPPORTED:
+                raw_view_ddl = view_ddl_map.get((src_schema, src_obj))
+                if raw_view_ddl:
+                    try:
+                        cleaned_ddl = clean_view_ddl_for_oceanbase(raw_view_ddl, ob_version)
+                        col_meta = oracle_meta.table_columns.get((src_schema, src_obj), {}) or {}
+                        cleaned_ddl = sanitize_view_ddl(cleaned_ddl, set(col_meta.keys()))
+                        remapped_ddl = remap_view_dependencies(
+                            cleaned_ddl,
+                            src_schema,
+                            src_obj,
+                            remap_rules,
+                            full_object_mapping,
+                            synonym_meta=synonym_meta_map,
+                            view_dependency_map=view_dependency_map
+                        )
+                        final_ddl = adjust_ddl_for_object(
+                            remapped_ddl,
+                            src_schema,
+                            src_obj,
+                            tgt_schema,
+                            tgt_obj,
+                            extra_identifiers=[],
+                            obj_type='VIEW'
+                        )
+                        final_ddl = cleanup_dbcat_wrappers(final_ddl)
+                        final_ddl = normalize_ddl_for_ob(final_ddl)
+                        final_ddl = apply_ddl_cleanup_rules(final_ddl, 'VIEW')
+                        final_ddl = strip_constraint_enable(final_ddl)
+                        final_ddl = enforce_schema_for_ddl(final_ddl, tgt_schema, 'VIEW')
+                        risk_codes = detect_view_fixup_risks(final_ddl)
+                        if risk_codes:
+                            support_state = SUPPORT_STATE_RISKY
+                            reason_code = "VIEW_FIXUP_RISK"
+                            reason = "视图DDL清洗后仍存在OB兼容风险"
+                            detail = ",".join(risk_codes)
+                            dependency = "-"
+                            action = "人工复核DDL"
+                    except Exception as exc:
+                        support_state = SUPPORT_STATE_RISKY
+                        reason_code = "VIEW_FIXUP_RISK"
+                        reason = "视图预检失败，已从自动fixup剔除"
+                        detail = f"precheck_error:{exc}"
+                        dependency = "-"
+                        action = "人工复核DDL"
         elif obj_type_u == "SYNONYM":
             syn_meta = synonym_meta_map.get((src_schema, src_obj))
             if syn_meta and syn_meta.table_owner and syn_meta.table_name:
@@ -6262,6 +6331,8 @@ def classify_missing_objects(
                     or _resolve_root_cause((dep_full, "VIEW"))
                     or f"{dep_full}(DEPENDENCY)"
                 )
+        elif support_state == SUPPORT_STATE_RISKY:
+            root_cause = f"{src_full}(VIEW_FIXUP_RISK)"
 
         row = ObjectSupportReportRow(
             obj_type=obj_type_u,
@@ -6282,6 +6353,9 @@ def classify_missing_objects(
             unsupported_rows.append(row)
         elif support_state == SUPPORT_STATE_BLOCKED:
             missing_support_counts[obj_type_u]["blocked"] += 1
+            unsupported_rows.append(row)
+        elif support_state == SUPPORT_STATE_RISKY:
+            missing_support_counts[obj_type_u]["risky"] += 1
             unsupported_rows.append(row)
         else:
             missing_support_counts[obj_type_u]["supported"] += 1
@@ -6944,6 +7018,48 @@ def load_synonym_metadata(
         target_hint
     )
     return result
+
+
+def resolve_synonym_terminal_source(
+    synonym_owner: str,
+    synonym_name: str,
+    synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]],
+    max_depth: int = 16
+) -> Optional[str]:
+    """
+    解析同义词最终指向的源对象（多级同义词展开）。
+    返回格式: OWNER.OBJECT
+    - 若遇到 DBLINK、循环依赖或元数据不足，则返回 None。
+    """
+    if not synonym_meta:
+        return None
+    owner_u = (synonym_owner or "").upper()
+    name_u = (synonym_name or "").upper()
+    if not owner_u or not name_u:
+        return None
+    if (owner_u, name_u) not in synonym_meta:
+        return None
+
+    visited: Set[Tuple[str, str]] = set()
+    for _ in range(max_depth):
+        key = (owner_u, name_u)
+        if key in visited:
+            return None
+        visited.add(key)
+        meta = synonym_meta.get(key)
+        if not meta:
+            return f"{owner_u}.{name_u}"
+        if meta.db_link:
+            return None
+        next_owner = (meta.table_owner or "").upper()
+        next_name = (meta.table_name or "").upper()
+        if not next_owner or not next_name:
+            return None
+        if (next_owner, next_name) not in synonym_meta:
+            return f"{next_owner}.{next_name}"
+        owner_u, name_u = next_owner, next_name
+
+    return None
 
 
 def validate_remap_rules(
@@ -12068,12 +12184,9 @@ def resolve_synonym_chain_target(
     if '.' not in src_full:
         return None, None
     owner, name = src_full.split('.', 1)
-    meta = synonym_meta.get((owner, name))
-    if not meta or not meta.table_owner or not meta.table_name:
+    target_source = resolve_synonym_terminal_source(owner, name, synonym_meta)
+    if not target_source:
         return None, None
-    if meta.db_link:
-        return None, None
-    target_source = f"{meta.table_owner}.{meta.table_name}".upper()
     mapped = find_mapped_target_any_type(
         full_object_mapping,
         target_source,
@@ -12093,6 +12206,7 @@ def build_view_fixup_chains(
     full_object_mapping: FullObjectMapping,
     remap_rules: RemapRules,
     synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]] = None,
+    view_dependency_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
     ob_meta: Optional[ObMetadata] = None,
     ob_grant_catalog: Optional[ObGrantCatalog] = None,
     view_grant_targets: Optional[Set[str]] = None,
@@ -12112,6 +12226,36 @@ def build_view_fixup_chains(
         graph[dep_node].add(ref_node)
         all_nodes.add(dep_node)
         all_nodes.add(ref_node)
+
+    if view_dependency_map:
+        preferred_types = ("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM", "FUNCTION", "PROCEDURE", "PACKAGE", "TYPE")
+        for (owner, view_name), refs in view_dependency_map.items():
+            dep_full = f"{(owner or '').upper()}.{(view_name or '').upper()}".strip(".")
+            if not dep_full:
+                continue
+            dep_node = (dep_full, "VIEW")
+            all_nodes.add(dep_node)
+            for ref in refs or set():
+                ref_source = (ref or "").upper()
+                if not ref_source:
+                    continue
+                ref_type = infer_type_from_mapping(
+                    full_object_mapping,
+                    ref_source,
+                    preferred_types
+                )
+                ref_full = (
+                    find_mapped_target_any_type(full_object_mapping, ref_source, preferred_types=preferred_types)
+                    or remap_rules.get(ref_source)
+                    or ref_source
+                ).upper()
+                if not ref_type and '.' in ref_source and synonym_meta:
+                    ref_owner, ref_name = ref_source.split('.', 1)
+                    if (ref_owner, ref_name) in synonym_meta:
+                        ref_type = "SYNONYM"
+                ref_node = (ref_full, (ref_type or "UNKNOWN").upper())
+                graph[dep_node].add(ref_node)
+                all_nodes.add(ref_node)
 
     target_to_source = build_target_to_source_mapping(full_object_mapping)
     synonym_target_map: Dict[DependencyNode, DependencyNode] = {}
@@ -12227,6 +12371,7 @@ def export_view_fixup_chains(
     full_object_mapping: FullObjectMapping,
     remap_rules: RemapRules,
     synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]] = None,
+    view_dependency_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
     ob_meta: Optional[ObMetadata] = None,
     ob_grant_catalog: Optional[ObGrantCatalog] = None,
     view_grant_targets: Optional[Set[str]] = None
@@ -12237,6 +12382,7 @@ def export_view_fixup_chains(
         full_object_mapping,
         remap_rules,
         synonym_meta=synonym_meta,
+        view_dependency_map=view_dependency_map,
         ob_meta=ob_meta,
         ob_grant_catalog=ob_grant_catalog,
         view_grant_targets=view_grant_targets
@@ -16878,6 +17024,7 @@ def load_from_flat_cache(
         return 0
     
     loaded_count = 0
+    loaded_keys: List[Tuple[str, str, str]] = []
     total_read_time = 0.0
     slow_files = []
     results_lock = threading.Lock()
@@ -16909,6 +17056,7 @@ def load_from_flat_cache(
                         if elapsed > 0.5:
                             slow_files.append((f"{schema}.{name}", elapsed))
                         loaded_count += 1
+                        loaded_keys.append((schema, obj_type, name))
     else:
         for task in load_tasks:
             result = _load_file(task)
@@ -16921,9 +17069,10 @@ def load_from_flat_cache(
                 if elapsed > 0.5:
                     slow_files.append((f"{schema}.{name}", elapsed))
                 loaded_count += 1
-    
+                loaded_keys.append((schema, obj_type, name))
+
     # 更新schema_requests
-    for schema, obj_type, name, _ in load_tasks:
+    for schema, obj_type, name in loaded_keys:
         type_map = schema_requests.get(schema, {})
         if obj_type in type_map:
             type_map[obj_type].discard(name)
@@ -17653,6 +17802,22 @@ def clean_view_ddl_for_oceanbase(ddl: str, ob_version: Optional[str] = None) -> 
     cleaned_ddl = cleaned_ddl.strip()
     
     return cleaned_ddl
+
+
+def detect_view_fixup_risks(ddl: Optional[str]) -> List[str]:
+    """
+    对最终用于 VIEW fixup 的 DDL 做静态风险识别。
+    返回风险码列表；空列表表示未识别到已知高风险语法残留。
+    """
+    if not ddl:
+        return ["VIEW_DDL_EMPTY"]
+    masker = SqlMasker(ddl)
+    masked = masker.masked_sql
+    risks: List[str] = []
+    for code, pattern in VIEW_FIXUP_RISK_PATTERNS:
+        if pattern.search(masked):
+            risks.append(code)
+    return risks
 
 
 class SqlMasker:
@@ -18593,18 +18758,68 @@ def replace_unqualified_table_refs(
         return ddl
 
     masked = mask_sql_for_scan(ddl)
-    start_keywords = r'(?:FROM|JOIN|UPDATE|INTO|MERGE\s+INTO)'
-    stopper_keywords = [
-        'WHERE', 'GROUP', 'HAVING', 'ORDER', 'UNION', 'INTERSECT', 'MINUS', 'EXCEPT',
-        'START', 'CONNECT', 'MODEL', 'WINDOW', 'FETCH', 'OFFSET', 'FOR',
-        'ON', 'USING', 'LEFT', 'RIGHT', 'FULL', 'INNER', 'CROSS', 'NATURAL',
-        'SELECT', 'SET', 'VALUES', 'RETURNING', 'AS'
-    ]
-    stopper_pattern = r'\b(?:' + '|'.join(stopper_keywords) + r')\b'
-    combined_pattern = re.compile(rf'\b{start_keywords}\b', re.IGNORECASE)
-    stopper_regex = re.compile(stopper_pattern + r'|' + rf'\b{start_keywords}\b', re.IGNORECASE)
+    masked_upper = masked.upper()
+    length = len(masked_upper)
+    start_single = ("FROM", "JOIN", "UPDATE", "INTO")
+    stopper_keywords = (
+        "WHERE", "GROUP", "HAVING", "ORDER", "UNION", "INTERSECT", "MINUS", "EXCEPT",
+        "START", "CONNECT", "MODEL", "WINDOW", "FETCH", "OFFSET", "FOR",
+        "ON", "USING", "LEFT", "RIGHT", "FULL", "INNER", "CROSS", "NATURAL",
+        "SELECT", "SET", "VALUES", "RETURNING", "AS",
+    )
 
     edits: List[Tuple[int, int, str]] = []
+
+    def _is_word_char(ch: str) -> bool:
+        return ch.isalnum() or ch in "_$#"
+
+    def _match_word_at(pos: int, word: str) -> Optional[int]:
+        end = pos + len(word)
+        if end > length:
+            return None
+        if masked_upper[pos:end] != word:
+            return None
+        if pos > 0 and _is_word_char(masked_upper[pos - 1]):
+            return None
+        if end < length and _is_word_char(masked_upper[end]):
+            return None
+        return end
+
+    def _match_merge_into_at(pos: int) -> Optional[int]:
+        merge_end = _match_word_at(pos, "MERGE")
+        if merge_end is None:
+            return None
+        idx = merge_end
+        while idx < length and masked_upper[idx].isspace():
+            idx += 1
+        into_end = _match_word_at(idx, "INTO")
+        return into_end
+
+    def _previous_word(pos: int) -> str:
+        idx = pos - 1
+        while idx >= 0 and masked_upper[idx].isspace():
+            idx -= 1
+        if idx < 0 or not _is_word_char(masked_upper[idx]):
+            return ""
+        end = idx + 1
+        while idx >= 0 and _is_word_char(masked_upper[idx]):
+            idx -= 1
+        return masked_upper[idx + 1:end]
+
+    def _match_start_at(pos: int) -> Optional[Tuple[str, int]]:
+        merge_into_end = _match_merge_into_at(pos)
+        if merge_into_end is not None:
+            return "MERGE INTO", merge_into_end
+        for keyword in start_single:
+            keyword_end = _match_word_at(pos, keyword)
+            if keyword_end is None:
+                continue
+            if keyword == "INTO":
+                prev = _previous_word(pos)
+                if prev not in {"INSERT", "MERGE"}:
+                    continue
+            return keyword, keyword_end
+        return None
 
     def _process_part(part_start: int, part_end: int, segment_offset: int) -> None:
         j = part_start
@@ -18634,36 +18849,55 @@ def replace_unqualified_table_refs(
             return
         edits.append((segment_offset + j, segment_offset + k, tgt))
 
-    current_pos = 0
-    while True:
-        match = combined_pattern.search(masked, current_pos)
-        if not match:
-            break
-        content_start = match.end()
-        stop_match = stopper_regex.search(masked, content_start)
-        if stop_match:
-            content_end = stop_match.start()
-            next_scan_pos = stop_match.start()
-        else:
-            content_end = len(masked)
-            next_scan_pos = len(masked)
-        segment = masked[content_start:content_end]
-        depth = 0
+    depth_map: List[int] = [0] * length
+    current_depth = 0
+    for idx, ch in enumerate(masked_upper):
+        depth_map[idx] = current_depth
+        if ch == '(':
+            current_depth += 1
+        elif ch == ')':
+            current_depth = max(0, current_depth - 1)
+
+    i = 0
+    while i < length:
+        start_hit = _match_start_at(i)
+        if not start_hit:
+            i += 1
+            continue
+
+        _start_kw, content_start = start_hit
+        clause_depth = depth_map[i]
+        j = content_start
+        while j < length:
+            depth_j = depth_map[j]
+            if depth_j < clause_depth:
+                break
+            if depth_j == clause_depth:
+                if _match_start_at(j):
+                    break
+                should_stop = False
+                for keyword in stopper_keywords:
+                    if _match_word_at(j, keyword):
+                        should_stop = True
+                        break
+                if should_stop:
+                    break
+            j += 1
+
+        segment = masked[content_start:j]
+        seg_depth = 0
         part_start = 0
-        for idx, ch in enumerate(segment):
-            if ch == '(':
-                depth += 1
-            elif ch == ')':
-                if depth > 0:
-                    depth -= 1
-            elif ch == ',' and depth == 0:
+        for idx, seg_ch in enumerate(segment):
+            if seg_ch == '(':
+                seg_depth += 1
+            elif seg_ch == ')':
+                if seg_depth > 0:
+                    seg_depth -= 1
+            elif seg_ch == ',' and seg_depth == 0:
                 _process_part(part_start, idx, content_start)
                 part_start = idx + 1
         _process_part(part_start, len(segment), content_start)
-
-        current_pos = next_scan_pos
-        if current_pos <= match.start():
-            current_pos = match.end()
+        i += 1
 
     if not edits:
         return ddl
@@ -18708,22 +18942,26 @@ def remap_view_dependencies(
     preferred_types = ("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM", "FUNCTION")
 
     def _resolve_synonym(owner: str, dep_obj: str) -> Optional[str]:
-        meta = synonym_meta.get((owner.upper(), dep_obj.upper()))
-        if not meta or meta.db_link:
+        terminal_source = resolve_synonym_terminal_source(owner, dep_obj, synonym_meta)
+        if not terminal_source:
             return None
-        base_full = f"{meta.table_owner}.{meta.table_name}"
         mapped = find_mapped_target_any_type(
             full_object_mapping,
-            base_full,
+            terminal_source,
             preferred_types=preferred_types
         )
-        explicit = remap_rules.get(base_full)
+        explicit = remap_rules.get(terminal_source)
         # 当 full_object_mapping 因冲突回退为 1:1 时，显式 remap 规则优先。
-        if mapped and explicit and mapped.upper() == base_full and explicit.upper() != base_full:
+        if (
+            mapped
+            and explicit
+            and mapped.upper() == terminal_source
+            and explicit.upper() != terminal_source
+        ):
             mapped = explicit
         if not mapped:
             mapped = explicit
-        return (mapped or base_full).upper()
+        return (mapped or terminal_source).upper()
 
     for dep in dependencies:
         dep_u = dep.upper()
@@ -18738,6 +18976,12 @@ def remap_view_dependencies(
         if dep_schema == "PUBLIC":
             mapped_target = _resolve_synonym("PUBLIC", dep_obj)
         else:
+            # 同义词依赖优先解析为终点对象，再做 remap，避免停留在目标同义词名。
+            mapped_target = _resolve_synonym(dep_schema, dep_obj)
+            if not mapped_target and dep_schema == view_schema_u:
+                mapped_target = _resolve_synonym("PUBLIC", dep_obj)
+
+        if not mapped_target:
             mapped_target = find_mapped_target_any_type(
                 full_object_mapping,
                 dep_u,
@@ -18914,16 +19158,44 @@ def oracle_get_ddl(ora_conn, obj_type: str, owner: str, name: str) -> Optional[s
         return None
 
 
+def _oracle_dba_views_has_check_option(ora_conn) -> bool:
+    global _DBA_VIEWS_HAS_CHECK_OPTION
+    if _DBA_VIEWS_HAS_CHECK_OPTION is not None:
+        return _DBA_VIEWS_HAS_CHECK_OPTION
+    sql = """
+        SELECT 1
+        FROM ALL_TAB_COLUMNS
+        WHERE OWNER = 'SYS'
+          AND TABLE_NAME = 'DBA_VIEWS'
+          AND COLUMN_NAME = 'CHECK_OPTION'
+    """
+    try:
+        with ora_conn.cursor() as cursor:
+            cursor.execute(sql)
+            _DBA_VIEWS_HAS_CHECK_OPTION = cursor.fetchone() is not None
+    except (oracledb.Error, Exception) as exc:
+        log.warning("[DDL] 检测 DBA_VIEWS.CHECK_OPTION 失败，按不存在处理: %s", exc)
+        _DBA_VIEWS_HAS_CHECK_OPTION = False
+    return bool(_DBA_VIEWS_HAS_CHECK_OPTION)
+
+
 def oracle_get_view_text(
     ora_conn,
     owner: str,
     name: str
 ) -> Optional[Tuple[str, str, str]]:
-    sql = """
-        SELECT TEXT, READ_ONLY, CHECK_OPTION
-        FROM DBA_VIEWS
-        WHERE OWNER = :1 AND VIEW_NAME = :2
-    """
+    if _oracle_dba_views_has_check_option(ora_conn):
+        sql = """
+            SELECT TEXT, READ_ONLY, CHECK_OPTION
+            FROM DBA_VIEWS
+            WHERE OWNER = :1 AND VIEW_NAME = :2
+        """
+    else:
+        sql = """
+            SELECT TEXT, READ_ONLY, '' AS CHECK_OPTION
+            FROM DBA_VIEWS
+            WHERE OWNER = :1 AND VIEW_NAME = :2
+        """
     try:
         with ora_conn.cursor() as cursor:
             cursor.execute(sql, [owner.upper(), name.upper()])
@@ -18931,8 +19203,8 @@ def oracle_get_view_text(
             if not row or row[0] is None:
                 return None
             text = str(row[0])
-            read_only = (row[1] or "").strip().upper()
-            check_option = (row[2] or "").strip().upper()
+            read_only = (row[1] or "").strip().upper() if len(row) > 1 else ""
+            check_option = (row[2] or "").strip().upper() if len(row) > 2 else ""
             return text, read_only, check_option
     except (oracledb.Error, Exception) as exc:
         log.warning("[DDL] 读取 DBA_VIEWS.%s.%s 失败: %s", owner, name, exc)
@@ -19297,6 +19569,24 @@ def adjust_ddl_for_object(
         # - 当依赖对象的目标 schema != 主对象目标 schema，或目标名称发生变化时，需要补全/替换
         src_schema_u = src_schema.upper()
         main_tgt_schema_u = tgt_schema_u
+        if (obj_type or "").upper() == "VIEW":
+            # VIEW 使用安全替换器，仅处理 FROM/JOIN/UPDATE/INTO/MERGE 段落，
+            # 避免误伤 SELECT 列名。
+            view_replacements: Dict[str, str] = {}
+            for (src_s, src_o), (tgt_s, tgt_o) in replacement_dict.items():
+                if src_s.upper() != src_schema_u:
+                    continue
+                src_o_u = src_o.upper()
+                if src_o_u == src_name.upper():
+                    continue
+                tgt_s_u = tgt_s.upper()
+                tgt_o_u = tgt_o.upper()
+                if tgt_s_u == main_tgt_schema_u and tgt_o_u == src_o_u:
+                    continue
+                view_replacements[src_o_u] = f"{tgt_s_u}.{tgt_o_u}"
+            if view_replacements:
+                result = replace_unqualified_table_refs(result, view_replacements)
+            return result
         for (src_s, src_o), (tgt_s, tgt_o) in replacement_dict.items():
             if src_s.upper() != src_schema_u:
                 continue
@@ -20291,16 +20581,50 @@ def clean_oracle_hints(ddl: str) -> str:
 
 
 def clean_storage_clauses(ddl: str) -> str:
-    """移除Oracle特有的存储子句"""
+    """移除 Oracle 特有的存储子句（仅处理 SQL 代码区域）。"""
     if not ddl:
         return ddl
-    
-    # 移除STORAGE子句
-    cleaned = re.sub(r'\s+STORAGE\s*\([^)]+\)', '', ddl, flags=re.IGNORECASE)
-    
-    # 移除TABLESPACE子句（OceanBase可能不完全兼容）
-    cleaned = re.sub(r'\s+TABLESPACE\s+\w+', '', cleaned, flags=re.IGNORECASE)
-    
+
+    masked = mask_sql_for_scan(ddl)
+    masked_upper = masked.upper()
+    spans: List[Tuple[int, int]] = []
+
+    # STORAGE(...)：支持嵌套括号
+    for match in re.finditer(r'\s+STORAGE\s*\(', masked_upper, flags=re.IGNORECASE):
+        start = match.start()
+        idx = match.end() - 1
+        depth = 0
+        end = None
+        while idx < len(masked_upper):
+            ch = masked_upper[idx]
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    end = idx + 1
+                    break
+            idx += 1
+        if end is not None and end > start:
+            spans.append((start, end))
+
+    # TABLESPACE <name>：仅移除代码中的 TABLESPACE 子句
+    for match in re.finditer(r'\s+TABLESPACE\s+[A-Z0-9_$#]+', masked_upper, flags=re.IGNORECASE):
+        spans.append((match.start(), match.end()))
+
+    if not spans:
+        return ddl
+
+    merged: List[Tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+
+    cleaned = ddl
+    for start, end in reversed(merged):
+        cleaned = cleaned[:start] + cleaned[end:]
     return cleaned
 
 
@@ -23465,6 +23789,7 @@ def generate_fixup_scripts(
             full_object_mapping,
             remap_rules,
             synonym_meta=synonym_meta_map,
+            view_dependency_map=view_dependency_map,
             ob_meta=ob_meta,
             ob_grant_catalog=ob_grant_catalog,
             view_grant_targets=grant_plan.view_grant_targets if grant_plan else None
@@ -24992,24 +25317,26 @@ def generate_fixup_scripts(
             return True
         return full_name.upper() in ob_meta.objects_by_type.get(obj_type.upper(), set())
 
-    def _compile_statements(obj_type: str, obj_name: str) -> List[str]:
+    def _compile_statements(obj_type: str, schema_name: str, obj_name: str) -> List[str]:
         obj_type_u = obj_type.upper()
+        schema_u = schema_name.upper()
         obj_name_u = obj_name.upper()
+        obj_full_quoted = quote_qualified_parts(schema_u, obj_name_u)
         if obj_type_u in ("VIEW", "MATERIALIZED VIEW"):
             return []
         if obj_type_u in ("FUNCTION", "PROCEDURE"):
-            return [f"ALTER {obj_type_u} {obj_name_u} COMPILE;"]
+            return [f"ALTER {obj_type_u} {obj_full_quoted} COMPILE;"]
         if obj_type_u in ("PACKAGE", "PACKAGE BODY"):
             return [
-                f"ALTER PACKAGE {obj_name_u} COMPILE;",
-                f"ALTER PACKAGE {obj_name_u} COMPILE BODY;"
+                f"ALTER PACKAGE {obj_full_quoted} COMPILE;",
+                f"ALTER PACKAGE {obj_full_quoted} COMPILE BODY;"
             ]
         if obj_type_u == "TRIGGER":
-            return [f"ALTER TRIGGER {obj_name_u} COMPILE;"]
+            return [f"ALTER TRIGGER {obj_full_quoted} COMPILE;"]
         if obj_type_u == "TYPE":
-            return [f"ALTER TYPE {obj_name_u} COMPILE;"]
+            return [f"ALTER TYPE {obj_full_quoted} COMPILE;"]
         if obj_type_u == "TYPE BODY":
-            return [f"ALTER TYPE {obj_name_u} COMPILE BODY;"]
+            return [f"ALTER TYPE {obj_full_quoted} COMPILE BODY;"]
         return []
 
     log.info("[FIXUP] (8/9) 正在生成依赖重编译脚本...")
@@ -25026,7 +25353,7 @@ def generate_fixup_scripts(
         schema_u, obj_u = parts[0], parts[1]
         if not allow_fixup(dep_type, schema_u):
             continue
-        stmts = _compile_statements(dep_type, obj_u)
+        stmts = _compile_statements(dep_type, schema_u, obj_u)
         if not stmts:
             continue
         compile_tasks[(schema_u, obj_u, dep_type)].update(stmts)
@@ -25790,7 +26117,7 @@ def export_unsupported_by_type(
         return {}
     grouped: Dict[str, List[ObjectSupportReportRow]] = defaultdict(list)
     for row in rows:
-        if row.support_state not in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED}:
+        if row.support_state not in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED, SUPPORT_STATE_RISKY}:
             continue
         grouped[row.obj_type.upper()].append(row)
     result: Dict[str, Optional[Path]] = {}
@@ -26070,7 +26397,7 @@ def export_migration_focus_report(
     ]
     unsupported_or_blocked = [
         row for row in (unsupported_rows or [])
-        if row.support_state in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED}
+        if row.support_state in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED, SUPPORT_STATE_RISKY}
     ]
     output_path = Path(report_dir) / f"migration_focus_{report_timestamp}.txt"
     lines: List[str] = [
@@ -27727,7 +28054,7 @@ def _build_report_detail_rows(
         ]
         unsupported_rows = [
             row for row in support_summary.unsupported_rows
-            if row.support_state in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED}
+            if row.support_state in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED, SUPPORT_STATE_RISKY}
         ]
 
     mismatch_rows = tv_results.get("mismatched", []) or []
@@ -28044,6 +28371,7 @@ def _build_report_detail_item_rows(
     trigger_validity_mode: str = "off"
 ) -> Tuple[List[Dict[str, object]], bool, int]:
     rows: List[Dict[str, object]] = []
+    seen_keys: Set[Tuple[str, ...]] = set()
     truncated = False
     truncated_count = 0
 
@@ -28060,6 +28388,23 @@ def _build_report_detail_item_rows(
 
     def _push(row: Dict[str, object]) -> None:
         nonlocal truncated, truncated_count
+        key = (
+            str(row.get("report_type") or ""),
+            str(row.get("object_type") or ""),
+            str(row.get("source_schema") or ""),
+            str(row.get("source_name") or ""),
+            str(row.get("target_schema") or ""),
+            str(row.get("target_name") or ""),
+            str(row.get("status") or ""),
+            str(row.get("item_type") or ""),
+            str(row.get("item_key") or ""),
+            str(row.get("src_value") or ""),
+            str(row.get("tgt_value") or ""),
+            str(row.get("item_value") or ""),
+        )
+        if key in seen_keys:
+            return
+        seen_keys.add(key)
         if max_rows and len(rows) >= max_rows:
             truncated = True
             truncated_count += 1
@@ -29383,14 +29728,16 @@ def _insert_report_artifact_line_rows(
     for row in row_iter:
         batch.append(row)
         if len(batch) >= batch_size:
-            if not _flush(batch):
+            if _flush(batch):
+                inserted += len(batch)
+            else:
                 ok_all = False
-            inserted += len(batch)
             batch = []
     if batch:
-        if not _flush(batch):
+        if _flush(batch):
+            inserted += len(batch)
+        else:
             ok_all = False
-        inserted += len(batch)
     return ok_all, inserted
 
 
@@ -30005,7 +30352,7 @@ SELECT report_id,
        reason
   FROM {detail}
  WHERE report_type IN ('MISSING','MISMATCHED')
-   AND (status IS NULL OR status NOT IN ('UNSUPPORTED','BLOCKED'))
+   AND (status IS NULL OR status NOT IN ('UNSUPPORTED','BLOCKED','RISKY'))
 UNION ALL
 SELECT report_id,
        'REFACTOR' AS action_type,
@@ -30034,6 +30381,20 @@ SELECT report_id,
   FROM {detail}
  WHERE report_type = 'UNSUPPORTED'
    AND status = 'BLOCKED'
+UNION ALL
+SELECT report_id,
+       'REVIEW' AS action_type,
+       object_type,
+       source_schema,
+       source_name,
+       target_schema,
+       target_name,
+       report_type,
+       status,
+       reason
+  FROM {detail}
+ WHERE report_type = 'UNSUPPORTED'
+   AND status = 'RISKY'
 UNION ALL
 SELECT report_id,
        'GRANT_REQUIRED' AS action_type,
@@ -30254,7 +30615,7 @@ def _find_report_sql_playbook() -> Optional[Path]:
     candidates = sorted(base_dir.glob("HOW_TO_READ_REPORTS_IN_OB_*_sqls.txt"))
     if candidates:
         def _score(path: Path) -> int:
-            match = re.search(r"_([0-9]+)_sqls\\.txt$", path.name)
+            match = re.search(r"_([0-9]+)_sqls\.txt$", path.name)
             if match:
                 try:
                     return int(match.group(1))
@@ -30738,13 +31099,14 @@ def build_unsupported_summary_counts(
     extra_results: Optional[ExtraCheckResults]
 ) -> Dict[str, int]:
     """
-    汇总不支持/阻断数量（含扩展对象），供报告汇总使用。
+    汇总不支持/阻断/待确认数量（含扩展对象），供报告汇总使用。
     """
     counts: Dict[str, int] = defaultdict(int)
     if support_summary:
         for obj_type, data in (support_summary.missing_support_counts or {}).items():
             counts[obj_type] += int(data.get("unsupported", 0) or 0)
             counts[obj_type] += int(data.get("blocked", 0) or 0)
+            counts[obj_type] += int(data.get("risky", 0) or 0)
         for obj_type, blocked in (support_summary.extra_blocked_counts or {}).items():
             counts[obj_type] += int(blocked or 0)
     if extra_results:
@@ -30787,7 +31149,7 @@ def build_missing_breakdown_counts(
     """
     计算缺失口径分解：
       - total_missing_by_type: 总缺失（保持历史口径）
-      - unsupported_missing_by_type: 不支持/阻断（与总缺失同口径裁剪）
+      - unsupported_missing_by_type: 不支持/阻断/待确认（与总缺失同口径裁剪）
       - fixable_missing_by_type: 可修补缺失（total - unsupported）
     """
     total_missing = dict((object_counts_summary or {}).get("missing", {}) or {})
@@ -30798,7 +31160,7 @@ def build_missing_breakdown_counts(
     for obj_type in types:
         total = int(total_missing.get(obj_type, 0) or 0)
         uns = int(unsupported_raw.get(obj_type, 0) or 0)
-        uns_clamped = min(total, max(0, uns)) if total > 0 else max(0, uns)
+        uns_clamped = min(total, max(0, uns))
         unsupported[obj_type] = uns_clamped
         fixable[obj_type] = max(0, total - uns_clamped)
     return total_missing, unsupported, fixable
@@ -30972,7 +31334,7 @@ def build_run_summary(
         findings.append(f"显式排除对象(EXCLUDED): {items}")
     if unsupported_by_type:
         items = ", ".join(f"{k}={v}" for k, v in sorted(unsupported_by_type.items()))
-        findings.append(f"缺失中不支持/阻断: {items}")
+        findings.append(f"缺失中不支持/阻断/待确认: {items}")
     if extraneous_count:
         findings.append(f"无效 remap 规则: {extraneous_count}")
     if remap_conflict_cnt:
@@ -31380,7 +31742,7 @@ def print_final_report(
     missing_supported_cnt = len(missing_supported_rows)
     unsupported_blocked_cnt = len([
         row for row in unsupported_rows
-        if row.support_state in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED}
+        if row.support_state in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED, SUPPORT_STATE_RISKY}
     ])
 
     console.print(Panel.fit(f"[bold]数据库对象迁移校验报告 (V{__version__} - Rich)[/bold]", style="title"))
@@ -31444,6 +31806,7 @@ def print_final_report(
         for data in support_counts.values():
             unsupported_total += int(data.get("unsupported", 0) or 0)
             unsupported_total += int(data.get("blocked", 0) or 0)
+            unsupported_total += int(data.get("risky", 0) or 0)
     idx_blocked_cnt = extra_blocked_counts.get("INDEX", 0)
     cons_blocked_cnt = extra_blocked_counts.get("CONSTRAINT", 0)
     trg_blocked_cnt = extra_blocked_counts.get("TRIGGER", 0)
@@ -31472,10 +31835,10 @@ def print_final_report(
         ]
         if missing_supported_cnt or unsupported_blocked_cnt:
             lines.append(
-                f"迁移聚焦: 缺失可修补 {missing_supported_cnt}, 不兼容/阻断 {unsupported_blocked_cnt}"
+                f"迁移聚焦: 缺失可修补 {missing_supported_cnt}, 不兼容/阻断/待确认 {unsupported_blocked_cnt}"
             )
         if blocked_total:
-            lines.append(f"不支持/阻断: {blocked_total}")
+            lines.append(f"不支持/阻断/待确认: {blocked_total}")
         next_steps: List[str] = []
         if actionable_cnt:
             if settings and not bool(settings.get("generate_fixup", True)):
@@ -31519,7 +31882,7 @@ def print_final_report(
     primary_text.append("缺失: ", style="missing")
     primary_text.append(f"{missing_count}\n")
     if unsupported_total:
-        primary_text.append("缺失(不支持/阻断): ", style="mismatch")
+        primary_text.append("缺失(不支持/阻断/待确认): ", style="mismatch")
         primary_text.append(f"{unsupported_total}\n", style="mismatch")
     primary_text.append("不匹配 (表列/长度): ", style="mismatch")
     primary_text.append(f"{mismatched_count}\n")
@@ -31567,7 +31930,7 @@ def print_final_report(
     focus_text = Text()
     focus_text.append("缺失可修补: ", style="missing")
     focus_text.append(f"{missing_supported_cnt}")
-    focus_text.append("\n不兼容/阻断: ", style="mismatch")
+    focus_text.append("\n不兼容/阻断/待确认: ", style="mismatch")
     focus_text.append(f"{unsupported_blocked_cnt}")
     if report_ts:
         focus_text.append("\n详见: ", style="info")
@@ -31912,7 +32275,7 @@ def print_final_report(
         count_table.add_column("Oracle (应校验)", justify="right", width=18)
         count_table.add_column("OceanBase (命中)", justify="right", width=18)
         count_table.add_column("缺失(可修补)", justify="right", width=12)
-        count_table.add_column("缺失(不支持/阻断)", justify="right", width=16)
+        count_table.add_column("缺失(不支持/阻断/待确认)", justify="right", width=20)
         count_table.add_column("排除(EXCLUDED)", justify="right", width=14)
         count_table.add_column("多余", justify="right", width=8)
         oracle_counts = dict(object_counts_summary.get("oracle", {}))
@@ -31926,6 +32289,7 @@ def print_final_report(
             | set(excluded_summary_counts)
             | set(extra_counts)
         )
+        count_invariant_mismatches: List[Tuple[str, int, int, int, int, int]] = []
         for obj_type in count_types:
             ora_val = oracle_counts.get(obj_type, 0)
             ob_val = ob_counts.get(obj_type, 0)
@@ -31933,6 +32297,12 @@ def print_final_report(
             extra_val = extra_counts.get(obj_type, 0)
             unsupported_val = int(unsupported_summary_counts.get(obj_type, 0) or 0)
             excluded_val = int(excluded_summary_counts.get(obj_type, 0) or 0)
+            lhs = int(ora_val or 0)
+            rhs = int(ob_val or 0) + miss_fixable_val + unsupported_val + excluded_val
+            if lhs != rhs:
+                count_invariant_mismatches.append(
+                    (obj_type, lhs, int(ob_val or 0), miss_fixable_val, unsupported_val, excluded_val)
+                )
             count_table.add_row(
                 obj_type,
                 str(ora_val),
@@ -31943,6 +32313,23 @@ def print_final_report(
                 f"[mismatch]{extra_val}[/mismatch]" if extra_val else "0"
             )
         console.print(count_table)
+        if count_invariant_mismatches:
+            mismatch_lines = [
+                (
+                    f"{obj_type}: Oracle={lhs}, "
+                    f"命中={hit}, 缺失(可修补)={fixable}, "
+                    f"缺失(不支持/阻断/待确认)={unsup}, 排除={excluded}"
+                )
+                for obj_type, lhs, hit, fixable, unsup, excluded in count_invariant_mismatches
+            ]
+            console.print(
+                Panel.fit(
+                    "\n".join(mismatch_lines),
+                    title="[warning]检查汇总口径校验告警[/warning]",
+                    border_style="warning",
+                    width=section_width
+                )
+            )
 
     # --- 1. 缺失的主对象 ---
     if show_detail_sections and tv_results['missing']:
@@ -32456,7 +32843,7 @@ def print_final_report(
                 continue
             type_rows = [
                 row for row in unsupported_rows
-                if row.support_state in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED}
+                if row.support_state in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED, SUPPORT_STATE_RISKY}
                 and row.obj_type.upper() == obj_type
             ]
             _add_index_entry(
@@ -33696,7 +34083,10 @@ def main():
         dependency_graph,
         object_parent_map,
         table_target_map,
-        synonym_meta
+        synonym_meta,
+        remap_rules=remap_rules,
+        view_dependency_map=view_dependency_map,
+        ob_version=settings.get("ob_version")
     )
 
     usability_summary: Optional[UsabilitySummary] = None

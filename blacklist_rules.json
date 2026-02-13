@@ -40,8 +40,8 @@
     {
       "id": "IOT_TABLES",
       "enabled": true,
-      "black_type": "DBLINK",
-      "sql": "SELECT owner, table_name, 'IOT' AS data_type, 'DBLINK' AS black_type\nFROM dba_tables\nWHERE iot_type IS NOT NULL\n  AND owner IN ({{owners_clause}})"
+      "black_type": "IOT",
+      "sql": "SELECT owner, table_name, 'IOT' AS data_type, 'IOT' AS black_type\nFROM dba_tables\nWHERE iot_type IS NOT NULL\n  AND owner IN ({{owners_clause}})"
     }
   ]
 }

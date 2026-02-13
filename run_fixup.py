@@ -752,6 +752,18 @@ class FixupAutoGrantSettings:
     cache_limit: int
 
 
+@dataclass
+class FixupPrecheckSummary:
+    current_user: str
+    target_schemas: Set[str]
+    existing_schemas: Set[str]
+    missing_schemas: Set[str]
+    required_sys_privileges: Set[str]
+    effective_sys_privileges: Set[str]
+    missing_sys_privileges: Set[str]
+    schema_lookup_source: str = "unknown"
+
+
 class LimitedCache(OrderedDict):
     """Simple size-limited cache with FIFO eviction."""
 
@@ -2496,6 +2508,262 @@ def query_single_column(
     return values
 
 
+def extract_login_user(user_string: str) -> str:
+    """Extract login username (without tenant suffix) from user_string."""
+    raw = (user_string or "").strip()
+    if not raw:
+        return ""
+    return raw.split("@", 1)[0].strip().upper()
+
+
+def query_single_column_values(
+    obclient_cmd: List[str],
+    sql_text: str,
+    timeout: Optional[int],
+    column_name: str
+) -> Tuple[bool, Set[str], str]:
+    ok, lines, err = run_query_lines(obclient_cmd, sql_text, timeout)
+    if not ok:
+        return False, set(), err
+    col_upper = (column_name or "").strip().upper()
+    values: Set[str] = set()
+    for line in lines:
+        token = line.split("\t", 1)[0].strip().upper()
+        if not token or token == col_upper:
+            continue
+        values.add(token)
+    return True, values, ""
+
+
+def query_existing_schemas(
+    obclient_cmd: List[str],
+    timeout: Optional[int]
+) -> Tuple[Set[str], str]:
+    """
+    Query existing users/schemas using best-effort fallback.
+    Returns (schemas, source_view).
+    """
+    attempts = (
+        ("DBA_USERS", "SELECT USERNAME FROM DBA_USERS;", "USERNAME"),
+        ("ALL_USERS", "SELECT USERNAME FROM ALL_USERS;", "USERNAME"),
+    )
+    for source_name, sql_text, col_name in attempts:
+        ok, values, _err = query_single_column_values(obclient_cmd, sql_text, timeout, col_name)
+        if ok:
+            return values, source_name
+    return set(), "unavailable"
+
+
+def query_effective_sys_privileges(
+    obclient_cmd: List[str],
+    timeout: Optional[int],
+    login_user: str
+) -> Set[str]:
+    """Best-effort collection of direct + role-inherited system privileges."""
+    user_u = (login_user or "").strip().upper()
+    if not user_u:
+        return set()
+
+    def _escape(v: str) -> str:
+        return v.replace("'", "''")
+
+    effective: Set[str] = set()
+    ok_direct, direct_values, _ = query_single_column_values(
+        obclient_cmd,
+        f"SELECT PRIVILEGE FROM DBA_SYS_PRIVS WHERE GRANTEE = '{_escape(user_u)}';",
+        timeout,
+        "PRIVILEGE"
+    )
+    if ok_direct:
+        effective.update(direct_values)
+
+    ok_roles, role_values, _ = query_single_column_values(
+        obclient_cmd,
+        f"SELECT GRANTED_ROLE FROM DBA_ROLE_PRIVS WHERE GRANTEE = '{_escape(user_u)}';",
+        timeout,
+        "GRANTED_ROLE"
+    )
+    if ok_roles and role_values:
+        role_list = sorted(r for r in role_values if r)
+        literals = ",".join("'" + _escape(r) + "'" for r in role_list)
+        ok_role_privs, role_priv_values, _ = query_single_column_values(
+            obclient_cmd,
+            f"SELECT PRIVILEGE FROM DBA_SYS_PRIVS WHERE GRANTEE IN ({literals});",
+            timeout,
+            "PRIVILEGE"
+        )
+        if ok_role_privs:
+            effective.update(role_priv_values)
+
+    return effective
+
+
+def collect_target_schemas_from_scripts(files_with_layer: List[Tuple[int, Path]]) -> Set[str]:
+    """Collect target schemas inferred from script filenames."""
+    schemas: Set[str] = set()
+    schema_dirs = set(CREATE_OBJECT_DIRS) | {"table_alter", "compile"}
+    for _, sql_path in files_with_layer:
+        dir_name = sql_path.parent.name.lower()
+        if dir_name not in schema_dirs:
+            continue
+        schema, _name = parse_object_identity_from_path(sql_path)
+        if schema:
+            schemas.add(schema.upper())
+    return schemas
+
+
+def infer_required_sys_privileges(
+    files_with_layer: List[Tuple[int, Path]],
+    current_user: str,
+    target_schemas: Set[str]
+) -> Set[str]:
+    """
+    Infer required system privileges for cross-schema fixup.
+    This is a heuristic precheck (warn-only), not a strict blocker.
+    """
+    current_u = (current_user or "").upper()
+    foreign_schemas = {
+        s.upper()
+        for s in (target_schemas or set())
+        if s and s.upper() not in {current_u, "PUBLIC", "__PUBLIC"}
+    }
+    if not foreign_schemas:
+        return set()
+
+    dir_names = {path.parent.name.lower() for _, path in files_with_layer}
+    required: Set[str] = set()
+
+    if "table" in dir_names:
+        required.add("CREATE ANY TABLE")
+    if "table_alter" in dir_names or "constraint" in dir_names:
+        required.add("ALTER ANY TABLE")
+    if "view" in dir_names:
+        required.add("CREATE ANY VIEW")
+    if "materialized_view" in dir_names:
+        required.add("CREATE ANY MATERIALIZED VIEW")
+    if "synonym" in dir_names:
+        required.add("CREATE ANY SYNONYM")
+        if any(s in {"PUBLIC", "__PUBLIC"} for s in target_schemas):
+            required.add("CREATE PUBLIC SYNONYM")
+    if "sequence" in dir_names:
+        required.add("CREATE ANY SEQUENCE")
+    if "index" in dir_names:
+        required.add("CREATE ANY INDEX")
+    if "trigger" in dir_names:
+        required.add("CREATE ANY TRIGGER")
+    if any(d in dir_names for d in {"procedure", "function", "package", "package_body"}):
+        required.add("CREATE ANY PROCEDURE")
+    if any(d in dir_names for d in {"type", "type_body"}):
+        required.add("CREATE ANY TYPE")
+    if any(d in dir_names for d in {"job", "schedule"}):
+        required.add("CREATE ANY JOB")
+    if any(d in GRANT_DIRS for d in dir_names):
+        required.add("GRANT ANY OBJECT PRIVILEGE")
+
+    return required
+
+
+def build_fixup_precheck_summary(
+    ob_cfg: Dict[str, str],
+    obclient_cmd: List[str],
+    timeout: Optional[int],
+    files_with_layer: List[Tuple[int, Path]]
+) -> FixupPrecheckSummary:
+    current_user = extract_login_user(ob_cfg.get("user_string", ""))
+    target_schemas = collect_target_schemas_from_scripts(files_with_layer)
+    existing_schemas, lookup_source = query_existing_schemas(obclient_cmd, timeout)
+    missing_schemas = set()
+    if existing_schemas:
+        missing_schemas = {s for s in target_schemas if s not in existing_schemas}
+
+    required_privs = infer_required_sys_privileges(files_with_layer, current_user, target_schemas)
+    effective_privs = query_effective_sys_privileges(obclient_cmd, timeout, current_user)
+    missing_privs = set(required_privs)
+    if effective_privs:
+        missing_privs -= effective_privs
+
+    return FixupPrecheckSummary(
+        current_user=current_user,
+        target_schemas=target_schemas,
+        existing_schemas=existing_schemas,
+        missing_schemas=missing_schemas,
+        required_sys_privileges=required_privs,
+        effective_sys_privileges=effective_privs,
+        missing_sys_privileges=missing_privs,
+        schema_lookup_source=lookup_source,
+    )
+
+
+def write_fixup_precheck_report(fixup_dir: Path, summary: FixupPrecheckSummary) -> Optional[Path]:
+    try:
+        out_dir = fixup_dir / "errors"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = out_dir / f"fixup_precheck_{ts}.txt"
+        lines: List[str] = []
+        lines.append("# fixup precheck report")
+        lines.append(f"# generated={datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"CURRENT_USER|{summary.current_user or '-'}")
+        lines.append(
+            f"TARGET_SCHEMAS|{len(summary.target_schemas)}|{','.join(sorted(summary.target_schemas)) if summary.target_schemas else '-'}"
+        )
+        lines.append(
+            f"EXISTING_SCHEMAS_SOURCE|{summary.schema_lookup_source}|{len(summary.existing_schemas)}"
+        )
+        lines.append(
+            f"MISSING_SCHEMAS|{len(summary.missing_schemas)}|{','.join(sorted(summary.missing_schemas)) if summary.missing_schemas else '-'}"
+        )
+        lines.append(
+            f"REQUIRED_SYS_PRIVS|{len(summary.required_sys_privileges)}|{','.join(sorted(summary.required_sys_privileges)) if summary.required_sys_privileges else '-'}"
+        )
+        lines.append(
+            f"EFFECTIVE_SYS_PRIVS|{len(summary.effective_sys_privileges)}|{','.join(sorted(summary.effective_sys_privileges)) if summary.effective_sys_privileges else '-'}"
+        )
+        lines.append(
+            f"MISSING_SYS_PRIVS|{len(summary.missing_sys_privileges)}|{','.join(sorted(summary.missing_sys_privileges)) if summary.missing_sys_privileges else '-'}"
+        )
+        out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return out_path
+    except Exception as exc:
+        log.warning("写入 fixup precheck 报告失败: %s", exc)
+        return None
+
+
+def log_fixup_precheck(summary: FixupPrecheckSummary, report_path: Optional[Path]) -> None:
+    log_subsection("执行前检查")
+    log.info("当前用户: %s", summary.current_user or "-")
+    log.info("脚本目标 schema: %d 个", len(summary.target_schemas))
+    if summary.target_schemas:
+        log.info("目标 schema 列表: %s", ", ".join(sorted(summary.target_schemas)))
+    if summary.schema_lookup_source != "unavailable":
+        log.info(
+            "目标库 schema 查询: %s (%d 个)",
+            summary.schema_lookup_source,
+            len(summary.existing_schemas)
+        )
+    else:
+        log.warning("目标库 schema 查询失败，无法提前判断缺失 schema。")
+    if summary.missing_schemas:
+        log.warning(
+            "前置检查发现缺失 schema (%d): %s",
+            len(summary.missing_schemas),
+            ", ".join(sorted(summary.missing_schemas))
+        )
+    if summary.required_sys_privileges:
+        log.info(
+            "跨 schema 预估需要系统权限: %s",
+            ", ".join(sorted(summary.required_sys_privileges))
+        )
+    if summary.missing_sys_privileges:
+        log.warning(
+            "前置检查发现可能缺少系统权限 (%d): %s",
+            len(summary.missing_sys_privileges),
+            ", ".join(sorted(summary.missing_sys_privileges))
+        )
+    if report_path:
+        log.info("前置检查清单: %s", report_path)
+
+
 def build_fixup_object_index(
     files_with_layer: List[Tuple[int, Path]]
 ) -> Tuple[Dict[Tuple[str, str], List[Path]], Dict[str, List[Path]]]:
@@ -2932,6 +3200,7 @@ def execute_grant_file_with_prune(
     failures: List[StatementFailure] = []
     executed_count = 0
     removed_count = 0
+    non_grant_success_count = 0
     truncated = False
 
     for statement in statements:
@@ -2958,6 +3227,7 @@ def execute_grant_file_with_prune(
                 removed_count += 1
             else:
                 kept_statements.append(statement)
+                non_grant_success_count += 1
             continue
 
         message = error_msg
@@ -2969,6 +3239,13 @@ def execute_grant_file_with_prune(
             )
 
     summary = ExecutionSummary(executed_count, failures)
+    if non_grant_success_count:
+        log.warning(
+            "%s %s 包含并执行了 %d 条非 GRANT 语句，成功语句将保留在原文件中。",
+            label_prefix,
+            relative_path,
+            non_grant_success_count
+        )
 
     if executed_count == 0:
         log.warning("%s %s -> SKIP (文件为空)", label_prefix, relative_path)
@@ -3150,7 +3427,8 @@ def recompile_invalid_objects(
                 continue
             try:
                 result = run_sql(obclient_cmd, compile_sql, timeout)
-                if result.returncode == 0:
+                error_msg = extract_execution_error(result)
+                if not error_msg:
                     recompiled_this_round += 1
                     log.info("  OK %s.%s (%s)", owner, obj_name, obj_type)
                 else:
@@ -3159,7 +3437,7 @@ def recompile_invalid_objects(
                         owner,
                         obj_name,
                         obj_type,
-                        result.stderr.strip()[:100]
+                        str(error_msg)[:100]
                     )
             except Exception as e:
                 log.warning(
@@ -3450,6 +3728,9 @@ def run_single_fixup(
         log.error("OBClient 连接检查失败: %s", conn_err)
         log.error("请确认网络连通性/账号权限/obclient 可用性后重试。")
         sys.exit(1)
+    precheck_summary = build_fixup_precheck_summary(ob_cfg, obclient_cmd, ob_timeout, files_with_layer)
+    precheck_report = write_fixup_precheck_report(fixup_dir, precheck_summary)
+    log_fixup_precheck(precheck_summary, precheck_report)
     auto_grant_ctx = init_auto_grant_context(
         fixup_settings,
         report_dir,
@@ -3768,6 +4049,9 @@ def run_view_chain_autofix(
         log.error("OBClient 连接检查失败: %s", conn_err)
         log.error("请确认网络连通性/账号权限/obclient 可用性后重试。")
         sys.exit(1)
+    precheck_summary = build_fixup_precheck_summary(ob_cfg, obclient_cmd, ob_timeout, files_with_layer)
+    precheck_report = write_fixup_precheck_report(fixup_dir, precheck_summary)
+    log_fixup_precheck(precheck_summary, precheck_report)
 
     exists_cache: Dict[Tuple[str, str], bool] = {}
     roles_cache: Dict[str, Set[str]] = LimitedCache(fixup_settings.cache_limit)
@@ -4064,6 +4348,10 @@ def run_iterative_fixup(
         if not files_with_layer:
             log.info("✓ 所有脚本已成功执行！")
             break
+        if round_num == 1:
+            precheck_summary = build_fixup_precheck_summary(ob_cfg, obclient_cmd, ob_timeout, files_with_layer)
+            precheck_report = write_fixup_precheck_report(fixup_dir, precheck_summary)
+            log_fixup_precheck(precheck_summary, precheck_report)
         recompile_owners.update(infer_recompile_owners(files_with_layer))
 
         object_index, name_index = build_fixup_object_index(files_with_layer)
