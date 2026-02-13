@@ -6,6 +6,8 @@
 
 ### 新增
 - `run_fixup.py` 新增 `--version` 输出，便于现场快速确认执行器版本。
+- 新增 `prod_diagnose.py`（只读生产诊断器）：支持报告口径验真、实库复核、fixup 失败归因与 OCR 友好输出。
+- `prod_diagnose.py` 新增 `--focus-object` + `--deep`，支持单对象全链路深挖。
 
 ### 变更
 - 版本号改回脚本内置常量，移除对 `tool_version.py` 的运行时依赖，兼容“仅替换单个脚本”的历史分发方式。

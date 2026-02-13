@@ -68,3 +68,15 @@ python3 schema_diff_reconciler.py config.ini
 - 先跑主程序，再审 fixup_scripts，再跑 run_fixup。
 - 不要随便执行建表脚本（避免目标端空表）。
 - 发现异常先 git pull 更新后重跑。
+
+9. 生产快速排障（只读）
+- 自动读取最新 report_id 并输出诊断报告：
+  python3 prod_diagnose.py config.ini
+- 聚焦单对象深挖（推荐用户反馈“某对象不对/没生成/schema错/语法错”时）：
+  python3 prod_diagnose.py config.ini --report-id <report_id> --focus-object VIEW:SCHEMA.OBJ --deep
+- 主要看 4 个文件：
+  triage_summary_*.txt（口径是否漂移）
+  triage_detail_*.txt（每条差异的根因/建议）
+  triage_fixup_failures_*.txt（fixup 失败归因）
+  triage_false_positive_candidates_*.txt（疑似误报）
+  （--deep 时还会生成 triage_focus_deep_*.txt）

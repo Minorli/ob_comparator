@@ -28592,6 +28592,10 @@ def _build_report_detail_rows(
             row for row in support_summary.missing_detail_rows
             if row.support_state == SUPPORT_STATE_SUPPORTED
         ]
+        missing_supported.extend(
+            row for row in (support_summary.extra_missing_rows or [])
+            if row.support_state == SUPPORT_STATE_SUPPORTED
+        )
         unsupported_rows = [
             row for row in support_summary.unsupported_rows
             if row.support_state in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED, SUPPORT_STATE_RISKY}
@@ -28965,7 +28969,11 @@ def _build_report_detail_item_rows(
 
     # 1) 支持/阻断/缺失原因（SupportClassification）
     if support_summary:
-        for row in (support_summary.missing_detail_rows or []) + (support_summary.unsupported_rows or []):
+        for row in (
+            (support_summary.missing_detail_rows or [])
+            + (support_summary.extra_missing_rows or [])
+            + (support_summary.unsupported_rows or [])
+        ):
             report_type = "MISSING" if row.support_state == SUPPORT_STATE_SUPPORTED else "UNSUPPORTED"
             src_schema, src_name = _split_full(row.src_full)
             tgt_schema, tgt_name = _split_full(row.tgt_full)
@@ -33471,7 +33479,7 @@ def print_final_report(
         unsupported_by_type_paths: Dict[str, Optional[Path]] = {}
         if emit_detail_files:
             missing_detail_path = export_missing_objects_detail(
-                missing_detail_rows,
+                combined_missing_rows,
                 report_path.parent,
                 report_ts
             )
@@ -33510,7 +33518,7 @@ def print_final_report(
         _add_index_entry(
             "DETAIL",
             missing_detail_path,
-            len(missing_detail_rows or []),
+            len(combined_missing_rows or []),
             "缺失对象支持性明细"
         )
         _add_index_entry(
