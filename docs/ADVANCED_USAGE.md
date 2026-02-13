@@ -130,7 +130,7 @@
 - 支持 `report_db_schema` 指定存储 schema；留空使用目标连接用户。
 - 写库范围由 `report_db_store_scope` 控制：
   - `summary`：仅写入 SUMMARY / COUNTS
-  - `core`：summary + DETAIL / GRANT / USABILITY / PACKAGE / TRIGGER
+  - `core`：summary + DETAIL / GRANT / USABILITY / TABLE_PRESENCE / PACKAGE / TRIGGER
   - `full`：core + ARTIFACT / ARTIFACT_LINE / DEPENDENCY / VIEW_CHAIN / REMAP_CONFLICT / OBJECT_MAPPING / BLACKLIST / FIXUP_SKIP / OMS_MISSING
   - `DIFF_REPORT_WRITE_ERRORS` / `DIFF_REPORT_RESOLUTION` 为写库追踪与闭环表，report_to_db 启用后默认创建
   - `full` 下会将 run 目录 txt 逐行写入 `DIFF_REPORT_ARTIFACT_LINE`，可直接在库中复盘全部文本报告
@@ -145,6 +145,7 @@
   - `DIFF_REPORT_SUMMARY` / `DIFF_REPORT_COUNTS` / `DIFF_REPORT_DETAIL` / `DIFF_REPORT_GRANT`
   - `DIFF_REPORT_DETAIL_ITEM`（明细行化表，便于逐项查询，store_scope=full 时写入）
   - `DIFF_REPORT_USABILITY`（可用性校验明细）
+  - `DIFF_REPORT_TABLE_PRESENCE`（表数据存在性风险明细：源有数据/目标空表）
   - `DIFF_REPORT_PACKAGE_COMPARE`（PACKAGE/PKG BODY 对比摘要）
   - `DIFF_REPORT_TRIGGER_STATUS`（触发器状态差异）
   - `DIFF_REPORT_ARTIFACT`（报告工件目录）
@@ -247,6 +248,11 @@ sequence -> table -> table_alter -> grants -> view -> procedure -> package -> co
 - `--only-dirs` / `--exclude-dirs`
 - `--only-types` / `--glob`
 
+### 5.6 建表脚本安全门禁（--allow-table-create）
+- 默认安全模式会跳过 `fixup_scripts/table/`，防止误建空表。
+- 即使传入 `--only-dirs table` 或 `--only-types TABLE`，未显式开启时仍会被拦截。
+- 只有在明确需要执行建表脚本时，才加 `--allow-table-create`。
+
 ---
 
 ## 7. 大规模迁移建议
@@ -275,6 +281,7 @@ A: `check_primary_types` 限制后，未包含的类型不会加载/推导/生�
 2) 先看 `report_*.txt` 的执行结论与 `report_index_*.txt` 的工件索引。  
 3) 如启用 `report_to_db=true`，优先用 `HOW_TO_READ_REPORTS_IN_OB_latest.txt` 查询问题。  
 4) 人工审核 `fixup_scripts/` 后执行：`python3 run_fixup.py --smart-order --recompile`。  
+   如需执行 `fixup_scripts/table/`，必须显式加 `--allow-table-create`。  
 5) 复杂 VIEW 依赖场景再执行：`python3 run_fixup.py --view-chain-autofix`。  
 6) 完成后再次运行主程序做收敛验证（确保缺失/不支持数量符合预期）。
 

@@ -114,6 +114,14 @@
 - usability_sample_ratio：可用性校验抽样比例（0~1）。默认：0（不抽样）。
   说明：仅当 max_usability_objects>0 且 usability_sample_ratio>0 时才启用抽样。
   说明：被抽样跳过的对象不会写入明细报告，仅计入汇总的“跳过”数量。
+- table_data_presence_check：表数据存在性风险校验模式（仅 TABLE）。默认：auto。
+  可选值：off（关闭）、auto（按阈值自动执行）、on（始终执行）。
+- table_data_presence_auto_max_tables：auto 模式候选表阈值。默认：20000。
+  说明：候选表数量超过阈值时该阶段跳过，并在主报告统计 skipped。
+- table_data_presence_chunk_size：OB 批量探测 chunk 大小。默认：500。
+  说明：每个 chunk 使用一次 obclient 多语句探测，失败时自动回退为单表探测。
+- table_data_presence_obclient_timeout：OB 批量探测超时（秒）。默认：空（沿用 obclient_timeout）。
+  说明：该参数仅影响“表数据存在性风险校验”阶段。
 - column_visibility_policy：列可见性(INVISIBLE)处理策略。默认：auto。
   可选值：auto（元数据可用时校验并生成修补）、enforce（强制校验/修补）、ignore（跳过可见性校验）。
 - 说明：OB 侧 CHAR_USED 缺失时默认按 BYTE 语义处理；若 DATA_LENGTH > CHAR_LENGTH 则推断为 CHAR 语义，避免长度语义误判。

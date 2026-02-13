@@ -28,6 +28,7 @@ Usage:
     --smart-order     : Enable dependency-aware execution (recommended)
     --recompile       : Enable automatic recompilation of INVALID objects
     --max-retries N   : Maximum recompilation retries (default: 5)
+    --allow-table-create : Allow executing fixup_scripts/table/* (default: disabled)
     --only-dirs       : Filter by subdirectories
     --only-types      : Filter by object types
     --glob            : Filter by filename patterns
@@ -3474,6 +3475,7 @@ def parse_args() -> argparse.Namespace:
           --max-rounds   : 最大迭代轮次（默认 10）
           --min-progress : 最小进展阈值（默认 1）
           --view-chain-autofix : 基于 VIEW 依赖链生成/执行修复计划
+          --allow-table-create : 允许执行 table/ 建表脚本（默认关闭，防止误建空表）
         
         保留原有功能：
           --only-dirs    : 按子目录过滤
@@ -3573,6 +3575,12 @@ def parse_args() -> argparse.Namespace:
         action="append",
         help="Only execute scripts matching these glob patterns",
     )
+
+    parser.add_argument(
+        "--allow-table-create",
+        action="store_true",
+        help="Allow executing fixup_scripts/table/* (disabled by default for safety)",
+    )
     
     return parser.parse_args()
 
@@ -3629,10 +3637,25 @@ def main() -> None:
     
     exclude_dirs = [d.lower() for d in exclude_dirs]
     default_excludes = {"tables_unsupported", "unsupported", "constraint_validate_later"}
+    if not getattr(args, "allow_table_create", False):
+        # Safety first: table create scripts are risky in migration workflows
+        # because they can create empty target tables if OMS data load is skipped.
+        default_excludes.add("table")
     exclude_set = set(exclude_dirs) | default_excludes
     if only_dirs:
         exclude_set -= set(only_dirs)
+    if not getattr(args, "allow_table_create", False):
+        # Keep table excluded unless explicit opt-in, even with --only-dirs table.
+        exclude_set.add("table")
     exclude_dirs = sorted(exclude_set)
+
+    if "table" in only_dirs and not getattr(args, "allow_table_create", False):
+        log.warning(
+            "检测到 --only-dirs/--only-types 包含 table，但默认安全策略已禁用 table 执行。"
+            "如需执行建表脚本，请显式添加 --allow-table-create。"
+        )
+    if not getattr(args, "allow_table_create", False):
+        log.warning("安全模式: 默认跳过 fixup_scripts/table/（防止误建空表）。")
     
     # Load configuration
     try:

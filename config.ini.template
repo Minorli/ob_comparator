@@ -246,6 +246,17 @@ usability_check_workers = 10
 max_usability_objects   = 0
 # 可用性校验抽样比例（0~1；留空或 0 表示不抽样）
 usability_sample_ratio  = 0
+# 表数据存在性风险校验（仅 TABLE）：
+#   off  -> 关闭
+#   auto -> 当候选表数量 <= table_data_presence_auto_max_tables 时执行
+#   on   -> 始终执行
+table_data_presence_check = auto
+# auto 模式候选表阈值（超过阈值自动跳过该项校验）
+table_data_presence_auto_max_tables = 20000
+# OB 侧批量探测 chunk 大小（单次 obclient 多语句批量）
+table_data_presence_chunk_size = 500
+# OB 侧批量探测超时（秒）；留空表示沿用 obclient_timeout
+table_data_presence_obclient_timeout =
 # 列可见性(INVISIBLE)处理策略
 #   auto    -> 元数据可用时校验并生成修补（默认）
 #   enforce -> 强制校验/生成修补（即使元数据不完整）

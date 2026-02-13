@@ -18,7 +18,22 @@
 - **DDL 输出格式化**：可选 SQLcl 格式化 fixup DDL（不影响校验与修补逻辑）。
 - **修补脚本执行器**：支持 smart-order、迭代重试、VIEW 链路自动修复、错误报告。
 - **报告体系**：Rich 控制台 + 纯文本快照 + 细节分拆报告（可配置）。
+- **空表风险识别**：可选识别“源端有数据但目标端空表”的高风险场景（不做 `COUNT(*)`）。
 - **不支持对象识别**：黑名单/依赖阻断对象单独统计与分流输出。
+
+## 新增能力总览（按模块）
+- **报告入库**：`report_to_db` 支持 `summary/core/full` 多级落库与行化明细，支持数据库侧直接排查（含 HOW TO SQL 手册）。
+- **迁移聚焦报告**：按“可修补缺失 vs 不支持/阻断”拆分，保留全量明细并可在主报告快速定位。
+- **可用性校验**：支持 VIEW/SYNONYM 查询可用性检查（`WHERE 1=2`）与根因输出。
+- **表数据风险校验**：`table_data_presence_check` 识别“源端有数据、目标空表”风险，支持 `auto` 成本保护。
+- **run_fixup 增强**：支持 `--iterative`、`--view-chain-autofix`、语句级继续执行、授权修剪与错误报告。
+- **run_fixup 安全门禁**：默认跳过 `fixup_scripts/table/`，需显式 `--allow-table-create` 才执行建表脚本。
+- **状态漂移修复**：支持 TRIGGER/CONSTRAINT 的状态差异检测与状态修补脚本生成。
+- **约束策略增强**：支持缺失约束的 `safe_novalidate/source/force_validate` 策略与后置 `validate_later` 脚本。
+- **视图兼容治理**：支持 VIEW 兼容规则、DBLINK 策略、列清单约束清洗与依赖链修复。
+- **DDL 清洗与格式化**：支持全角标点清洗、hint 策略清洗、SQLcl 格式化（可按类型/体积/超时控制）。
+- **黑名单与排除机制**：支持规则引擎、名称模式、显式排除清单（`exclude_objects_file`）与依赖联动过滤。
+- **版本门控**：按 OB 版本动态处理 MVIEW、interval 分区等能力差异，降低跨版本误报。
 
 ## 适用场景
 - Oracle → OceanBase 迁移后的结构一致性审计
@@ -71,6 +86,9 @@ trigger_qualify_schema = true
 report_dir_layout = per_run
 report_detail_mode = split
 report_to_db = true
+table_data_presence_check = auto
+table_data_presence_auto_max_tables = 20000
+table_data_presence_chunk_size = 500
 oracle_client_lib_dir = /opt/instantclient_19_28
 dbcat_bin = /opt/dbcat-2.5.0-SNAPSHOT
 dbcat_output_dir = dbcat_output
@@ -120,6 +138,9 @@ SRC_A.TRG_ORDER = OB_A.TRG_ORDER
 
 ## run_fixup 执行模式
 
+默认安全策略：`run_fixup` 会默认跳过 `fixup_scripts/table/`，避免误创建空表。
+如确认要执行建表脚本，请显式加 `--allow-table-create`。
+
 **标准执行**（一次运行）：
 ```bash
 python3 run_fixup.py --smart-order --recompile
@@ -135,6 +156,11 @@ python3 run_fixup.py --iterative --smart-order --recompile --max-rounds 10
 python3 run_fixup.py --view-chain-autofix
 ```
 
+**显式允许执行建表脚本**（仅在确认需要时使用）：
+```bash
+python3 run_fixup.py --smart-order --recompile --allow-table-create
+```
+
 ## 额外工具
 - `init_users_roles.py`：以 Oracle 为准创建用户/角色并同步系统权限与角色授权。
 > 注意：`init_users_roles.py` 运行时会交互输入用户初始密码，不再在脚本中写死明文初始密码。
@@ -147,6 +173,7 @@ python3 run_fixup.py --view-chain-autofix
 - `main_reports/run_<ts>/blacklist_tables.txt`：黑名单表清单
 - `main_reports/run_<ts>/filtered_grants.txt`：过滤授权清单
 - `main_reports/run_<ts>/trigger_status_report.txt`：触发器清单/状态差异报告
+- `main_reports/run_<ts>/table_data_presence_detail_<ts>.txt`：表数据存在性风险明细（源有数据/目标空表）
 - `main_reports/run_<ts>/missing_objects_detail_<ts>.txt`：缺失对象支持性明细（report_detail_mode=split）
 - `main_reports/run_<ts>/unsupported_objects_detail_<ts>.txt`：不支持/阻断对象明细（report_detail_mode=split）
 - `main_reports/run_<ts>/extra_mismatch_detail_<ts>.txt`：扩展对象差异明细（report_detail_mode=split）

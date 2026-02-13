@@ -34,7 +34,7 @@
 - HOW_TO_READ_REPORTS_IN_OB_latest.txt SQL 校验修正与完善（历史快照按时间戳文件保留）
 
 ## [未发布]
-- 暂无
+- run_fixup 安全门禁：默认跳过 `fixup_scripts/table/`，避免误创建空表；需显式 `--allow-table-create` 才执行建表脚本。
 
 ## [0.9.8.2] - 2026-02-03
 

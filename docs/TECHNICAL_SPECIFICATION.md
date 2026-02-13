@@ -158,6 +158,7 @@
 
 ### 8.1 Smart Order
 按依赖层级执行（sequence → table → grants → view → code → index/constraint → trigger）。
+默认安全策略下，`table` 目录会被 run_fixup 排除；仅在显式 `--allow-table-create` 时执行。
 
 ### 8.2 Iterative 模式
 失败脚本自动重试，直至收敛或达到最大轮次。
@@ -173,6 +174,7 @@
 - `fixup_dir_allow_outside_repo=false` 时，run_fixup 不允许 fixup_dir 指向项目外目录。
 - 成功执行脚本移动到 `done/` 时会自动备份同名文件，避免覆盖历史结果。
 - 自动补权限缓存支持 `fixup_auto_grant_cache_limit` 控制，避免长时间运行内存膨胀。
+- 默认跳过 `fixup_scripts/table/`，防止误创建空表；需要显式 `--allow-table-create` 才可执行建表脚本。
 
 ---
 

@@ -68,6 +68,9 @@ python schema_diff_reconciler.py
 python run_fixup.py --smart-order --recompile
 ```
 
+提示：`run_fixup` 默认跳过 `fixup_scripts/table/`（防止误建空表）。  
+如需执行建表脚本，显式添加：`--allow-table-create`。
+
 提示：默认报告输出为 `main_reports/run_<timestamp>/`，如需兼容旧流程可设置 `report_dir_layout=flat`。
 
 ## 5. 常见问题检查清单

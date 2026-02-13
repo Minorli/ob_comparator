@@ -208,6 +208,7 @@ RUN_PHASE_ORDER: Tuple[str, ...] = (
     "OceanBase 元数据转储",
     "Oracle 元数据转储",
     "主对象校验",
+    "表数据存在性校验",
     "扩展对象校验",
     "对象可用性校验",
     "依赖/授权校验",
@@ -479,6 +480,41 @@ class UsabilitySummary(NamedTuple):
     total_sampled_out: int
     duration_seconds: float
     results: List[UsabilityCheckResult]
+
+
+TABLE_PRESENCE_STATUS_RISK = "RISK_SOURCE_NONEMPTY_TARGET_EMPTY"
+TABLE_PRESENCE_STATUS_OK_BOTH_NONEMPTY = "OK_BOTH_NONEMPTY"
+TABLE_PRESENCE_STATUS_OK_BOTH_EMPTY = "OK_BOTH_EMPTY"
+TABLE_PRESENCE_STATUS_UNKNOWN = "UNKNOWN"
+TABLE_PRESENCE_FLAG_YES = "YES"
+TABLE_PRESENCE_FLAG_NO = "NO"
+TABLE_PRESENCE_FLAG_UNKNOWN = "UNKNOWN"
+
+
+class TablePresenceResult(NamedTuple):
+    source_schema: str
+    source_table: str
+    target_schema: str
+    target_table: str
+    source_has_rows: str
+    target_has_rows: str
+    status: str
+    detail: str
+    source_probe_ms: int
+    target_probe_ms: int
+
+
+class TablePresenceSummary(NamedTuple):
+    total_candidates: int
+    total_checked: int
+    total_risk: int
+    total_ok_nonempty: int
+    total_ok_empty: int
+    total_unknown: int
+    total_skipped: int
+    duration_seconds: float
+    mode: str
+    rows: List[TablePresenceResult]
 
 
 @dataclass
@@ -2532,6 +2568,17 @@ REPORT_DB_STORE_SCOPE_ALIASES = {
     "all": "full",
     "full_only": "full",
 }
+TABLE_DATA_PRESENCE_CHECK_MODE_VALUES = {"off", "auto", "on"}
+TABLE_DATA_PRESENCE_CHECK_MODE_ALIASES = {
+    "false": "off",
+    "0": "off",
+    "disable": "off",
+    "disabled": "off",
+    "true": "on",
+    "1": "on",
+    "enable": "on",
+    "enabled": "on",
+}
 
 
 def normalize_report_detail_mode(raw_value: Optional[str]) -> str:
@@ -2542,6 +2589,17 @@ def normalize_report_detail_mode(raw_value: Optional[str]) -> str:
     if value not in REPORT_DETAIL_MODE_VALUES:
         log.warning("report_detail_mode=%s 不在支持范围内，将回退为 split。", raw_value)
         return "split"
+    return value
+
+
+def normalize_table_data_presence_check_mode(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "auto"
+    value = str(raw_value).strip().lower()
+    value = TABLE_DATA_PRESENCE_CHECK_MODE_ALIASES.get(value, value)
+    if value not in TABLE_DATA_PRESENCE_CHECK_MODE_VALUES:
+        log.warning("table_data_presence_check=%s 不在支持范围内，将回退为 auto。", raw_value)
+        return "auto"
     return value
 
 
@@ -3556,6 +3614,10 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('usability_check_workers', '10')
         settings.setdefault('max_usability_objects', '')
         settings.setdefault('usability_sample_ratio', '')
+        settings.setdefault('table_data_presence_check', 'auto')
+        settings.setdefault('table_data_presence_auto_max_tables', '20000')
+        settings.setdefault('table_data_presence_chunk_size', '500')
+        settings.setdefault('table_data_presence_obclient_timeout', '')
         settings.setdefault('generate_interval_partition_fixup', 'auto')
         settings.setdefault('mview_check_fixup_mode', 'auto')
         settings.setdefault('interval_partition_cutoff', '20280301')
@@ -3666,6 +3728,33 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             settings['usability_sample_ratio'] = 0.0
         if settings['usability_sample_ratio'] < 0:
             settings['usability_sample_ratio'] = 0.0
+        settings['table_data_presence_check_mode'] = normalize_table_data_presence_check_mode(
+            settings.get('table_data_presence_check', 'auto')
+        )
+        try:
+            settings['table_data_presence_auto_max_tables'] = int(
+                settings.get('table_data_presence_auto_max_tables', '20000') or 20000
+            )
+        except (TypeError, ValueError):
+            settings['table_data_presence_auto_max_tables'] = 20000
+        if settings['table_data_presence_auto_max_tables'] < 0:
+            settings['table_data_presence_auto_max_tables'] = 0
+        try:
+            settings['table_data_presence_chunk_size'] = int(
+                settings.get('table_data_presence_chunk_size', '500') or 500
+            )
+        except (TypeError, ValueError):
+            settings['table_data_presence_chunk_size'] = 500
+        if settings['table_data_presence_chunk_size'] <= 0:
+            settings['table_data_presence_chunk_size'] = 500
+        timeout_raw = (settings.get('table_data_presence_obclient_timeout') or '').strip()
+        if timeout_raw:
+            try:
+                settings['table_data_presence_obclient_timeout'] = max(1, int(timeout_raw))
+            except (TypeError, ValueError):
+                settings['table_data_presence_obclient_timeout'] = int(settings.get('obclient_timeout', 60))
+        else:
+            settings['table_data_presence_obclient_timeout'] = int(settings.get('obclient_timeout', 60))
         settings['fixup_drop_sys_c_columns'] = parse_bool_flag(
             settings.get('fixup_drop_sys_c_columns', 'true'),
             False
@@ -4247,6 +4336,14 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "仅支持 auto/on/off"
 
+    def _validate_table_data_presence_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = TABLE_DATA_PRESENCE_CHECK_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in TABLE_DATA_PRESENCE_CHECK_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 off/auto/on"
+
     def _validate_column_visibility_policy(val: str) -> Tuple[bool, str]:
         if not val.strip():
             return True, ""
@@ -4653,6 +4750,35 @@ def run_config_wizard(config_path: Path) -> None:
         "可用性校验抽样比例（0~1，留空/0 表示不抽样）",
         default=cfg.get("SETTINGS", "usability_sample_ratio", fallback="0"),
         validator=_validate_ratio_0_1,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "table_data_presence_check",
+        "是否启用表数据存在性风险校验 (off/auto/on，默认 auto)",
+        default=cfg.get("SETTINGS", "table_data_presence_check", fallback="auto"),
+        validator=_validate_table_data_presence_mode,
+        transform=normalize_table_data_presence_check_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "table_data_presence_auto_max_tables",
+        "表数据存在性校验 auto 阈值（候选表上限，默认 20000）",
+        default=cfg.get("SETTINGS", "table_data_presence_auto_max_tables", fallback="20000"),
+        validator=_validate_non_negative_int,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "table_data_presence_chunk_size",
+        "表数据存在性校验 OB 批量大小（默认 500）",
+        default=cfg.get("SETTINGS", "table_data_presence_chunk_size", fallback="500"),
+        validator=_validate_positive_int,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "table_data_presence_obclient_timeout",
+        "表数据存在性校验 OB 超时（秒，留空沿用 obclient_timeout）",
+        default=cfg.get("SETTINGS", "table_data_presence_obclient_timeout", fallback=""),
+        validator=lambda v: _validate_positive_int(v) if v.strip() else (True, ""),
     )
     _prompt_field(
         "SETTINGS",
@@ -16637,6 +16763,355 @@ def check_object_usability(
     )
 
 
+# ====================== TABLE 数据存在性风险校验 ======================
+
+def _table_presence_flag(value: Optional[bool]) -> str:
+    if value is True:
+        return TABLE_PRESENCE_FLAG_YES
+    if value is False:
+        return TABLE_PRESENCE_FLAG_NO
+    return TABLE_PRESENCE_FLAG_UNKNOWN
+
+
+def _classify_table_presence_status(src_has_rows: Optional[bool], tgt_has_rows: Optional[bool]) -> str:
+    if src_has_rows is True and tgt_has_rows is False:
+        return TABLE_PRESENCE_STATUS_RISK
+    if src_has_rows is True and tgt_has_rows is True:
+        return TABLE_PRESENCE_STATUS_OK_BOTH_NONEMPTY
+    if src_has_rows is False and tgt_has_rows is False:
+        return TABLE_PRESENCE_STATUS_OK_BOTH_EMPTY
+    return TABLE_PRESENCE_STATUS_UNKNOWN
+
+
+def _parse_ob_presence_probe_output(
+    output: str,
+    token_to_table: Dict[str, Tuple[str, str]]
+) -> Dict[Tuple[str, str], bool]:
+    result: Dict[Tuple[str, str], bool] = {}
+    if not output or not token_to_table:
+        return result
+    for raw_line in output.splitlines():
+        line = (raw_line or "").strip()
+        if not line or "|" not in line:
+            continue
+        parts = line.split("|", 2)
+        if len(parts) != 3:
+            continue
+        token = f"{parts[0]}|{parts[1]}"
+        state = (parts[2] or "").strip().upper()
+        table_key = token_to_table.get(token)
+        if not table_key:
+            continue
+        if state == "Y":
+            result[table_key] = True
+        elif state == "N":
+            result[table_key] = False
+    return result
+
+
+def _build_ob_presence_probe_sql(
+    table_keys: List[Tuple[str, str]]
+) -> Tuple[str, Dict[str, Tuple[str, str]]]:
+    sql_lines: List[str] = []
+    token_to_table: Dict[str, Tuple[str, str]] = {}
+    for idx, (schema_u, table_u) in enumerate(table_keys, 1):
+        qualified = quote_qualified_parts(schema_u, table_u)
+        token = f"PRESENCE|{idx:06d}"
+        token_to_table[token] = (schema_u, table_u)
+        sql_lines.append(f"SELECT '{token}|Y' FROM {qualified} WHERE ROWNUM=1")
+        sql_lines.append(
+            "SELECT '{token}|N' FROM DUAL WHERE NOT EXISTS "
+            "(SELECT 1 FROM {qualified} WHERE ROWNUM=1)".format(
+                token=token,
+                qualified=qualified
+            )
+        )
+    return ";\n".join(sql_lines), token_to_table
+
+
+def _probe_ob_table_has_rows_single(
+    ob_cfg: ObConfig,
+    schema_u: str,
+    table_u: str,
+    timeout_sec: int
+) -> Tuple[Optional[bool], str, int]:
+    sql, token_map = _build_ob_presence_probe_sql([(schema_u, table_u)])
+    start = time.perf_counter()
+    ok, out, err = obclient_run_sql(ob_cfg, sql, timeout=timeout_sec)
+    duration_ms = int((time.perf_counter() - start) * 1000)
+    if not ok:
+        return None, normalize_error_text(err), duration_ms
+    parsed = _parse_ob_presence_probe_output(out, token_map)
+    key = (schema_u, table_u)
+    if key not in parsed:
+        return None, "NO_RESULT", duration_ms
+    return parsed[key], "", duration_ms
+
+
+def _probe_ob_table_has_rows_batch(
+    ob_cfg: ObConfig,
+    table_keys: List[Tuple[str, str]],
+    chunk_size: int,
+    timeout_sec: int
+) -> Dict[Tuple[str, str], Tuple[Optional[bool], str, int]]:
+    if not table_keys:
+        return {}
+    chunk_size = max(1, int(chunk_size or 1))
+    timeout_sec = max(1, int(timeout_sec or 1))
+    result: Dict[Tuple[str, str], Tuple[Optional[bool], str, int]] = {}
+    for chunk in chunk_list(table_keys, chunk_size):
+        chunk_sql, token_map = _build_ob_presence_probe_sql(chunk)
+        chunk_start = time.perf_counter()
+        ok, out, err = obclient_run_sql(ob_cfg, chunk_sql, timeout=timeout_sec)
+        chunk_duration_ms = int((time.perf_counter() - chunk_start) * 1000)
+        avg_ms = int(chunk_duration_ms / max(1, len(chunk)))
+        if ok:
+            parsed = _parse_ob_presence_probe_output(out, token_map)
+            unresolved = [key for key in chunk if key not in parsed]
+            for key in chunk:
+                if key in parsed:
+                    result[key] = (parsed[key], "", avg_ms)
+            if unresolved:
+                for schema_u, table_u in unresolved:
+                    single_ok, single_err, single_ms = _probe_ob_table_has_rows_single(
+                        ob_cfg,
+                        schema_u,
+                        table_u,
+                        timeout_sec
+                    )
+                    result[(schema_u, table_u)] = (single_ok, single_err, single_ms)
+            continue
+
+        batch_err = normalize_error_text(err)
+        log.warning(
+            "[TABLE_PRESENCE] OB 批量探测失败，回退单表探测: chunk=%d, err=%s",
+            len(chunk),
+            batch_err
+        )
+        for schema_u, table_u in chunk:
+            single_ok, single_err, single_ms = _probe_ob_table_has_rows_single(
+                ob_cfg,
+                schema_u,
+                table_u,
+                timeout_sec
+            )
+            if single_ok is None and batch_err:
+                single_err = f"{single_err}; BATCH={batch_err}" if single_err else f"BATCH={batch_err}"
+            result[(schema_u, table_u)] = (single_ok, single_err, single_ms)
+    return result
+
+
+def check_table_data_presence(
+    settings: Dict,
+    master_list: MasterCheckList,
+    tv_results: ReportResults,
+    ob_cfg: ObConfig,
+    ora_cfg: OraConfig,
+    ob_meta: ObMetadata,
+    enabled_primary_types: Set[str]
+) -> Optional[TablePresenceSummary]:
+    if not settings:
+        return None
+    mode = settings.get("table_data_presence_check_mode")
+    if not mode:
+        mode = normalize_table_data_presence_check_mode(settings.get("table_data_presence_check", "auto"))
+    if mode == "off":
+        return None
+    if "TABLE" not in enabled_primary_types:
+        return None
+
+    missing_target_tables: Set[str] = {
+        (tgt_full or "").upper()
+        for obj_type, tgt_full, _src_full in (tv_results.get("missing", []) or [])
+        if (obj_type or "").upper() == "TABLE"
+    }
+    target_tables = ob_meta.objects_by_type.get("TABLE", set()) if ob_meta else set()
+    target_tables_u = {(name or "").upper() for name in target_tables}
+
+    candidates: List[Tuple[str, str, str, str]] = []
+    seen: Set[Tuple[str, str, str, str]] = set()
+    for src_full, tgt_full, obj_type in sorted(master_list, key=lambda x: (x[2], x[0], x[1])):
+        if (obj_type or "").upper() != "TABLE":
+            continue
+        if (tgt_full or "").upper() in missing_target_tables:
+            continue
+        if target_tables_u and (tgt_full or "").upper() not in target_tables_u:
+            continue
+        src_parsed = parse_full_object_name(src_full)
+        tgt_parsed = parse_full_object_name(tgt_full)
+        if not src_parsed or not tgt_parsed:
+            continue
+        row_key = (
+            src_parsed[0].upper(),
+            src_parsed[1].upper(),
+            tgt_parsed[0].upper(),
+            tgt_parsed[1].upper(),
+        )
+        if row_key in seen:
+            continue
+        seen.add(row_key)
+        candidates.append(row_key)
+
+    total_candidates = len(candidates)
+    if total_candidates == 0:
+        return TablePresenceSummary(
+            total_candidates=0,
+            total_checked=0,
+            total_risk=0,
+            total_ok_nonempty=0,
+            total_ok_empty=0,
+            total_unknown=0,
+            total_skipped=0,
+            duration_seconds=0.0,
+            mode=mode,
+            rows=[]
+        )
+
+    auto_max_raw = settings.get("table_data_presence_auto_max_tables", 20000)
+    try:
+        auto_max = int(auto_max_raw)
+    except Exception:
+        auto_max = 20000
+    if auto_max < 0:
+        auto_max = 0
+    if mode == "auto" and total_candidates > auto_max:
+        log.warning(
+            "[TABLE_PRESENCE] auto 模式已跳过：候选表 %d 超过阈值 %d。",
+            total_candidates,
+            auto_max
+        )
+        return TablePresenceSummary(
+            total_candidates=total_candidates,
+            total_checked=0,
+            total_risk=0,
+            total_ok_nonempty=0,
+            total_ok_empty=0,
+            total_unknown=0,
+            total_skipped=total_candidates,
+            duration_seconds=0.0,
+            mode=mode,
+            rows=[]
+        )
+
+    chunk_size = max(1, int(settings.get("table_data_presence_chunk_size", 500) or 500))
+    ob_timeout = max(1, int(settings.get("table_data_presence_obclient_timeout", settings.get("obclient_timeout", 60)) or 60))
+    oracle_timeout_ms = ob_timeout * 1000
+
+    log.info(
+        "[TABLE_PRESENCE] 开始校验：mode=%s, candidates=%d, chunk_size=%d, ob_timeout=%ds",
+        mode,
+        total_candidates,
+        chunk_size,
+        ob_timeout
+    )
+
+    start_perf = time.perf_counter()
+    source_probe: Dict[Tuple[str, str], Tuple[Optional[bool], str, int]] = {}
+    source_conn: Optional[oracledb.Connection] = None
+    try:
+        source_conn = oracledb.connect(
+            user=ora_cfg["user"],
+            password=ora_cfg["password"],
+            dsn=ora_cfg["dsn"]
+        )
+        for src_schema, src_table, _tgt_schema, _tgt_table in candidates:
+            sql = f"SELECT 1 FROM {quote_qualified_parts(src_schema, src_table)} WHERE ROWNUM=1"
+            begin = time.perf_counter()
+            src_flag: Optional[bool] = None
+            src_err = ""
+            try:
+                with source_conn.cursor() as cursor:
+                    cursor.call_timeout = oracle_timeout_ms
+                    cursor.execute(sql)
+                    src_flag = cursor.fetchone() is not None
+            except Exception as exc:
+                src_flag = None
+                src_err = normalize_error_text(str(exc))
+            source_probe[(src_schema, src_table)] = (
+                src_flag,
+                src_err,
+                int((time.perf_counter() - begin) * 1000)
+            )
+    except Exception as exc:
+        src_connect_err = normalize_error_text(str(exc))
+        log.warning("[TABLE_PRESENCE] Oracle 探测连接失败：%s", src_connect_err)
+        for src_schema, src_table, _tgt_schema, _tgt_table in candidates:
+            source_probe[(src_schema, src_table)] = (None, src_connect_err, 0)
+    finally:
+        if source_conn:
+            try:
+                source_conn.close()
+            except Exception:
+                pass
+
+    target_keys: List[Tuple[str, str]] = []
+    seen_target: Set[Tuple[str, str]] = set()
+    for _src_schema, _src_table, tgt_schema, tgt_table in candidates:
+        target_key = (tgt_schema, tgt_table)
+        if target_key in seen_target:
+            continue
+        seen_target.add(target_key)
+        target_keys.append(target_key)
+    target_probe = _probe_ob_table_has_rows_batch(
+        ob_cfg,
+        target_keys,
+        chunk_size,
+        ob_timeout
+    )
+
+    rows: List[TablePresenceResult] = []
+    for src_schema, src_table, tgt_schema, tgt_table in candidates:
+        src_has, src_err, src_ms = source_probe.get((src_schema, src_table), (None, "SRC_NOT_PROBED", 0))
+        tgt_has, tgt_err, tgt_ms = target_probe.get((tgt_schema, tgt_table), (None, "TGT_NOT_PROBED", 0))
+        status = _classify_table_presence_status(src_has, tgt_has)
+        detail_parts: List[str] = []
+        if src_err:
+            detail_parts.append(f"SRC={src_err}")
+        if tgt_err:
+            detail_parts.append(f"TGT={tgt_err}")
+        if status == TABLE_PRESENCE_STATUS_UNKNOWN and not detail_parts and src_has is False and tgt_has is True:
+            detail_parts.append("源端空表但目标端非空")
+        detail = "; ".join(detail_parts) if detail_parts else "-"
+        rows.append(TablePresenceResult(
+            source_schema=src_schema,
+            source_table=src_table,
+            target_schema=tgt_schema,
+            target_table=tgt_table,
+            source_has_rows=_table_presence_flag(src_has),
+            target_has_rows=_table_presence_flag(tgt_has),
+            status=status,
+            detail=detail,
+            source_probe_ms=src_ms,
+            target_probe_ms=tgt_ms
+        ))
+
+    total_risk = len([row for row in rows if row.status == TABLE_PRESENCE_STATUS_RISK])
+    total_ok_nonempty = len([row for row in rows if row.status == TABLE_PRESENCE_STATUS_OK_BOTH_NONEMPTY])
+    total_ok_empty = len([row for row in rows if row.status == TABLE_PRESENCE_STATUS_OK_BOTH_EMPTY])
+    total_unknown = len([row for row in rows if row.status == TABLE_PRESENCE_STATUS_UNKNOWN])
+    summary = TablePresenceSummary(
+        total_candidates=total_candidates,
+        total_checked=len(rows),
+        total_risk=total_risk,
+        total_ok_nonempty=total_ok_nonempty,
+        total_ok_empty=total_ok_empty,
+        total_unknown=total_unknown,
+        total_skipped=0,
+        duration_seconds=time.perf_counter() - start_perf,
+        mode=mode,
+        rows=rows
+    )
+    log.info(
+        "[TABLE_PRESENCE] 完成：risk=%d, ok_nonempty=%d, ok_empty=%d, unknown=%d, skipped=%d。",
+        summary.total_risk,
+        summary.total_ok_nonempty,
+        summary.total_ok_empty,
+        summary.total_unknown,
+        summary.total_skipped
+    )
+    return summary
+
+
 # ====================== DDL 抽取 & ALTER 级别修补 ======================
 
 def parse_oracle_dsn(dsn: str) -> Tuple[str, str, Optional[str]]:
@@ -25865,6 +26340,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "依赖关系差异明细"
     if name.startswith("usability_check_detail_"):
         return "DETAIL", "对象可用性校验明细"
+    if name.startswith("table_data_presence_detail_"):
+        return "DETAIL", "表数据存在性风险明细"
     if name.startswith("missing_") and "_detail_" in name:
         match = re.match(r"missing_(.+)_detail_", name)
         if match:
@@ -26593,6 +27070,45 @@ def export_usability_check_detail(
             str(item.tgt_time_ms)
         ])
     return write_pipe_report("对象可用性校验明细", header_fields, rows, output_path)
+
+
+def export_table_data_presence_detail(
+    summary: TablePresenceSummary,
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not summary or not report_dir or not report_timestamp:
+        return None
+    if not summary.rows:
+        return None
+    output_path = Path(report_dir) / f"table_data_presence_detail_{report_timestamp}.txt"
+    header_fields = [
+        "SOURCE_SCHEMA",
+        "SOURCE_TABLE",
+        "TARGET_SCHEMA",
+        "TARGET_TABLE",
+        "SOURCE_HAS_ROWS",
+        "TARGET_HAS_ROWS",
+        "STATUS",
+        "DETAIL",
+        "SOURCE_PROBE_MS",
+        "TARGET_PROBE_MS"
+    ]
+    rows: List[List[str]] = []
+    for item in summary.rows:
+        rows.append([
+            item.source_schema,
+            item.source_table,
+            item.target_schema,
+            item.target_table,
+            item.source_has_rows,
+            item.target_has_rows,
+            item.status,
+            item.detail or "-",
+            str(item.source_probe_ms),
+            str(item.target_probe_ms)
+        ])
+    return write_pipe_report("表数据存在性风险明细", header_fields, rows, output_path)
 
 
 def export_extra_mismatch_detail(
@@ -27385,6 +27901,7 @@ REPORT_DB_TABLES = {
     "grants": "DIFF_REPORT_GRANT",
     "counts": "DIFF_REPORT_COUNTS",
     "usability": "DIFF_REPORT_USABILITY",
+    "table_presence": "DIFF_REPORT_TABLE_PRESENCE",
     "package_compare": "DIFF_REPORT_PACKAGE_COMPARE",
     "trigger_status": "DIFF_REPORT_TRIGGER_STATUS",
     "artifact": "DIFF_REPORT_ARTIFACT",
@@ -27637,6 +28154,22 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['usability']} (
     CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP
 )
 """
+    ddl_table_presence = f"""
+CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['table_presence']} (
+    REPORT_ID           VARCHAR2(64) NOT NULL,
+    SOURCE_SCHEMA       VARCHAR2(128) NOT NULL,
+    SOURCE_TABLE        VARCHAR2(256) NOT NULL,
+    TARGET_SCHEMA       VARCHAR2(128) NOT NULL,
+    TARGET_TABLE        VARCHAR2(256) NOT NULL,
+    SOURCE_HAS_ROWS     VARCHAR2(16),
+    TARGET_HAS_ROWS     VARCHAR2(16),
+    STATUS              VARCHAR2(64),
+    DETAIL              VARCHAR2(2000),
+    SOURCE_PROBE_MS     NUMBER DEFAULT 0,
+    TARGET_PROBE_MS     NUMBER DEFAULT 0,
+    CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP
+)
+"""
     ddl_package_compare = f"""
 CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['package_compare']} (
     REPORT_ID           VARCHAR2(64) NOT NULL,
@@ -27843,6 +28376,10 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['resolution']} (
          f"CREATE INDEX IDX_DIFF_USABILITY_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['usability']}(REPORT_ID)"),
         ("IDX_DIFF_USABILITY_TYPE",
          f"CREATE INDEX IDX_DIFF_USABILITY_TYPE ON {schema_prefix}{REPORT_DB_TABLES['usability']}(OBJECT_TYPE)"),
+        ("IDX_DIFF_TBL_PRESENCE_REPORT_ID",
+         f"CREATE INDEX IDX_DIFF_TBL_PRESENCE_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['table_presence']}(REPORT_ID)"),
+        ("IDX_DIFF_TBL_PRESENCE_STATUS",
+         f"CREATE INDEX IDX_DIFF_TBL_PRESENCE_STATUS ON {schema_prefix}{REPORT_DB_TABLES['table_presence']}(STATUS)"),
         ("IDX_DIFF_PKG_REPORT_ID",
          f"CREATE INDEX IDX_DIFF_PKG_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['package_compare']}(REPORT_ID)"),
         ("IDX_DIFF_PKG_OBJ",
@@ -27908,6 +28445,8 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['resolution']} (
         to_create.append(("counts", ddl_counts))
     if REPORT_DB_TABLES["usability"] not in existing:
         to_create.append(("usability", ddl_usability))
+    if REPORT_DB_TABLES["table_presence"] not in existing:
+        to_create.append(("table_presence", ddl_table_presence))
     if REPORT_DB_TABLES["package_compare"] not in existing:
         to_create.append(("package_compare", ddl_package_compare))
     if REPORT_DB_TABLES["trigger_status"] not in existing:
@@ -28713,6 +29252,31 @@ def _build_report_usability_rows(
     return rows
 
 
+def _build_report_table_presence_rows(
+    summary: Optional[TablePresenceSummary]
+) -> List[Dict[str, object]]:
+    if not summary:
+        return []
+    rows: List[Dict[str, object]] = []
+    for item in summary.rows:
+        detail = item.detail or ""
+        if len(detail) > 2000:
+            detail = detail[:1997] + "..."
+        rows.append({
+            "source_schema": item.source_schema,
+            "source_table": item.source_table,
+            "target_schema": item.target_schema,
+            "target_table": item.target_table,
+            "source_has_rows": item.source_has_rows,
+            "target_has_rows": item.target_has_rows,
+            "status": item.status,
+            "detail": detail,
+            "source_probe_ms": int(item.source_probe_ms or 0),
+            "target_probe_ms": int(item.target_probe_ms or 0),
+        })
+    return rows
+
+
 def _hash_package_compare_row(row: PackageCompareRow) -> str:
     payload = "|".join([
         row.src_full or "",
@@ -28849,6 +29413,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "TRIGGER_STATUS"
     if name.startswith("usability_check_detail_"):
         return "USABILITY_DETAIL"
+    if name.startswith("table_data_presence_detail_"):
+        return "TABLE_PRESENCE_DETAIL"
     if name.startswith("dependency_chains_"):
         return "DEPENDENCY_CHAINS"
     if name.startswith("VIEWs_chain_"):
@@ -28897,7 +29463,7 @@ def _infer_artifact_status(
                 return "PARTIAL", "detail_truncated"
             return "IN_DB", ""
         return "TXT_ONLY", ""
-    if artifact_type in {"PACKAGE_COMPARE", "TRIGGER_STATUS", "USABILITY_DETAIL", "FILTERED_GRANTS"}:
+    if artifact_type in {"PACKAGE_COMPARE", "TRIGGER_STATUS", "USABILITY_DETAIL", "TABLE_PRESENCE_DETAIL", "FILTERED_GRANTS"}:
         return ("IN_DB", "") if store_scope in {"core", "full"} else ("TXT_ONLY", "")
     if artifact_type in {"DEPENDENCY_CHAINS", "VIEW_CHAIN", "REMAP_CONFLICT", "OBJECT_MAPPING",
                          "BLACKLIST_TABLES", "FIXUP_SKIP_SUMMARY", "OMS_MISSING_RULES"}:
@@ -29536,6 +30102,54 @@ def _insert_report_usability_rows(
                 schema_prefix,
                 report_id,
                 REPORT_DB_TABLES["usability"],
+                insert_sql,
+                err
+            )
+    return ok_all
+
+
+def _insert_report_table_presence_rows(
+    ob_cfg: ObConfig,
+    schema_prefix: str,
+    report_id: str,
+    rows: List[Dict[str, object]],
+    batch_size: int
+) -> bool:
+    if not rows:
+        return True
+    ok_all = True
+    for batch in chunk_list(rows, batch_size):
+        values_sql: List[str] = []
+        for row in batch:
+            values_sql.append(
+                "INTO {table} (REPORT_ID, SOURCE_SCHEMA, SOURCE_TABLE, TARGET_SCHEMA, TARGET_TABLE, "
+                "SOURCE_HAS_ROWS, TARGET_HAS_ROWS, STATUS, DETAIL, SOURCE_PROBE_MS, TARGET_PROBE_MS) "
+                "VALUES ({report_id}, {source_schema}, {source_table}, {target_schema}, {target_table}, "
+                "{source_has_rows}, {target_has_rows}, {status}, {detail}, {source_probe_ms}, {target_probe_ms})".format(
+                    table=f"{schema_prefix}{REPORT_DB_TABLES['table_presence']}",
+                    report_id=sql_quote_literal(report_id),
+                    source_schema=sql_quote_literal(row.get("source_schema")),
+                    source_table=sql_quote_literal(row.get("source_table")),
+                    target_schema=sql_quote_literal(row.get("target_schema")),
+                    target_table=sql_quote_literal(row.get("target_table")),
+                    source_has_rows=sql_quote_literal(row.get("source_has_rows")) if row.get("source_has_rows") else "NULL",
+                    target_has_rows=sql_quote_literal(row.get("target_has_rows")) if row.get("target_has_rows") else "NULL",
+                    status=sql_quote_literal(row.get("status")) if row.get("status") else "NULL",
+                    detail=sql_quote_literal(row.get("detail")) if row.get("detail") else "NULL",
+                    source_probe_ms=int(row.get("source_probe_ms", 0) or 0),
+                    target_probe_ms=int(row.get("target_probe_ms", 0) or 0),
+                )
+            )
+        insert_sql = "INSERT ALL\n  " + "\n  ".join(values_sql) + "\nSELECT 1 FROM DUAL"
+        ok, _out, err = obclient_run_sql_commit(ob_cfg, insert_sql)
+        if not ok:
+            ok_all = False
+            log.warning("[REPORT_DB] 写入 table_presence 失败: %s", err)
+            _record_report_db_write_error(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                REPORT_DB_TABLES["table_presence"],
                 insert_sql,
                 err
             )
@@ -30707,6 +31321,7 @@ def save_report_to_db(
     target_schemas: Optional[Set[str]],
     grant_plan: Optional[GrantPlan] = None,
     usability_summary: Optional[UsabilitySummary] = None,
+    table_presence_summary: Optional[TablePresenceSummary] = None,
     package_results: Optional[PackageCompareResults] = None,
     trigger_status_rows: Optional[List[TriggerStatusReportRow]] = None,
     constraint_status_rows: Optional[List[ConstraintStatusDriftRow]] = None,
@@ -30973,6 +31588,9 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
         usability_rows = _build_report_usability_rows(usability_summary)
         if usability_rows:
             _insert_report_usability_rows(ob_cfg, schema_prefix, report_id, usability_rows, batch_size)
+        table_presence_rows = _build_report_table_presence_rows(table_presence_summary)
+        if table_presence_rows:
+            _insert_report_table_presence_rows(ob_cfg, schema_prefix, report_id, table_presence_rows, batch_size)
         package_rows = _build_report_package_compare_rows(package_results, report_dir, report_timestamp)
         if package_rows:
             _insert_report_package_compare_rows(ob_cfg, schema_prefix, report_id, package_rows, batch_size)
@@ -31211,6 +31829,7 @@ def build_run_summary(
     support_summary: Optional[SupportClassificationResult] = None,
     noise_suppressed_count: int = 0,
     noise_suppressed_path: Optional[Path] = None,
+    table_presence_summary: Optional[TablePresenceSummary] = None,
     excluded_object_rows: Optional[List[Dict[str, object]]] = None
 ) -> RunSummary:
     end_time = datetime.now()
@@ -31250,6 +31869,19 @@ def build_run_summary(
             actions_done.append("注释一致性校验: 启用")
     else:
         actions_skipped.append("注释一致性校验: check_comments=false")
+
+    if table_presence_summary:
+        actions_done.append(
+            "表数据存在性校验: mode={mode}, 校验 {checked}, 风险 {risk}, unknown {unknown}, 跳过 {skipped}".format(
+                mode=table_presence_summary.mode,
+                checked=table_presence_summary.total_checked,
+                risk=table_presence_summary.total_risk,
+                unknown=table_presence_summary.total_unknown,
+                skipped=table_presence_summary.total_skipped
+            )
+        )
+    elif "表数据存在性校验" in ctx.phase_skip_reasons:
+        actions_skipped.append(f"表数据存在性校验: {ctx.phase_skip_reasons['表数据存在性校验']}")
 
     if ctx.enable_dependencies_check:
         actions_done.append("依赖校验: 启用")
@@ -31324,6 +31956,9 @@ def build_run_summary(
     dep_missing_cnt = len(dependency_report.get("missing", []))
     dep_unexpected_cnt = len(dependency_report.get("unexpected", []))
     dep_skipped_cnt = len(dependency_report.get("skipped", []))
+    table_presence_risk_cnt = int((table_presence_summary.total_risk if table_presence_summary else 0) or 0)
+    table_presence_unknown_cnt = int((table_presence_summary.total_unknown if table_presence_summary else 0) or 0)
+    table_presence_skipped_cnt = int((table_presence_summary.total_skipped if table_presence_summary else 0) or 0)
     unsupported_by_type: Dict[str, int] = build_unsupported_summary_counts(support_summary, extra_results)
     excluded_by_type: Dict[str, int] = build_excluded_summary_counts(excluded_object_rows)
     findings: List[str] = [
@@ -31355,6 +31990,15 @@ def build_run_summary(
         )
     if ctx.enable_dependencies_check:
         findings.append(f"依赖差异: 缺失 {dep_missing_cnt}, 额外 {dep_unexpected_cnt}, 跳过 {dep_skipped_cnt}")
+    if table_presence_summary:
+        findings.append(
+            "表数据存在性: 风险 {risk}, unknown {unknown}, 跳过 {skipped} (mode={mode})".format(
+                risk=table_presence_risk_cnt,
+                unknown=table_presence_unknown_cnt,
+                skipped=table_presence_skipped_cnt,
+                mode=table_presence_summary.mode
+            )
+        )
     if noise_suppressed_count:
         if noise_suppressed_path:
             findings.append(f"降噪项: {noise_suppressed_count} (见 {noise_suppressed_path})")
@@ -31409,6 +32053,10 @@ def build_run_summary(
         attention.append("依赖校验已关闭，依赖差异可能未暴露。")
     if dep_missing_cnt or dep_unexpected_cnt:
         attention.append("依赖关系存在缺失或额外，需要补齐或清理。")
+    if table_presence_risk_cnt:
+        attention.append("存在“源有数据但目标空表”风险，需要优先补数。")
+    if table_presence_unknown_cnt:
+        attention.append("表数据存在性校验存在 unknown 结果，建议核查权限/对象状态。")
     if blacklist_missing_cnt:
         attention.append("存在黑名单表，未生成 OMS 规则。")
     if trigger_summary.get("error") or trigger_summary.get("invalid_entries"):
@@ -31446,6 +32094,14 @@ def build_run_summary(
         next_steps.append("修正 trigger_list 清单内容后重新运行。")
     if dep_missing_cnt or dep_unexpected_cnt:
         next_steps.append("根据依赖差异报告补齐编译或授权。")
+    if table_presence_risk_cnt:
+        if report_file:
+            report_parent = Path(report_file).parent
+            next_steps.append(
+                f"优先处理 {report_parent}/table_data_presence_detail_*.txt 中的 RISK_SOURCE_NONEMPTY_TARGET_EMPTY 表。"
+            )
+        else:
+            next_steps.append("优先处理 table_data_presence_detail_*.txt 中的 RISK_SOURCE_NONEMPTY_TARGET_EMPTY 表。")
     if comment_mis_cnt:
         next_steps.append("确认注释差异是否需要修复。")
     if ctx.enable_grant_generation and ctx.fixup_enabled:
@@ -31578,6 +32234,7 @@ def print_final_report(
     support_summary: Optional[SupportClassificationResult] = None,
     noise_suppressed_details: Optional[List[NoiseSuppressedDetail]] = None,
     usability_summary: Optional[UsabilitySummary] = None,
+    table_presence_summary: Optional[TablePresenceSummary] = None,
     excluded_object_rows: Optional[List[Dict[str, object]]] = None
 ):
     custom_theme = Theme({
@@ -31682,6 +32339,13 @@ def print_final_report(
     usability_timeout_cnt = 0
     usability_skipped_cnt = 0
     usability_sampled_out_cnt = 0
+    table_presence_risk_cnt = 0
+    table_presence_ok_nonempty_cnt = 0
+    table_presence_ok_empty_cnt = 0
+    table_presence_unknown_cnt = 0
+    table_presence_skipped_cnt = 0
+    table_presence_checked_cnt = 0
+    table_presence_mode = "-"
     if usability_summary:
         usability_checked_cnt = usability_summary.total_checked
         usability_usable_cnt = usability_summary.total_usable
@@ -31691,6 +32355,14 @@ def print_final_report(
         usability_timeout_cnt = usability_summary.total_timeout
         usability_skipped_cnt = usability_summary.total_skipped
         usability_sampled_out_cnt = usability_summary.total_sampled_out
+    if table_presence_summary:
+        table_presence_risk_cnt = int(table_presence_summary.total_risk or 0)
+        table_presence_ok_nonempty_cnt = int(table_presence_summary.total_ok_nonempty or 0)
+        table_presence_ok_empty_cnt = int(table_presence_summary.total_ok_empty or 0)
+        table_presence_unknown_cnt = int(table_presence_summary.total_unknown or 0)
+        table_presence_skipped_cnt = int(table_presence_summary.total_skipped or 0)
+        table_presence_checked_cnt = int(table_presence_summary.total_checked or 0)
+        table_presence_mode = table_presence_summary.mode or "-"
     source_missing_schema_cnt = len(schema_summary.get("source_missing", []))
     package_rows: List[PackageCompareRow] = []
     package_diff_rows: List[PackageCompareRow] = []
@@ -31814,7 +32486,7 @@ def print_final_report(
 
     def build_execution_conclusion() -> Panel:
         ext_mismatch_cnt = idx_missing_cnt + cons_missing_cnt + seq_missing_cnt + trg_missing_cnt
-        actionable_cnt = missing_count + mismatched_count + ext_mismatch_cnt
+        actionable_cnt = missing_count + mismatched_count + ext_mismatch_cnt + table_presence_risk_cnt
         blocked_total = (
             unsupported_total
             + idx_blocked_cnt
@@ -31833,6 +32505,13 @@ def print_final_report(
                 f"序列 {seq_missing_cnt}, 触发器 {trg_missing_cnt}"
             ),
         ]
+        if table_presence_summary:
+            lines.append(
+                "表数据存在性风险: "
+                f"源有数据目标空表 {table_presence_risk_cnt}, "
+                f"unknown {table_presence_unknown_cnt}, "
+                f"跳过 {table_presence_skipped_cnt} (mode={table_presence_mode})"
+            )
         if missing_supported_cnt or unsupported_blocked_cnt:
             lines.append(
                 f"迁移聚焦: 缺失可修补 {missing_supported_cnt}, 不兼容/阻断/待确认 {unsupported_blocked_cnt}"
@@ -32108,6 +32787,27 @@ def print_final_report(
             usability_text.append(f"usability_check_detail_{report_ts}.txt", style="info")
         summary_table.add_row("[bold]对象可用性 (VIEW/SYNONYM)[/bold]", usability_text)
 
+    if table_presence_summary:
+        presence_text = Text()
+        presence_text.append("校验表: ", style="info")
+        presence_text.append(str(table_presence_checked_cnt), style="info")
+        if table_presence_skipped_cnt:
+            presence_text.append("  跳过: ", style="info")
+            presence_text.append(str(table_presence_skipped_cnt), style="info")
+        presence_text.append("\n风险(源有/目标空): ", style="missing")
+        presence_text.append(str(table_presence_risk_cnt), style="missing")
+        presence_text.append("  unknown: ", style="mismatch")
+        presence_text.append(str(table_presence_unknown_cnt), style="mismatch")
+        presence_text.append("\nOK(nonempty): ", style="ok")
+        presence_text.append(str(table_presence_ok_nonempty_cnt), style="ok")
+        presence_text.append("  OK(empty): ", style="ok")
+        presence_text.append(str(table_presence_ok_empty_cnt), style="ok")
+        presence_text.append(f"\nmode={table_presence_mode}", style="info")
+        if report_ts:
+            presence_text.append("\n详见: ", style="info")
+            presence_text.append(f"table_data_presence_detail_{report_ts}.txt", style="info")
+        summary_table.add_row("[bold]表数据存在性风险[/bold]", presence_text)
+
     console.print(summary_table)
     console.print("")
     console.print("")
@@ -32169,6 +32869,10 @@ def print_final_report(
         if usability_summary and report_ts:
             detail_hint_lines.append(
                 f"对象可用性明细: usability_check_detail_{report_ts}.txt"
+            )
+        if table_presence_summary and report_ts:
+            detail_hint_lines.append(
+                f"表数据存在性风险明细: table_data_presence_detail_{report_ts}.txt"
             )
         if emit_detail_files and report_ts:
             if blocked_index_rows:
@@ -32683,6 +33387,7 @@ def print_final_report(
             support_summary=support_summary,
             noise_suppressed_count=noise_suppressed_count,
             noise_suppressed_path=noise_detail_path,
+            table_presence_summary=table_presence_summary,
             excluded_object_rows=excluded_object_rows
         )
         console.print(render_run_summary_panel(run_summary, section_width))
@@ -32938,12 +33643,19 @@ def print_final_report(
         column_order_mismatch_path = None
         comment_mismatch_path = None
         usability_detail_path = None
+        table_presence_detail_path = None
         extra_mismatch_path = None
         dependency_detail_path = None
         noise_suppressed_path = None
         if usability_summary and report_ts:
             usability_detail_path = export_usability_check_detail(
                 usability_summary,
+                report_path.parent,
+                report_ts
+            )
+        if table_presence_summary and report_ts:
+            table_presence_detail_path = export_table_data_presence_detail(
+                table_presence_summary,
                 report_path.parent,
                 report_ts
             )
@@ -33023,6 +33735,12 @@ def print_final_report(
             usability_detail_path,
             len(usability_summary.results) if usability_summary else 0,
             "对象可用性校验明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            table_presence_detail_path,
+            len(table_presence_summary.rows) if table_presence_summary else 0,
+            "表数据存在性风险明细"
         )
         extra_mismatch_count = (
             len(extra_results.get("index_mismatched", []) or [])
@@ -33126,6 +33844,8 @@ def print_final_report(
                 log.info("注释差异明细已输出到: %s", comment_mismatch_path)
             if usability_detail_path:
                 log.info("对象可用性明细已输出到: %s", usability_detail_path)
+            if table_presence_detail_path:
+                log.info("表数据存在性风险明细已输出到: %s", table_presence_detail_path)
             if extra_mismatch_path:
                 log.info("扩展对象差异明细已输出到: %s", extra_mismatch_path)
             if noise_suppressed_path:
@@ -33215,6 +33935,10 @@ def parse_cli_args() -> argparse.Namespace:
             ddl_format_timeout      SQLcl 批次超时（秒，0 不超时）
             check_dependencies      true/false 控制依赖校验
             check_column_order      true/false 控制列顺序校验（默认 false）
+            table_data_presence_check 表数据存在性风险校验 (off/auto/on, 默认 auto)
+            table_data_presence_auto_max_tables auto 模式候选表阈值（默认 20000）
+            table_data_presence_chunk_size OB 批量探测 chunk 大小（默认 500）
+            table_data_presence_obclient_timeout OB 批量探测超时（秒，默认沿用 obclient_timeout）
             generate_grants         true/false 控制授权脚本生成
             grant_tab_privs_scope   owner/owner_or_grantee 控制 DBA_TAB_PRIVS 抽取范围
             grant_merge_privileges  true/false 合并同对象多权限授权
@@ -33241,6 +33965,7 @@ def parse_cli_args() -> argparse.Namespace:
           main_reports/run_<ts>/unsupported_objects_detail_<ts>.txt 不支持/阻断对象明细 (report_detail_mode=split)
           main_reports/run_<ts>/view_constraint_cleaned_detail_<ts>.txt VIEW 列清单约束清洗明细 (report_detail_mode=split)
           main_reports/run_<ts>/view_constraint_uncleanable_detail_<ts>.txt VIEW 列清单约束无法清洗明细 (report_detail_mode=split)
+          main_reports/run_<ts>/table_data_presence_detail_<ts>.txt 表数据存在性风险明细
           main_reports/run_<ts>/extra_mismatch_detail_<ts>.txt 扩展对象差异明细 (report_detail_mode=split)
           main_reports/run_<ts>/missing_<TYPE>_detail_<ts>.txt 按类型缺失明细 (report_detail_mode=split)
           main_reports/run_<ts>/unsupported_<TYPE>_detail_<ts>.txt 按类型不支持/阻断明细 (含 ROOT_CAUSE)
@@ -33301,6 +34026,8 @@ def main():
         enable_column_order_check: bool = bool(settings.get('enable_column_order_check', False))
         enable_grant_generation: bool = bool(settings.get('enable_grant_generation', True))
         enable_usability_check: bool = bool(settings.get('check_object_usability', False))
+        table_data_presence_mode: str = str(settings.get("table_data_presence_check_mode", "auto")).strip().lower()
+        enable_table_presence_check: bool = table_data_presence_mode != "off"
 
         # 初始化 Oracle Instant Client (Thick Mode)
         init_oracle_client_from_settings(settings)
@@ -33342,6 +34069,8 @@ def main():
             log.info("已根据配置关闭授权脚本生成。")
         if enable_usability_check:
             log.info("已开启 VIEW/SYNONYM 可用性校验。")
+        if enable_table_presence_check:
+            log.info("已开启表数据存在性风险校验 (mode=%s)。", table_data_presence_mode)
         log.info(
             "OB 特性门控: ob_version=%s, gate=%s, interval(mode=%s)->%s, mview(mode=%s)->%s",
             gate_info.get("version") or "unknown",
@@ -33371,6 +34100,10 @@ def main():
         phase_skip_reasons["扩展对象校验"] = "check_extra_types 为空"
     if not enable_usability_check:
         phase_skip_reasons["对象可用性校验"] = "check_object_usability=false"
+    if not enable_table_presence_check:
+        phase_skip_reasons["表数据存在性校验"] = "table_data_presence_check=off"
+    elif "TABLE" not in enabled_primary_types:
+        phase_skip_reasons["表数据存在性校验"] = "check_primary_types 未启用 TABLE"
     if not enable_dependencies_check:
         phase_skip_reasons["依赖/授权校验"] = "check_dependencies=false"
     if not generate_fixup_enabled:
@@ -33572,6 +34305,7 @@ def main():
             "OceanBase 元数据转储",
             "Oracle 元数据转储",
             "主对象校验",
+            "表数据存在性校验",
             "扩展对象校验",
             "对象可用性校验",
             "依赖/授权校验",
@@ -33666,7 +34400,8 @@ def main():
             filtered_grants=None,
             config_diagnostics=config_diagnostics,
             fixup_skip_summary=None,
-            usability_summary=None
+            usability_summary=None,
+            table_presence_summary=None
         )
         if run_summary:
             log_run_summary(run_summary)
@@ -33686,6 +34421,7 @@ def main():
                 set(),
                 grant_plan=None,
                 usability_summary=None,
+                table_presence_summary=None,
                 package_results=package_results,
                 trigger_status_rows=None,
                 dependency_report=dependency_report,
@@ -34053,6 +34789,19 @@ def main():
             enable_comment_check
         )
 
+    table_presence_summary: Optional[TablePresenceSummary] = None
+    if enable_table_presence_check and "TABLE" in enabled_primary_types:
+        with phase_timer("表数据存在性校验", phase_durations):
+            table_presence_summary = check_table_data_presence(
+                settings,
+                master_list,
+                tv_results,
+                ob_cfg,
+                ora_cfg,
+                ob_meta,
+                enabled_primary_types
+            )
+
     # 8) 扩展对象校验 (索引/约束/序列/触发器)
     extra_check_ctx = phase_timer("扩展对象校验", phase_durations) if enabled_extra_types else nullcontext()
     with extra_check_ctx:
@@ -34402,6 +35151,7 @@ def main():
         support_summary=support_summary,
         noise_suppressed_details=noise_suppressed_details,
         usability_summary=usability_summary,
+        table_presence_summary=table_presence_summary,
         excluded_object_rows=excluded_object_report_rows
     )
     if run_summary:
@@ -34422,6 +35172,7 @@ def main():
             target_schemas,
             grant_plan=grant_plan,
             usability_summary=usability_summary,
+            table_presence_summary=table_presence_summary,
             package_results=package_results,
             trigger_status_rows=trigger_status_rows,
             constraint_status_rows=constraint_status_rows,

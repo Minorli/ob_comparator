@@ -1,7 +1,7 @@
 ============================================================
 OceanBase 报告库排查手册（report_to_db）
 文件: HOW_TO_READ_REPORTS_IN_OB_latest.txt
-快照: HOW_TO_READ_REPORTS_IN_OB_20260212_15_sqls.txt
+快照: HOW_TO_READ_REPORTS_IN_OB_20260213_09_sqls.txt
 ============================================================
 
 使用说明
@@ -24,7 +24,8 @@ L0. 快速入口（新手只看这 12 条）
 4) SQL-16, SQL-37：看缺失与不一致主类型
 5) SQL-60, SQL-61, SQL-62, SQL-63：看权限缺失/不一致/不支持
 6) SQL-67：看 VIEW/SYNONYM 可用性
-7) SQL-47：看依赖边状态分布
+7) SQL-78, SQL-79：看“源有数据/目标空表”高风险清单
+8) SQL-47：看依赖边状态分布
 
 ------------------------------------------------------------
 L1. 场景剧本（按问题类型排查）
@@ -1168,6 +1169,41 @@ SELECT x.target_full,
   LEFT JOIN m ON UPPER(x.target_full) = m.target_full
  ORDER BY mapping_flag DESC, x.target_full;
 
+------------------------------------------------------------
+H. 表数据存在性风险（SQL-78 ~ SQL-81）
+------------------------------------------------------------
+
+-- SQL-78 源有数据/目标空表（高风险优先清单）
+SELECT source_schema, source_table, target_schema, target_table,
+       source_has_rows, target_has_rows, status, detail
+  FROM DIFF_REPORT_TABLE_PRESENCE
+ WHERE report_id = :report_id
+   AND status = 'RISK_SOURCE_NONEMPTY_TARGET_EMPTY'
+ ORDER BY target_schema, target_table;
+
+-- SQL-79 表数据存在性状态分布（risk/ok/unknown）
+SELECT status, COUNT(*) AS cnt
+  FROM DIFF_REPORT_TABLE_PRESENCE
+ WHERE report_id = :report_id
+ GROUP BY status
+ ORDER BY cnt DESC, status;
+
+-- SQL-80 按 schema 统计“源有数据/目标空表”风险
+SELECT target_schema, COUNT(*) AS risk_cnt
+  FROM DIFF_REPORT_TABLE_PRESENCE
+ WHERE report_id = :report_id
+   AND status = 'RISK_SOURCE_NONEMPTY_TARGET_EMPTY'
+ GROUP BY target_schema
+ ORDER BY risk_cnt DESC, target_schema;
+
+-- SQL-81 表数据存在性 unknown 明细（权限/对象异常优先排查）
+SELECT source_schema, source_table, target_schema, target_table,
+       source_has_rows, target_has_rows, detail
+  FROM DIFF_REPORT_TABLE_PRESENCE
+ WHERE report_id = :report_id
+   AND status = 'UNKNOWN'
+ ORDER BY target_schema, target_table;
+
 ============================================================
 建议排查顺序（实战）
 1) SQL-01/02/08/10 先建立全局认知。
@@ -1177,4 +1213,5 @@ SELECT x.target_full,
 5) SQL-47~59 定位依赖链、remap、同义词/public 特殊问题。
 6) SQL-60~73 收口权限、可用性、package/trigger 与写库异常。
 7) SQL-74~77 专项核查“多余对象/多余同义词”。
+8) SQL-78~81 单独处理“源有数据/目标空表”风险清单。
 ============================================================
