@@ -34,12 +34,13 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
+from tool_version import __version__
+
 try:
     import oracledb
 except ImportError:
     oracledb = None
 
-__version__ = "0.9.8.4"
 __author__ = "Minor Li"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
 REPO_ISSUES_URL = f"{REPO_URL}/issues"

@@ -51,6 +51,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
+from tool_version import __version__
+
 CONFIG_DEFAULT_PATH = "config.ini"
 DEFAULT_FIXUP_DIR = "fixup_scripts"
 DONE_DIR_NAME = "done"
@@ -3481,8 +3483,9 @@ def parse_args() -> argparse.Namespace:
         项目信息：
           主页: {repo_url}
           反馈: {issues_url}
+          版本: {version}
         """
-    ).format(repo_url=REPO_URL, issues_url=REPO_ISSUES_URL)
+    ).format(repo_url=REPO_URL, issues_url=REPO_ISSUES_URL, version=__version__)
     
     parser = argparse.ArgumentParser(
         description=desc,
@@ -3494,6 +3497,11 @@ def parse_args() -> argparse.Namespace:
         nargs="?",
         default=CONFIG_DEFAULT_PATH,
         help="config.ini path (default: config.ini)",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     
     parser.add_argument(
@@ -3647,6 +3655,7 @@ def main() -> None:
     else:
         log.info("日志级别: console=%s", logging.getLevelName(level))
     set_console_log_level(level)
+    log.info("run_fixup v%s", __version__)
     
     # Check if iterative mode requested via config or args
     iterative_mode = getattr(args, 'iterative', False)

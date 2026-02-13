@@ -1,14 +1,13 @@
 # OceanBase Comparator Toolkit
 
-> 当前版本：V0.9.8.4  
+> 当前版本：V0.9.8.5  
 > 面向 Oracle → OceanBase (Oracle 模式) 的结构一致性校验与修补脚本生成工具  
 > 核心理念：一次转储、本地对比、脚本审计优先
 
-## 近期更新（0.9.8.4）
-- 触发器扩展校验降噪：按 `OWNER.TRIGGER_NAME` 比较，修复同表跨 schema 同名触发器误报 `EXTRA_TRIGGER`。
-- 约束扩展校验降噪：在签名层与对比层双重忽略 OceanBase 自动 `*_OBNOTNULL_*` 约束，降低 `NOT NULL` 命名差异噪声。
-- report_to_db `full` 模式继续增强：支持 `DIFF_REPORT_ARTIFACT_LINE` 报告逐行入库，提升数据库侧闭环排查能力。
-- 文档与版本全面同步到 `0.9.8.4`。
+## 近期更新（0.9.8.5）
+- 主程序、`run_fixup.py`、`init_users_roles.py` 改为共享统一版本号，避免版本漂移。
+- `run_fixup.py` 新增 `--version` 并在启动日志打印版本，便于现场排查。
+- 文档与版本标记全面同步到 `0.9.8.5`。
 
 ## 核心能力
 - **对象覆盖完整**：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。
