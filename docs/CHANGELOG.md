@@ -8,7 +8,7 @@
 - `run_fixup.py` 新增 `--version` 输出，便于现场快速确认执行器版本。
 
 ### 变更
-- 新增共享版本文件 `tool_version.py`，主程序、`run_fixup.py`、`init_users_roles.py` 统一引用同一版本号。
+- 版本号改回脚本内置常量，移除对 `tool_version.py` 的运行时依赖，兼容“仅替换单个脚本”的历史分发方式。
 - README / readme_config / ARCHITECTURE / ADVANCED_USAGE / TECHNICAL_SPECIFICATION / DEPLOYMENT 同步到 `0.9.8.5`。
 
 ## [0.9.8.4] - 2026-02-10
