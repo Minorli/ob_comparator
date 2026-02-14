@@ -276,8 +276,6 @@ def ob_query(ob_cfg: ObCfg, sql: str, timeout: Optional[int] = None) -> List[Lis
             rows.append([col.strip() for col in line.split("\t")])
         elif LINE_SEP in line:
             rows.append([col.strip() for col in line.split(LINE_SEP)])
-        elif "|" in line:
-            rows.append([col.strip() for col in line.split("|")])
         else:
             rows.append([line])
     return rows
@@ -403,6 +401,40 @@ def load_detail_group_counts(ob_cfg: ObCfg, settings: ToolSettings, report_id: s
     return result
 
 
+def load_counts_by_type(ob_cfg: ObCfg, settings: ToolSettings, report_id: str) -> Dict[str, Dict[str, int]]:
+    tbl = f"{_schema_prefix(settings)}{REPORT_TABLES['counts']}"
+    sql = (
+        "SELECT OBJECT_TYPE, "
+        "NVL(ORACLE_COUNT,0), NVL(OCEANBASE_COUNT,0), NVL(MISSING_COUNT,0), "
+        "NVL(MISSING_FIXABLE_COUNT,0), NVL(UNSUPPORTED_COUNT,0), NVL(EXCLUDED_COUNT,0) "
+        f"FROM {tbl} "
+        f"WHERE REPORT_ID = {sql_quote(report_id)}"
+    )
+    rows = ob_query(ob_cfg, sql)
+    result: Dict[str, Dict[str, int]] = {}
+    for row in rows:
+        if len(row) < 7:
+            continue
+        obj_type = (row[0] or "").strip().upper()
+        if not obj_type:
+            continue
+        values: List[int] = []
+        for raw in row[1:7]:
+            try:
+                values.append(int((raw or "0").strip() or "0"))
+            except ValueError:
+                values.append(0)
+        result[obj_type] = {
+            "oracle_count": values[0],
+            "oceanbase_count": values[1],
+            "missing_count": values[2],
+            "missing_fixable_count": values[3],
+            "unsupported_count": values[4],
+            "excluded_count": values[5],
+        }
+    return result
+
+
 def load_sample_detail_rows(
     ob_cfg: ObCfg,
     settings: ToolSettings,
@@ -521,22 +553,43 @@ def _parse_primary_types(meta: Dict[str, str]) -> List[str]:
     return [x.strip().upper() for x in raw.split(",") if x.strip()]
 
 
-def summarize_consistency(meta: Dict[str, str], group_counts: Dict[Tuple[str, str], int]) -> List[Tuple[str, int, int, str, str]]:
+def summarize_consistency(
+    meta: Dict[str, str],
+    group_counts: Dict[Tuple[str, str], int],
+    counts_by_type: Optional[Dict[str, Dict[str, int]]] = None,
+) -> List[Tuple[str, int, int, str, str]]:
     missing_detail = sum(cnt for (rt, _), cnt in group_counts.items() if rt == "MISSING")
     primary_types = set(_parse_primary_types(meta))
-    unsupported_primary = sum(
-        cnt for (rt, ot), cnt in group_counts.items() if rt == "UNSUPPORTED" and ot in primary_types
-    )
+    primary_count_types = primary_types - {"MATERIALIZED VIEW", "PACKAGE", "PACKAGE BODY"}
     mismatch_primary = sum(
-        cnt for (rt, ot), cnt in group_counts.items() if rt == "MISMATCHED" and ot in primary_types
+        cnt for (rt, ot), cnt in group_counts.items() if rt == "MISMATCHED" and ot in primary_count_types
     )
-    derived_missing_total = missing_detail + unsupported_primary
+    if counts_by_type:
+        missing_fixable_derived = sum(
+            int((vals or {}).get("missing_fixable_count", 0) or 0)
+            for vals in counts_by_type.values()
+        )
+        missing_primary_derived = sum(
+            int((counts_by_type.get(obj_type, {}) or {}).get("missing_count", 0) or 0)
+            for obj_type in primary_count_types
+        )
+        unsupported_total_derived = sum(
+            int((vals or {}).get("unsupported_count", 0) or 0)
+            for vals in counts_by_type.values()
+        )
+    else:
+        unsupported_primary = sum(
+            cnt for (rt, ot), cnt in group_counts.items() if rt == "UNSUPPORTED" and ot in primary_count_types
+        )
+        missing_fixable_derived = missing_detail
+        missing_primary_derived = missing_detail + unsupported_primary
+        unsupported_total_derived = unsupported_primary
 
     expectations = [
-        ("MISSING_FIXABLE_COUNT", int(meta.get("missing_fixable_count", "0") or 0), missing_detail),
-        ("MISSING_COUNT_DERIVED", int(meta.get("missing_count", "0") or 0), derived_missing_total),
+        ("MISSING_FIXABLE_COUNT", int(meta.get("missing_fixable_count", "0") or 0), missing_fixable_derived),
+        ("MISSING_COUNT_DERIVED", int(meta.get("missing_count", "0") or 0), missing_primary_derived),
         ("MISMATCHED_COUNT_PRIMARY", int(meta.get("mismatched_count", "0") or 0), mismatch_primary),
-        ("UNSUPPORTED_COUNT_PRIMARY", int(meta.get("unsupported_count", "0") or 0), unsupported_primary),
+        ("UNSUPPORTED_COUNT_PRIMARY", int(meta.get("unsupported_count", "0") or 0), unsupported_total_derived),
     ]
 
     detail_truncated = str(meta.get("detail_truncated", "0") or "0").strip() in {"1", "true", "TRUE"}
@@ -973,7 +1026,7 @@ def _find_latest_fixup_error_file(fixup_dir: Path) -> Optional[Path]:
     return files[0] if files else None
 
 
-def classify_fixup_error_line(line: str) -> Tuple[str, str, str]:
+def classify_fixup_error_line(line: str) -> Tuple[str, str, str, str]:
     upper = (line or "").upper()
     m = ORA_CODE_RE.search(upper)
     code = m.group(1) if m else "NO_ORA_CODE"
@@ -998,7 +1051,6 @@ def classify_fixup_error_line(line: str) -> Tuple[str, str, str]:
 def parse_fixup_failures(fixup_dir: Path, logs_dir: Path) -> List[FixupFailure]:
     failures: List[FixupFailure] = []
     seen: set = set()
-    script_hint = ""
 
     latest = _find_latest_fixup_error_file(fixup_dir)
     candidate_files: List[Path] = []
@@ -1009,6 +1061,7 @@ def parse_fixup_failures(fixup_dir: Path, logs_dir: Path) -> List[FixupFailure]:
         candidate_files.extend(sorted(logs_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:2])
 
     for file_path in candidate_files:
+        script_hint = ""
         is_log_fallback = file_path.suffix.lower() == ".log"
         try:
             lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -1090,7 +1143,8 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         report_meta.setdefault("run_dir", latest_meta.get("run_dir", ""))
 
     group_counts = load_detail_group_counts(ob_cfg, settings, report_id)
-    consistency_rows = summarize_consistency(report_meta, group_counts)
+    counts_by_type = load_counts_by_type(ob_cfg, settings, report_id)
+    consistency_rows = summarize_consistency(report_meta, group_counts, counts_by_type)
 
     focus = parse_focus_object(args.focus_object, args.focus_object_type)
 

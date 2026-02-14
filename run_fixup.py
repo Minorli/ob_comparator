@@ -3203,14 +3203,19 @@ def execute_grant_file_with_prune(
     failures: List[StatementFailure] = []
     executed_count = 0
     removed_count = 0
-    non_grant_success_count = 0
+    skipped_non_grant_count = 0
     truncated = False
 
     for statement in statements:
         if is_comment_only_statement(statement):
             continue
+        stripped = statement.strip()
+        is_grant = stripped.upper().startswith("GRANT ")
+        # grants_* 文件仅保留 GRANT 的重试语义，避免非 GRANT 语句反复执行。
+        if not is_grant:
+            skipped_non_grant_count += 1
+            continue
         executed_count += 1
-        is_grant = statement.lstrip().upper().startswith("GRANT ")
 
         try:
             result = run_sql(obclient_cmd, statement, timeout)
@@ -3228,9 +3233,6 @@ def execute_grant_file_with_prune(
         if not error_msg:
             if is_grant:
                 removed_count += 1
-            else:
-                kept_statements.append(statement)
-                non_grant_success_count += 1
             continue
 
         message = error_msg
@@ -3242,12 +3244,12 @@ def execute_grant_file_with_prune(
             )
 
     summary = ExecutionSummary(executed_count, failures)
-    if non_grant_success_count:
+    if skipped_non_grant_count:
         log.warning(
-            "%s %s 包含并执行了 %d 条非 GRANT 语句，成功语句将保留在原文件中。",
+            "%s %s 包含 %d 条非 GRANT 语句，已在 grant-prune 模式下跳过（不参与重试）。",
             label_prefix,
             relative_path,
-            non_grant_success_count
+            skipped_non_grant_count
         )
 
     if executed_count == 0:
@@ -4094,7 +4096,6 @@ def run_view_chain_autofix(
     planned_object_privs: Set[Tuple[str, str, str]] = set()
     planned_object_privs_with_option: Set[Tuple[str, str, str]] = set()
     planned_sys_privs: Set[Tuple[str, str]] = set()
-    planned_objects: Set[Tuple[str, str]] = set()
 
     total_views = len(chains_by_view)
     view_width = len(str(total_views)) or 1
@@ -4111,6 +4112,7 @@ def run_view_chain_autofix(
 
     for idx, view_full in enumerate(sorted(chains_by_view.keys()), start=1):
         view_key = normalize_identifier(view_full)
+        planned_objects: Set[Tuple[str, str]] = set()
         label = format_progress_label(idx, total_views, view_width)
         chains = chains_by_view.get(view_full) or []
         root_type = chains[0][0][1] if chains and chains[0] else "VIEW"
