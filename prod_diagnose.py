@@ -727,7 +727,25 @@ def classify_detail_row(
                 reason_code = detail_reason
                 cause = detail_cause
                 action = detail_action
-        if row.object_type in {"INDEX", "CONSTRAINT", "TRIGGER", "SEQUENCE"} and not row.source_name and not row.target_name:
+            elif (
+                row.source_schema
+                and row.target_schema
+                and row.source_name
+                and row.target_name
+                and row.source_schema == row.target_schema
+                and row.source_name == row.target_name
+            ):
+                reason_code = "TABLE_MISMATCH_AGGREGATED"
+                cause = "该行为表级聚合 mismatch（具体列差异在 detail_item）"
+                action = (
+                    "按对象过滤 DIFF_REPORT_DETAIL_ITEM，查看 LENGTH_MISMATCH/TYPE_MISMATCH/"
+                    "MISSING_COLUMN/EXTRA_COLUMN"
+                )
+        if row.status == "STATUS_DRIFT":
+            reason_code = "STATUS_DRIFT"
+            cause = "对象存在，但状态不一致"
+            action = "执行状态同步 fixup（enable/compile）"
+        elif row.object_type in {"INDEX", "CONSTRAINT", "TRIGGER", "SEQUENCE"} and not row.source_name and not row.target_name:
             reason_code = "AGGREGATED_MISMATCH_ROW"
             cause = "该行为聚合类 mismatch，需要查看 detail item"
             action = "结合 DIFF_REPORT_DETAIL_ITEM 逐项定位"
@@ -743,14 +761,14 @@ def classify_detail_row(
             reason_code = "AGGREGATED_MISMATCH_ROW"
             cause = "该行为表级聚合 mismatch（非对象名级）"
             action = "结合 detail_json/detail_item 中 missing_* 与 extra_* 字段定位"
-        elif row.status == "STATUS_DRIFT":
-            reason_code = "STATUS_DRIFT"
-            cause = "对象存在，但状态不一致"
-            action = "执行状态同步 fixup（enable/compile）"
         elif tgt_fact.exists is False:
             reason_code = "MISMATCH_TARGET_MISSING"
             cause = "报 mismatch 但目标对象不存在"
             action = "先按缺失对象处理，再复跑"
+        elif reason_code == "UNCLASSIFIED" and src_fact.exists is True and tgt_fact.exists is True:
+            reason_code = "MISMATCH_NEEDS_DETAIL"
+            cause = "对象两端均存在，需结合明细项定位差异"
+            action = "查询 DIFF_REPORT_DETAIL_ITEM，按对象查看 missing_*/extra_*/mismatch_* 细项"
 
     evidence = f"SRC={src_fact.status}:{src_fact.detail}; TGT={tgt_fact.status}:{tgt_fact.detail}"
     return TriageEntry(

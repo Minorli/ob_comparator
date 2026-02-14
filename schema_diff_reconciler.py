@@ -15603,6 +15603,40 @@ def compare_triggers_for_table(
             missing -= matched_missing
             extra -= matched_extra
 
+    # 当源端存在“跨 schema 派生触发器副本”（owner != table owner）而目标端仅保留
+    # 同名同事件的单份触发器时，将其视为 owner 漂移语义等价，不再计入 missing。
+    # 该规则仅作用于跨 schema 副本，且要求目标端存在同名同事件触发器，避免误吞真实缺失。
+    if missing:
+        table_owner_u = (src_schema or "").upper()
+        tgt_candidates_by_sig: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+        for tgt_full, tgt_info in tgt_info_map.items():
+            _, tgt_name_u = _owner_and_name(tgt_full)
+            tgt_event = (tgt_info.get("event") or "").strip()
+            tgt_candidates_by_sig[(tgt_name_u, tgt_event)].append(tgt_full)
+
+        relaxed_missing: Set[str] = set()
+        for src_full in sorted(missing):
+            src_info = src_info_map.get(src_full, {})
+            src_owner_u = (src_info.get("src_owner") or _owner_and_name(src_full)[0] or "").upper()
+            src_name_u = (src_info.get("src_name") or _owner_and_name(src_full)[1] or "").upper()
+            src_event = (src_info.get("event") or "").strip()
+            if not src_name_u:
+                continue
+            # 仅放宽跨 schema 副本，表 owner 对应的主触发器仍严格要求存在。
+            if not src_owner_u or src_owner_u == table_owner_u:
+                continue
+            candidates = sorted(tgt_candidates_by_sig.get((src_name_u, src_event), []))
+            if not candidates:
+                continue
+            chosen_tgt = candidates[0]
+            relaxed_missing.add(src_full)
+            owner_drift_pairs.append((src_full, chosen_tgt))
+            detail_mismatch.append(
+                f"{src_full}: 跨 schema 派生触发器副本按同名同事件语义匹配，目标端命中 {chosen_tgt}。"
+            )
+        if relaxed_missing:
+            missing -= relaxed_missing
+
     for tgt_full in sorted(missing):
         src_info = src_info_map.get(tgt_full, {})
         missing_mappings.append(
