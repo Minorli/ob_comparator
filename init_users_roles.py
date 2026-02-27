@@ -34,7 +34,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-__version__ = "0.9.8.5"
+__version__ = "0.9.8.6"
 
 try:
     import oracledb

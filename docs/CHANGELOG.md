@@ -2,6 +2,22 @@
 
 本文件记录 OceanBase Comparator Toolkit 的重要变更。
 
+## [0.9.8.6] - 2026-02-27
+
+### 新增
+- 授权延后机制：当目标对象当前不存在且本轮不会创建时，授权从 `grants_miss` 分流并标记为 `DEFERRED_TARGET_MISSING_NOT_PLANNED`。
+- 新增 `deferred_grants_detail_<ts>.txt`，用于明确后续需补执行的授权清单。
+- 新增 `fixup_scripts/grants_deferred/README.txt` 兜底提醒（即使 deferred SQL 未生成也会保留执行指引）。
+
+### 变更
+- `run_fixup.py` 默认将 `grants_deferred` 纳入安全跳过目录；对象补齐后需显式 `--only-dirs grants_deferred` 执行。
+- `run_fixup.py` 执行层级新增 `name_collision` 前置层，约束/索引同名修复先于 `constraint/index` 执行。
+- 同名约束修复按 OB 版本门控：低版本自动回退 `DROP + ADD`，避免 `RENAME CONSTRAINT` 兼容问题。
+
+### 修复
+- 黑名单依赖阻断口径优化：`LONG/LOB_OVERSIZE` 作为风险项不再一刀切阻断依赖对象检查与修补。
+- 默认排除 `MLOG$_*` 物化视图日志表（EXCLUDED），不参与缺失/不一致校验与 fixup 生成，减少系统派生噪声。
+
 ## [0.9.8.5] - 2026-02-13
 
 ### 新增
@@ -36,7 +52,7 @@
 - HOW_TO_READ_REPORTS_IN_OB_latest.txt SQL 校验修正与完善（历史快照按时间戳文件保留）
 
 ## [未发布]
-- run_fixup 安全门禁：默认跳过 `fixup_scripts/table/`，避免误创建空表；需显式 `--allow-table-create` 才执行建表脚本。
+- 暂无。
 
 ## [0.9.8.2] - 2026-02-03
 
