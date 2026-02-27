@@ -172,6 +172,14 @@ fixup_idempotent_types  =
 #   all         -> 生成 PUBLIC + 私有同义词
 #   public_only -> 仅生成 PUBLIC 同义词
 synonym_fixup_scope     = public_only
+# 约束/索引重名处理模式：
+#   off    -> 关闭
+#   report -> 仅输出重名诊断，不改写脚本
+#   fixup  -> 生成重名修复脚本，并重写缺失约束/索引名称（默认）
+name_collision_mode     = fixup
+# fixup 模式下是否重命名目标端已有对象（默认 true）
+# 注：当 OB 版本不支持 RENAME CONSTRAINT 时，将自动回退为约束 DROP+ADD
+name_collision_rename_existing = true
 # 可选：触发器清单过滤（每行 SCHEMA.TRIGGER_NAME）
 # 配置后仅生成列表内触发器脚本，并输出 report_dir/trigger_status_report.txt 记录清单与状态差异
 trigger_list            =
@@ -286,6 +294,8 @@ blacklist_name_patterns_file =
 # 说明：未配置或文件不存在时，不生效，继续走原有校验逻辑
 exclude_objects_file    =
 # LOB 体积阈值（MB）；超过阈值则标记为 LOB_OVERSIZE
+# 说明：LOB_OVERSIZE/LONG 为风险项，不阻断其依赖对象（INDEX/CONSTRAINT/TRIGGER）检查与修补；
+#      仅当父 TABLE 目标端缺失时，依赖对象才按 DEPENDENCY_TARGET_TABLE_MISSING 阻断。
 blacklist_lob_max_mb    = 512
 # 是否启用 schema 推导（一对多场景下用于非表对象）
 # 可选值：true/false/1/0/yes/no（大小写不敏感）

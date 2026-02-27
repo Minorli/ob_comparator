@@ -334,7 +334,10 @@ def log_failure_analysis(failures_by_type: Dict[str, List['ScriptResult']]) -> N
     if FailureType.PERMISSION_DENIED in failures_by_type:
         items = failures_by_type[FailureType.PERMISSION_DENIED]
         log.info("❌ 权限不足: %d 个", len(items))
-        log.info("   建议: 检查并执行 fixup_scripts/grants_miss/ 下的授权脚本 (全量审计见 grants_all)")
+        log.info(
+            "   建议: 先执行 fixup_scripts/grants_miss/；"
+            "若对象尚未补齐，再查看 fixup_scripts/grants_deferred/（全量审计见 grants_all）"
+        )
         if len(items) <= 3:
             for item in items[:3]:
                 log.info("     - %s", item.path.name)
@@ -482,9 +485,10 @@ DEPENDENCY_LAYERS = [
     ["package"],                                     # Layer 8: Package specs
     ["procedure", "function"],                       # Layer 9: Standalone routines
     ["type_body", "package_body"],                   # Layer 10: Type/package bodies
-    ["constraint", "index"],                         # Layer 11: Constraints and indexes
-    ["trigger"],                                     # Layer 12: Triggers (last)
-    ["job", "schedule"],                             # Layer 13: Jobs
+    ["name_collision"],                              # Layer 11: Name collision remediation
+    ["constraint", "index"],                         # Layer 12: Constraints and indexes
+    ["trigger"],                                     # Layer 13: Triggers (last)
+    ["job", "schedule"],                             # Layer 14: Jobs
 ]
 
 CORE_GRANT_DIRS_ORDER = ("grants_all", "grants_miss", "grants")
@@ -1021,7 +1025,7 @@ def collect_sql_files_by_layer(
             "sequence", "table", "table_alter", "view_prereq_grants", "grants",
             "view", "synonym", "view_post_grants", "materialized_view",
             "type", "package", "procedure", "function",
-            "type_body", "package_body", "constraint", "index", "trigger",
+            "type_body", "package_body", "name_collision", "constraint", "index", "trigger",
             "job", "schedule",
         ]
         
@@ -3478,6 +3482,7 @@ def parse_args() -> argparse.Namespace:
           --min-progress : 最小进展阈值（默认 1）
           --view-chain-autofix : 基于 VIEW 依赖链生成/执行修复计划
           --allow-table-create : 允许执行 table/ 建表脚本（默认关闭，防止误建空表）
+          注意: grants_deferred/ 默认跳过，需在补齐对象后显式执行
         
         保留原有功能：
           --only-dirs    : 按子目录过滤
@@ -3638,7 +3643,7 @@ def main() -> None:
         only_dirs = [d.lower() for d in only_dirs] if only_dirs else []
     
     exclude_dirs = [d.lower() for d in exclude_dirs]
-    default_excludes = {"tables_unsupported", "unsupported", "constraint_validate_later"}
+    default_excludes = {"tables_unsupported", "unsupported", "constraint_validate_later", "grants_deferred"}
     if not getattr(args, "allow_table_create", False):
         # Safety first: table create scripts are risky in migration workflows
         # because they can create empty target tables if OMS data load is skipped.
@@ -3658,6 +3663,8 @@ def main() -> None:
         )
     if not getattr(args, "allow_table_create", False):
         log.warning("安全模式: 默认跳过 fixup_scripts/table/（防止误建空表）。")
+    if "grants_deferred" not in only_dirs:
+        log.warning("安全模式: 默认跳过 fixup_scripts/grants_deferred/（需对象补齐后再执行）。")
     
     # Load configuration
     try:

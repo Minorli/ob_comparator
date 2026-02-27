@@ -147,7 +147,10 @@
   说明：建议用于“明确不参与校验/修补”的对象（优先 TABLE）；程序在读取源端元数据后先按清单剪裁，再做 remap/依赖与差异校验。
   说明：仅对“source_schemas 范围内且类型匹配”的对象生效；未命中条目会记录为 SKIPPED，不会误杀。
   说明：命中对象及其依赖链会被一并排除；并输出 `excluded_objects_detail_<ts>.txt` 供核对。
+  说明：系统会默认将 `MLOG$_*`（Oracle 物化视图日志表）作为系统派生对象纳入 EXCLUDED，不参与缺失/不一致校验与 fixup 生成。
 - blacklist_lob_max_mb：LOB 体积阈值（MB），超过则标记为 LOB_OVERSIZE。默认：512。
+  说明：`LOB_OVERSIZE` 与 `LONG/LONG RAW` 归类为风险项（RISK_ONLY），不会阻断其依赖对象（INDEX/CONSTRAINT/TRIGGER）的检查与 fixup。
+  说明：若父 TABLE 在目标端缺失，则依赖对象会统一标记为 `DEPENDENCY_TARGET_TABLE_MISSING`，不进入 fixup。
 
 修补脚本生成（Fixup）
 - generate_fixup：是否生成修补脚本。默认：true。
@@ -195,6 +198,9 @@
 授权与权限脚本
 - generate_grants：是否生成授权脚本并附加到修补 DDL。默认：true。
   注意：generate_grants 仅控制授权脚本与注入，修补脚本仍由 generate_fixup 控制。
+  说明：当目标对象当前不存在且本轮不会创建时，授权会延后到 `fixup_scripts/grants_deferred/`，
+  同时写入 `deferred_grants_detail_<ts>.txt`，避免误执行失败。
+  说明：若延后授权因 owner 策略无法自动输出 SQL，`fixup_scripts/grants_deferred/README.txt` 仍会保留完整提醒。
 - grant_tab_privs_scope：DBA_TAB_PRIVS 抽取范围。默认：owner。
   可选值：owner（仅源 schema 所拥有对象）、owner_or_grantee（兼容旧逻辑）。
 - grant_merge_privileges：合并同一对象的多权限授权。默认：true。
@@ -204,6 +210,7 @@
 - grant_include_oracle_maintained_roles：是否生成 ORACLE_MAINTAINED 角色。默认：false。
 - fixup_auto_grant：run_fixup 自动补权限。默认：true。
   说明：基于 dependency_chains 与 VIEWs_chain 预判依赖授权，执行前自动应用 grants_miss/grants_all 中的授权。
+  说明：run_fixup 默认跳过 `fixup_scripts/grants_deferred/`，对象补齐后需显式执行该目录。
 - fixup_auto_grant_types：自动补权限对象类型（逗号分隔）。默认：
   VIEW, MATERIALIZED VIEW, SYNONYM, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, TYPE, TYPE BODY。
   说明：仅对这些对象执行自动补权限；其他对象仍按原流程执行。
@@ -218,6 +225,11 @@
   说明：该开关影响“校验与统计口径”；不影响同义词 fixup 输出范围。
 - synonym_fixup_scope：同义词修补范围。默认：public_only。
   可选值：all（PUBLIC+私有）、public_only（仅 PUBLIC）。
+- name_collision_mode：约束/索引重名处理模式。默认：fixup。
+  可选值：off（关闭）、report（仅输出重名诊断，不改写脚本）、fixup（生成重名修复脚本并改写缺失 INDEX/CONSTRAINT 名称）。
+- name_collision_rename_existing：fixup 模式下是否重命名目标端已有冲突对象。默认：true。
+  说明：开启后会生成 `fixup_scripts/name_collision` 两阶段脚本（phase1 临时改名、phase2 最终改名），并在 run_fixup 中先于 constraint/index 执行。
+  兼容说明：若检测到目标 OB 版本不支持 `ALTER TABLE ... RENAME CONSTRAINT`，系统会自动改用约束 `DROP + ADD` 路径，仅索引继续使用 RENAME。
 - trigger_list：触发器清单文件（每行 SCHEMA.TRIGGER_NAME）。默认：空。
   注意：配置后仅生成列表内触发器，并输出 trigger_status_report.txt 报告；清单读取失败会回退全量触发器。
 - trigger_qualify_schema：触发器 DDL 是否强制补全 schema 前缀。默认：true。

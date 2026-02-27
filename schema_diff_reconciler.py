@@ -679,6 +679,17 @@ class FilteredGrantEntry(NamedTuple):
     reason: str
 
 
+class UnsupportedGrantDetailRow(NamedTuple):
+    category: str
+    grantee: str
+    privilege: str
+    object_full: str
+    reason_code: str
+    reason: str
+    root_cause: str
+    action: str
+
+
 class GrantPlan(NamedTuple):
     object_grants: Dict[str, Set[ObjectGrantEntry]]
     sys_privs: Dict[str, Set[SystemGrantEntry]]
@@ -840,6 +851,19 @@ SUPPORT_STATE_SUPPORTED = "SUPPORTED"
 SUPPORT_STATE_UNSUPPORTED = "UNSUPPORTED"
 SUPPORT_STATE_BLOCKED = "BLOCKED"
 SUPPORT_STATE_RISKY = "RISKY"
+
+UNSUPPORTED_GRANT_TARGET_REASON_PREFIX = "UNSUPPORTED_TARGET_"
+DEFERRED_GRANT_REASON_TARGET_MISSING_NOT_PLANNED = "DEFERRED_TARGET_MISSING_NOT_PLANNED"
+UNSUPPORTED_GRANT_REASON_DEFAULTS: Dict[str, Tuple[str, str]] = {
+    "UNSUPPORTED_OBJECT_PRIV_IN_OB": ("OB 不支持该对象权限", "移除该权限或改造对象后手工授权"),
+    "UNSUPPORTED_SYS_PRIV_IN_OB": ("OB 不支持该系统权限", "移除该权限或改造后手工授权"),
+    "NOT_IN_ORACLE_OBJECT_PRIVILEGE_MAP": ("源端对象权限映射缺失", "检查源端权限定义与元数据"),
+    "NOT_IN_ORACLE_SYSTEM_PRIVILEGE_MAP": ("源端系统权限映射缺失", "检查源端权限定义与元数据"),
+    DEFERRED_GRANT_REASON_TARGET_MISSING_NOT_PLANNED: (
+        "目标对象当前不存在且本轮不会创建，授权已延后。",
+        "先补齐对象（OMS/手工）后执行 grants_deferred 目录脚本。"
+    ),
+}
 
 VIEW_UNSUPPORTED_DEFAULT_VIEWS: Set[str] = {
     "DBA_DATA_FILES",
@@ -1013,6 +1037,7 @@ NOISE_REASON_OMS_HELPER_COLUMN = "OMS_HELPER_COLUMN"
 NOISE_REASON_OMS_ROWID_INDEX = "OMS_ROWID_INDEX"
 NOISE_REASON_OBNOTNULL_CONSTRAINT = "OBNOTNULL_CONSTRAINT"
 OB_OBCHECK_NAME_PATTERN = re.compile(r"_OBCHECK_\d+$", re.IGNORECASE)
+MVIEW_LOG_TABLE_NAME_PATTERN = re.compile(r"^MLOG\$_", re.IGNORECASE)
 
 
 def normalize_identifier_name(name: Optional[str]) -> str:
@@ -1279,6 +1304,46 @@ def is_long_only_blacklist(entries: Optional[Dict[Tuple[str, str], BlacklistEntr
     return True
 
 
+def collect_blacklist_types(entries: Optional[Dict[Tuple[str, str], BlacklistEntry]]) -> Set[str]:
+    """
+    提取黑名单条目的标准类型集合（大写）。
+    """
+    types: Set[str] = set()
+    if not entries:
+        return types
+    for (black_type, data_type), entry in entries.items():
+        bt = normalize_black_type(black_type)
+        if not bt and entry and entry.black_type:
+            bt = normalize_black_type(entry.black_type)
+        if bt:
+            types.add(bt)
+            continue
+        dt = normalize_black_data_type(data_type)
+        if not dt and entry and entry.data_type:
+            dt = normalize_black_data_type(entry.data_type)
+        if is_long_type(dt):
+            types.add("LONG")
+    return types
+
+
+def is_non_blocking_blacklist(entries: Optional[Dict[Tuple[str, str], BlacklistEntry]]) -> bool:
+    """
+    黑名单是否属于“仅风险提示，不阻断依赖”的类别。
+    """
+    blacklist_types = collect_blacklist_types(entries)
+    if not blacklist_types:
+        return False
+    return blacklist_types.issubset({"LONG", "LOB_OVERSIZE"})
+
+
+def has_lob_oversize_blacklist(entries: Optional[Dict[Tuple[str, str], BlacklistEntry]]) -> bool:
+    """
+    黑名单条目中是否包含 LOB_OVERSIZE。
+    """
+    blacklist_types = collect_blacklist_types(entries)
+    return "LOB_OVERSIZE" in blacklist_types
+
+
 def is_rename_blacklist_type(black_type: Optional[str]) -> bool:
     bt = (black_type or "").strip().upper()
     return bt in {"RENAME", "NAME_PATTERN"}
@@ -1297,6 +1362,34 @@ def is_rename_only_blacklist(entries: Optional[Dict[Tuple[str, str], BlacklistEn
         if not is_rename_blacklist_type(bt):
             return False
     return True
+
+
+def is_mview_log_table_name(table_name: Optional[str]) -> bool:
+    name_u = normalize_identifier_name(table_name)
+    if not name_u:
+        return False
+    return bool(MVIEW_LOG_TABLE_NAME_PATTERN.match(name_u))
+
+
+def collect_mview_log_artifact_table_keys(
+    source_objects: Optional[SourceObjectMap]
+) -> Set[Tuple[str, str]]:
+    """
+    收集源端对象范围内的 MVIEW LOG 派生表（MLOG$_*）。
+    返回 {(OWNER, TABLE_NAME)}，均为大写。
+    """
+    result: Set[Tuple[str, str]] = set()
+    if not source_objects:
+        return result
+    for full_name, obj_types in source_objects.items():
+        if not full_name or "." not in full_name:
+            continue
+        if "TABLE" not in {str(t).upper() for t in (obj_types or set())}:
+            continue
+        owner_u, table_u = full_name.upper().split(".", 1)
+        if is_mview_log_table_name(table_u):
+            result.add((owner_u, table_u))
+    return result
 
 
 def map_long_type_to_ob(data_type: Optional[str]) -> str:
@@ -2411,6 +2504,17 @@ def collect_fixup_config_diagnostics(
     if trigger_list_path and "TRIGGER" not in enabled_extra_types:
         diagnostics.append("trigger_list 已配置，但 check_extra_types 未启用 TRIGGER，仅进行清单格式校验。")
 
+    name_collision_mode = normalize_name_collision_mode(settings.get("name_collision_mode", "fixup"))
+    rename_existing = parse_bool_flag(settings.get("name_collision_rename_existing", "true"), True)
+    if name_collision_mode in {"off", "report"} and rename_existing:
+        diagnostics.append(
+            f"name_collision_mode={name_collision_mode} 时不会执行重命名，name_collision_rename_existing 将被忽略。"
+        )
+    if name_collision_mode == "fixup" and not parse_bool_flag(settings.get("generate_fixup", "true"), True):
+        diagnostics.append(
+            "name_collision_mode=fixup 但 generate_fixup=false，仅会输出碰撞诊断，不会生成重命名脚本。"
+        )
+
     interval_enabled = bool(
         settings.get(
             "effective_interval_fixup_enabled",
@@ -2496,6 +2600,27 @@ def normalize_synonym_fixup_scope(raw_value: Optional[str]) -> str:
     if value not in SYNONYM_FIXUP_SCOPE_VALUES:
         log.warning("synonym_fixup_scope=%s 不在支持范围内，将回退为 public_only。", raw_value)
         return "public_only"
+    return value
+
+
+NAME_COLLISION_MODE_VALUES = {"off", "report", "fixup"}
+NAME_COLLISION_MODE_ALIASES = {
+    "on": "fixup",
+    "true": "fixup",
+    "false": "off",
+    "enabled": "fixup",
+    "disabled": "off",
+}
+
+
+def normalize_name_collision_mode(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "fixup"
+    value = str(raw_value).strip().lower()
+    value = NAME_COLLISION_MODE_ALIASES.get(value, value)
+    if value not in NAME_COLLISION_MODE_VALUES:
+        log.warning("name_collision_mode=%s 不在支持范围内，将回退为 fixup。", raw_value)
+        return "fixup"
     return value
 
 
@@ -2928,6 +3053,18 @@ class ConstraintValidateDeferredRow(NamedTuple):
     applied_mode: str
     reason: str
     validate_sql: str
+
+
+class NameCollisionDetailRow(NamedTuple):
+    schema_name: str
+    object_type: str
+    table_name: str
+    old_name: str
+    conflict_type: str
+    conflict_with: str
+    proposed_name: str
+    action: str
+    reason: str
 
 
 class ReportIndexEntry(NamedTuple):
@@ -3586,6 +3723,8 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('fixup_auto_grant_cache_limit', '10000')
         settings.setdefault('synonym_check_scope', 'public_only')
         settings.setdefault('synonym_fixup_scope', 'public_only')
+        settings.setdefault('name_collision_mode', 'fixup')
+        settings.setdefault('name_collision_rename_existing', 'true')
         settings.setdefault('trigger_list', '')
         settings.setdefault('trigger_qualify_schema', 'true')
         settings.setdefault('check_status_drift_types', 'trigger,constraint')
@@ -3864,6 +4003,13 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         )
         settings['synonym_fixup_scope'] = normalize_synonym_fixup_scope(
             settings.get('synonym_fixup_scope', 'public_only')
+        )
+        settings['name_collision_mode'] = normalize_name_collision_mode(
+            settings.get('name_collision_mode', 'fixup')
+        )
+        settings['name_collision_rename_existing'] = parse_bool_flag(
+            settings.get('name_collision_rename_existing', 'true'),
+            True
         )
         settings['report_dir_layout'] = normalize_report_dir_layout(
             settings.get('report_dir_layout', 'per_run')
@@ -4290,6 +4436,14 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "仅支持 all 或 public_only"
 
+    def _validate_name_collision_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = NAME_COLLISION_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in NAME_COLLISION_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 off/report/fixup"
+
     def _validate_synonym_check_scope(val: str) -> Tuple[bool, str]:
         if not val.strip():
             return True, ""
@@ -4589,6 +4743,21 @@ def run_config_wizard(config_path: Path) -> None:
         default=cfg.get("SETTINGS", "synonym_fixup_scope", fallback="public_only"),
         validator=_validate_synonym_fixup_scope,
         transform=normalize_synonym_fixup_scope,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "name_collision_mode",
+        "约束/索引重名处理模式 (off/report/fixup)",
+        default=cfg.get("SETTINGS", "name_collision_mode", fallback="fixup"),
+        validator=_validate_name_collision_mode,
+        transform=normalize_name_collision_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "name_collision_rename_existing",
+        "重名处理时是否重命名目标端已有对象 (true/false)",
+        default=cfg.get("SETTINGS", "name_collision_rename_existing", fallback="true"),
+        transform=_bool_transform,
     )
     _prompt_field(
         "SETTINGS",
@@ -6253,16 +6422,19 @@ def classify_missing_objects(
         if not schema_u or not table_u:
             continue
         full = f"{schema_u}.{table_u}"
-        if is_long_only_blacklist(entries):
+        if is_non_blocking_blacklist(entries):
             tgt_schema_u, tgt_table_u = table_target_map.get((schema_u, table_u), (schema_u, table_u))
             tgt_full = f"{tgt_schema_u}.{tgt_table_u}"
-            if ob_meta and ob_meta.objects_by_type and "TABLE" in (ob_meta.objects_by_type or {}):
-                if tgt_full in ob_meta.objects_by_type.get("TABLE", set()):
-                    log.info("[BLACKLIST] LONG 表 %s 目标端存在，依赖不再阻断。", full)
+            if is_long_only_blacklist(entries):
+                if ob_meta and ob_meta.objects_by_type and "TABLE" in (ob_meta.objects_by_type or {}):
+                    if tgt_full in ob_meta.objects_by_type.get("TABLE", set()):
+                        log.info("[BLACKLIST] LONG 表 %s 目标端存在，依赖不再阻断。", full)
+                    else:
+                        log.info("[BLACKLIST] LONG 表 %s 目标端缺失，仍不阻断依赖。", full)
                 else:
-                    log.info("[BLACKLIST] LONG 表 %s 目标端缺失，仍不阻断依赖。", full)
+                    log.info("[BLACKLIST] LONG 表 %s 未能确认目标端存在性，默认不阻断依赖。", full)
             else:
-                log.info("[BLACKLIST] LONG 表 %s 未能确认目标端存在性，默认不阻断依赖。", full)
+                log.info("[BLACKLIST] 风险类黑名单表 %s 不阻断依赖（类型=%s）。", full, ",".join(sorted(collect_blacklist_types(entries))))
             continue
 
         black_type, reason, detail = summarize_blacklist_entries(entries)
@@ -6355,8 +6527,14 @@ def classify_missing_objects(
         elif obj_type_u == "TABLE":
             entries = oracle_meta.blacklist_tables.get((src_schema, src_obj))
             if entries:
-                if not is_long_only_blacklist(entries):
-                    black_type, reason, detail = summarize_blacklist_entries(entries)
+                black_type, reason, detail = summarize_blacklist_entries(entries)
+                if is_non_blocking_blacklist(entries):
+                    if has_lob_oversize_blacklist(entries):
+                        support_state = SUPPORT_STATE_RISKY
+                        reason_code = f"BLACKLIST_{black_type}" if black_type else "BLACKLIST"
+                        dependency = "-"
+                        action = "人工确认风险"
+                else:
                     support_state = SUPPORT_STATE_UNSUPPORTED
                     reason_code = f"BLACKLIST_{black_type}" if black_type else "BLACKLIST"
                     dependency = "-"
@@ -6491,6 +6669,46 @@ def classify_missing_objects(
     table_map: Dict[str, str] = {}
     for (src_schema, src_table), (tgt_schema, tgt_table) in table_target_map.items():
         table_map[f"{tgt_schema.upper()}.{tgt_table.upper()}"] = f"{src_schema.upper()}.{src_table.upper()}"
+    missing_target_table_keys = collect_missing_target_table_source_keys(tv_results)
+
+    def _build_extra_blocked_row(
+        obj_type: str,
+        src_full: str,
+        tgt_full: str,
+        table_str: str,
+        src_schema: str,
+        src_table: str,
+    ) -> Optional[ObjectSupportReportRow]:
+        src_key = (src_schema.upper(), src_table.upper())
+        table_full_u = table_str.upper()
+        if src_key in missing_target_table_keys:
+            return ObjectSupportReportRow(
+                obj_type=obj_type,
+                src_full=src_full,
+                tgt_full=tgt_full,
+                support_state=SUPPORT_STATE_BLOCKED,
+                reason_code="DEPENDENCY_TARGET_TABLE_MISSING",
+                reason="依赖目标端缺失表",
+                dependency=table_full_u,
+                action="先补齐目标表",
+                detail=obj_type,
+                root_cause=f"{table_full_u}(TARGET_TABLE_MISSING)"
+            )
+        if src_key in unsupported_table_keys:
+            root_cause = _root_cause_label((f"{src_schema.upper()}.{src_table.upper()}", "TABLE"))
+            return ObjectSupportReportRow(
+                obj_type=obj_type,
+                src_full=src_full,
+                tgt_full=tgt_full,
+                support_state=SUPPORT_STATE_BLOCKED,
+                reason_code="DEPENDENCY_UNSUPPORTED",
+                reason="依赖不支持表",
+                dependency=table_full_u,
+                action="先改造依赖表",
+                detail=obj_type,
+                root_cause=root_cause
+            )
+        return None
 
     for item in extra_results.get('index_mismatched', []):
         table_str = item.table.split()[0]
@@ -6500,23 +6718,18 @@ def classify_missing_objects(
         if not src_name or '.' not in src_name:
             continue
         src_schema, src_table = src_name.split('.', 1)
-        if (src_schema.upper(), src_table.upper()) not in unsupported_table_keys:
-            continue
         tgt_schema, _ = table_str.split('.', 1)
-        root_cause = _root_cause_label((f"{src_schema.upper()}.{src_table.upper()}", "TABLE"))
         for idx_name in sorted(item.missing_indexes):
-            row = ObjectSupportReportRow(
-                obj_type="INDEX",
-                src_full=f"{src_schema.upper()}.{idx_name.upper()}",
-                tgt_full=f"{tgt_schema.upper()}.{idx_name.upper()}",
-                support_state=SUPPORT_STATE_BLOCKED,
-                reason_code="DEPENDENCY_UNSUPPORTED",
-                reason="依赖不支持表",
-                dependency=table_str.upper(),
-                action="先改造依赖表",
-                detail="INDEX",
-                root_cause=root_cause
+            row = _build_extra_blocked_row(
+                "INDEX",
+                f"{src_schema.upper()}.{idx_name.upper()}",
+                f"{tgt_schema.upper()}.{idx_name.upper()}",
+                table_str,
+                src_schema,
+                src_table,
             )
+            if not row:
+                continue
             unsupported_rows.append(row)
             extra_blocked_counts["INDEX"] += 1
 
@@ -6528,23 +6741,18 @@ def classify_missing_objects(
         if not src_name or '.' not in src_name:
             continue
         src_schema, src_table = src_name.split('.', 1)
-        if (src_schema.upper(), src_table.upper()) not in unsupported_table_keys:
-            continue
         tgt_schema, _ = table_str.split('.', 1)
-        root_cause = _root_cause_label((f"{src_schema.upper()}.{src_table.upper()}", "TABLE"))
         for cons_name in sorted(item.missing_constraints):
-            row = ObjectSupportReportRow(
-                obj_type="CONSTRAINT",
-                src_full=f"{src_schema.upper()}.{cons_name.upper()}",
-                tgt_full=f"{tgt_schema.upper()}.{cons_name.upper()}",
-                support_state=SUPPORT_STATE_BLOCKED,
-                reason_code="DEPENDENCY_UNSUPPORTED",
-                reason="依赖不支持表",
-                dependency=table_str.upper(),
-                action="先改造依赖表",
-                detail="CONSTRAINT",
-                root_cause=root_cause
+            row = _build_extra_blocked_row(
+                "CONSTRAINT",
+                f"{src_schema.upper()}.{cons_name.upper()}",
+                f"{tgt_schema.upper()}.{cons_name.upper()}",
+                table_str,
+                src_schema,
+                src_table,
             )
+            if not row:
+                continue
             unsupported_rows.append(row)
             extra_blocked_counts["CONSTRAINT"] += 1
 
@@ -6588,23 +6796,18 @@ def classify_missing_objects(
         if not src_name or '.' not in src_name:
             continue
         src_schema, src_table = src_name.split('.', 1)
-        if (src_schema.upper(), src_table.upper()) not in unsupported_table_keys:
-            continue
         tgt_schema, _ = table_str.split('.', 1)
-        root_cause = _root_cause_label((f"{src_schema.upper()}.{src_table.upper()}", "TABLE"))
         for src_full, tgt_full in _iter_missing_trigger_full_pairs(item, src_schema, tgt_schema):
-            row = ObjectSupportReportRow(
-                obj_type="TRIGGER",
-                src_full=src_full,
-                tgt_full=tgt_full,
-                support_state=SUPPORT_STATE_BLOCKED,
-                reason_code="DEPENDENCY_UNSUPPORTED",
-                reason="依赖不支持表",
-                dependency=table_str.upper(),
-                action="先改造依赖表",
-                detail="TRIGGER",
-                root_cause=root_cause
+            row = _build_extra_blocked_row(
+                "TRIGGER",
+                src_full,
+                tgt_full,
+                table_str,
+                src_schema,
+                src_table,
             )
+            if not row:
+                continue
             unsupported_rows.append(row)
             extra_blocked_counts["TRIGGER"] += 1
 
@@ -6640,7 +6843,8 @@ def classify_missing_objects(
         if not src_name or '.' not in src_name:
             continue
         src_schema, src_table = src_name.split('.', 1)
-        if (src_schema.upper(), src_table.upper()) in unsupported_table_keys:
+        src_key = (src_schema.upper(), src_table.upper())
+        if src_key in unsupported_table_keys or src_key in missing_target_table_keys:
             continue
         tgt_schema, _ = table_str.split('.', 1)
         for idx_name in sorted(item.missing_indexes):
@@ -6660,7 +6864,8 @@ def classify_missing_objects(
         if not src_name or '.' not in src_name:
             continue
         src_schema, src_table = src_name.split('.', 1)
-        if (src_schema.upper(), src_table.upper()) in unsupported_table_keys:
+        src_key = (src_schema.upper(), src_table.upper())
+        if src_key in unsupported_table_keys or src_key in missing_target_table_keys:
             continue
         tgt_schema, _ = table_str.split('.', 1)
         for cons_name in sorted(item.missing_constraints):
@@ -6680,7 +6885,8 @@ def classify_missing_objects(
         if not src_name or '.' not in src_name:
             continue
         src_schema, src_table = src_name.split('.', 1)
-        if (src_schema.upper(), src_table.upper()) in unsupported_table_keys:
+        src_key = (src_schema.upper(), src_table.upper())
+        if src_key in unsupported_table_keys or src_key in missing_target_table_keys:
             continue
         tgt_schema, _ = table_str.split('.', 1)
         for src_full, tgt_full in _iter_missing_trigger_full_pairs(item, src_schema, tgt_schema):
@@ -8283,18 +8489,52 @@ def build_table_target_map(master_list: MasterCheckList) -> Dict[Tuple[str, str]
     return mapping
 
 
+def collect_missing_target_table_source_keys(tv_results: Optional[ReportResults]) -> Set[Tuple[str, str]]:
+    """
+    收集“目标端缺失 TABLE”对应的源端键集合 {(SRC_SCHEMA, SRC_TABLE)}。
+    """
+    result: Set[Tuple[str, str]] = set()
+    if not tv_results:
+        return result
+    for obj_type, _tgt_name, src_name in (tv_results.get("missing", []) or []):
+        if (obj_type or "").upper() != "TABLE":
+            continue
+        src_parsed = parse_full_object_name(src_name)
+        if not src_parsed:
+            continue
+        result.add((src_parsed[0].upper(), src_parsed[1].upper()))
+    return result
+
+
 def filter_trigger_results_for_unsupported_tables(
     extra_results: ExtraCheckResults,
     unsupported_table_keys: Optional[Set[Tuple[str, str]]],
-    table_target_map: Optional[Dict[Tuple[str, str], Tuple[str, str]]]
+    table_target_map: Optional[Dict[Tuple[str, str], Tuple[str, str]]],
+    support_state_map: Optional[Dict[Tuple[str, str], ObjectSupportReportRow]] = None
 ) -> ExtraCheckResults:
     """
-    将黑名单 TABLE 相关的触发器差异从扩展校验结果中剔除，避免误报。
+    将“已阻断表”相关的扩展差异从结果中剔除，避免统计口径与 fixup 漂移。
+    阻断来源：
+      - 黑名单结构性阻断表（unsupported_table_keys）
+      - 目标端缺失表（来自 support_state_map 的 TABLE 缺失）
     """
-    if not extra_results or not unsupported_table_keys or not table_target_map:
+    if not extra_results or not table_target_map:
         return extra_results
 
-    unsupported_keys = {(s.upper(), t.upper()) for s, t in unsupported_table_keys}
+    blocked_keys: Set[Tuple[str, str]] = {
+        (s.upper(), t.upper()) for s, t in (unsupported_table_keys or set())
+    }
+    if support_state_map:
+        for (obj_type, src_full), _row in support_state_map.items():
+            if (obj_type or "").upper() != "TABLE":
+                continue
+            src_parsed = parse_full_object_name(src_full)
+            if not src_parsed:
+                continue
+            blocked_keys.add((src_parsed[0].upper(), src_parsed[1].upper()))
+    if not blocked_keys:
+        return extra_results
+
     table_map = {
         f"{tgt_schema.upper()}.{tgt_table.upper()}": (src_schema.upper(), src_table.upper())
         for (src_schema, src_table), (tgt_schema, tgt_table) in table_target_map.items()
@@ -8305,12 +8545,28 @@ def filter_trigger_results_for_unsupported_tables(
             return False
         table_key = table_name.split()[0].upper()
         src_key = table_map.get(table_key)
-        return bool(src_key and src_key in unsupported_keys)
+        return bool(src_key and src_key in blocked_keys)
 
     filtered = dict(extra_results)
+    filtered["index_mismatched"] = [
+        item for item in (extra_results.get("index_mismatched", []) or [])
+        if not _is_unsupported_table(item.table)
+    ]
+    filtered["constraint_mismatched"] = [
+        item for item in (extra_results.get("constraint_mismatched", []) or [])
+        if not _is_unsupported_table(item.table)
+    ]
     filtered["trigger_mismatched"] = [
         item for item in (extra_results.get("trigger_mismatched", []) or [])
         if not _is_unsupported_table(item.table)
+    ]
+    filtered["index_ok"] = [
+        name for name in (extra_results.get("index_ok", []) or [])
+        if not _is_unsupported_table(name)
+    ]
+    filtered["constraint_ok"] = [
+        name for name in (extra_results.get("constraint_ok", []) or [])
+        if not _is_unsupported_table(name)
     ]
     filtered["trigger_ok"] = [
         name for name in (extra_results.get("trigger_ok", []) or [])
@@ -12930,6 +13186,97 @@ def filter_missing_grant_entries(
     return miss_obj, miss_sys, miss_role
 
 
+def build_existing_target_object_set(ob_meta: Optional[ObMetadata]) -> Set[str]:
+    existing: Set[str] = set()
+    if not ob_meta:
+        return existing
+    for full_set in (ob_meta.objects_by_type or {}).values():
+        for full_name in (full_set or set()):
+            full_u = (full_name or "").upper()
+            if full_u and "." in full_u:
+                existing.add(full_u)
+    return existing
+
+
+def build_planned_grant_target_set(
+    missing_tables: List[Tuple[str, str, str, str]],
+    view_missing_objects: List[Tuple[str, str, str, str]],
+    non_view_missing_objects: List[Tuple[str, str, str, str, str]],
+    sequence_tasks: List[Tuple[str, str, str, str]]
+) -> Set[str]:
+    planned: Set[str] = set()
+    for _src_schema, _src_table, tgt_schema, tgt_table in (missing_tables or []):
+        planned.add(f"{(tgt_schema or '').upper()}.{(tgt_table or '').upper()}")
+    for _src_schema, _src_obj, tgt_schema, tgt_obj in (view_missing_objects or []):
+        planned.add(f"{(tgt_schema or '').upper()}.{(tgt_obj or '').upper()}")
+    for _obj_type, _src_schema, _src_obj, tgt_schema, tgt_obj in (non_view_missing_objects or []):
+        planned.add(f"{(tgt_schema or '').upper()}.{(tgt_obj or '').upper()}")
+    for _src_schema, _src_seq, tgt_schema, tgt_seq in (sequence_tasks or []):
+        planned.add(f"{(tgt_schema or '').upper()}.{(tgt_seq or '').upper()}")
+    return {name for name in planned if name and "." in name}
+
+
+def defer_missing_target_grants(
+    object_grants_missing_by_grantee: Dict[str, Set[ObjectGrantEntry]],
+    existing_targets: Set[str],
+    planned_targets: Set[str]
+) -> Tuple[
+    Dict[str, Set[ObjectGrantEntry]],
+    Dict[str, Set[ObjectGrantEntry]],
+    List[FilteredGrantEntry]
+]:
+    """
+    将“目标端当前不存在且本轮不会创建”的对象授权从 grants_miss 中延后。
+    返回: (kept_missing, deferred_missing, filtered_entries_for_report)
+    """
+    kept: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
+    deferred: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
+    filtered_entries: List[FilteredGrantEntry] = []
+    seen_filtered: Set[Tuple[str, str, str, str, str]] = set()
+
+    for grantee, entries in (object_grants_missing_by_grantee or {}).items():
+        grantee_u = (grantee or "").upper()
+        for entry in (entries or set()):
+            obj_u = (entry.object_full or "").upper()
+            priv_u = (entry.privilege or "").upper()
+            if not grantee_u or not obj_u or not priv_u:
+                continue
+            if obj_u in existing_targets or obj_u in planned_targets:
+                kept[grantee_u].add(entry)
+                continue
+            deferred[grantee_u].add(entry)
+            dedupe_key = (
+                "OBJECT",
+                grantee_u,
+                priv_u,
+                obj_u,
+                DEFERRED_GRANT_REASON_TARGET_MISSING_NOT_PLANNED,
+            )
+            if dedupe_key in seen_filtered:
+                continue
+            seen_filtered.add(dedupe_key)
+            filtered_entries.append(
+                FilteredGrantEntry(
+                    category="OBJECT",
+                    grantee=grantee_u,
+                    privilege=priv_u,
+                    object_full=obj_u,
+                    reason=DEFERRED_GRANT_REASON_TARGET_MISSING_NOT_PLANNED,
+                )
+            )
+
+    filtered_entries.sort(
+        key=lambda x: (
+            (x.category or "").upper(),
+            (x.grantee or "").upper(),
+            (x.privilege or "").upper(),
+            (x.object_full or "").upper(),
+            (x.reason or "").upper(),
+        )
+    )
+    return dict(kept), dict(deferred), filtered_entries
+
+
 def split_view_grants(
     view_targets: Set[str],
     expected_dependency_pairs: Optional[Set[Tuple[str, str, str, str]]],
@@ -13642,6 +13989,211 @@ def build_grant_plan(
     )
 
 
+def normalize_filtered_grant_reason_token(reason_code: Optional[str]) -> str:
+    token = (reason_code or "").strip().upper()
+    if not token:
+        return ""
+    token = re.sub(r"[^A-Z0-9_]+", "_", token)
+    token = re.sub(r"_+", "_", token).strip("_")
+    return token
+
+
+def build_unsupported_grant_filter_reason(
+    support_state: Optional[str],
+    reason_code: Optional[str]
+) -> str:
+    token = normalize_filtered_grant_reason_token(reason_code)
+    if token:
+        return f"{UNSUPPORTED_GRANT_TARGET_REASON_PREFIX}{token}"
+    state = (support_state or "").upper()
+    if state == SUPPORT_STATE_BLOCKED:
+        return f"{UNSUPPORTED_GRANT_TARGET_REASON_PREFIX}BLOCKED"
+    if state == SUPPORT_STATE_UNSUPPORTED:
+        return f"{UNSUPPORTED_GRANT_TARGET_REASON_PREFIX}UNSUPPORTED"
+    return f"{UNSUPPORTED_GRANT_TARGET_REASON_PREFIX}OBJECT"
+
+
+def _support_row_rank(row: ObjectSupportReportRow) -> Tuple[int, int, int]:
+    state = (row.support_state or "").upper()
+    if state == SUPPORT_STATE_BLOCKED:
+        state_rank = 3
+    elif state == SUPPORT_STATE_UNSUPPORTED:
+        state_rank = 2
+    elif state == SUPPORT_STATE_RISKY:
+        state_rank = 1
+    else:
+        state_rank = 0
+    reason_rank = 1 if (row.reason_code and row.reason_code != "-") else 0
+    root_rank = 1 if (row.root_cause and row.root_cause != "-") else 0
+    return state_rank, reason_rank, root_rank
+
+
+def build_blacklist_missing_grant_target_rows(
+    blacklist_tables: Optional[BlacklistTableMap],
+    table_target_map: Optional[Dict[Tuple[str, str], Tuple[str, str]]],
+    ob_meta: Optional[ObMetadata]
+) -> Dict[str, ObjectSupportReportRow]:
+    """
+    构建“黑名单且目标端不存在”的授权过滤目标。
+    仅用于授权过滤，不改变缺失对象支持性分类。
+    """
+    rows_by_target: Dict[str, ObjectSupportReportRow] = {}
+    if not blacklist_tables:
+        return rows_by_target
+    target_map = table_target_map or {}
+    ob_tables = {
+        (name or "").upper()
+        for name in ((ob_meta.objects_by_type or {}).get("TABLE", set()) if ob_meta else set())
+        if name
+    }
+    for (src_schema, src_table), entries in blacklist_tables.items():
+        src_schema_u = (src_schema or "").upper()
+        src_table_u = (src_table or "").upper()
+        if not src_schema_u or not src_table_u:
+            continue
+        tgt_schema_u, tgt_table_u = target_map.get(
+            (src_schema_u, src_table_u),
+            (src_schema_u, src_table_u)
+        )
+        tgt_full = f"{tgt_schema_u.upper()}.{tgt_table_u.upper()}"
+        if tgt_full in ob_tables:
+            continue
+        black_type, reason, detail = summarize_blacklist_entries(entries)
+        black_type_u = (black_type or "BLACKLIST").upper()
+        reason_code = f"BLACKLIST_{black_type_u}" if black_type_u else "BLACKLIST"
+        row = ObjectSupportReportRow(
+            obj_type="TABLE",
+            src_full=f"{src_schema_u}.{src_table_u}",
+            tgt_full=tgt_full,
+            support_state=SUPPORT_STATE_BLOCKED,
+            reason_code=reason_code,
+            reason=reason or "黑名单表目标端不存在",
+            dependency="-",
+            action="先补齐对象(OMS/改造)后再授权",
+            detail=detail or "-",
+            root_cause=f"{src_schema_u}.{src_table_u}({black_type_u})",
+        )
+        existing = rows_by_target.get(tgt_full)
+        if not existing or _support_row_rank(row) >= _support_row_rank(existing):
+            rows_by_target[tgt_full] = row
+    return rows_by_target
+
+
+def build_unsupported_grant_target_rows(
+    support_summary: Optional[SupportClassificationResult],
+    extra_target_rows: Optional[Dict[str, ObjectSupportReportRow]] = None
+) -> Dict[str, ObjectSupportReportRow]:
+    rows_by_target: Dict[str, ObjectSupportReportRow] = {}
+
+    def _add_row(row: Optional[ObjectSupportReportRow]) -> None:
+        if not row:
+            return
+        state_u = (row.support_state or "").upper()
+        if state_u not in {SUPPORT_STATE_BLOCKED, SUPPORT_STATE_UNSUPPORTED}:
+            return
+        tgt_u = (row.tgt_full or "").upper()
+        if not tgt_u:
+            return
+        existing = rows_by_target.get(tgt_u)
+        if not existing or _support_row_rank(row) >= _support_row_rank(existing):
+            rows_by_target[tgt_u] = row
+
+    if support_summary:
+        for row in (support_summary.support_state_map or {}).values():
+            _add_row(row)
+        for row in (support_summary.unsupported_rows or []):
+            _add_row(row)
+    for row in (extra_target_rows or {}).values():
+        _add_row(row)
+    return rows_by_target
+
+
+def filter_grant_plan_unsupported_targets(
+    grant_plan: Optional[GrantPlan],
+    support_summary: Optional[SupportClassificationResult],
+    extra_target_rows: Optional[Dict[str, ObjectSupportReportRow]] = None
+) -> Tuple[Optional[GrantPlan], int]:
+    if not grant_plan:
+        return grant_plan, 0
+    unsupported_target_rows = build_unsupported_grant_target_rows(
+        support_summary,
+        extra_target_rows
+    )
+    if not unsupported_target_rows:
+        return grant_plan, 0
+
+    filtered_entries: List[FilteredGrantEntry] = list(grant_plan.filtered_grants or [])
+    filtered_seen: Set[Tuple[str, str, str, str, str]] = {
+        (
+            (entry.category or "").upper(),
+            (entry.grantee or "").upper(),
+            (entry.privilege or "").upper(),
+            (entry.object_full or "").upper(),
+            (entry.reason or "").upper(),
+        )
+        for entry in filtered_entries
+    }
+    kept_obj_grants: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
+    skipped = 0
+
+    for grantee, entries in (grant_plan.object_grants or {}).items():
+        grantee_u = (grantee or "").upper()
+        for entry in (entries or set()):
+            obj_u = (entry.object_full or "").upper()
+            if not obj_u:
+                continue
+            support_row = unsupported_target_rows.get(obj_u)
+            if support_row is None:
+                kept_obj_grants[grantee_u].add(entry)
+                continue
+            skipped += 1
+            reason_code = build_unsupported_grant_filter_reason(
+                support_row.support_state,
+                support_row.reason_code
+            )
+            dedupe_key = (
+                "OBJECT",
+                grantee_u,
+                (entry.privilege or "").upper(),
+                obj_u,
+                reason_code,
+            )
+            if dedupe_key in filtered_seen:
+                continue
+            filtered_seen.add(dedupe_key)
+            filtered_entries.append(
+                FilteredGrantEntry(
+                    category="OBJECT",
+                    grantee=grantee_u,
+                    privilege=(entry.privilege or "").upper(),
+                    object_full=obj_u,
+                    reason=reason_code,
+                )
+            )
+
+    if not skipped:
+        return grant_plan, 0
+
+    filtered_entries.sort(
+        key=lambda x: (
+            (x.category or "").upper(),
+            (x.grantee or "").upper(),
+            (x.privilege or "").upper(),
+            (x.object_full or "").upper(),
+            (x.reason or "").upper(),
+        )
+    )
+    updated_plan = GrantPlan(
+        object_grants=dict(kept_obj_grants),
+        sys_privs=dict(grant_plan.sys_privs or {}),
+        role_privs=dict(grant_plan.role_privs or {}),
+        role_ddls=list(grant_plan.role_ddls or []),
+        filtered_grants=filtered_entries,
+        view_grant_targets=set(grant_plan.view_grant_targets or set()),
+    )
+    return updated_plan, skipped
+
+
 # ====================== TABLE / VIEW / 其他主对象校验 ======================
 
 def check_primary_objects(
@@ -14303,6 +14855,52 @@ def build_constraint_index_cols(
         if cols:
             cols_set.add(cols)
     return cols_set
+
+
+def find_source_backing_constraint_for_index(
+    source_constraints: Optional[Dict[str, Dict]],
+    index_name: Optional[str]
+) -> Optional[Tuple[str, Dict]]:
+    """
+    找到源端由 PK/UK 约束背靠的索引：
+    - 优先匹配 CONSTRAINTS.INDEX_NAME；
+    - 兼容回退到 CONSTRAINT_NAME == INDEX_NAME。
+    """
+    idx_name_u = normalize_identifier_name(index_name)
+    if not idx_name_u:
+        return None
+    for cons_name, cons_meta in (source_constraints or {}).items():
+        ctype = normalize_identifier_name((cons_meta or {}).get("type"))
+        if ctype not in {"P", "U"}:
+            continue
+        cons_name_u = normalize_identifier_name(cons_name)
+        backing_idx_u = normalize_identifier_name((cons_meta or {}).get("index_name"))
+        if (backing_idx_u and backing_idx_u == idx_name_u) or (
+            not backing_idx_u and cons_name_u == idx_name_u
+        ):
+            return cons_name_u, (cons_meta or {})
+    return None
+
+
+def has_equivalent_pk_uk_constraint(
+    target_constraints: Optional[Dict[str, Dict]],
+    columns: Optional[Sequence[str]]
+) -> bool:
+    """
+    判断目标端是否已有与给定列集等价的 PK/UK 约束。
+    这里将 PK 与 UK 视为“索引语义等价”，用于避免重复建索引导致 ORA-01408。
+    """
+    cols_u = normalize_column_sequence(columns or [])
+    if not cols_u:
+        return False
+    for cons_meta in (target_constraints or {}).values():
+        ctype = normalize_identifier_name((cons_meta or {}).get("type"))
+        if ctype not in {"P", "U"}:
+            continue
+        tgt_cols = normalize_column_sequence((cons_meta or {}).get("columns"))
+        if tgt_cols == cols_u:
+            return True
+    return False
 
 
 def build_constraint_signature(
@@ -19483,13 +20081,21 @@ def remap_view_dependencies(
             dep_schema, dep_obj = dep_u.split('.', 1)
 
         mapped_target: Optional[str] = None
+        explicit_dep_target = remap_rules.get(dep_u)
+        resolved_by_synonym = False
         if dep_schema == "PUBLIC":
             mapped_target = _resolve_synonym("PUBLIC", dep_obj)
+            if mapped_target:
+                resolved_by_synonym = True
         else:
             # 同义词依赖优先解析为终点对象，再做 remap，避免停留在目标同义词名。
             mapped_target = _resolve_synonym(dep_schema, dep_obj)
+            if mapped_target:
+                resolved_by_synonym = True
             if not mapped_target and dep_schema == view_schema_u:
                 mapped_target = _resolve_synonym("PUBLIC", dep_obj)
+                if mapped_target:
+                    resolved_by_synonym = True
 
         if not mapped_target:
             mapped_target = find_mapped_target_any_type(
@@ -19497,7 +20103,7 @@ def remap_view_dependencies(
                 dep_u,
                 preferred_types=preferred_types
             )
-            explicit = remap_rules.get(dep_u)
+            explicit = explicit_dep_target
             # 当 full_object_mapping 因冲突回退为 1:1 时，显式 remap 规则优先。
             if mapped_target and explicit and mapped_target.upper() == dep_u and explicit.upper() != dep_u:
                 mapped_target = explicit
@@ -19515,6 +20121,17 @@ def remap_view_dependencies(
                     mapped_target = mapped_public
         if not mapped_target:
             continue
+        # 保护规则：
+        # 若未显式配置该依赖对象的重命名 remap，且不是同义词终点解析得到的结果，
+        # 则仅允许变更 schema，不允许把对象名改成其他名字（避免误替换为同 schema 下其它对象）。
+        if (
+            not explicit_dep_target
+            and not resolved_by_synonym
+            and '.' in mapped_target
+        ):
+            tgt_schema_tmp, tgt_obj_tmp = mapped_target.upper().split('.', 1)
+            if tgt_obj_tmp != dep_obj:
+                mapped_target = f"{tgt_schema_tmp}.{dep_obj}"
         tgt_u = mapped_target.upper()
         replacements_qualified[dep_u] = tgt_u
         if dep_schema == view_schema_u:
@@ -23037,6 +23654,839 @@ def generate_interval_partition_fixup_scripts(
     return None
 
 
+NAME_COLLISION_IDENTIFIER_MAX = 30
+NAME_COLLISION_TEMP_PREFIX = "TMPNC"
+NAME_COLLISION_CONSTRAINT_RENAME_GATE_VERSION = "4.3.0.0"
+
+
+def _sanitize_name_token(value: Optional[str], fallback: str = "X") -> str:
+    raw = (value or "").strip().upper()
+    token = re.sub(r"[^A-Z0-9_]+", "_", raw)
+    token = re.sub(r"_+", "_", token).strip("_")
+    return token or fallback
+
+
+def _short_hash(text: str, length: int = 8) -> str:
+    return hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:length].upper()
+
+
+def resolve_name_collision_constraint_strategy(ob_version: Optional[str]) -> str:
+    """
+    约束重名修复策略:
+      - rename: ALTER TABLE ... RENAME CONSTRAINT ...
+      - drop_add: DROP CONSTRAINT + ADD CONSTRAINT (兼容低版本 OB)
+    """
+    version = extract_ob_version_number(ob_version)
+    if not version:
+        return "rename"
+    if compare_version(version, NAME_COLLISION_CONSTRAINT_RENAME_GATE_VERSION) < 0:
+        return "drop_add"
+    return "rename"
+
+
+def _extract_notnull_column(search_condition: Optional[str]) -> str:
+    cond = normalize_sql_expression(search_condition)
+    if not cond:
+        return ""
+    cond_u = cond.upper().strip()
+    while cond_u.startswith("(") and cond_u.endswith(")"):
+        stripped = strip_wrapping_parentheses(cond_u)
+        if stripped == cond_u:
+            break
+        cond_u = stripped.strip()
+    cond_u = re.sub(r'"([A-Z0-9_#$]+)"', r"\1", cond_u)
+    m = re.match(r"^([A-Z0-9_#$]+)\s+IS\s+NOT\s+NULL$", cond_u)
+    if not m:
+        return ""
+    return _sanitize_name_token(m.group(1), "COL")
+
+
+def _build_name_component_token(
+    columns: Sequence[str],
+    expressions: Sequence[str],
+    search_condition: Optional[str]
+) -> str:
+    tokens: List[str] = []
+    for col in columns or []:
+        token = _sanitize_name_token(col, "")
+        if token:
+            tokens.append(token)
+    if not tokens and expressions:
+        expr = " ".join(expressions)
+        token = _sanitize_name_token(expr, "EXPR")
+        tokens.append(token[:24] if len(token) > 24 else token)
+    if not tokens and search_condition:
+        cond_token = _sanitize_name_token(normalize_sql_expression(search_condition), "EXPR")
+        tokens.append(cond_token[:24] if len(cond_token) > 24 else cond_token)
+    if not tokens:
+        return "COL"
+    joined = "_".join(tokens[:3])
+    return joined[:24] if len(joined) > 24 else joined
+
+
+def _build_collision_preferred_name(
+    object_type: str,
+    table_name: str,
+    constraint_type: Optional[str],
+    columns: Sequence[str],
+    expressions: Sequence[str],
+    search_condition: Optional[str]
+) -> str:
+    table_token = _sanitize_name_token(table_name, "T")
+    object_type_u = (object_type or "").upper()
+    ctype = (constraint_type or "").upper()
+    if object_type_u == "INDEX":
+        detail = _build_name_component_token(columns, expressions, None)
+        base = f"IX_{table_token}_{detail}"
+    elif ctype == "P":
+        base = f"PK_{table_token}"
+    elif ctype == "U":
+        detail = _build_name_component_token(columns, expressions, None)
+        base = f"UK_{table_token}_{detail}"
+    elif ctype == "R":
+        detail = _build_name_component_token(columns, expressions, None)
+        base = f"FK_{table_token}_{detail}"
+    elif ctype == "C":
+        nn_col = _extract_notnull_column(search_condition)
+        if nn_col:
+            base = f"NN_{table_token}_{nn_col}"
+        else:
+            detail = _build_name_component_token(columns, expressions, search_condition)
+            base = f"CK_{table_token}_{detail}"
+    else:
+        detail = _build_name_component_token(columns, expressions, search_condition)
+        base = f"CK_{table_token}_{detail}"
+    base = _sanitize_name_token(base, "OBJ")
+    return base
+
+
+def _fit_collision_name(preferred: str, semantic_key: str) -> str:
+    name = _sanitize_name_token(preferred, "OBJ")
+    if len(name) <= NAME_COLLISION_IDENTIFIER_MAX:
+        return name
+    digest = _short_hash(semantic_key, 8)
+    keep = max(1, NAME_COLLISION_IDENTIFIER_MAX - len(digest) - 1)
+    short = name[:keep].rstrip("_")
+    if not short:
+        short = name[:keep]
+    return f"{short}_{digest}"
+
+
+def _allocate_collision_name(
+    preferred: str,
+    semantic_key: str,
+    reserved: Set[str],
+    forbidden: Optional[Set[str]] = None
+) -> str:
+    forbidden = {v.upper() for v in (forbidden or set())}
+    base = _fit_collision_name(preferred, semantic_key)
+    if base not in reserved and base not in forbidden:
+        reserved.add(base)
+        return base
+
+    for i in range(1, 10000):
+        suffix = f"_{i}"
+        keep = max(1, NAME_COLLISION_IDENTIFIER_MAX - len(suffix))
+        candidate = (base[:keep].rstrip("_") or base[:keep]) + suffix
+        candidate = candidate[:NAME_COLLISION_IDENTIFIER_MAX]
+        if candidate in reserved or candidate in forbidden:
+            continue
+        reserved.add(candidate)
+        return candidate
+
+    fallback = _fit_collision_name(f"{base}_{_short_hash(semantic_key + '|FALLBACK', 10)}", semantic_key)
+    if fallback in forbidden:
+        fallback = _fit_collision_name(f"{fallback}_{_short_hash(semantic_key + '|ALT', 6)}", semantic_key)
+    reserved.add(fallback)
+    return fallback
+
+
+def _build_collision_semantic_key(entry: Dict[str, object]) -> str:
+    cols = ",".join(entry.get("columns") or [])
+    exprs = ",".join(entry.get("expressions") or [])
+    cond = normalize_sql_expression_casefold(str(entry.get("search_condition") or ""))
+    return "|".join([
+        str(entry.get("schema") or ""),
+        str(entry.get("table") or ""),
+        str(entry.get("object_type") or ""),
+        str(entry.get("constraint_type") or ""),
+        cols,
+        exprs,
+        cond,
+        str(entry.get("name") or ""),
+    ])
+
+
+def _is_constraint_backing_index_pair(left: Dict[str, object], right: Dict[str, object]) -> bool:
+    """
+    判断约束/索引是否属于同一张表上的“约束及其底层索引”合法配对。
+    仅对 PK/UK 生效。
+    """
+    if str(left.get("object_type") or "").upper() == "CONSTRAINT":
+        cons, idx = left, right
+    elif str(right.get("object_type") or "").upper() == "CONSTRAINT":
+        cons, idx = right, left
+    else:
+        return False
+    if str(idx.get("object_type") or "").upper() != "INDEX":
+        return False
+    if normalize_identifier_name(cons.get("schema")) != normalize_identifier_name(idx.get("schema")):
+        return False
+    if normalize_identifier_name(cons.get("table")) != normalize_identifier_name(idx.get("table")):
+        return False
+    cons_name = normalize_identifier_name(cons.get("name"))
+    idx_name = normalize_identifier_name(idx.get("name"))
+    if not cons_name or not idx_name or cons_name != idx_name:
+        return False
+    ctype = normalize_identifier_name(cons.get("constraint_type"))
+    if ctype not in {"P", "U"}:
+        return False
+    backing_index = normalize_identifier_name(cons.get("index_name"))
+    if backing_index and backing_index == idx_name:
+        return True
+    cons_cols = [normalize_identifier_name(v) for v in (cons.get("columns") or []) if normalize_identifier_name(v)]
+    idx_cols = [normalize_identifier_name(v) for v in (idx.get("columns") or []) if normalize_identifier_name(v)]
+    if cons_cols and idx_cols and cons_cols == idx_cols:
+        return True
+    return False
+
+
+def _rewrite_create_index_name(
+    ddl: str,
+    target_schema: str,
+    old_name: str,
+    new_name: str
+) -> str:
+    old_u = normalize_identifier_name(old_name)
+    new_u = normalize_identifier_name(new_name)
+    if not ddl or not old_u or old_u == new_u:
+        return ddl
+    pattern = re.compile(
+        r"(\bCREATE\s+(?:UNIQUE\s+)?INDEX\s+)(?P<name>(?:\"[^\"]+\"|[A-Za-z0-9_#$]+)(?:\.(?:\"[^\"]+\"|[A-Za-z0-9_#$]+))?)",
+        re.IGNORECASE
+    )
+    m = pattern.search(ddl)
+    if not m:
+        return ddl
+    replacement = quote_qualified_parts(target_schema.upper(), new_u)
+    return ddl[:m.start("name")] + replacement + ddl[m.end("name"):]
+
+
+def _rewrite_add_constraint_name(ddl: str, old_name: str, new_name: str) -> str:
+    old_u = normalize_identifier_name(old_name)
+    new_u = normalize_identifier_name(new_name)
+    if not ddl or not old_u or old_u == new_u:
+        return ddl
+    pattern = re.compile(r"(\bADD\s+CONSTRAINT\s+)(?P<name>(?:\"[^\"]+\"|[A-Za-z0-9_#$]+))", re.IGNORECASE)
+    m = pattern.search(ddl)
+    if not m:
+        return ddl
+    return ddl[:m.start("name")] + quote_identifier(new_u) + ddl[m.end("name"):]
+
+
+def _collect_existing_collision_entries(ob_meta: Optional[ObMetadata]) -> List[Dict[str, object]]:
+    entries: List[Dict[str, object]] = []
+    if not ob_meta:
+        return entries
+    constraint_lookup: Dict[Tuple[str, str], Dict[str, object]] = {}
+    for (schema, table), cons_map in (ob_meta.constraints or {}).items():
+        schema_u = (schema or "").upper()
+        table_u = (table or "").upper()
+        for cons_name, meta in (cons_map or {}).items():
+            cons_u = normalize_identifier_name(cons_name)
+            if not schema_u or not table_u or not cons_u:
+                continue
+            merged = dict(meta or {})
+            merged["table_name"] = table_u
+            constraint_lookup[(schema_u, cons_u)] = merged
+    for (schema, table), idx_map in (ob_meta.indexes or {}).items():
+        schema_u = (schema or "").upper()
+        table_u = (table or "").upper()
+        for idx_name, meta in (idx_map or {}).items():
+            name_u = normalize_identifier_name(idx_name)
+            if not schema_u or not table_u or not name_u:
+                continue
+            cols = [normalize_identifier_name(c) for c in (meta or {}).get("columns", []) if normalize_identifier_name(c)]
+            exprs = [str(v) for _, v in sorted(((meta or {}).get("expressions") or {}).items()) if v]
+            entries.append({
+                "schema": schema_u,
+                "table": table_u,
+                "object_type": "INDEX",
+                "constraint_type": "",
+                "name": name_u,
+                "columns": cols,
+                "expressions": exprs,
+                "search_condition": "",
+                "uniqueness": (meta or {}).get("uniqueness") or "",
+            })
+    for (schema, table), cons_map in (ob_meta.constraints or {}).items():
+        schema_u = (schema or "").upper()
+        table_u = (table or "").upper()
+        for cons_name, meta in (cons_map or {}).items():
+            name_u = normalize_identifier_name(cons_name)
+            ctype = normalize_identifier_name((meta or {}).get("type"))
+            if not schema_u or not table_u or not name_u or ctype not in {"P", "U", "R", "C"}:
+                continue
+            cols = [normalize_identifier_name(c) for c in (meta or {}).get("columns", []) if normalize_identifier_name(c)]
+            ref_owner = normalize_identifier_name((meta or {}).get("ref_table_owner") or (meta or {}).get("r_owner"))
+            ref_name = normalize_identifier_name((meta or {}).get("ref_table_name"))
+            ref_cons = normalize_identifier_name((meta or {}).get("r_constraint"))
+            ref_cols: List[str] = []
+            if ctype == "R" and ref_owner and ref_cons:
+                ref_meta = constraint_lookup.get((ref_owner, ref_cons)) or {}
+                ref_cols = [
+                    normalize_identifier_name(c)
+                    for c in (ref_meta.get("columns") or [])
+                    if normalize_identifier_name(c)
+                ]
+                if not ref_name:
+                    ref_name = normalize_identifier_name(ref_meta.get("table_name"))
+            entries.append({
+                "schema": schema_u,
+                "table": table_u,
+                "object_type": "CONSTRAINT",
+                "constraint_type": ctype,
+                "name": name_u,
+                "columns": cols,
+                "expressions": [],
+                "search_condition": (meta or {}).get("search_condition") or "",
+                "status": (meta or {}).get("status") or "",
+                "validated": (meta or {}).get("validated") or "",
+                "index_name": normalize_identifier_name((meta or {}).get("index_name")),
+                "r_owner": normalize_identifier_name((meta or {}).get("r_owner")),
+                "r_constraint": ref_cons,
+                "ref_table_owner": ref_owner,
+                "ref_table_name": ref_name,
+                "ref_columns": ref_cols,
+                "delete_rule": (meta or {}).get("delete_rule") or "",
+                "update_rule": (meta or {}).get("update_rule") or "",
+            })
+    return entries
+
+
+def build_name_collision_plan(
+    oracle_meta: OracleMetadata,
+    ob_meta: Optional[ObMetadata],
+    index_tasks: List[Tuple[IndexMismatch, str, str, str, str]],
+    constraint_tasks: List[Tuple[ConstraintMismatch, str, str, str, str]],
+    mode: str,
+    rename_existing: bool
+) -> Tuple[Dict[Tuple[str, str, str, str], str], List[Dict[str, object]], List[NameCollisionDetailRow]]:
+    mode_u = normalize_name_collision_mode(mode)
+    if mode_u == "off":
+        return {}, [], []
+
+    planned_entries: List[Dict[str, object]] = []
+    for item, src_schema, src_table, tgt_schema, tgt_table in index_tasks:
+        idx_meta_map = oracle_meta.indexes.get((src_schema.upper(), src_table.upper()), {}) or {}
+        for idx_name in sorted(item.missing_indexes or []):
+            idx_name_u = normalize_identifier_name(idx_name)
+            meta = idx_meta_map.get(idx_name_u, {}) or {}
+            cols = [normalize_identifier_name(c) for c in (meta.get("columns") or []) if normalize_identifier_name(c)]
+            exprs = [str(v) for _, v in sorted((meta.get("expressions") or {}).items()) if v]
+            planned_entries.append({
+                "schema": tgt_schema.upper(),
+                "table": tgt_table.upper(),
+                "object_type": "INDEX",
+                "constraint_type": "",
+                "name": idx_name_u,
+                "columns": cols,
+                "expressions": exprs,
+                "search_condition": "",
+            })
+    for item, src_schema, src_table, tgt_schema, tgt_table in constraint_tasks:
+        cons_meta_map = oracle_meta.constraints.get((src_schema.upper(), src_table.upper()), {}) or {}
+        for cons_name in sorted(item.missing_constraints or []):
+            cons_name_u = normalize_identifier_name(cons_name)
+            meta = cons_meta_map.get(cons_name_u, {}) or {}
+            ctype = normalize_identifier_name(meta.get("type"))
+            cols = [normalize_identifier_name(c) for c in (meta.get("columns") or []) if normalize_identifier_name(c)]
+            planned_entries.append({
+                "schema": tgt_schema.upper(),
+                "table": tgt_table.upper(),
+                "object_type": "CONSTRAINT",
+                "constraint_type": ctype,
+                "name": cons_name_u,
+                "columns": cols,
+                "expressions": [],
+                "search_condition": meta.get("search_condition") or "",
+            })
+
+    existing_entries = _collect_existing_collision_entries(ob_meta)
+    existing_name_groups: Dict[Tuple[str, str], List[Dict[str, object]]] = defaultdict(list)
+    for entry in existing_entries:
+        existing_name_groups[(str(entry["schema"]), str(entry["name"]))].append(entry)
+
+    planned_desired_names_by_schema: Dict[str, Set[str]] = defaultdict(set)
+    for entry in planned_entries:
+        preferred = _build_collision_preferred_name(
+            str(entry.get("object_type")),
+            str(entry.get("table")),
+            str(entry.get("constraint_type") or ""),
+            list(entry.get("columns") or []),
+            list(entry.get("expressions") or []),
+            str(entry.get("search_condition") or ""),
+        )
+        desired = _fit_collision_name(preferred, _build_collision_semantic_key(entry))
+        entry["desired_name"] = desired
+        planned_desired_names_by_schema[str(entry["schema"])].add(desired)
+
+    existing_candidate_ids: Set[Tuple[str, str, str, str]] = set()
+    must_move_ids: Set[Tuple[str, str, str, str]] = set()
+    existing_conflict_types: Dict[Tuple[str, str, str, str], Set[str]] = defaultdict(set)
+    existing_conflict_with: Dict[Tuple[str, str, str, str], Set[str]] = defaultdict(set)
+
+    for (schema, name), group in existing_name_groups.items():
+        obj_types = {str(g.get("object_type")) for g in group}
+        if len(group) > 1 and len(obj_types) > 1:
+            for g in group:
+                peers: List[Dict[str, object]] = []
+                for p in group:
+                    if p is g:
+                        continue
+                    if str(p.get("object_type")) == str(g.get("object_type")):
+                        continue
+                    if _is_constraint_backing_index_pair(g, p):
+                        continue
+                    peers.append(p)
+                if not peers:
+                    continue
+                gid = (schema, str(g["object_type"]), str(g["table"]), str(g["name"]))
+                existing_candidate_ids.add(gid)
+                existing_conflict_types[gid].add("EXISTING_CROSS_TYPE_DUP")
+                peer_labels = [
+                    f"{str(p.get('object_type'))}:{str(p.get('table'))}.{str(p.get('name'))}"
+                    for p in peers
+                ]
+                existing_conflict_with[gid].update(peer_labels)
+
+    for entry in existing_entries:
+        schema = str(entry["schema"])
+        name = str(entry["name"])
+        gid = (schema, str(entry["object_type"]), str(entry["table"]), name)
+        if name in planned_desired_names_by_schema.get(schema, set()):
+            existing_candidate_ids.add(gid)
+            must_move_ids.add(gid)
+            existing_conflict_types[gid].add("PLANNED_VS_EXISTING")
+            existing_conflict_with[gid].add(f"PLANNED:{schema}.{name}")
+
+    existing_non_candidates: List[Dict[str, object]] = []
+    existing_candidates: List[Dict[str, object]] = []
+    for entry in existing_entries:
+        gid = (str(entry["schema"]), str(entry["object_type"]), str(entry["table"]), str(entry["name"]))
+        if gid in existing_candidate_ids:
+            existing_candidates.append(entry)
+        else:
+            existing_non_candidates.append(entry)
+
+    reserved_non_candidate: Dict[str, Set[str]] = defaultdict(set)
+    for entry in existing_non_candidates:
+        reserved_non_candidate[str(entry["schema"])].add(str(entry["name"]))
+
+    existing_final_name_map: Dict[Tuple[str, str, str, str], str] = {}
+    if mode_u == "fixup" and rename_existing and existing_candidates:
+        alloc_reserved = {schema: set(names) for schema, names in reserved_non_candidate.items()}
+        for entry in sorted(
+            existing_candidates,
+            key=lambda e: (str(e["schema"]), str(e["object_type"]), str(e["table"]), str(e["name"]))
+        ):
+            schema = str(entry["schema"])
+            gid = (schema, str(entry["object_type"]), str(entry["table"]), str(entry["name"]))
+            preferred = _build_collision_preferred_name(
+                str(entry.get("object_type")),
+                str(entry.get("table")),
+                str(entry.get("constraint_type") or ""),
+                list(entry.get("columns") or []),
+                list(entry.get("expressions") or []),
+                str(entry.get("search_condition") or ""),
+            )
+            forbidden: Set[str] = set()
+            if gid in must_move_ids:
+                forbidden.add(str(entry["name"]))
+            final_name = _allocate_collision_name(
+                preferred,
+                _build_collision_semantic_key(entry),
+                alloc_reserved.setdefault(schema, set()),
+                forbidden=forbidden
+            )
+            existing_final_name_map[gid] = final_name
+
+    planned_name_map: Dict[Tuple[str, str, str, str], str] = {}
+    planned_old_groups: Dict[Tuple[str, str], int] = defaultdict(int)
+    for entry in planned_entries:
+        planned_old_groups[(str(entry["schema"]), str(entry["name"]))] += 1
+
+    planned_reserved: Dict[str, Set[str]] = defaultdict(set)
+    if mode_u == "fixup" and rename_existing and existing_candidates:
+        for schema, names in reserved_non_candidate.items():
+            planned_reserved[schema].update(names)
+        for gid, final_name in existing_final_name_map.items():
+            planned_reserved[gid[0]].add(final_name)
+    else:
+        for entry in existing_entries:
+            planned_reserved[str(entry["schema"])].add(str(entry["name"]))
+
+    for entry in sorted(
+        planned_entries,
+        key=lambda e: (str(e["schema"]), str(e["object_type"]), str(e["table"]), str(e["name"]))
+    ):
+        schema = str(entry["schema"])
+        key = (
+            schema,
+            str(entry["object_type"]).upper(),
+            str(entry["table"]).upper(),
+            str(entry["name"]).upper()
+        )
+        preferred = _build_collision_preferred_name(
+            str(entry.get("object_type")),
+            str(entry.get("table")),
+            str(entry.get("constraint_type") or ""),
+            list(entry.get("columns") or []),
+            list(entry.get("expressions") or []),
+            str(entry.get("search_condition") or ""),
+        )
+        final_name = _allocate_collision_name(
+            preferred,
+            _build_collision_semantic_key(entry),
+            planned_reserved.setdefault(schema, set())
+        )
+        planned_name_map[key] = final_name
+
+    rename_actions: List[Dict[str, object]] = []
+    detail_rows: List[NameCollisionDetailRow] = []
+
+    for entry in sorted(
+        existing_candidates,
+        key=lambda e: (str(e["schema"]), str(e["object_type"]), str(e["table"]), str(e["name"]))
+    ):
+        schema = str(entry["schema"])
+        old_name = str(entry["name"]).upper()
+        gid = (schema, str(entry["object_type"]), str(entry["table"]), old_name)
+        new_name = existing_final_name_map.get(gid, old_name)
+        conflict_types = sorted(existing_conflict_types.get(gid, set()) or {"EXISTING_CONFLICT"})
+        conflict_with = ",".join(sorted(existing_conflict_with.get(gid, set())))
+        if mode_u == "fixup" and rename_existing:
+            action = "RENAME_EXISTING" if new_name != old_name else "KEEP_EXISTING"
+        elif mode_u == "report":
+            action = "REPORT_ONLY"
+        else:
+            action = "SKIP_RENAME"
+        if mode_u == "fixup" and rename_existing and new_name != old_name:
+            rename_action: Dict[str, object] = {
+                "schema": schema,
+                "object_type": str(entry["object_type"]),
+                "table": str(entry["table"]),
+                "old_name": old_name,
+                "new_name": new_name,
+            }
+            if str(entry.get("object_type") or "").upper() == "CONSTRAINT":
+                rename_action.update({
+                    "constraint_type": str(entry.get("constraint_type") or "").upper(),
+                    "columns": list(entry.get("columns") or []),
+                    "search_condition": str(entry.get("search_condition") or ""),
+                    "status": str(entry.get("status") or ""),
+                    "validated": str(entry.get("validated") or ""),
+                    "index_name": str(entry.get("index_name") or ""),
+                    "r_owner": str(entry.get("r_owner") or ""),
+                    "r_constraint": str(entry.get("r_constraint") or ""),
+                    "ref_table_owner": str(entry.get("ref_table_owner") or ""),
+                    "ref_table_name": str(entry.get("ref_table_name") or ""),
+                    "ref_columns": list(entry.get("ref_columns") or []),
+                    "delete_rule": str(entry.get("delete_rule") or ""),
+                    "update_rule": str(entry.get("update_rule") or ""),
+                })
+            elif str(entry.get("object_type") or "").upper() == "INDEX":
+                rename_action.update({
+                    "columns": list(entry.get("columns") or []),
+                    "expressions": list(entry.get("expressions") or []),
+                    "uniqueness": str(entry.get("uniqueness") or ""),
+                })
+            rename_actions.append(rename_action)
+        detail_rows.append(
+            NameCollisionDetailRow(
+                schema_name=schema,
+                object_type=str(entry["object_type"]).upper(),
+                table_name=str(entry["table"]).upper(),
+                old_name=old_name,
+                conflict_type=",".join(conflict_types),
+                conflict_with=conflict_with,
+                proposed_name=new_name,
+                action=action,
+                reason="existing_object_collision",
+            )
+        )
+
+    for entry in sorted(
+        planned_entries,
+        key=lambda e: (str(e["schema"]), str(e["object_type"]), str(e["table"]), str(e["name"]))
+    ):
+        schema = str(entry["schema"])
+        object_type = str(entry["object_type"]).upper()
+        table = str(entry["table"]).upper()
+        old_name = str(entry["name"]).upper()
+        key = (schema, object_type, table, old_name)
+        new_name = planned_name_map.get(key, old_name)
+        conflict_types: List[str] = []
+        if (schema, old_name) in existing_name_groups:
+            conflict_types.append("PLANNED_VS_EXISTING")
+        if planned_old_groups.get((schema, old_name), 0) > 1:
+            conflict_types.append("PLANNED_INTERNAL_DUP")
+        if new_name != old_name and "PLANNED_VS_EXISTING" not in conflict_types:
+            conflict_types.append("POLICY_RENAME")
+        if not conflict_types:
+            continue
+        conflict_with_set: Set[str] = set()
+        for g in existing_name_groups.get((schema, old_name), []):
+            conflict_with_set.add(f"{str(g.get('object_type'))}:{str(g.get('table'))}.{str(g.get('name'))}")
+        detail_rows.append(
+            NameCollisionDetailRow(
+                schema_name=schema,
+                object_type=object_type,
+                table_name=table,
+                old_name=old_name,
+                conflict_type=",".join(conflict_types),
+                conflict_with=",".join(sorted(conflict_with_set)),
+                proposed_name=new_name,
+                action="REWRITE_FIXUP_NAME" if mode_u == "fixup" else "REPORT_ONLY",
+                reason="planned_object_collision",
+            )
+        )
+
+    return planned_name_map, rename_actions, detail_rows
+
+
+def _build_name_collision_temp_name(
+    schema: str,
+    object_type: str,
+    table_name: str,
+    old_name: str,
+    reserved: Set[str]
+) -> str:
+    semantic = "|".join([schema, object_type, table_name, old_name])
+    base = f"{NAME_COLLISION_TEMP_PREFIX}_{_short_hash(semantic, 10)}"
+    candidate = base[:NAME_COLLISION_IDENTIFIER_MAX]
+    if candidate not in reserved:
+        reserved.add(candidate)
+        return candidate
+    for i in range(1, 10000):
+        suffix = f"_{i}"
+        keep = max(1, NAME_COLLISION_IDENTIFIER_MAX - len(suffix))
+        cand = (base[:keep].rstrip("_") or base[:keep]) + suffix
+        cand = cand[:NAME_COLLISION_IDENTIFIER_MAX]
+        if cand in reserved:
+            continue
+        reserved.add(cand)
+        return cand
+    fallback = f"{NAME_COLLISION_TEMP_PREFIX}_{_short_hash(semantic + '|ALT', 8)}"
+    fallback = fallback[:NAME_COLLISION_IDENTIFIER_MAX]
+    reserved.add(fallback)
+    return fallback
+
+
+def _quote_identifier_list(columns: Sequence[str]) -> str:
+    names = [quote_identifier(normalize_identifier_name(col)) for col in (columns or []) if normalize_identifier_name(col)]
+    return ", ".join(names)
+
+
+def _build_constraint_drop_add_sql(
+    schema: str,
+    table: str,
+    new_name: str,
+    action: Dict[str, object],
+    constraint_validate_mode: str
+) -> Optional[str]:
+    table_full = quote_qualified_parts(schema, table)
+    ctype = normalize_identifier_name(str(action.get("constraint_type") or ""))
+    cols = [normalize_identifier_name(v) for v in (action.get("columns") or []) if normalize_identifier_name(v)]
+    stmt = ""
+
+    if ctype == "P":
+        if not cols:
+            return None
+        stmt = (
+            f"ALTER TABLE {table_full} "
+            f"ADD CONSTRAINT {quote_identifier(new_name)} PRIMARY KEY ({_quote_identifier_list(cols)})"
+        )
+    elif ctype == "U":
+        if not cols:
+            return None
+        stmt = (
+            f"ALTER TABLE {table_full} "
+            f"ADD CONSTRAINT {quote_identifier(new_name)} UNIQUE ({_quote_identifier_list(cols)})"
+        )
+    elif ctype == "R":
+        ref_owner = normalize_identifier_name(str(action.get("ref_table_owner") or action.get("r_owner") or ""))
+        ref_table = normalize_identifier_name(str(action.get("ref_table_name") or ""))
+        ref_cols = [
+            normalize_identifier_name(v)
+            for v in (action.get("ref_columns") or [])
+            if normalize_identifier_name(v)
+        ]
+        if not cols or not ref_owner or not ref_table or not ref_cols:
+            return None
+        delete_rule = normalize_delete_rule(str(action.get("delete_rule") or ""))
+        delete_clause = f" ON DELETE {delete_rule}" if delete_rule else ""
+        stmt = (
+            f"ALTER TABLE {table_full} "
+            f"ADD CONSTRAINT {quote_identifier(new_name)} FOREIGN KEY ({_quote_identifier_list(cols)}) "
+            f"REFERENCES {quote_qualified_parts(ref_owner, ref_table)} ({_quote_identifier_list(ref_cols)})"
+            f"{delete_clause}"
+        )
+    elif ctype == "C":
+        search_condition = str(action.get("search_condition") or "").strip()
+        if not search_condition:
+            return None
+        stmt = (
+            f"ALTER TABLE {table_full} "
+            f"ADD CONSTRAINT {quote_identifier(new_name)} CHECK ({search_condition})"
+        )
+    else:
+        return None
+
+    ddl, _applied_keyword, _applied_reason = apply_constraint_missing_validate_mode_to_ddl(
+        stmt + ";",
+        constraint_validate_mode,
+        str(action.get("validated") or ""),
+        str(action.get("status") or ""),
+        ctype
+    )
+    return ddl
+
+
+def generate_name_collision_fixup_scripts(
+    base_dir: Path,
+    rename_actions: List[Dict[str, object]],
+    constraint_strategy: str = "rename",
+    constraint_validate_mode: str = "safe_novalidate",
+) -> int:
+    if not rename_actions:
+        return 0
+    by_schema: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+    for action in rename_actions:
+        by_schema[(action.get("schema") or "").upper()].append(action)
+
+    written = 0
+    for schema, actions in sorted(by_schema.items()):
+        if not schema:
+            continue
+        final_reserved: Set[str] = set()
+        for item in actions:
+            final_reserved.add(normalize_identifier_name(item.get("new_name")))
+        for item in actions:
+            final_reserved.add(normalize_identifier_name(item.get("old_name")))
+
+        actions_sorted = sorted(
+            actions,
+            key=lambda r: (
+                (r.get("object_type") or ""),
+                (r.get("table") or ""),
+                (r.get("old_name") or "")
+            )
+        )
+        phase1_lines: List[str] = []
+        phase2_lines: List[str] = []
+        skip_index_keys: Set[Tuple[str, str]] = set()
+        strategy = (constraint_strategy or "rename").strip().lower()
+        for item in actions_sorted:
+            obj_type = (item.get("object_type") or "").upper()
+            if obj_type != "CONSTRAINT" or strategy != "drop_add":
+                continue
+            table = normalize_identifier_name(item.get("table"))
+            old_name = normalize_identifier_name(item.get("old_name"))
+            new_name = normalize_identifier_name(item.get("new_name"))
+            if not table or not old_name or not new_name:
+                continue
+            add_sql = _build_constraint_drop_add_sql(
+                schema,
+                table,
+                new_name,
+                item,
+                constraint_validate_mode
+            )
+            if not add_sql:
+                phase1_lines.append(
+                    f"-- SKIP CONSTRAINT {quote_qualified_parts(schema, table)}.{quote_identifier(old_name)}:"
+                    " 无法基于元数据生成 DROP+ADD，请人工处理。"
+                )
+                phase2_lines.append(
+                    f"-- SKIP CONSTRAINT {quote_qualified_parts(schema, table)}.{quote_identifier(old_name)}:"
+                    " 无法基于元数据生成 DROP+ADD，请人工处理。"
+                )
+                continue
+            phase1_lines.append(
+                f"ALTER TABLE {quote_qualified_parts(schema, table)} "
+                f"DROP CONSTRAINT {quote_identifier(old_name)};"
+            )
+            phase2_lines.append(add_sql)
+            index_name = normalize_identifier_name(item.get("index_name"))
+            if index_name and index_name == old_name:
+                skip_index_keys.add((table, old_name))
+
+        for item in actions_sorted:
+            obj_type = (item.get("object_type") or "").upper()
+            table = normalize_identifier_name(item.get("table"))
+            old_name = normalize_identifier_name(item.get("old_name"))
+            new_name = normalize_identifier_name(item.get("new_name"))
+            if not old_name or not new_name or old_name == new_name:
+                continue
+            if obj_type == "CONSTRAINT" and strategy == "drop_add":
+                continue
+            if obj_type == "INDEX" and (table, old_name) in skip_index_keys:
+                phase1_lines.append(
+                    f"-- SKIP INDEX {quote_qualified_parts(schema, old_name)}: 由同名约束 DROP+ADD 自动处理其底层索引。"
+                )
+                phase2_lines.append(
+                    f"-- SKIP INDEX {quote_qualified_parts(schema, old_name)}: 由同名约束 DROP+ADD 自动处理其底层索引。"
+                )
+                continue
+            temp_name = _build_name_collision_temp_name(schema, obj_type, table, old_name, final_reserved)
+            if obj_type == "INDEX":
+                phase1_lines.append(
+                    f"ALTER INDEX {quote_qualified_parts(schema, old_name)} RENAME TO {quote_identifier(temp_name)};"
+                )
+                phase2_lines.append(
+                    f"ALTER INDEX {quote_qualified_parts(schema, temp_name)} RENAME TO {quote_identifier(new_name)};"
+                )
+            else:
+                phase1_lines.append(
+                    f"ALTER TABLE {quote_qualified_parts(schema, table)} "
+                    f"RENAME CONSTRAINT {quote_identifier(old_name)} TO {quote_identifier(temp_name)};"
+                )
+                phase2_lines.append(
+                    f"ALTER TABLE {quote_qualified_parts(schema, table)} "
+                    f"RENAME CONSTRAINT {quote_identifier(temp_name)} TO {quote_identifier(new_name)};"
+                )
+
+        if not phase1_lines:
+            continue
+        phase1_header = (
+            f"约束/索引重名修复 Phase1 临时改名 ({schema})"
+            if strategy != "drop_add"
+            else f"约束/索引重名修复 Phase1 预处理 ({schema}, CONSTRAINT=DROP)"
+        )
+        phase2_header = (
+            f"约束/索引重名修复 Phase2 最终改名 ({schema})"
+            if strategy != "drop_add"
+            else f"约束/索引重名修复 Phase2 收敛 ({schema}, CONSTRAINT=ADD)"
+        )
+        write_fixup_file(
+            base_dir,
+            "name_collision",
+            f"{schema}.phase1_temp_rename.sql",
+            "\n".join(phase1_lines),
+            phase1_header
+        )
+        write_fixup_file(
+            base_dir,
+            "name_collision",
+            f"{schema}.phase2_final_rename.sql",
+            "\n".join(phase2_lines),
+            phase2_header
+        )
+        written += 2
+    return written
+
+
 def generate_fixup_scripts(
     ora_cfg: OraConfig,
     ob_cfg: ObConfig,
@@ -23090,9 +24540,51 @@ def generate_fixup_scripts(
     view_dependency_map = view_dependency_map or {}
     trigger_status_rows = trigger_status_rows or []
     constraint_status_rows = constraint_status_rows or []
+    name_collision_mode = normalize_name_collision_mode(
+        settings.get("name_collision_mode", "fixup")
+    )
+    name_collision_rename_existing = parse_bool_flag(
+        settings.get("name_collision_rename_existing", "true"),
+        True
+    )
+    name_collision_constraint_strategy = resolve_name_collision_constraint_strategy(
+        settings.get("ob_version")
+    )
+    settings["_name_collision_constraint_strategy"] = name_collision_constraint_strategy
+    if (
+        name_collision_mode == "fixup"
+        and name_collision_rename_existing
+        and name_collision_constraint_strategy == "drop_add"
+    ):
+        log.warning(
+            "[FIXUP] 检测到当前 OB 版本对 RENAME CONSTRAINT 支持不足，"
+            "name_collision 将自动回退为 CONSTRAINT DROP+ADD。"
+        )
+    settings["_name_collision_rows"] = []
+    settings["_name_collision_report_path"] = ""
+    settings["_name_collision_fixup_sql_count"] = 0
+    settings["_deferred_filtered_grants"] = []
     trigger_filter_set = {t.upper() for t in (trigger_filter_entries or set())}
     support_state_map = support_state_map or {}
+    table_target_map = build_table_target_map(master_list)
+    blacklist_missing_grant_rows = build_blacklist_missing_grant_target_rows(
+        oracle_meta.blacklist_tables,
+        table_target_map,
+        ob_meta
+    )
+    unsupported_grant_target_set: Set[str] = {
+        (row.tgt_full or "").upper()
+        for row in support_state_map.values()
+        if (row.support_state or "").upper() in {SUPPORT_STATE_BLOCKED, SUPPORT_STATE_UNSUPPORTED}
+        and (row.tgt_full or "")
+    }
+    unsupported_grant_target_set.update(
+        (row.tgt_full or "").upper()
+        for row in blacklist_missing_grant_rows.values()
+        if row.tgt_full
+    )
     unsupported_table_keys = {(s.upper(), t.upper()) for s, t in (unsupported_table_keys or set())}
+    missing_target_table_keys = collect_missing_target_table_source_keys(tv_results)
     view_compat_map = view_compat_map or {}
     check_status_drift_types = set(settings.get("check_status_drift_type_set", set()) or set())
     status_fixup_types = set(settings.get("status_fixup_type_set", set()) or set())
@@ -23235,8 +24727,6 @@ def generate_fixup_scripts(
         for (src_name, tgt_name, obj_type) in master_list
         if obj_type.upper() == 'TABLE'
     }
-    table_target_map = build_table_target_map(master_list)
-
     object_replacements: List[Tuple[Tuple[str, str], Tuple[str, str]]] = []
     replacement_set: Set[Tuple[str, str, str, str]] = set()
     for src_name, type_map in full_object_mapping.items():
@@ -23662,6 +25152,14 @@ def generate_fixup_scripts(
         privilege_u = (privilege or "").upper()
         if not grantee_u or not object_u or not privilege_u:
             return
+        if object_u in unsupported_grant_target_set:
+            log.info(
+                "[GRANT] 跳过不可执行授权: %s ON %s TO %s (目标对象不支持/阻断)",
+                privilege_u,
+                object_u,
+                grantee_u
+            )
+            return
         owner_u = object_u.split('.', 1)[0] if '.' in object_u else ""
         if not is_allowed_grant_owner(owner_u):
             return
@@ -23980,8 +25478,12 @@ def generate_fixup_scripts(
             continue
         src_schema, src_table = src_name.split('.')
         tgt_schema, tgt_table = table_str.split('.')
-        if (src_schema.upper(), src_table.upper()) in unsupported_table_keys:
+        src_table_key = (src_schema.upper(), src_table.upper())
+        if src_table_key in unsupported_table_keys:
             index_skip_counts["unsupported_table"] += len(item.missing_indexes)
+            continue
+        if src_table_key in missing_target_table_keys:
+            index_skip_counts["table_missing_target"] += len(item.missing_indexes)
             continue
         if not allow_fixup('INDEX', tgt_schema, src_schema):
             reason = classify_fixup_skip('INDEX', tgt_schema, src_schema) or "filtered"
@@ -24000,12 +25502,68 @@ def generate_fixup_scripts(
             continue
         src_schema, src_table = src_name.split('.')
         tgt_schema, tgt_table = table_str.split('.')
-        if (src_schema.upper(), src_table.upper()) in unsupported_table_keys:
+        src_table_key = (src_schema.upper(), src_table.upper())
+        if src_table_key in unsupported_table_keys or src_table_key in missing_target_table_keys:
             continue
         if not allow_fixup('CONSTRAINT', tgt_schema, src_schema):
             continue
         queue_request(src_schema, 'TABLE', src_table)
         constraint_tasks.append((item, src_schema, src_table, tgt_schema.upper(), tgt_table.upper()))
+    missing_constraint_names_by_src_table: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+    for item, src_schema, src_table, _tgt_schema, _tgt_table in constraint_tasks:
+        key = (src_schema.upper(), src_table.upper())
+        for cons_name in (item.missing_constraints or set()):
+            cons_u = normalize_identifier_name(cons_name)
+            if cons_u:
+                missing_constraint_names_by_src_table[key].add(cons_u)
+
+    name_collision_planned_map: Dict[Tuple[str, str, str, str], str] = {}
+    name_collision_rows: List[NameCollisionDetailRow] = []
+    name_collision_rename_actions: List[Dict[str, object]] = []
+    if name_collision_mode != "off":
+        (
+            name_collision_planned_map,
+            name_collision_rename_actions,
+            name_collision_rows
+        ) = build_name_collision_plan(
+            oracle_meta,
+            ob_meta,
+            index_tasks,
+            constraint_tasks,
+            mode=name_collision_mode,
+            rename_existing=name_collision_rename_existing
+        )
+        if (
+            name_collision_constraint_strategy == "drop_add"
+            and name_collision_rows
+        ):
+            adjusted_rows: List[NameCollisionDetailRow] = []
+            for row in name_collision_rows:
+                if row.object_type == "CONSTRAINT" and row.action == "RENAME_EXISTING":
+                    adjusted_rows.append(
+                        row._replace(action="DROP_ADD_EXISTING")
+                    )
+                else:
+                    adjusted_rows.append(row)
+            name_collision_rows = adjusted_rows
+        settings["_name_collision_rows"] = name_collision_rows
+        if name_collision_rows and report_dir and report_timestamp:
+            collision_path = export_name_collision_detail(
+                name_collision_rows,
+                Path(report_dir),
+                report_timestamp
+            )
+            if collision_path:
+                settings["_name_collision_report_path"] = str(collision_path)
+                log.info("重名处理明细已输出: %s", collision_path)
+        if name_collision_rows:
+            log.info(
+                "[FIXUP] 约束/索引重名规划: mode=%s, rename_existing=%s, planned_rewrite=%d, existing_rename=%d",
+                name_collision_mode,
+                "true" if name_collision_rename_existing else "false",
+                len(name_collision_planned_map),
+                len(name_collision_rename_actions)
+            )
 
     trigger_tasks: List[Tuple[str, str, str, str, str, str, str]] = []
     for item in extra_results.get('trigger_mismatched', []):
@@ -24017,7 +25575,8 @@ def generate_fixup_scripts(
             continue
         src_schema, src_table = src_name.split('.', 1)
         tgt_schema, tgt_table = table_str.split('.', 1)
-        if (src_schema.upper(), src_table.upper()) in unsupported_table_keys:
+        src_table_key = (src_schema.upper(), src_table.upper())
+        if src_table_key in unsupported_table_keys or src_table_key in missing_target_table_keys:
             continue
         # 优先使用缺失映射对（源->目标），确保 dbcat 按源名导出
         if item.missing_mappings:
@@ -24111,6 +25670,8 @@ def generate_fixup_scripts(
     object_grants_missing_by_grantee: Dict[str, Set[ObjectGrantEntry]] = {}
     sys_privs_missing_by_grantee: Dict[str, Set[SystemGrantEntry]] = {}
     role_privs_missing_by_grantee: Dict[str, Set[RoleGrantEntry]] = {}
+    deferred_object_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]] = {}
+    deferred_filtered_grants: List[FilteredGrantEntry] = []
 
     if grant_enabled:
         pre_added = pre_add_cross_schema_grants(constraint_tasks, trigger_tasks)
@@ -24179,6 +25740,31 @@ def generate_fixup_scripts(
 
     view_missing_objects = list(view_missing_supported)
     non_view_missing_objects = list(non_view_missing_supported)
+
+    if grant_enabled and object_grants_missing_by_grantee:
+        existing_targets = build_existing_target_object_set(ob_meta)
+        planned_targets = build_planned_grant_target_set(
+            missing_tables,
+            view_missing_supported,
+            non_view_missing_supported,
+            sequence_tasks
+        )
+        (
+            object_grants_missing_by_grantee,
+            deferred_object_grants_by_grantee,
+            deferred_filtered_grants
+        ) = defer_missing_target_grants(
+            object_grants_missing_by_grantee,
+            existing_targets,
+            planned_targets
+        )
+        if deferred_filtered_grants:
+            settings["_deferred_filtered_grants"] = list(deferred_filtered_grants)
+            log.warning(
+                "[GRANT] 已延后 %d 条授权（目标对象当前不存在且本轮不会创建），"
+                "请在补齐对象后执行 fixup_scripts/grants_deferred/。",
+                len(deferred_filtered_grants)
+            )
 
     view_target_set: Set[str] = {
         f"{tgt_schema}.{tgt_obj}".upper()
@@ -24408,7 +25994,8 @@ def generate_fixup_scripts(
         src_table: str,
         tgt_schema: str,
         tgt_table: str,
-        idx_name: str
+        idx_name: str,
+        target_idx_name: Optional[str] = None
     ) -> Optional[str]:
         meta = oracle_meta.indexes.get((src_schema.upper(), src_table.upper()), {}).get(idx_name.upper())
         if not meta:
@@ -24424,7 +26011,8 @@ def generate_fixup_scripts(
             ddl_cols.append(expr if expr else col)
         col_list = ", ".join(ddl_cols)
         prefix = "UNIQUE " if uniq else ""
-        idx_full = quote_qualified_parts(tgt_schema.upper(), idx_name.upper())
+        out_idx_name = normalize_identifier_name(target_idx_name or idx_name)
+        idx_full = quote_qualified_parts(tgt_schema.upper(), out_idx_name)
         table_full = quote_qualified_parts(tgt_schema.upper(), tgt_table.upper())
         return f"CREATE {prefix}INDEX {idx_full} ON {table_full} ({col_list});"
 
@@ -24908,7 +26496,9 @@ def generate_fixup_scripts(
                     src_obj,
                     tgt_schema,
                     tgt_obj,
-                    extra_identifiers=get_relevant_replacements(src_schema),
+                    # VIEW 依赖替换已由 remap_view_dependencies 完成，
+                    # 这里不再做 schema 级全量替换，避免同名对象误替换。
+                    extra_identifiers=[],
                     obj_type='VIEW'
                 )
                 
@@ -25010,7 +26600,9 @@ def generate_fixup_scripts(
                     src_obj,
                     tgt_schema,
                     tgt_obj,
-                    extra_identifiers=get_relevant_replacements(src_schema),
+                    # VIEW 依赖替换已由 remap_view_dependencies 完成，
+                    # 这里不再做 schema 级全量替换，避免同名对象误替换。
+                    extra_identifiers=[],
                     obj_type='VIEW'
                 )
                 final_ddl = cleanup_dbcat_wrappers(final_ddl)
@@ -25230,6 +26822,26 @@ def generate_fixup_scripts(
             other_unsup_jobs.append(_job)
         run_tasks(other_unsup_jobs, "OTHER_UNSUPPORTED")
 
+    if (
+        name_collision_mode == "fixup"
+        and name_collision_rename_existing
+        and name_collision_rename_actions
+    ):
+        log.info("[FIXUP] (4d/9) 正在生成约束/索引重名修复脚本...")
+        collision_sql_count = generate_name_collision_fixup_scripts(
+            base_dir,
+            name_collision_rename_actions,
+            constraint_strategy=name_collision_constraint_strategy,
+            constraint_validate_mode=constraint_missing_validate_mode,
+        )
+        settings["_name_collision_fixup_sql_count"] = collision_sql_count
+        if collision_sql_count:
+            log.info(
+                "[FIXUP] name_collision 脚本已生成 %d 份，目录=%s",
+                collision_sql_count,
+                (base_dir / "name_collision").resolve()
+            )
+
     index_generated = 0
     index_skip_lock = threading.Lock()
     log.info("[FIXUP] (5/9) 正在生成 INDEX 脚本...")
@@ -25239,6 +26851,9 @@ def generate_fixup_scripts(
         def _job(it=item, ss=src_schema, st=src_table, ts=tgt_schema, tt=tgt_table):
             nonlocal index_generated
             table_ddl = table_ddl_cache.get((ss.upper(), st.upper()))
+            src_constraints = oracle_meta.constraints.get((ss.upper(), st.upper()), {}) or {}
+            tgt_constraints = (ob_meta.constraints.get((ts.upper(), tt.upper()), {}) if ob_meta else {}) or {}
+            planned_missing_constraints = missing_constraint_names_by_src_table.get((ss.upper(), st.upper()), set())
             if not table_ddl:
                 log.warning("[FIXUP] 未找到 TABLE %s.%s 的 dbcat DDL，将尝试基于元数据重建索引。", ss, st)
 
@@ -25248,15 +26863,46 @@ def generate_fixup_scripts(
             extracted = extract_statements_for_names(table_ddl, it.missing_indexes, index_predicate) if table_ddl else {}
             for idx_name in sorted(it.missing_indexes):
                 idx_name_u = idx_name.upper()
+                final_idx_name = name_collision_planned_map.get(
+                    (ts.upper(), "INDEX", tt.upper(), idx_name_u),
+                    idx_name_u
+                )
                 try:
+                    backing = find_source_backing_constraint_for_index(src_constraints, idx_name_u)
+                    if backing:
+                        cons_name_u, cons_meta = backing
+                        constraint_planned = cons_name_u in planned_missing_constraints
+                        constraint_exists = has_equivalent_pk_uk_constraint(
+                            tgt_constraints,
+                            cons_meta.get("columns")
+                        )
+                        if constraint_planned or constraint_exists:
+                            reason = "backing_constraint_planned" if constraint_planned else "backing_constraint_exists"
+                            with index_skip_lock:
+                                index_skip_counts[reason] += 1
+                            log.info(
+                                "[FIXUP] 跳过 INDEX %s.%s：源端为约束 %s 的背靠索引 (%s)。",
+                                ts,
+                                final_idx_name,
+                                cons_name_u,
+                                "本轮将补约束" if constraint_planned else "目标已存在等价约束"
+                            )
+                            continue
                     statements = extracted.get(idx_name_u) or []
                     source_label = "DBCAT" if table_ddl else "META"
                     meta_entry = oracle_meta.indexes.get((ss.upper(), st.upper()), {}).get(idx_name_u)
                     if not statements:
-                        fallback_stmt = build_index_from_meta(ss, st, ts, tt, idx_name_u)
+                        fallback_stmt = build_index_from_meta(
+                            ss,
+                            st,
+                            ts,
+                            tt,
+                            idx_name_u,
+                            target_idx_name=final_idx_name
+                        )
                         if fallback_stmt:
                             statements = [fallback_stmt]
-                            log.info("[FIXUP][META] 使用元数据重建索引 %s.%s。", ts, idx_name_u)
+                            log.info("[FIXUP][META] 使用元数据重建索引 %s.%s。", ts, final_idx_name)
                             source_label = "META"
                             mark_source('INDEX', 'fallback')
                         else:
@@ -25281,21 +26927,37 @@ def generate_fixup_scripts(
                             extra_identifiers=get_relevant_replacements(ss),
                             obj_type='INDEX'
                         )
+                        ddl_adj = _rewrite_create_index_name(
+                            ddl_adj,
+                            ts,
+                            idx_name_u,
+                            final_idx_name
+                        )
                         ddl_adj = normalize_ddl_for_ob(ddl_adj)
                         ddl_adj = apply_fixup_idempotency(
                             ddl_adj,
                             'INDEX',
                             ts,
-                            idx_name_u,
+                            final_idx_name,
                             settings,
                             idempotent_stats
                         )
                         ddl_lines.append(_ensure_statement_terminated(ddl_adj))
                     content = prepend_set_schema("\n".join(ddl_lines), ts)
-                    filename = f"{ts}.{idx_name_u}.sql"
-                    header = f"修补缺失的 INDEX {idx_name_u} (表: {ts}.{tt})"
+                    filename = f"{ts}.{final_idx_name}.sql"
+                    header = f"修补缺失的 INDEX {final_idx_name} (表: {ts}.{tt})"
                     log.info("[FIXUP]%s 写入 INDEX 脚本: %s", source_tag(source_label), filename)
-                    write_fixup_file(base_dir, 'index', filename, content, header)
+                    extra_comments = None
+                    if final_idx_name != idx_name_u:
+                        extra_comments = [f"NAME_REWRITE: {idx_name_u} -> {final_idx_name}"]
+                    write_fixup_file(
+                        base_dir,
+                        'index',
+                        filename,
+                        content,
+                        header,
+                        extra_comments=extra_comments
+                    )
                     with index_skip_lock:
                         index_generated += 1
                 finally:
@@ -25325,6 +26987,10 @@ def generate_fixup_scripts(
             extracted = extract_statements_for_names(table_ddl, it.missing_constraints, constraint_predicate) if table_ddl else {}
             for cons_name in sorted(it.missing_constraints):
                 cons_name_u = cons_name.upper()
+                final_cons_name = name_collision_planned_map.get(
+                    (ts.upper(), "CONSTRAINT", tt.upper(), cons_name_u),
+                    cons_name_u
+                )
                 table_full = quote_qualified_parts(ts, tt)
                 grants_for_constraint: Set[str] = set()
                 try:
@@ -25375,7 +27041,7 @@ def generate_fixup_scripts(
                             add_clause = "PRIMARY KEY" if ctype == 'P' and not downgrade_pk else "UNIQUE"
                             stmt = (
                                 f"ALTER TABLE {table_full} "
-                                f"ADD CONSTRAINT {cons_name_u} {add_clause} ({cols_join})"
+                                f"ADD CONSTRAINT {final_cons_name} {add_clause} ({cols_join})"
                             )
                             statements = [stmt]
                             mark_source('CONSTRAINT', 'fallback')
@@ -25417,7 +27083,7 @@ def generate_fixup_scripts(
                                 delete_clause = f" ON DELETE {delete_rule}" if delete_rule else ""
                                 stmt = (
                                     f"ALTER TABLE {table_full} "
-                                    f"ADD CONSTRAINT {cons_name_u} FOREIGN KEY ({', '.join(cols)}) "
+                                    f"ADD CONSTRAINT {final_cons_name} FOREIGN KEY ({', '.join(cols)}) "
                                     f"REFERENCES {quote_qualified_parts(ref_tgt_schema, ref_tgt_table)} "
                                     f"({', '.join(ref_cols)})"
                                     f"{delete_clause}"
@@ -25439,7 +27105,7 @@ def generate_fixup_scripts(
                             if search_condition and not is_system_notnull_check(cons_name_u, search_condition):
                                 stmt = (
                                     f"ALTER TABLE {table_full} "
-                                    f"ADD CONSTRAINT {cons_name_u} CHECK ({search_condition})"
+                                    f"ADD CONSTRAINT {final_cons_name} CHECK ({search_condition})"
                                 )
                                 statements = [stmt]
                                 mark_source('CONSTRAINT', 'fallback')
@@ -25478,6 +27144,11 @@ def generate_fixup_scripts(
                             tt,
                             extra_identifiers=constraint_replacements
                         )
+                        ddl_adj = _rewrite_add_constraint_name(
+                            ddl_adj,
+                            cons_name_u,
+                            final_cons_name
+                        )
                         if downgrade_pk and ctype == 'P':
                             ddl_adj = re.sub(r'\bPRIMARY\s+KEY\b', 'UNIQUE', ddl_adj, flags=re.IGNORECASE)
                         ddl_adj = normalize_ddl_for_ob(ddl_adj)
@@ -25496,14 +27167,14 @@ def generate_fixup_scripts(
                         ):
                             validate_sql = (
                                 f"ALTER TABLE {table_full} ENABLE VALIDATE CONSTRAINT "
-                                f"{quote_identifier(cons_name_u)};"
+                                f"{quote_identifier(final_cons_name)};"
                             )
                             with deferred_validation_lock:
                                 deferred_validation_rows.append(
                                     ConstraintValidateDeferredRow(
                                         schema_name=ts.upper(),
                                         table_name=tt.upper(),
-                                        constraint_name=cons_name_u,
+                                        constraint_name=final_cons_name,
                                         constraint_type=ctype or "UNKNOWN",
                                         src_validated=normalize_constraint_validated_status(src_validated),
                                         applied_mode=constraint_missing_validate_mode,
@@ -25516,18 +27187,21 @@ def generate_fixup_scripts(
                             ddl_adj,
                             'CONSTRAINT',
                             ts,
-                            cons_name_u,
+                            final_cons_name,
                             settings,
                             idempotent_stats,
                             parent_table=tt
                         )
                         ddl_lines.append(_ensure_statement_terminated(ddl_adj))
                     content = prepend_set_schema("\n".join(ddl_lines), ts)
-                    filename = f"{ts}.{cons_name_u}.sql"
-                    header = f"修补缺失的约束 {cons_name_u} (表: {ts}.{tt})"
+                    filename = f"{ts}.{final_cons_name}.sql"
+                    header = f"修补缺失的约束 {final_cons_name} (表: {ts}.{tt})"
                     extra_comments = None
                     if downgrade_pk and ctype == 'P':
                         extra_comments = ["NOTE: 源端为分区表且主键未包含分区键，已降级为 UNIQUE。"]
+                    if final_cons_name != cons_name_u:
+                        extra_comments = list(extra_comments or [])
+                        extra_comments.append(f"NAME_REWRITE: {cons_name_u} -> {final_cons_name}")
                     log.info("[FIXUP]%s 写入 CONSTRAINT 脚本: %s", source_tag(source_label), filename)
                     write_fixup_file(
                         base_dir,
@@ -25885,6 +27559,7 @@ def generate_fixup_scripts(
     if grant_enabled:
         grant_dir_all = 'grants_all'
         grant_dir_miss = 'grants_miss'
+        grant_dir_deferred = 'grants_deferred'
         grant_dir_view_prereq = 'view_prereq_grants'
         grant_dir_view_post = 'view_post_grants'
 
@@ -26000,6 +27675,68 @@ def generate_fixup_scripts(
                         header
                     )
 
+            deferred_grants_by_owner: Dict[str, Set[str]] = {}
+            if deferred_object_grants_by_grantee:
+                _raw_def, _merged_def, _obj_lookup_def, deferred_grants_by_owner = (
+                    build_object_grant_statements_for(deferred_object_grants_by_grantee)
+                )
+            if deferred_grants_by_owner:
+                for owner, stmts in sorted(deferred_grants_by_owner.items()):
+                    if not stmts:
+                        continue
+                    content = "\n".join(sorted(stmts))
+                    header = f"{owner} 延后执行授权 (目标对象当前不存在且本轮不会创建)"
+                    write_fixup_file(
+                        base_dir,
+                        grant_dir_deferred,
+                        f"{owner}.grants.sql",
+                        content,
+                        header
+                    )
+                log.warning(
+                    "[FIXUP] 已生成延后授权脚本目录: %s/%s（对象补齐后再执行）。",
+                    base_dir,
+                    grant_dir_deferred
+                )
+            if deferred_filtered_grants:
+                deferred_dir = Path(base_dir) / grant_dir_deferred
+                deferred_preview: List[str] = []
+                for item in deferred_filtered_grants[:30]:
+                    deferred_preview.append(
+                        f"- {item.grantee} | {item.privilege} | {item.object_full} | {item.reason}"
+                    )
+                if len(deferred_filtered_grants) > 30:
+                    deferred_preview.append(
+                        f"- ...(省略 {len(deferred_filtered_grants) - 30} 条)"
+                    )
+                readme_lines = [
+                    "# 延后授权提示",
+                    "",
+                    f"total_deferred={len(deferred_filtered_grants)}",
+                    "",
+                    "说明:",
+                    "1) 这批授权不会进入 grants_miss（避免当前执行失败）。",
+                    "2) 对象补齐后，请执行 run_fixup.py --only-dirs grants_deferred。",
+                    "3) 详细清单请查看 main_reports/run_<ts>/deferred_grants_detail_<ts>.txt。",
+                    "",
+                    "预览(最多30条):",
+                ]
+                readme_lines.extend(deferred_preview or ["- (无)"])
+                if not deferred_grants_by_owner:
+                    readme_lines.extend([
+                        "",
+                        "提示: 当前未生成可直接执行的 grants_deferred/*.sql（owner 策略过滤或语句不可自动输出）。",
+                        "请按 deferred_grants_detail 明细手工补齐授权。"
+                    ])
+                try:
+                    deferred_dir.mkdir(parents=True, exist_ok=True)
+                    (deferred_dir / "README.txt").write_text(
+                        "\n".join(readme_lines).strip() + "\n",
+                        encoding="utf-8"
+                    )
+                except OSError as exc:
+                    log.warning("[FIXUP] 写入延后授权 README 失败: %s", exc)
+
             miss_privs_by_grantee: Dict[str, Set[str]] = defaultdict(set)
             for grantee, entries in sys_privs_missing_by_grantee.items():
                 for entry in entries:
@@ -26026,6 +27763,7 @@ def generate_fixup_scripts(
                 and not privs_by_grantee
                 and not grant_plan.role_ddls
                 and not miss_grants_by_owner
+                and not deferred_grants_by_owner
                 and not miss_privs_by_grantee
                 and not view_prereq_grants_by_grantee
                 and not view_post_grants_by_grantee
@@ -26325,6 +28063,10 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "AUX", "触发器状态/清单报告"
     if name == "filtered_grants.txt":
         return "AUX", "过滤授权清单"
+    if name.startswith("deferred_grants_detail_"):
+        return "DETAIL", "延后授权明细"
+    if name.startswith("unsupported_grant_detail_"):
+        return "DETAIL", "不支持授权明细"
     if name.startswith("fixup_skip_summary_"):
         return "AUX", "Fixup 跳过汇总"
     if name.startswith("ddl_format_report_"):
@@ -26745,6 +28487,49 @@ def export_constraint_validate_deferred_detail(
     return write_pipe_report("约束后置 VALIDATE 明细", header_fields, data_rows, output_path)
 
 
+def export_name_collision_detail(
+    rows: List[NameCollisionDetailRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出约束/索引重名处理明细。
+    """
+    if not report_dir or not rows or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"name_collision_detail_{report_timestamp}.txt"
+    rows_sorted = sorted(
+        rows,
+        key=lambda r: (r.schema_name, r.object_type, r.table_name, r.old_name, r.proposed_name)
+    )
+    header_fields = [
+        "SCHEMA",
+        "OBJECT_TYPE",
+        "TABLE_NAME",
+        "OLD_NAME",
+        "CONFLICT_TYPE",
+        "CONFLICT_WITH",
+        "PROPOSED_NAME",
+        "ACTION",
+        "REASON"
+    ]
+    data_rows = [
+        [
+            row.schema_name,
+            row.object_type,
+            row.table_name,
+            row.old_name,
+            row.conflict_type,
+            row.conflict_with or "-",
+            row.proposed_name,
+            row.action,
+            row.reason or "-"
+        ]
+        for row in rows_sorted
+    ]
+    return write_pipe_report("约束/索引重名处理明细", header_fields, data_rows, output_path)
+
+
 def export_indexes_unsupported_detail(
     rows: List[IndexUnsupportedDetail],
     report_dir: Path,
@@ -26787,7 +28572,7 @@ def _filter_blocked_support_rows(
     return [
         row for row in rows
         if row.obj_type.upper() == obj_type_u
-        and row.reason_code == "DEPENDENCY_UNSUPPORTED"
+        and row.reason_code in {"DEPENDENCY_UNSUPPORTED", "DEPENDENCY_TARGET_TABLE_MISSING"}
     ]
 
 
@@ -27891,6 +29676,157 @@ def export_filtered_grants(
         return None
 
 
+def build_unsupported_grant_detail_rows(
+    filtered_grants: List[FilteredGrantEntry],
+    support_summary: Optional[SupportClassificationResult],
+    extra_target_rows: Optional[Dict[str, ObjectSupportReportRow]] = None
+) -> List[UnsupportedGrantDetailRow]:
+    if not filtered_grants:
+        return []
+    target_row_map = build_unsupported_grant_target_rows(
+        support_summary,
+        extra_target_rows
+    )
+    rows: List[UnsupportedGrantDetailRow] = []
+    for item in filtered_grants:
+        reason_code = (item.reason or "").strip().upper()
+        category_u = (item.category or "").upper()
+        grantee_u = (item.grantee or "").upper()
+        privilege_u = (item.privilege or "").upper()
+        object_u = (item.object_full or "").upper()
+        reason = "过滤授权"
+        root_cause = reason_code or "-"
+        action = "人工评估是否需要保留该授权"
+        support_row = target_row_map.get(object_u) if object_u else None
+        if reason_code.startswith(UNSUPPORTED_GRANT_TARGET_REASON_PREFIX):
+            if support_row:
+                reason = support_row.reason or "目标对象不支持/阻断"
+                root_cause = support_row.root_cause or support_row.reason_code or reason_code
+                action = support_row.action or "先修复依赖/不支持对象，再处理授权"
+            else:
+                if reason_code.startswith(f"{UNSUPPORTED_GRANT_TARGET_REASON_PREFIX}BLACKLIST_"):
+                    reason = "黑名单对象目标端不存在，已跳过授权"
+                    action = "先补齐对象(OMS/改造)后再评估授权"
+                else:
+                    reason = "目标对象不支持/阻断"
+                root_cause = reason_code
+                if not action:
+                    action = "先修复对象可用性，再处理授权"
+        else:
+            default_reason = UNSUPPORTED_GRANT_REASON_DEFAULTS.get(reason_code)
+            if default_reason:
+                reason, action = default_reason
+                root_cause = reason_code
+        rows.append(
+            UnsupportedGrantDetailRow(
+                category=category_u or "-",
+                grantee=grantee_u or "-",
+                privilege=privilege_u or "-",
+                object_full=object_u or "-",
+                reason_code=reason_code or "-",
+                reason=reason or "-",
+                root_cause=root_cause or "-",
+                action=action or "-",
+            )
+        )
+    rows.sort(
+        key=lambda x: (
+            x.reason_code,
+            x.category,
+            x.grantee,
+            x.object_full,
+            x.privilege,
+        )
+    )
+    return rows
+
+
+def export_unsupported_grant_detail(
+    filtered_grants: List[FilteredGrantEntry],
+    support_summary: Optional[SupportClassificationResult],
+    extra_target_rows: Optional[Dict[str, ObjectSupportReportRow]],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not report_timestamp:
+        return None
+    rows = build_unsupported_grant_detail_rows(
+        filtered_grants,
+        support_summary,
+        extra_target_rows
+    )
+    if not rows:
+        return None
+    output_path = Path(report_dir) / f"unsupported_grant_detail_{report_timestamp}.txt"
+    header_fields = [
+        "CATEGORY",
+        "GRANTEE",
+        "PRIVILEGE",
+        "OBJECT",
+        "REASON_CODE",
+        "REASON",
+        "ROOT_CAUSE",
+        "ACTION",
+    ]
+    data_rows = [
+        [
+            row.category,
+            row.grantee,
+            row.privilege,
+            row.object_full,
+            row.reason_code,
+            row.reason,
+            row.root_cause,
+            row.action,
+        ]
+        for row in rows
+    ]
+    return write_pipe_report("不支持授权明细", header_fields, data_rows, output_path)
+
+
+def export_deferred_grant_detail(
+    filtered_grants: List[FilteredGrantEntry],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not report_timestamp or not filtered_grants:
+        return None
+    rows = [
+        item for item in (filtered_grants or [])
+        if (item.reason or "").upper().startswith("DEFERRED_")
+    ]
+    if not rows:
+        return None
+    output_path = Path(report_dir) / f"deferred_grants_detail_{report_timestamp}.txt"
+    header_fields = ["CATEGORY", "GRANTEE", "PRIVILEGE", "OBJECT", "REASON_CODE", "REASON", "ACTION"]
+    data_rows: List[List[str]] = []
+    for item in sorted(
+        rows,
+        key=lambda x: (
+            (x.category or "").upper(),
+            (x.grantee or "").upper(),
+            (x.privilege or "").upper(),
+            (x.object_full or "").upper(),
+            (x.reason or "").upper(),
+        )
+    ):
+        reason_code = (item.reason or "").upper() or "-"
+        reason, action = UNSUPPORTED_GRANT_REASON_DEFAULTS.get(
+            reason_code,
+            ("授权已延后", "先补齐对象后执行 grants_deferred 目录脚本")
+        )
+        data_rows.append([
+            (item.category or "").upper() or "-",
+            (item.grantee or "").upper() or "-",
+            (item.privilege or "").upper() or "-",
+            (item.object_full or "").upper() or "-",
+            reason_code,
+            reason,
+            action,
+        ])
+    return write_pipe_report("延后授权明细", header_fields, data_rows, output_path)
+
+
 def export_fixup_skip_summary(
     summary: Dict[str, Dict[str, object]],
     report_dir: Path,
@@ -28946,7 +30882,8 @@ def _build_report_detail_item_rows(
     max_rows: int,
     trigger_status_rows: Optional[List[TriggerStatusReportRow]] = None,
     constraint_status_rows: Optional[List[ConstraintStatusDriftRow]] = None,
-    trigger_validity_mode: str = "off"
+    trigger_validity_mode: str = "off",
+    name_collision_rows: Optional[List[NameCollisionDetailRow]] = None
 ) -> Tuple[List[Dict[str, object]], bool, int]:
     rows: List[Dict[str, object]] = []
     seen_keys: Set[Tuple[str, ...]] = set()
@@ -29256,6 +31193,30 @@ def _build_report_detail_item_rows(
             detail = f"{detail} | COND={item.search_condition}" if detail else f"COND={item.search_condition}"
         _push({**base, "item_type": "UNSUPPORTED_CONSTRAINT", "item_key": item.constraint_name, "item_value": detail})
 
+    # 8) 约束/索引重名规划明细
+    for row in name_collision_rows or []:
+        base = {
+            "report_type": "MISMATCHED",
+            "object_type": "NAME_COLLISION",
+            "source_schema": row.schema_name,
+            "source_name": row.table_name,
+            "target_schema": row.schema_name,
+            "target_name": row.table_name,
+            "status": row.action,
+        }
+        item_value = (
+            f"type={row.object_type}; conflict_type={row.conflict_type}; "
+            f"conflict_with={row.conflict_with or '-'}; proposed={row.proposed_name}; reason={row.reason or '-'}"
+        )
+        _push({
+            **base,
+            "item_type": "NAME_COLLISION",
+            "item_key": row.old_name,
+            "src_value": row.old_name,
+            "tgt_value": row.proposed_name,
+            "item_value": item_value,
+        })
+
     return rows, truncated, truncated_count
 
 def _build_report_usability_rows(
@@ -29450,6 +31411,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "MISMATCH_DETAIL"
     if name.startswith("constraint_validate_deferred_detail_"):
         return "MISMATCH_DETAIL"
+    if name.startswith("name_collision_detail_"):
+        return "NAME_COLLISION_DETAIL"
     if name.startswith("package_compare_"):
         return "PACKAGE_COMPARE"
     if name.startswith("trigger_status_report"):
@@ -29474,6 +31437,10 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "FIXUP_SKIP_SUMMARY"
     if name.startswith("filtered_grants"):
         return "FILTERED_GRANTS"
+    if name.startswith("deferred_grants_detail_"):
+        return "DEFERRED_GRANT_DETAIL"
+    if name.startswith("unsupported_grant_detail_"):
+        return "UNSUPPORTED_GRANT_DETAIL"
     if "missed_tables_views_for_OMS" in rel_path:
         return "OMS_MISSING_RULES"
     return "OTHER"
@@ -29506,8 +31473,18 @@ def _infer_artifact_status(
                 return "PARTIAL", "detail_truncated"
             return "IN_DB", ""
         return "TXT_ONLY", ""
-    if artifact_type in {"PACKAGE_COMPARE", "TRIGGER_STATUS", "USABILITY_DETAIL", "TABLE_PRESENCE_DETAIL", "FILTERED_GRANTS"}:
+    if artifact_type in {
+        "PACKAGE_COMPARE",
+        "TRIGGER_STATUS",
+        "USABILITY_DETAIL",
+        "TABLE_PRESENCE_DETAIL",
+        "FILTERED_GRANTS",
+        "UNSUPPORTED_GRANT_DETAIL",
+        "DEFERRED_GRANT_DETAIL",
+    }:
         return ("IN_DB", "") if store_scope in {"core", "full"} else ("TXT_ONLY", "")
+    if artifact_type == "NAME_COLLISION_DETAIL":
+        return ("IN_DB", "") if store_scope == "full" else ("TXT_ONLY", "")
     if artifact_type in {"DEPENDENCY_CHAINS", "VIEW_CHAIN", "REMAP_CONFLICT", "OBJECT_MAPPING",
                          "BLACKLIST_TABLES", "FIXUP_SKIP_SUMMARY", "OMS_MISSING_RULES"}:
         return ("IN_DB", "") if store_scope == "full" else ("TXT_ONLY", "")
@@ -31514,6 +33491,7 @@ def save_report_to_db(
     detail_item_rows: List[Dict[str, object]] = []
     detail_item_truncated = False
     detail_item_truncated_count = 0
+    name_collision_rows = list(settings.get("_name_collision_rows") or [])
     if detail_item_enable and store_scope == "full":
         detail_item_rows, detail_item_truncated, detail_item_truncated_count = _build_report_detail_item_rows(
             tv_results,
@@ -31523,7 +33501,8 @@ def save_report_to_db(
             detail_item_max_rows,
             trigger_status_rows=trigger_status_rows,
             constraint_status_rows=constraint_status_rows,
-            trigger_validity_mode=settings.get("trigger_validity_sync_mode", "compile")
+            trigger_validity_mode=settings.get("trigger_validity_sync_mode", "compile"),
+            name_collision_rows=name_collision_rows
         )
         if detail_item_truncated:
             detail_truncated = True
@@ -31785,12 +33764,18 @@ def build_excluded_summary_counts(
       - APPLIED: 规则命中
       - CASCADED: 依赖连带排除
       - APPLIED_LEGACY_RENAME: 历史 RENAME 规则命中
+      - APPLIED_SYSTEM: 系统派生对象（如 MLOG$_*）命中
     """
     counts: Dict[str, int] = defaultdict(int)
     if not excluded_rows:
         return {}
 
-    effective_statuses = {"APPLIED", "CASCADED", "APPLIED_LEGACY_RENAME"}
+    effective_statuses = {
+        "APPLIED",
+        "CASCADED",
+        "APPLIED_LEGACY_RENAME",
+        "APPLIED_SYSTEM",
+    }
     for row in excluded_rows:
         status = str(row.get("status") or "").upper()
         if status not in effective_statuses:
@@ -31948,8 +33933,9 @@ def build_run_summary(
     if ctx.enable_grant_generation:
         if ctx.fixup_enabled:
             actions_done.append(
-                "授权脚本生成: 启用 (目录 {miss}, {all})".format(
+                "授权脚本生成: 启用 (目录 {miss}, {deferred}, {all})".format(
                     miss=Path(ctx.fixup_dir) / 'grants_miss',
+                    deferred=Path(ctx.fixup_dir) / 'grants_deferred',
                     all=Path(ctx.fixup_dir) / 'grants_all'
                 )
             )
@@ -32149,8 +34135,9 @@ def build_run_summary(
         next_steps.append("确认注释差异是否需要修复。")
     if ctx.enable_grant_generation and ctx.fixup_enabled:
         next_steps.append(
-            "审核 {miss} 中的授权脚本（全量审计见 {all}）。".format(
+            "审核 {miss} 中的授权脚本；对象补齐后再执行 {deferred}（全量审计见 {all}）。".format(
                 miss=Path(ctx.fixup_dir) / 'grants_miss',
+                deferred=Path(ctx.fixup_dir) / 'grants_deferred',
                 all=Path(ctx.fixup_dir) / 'grants_all'
             )
         )
@@ -32275,6 +34262,7 @@ def print_final_report(
     config_diagnostics: Optional[List[str]] = None,
     fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None,
     support_summary: Optional[SupportClassificationResult] = None,
+    unsupported_grant_target_rows: Optional[Dict[str, ObjectSupportReportRow]] = None,
     noise_suppressed_details: Optional[List[NoiseSuppressedDetail]] = None,
     usability_summary: Optional[UsabilitySummary] = None,
     table_presence_summary: Optional[TablePresenceSummary] = None,
@@ -33072,8 +35060,8 @@ def print_final_report(
             console.print(
                 Panel.fit(
                     "\n".join(mismatch_lines),
-                    title="[warning]检查汇总口径校验告警[/warning]",
-                    border_style="warning",
+                    title="[yellow]检查汇总口径校验告警[/yellow]",
+                    border_style="yellow",
                     width=section_width
                 )
             )
@@ -33389,12 +35377,14 @@ def print_final_report(
         "fixup_scripts/type_body     : 缺失 TYPE BODY 的 CREATE 脚本\n"
         "fixup_scripts/index         : 缺失 INDEX 的 CREATE 脚本\n"
         "fixup_scripts/constraint    : 缺失约束的 CREATE 脚本\n"
+        "fixup_scripts/name_collision : 约束/索引重名修复 (phase1/phase2)\n"
         "fixup_scripts/sequence      : 缺失 SEQUENCE 的 CREATE 脚本\n"
         "fixup_scripts/trigger       : 缺失 TRIGGER 的 CREATE 脚本\n"
         "fixup_scripts/constraint_validate_later : 约束后置 VALIDATE 脚本（脏数据清理后执行）\n"
         "fixup_scripts/unsupported/* : 不支持/阻断对象 DDL (默认不执行)\n"
         "fixup_scripts/compile       : 依赖重编译脚本 (ALTER ... COMPILE)\n"
         "fixup_scripts/grants_miss   : 缺失授权脚本 (对象/角色/系统)\n"
+        "fixup_scripts/grants_deferred: 延后授权脚本 (对象补齐后执行)\n"
         "fixup_scripts/grants_all    : 全量授权脚本 (对象/角色/系统)\n"
         "fixup_scripts/table_alter   : 列不匹配 TABLE 的 ALTER 修补脚本\n"
         + interval_fixup_line +
@@ -33498,6 +35488,33 @@ def print_final_report(
             report_path.parent
         )
         _add_index_entry("AUX", filtered_grants_path, len(filtered_grants or []), "过滤授权清单")
+        deferred_grants_detail_path = export_deferred_grant_detail(
+            filtered_grants or [],
+            report_path.parent,
+            report_ts
+        )
+        _add_index_entry(
+            "DETAIL",
+            deferred_grants_detail_path,
+            None if not deferred_grants_detail_path else sum(
+                1 for item in (filtered_grants or [])
+                if (item.reason or "").upper().startswith("DEFERRED_")
+            ),
+            "延后授权明细"
+        )
+        unsupported_grant_detail_path = export_unsupported_grant_detail(
+            filtered_grants or [],
+            support_summary,
+            unsupported_grant_target_rows,
+            report_path.parent,
+            report_ts
+        )
+        _add_index_entry(
+            "DETAIL",
+            unsupported_grant_detail_path,
+            len(filtered_grants or []) if unsupported_grant_detail_path else None,
+            "不支持授权明细"
+        )
         fixup_skip_path = export_fixup_skip_summary(
             fixup_skip_summary or {},
             report_path.parent,
@@ -33509,8 +35526,13 @@ def print_final_report(
         migration_focus_path = None
         view_constraint_cleaned_path = None
         view_constraint_uncleanable_path = None
+        name_collision_detail_path = None
         missing_by_type_paths: Dict[str, Optional[Path]] = {}
         unsupported_by_type_paths: Dict[str, Optional[Path]] = {}
+        name_collision_rows = list((settings or {}).get("_name_collision_rows") or [])
+        collision_path_raw = str((settings or {}).get("_name_collision_report_path", "") or "").strip()
+        if collision_path_raw:
+            name_collision_detail_path = Path(collision_path_raw)
         if emit_detail_files:
             missing_detail_path = export_missing_objects_detail(
                 combined_missing_rows,
@@ -33572,6 +35594,12 @@ def print_final_report(
             view_constraint_uncleanable_path,
             len(view_constraint_uncleanable_rows or []),
             "VIEW 列清单约束无法清洗明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            name_collision_detail_path,
+            len(name_collision_rows or []),
+            "约束/索引重名处理明细"
         )
         for obj_type, path in sorted(missing_by_type_paths.items()):
             if not path:
@@ -33851,6 +35879,10 @@ def print_final_report(
                 log.info("状态漂移明细已输出到: %s", status_drift_path)
             if filtered_grants_path:
                 log.info("过滤授权清单已输出到: %s", filtered_grants_path)
+            if deferred_grants_detail_path:
+                log.info("延后授权明细已输出到: %s", deferred_grants_detail_path)
+            if unsupported_grant_detail_path:
+                log.info("不支持授权明细已输出到: %s", unsupported_grant_detail_path)
             if fixup_skip_path:
                 log.info("Fixup 跳过汇总已输出到: %s", fixup_skip_path)
             if missing_detail_path:
@@ -34608,7 +36640,34 @@ def main():
                     }
                 )
 
-        excluded_seed_nodes: Set[DependencyNode] = set(rename_seed_nodes) | set(explicit_seed_nodes)
+        # 系统派生对象：MVIEW LOG 表 (MLOG$_*)，默认纳入 EXCLUDED（不参与校验/FIXUP）
+        system_artifact_excluded_table_keys: Set[Tuple[str, str]] = collect_mview_log_artifact_table_keys(source_objects)
+        system_artifact_seed_nodes: Set[DependencyNode] = {
+            (f"{schema}.{table}", "TABLE")
+            for schema, table in system_artifact_excluded_table_keys
+        }
+        if system_artifact_excluded_table_keys:
+            # 若用户显式排除/legacy rename 已覆盖同表，避免重复展示 APPLIED 行。
+            dedup_keys = set(explicit_excluded_table_keys) | set(rename_excluded_table_keys)
+            for schema, table in sorted(system_artifact_excluded_table_keys):
+                if (schema, table) in dedup_keys:
+                    continue
+                excluded_object_report_rows.append(
+                    {
+                        "status": "APPLIED_SYSTEM",
+                        "line_no": 0,
+                        "object_type": "TABLE",
+                        "schema_name": schema,
+                        "object_name": table,
+                        "detail": "MVIEW_LOG_TABLE",
+                    }
+                )
+
+        excluded_seed_nodes: Set[DependencyNode] = (
+            set(rename_seed_nodes)
+            | set(explicit_seed_nodes)
+            | set(system_artifact_seed_nodes)
+        )
         excluded_nodes: Set[DependencyNode] = set()
         if excluded_seed_nodes:
             blocked_by = build_blocked_dependency_map(
@@ -34621,7 +36680,7 @@ def main():
             effective_keys: Set[Tuple[str, str, str]] = set()
             for row in excluded_object_report_rows:
                 status_u = str(row.get("status") or "").upper()
-                if status_u not in {"APPLIED", "APPLIED_LEGACY_RENAME", "CASCADED"}:
+                if status_u not in {"APPLIED", "APPLIED_LEGACY_RENAME", "APPLIED_SYSTEM", "CASCADED"}:
                     continue
                 key = (
                     str(row.get("object_type") or "").upper(),
@@ -34749,6 +36808,12 @@ def main():
                 log.info(
                     "[BLACKLIST] RENAME 规则生效: 表=%d, 连带对象=%d。",
                     len(rename_excluded_table_keys),
+                    cascaded_count
+                )
+            if system_artifact_seed_nodes:
+                log.info(
+                    "[EXCLUDE] 系统派生对象生效(MLOG$_*): 表=%d, 连带对象=%d。",
+                    len(system_artifact_excluded_table_keys),
                     cascaded_count
                 )
 
@@ -34902,7 +36967,8 @@ def main():
     extra_results_for_report = filter_trigger_results_for_unsupported_tables(
         extra_results,
         support_summary.unsupported_table_keys if support_summary else None,
-        table_target_map
+        table_target_map,
+        support_summary.support_state_map if support_summary else None,
     )
     object_counts_summary = reconcile_object_counts_summary(
         object_counts_summary,
@@ -35024,6 +37090,7 @@ def main():
     log_section("修补脚本与报告")
     # 9) 生成目标端订正 SQL
     fixup_skip_summary: Dict[str, Dict[str, object]] = {}
+    unsupported_grant_target_extra_rows: Dict[str, ObjectSupportReportRow] = {}
     if generate_fixup_enabled:
         fixup_dir_label = settings.get('fixup_dir', 'fixup_scripts') or 'fixup_scripts'
         log.info('已开启修补脚本生成，开始写入 %s 目录...', fixup_dir_label)
@@ -35090,6 +37157,21 @@ def main():
                     progress_interval=grant_progress_interval,
                     sequence_remap_policy=sequence_policy
                 )
+                unsupported_grant_target_extra_rows = build_blacklist_missing_grant_target_rows(
+                    oracle_meta.blacklist_tables,
+                    table_target_map,
+                    ob_meta
+                )
+                grant_plan, unsupported_target_filtered = filter_grant_plan_unsupported_targets(
+                    grant_plan,
+                    support_summary,
+                    unsupported_grant_target_extra_rows
+                )
+                if unsupported_target_filtered:
+                    log.info(
+                        "[GRANT] 已过滤 %d 条目标对象不支持/阻断的授权（不进入 grants_miss/grants_all）。",
+                        unsupported_target_filtered
+                    )
                 object_grant_cnt = sum(len(v) for v in grant_plan.object_grants.values())
                 sys_grant_cnt = sum(len(v) for v in grant_plan.sys_privs.values())
                 role_grant_cnt = sum(len(v) for v in grant_plan.role_privs.values())
@@ -35138,6 +37220,36 @@ def main():
                 view_compat_map=support_summary.view_compat_map,
                 view_dependency_map=view_dependency_map
             )
+            deferred_filtered_grants = list(settings.get("_deferred_filtered_grants") or [])
+            if grant_plan and deferred_filtered_grants:
+                merged_filtered = list(grant_plan.filtered_grants or []) + deferred_filtered_grants
+                dedupe: Dict[Tuple[str, str, str, str, str], FilteredGrantEntry] = {}
+                for item in merged_filtered:
+                    key = (
+                        (item.category or "").upper(),
+                        (item.grantee or "").upper(),
+                        (item.privilege or "").upper(),
+                        (item.object_full or "").upper(),
+                        (item.reason or "").upper(),
+                    )
+                    dedupe[key] = item
+                grant_plan = GrantPlan(
+                    object_grants=dict(grant_plan.object_grants or {}),
+                    sys_privs=dict(grant_plan.sys_privs or {}),
+                    role_privs=dict(grant_plan.role_privs or {}),
+                    role_ddls=list(grant_plan.role_ddls or []),
+                    filtered_grants=sorted(
+                        dedupe.values(),
+                        key=lambda x: (
+                            (x.category or "").upper(),
+                            (x.grantee or "").upper(),
+                            (x.privilege or "").upper(),
+                            (x.object_full or "").upper(),
+                            (x.reason or "").upper(),
+                        )
+                    ),
+                    view_grant_targets=set(grant_plan.view_grant_targets or set()),
+                )
     else:
         log.info('已根据配置跳过修补脚本生成，仅打印对比报告。')
         if enable_grant_generation:
@@ -35192,6 +37304,7 @@ def main():
         config_diagnostics=config_diagnostics,
         fixup_skip_summary=fixup_skip_summary,
         support_summary=support_summary,
+        unsupported_grant_target_rows=unsupported_grant_target_extra_rows,
         noise_suppressed_details=noise_suppressed_details,
         usability_summary=usability_summary,
         table_presence_summary=table_presence_summary,
