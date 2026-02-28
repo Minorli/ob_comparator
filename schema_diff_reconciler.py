@@ -1732,6 +1732,8 @@ CHECK_LIKE_ESCAPE_REWRITE_RE = re.compile(
     r"([A-Z0-9_#$]+\s+LIKE)\s+REPLACE\('((?:''|[^'])*)','\\\\','\\\\\\\\'\)\s+ESCAPE\s+'\\\\'",
     flags=re.IGNORECASE
 )
+CHECK_NOT_IN_SPACING_RE = re.compile(r"\bNOT\s+IN\s*\(", flags=re.IGNORECASE)
+CHECK_IN_SPACING_RE = re.compile(r"\bIN\s*\(", flags=re.IGNORECASE)
 CHECK_RANGE_REWRITE_RE = re.compile(
     r"^([A-Z0-9_#$]+)\s*>=\s*(.+)\s+AND\s+\1\s*<=\s*(.+)$",
     flags=re.IGNORECASE
@@ -1771,8 +1773,12 @@ def normalize_check_constraint_expression(
     expr_norm = normalize_sql_expression_casefold(expr)
     expr_norm = strip_redundant_predicate_parentheses(expr_norm)
     expr_norm = uppercase_outside_single_quotes(normalize_sql_expression(expr_norm))
+    expr_norm = normalize_space_before_parentheses(expr_norm)
     # OceanBase 可能将 LIKE 常量重写为 REPLACE(... ) ESCAPE '\\'，此处回归到字面量语义。
     expr_norm = CHECK_LIKE_ESCAPE_REWRITE_RE.sub(r"\1 '\2'", expr_norm)
+    # 统一 IN 列表前空格，避免 `IN (` 与 `IN(` 被误判为不同语义。
+    expr_norm = CHECK_NOT_IN_SPACING_RE.sub("NOT IN(", expr_norm)
+    expr_norm = CHECK_IN_SPACING_RE.sub("IN(", expr_norm)
     # OceanBase 可能将 BETWEEN 展开为 >= AND <=，统一回 BETWEEN 以便跨库语义匹配。
     m = CHECK_RANGE_REWRITE_RE.fullmatch(expr_norm)
     if m:
@@ -1796,6 +1802,48 @@ def normalize_check_constraint_signature(
     deferrable = normalize_deferrable_flag((cons_meta or {}).get("deferrable"))
     deferred = normalize_deferred_flag((cons_meta or {}).get("deferred"))
     return f"{expr_norm}||DEFERRABLE={deferrable}||DEFERRED={deferred}"
+
+
+def normalize_space_before_parentheses(text: str) -> str:
+    """
+    统一“单词 + 空格 + 左括号”形态为“单词+左括号”，不处理字符串字面量内文本。
+    示例：
+      EXISTS (SELECT ...) -> EXISTS(SELECT ...)
+      NVL (COL,0)         -> NVL(COL,0)
+      NOT (A=1)           -> NOT(A=1)
+    """
+    if not text:
+        return ""
+    out: List[str] = []
+    in_quote = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "'":
+            out.append(ch)
+            if in_quote:
+                if i + 1 < n and text[i + 1] == "'":
+                    out.append("'")
+                    i += 1
+                else:
+                    in_quote = False
+            else:
+                in_quote = True
+            i += 1
+            continue
+        if not in_quote and ch.isspace():
+            j = i + 1
+            while j < n and text[j].isspace():
+                j += 1
+            prev = out[-1] if out else ""
+            next_ch = text[j] if j < n else ""
+            if next_ch == "(" and (prev.isalnum() or prev in "_$#)"):
+                i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 CONSTRAINT_TYPE_LABELS = {
@@ -15946,8 +15994,11 @@ def compare_constraints_for_table(
             tgt_by_name[name] = (expr_key, raw_expr, deferrable, deferred)
 
         used: Set[str] = set()
+        expr_keys_with_name_match: Set[str] = set()
+        matched_expr_keys_any: Set[str] = set()
         for expr_key, name, raw_expr, deferrable, deferred in src_list:
             if name in tgt_by_name:
+                expr_keys_with_name_match.add(expr_key)
                 tgt_expr_key, tgt_expr_raw, tgt_deferrable, tgt_deferred = tgt_by_name.get(
                     name, ("", "", "", "")
                 )
@@ -15973,6 +16024,7 @@ def compare_constraints_for_table(
                 expr_matches = tgt_by_expr.get(expr_key)
                 if expr_matches and name in expr_matches:
                     expr_matches.remove(name)
+                matched_expr_keys_any.add(expr_key)
                 used.add(name)
                 continue
             expr_matches = tgt_by_expr.get(expr_key)
@@ -15982,15 +16034,24 @@ def compare_constraints_for_table(
                     matched_name = name
                 else:
                     matched_name = expr_matches.pop()
+                matched_expr_keys_any.add(expr_key)
                 used.add(matched_name)
+                continue
+            # 源端同语义重复 CHECK：目标端已有同语义命中时，不再继续标记 missing。
+            if expr_key in matched_expr_keys_any:
                 continue
             missing.add(name)
             detail_mismatch.append(
                 f"CHECK: 源约束 {name} (条件 {raw_expr}) 在目标端未找到。"
             )
 
+        src_expr_keys = {expr_key for expr_key, _name, _raw, _def, _deferred in src_list}
         for expr_key, name, raw_expr, _deferrable, _deferred in tgt_list:
             if name in used:
+                continue
+            # 目标端同表达式重复 CHECK（常见于历史重复执行或迁移工具副产物）不再计为 extra。
+            # 若源端存在同名 CHECK（哪怕表达式不同），保留 extra 以暴露“同名漂移 + 旁路重复”的风险。
+            if expr_key in src_expr_keys and expr_key not in expr_keys_with_name_match:
                 continue
             extra.add(name)
             detail_mismatch.append(

@@ -1,6 +1,6 @@
 ============================================================
 OceanBase 报告库排查手册（report_to_db）
-文件: HOW_TO_READ_REPORTS_IN_OB_20260228_09_sqls.txt
+文件: HOW_TO_READ_REPORTS_IN_OB_20260228_17_sqls.txt
 来源: HOW_TO_READ_REPORTS_IN_OB_latest.txt
 ============================================================
 
@@ -1240,6 +1240,61 @@ SELECT source_schema, source_table, target_schema, target_table,
    AND status = 'UNKNOWN'
  ORDER BY target_schema, target_table;
 
+------------------------------------------------------------
+I. 单对象原因定位（SQL-82 ~ SQL-86）
+------------------------------------------------------------
+
+-- SQL-82 单对象主结论（示例：PBSINTF.MG_PBS_PREM_INFO）
+SELECT report_type, object_type,
+       source_schema, source_name, target_schema, target_name,
+       status, reason,
+       DBMS_LOB.SUBSTR(detail_json, 2000, 1) AS detail_json
+  FROM DIFF_REPORT_DETAIL
+ WHERE report_id = :report_id
+   AND (
+        (source_schema='PBSINTF' AND source_name='MG_PBS_PREM_INFO')
+     OR (target_schema='PBSINTF' AND target_name='MG_PBS_PREM_INFO')
+   )
+ ORDER BY report_type, object_type, status;
+
+-- SQL-83 单对象细节行（缺失项/多余项/根因/建议动作）
+SELECT report_type, object_type, item_type, item_key, src_value, tgt_value,
+       DBMS_LOB.SUBSTR(item_value, 2000, 1) AS item_value, status
+  FROM DIFF_REPORT_DETAIL_ITEM
+ WHERE report_id = :report_id
+   AND (
+        (source_schema='PBSINTF' AND source_name='MG_PBS_PREM_INFO')
+     OR (target_schema='PBSINTF' AND target_name='MG_PBS_PREM_INFO')
+   )
+ ORDER BY object_type, item_type, item_key;
+
+-- SQL-84 单对象依赖边（定位“被谁阻断/依赖谁缺失”）
+SELECT dep_schema, dep_name, dep_type,
+       ref_schema, ref_name, ref_type,
+       edge_status, reason
+  FROM DIFF_REPORT_DEPENDENCY
+ WHERE report_id = :report_id
+   AND dep_schema='PBSINTF'
+   AND dep_name='MG_PBS_PREM_INFO'
+ ORDER BY edge_status, ref_schema, ref_name;
+
+-- SQL-85 单对象 VIEW 链（仅当对象类型为 VIEW 时使用）
+SELECT view_schema, view_name, chain_id, node_index,
+       node_schema, node_name, node_type, node_exists, grant_status, cycle_flag
+  FROM DIFF_REPORT_VIEW_CHAIN
+ WHERE report_id = :report_id
+   AND view_schema='PBSINTF'
+   AND view_name='MG_PBS_PREM_INFO'
+ ORDER BY chain_id, node_index;
+
+-- SQL-86 单对象 remap 轨迹（源->目标映射来源）
+SELECT object_type, src_schema, src_name, tgt_schema, tgt_name, map_source
+  FROM DIFF_REPORT_OBJECT_MAPPING
+ WHERE report_id = :report_id
+   AND src_schema='PBSINTF'
+   AND src_name='MG_PBS_PREM_INFO'
+ ORDER BY object_type, map_source;
+
 ============================================================
 建议排查顺序（实战）
 1) SQL-01/02/08/10 先建立全局认知。
@@ -1250,4 +1305,5 @@ SELECT source_schema, source_table, target_schema, target_table,
 6) SQL-60~73 收口权限、可用性、package/trigger 与写库异常。
 7) SQL-74~77 专项核查“多余对象/多余同义词”。
 8) SQL-78~81 单独处理“源有数据/目标空表”风险清单。
+9) SQL-82~86 复核单对象根因（对客户反馈点做一锤定音）。
 ============================================================
