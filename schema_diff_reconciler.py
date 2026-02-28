@@ -844,6 +844,9 @@ BLACKLIST_REASON_BY_TYPE: Dict[str, str] = {
     'NAME_PATTERN': "表名命中黑名单关键字规则，建议排除迁移或人工确认",
     'RENAME': "表名命中黑名单关键字规则，建议排除迁移或人工确认",
 }
+TEMP_TABLE_BLACKLIST_TYPES: Set[str] = {"TEMP_TABLE", "TEMPORARY_TABLE"}
+TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON_CODE = "TRIGGER_ON_TEMP_TABLE_UNSUPPORTED"
+TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON = "OB 不支持在临时表上创建 DML 触发器（实测 ORA-00600/-4007）"
 BLACKLIST_MODES: Set[str] = {"auto", "table_only", "rules_only", "disabled"}
 DEFAULT_BLACKLIST_RULES_PATH = str(Path(__file__).resolve().parent / "blacklist_rules.json")
 
@@ -1347,6 +1350,13 @@ def has_lob_oversize_blacklist(entries: Optional[Dict[Tuple[str, str], Blacklist
 def is_rename_blacklist_type(black_type: Optional[str]) -> bool:
     bt = (black_type or "").strip().upper()
     return bt in {"RENAME", "NAME_PATTERN"}
+
+
+def is_temp_table_blacklist_reason_code(reason_code: Optional[str]) -> bool:
+    token = (reason_code or "").strip().upper()
+    if not token:
+        return False
+    return any(bt in token for bt in TEMP_TABLE_BLACKLIST_TYPES)
 
 
 def is_rename_only_blacklist(entries: Optional[Dict[Tuple[str, str], BlacklistEntry]]) -> bool:
@@ -6681,6 +6691,33 @@ def classify_missing_objects(
     ) -> Optional[ObjectSupportReportRow]:
         src_key = (src_schema.upper(), src_table.upper())
         table_full_u = table_str.upper()
+        table_support = support_state_map.get(("TABLE", f"{src_schema.upper()}.{src_table.upper()}"))
+        table_reason_code = (table_support.reason_code or "").upper() if table_support else ""
+        table_black_type = (
+            (unsupported_table_map.get(f"{src_schema.upper()}.{src_table.upper()}") or ("", "", ""))[0] or ""
+        ).upper()
+
+        if (
+            obj_type.upper() == "TRIGGER"
+            and (
+                table_black_type in TEMP_TABLE_BLACKLIST_TYPES
+                or is_temp_table_blacklist_reason_code(table_reason_code)
+            )
+        ):
+            root_cause = _root_cause_label((f"{src_schema.upper()}.{src_table.upper()}", "TABLE"))
+            return ObjectSupportReportRow(
+                obj_type=obj_type,
+                src_full=src_full,
+                tgt_full=tgt_full,
+                support_state=SUPPORT_STATE_UNSUPPORTED,
+                reason_code=TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON_CODE,
+                reason=TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON,
+                dependency=table_full_u,
+                action="改造/不迁移",
+                detail="TRIGGER",
+                root_cause=root_cause
+            )
+
         if src_key in missing_target_table_keys:
             return ObjectSupportReportRow(
                 obj_type=obj_type,
@@ -28095,6 +28132,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "约束依赖阻断明细"
     if name.startswith("triggers_blocked_detail_"):
         return "DETAIL", "触发器依赖阻断明细"
+    if name.startswith("triggers_temp_table_unsupported_detail_"):
+        return "DETAIL", "临时表触发器不支持明细"
     if name.startswith("migration_focus_"):
         return "DETAIL", "迁移聚焦清单"
     if name.startswith("extra_targets_detail_"):
@@ -28675,6 +28714,53 @@ def export_triggers_blocked_detail(
         "triggers",
         "触发器阻断明细"
     )
+
+
+def export_triggers_temp_table_unsupported_detail(
+    rows: List[ObjectSupportReportRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出“触发器依赖临时表”不支持明细，便于单独排查。
+    """
+    if not report_dir or not report_timestamp or not rows:
+        return None
+    filtered = [
+        row for row in rows
+        if row.obj_type.upper() == "TRIGGER"
+        and (row.reason_code or "").upper() == TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON_CODE
+    ]
+    if not filtered:
+        return None
+    output_path = Path(report_dir) / f"triggers_temp_table_unsupported_detail_{report_timestamp}.txt"
+    rows_sorted = sorted(filtered, key=lambda r: (r.dependency or "-", r.src_full or "-", r.tgt_full or "-"))
+    header_fields = [
+        "TRIGGER",
+        "SRC_FULL",
+        "TGT_FULL",
+        "PARENT_TABLE",
+        "STATE",
+        "REASON_CODE",
+        "REASON",
+        "ACTION",
+        "ROOT_CAUSE"
+    ]
+    data_rows: List[List[str]] = []
+    for row in rows_sorted:
+        trigger_name = row.src_full.split(".", 1)[1] if "." in row.src_full else row.src_full
+        data_rows.append([
+            trigger_name or "-",
+            row.src_full or "-",
+            row.tgt_full or "-",
+            row.dependency or "-",
+            row.support_state or "-",
+            row.reason_code or "-",
+            row.reason or "-",
+            row.action or "-",
+            row.root_cause or "-",
+        ])
+    return write_pipe_report("临时表触发器不支持明细", header_fields, data_rows, output_path)
 
 
 def export_migration_focus_report(
@@ -31441,6 +31527,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "DEFERRED_GRANT_DETAIL"
     if name.startswith("unsupported_grant_detail_"):
         return "UNSUPPORTED_GRANT_DETAIL"
+    if name.startswith("triggers_temp_table_unsupported_detail_"):
+        return "TRIGGER_TEMP_UNSUPPORTED_DETAIL"
     if "missed_tables_views_for_OMS" in rel_path:
         return "OMS_MISSING_RULES"
     return "OTHER"
@@ -31476,6 +31564,7 @@ def _infer_artifact_status(
     if artifact_type in {
         "PACKAGE_COMPARE",
         "TRIGGER_STATUS",
+        "TRIGGER_TEMP_UNSUPPORTED_DETAIL",
         "USABILITY_DETAIL",
         "TABLE_PRESENCE_DETAIL",
         "FILTERED_GRANTS",
@@ -34434,6 +34523,11 @@ def print_final_report(
     blocked_index_rows = _filter_blocked_support_rows(unsupported_rows, "INDEX") if unsupported_rows else []
     blocked_constraint_rows = _filter_blocked_support_rows(unsupported_rows, "CONSTRAINT") if unsupported_rows else []
     blocked_trigger_rows = _filter_blocked_support_rows(unsupported_rows, "TRIGGER") if unsupported_rows else []
+    temp_trigger_unsupported_rows = [
+        row for row in unsupported_rows
+        if row.obj_type.upper() == "TRIGGER"
+        and (row.reason_code or "").upper() == TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON_CODE
+    ] if unsupported_rows else []
     missing_supported_rows = [
         row for row in missing_detail_rows
         if row.support_state == SUPPORT_STATE_SUPPORTED
@@ -34742,6 +34836,17 @@ def print_final_report(
         ext_text.append(f" (不支持/阻断 {trg_blocked_cnt})", style="mismatch")
     summary_table.add_row("[bold]扩展对象 (INDEX/SEQ/etc.)[/bold]", ext_text)
 
+    if temp_trigger_unsupported_rows:
+        temp_trg_text = Text()
+        temp_trg_text.append("临时表触发器不支持: ", style="mismatch")
+        temp_trg_text.append(str(len(temp_trigger_unsupported_rows)), style="mismatch")
+        temp_trg_text.append("\n原因: ", style="info")
+        temp_trg_text.append(TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON, style="info")
+        if report_ts:
+            temp_trg_text.append("\n详见: ", style="info")
+            temp_trg_text.append(f"triggers_temp_table_unsupported_detail_{report_ts}.txt", style="info")
+        summary_table.add_row("[bold]触发器兼容性[/bold]", temp_trg_text)
+
     if trigger_list_summary and trigger_list_summary.get("enabled"):
         filter_text = Text()
         if trigger_list_summary.get("error"):
@@ -34918,6 +35023,10 @@ def print_final_report(
                 detail_hint_lines.append(
                     f"触发器依赖阻断明细: triggers_blocked_detail_{report_ts}.txt"
                 )
+        if temp_trigger_unsupported_rows and report_ts:
+            detail_hint_lines.append(
+                f"临时表触发器不支持明细: triggers_temp_table_unsupported_detail_{report_ts}.txt"
+            )
         console.print(Panel.fit("\n".join(detail_hint_lines), style="info", width=section_width))
 
     if config_diagnostics:
@@ -35656,6 +35765,17 @@ def print_final_report(
             len(extra_results.get("constraint_unsupported", []) or []),
             "约束语法不支持明细(DEFERRABLE/自引用外键等)"
         )
+        temp_trigger_unsupported_path = export_triggers_temp_table_unsupported_detail(
+            unsupported_rows,
+            report_path.parent,
+            report_ts
+        )
+        _add_index_entry(
+            "DETAIL",
+            temp_trigger_unsupported_path,
+            len(temp_trigger_unsupported_rows) if temp_trigger_unsupported_path else None,
+            "临时表触发器不支持明细"
+        )
         deferred_validate_detail_path = None
         deferred_validate_count = int((settings or {}).get("_constraint_validate_deferred_count", 0) or 0)
         deferred_validate_path_raw = str((settings or {}).get("_constraint_validate_deferred_report_path", "") or "").strip()
@@ -35899,6 +36019,8 @@ def print_final_report(
                 log.info("索引不支持明细已输出到: %s", index_unsupported_path)
             if constraint_unsupported_path:
                 log.info("约束不支持明细已输出到: %s", constraint_unsupported_path)
+            if temp_trigger_unsupported_path:
+                log.info("临时表触发器不支持明细已输出到: %s", temp_trigger_unsupported_path)
             if blocked_index_path:
                 log.info("索引阻断明细已输出到: %s", blocked_index_path)
             if blocked_constraint_path:
