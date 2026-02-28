@@ -17453,6 +17453,154 @@ def _classify_table_presence_status(src_has_rows: Optional[bool], tgt_has_rows: 
     return TABLE_PRESENCE_STATUS_UNKNOWN
 
 
+def _normalize_table_num_rows_value(raw: object) -> Optional[int]:
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return 1 if raw else 0
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, Decimal):
+        try:
+            return int(raw)
+        except Exception:
+            return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    text_u = text.upper()
+    if text_u in {"NULL", "NONE", "N/A"}:
+        return None
+    try:
+        return int(text)
+    except Exception:
+        try:
+            return int(Decimal(text))
+        except Exception:
+            return None
+
+
+def _format_table_num_rows_value(value: Optional[int]) -> str:
+    if value is None:
+        return "NULL"
+    return str(int(value))
+
+
+def _summarize_table_presence_rows(
+    total_candidates: int,
+    mode: str,
+    rows: List[TablePresenceResult],
+    duration_seconds: float,
+    total_skipped: int = 0
+) -> TablePresenceSummary:
+    total_risk = len([row for row in rows if row.status == TABLE_PRESENCE_STATUS_RISK])
+    total_ok_nonempty = len([row for row in rows if row.status == TABLE_PRESENCE_STATUS_OK_BOTH_NONEMPTY])
+    total_ok_empty = len([row for row in rows if row.status == TABLE_PRESENCE_STATUS_OK_BOTH_EMPTY])
+    total_unknown = len([row for row in rows if row.status == TABLE_PRESENCE_STATUS_UNKNOWN])
+    return TablePresenceSummary(
+        total_candidates=total_candidates,
+        total_checked=len(rows),
+        total_risk=total_risk,
+        total_ok_nonempty=total_ok_nonempty,
+        total_ok_empty=total_ok_empty,
+        total_unknown=total_unknown,
+        total_skipped=total_skipped,
+        duration_seconds=duration_seconds,
+        mode=mode,
+        rows=rows
+    )
+
+
+def _load_oracle_table_num_rows_from_stats(
+    ora_cfg: OraConfig,
+    table_keys: List[Tuple[str, str]],
+    timeout_ms: int
+) -> Tuple[Dict[Tuple[str, str], Optional[int]], str]:
+    if not table_keys:
+        return {}, ""
+    table_key_set = {(schema.upper(), table.upper()) for schema, table in table_keys}
+    owners = sorted({schema for schema, _ in table_key_set})
+    result: Dict[Tuple[str, str], Optional[int]] = {}
+    conn: Optional[oracledb.Connection] = None
+    try:
+        conn = oracledb.connect(
+            user=ora_cfg["user"],
+            password=ora_cfg["password"],
+            dsn=ora_cfg["dsn"]
+        )
+        with conn.cursor() as cursor:
+            cursor.call_timeout = max(1000, int(timeout_ms or 1000))
+            for owner_chunk in chunk_list(owners, 200):
+                if not owner_chunk:
+                    continue
+                placeholders = ",".join(f":o{i}" for i in range(len(owner_chunk)))
+                bind = {f"o{i}": owner_chunk[i] for i in range(len(owner_chunk))}
+                sql = (
+                    "SELECT OWNER, TABLE_NAME, NUM_ROWS "
+                    f"FROM DBA_TABLES WHERE OWNER IN ({placeholders})"
+                )
+                cursor.execute(sql, bind)
+                for owner, table_name, num_rows in cursor:
+                    key = (
+                        str(owner or "").strip().upper(),
+                        str(table_name or "").strip().upper()
+                    )
+                    if key in table_key_set:
+                        result[key] = _normalize_table_num_rows_value(num_rows)
+        return result, ""
+    except Exception as exc:
+        return {}, normalize_error_text(str(exc))
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _load_ob_table_num_rows_from_stats(
+    ob_cfg: ObConfig,
+    table_keys: List[Tuple[str, str]],
+    timeout_sec: int
+) -> Tuple[Dict[Tuple[str, str], Optional[int]], str]:
+    if not table_keys:
+        return {}, ""
+    table_key_set = {(schema.upper(), table.upper()) for schema, table in table_keys}
+    owners = sorted({schema for schema, _ in table_key_set})
+    result: Dict[Tuple[str, str], Optional[int]] = {}
+    timeout_sec = max(1, int(timeout_sec or 1))
+    for owner_chunk in chunk_list(owners, 200):
+        if not owner_chunk:
+            continue
+        owner_in = ", ".join(f"'{_escape_sql_literal(owner)}'" for owner in owner_chunk)
+        sql = (
+            "SELECT OWNER, TABLE_NAME, NUM_ROWS "
+            f"FROM DBA_TABLES WHERE OWNER IN ({owner_in})"
+        )
+        ok, out, err = obclient_run_sql(ob_cfg, sql, timeout=timeout_sec)
+        if not ok:
+            return {}, normalize_error_text(err)
+        for raw_line in (out or "").splitlines():
+            line = (raw_line or "").strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split("\t")]
+            if len(parts) < 2:
+                parts = re.split(r"\s+", line)
+            if len(parts) < 2:
+                continue
+            owner = (parts[0] or "").strip().upper()
+            table_name = (parts[1] or "").strip().upper()
+            if not owner or not table_name:
+                continue
+            key = (owner, table_name)
+            if key not in table_key_set:
+                continue
+            num_rows_raw = parts[2] if len(parts) > 2 else None
+            result[key] = _normalize_table_num_rows_value(num_rows_raw)
+    return result, ""
+
+
 def _parse_ob_presence_probe_output(
     output: str,
     token_to_table: Dict[str, Tuple[str, str]]
@@ -17667,14 +17815,94 @@ def check_table_data_presence(
     ob_timeout = max(1, int(settings.get("table_data_presence_obclient_timeout", settings.get("obclient_timeout", 60)) or 60))
     oracle_timeout_ms = ob_timeout * 1000
 
+    if mode == "auto":
+        log.info(
+            "[TABLE_PRESENCE] 开始校验：mode=auto(strategy=stats_only), candidates=%d, chunk_size=%d, ob_timeout=%ds",
+            total_candidates,
+            chunk_size,
+            ob_timeout
+        )
+        start_perf = time.perf_counter()
+        source_keys = sorted({(src_schema, src_table) for src_schema, src_table, _tgt_schema, _tgt_table in candidates})
+        target_keys = sorted({(tgt_schema, tgt_table) for _src_schema, _src_table, tgt_schema, tgt_table in candidates})
+
+        source_stats, source_stats_err = _load_oracle_table_num_rows_from_stats(
+            ora_cfg,
+            source_keys,
+            oracle_timeout_ms
+        )
+        target_stats, target_stats_err = _load_ob_table_num_rows_from_stats(
+            ob_cfg,
+            target_keys,
+            ob_timeout
+        )
+
+        if source_stats_err or target_stats_err:
+            err_parts: List[str] = []
+            if source_stats_err:
+                err_parts.append(f"SRC_STATS={source_stats_err}")
+            if target_stats_err:
+                err_parts.append(f"TGT_STATS={target_stats_err}")
+            log.warning(
+                "[TABLE_PRESENCE] auto(stats_only) 获取统计信息失败，回退 probe 路径: %s",
+                "; ".join(err_parts)
+            )
+        else:
+            rows: List[TablePresenceResult] = []
+            for src_schema, src_table, tgt_schema, tgt_table in candidates:
+                src_num_rows = source_stats.get((src_schema, src_table))
+                tgt_num_rows = target_stats.get((tgt_schema, tgt_table))
+                src_has = None if src_num_rows is None else src_num_rows > 0
+                tgt_has = None if tgt_num_rows is None else tgt_num_rows > 0
+                status = _classify_table_presence_status(src_has, tgt_has)
+                detail_parts = [
+                    "MODE=STATS_ONLY",
+                    f"SRC_NUM_ROWS={_format_table_num_rows_value(src_num_rows)}",
+                    f"TGT_NUM_ROWS={_format_table_num_rows_value(tgt_num_rows)}",
+                ]
+                if src_num_rows is None:
+                    detail_parts.append("SRC_STATS_MISSING")
+                if tgt_num_rows is None:
+                    detail_parts.append("TGT_STATS_MISSING")
+                if status == TABLE_PRESENCE_STATUS_UNKNOWN and src_has is False and tgt_has is True:
+                    detail_parts.append("源端空表但目标端非空")
+                rows.append(TablePresenceResult(
+                    source_schema=src_schema,
+                    source_table=src_table,
+                    target_schema=tgt_schema,
+                    target_table=tgt_table,
+                    source_has_rows=_table_presence_flag(src_has),
+                    target_has_rows=_table_presence_flag(tgt_has),
+                    status=status,
+                    detail="; ".join(detail_parts),
+                    source_probe_ms=0,
+                    target_probe_ms=0
+                ))
+
+            summary = _summarize_table_presence_rows(
+                total_candidates=total_candidates,
+                mode=mode,
+                rows=rows,
+                duration_seconds=time.perf_counter() - start_perf,
+                total_skipped=0
+            )
+            log.info(
+                "[TABLE_PRESENCE] 完成：mode=auto(strategy=stats_only), risk=%d, ok_nonempty=%d, ok_empty=%d, unknown=%d, skipped=%d。",
+                summary.total_risk,
+                summary.total_ok_nonempty,
+                summary.total_ok_empty,
+                summary.total_unknown,
+                summary.total_skipped
+            )
+            return summary
+
     log.info(
-        "[TABLE_PRESENCE] 开始校验：mode=%s, candidates=%d, chunk_size=%d, ob_timeout=%ds",
+        "[TABLE_PRESENCE] 开始校验：mode=%s(strategy=probe), candidates=%d, chunk_size=%d, ob_timeout=%ds",
         mode,
         total_candidates,
         chunk_size,
         ob_timeout
     )
-
     start_perf = time.perf_counter()
     source_probe: Dict[Tuple[str, str], Tuple[Optional[bool], str, int]] = {}
     source_conn: Optional[oracledb.Connection] = None
@@ -17755,24 +17983,16 @@ def check_table_data_presence(
             target_probe_ms=tgt_ms
         ))
 
-    total_risk = len([row for row in rows if row.status == TABLE_PRESENCE_STATUS_RISK])
-    total_ok_nonempty = len([row for row in rows if row.status == TABLE_PRESENCE_STATUS_OK_BOTH_NONEMPTY])
-    total_ok_empty = len([row for row in rows if row.status == TABLE_PRESENCE_STATUS_OK_BOTH_EMPTY])
-    total_unknown = len([row for row in rows if row.status == TABLE_PRESENCE_STATUS_UNKNOWN])
-    summary = TablePresenceSummary(
+    summary = _summarize_table_presence_rows(
         total_candidates=total_candidates,
-        total_checked=len(rows),
-        total_risk=total_risk,
-        total_ok_nonempty=total_ok_nonempty,
-        total_ok_empty=total_ok_empty,
-        total_unknown=total_unknown,
-        total_skipped=0,
-        duration_seconds=time.perf_counter() - start_perf,
         mode=mode,
-        rows=rows
+        rows=rows,
+        duration_seconds=time.perf_counter() - start_perf,
+        total_skipped=0
     )
     log.info(
-        "[TABLE_PRESENCE] 完成：risk=%d, ok_nonempty=%d, ok_empty=%d, unknown=%d, skipped=%d。",
+        "[TABLE_PRESENCE] 完成：mode=%s(strategy=probe), risk=%d, ok_nonempty=%d, ok_empty=%d, unknown=%d, skipped=%d。",
+        mode,
         summary.total_risk,
         summary.total_ok_nonempty,
         summary.total_ok_empty,

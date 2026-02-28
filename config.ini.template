@@ -256,14 +256,14 @@ max_usability_objects   = 0
 usability_sample_ratio  = 0
 # 表数据存在性风险校验（仅 TABLE）：
 #   off  -> 关闭
-#   auto -> 当候选表数量 <= table_data_presence_auto_max_tables 时执行
-#   on   -> 始终执行
+#   auto -> 统计口径（优先比较 OB/Oracle NUM_ROWS）
+#   on   -> 严格回表探测（ROWNUM=1）
 table_data_presence_check = auto
 # auto 模式候选表阈值（超过阈值自动跳过该项校验）
 table_data_presence_auto_max_tables = 20000
-# OB 侧批量探测 chunk 大小（单次 obclient 多语句批量）
+# on 模式 OB 侧批量探测 chunk 大小（单次 obclient 多语句批量）
 table_data_presence_chunk_size = 500
-# OB 侧批量探测超时（秒）；留空表示沿用 obclient_timeout
+# auto 模式统计查询与 on 模式探测超时（秒）；留空表示沿用 obclient_timeout
 table_data_presence_obclient_timeout =
 # 列可见性(INVISIBLE)处理策略
 #   auto    -> 元数据可用时校验并生成修补（默认）
