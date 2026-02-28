@@ -873,8 +873,8 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
     fixup_dir = parser.get("SETTINGS", "fixup_dir", fallback=DEFAULT_FIXUP_DIR).strip()
     fixup_path = (repo_root / fixup_dir).resolve()
     allow_outside = parse_bool_flag(
-        parser.get("SETTINGS", "fixup_dir_allow_outside_repo", fallback="true"),
-        True
+        parser.get("SETTINGS", "fixup_dir_allow_outside_repo", fallback="false"),
+        False
     )
     if not allow_outside:
         if fixup_path != repo_root and repo_root not in fixup_path.parents:

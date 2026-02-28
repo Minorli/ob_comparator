@@ -35,11 +35,13 @@ fixup_cli_timeout       = 3600
 # 报告与修复脚本输出目录（可为相对路径或绝对路径）
 fixup_dir               = fixup_scripts
 # fixup_dir_allow_outside_repo: 是否允许 fixup_dir 指向项目目录外 (true/false)
-fixup_dir_allow_outside_repo = true
+fixup_dir_allow_outside_repo = false
 # fixup_max_sql_file_mb: run_fixup 单文件最大读取大小（MB），<=0 表示不限制
 fixup_max_sql_file_mb   = 50
-# fixup_force_clean=true 时，即使 fixup_dir 为项目外绝对路径也会清理旧脚本（谨慎使用）
-fixup_force_clean       = true
+# fixup_force_clean: 是否强制清理 fixup_dir（仓外目录需同时开启 fixup_clean_outside_repo）
+fixup_force_clean       = false
+# fixup_clean_outside_repo: 是否允许清理项目目录外的 fixup_dir（默认关闭，防误删）
+fixup_clean_outside_repo = false
 # fixup_drop_sys_c_columns：是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE（默认 true）
 fixup_drop_sys_c_columns = true
 report_dir              = main_reports

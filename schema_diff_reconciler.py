@@ -3673,6 +3673,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         ora_cfg = dict(config['ORACLE_SOURCE'])
         ob_cfg = dict(config['OCEANBASE_TARGET'])
         settings = dict(config['SETTINGS'])
+        config_path = Path(config_file).expanduser().resolve()
+        settings['config_file'] = str(config_path)
+        settings['config_dir'] = str(config_path.parent)
 
         schemas_raw = settings.get('source_schemas', '')
         schemas_list = [s.strip().upper() for s in schemas_raw.split(',') if s.strip()]
@@ -3686,9 +3689,10 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
 
         # fixup 脚本目录
         settings.setdefault('fixup_dir', 'fixup_scripts')
-        settings.setdefault('fixup_dir_allow_outside_repo', 'true')
+        settings.setdefault('fixup_dir_allow_outside_repo', 'false')
         settings.setdefault('fixup_max_sql_file_mb', '50')
-        settings.setdefault('fixup_force_clean', 'true')
+        settings.setdefault('fixup_force_clean', 'false')
+        settings.setdefault('fixup_clean_outside_repo', 'false')
         settings.setdefault('fixup_drop_sys_c_columns', 'true')
         settings.setdefault('generate_extra_cleanup', 'false')
         # obclient 超时时间 (秒)
@@ -4114,8 +4118,12 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             True
         )
         settings['fixup_dir_allow_outside_repo'] = parse_bool_flag(
-            settings.get('fixup_dir_allow_outside_repo', 'true'),
-            True
+            settings.get('fixup_dir_allow_outside_repo', 'false'),
+            False
+        )
+        settings['fixup_clean_outside_repo'] = parse_bool_flag(
+            settings.get('fixup_clean_outside_repo', 'false'),
+            False
         )
         try:
             settings['fixup_max_sql_file_mb'] = str(
@@ -5039,7 +5047,7 @@ def run_config_wizard(config_path: Path) -> None:
         "SETTINGS",
         "fixup_dir_allow_outside_repo",
         "是否允许 fixup_dir 指向项目目录外 (true/false)",
-        default=cfg.get("SETTINGS", "fixup_dir_allow_outside_repo", fallback="true"),
+        default=cfg.get("SETTINGS", "fixup_dir_allow_outside_repo", fallback="false"),
         transform=_bool_transform,
     )
     _prompt_field(
@@ -5052,8 +5060,15 @@ def run_config_wizard(config_path: Path) -> None:
     _prompt_field(
         "SETTINGS",
         "fixup_force_clean",
-        "是否强制清理 fixup_dir（即使目录在项目外）(true/false)",
-        default=cfg.get("SETTINGS", "fixup_force_clean", fallback="true"),
+        "是否强制清理 fixup_dir（仓外目录需配合 clean_outside 开关）(true/false)",
+        default=cfg.get("SETTINGS", "fixup_force_clean", fallback="false"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "fixup_clean_outside_repo",
+        "是否允许清理项目目录外的 fixup_dir (true/false)",
+        default=cfg.get("SETTINGS", "fixup_clean_outside_repo", fallback="false"),
         transform=_bool_transform,
     )
     _prompt_field(
@@ -24875,9 +24890,40 @@ def generate_fixup_scripts(
             trigger_filter_enabled = False
     allowed_synonym_targets = {s.upper() for s in settings.get('source_schemas_list', [])}
 
-    base_dir = Path(settings.get('fixup_dir', 'fixup_scripts')).expanduser()
-    log.info("[FIXUP] 准备生成修补脚本，目标目录=%s", base_dir.resolve())
-    fixup_force_clean = parse_bool_flag(settings.get("fixup_force_clean", "true"), True)
+    config_dir_raw = str(settings.get("config_dir", "") or "").strip()
+    config_base_dir = Path(config_dir_raw).expanduser() if config_dir_raw else Path.cwd().resolve()
+    try:
+        config_base_dir = config_base_dir.resolve()
+    except Exception:
+        config_base_dir = Path.cwd().resolve()
+    base_dir_raw = str(settings.get('fixup_dir', 'fixup_scripts') or 'fixup_scripts').strip() or 'fixup_scripts'
+    base_dir = Path(base_dir_raw).expanduser()
+    if not base_dir.is_absolute():
+        base_dir = (config_base_dir / base_dir).resolve()
+    else:
+        base_dir = base_dir.resolve()
+    allow_outside_default = "fixup_dir_allow_outside_repo" not in settings
+    allow_outside_repo = parse_bool_flag(
+        settings.get("fixup_dir_allow_outside_repo", "true" if allow_outside_default else "false"),
+        allow_outside_default
+    )
+    fixup_force_clean = parse_bool_flag(settings.get("fixup_force_clean", "false"), False)
+    fixup_clean_outside_repo = parse_bool_flag(settings.get("fixup_clean_outside_repo", "false"), False)
+    inside_config_repo = base_dir == config_base_dir or config_base_dir in base_dir.parents
+    outside_config_repo = not inside_config_repo
+    log.info(
+        "[FIXUP] 准备生成修补脚本，目标目录=%s (config_dir=%s, outside_repo=%s)",
+        base_dir,
+        config_base_dir,
+        "YES" if outside_config_repo else "NO"
+    )
+    if outside_config_repo and not allow_outside_repo:
+        log.error(
+            "[FIXUP] fixup_dir=%s 位于 config.ini 所在目录 %s 之外，且 fixup_dir_allow_outside_repo=false，已终止以避免误写/误删。",
+            base_dir,
+            config_base_dir
+        )
+        abort_run()
     idempotent_stats: Dict[str, int] = {}
     idempotent_mode = settings.get("fixup_idempotent_mode", "replace")
     idempotent_types = settings.get("fixup_idempotent_types_set") or set()
@@ -24920,17 +24966,15 @@ def generate_fixup_scripts(
             )
 
     ensure_dir(base_dir)
-    safe_to_clean = False
-    try:
-        base_resolved = base_dir.resolve()
-        run_root = Path.cwd().resolve()
-        safe_to_clean = (not base_dir.is_absolute()) or (run_root == base_resolved or run_root in base_resolved.parents)
-    except Exception:
-        safe_to_clean = not base_dir.is_absolute()
+    safe_to_clean = inside_config_repo or (outside_config_repo and allow_outside_repo and fixup_clean_outside_repo)
     if fixup_force_clean:
-        if not safe_to_clean:
-            log.warning("[FIXUP] fixup_force_clean=true，将强制清理 %s。", base_dir.resolve())
-        safe_to_clean = True
+        if outside_config_repo and not (allow_outside_repo and fixup_clean_outside_repo):
+            log.warning(
+                "[FIXUP] fixup_force_clean=true，但仓外目录清理默认受保护。"
+                "如需清理仓外 fixup_dir，请同时设置 fixup_dir_allow_outside_repo=true 与 fixup_clean_outside_repo=true。"
+            )
+        else:
+            safe_to_clean = True
 
     if safe_to_clean:
         removed_files = 0
@@ -24955,13 +24999,22 @@ def generate_fixup_scripts(
             failed
         )
     else:
-        log.warning(
-            "[FIXUP] fixup_dir=%s 位于运行目录之外，已跳过自动清理以避免误删。",
-            base_dir.resolve()
-        )
+        if outside_config_repo and allow_outside_repo:
+            log.warning(
+                "[FIXUP] fixup_dir=%s 位于 config.ini 目录之外；当前未开启 fixup_clean_outside_repo，已跳过自动清理以避免误删。",
+                base_dir
+            )
+        else:
+            log.warning(
+                "[FIXUP] fixup_dir=%s 已跳过自动清理。",
+                base_dir
+            )
 
     if not master_list:
-        log.info("[FIXUP] master_list 为空，目录已清理，无新增订正 SQL。")
+        if safe_to_clean:
+            log.info("[FIXUP] master_list 为空，目录已清理，无新增订正 SQL。")
+        else:
+            log.info("[FIXUP] master_list 为空，目录未清理，无新增订正 SQL。")
         return None
 
     log.info(f"[FIXUP] 目标端订正 SQL 将生成到目录: {base_dir.resolve()}")
@@ -30570,7 +30623,7 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['blacklist']} (
     ddl_excluded_objects = f"""
 CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['excluded_objects']} (
     REPORT_ID           VARCHAR2(64) NOT NULL,
-    STATUS              VARCHAR2(16) NOT NULL,
+    STATUS              VARCHAR2(64) NOT NULL,
     LINE_NO             NUMBER,
     OBJECT_TYPE         VARCHAR2(32),
     SCHEMA_NAME         VARCHAR2(128),
@@ -30811,6 +30864,44 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['resolution']} (
         log.info("[REPORT_DB] 已补充列 %s.%s", table_name, column_name.upper())
         return True, ""
 
+    def _ensure_varchar2_column_min_len(table_name: str, column_name: str, min_len: int) -> Tuple[bool, str]:
+        if table_name not in existing:
+            return True, ""
+        check_len_sql = (
+            "SELECT DATA_LENGTH FROM ALL_TAB_COLUMNS "
+            f"WHERE {owner_clause} "
+            f"AND TABLE_NAME = '{table_name}' "
+            f"AND COLUMN_NAME = '{column_name.upper()}'"
+        )
+        ok_len, out_len, err_len = obclient_run_sql(ob_cfg, check_len_sql)
+        if not ok_len:
+            return False, f"检查列长度失败({table_name}.{column_name}): {err_len}"
+
+        current_len: Optional[int] = None
+        for raw in (out_len or "").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            m = re.search(r"\d+", line)
+            if m:
+                try:
+                    current_len = int(m.group(0))
+                except Exception:
+                    current_len = None
+                break
+        if current_len is None or current_len >= min_len:
+            return True, ""
+
+        alter_sql = (
+            f"ALTER TABLE {schema_prefix}{table_name} "
+            f"MODIFY ({column_name} VARCHAR2({min_len}))"
+        )
+        ok_alter, _out_alter, err_alter = obclient_run_sql_commit(ob_cfg, alter_sql)
+        if not ok_alter:
+            return False, f"扩容列失败({table_name}.{column_name}): {err_alter}"
+        log.info("[REPORT_DB] 已扩容列 %s.%s 到 VARCHAR2(%d)", table_name, column_name.upper(), min_len)
+        return True, ""
+
     for table_name, col_name, col_ddl in [
         (REPORT_DB_TABLES["summary"], "EXCLUDED_COUNT", "NUMBER DEFAULT 0"),
         (REPORT_DB_TABLES["summary"], "MISSING_FIXABLE_COUNT", "NUMBER DEFAULT 0"),
@@ -30820,6 +30911,14 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['resolution']} (
         ok_mig, err_mig = _ensure_column_if_missing(table_name, col_name, col_ddl)
         if not ok_mig:
             return False, err_mig
+
+    ok_len_mig, err_len_mig = _ensure_varchar2_column_min_len(
+        REPORT_DB_TABLES["excluded_objects"],
+        "STATUS",
+        64
+    )
+    if not ok_len_mig:
+        return False, err_len_mig
 
     if not to_create:
         return True, ""
@@ -34072,7 +34171,6 @@ def build_excluded_summary_counts(
     仅统计实际生效的排除状态：
       - APPLIED: 规则命中
       - CASCADED: 依赖连带排除
-      - APPLIED_LEGACY_RENAME: 历史 RENAME 规则命中
       - APPLIED_SYSTEM: 系统派生对象（如 MLOG$_*）命中
     """
     counts: Dict[str, int] = defaultdict(int)
@@ -34082,7 +34180,6 @@ def build_excluded_summary_counts(
     effective_statuses = {
         "APPLIED",
         "CASCADED",
-        "APPLIED_LEGACY_RENAME",
         "APPLIED_SYSTEM",
     }
     for row in excluded_rows:
@@ -36957,31 +37054,6 @@ def main():
                 for line_no, obj_type, schema, obj_name, reason in explicit_skipped_rules
             ])
 
-        # 兼容历史：当黑名单中存在 RENAME 类型时，仍可参与剪裁
-        rename_excluded_table_keys: Set[Tuple[str, str]] = set()
-        if oracle_meta.blacklist_tables:
-            rename_excluded_table_keys = {
-                (schema.upper(), table.upper())
-                for (schema, table), entries in oracle_meta.blacklist_tables.items()
-                if is_rename_only_blacklist(entries)
-            }
-        rename_seed_nodes: Set[DependencyNode] = {
-            (f"{schema}.{table}", "TABLE")
-            for schema, table in rename_excluded_table_keys
-        }
-        if rename_excluded_table_keys:
-            for schema, table in sorted(rename_excluded_table_keys):
-                excluded_object_report_rows.append(
-                    {
-                        "status": "APPLIED_LEGACY_RENAME",
-                        "line_no": 0,
-                        "object_type": "TABLE",
-                        "schema_name": schema,
-                        "object_name": table,
-                        "detail": "BLACKLIST_RENAME_RULE",
-                    }
-                )
-
         # 系统派生对象：MVIEW LOG 表 (MLOG$_*)，默认纳入 EXCLUDED（不参与校验/FIXUP）
         system_artifact_excluded_table_keys: Set[Tuple[str, str]] = collect_mview_log_artifact_table_keys(source_objects)
         system_artifact_seed_nodes: Set[DependencyNode] = {
@@ -36989,8 +37061,8 @@ def main():
             for schema, table in system_artifact_excluded_table_keys
         }
         if system_artifact_excluded_table_keys:
-            # 若用户显式排除/legacy rename 已覆盖同表，避免重复展示 APPLIED 行。
-            dedup_keys = set(explicit_excluded_table_keys) | set(rename_excluded_table_keys)
+            # 若用户显式排除已覆盖同表，避免重复展示 APPLIED 行。
+            dedup_keys = set(explicit_excluded_table_keys)
             for schema, table in sorted(system_artifact_excluded_table_keys):
                 if (schema, table) in dedup_keys:
                     continue
@@ -37006,8 +37078,7 @@ def main():
                 )
 
         excluded_seed_nodes: Set[DependencyNode] = (
-            set(rename_seed_nodes)
-            | set(explicit_seed_nodes)
+            set(explicit_seed_nodes)
             | set(system_artifact_seed_nodes)
         )
         excluded_nodes: Set[DependencyNode] = set()
@@ -37022,7 +37093,7 @@ def main():
             effective_keys: Set[Tuple[str, str, str]] = set()
             for row in excluded_object_report_rows:
                 status_u = str(row.get("status") or "").upper()
-                if status_u not in {"APPLIED", "APPLIED_LEGACY_RENAME", "APPLIED_SYSTEM", "CASCADED"}:
+                if status_u not in {"APPLIED", "APPLIED_SYSTEM", "CASCADED"}:
                     continue
                 key = (
                     str(row.get("object_type") or "").upper(),
@@ -37114,7 +37185,7 @@ def main():
             else:
                 transitive_table_cache = None
 
-            blacklist_pop_keys = set(rename_excluded_table_keys) | set(explicit_excluded_table_keys)
+            blacklist_pop_keys = set(explicit_excluded_table_keys)
             for key in blacklist_pop_keys:
                 oracle_meta.blacklist_tables.pop(key, None)
 
@@ -37145,12 +37216,6 @@ def main():
                     len(master_list),
                     before_mapping_cnt,
                     after_mapping_cnt
-                )
-            if rename_seed_nodes:
-                log.info(
-                    "[BLACKLIST] RENAME 规则生效: 表=%d, 连带对象=%d。",
-                    len(rename_excluded_table_keys),
-                    cascaded_count
                 )
             if system_artifact_seed_nodes:
                 log.info(

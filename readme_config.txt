@@ -70,10 +70,12 @@
   - 备注：DIFF_REPORT_WRITE_ERRORS / DIFF_REPORT_RESOLUTION 为写库追踪与闭环表，report_to_db 启用后默认创建。
         缺失/不支持明细可通过 DIFF_REPORT_DETAIL 查询；若需行化细节，使用 DIFF_REPORT_DETAIL_ITEM。
 - fixup_dir：修补脚本输出目录。默认：fixup_scripts。
-- fixup_dir_allow_outside_repo：是否允许 fixup_dir 指向项目目录外。默认：true。
+- fixup_dir_allow_outside_repo：是否允许 fixup_dir 指向项目目录外。默认：false。
 - fixup_max_sql_file_mb：run_fixup 单文件最大读取大小（MB）。默认：50；<=0 表示不限制。
-- fixup_force_clean：强制清理 fixup_dir（即使为项目外绝对路径）。默认：true。
-  说明：开启后会删除 fixup_dir 下旧脚本；请确保路径配置正确，避免误删。
+- fixup_force_clean：强制清理 fixup_dir。默认：false。
+- fixup_clean_outside_repo：是否允许清理项目目录外的 fixup_dir。默认：false。
+  说明：仓外目录默认只允许写入、不允许清理；如需清理仓外目录，必须同时设置
+  `fixup_dir_allow_outside_repo=true` 与 `fixup_clean_outside_repo=true`。
 - log_dir：运行日志目录。默认：logs。
 - log_level：控制台日志级别。默认：auto。可选：AUTO/DEBUG/INFO/WARNING/ERROR/CRITICAL。
   说明：AUTO 在 TTY 使用 INFO，非 TTY 使用 WARNING；日志文件固定 DEBUG。
