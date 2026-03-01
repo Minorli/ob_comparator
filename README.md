@@ -11,6 +11,8 @@
 - 视图 DDL 清洗增强：`CREATE ... VIEW` 前缀改为 token 扫描，降低注释/字符串命中导致的误改风险。
 - 表数据存在性校验增强：`auto` 模式下对 `NUM_ROWS=0` 做源端/目标端二次探针，新增 `table_data_presence_zero_probe_workers` 并限制最大并发为 32。
 - 黑名单规则增强：`blacklist_rules.json` 解析失败可致命中止（fail-fast），避免规则失效后“静默全量放行”。
+- 配置热加载增强：新增 `config_hot_reload_mode/config_hot_reload_interval_sec/config_hot_reload_fail_policy`，
+  支持主程序 phase 边界应用与 `run_fixup --iterative` round 边界应用（默认关闭）。
 - 近期能力与文档总览统一补齐（README / readme_config / docs/* / release notes / version diff）。
 
 ## 核心能力
@@ -93,6 +95,9 @@ report_to_db = true
 table_data_presence_check = auto
 table_data_presence_auto_max_tables = 20000
 table_data_presence_chunk_size = 500
+config_hot_reload_mode = off
+config_hot_reload_interval_sec = 5
+config_hot_reload_fail_policy = keep_last_good
 oracle_client_lib_dir = /opt/instantclient_19_28
 dbcat_bin = /opt/dbcat-2.5.0-SNAPSHOT
 dbcat_output_dir = dbcat_output

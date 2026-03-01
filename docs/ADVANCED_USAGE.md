@@ -263,6 +263,16 @@ sequence -> table -> table_alter -> grants -> view -> procedure -> package -> co
 - 二次探针并发由 `table_data_presence_zero_probe_workers` 控制，默认 1，最大 32。
 - 当日志显示 TABLE_PRESENCE 耗时较长，可降低候选规模或临时设置 `table_data_presence_check=off`。
 
+### 6.9 配置热加载（config_hot_reload_*）
+- `config_hot_reload_mode=off`：默认关闭，启动快照语义。
+- `config_hot_reload_mode=phase`：主程序仅在阶段边界检查并应用可热加载项（当前建议用于 `log_level`/热加载自身参数）。
+- `config_hot_reload_mode=round`：仅 `run_fixup --iterative` 生效，在每轮开始应用可热加载项；非迭代运行会告警并忽略。
+- `config_hot_reload_interval_sec`：热加载检查间隔（秒，默认 5）。
+- `config_hot_reload_fail_policy=keep_last_good|abort`：
+  - `keep_last_good`：新配置无效时记录 `REJECTED` 并继续。
+  - `abort`：新配置无效时终止运行。
+- 运行产物：`config_reload_events_<ts>.txt`（主程序在 `main_reports/run_<ts>/`，fixup 在 `fixup_scripts/errors/`）。
+
 ---
 
 ## 7. 大规模迁移建议

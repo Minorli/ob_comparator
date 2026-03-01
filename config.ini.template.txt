@@ -87,6 +87,19 @@ log_dir                 = logs
 log_level               = auto
 # report_width 为报告宽度（避免 nohup 等环境下自动截断）
 report_width            = 160
+# 配置热加载（默认关闭）
+# config_hot_reload_mode:
+#   off   -> 关闭热加载（默认）
+#   phase -> 主程序在“阶段边界”检查并应用可热加载项
+#   round -> run_fixup 在 --iterative 每轮开始检查并应用可热加载项
+#           （主程序不支持 round，会回退为 off）
+# config_hot_reload_interval_sec: 检查间隔秒数（>=1）
+# config_hot_reload_fail_policy:
+#   keep_last_good -> 新配置无效时保留当前运行配置并继续（默认）
+#   abort          -> 新配置无效时立即终止
+config_hot_reload_mode = off
+config_hot_reload_interval_sec = 5
+config_hot_reload_fail_policy = keep_last_good
 
 # 修补脚本生成相关
 # fixup_workers 控制并发生成脚本的线程数，建议 8 或 12；留空或 0 则自动取 min(12, CPU)

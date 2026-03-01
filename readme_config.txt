@@ -83,6 +83,12 @@
   说明：AUTO 在 TTY 使用 INFO，非 TTY 使用 WARNING；日志文件固定 DEBUG。
 - report_width：报告宽度（字符数）。默认：160。
   说明：非交互/重定向环境下可避免 Rich 报告被截断为 80 列。
+- config_hot_reload_mode：配置热加载模式。默认：off。可选：off/phase/round。
+  说明：主程序仅支持 `phase`（在阶段边界生效）；`run_fixup --iterative` 支持 `round`（每轮开始生效）。
+  说明：主程序配置 `round` 会自动回退为 `off` 并告警。
+- config_hot_reload_interval_sec：热加载检查间隔（秒）。默认：5（最小 1）。
+- config_hot_reload_fail_policy：热加载失败策略。默认：keep_last_good。可选：keep_last_good/abort。
+  说明：`keep_last_good` 在新配置无效时继续使用当前快照；`abort` 则立即终止运行。
 
 超时设置
 - cli_timeout：dbcat CLI 超时（秒）。默认：600。

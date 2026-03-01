@@ -47,6 +47,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
 from collections import defaultdict, OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -68,11 +69,16 @@ DEFAULT_FIXUP_TIMEOUT = 3600
 DEFAULT_ERROR_REPORT_LIMIT = 200
 DEFAULT_FIXUP_MAX_SQL_FILE_MB = 50
 DEFAULT_FIXUP_AUTO_GRANT_CACHE_LIMIT = 10000
+DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC = 5
 MAX_RECOMPILE_RETRIES = 5
 STATE_LEDGER_FILENAME = ".fixup_state_ledger.json"
 FIXUP_RUN_LOCK_FILENAME = ".run_fixup.lock"
+FIXUP_HOT_RELOAD_EVENTS_DIR = "errors"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
 REPO_ISSUES_URL = f"{REPO_URL}/issues"
+
+CONFIG_HOT_RELOAD_MODE_VALUES = {"off", "phase", "round"}
+CONFIG_HOT_RELOAD_FAIL_POLICY_VALUES = {"keep_last_good", "abort"}
 
 LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOG_FILE_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
@@ -973,6 +979,29 @@ class FixupAutoGrantSettings:
 
 
 @dataclass
+class FixupHotReloadSettings:
+    mode: str
+    interval_sec: int
+    fail_policy: str
+
+
+@dataclass
+class FixupHotReloadRuntime:
+    config_path: Path
+    mode: str
+    interval_sec: int
+    fail_policy: str
+    watch_paths: List[Path]
+    snapshot: Dict[str, str]
+    last_check_at: float = 0.0
+    events: List[Dict[str, str]] = None
+
+    def __post_init__(self) -> None:
+        if self.events is None:
+            self.events = []
+
+
+@dataclass
 class FixupPrecheckSummary:
     current_user: str
     target_schemas: Set[str]
@@ -1042,6 +1071,318 @@ class AutoGrantContext:
     applied_grants: Set[str]
     blocked_objects: Set[Tuple[str, str]]
     stats: AutoGrantStats
+
+
+def normalize_config_hot_reload_mode(raw_value: Optional[str]) -> str:
+    value = (raw_value or "off").strip().lower()
+    if value not in CONFIG_HOT_RELOAD_MODE_VALUES:
+        log.warning(
+            "config_hot_reload_mode=%s 非法，回退为 off（支持: off/phase/round）",
+            raw_value
+        )
+        return "off"
+    return value
+
+
+def normalize_config_hot_reload_fail_policy(raw_value: Optional[str]) -> str:
+    value = (raw_value or "keep_last_good").strip().lower()
+    if value not in CONFIG_HOT_RELOAD_FAIL_POLICY_VALUES:
+        log.warning(
+            "config_hot_reload_fail_policy=%s 非法，回退为 keep_last_good（支持: keep_last_good/abort）",
+            raw_value
+        )
+        return "keep_last_good"
+    return value
+
+
+def parse_config_hot_reload_interval(raw_value: Optional[str]) -> int:
+    if raw_value is None or not str(raw_value).strip():
+        return DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC
+    try:
+        value = int(str(raw_value).strip())
+    except Exception:
+        log.warning(
+            "config_hot_reload_interval_sec=%s 非法，回退为 %d",
+            raw_value,
+            DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC
+        )
+        return DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC
+    if value < 1:
+        log.warning(
+            "config_hot_reload_interval_sec=%s 小于 1，回退为 %d",
+            raw_value,
+            DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC
+        )
+        return DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC
+    return value
+
+
+def resolve_config_relative_path(base_dir: Path, raw_path: str) -> Path:
+    path = Path((raw_path or "").strip()).expanduser()
+    if not path.is_absolute():
+        path = base_dir / path
+    return path.resolve()
+
+
+def resolve_hot_reload_watch_paths(parser: configparser.ConfigParser, config_path: Path) -> List[Path]:
+    base_dir = config_path.parent.resolve()
+    watch_paths: List[Path] = [config_path.resolve()]
+    settings = parser["SETTINGS"] if parser.has_section("SETTINGS") else {}
+    for key in ("remap_file", "blacklist_rules_path", "exclude_objects_file"):
+        raw = (settings.get(key) if settings else "") or ""
+        raw = str(raw).strip()
+        if not raw:
+            continue
+        watch_paths.append(resolve_config_relative_path(base_dir, raw))
+    unique: List[Path] = []
+    seen: Set[Path] = set()
+    for item in watch_paths:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    return unique
+
+
+def compute_file_sha1(path: Path) -> str:
+    if not path.exists():
+        return "MISSING"
+    try:
+        data = path.read_bytes()
+    except Exception as exc:
+        return f"ERROR:{exc.__class__.__name__}:{str(exc)[:120]}"
+    return hashlib.sha1(data).hexdigest()
+
+
+def build_watch_snapshot(paths: List[Path]) -> Dict[str, str]:
+    snapshot: Dict[str, str] = {}
+    for path in paths:
+        snapshot[str(path)] = compute_file_sha1(path)
+    return snapshot
+
+
+def load_fixup_hot_reload_settings(parser: configparser.ConfigParser) -> FixupHotReloadSettings:
+    settings = parser["SETTINGS"] if parser.has_section("SETTINGS") else {}
+    mode = normalize_config_hot_reload_mode(settings.get("config_hot_reload_mode", "off"))
+    interval_sec = parse_config_hot_reload_interval(settings.get("config_hot_reload_interval_sec", "5"))
+    fail_policy = normalize_config_hot_reload_fail_policy(
+        settings.get("config_hot_reload_fail_policy", "keep_last_good")
+    )
+    if mode == "phase":
+        log.warning("run_fixup 不支持 phase 热加载，已回退为 off。")
+        mode = "off"
+    return FixupHotReloadSettings(mode=mode, interval_sec=interval_sec, fail_policy=fail_policy)
+
+
+def init_fixup_hot_reload_runtime(config_path: Path) -> Optional[FixupHotReloadRuntime]:
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read(config_path, encoding="utf-8")
+    except Exception as exc:
+        log.warning("初始化配置热加载失败，将关闭热加载: %s", exc)
+        return None
+    hot_settings = load_fixup_hot_reload_settings(parser)
+    watch_paths = resolve_hot_reload_watch_paths(parser, config_path)
+    snapshot = build_watch_snapshot(watch_paths)
+    return FixupHotReloadRuntime(
+        config_path=config_path,
+        mode=hot_settings.mode,
+        interval_sec=hot_settings.interval_sec,
+        fail_policy=hot_settings.fail_policy,
+        watch_paths=watch_paths,
+        snapshot=snapshot
+    )
+
+
+def append_fixup_hot_reload_event(
+    runtime: FixupHotReloadRuntime,
+    status: str,
+    stage: str,
+    changed_files: List[str],
+    changed_keys: List[str],
+    note: str
+) -> None:
+    event = {
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "status": status,
+        "stage": stage,
+        "changed_files": ",".join(changed_files) if changed_files else "-",
+        "changed_keys": ",".join(changed_keys) if changed_keys else "-",
+        "note": note or "-"
+    }
+    runtime.events.append(event)
+    message = (
+        "[HOT_RELOAD] {status} stage={stage} files={files} keys={keys} note={note}".format(
+            status=event["status"],
+            stage=event["stage"],
+            files=event["changed_files"],
+            keys=event["changed_keys"],
+            note=event["note"]
+        )
+    )
+    if status in {"REJECTED", "REQUIRES_RESTART"}:
+        log.warning(message)
+    else:
+        log.info(message)
+
+
+def write_fixup_hot_reload_events_report(
+    fixup_dir: Path,
+    runtime: Optional[FixupHotReloadRuntime]
+) -> Optional[Path]:
+    if not runtime or not runtime.events:
+        return None
+    report_dir = fixup_dir / FIXUP_HOT_RELOAD_EVENTS_DIR
+    report_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_path = report_dir / f"config_reload_events_{ts}.txt"
+    lines = [
+        "# config hot reload events",
+        f"# mode={runtime.mode} interval_sec={runtime.interval_sec} fail_policy={runtime.fail_policy}",
+        "TS | STATUS | STAGE | CHANGED_FILES | CHANGED_KEYS | NOTE"
+    ]
+    for event in runtime.events:
+        lines.append(
+            "{ts} | {status} | {stage} | {changed_files} | {changed_keys} | {note}".format(
+                ts=event.get("ts", "-"),
+                status=event.get("status", "-"),
+                stage=event.get("stage", "-"),
+                changed_files=event.get("changed_files", "-"),
+                changed_keys=event.get("changed_keys", "-"),
+                note=event.get("note", "-")
+            )
+        )
+    report_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return report_path
+
+
+def apply_fixup_hot_reload_at_round(
+    runtime: Optional[FixupHotReloadRuntime],
+    round_num: int,
+    current_ob_cfg: Dict[str, str],
+    current_fixup_dir: Path,
+    current_report_dir: Path,
+    current_fixup_settings: FixupAutoGrantSettings,
+    current_max_sql_file_bytes: Optional[int]
+) -> Tuple[Dict[str, str], FixupAutoGrantSettings, Optional[int], bool]:
+    if not runtime or runtime.mode != "round":
+        return current_ob_cfg, current_fixup_settings, current_max_sql_file_bytes, False
+
+    now = time.time()
+    if runtime.last_check_at > 0 and (now - runtime.last_check_at) < runtime.interval_sec:
+        return current_ob_cfg, current_fixup_settings, current_max_sql_file_bytes, False
+    runtime.last_check_at = now
+
+    latest_snapshot = build_watch_snapshot(runtime.watch_paths)
+    changed_files = [
+        path for path in sorted(latest_snapshot.keys())
+        if latest_snapshot.get(path) != runtime.snapshot.get(path)
+    ]
+    if not changed_files:
+        runtime.snapshot = latest_snapshot
+        return current_ob_cfg, current_fixup_settings, current_max_sql_file_bytes, False
+
+    try:
+        candidate_ob_cfg, candidate_fixup_dir, _repo_root, candidate_log_level, candidate_report_dir, candidate_fixup_settings, candidate_max_sql_file_bytes = load_ob_config(
+            runtime.config_path
+        )
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.read(runtime.config_path, encoding="utf-8")
+        candidate_hot = load_fixup_hot_reload_settings(parser)
+        candidate_watch_paths = resolve_hot_reload_watch_paths(parser, runtime.config_path)
+    except Exception as exc:
+        runtime.snapshot = latest_snapshot
+        append_fixup_hot_reload_event(
+            runtime,
+            status="REJECTED",
+            stage=f"round-{round_num}",
+            changed_files=changed_files,
+            changed_keys=[],
+            note=f"配置解析失败: {str(exc)[:240]}"
+        )
+        if runtime.fail_policy == "abort":
+            raise ConfigError(f"热加载配置无效（round={round_num}）: {exc}")
+        return current_ob_cfg, current_fixup_settings, current_max_sql_file_bytes, False
+
+    immutable_keys: List[str] = []
+    for key in ("executable", "host", "port", "user_string", "password"):
+        if str(candidate_ob_cfg.get(key, "")) != str(current_ob_cfg.get(key, "")):
+            immutable_keys.append(f"OCEANBASE_TARGET.{key}")
+    if candidate_fixup_dir.resolve() != current_fixup_dir.resolve():
+        immutable_keys.append("SETTINGS.fixup_dir")
+    if candidate_report_dir.resolve() != current_report_dir.resolve():
+        immutable_keys.append("SETTINGS.report_dir")
+
+    applied_keys: List[str] = []
+    next_ob_cfg = dict(current_ob_cfg)
+    next_fixup_settings = current_fixup_settings
+    next_max_sql_file_bytes = current_max_sql_file_bytes
+
+    current_level = logging.getLogger().level
+    candidate_level = resolve_console_log_level(candidate_log_level)
+    if candidate_level != current_level:
+        set_console_log_level(candidate_level)
+        applied_keys.append("SETTINGS.log_level")
+
+    if candidate_ob_cfg.get("timeout") != current_ob_cfg.get("timeout"):
+        next_ob_cfg["timeout"] = candidate_ob_cfg.get("timeout")
+        applied_keys.append("SETTINGS.fixup_cli_timeout/obclient_timeout")
+
+    if candidate_fixup_settings != current_fixup_settings:
+        next_fixup_settings = candidate_fixup_settings
+        applied_keys.extend([
+            "SETTINGS.fixup_auto_grant",
+            "SETTINGS.fixup_auto_grant_types",
+            "SETTINGS.fixup_auto_grant_fallback",
+            "SETTINGS.fixup_auto_grant_cache_limit",
+        ])
+
+    if candidate_max_sql_file_bytes != current_max_sql_file_bytes:
+        next_max_sql_file_bytes = candidate_max_sql_file_bytes
+        applied_keys.append("SETTINGS.fixup_max_sql_file_mb")
+
+    if candidate_hot.interval_sec != runtime.interval_sec:
+        runtime.interval_sec = candidate_hot.interval_sec
+        applied_keys.append("SETTINGS.config_hot_reload_interval_sec")
+    if candidate_hot.fail_policy != runtime.fail_policy:
+        runtime.fail_policy = candidate_hot.fail_policy
+        applied_keys.append("SETTINGS.config_hot_reload_fail_policy")
+    if candidate_hot.mode != runtime.mode:
+        runtime.mode = candidate_hot.mode
+        applied_keys.append("SETTINGS.config_hot_reload_mode")
+
+    if immutable_keys:
+        append_fixup_hot_reload_event(
+            runtime,
+            status="REQUIRES_RESTART",
+            stage=f"round-{round_num}",
+            changed_files=changed_files,
+            changed_keys=immutable_keys,
+            note="存在本轮不可热加载项，需重启 run_fixup 生效"
+        )
+    elif applied_keys:
+        append_fixup_hot_reload_event(
+            runtime,
+            status="APPLIED",
+            stage=f"round-{round_num}",
+            changed_files=changed_files,
+            changed_keys=sorted(set(applied_keys)),
+            note="已在轮次边界应用"
+        )
+    else:
+        append_fixup_hot_reload_event(
+            runtime,
+            status="REQUIRES_RESTART",
+            stage=f"round-{round_num}",
+            changed_files=changed_files,
+            changed_keys=[],
+            note="检测到文件变化，但 run_fixup 当前运行态无可热加载项"
+        )
+
+    runtime.watch_paths = candidate_watch_paths
+    runtime.snapshot = build_watch_snapshot(runtime.watch_paths)
+    settings_changed = next_fixup_settings != current_fixup_settings
+    return next_ob_cfg, next_fixup_settings, next_max_sql_file_bytes, settings_changed
 
 
 def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, Path, FixupAutoGrantSettings, Optional[int]]:
@@ -3990,7 +4331,12 @@ def main() -> None:
     iterative_mode = getattr(args, 'iterative', False)
     max_rounds = getattr(args, 'max_rounds', 10)
     min_progress = getattr(args, 'min_progress', 1)
-    
+    hot_reload_runtime = init_fixup_hot_reload_runtime(config_arg.resolve())
+    if hot_reload_runtime and hot_reload_runtime.mode == "round" and not iterative_mode:
+        log.warning(
+            "config_hot_reload_mode=round 仅在 --iterative 下生效；本次运行不会热加载。"
+        )
+
     try:
         with acquire_fixup_run_lock(fixup_dir):
             if getattr(args, "view_chain_autofix", False):
@@ -4011,7 +4357,8 @@ def main() -> None:
                     only_dirs, exclude_dirs,
                     fixup_settings,
                     max_sql_file_bytes,
-                    max_rounds, min_progress
+                    max_rounds, min_progress,
+                    hot_reload_runtime=hot_reload_runtime
                 )
             else:
                 run_single_fixup(
@@ -4615,7 +4962,8 @@ def run_iterative_fixup(
     fixup_settings: FixupAutoGrantSettings,
     max_sql_file_bytes: Optional[int],
     max_rounds: int = 10,
-    min_progress: int = 1
+    min_progress: int = 1,
+    hot_reload_runtime: Optional[FixupHotReloadRuntime] = None
 ) -> None:
     """
     Multi-round iterative fixup execution with automatic retry.
@@ -4650,15 +4998,19 @@ def run_iterative_fixup(
     done_dir.mkdir(exist_ok=True)
     state_ledger = FixupStateLedger(fixup_dir)
     
-    obclient_cmd = build_obclient_command(ob_cfg)
-    ob_timeout = resolve_timeout_value(ob_cfg.get("timeout"))
+    current_ob_cfg = dict(ob_cfg)
+    current_fixup_settings = fixup_settings
+    current_max_sql_file_bytes = max_sql_file_bytes
+
+    obclient_cmd = build_obclient_command(current_ob_cfg)
+    ob_timeout = resolve_timeout_value(current_ob_cfg.get("timeout"))
     ok_conn, conn_err = check_obclient_connectivity(obclient_cmd, ob_timeout)
     if not ok_conn:
         log.error("OBClient 连接检查失败: %s", conn_err)
         log.error("请确认网络连通性/账号权限/obclient 可用性后重试。")
         sys.exit(1)
     auto_grant_ctx = init_auto_grant_context(
-        fixup_settings,
+        current_fixup_settings,
         report_dir,
         fixup_dir,
         exclude_dirs,
@@ -4678,6 +5030,31 @@ def run_iterative_fixup(
     
     while round_num < max_rounds:
         round_num += 1
+        current_ob_cfg, current_fixup_settings, current_max_sql_file_bytes, fixup_settings_changed = apply_fixup_hot_reload_at_round(
+            hot_reload_runtime,
+            round_num,
+            current_ob_cfg,
+            fixup_dir,
+            report_dir,
+            current_fixup_settings,
+            current_max_sql_file_bytes
+        )
+        ob_timeout = resolve_timeout_value(current_ob_cfg.get("timeout"))
+        if fixup_settings_changed:
+            if current_fixup_settings.enabled:
+                if auto_grant_ctx is None:
+                    auto_grant_ctx = init_auto_grant_context(
+                        current_fixup_settings,
+                        report_dir,
+                        fixup_dir,
+                        exclude_dirs,
+                        obclient_cmd,
+                        ob_timeout
+                    )
+                else:
+                    auto_grant_ctx.settings = current_fixup_settings
+            else:
+                auto_grant_ctx = None
         reset_auto_grant_round_cache(auto_grant_ctx, round_num)
         
         log_section(f"第 {round_num}/{max_rounds} 轮")
@@ -4741,7 +5118,7 @@ def run_iterative_fixup(
                 error_entries,
                 DEFAULT_ERROR_REPORT_LIMIT,
                 max_sql_file_bytes,
-                state_ledger=state_ledger
+                    state_ledger=state_ledger
             )
                 error_truncated = error_truncated or truncated
                 round_results.append(result)
@@ -4763,7 +5140,7 @@ def run_iterative_fixup(
                 ob_timeout,
                 layer,
                 label,
-                max_sql_file_bytes,
+                current_max_sql_file_bytes,
                 state_ledger=state_ledger
             )
 
@@ -4819,7 +5196,7 @@ def run_iterative_fixup(
                                 ob_timeout,
                                 layer,
                                 "[DEPS]",
-                                max_sql_file_bytes,
+                                current_max_sql_file_bytes,
                                 state_ledger=state_ledger
                             )
                             pre_executed.add(dep_path)
@@ -4856,7 +5233,7 @@ def run_iterative_fixup(
                     ob_timeout,
                     layer,
                     f"{label} (retry)",
-                    max_sql_file_bytes,
+                    current_max_sql_file_bytes,
                     state_ledger=state_ledger
                 )
                 round_results.append(retry_result)
@@ -4992,6 +5369,9 @@ def run_iterative_fixup(
     )
     if report_path:
         log.info("错误报告已输出: %s", report_path)
+    reload_report_path = write_fixup_hot_reload_events_report(fixup_dir, hot_reload_runtime)
+    if reload_report_path:
+        log.info("配置热加载事件已输出: %s", reload_report_path)
     state_ledger.flush()
 
     log_section("执行结束")

@@ -120,6 +120,7 @@ def strip_ansi_text(text: str) -> str:
 LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOG_FILE_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
 LOG_SECTION_WIDTH = 80
+OBC_TIMEOUT = 60
 
 
 class FatalError(RuntimeError):
@@ -255,6 +256,25 @@ class RunSummaryContext(NamedTuple):
     view_chain_file: Optional[Path]
     trigger_list_summary: Optional[Dict[str, object]]
     report_start_perf: float
+    hot_reload_mode: str = "off"
+    hot_reload_events_count: int = 0
+    hot_reload_events_file: Optional[Path] = None
+
+
+@dataclass
+class ConfigHotReloadRuntime:
+    config_path: Path
+    mode: str
+    interval_sec: int
+    fail_policy: str
+    watch_paths: List[Path]
+    snapshot: Dict[str, str]
+    last_check_at: float = 0.0
+    events: List[Dict[str, str]] = None
+
+    def __post_init__(self) -> None:
+        if self.events is None:
+            self.events = []
 
 
 @contextmanager
@@ -321,6 +341,265 @@ def setup_run_logging(settings: Dict, timestamp: str) -> Optional[Path]:
     except Exception as exc:
         log.warning("初始化日志文件失败，将仅输出到控制台: %s", exc)
         return None
+
+
+def resolve_path_from_config(config_path: Path, raw_path: str) -> Path:
+    path = Path((raw_path or "").strip()).expanduser()
+    if not path.is_absolute():
+        path = config_path.parent / path
+    return path.resolve()
+
+
+def compute_hot_reload_file_sha1(path: Path) -> str:
+    if not path.exists():
+        return "MISSING"
+    try:
+        data = path.read_bytes()
+    except Exception as exc:
+        return f"ERROR:{exc.__class__.__name__}:{str(exc)[:120]}"
+    return hashlib.sha1(data).hexdigest()
+
+
+def build_hot_reload_snapshot(watch_paths: List[Path]) -> Dict[str, str]:
+    snapshot: Dict[str, str] = {}
+    for item in watch_paths:
+        snapshot[str(item)] = compute_hot_reload_file_sha1(item)
+    return snapshot
+
+
+def build_hot_reload_watch_paths(config_path: Path, settings: Dict[str, object]) -> List[Path]:
+    watch_paths: List[Path] = [config_path.resolve()]
+    for key in ("remap_file", "blacklist_rules_path", "exclude_objects_file"):
+        raw = str(settings.get(key, "") or "").strip()
+        if not raw:
+            continue
+        watch_paths.append(resolve_path_from_config(config_path, raw))
+    unique: List[Path] = []
+    seen: Set[Path] = set()
+    for item in watch_paths:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    return unique
+
+
+def append_config_hot_reload_event(
+    runtime: ConfigHotReloadRuntime,
+    status: str,
+    phase: str,
+    changed_files: List[str],
+    changed_keys: List[str],
+    note: str
+) -> None:
+    event = {
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "status": status,
+        "phase": phase,
+        "changed_files": ",".join(changed_files) if changed_files else "-",
+        "changed_keys": ",".join(changed_keys) if changed_keys else "-",
+        "note": note or "-"
+    }
+    runtime.events.append(event)
+    message = (
+        "[HOT_RELOAD] {status} phase={phase} files={files} keys={keys} note={note}".format(
+            status=event["status"],
+            phase=event["phase"],
+            files=event["changed_files"],
+            keys=event["changed_keys"],
+            note=event["note"]
+        )
+    )
+    if status in {"REJECTED", "REQUIRES_RESTART"}:
+        log.warning(message)
+    else:
+        log.info(message)
+
+
+def init_config_hot_reload_runtime(
+    config_path: Path,
+    settings: Dict[str, object]
+) -> Optional[ConfigHotReloadRuntime]:
+    mode = normalize_config_hot_reload_mode(settings.get("config_hot_reload_mode", "off"))
+    if mode == "round":
+        log.warning("主程序不支持 config_hot_reload_mode=round，本次按 off 处理。")
+        mode = "off"
+    interval_sec = parse_config_hot_reload_interval(settings.get("config_hot_reload_interval_sec", "5"))
+    fail_policy = normalize_config_hot_reload_fail_policy(
+        settings.get("config_hot_reload_fail_policy", "keep_last_good")
+    )
+    watch_paths = build_hot_reload_watch_paths(config_path, settings)
+    snapshot = build_hot_reload_snapshot(watch_paths)
+    return ConfigHotReloadRuntime(
+        config_path=config_path.resolve(),
+        mode=mode,
+        interval_sec=interval_sec,
+        fail_policy=fail_policy,
+        watch_paths=watch_paths,
+        snapshot=snapshot
+    )
+
+
+def apply_config_hot_reload_at_phase(
+    runtime: Optional[ConfigHotReloadRuntime],
+    phase_name: str,
+    settings: Dict[str, object],
+    current_ora_cfg: Optional[Dict[str, str]] = None,
+    current_ob_cfg: Optional[Dict[str, str]] = None
+) -> None:
+    if not runtime or runtime.mode != "phase":
+        return
+
+    now = time.time()
+    if runtime.last_check_at > 0 and (now - runtime.last_check_at) < runtime.interval_sec:
+        return
+    runtime.last_check_at = now
+
+    latest_snapshot = build_hot_reload_snapshot(runtime.watch_paths)
+    changed_files = [
+        key for key in sorted(latest_snapshot.keys())
+        if latest_snapshot.get(key) != runtime.snapshot.get(key)
+    ]
+    if not changed_files:
+        runtime.snapshot = latest_snapshot
+        return
+
+    prev_obc_timeout = OBC_TIMEOUT
+    try:
+        ora_cfg_new, ob_cfg_new, candidate_settings = load_config(str(runtime.config_path))
+    except Exception as exc:
+        runtime.snapshot = latest_snapshot
+        append_config_hot_reload_event(
+            runtime,
+            status="REJECTED",
+            phase=phase_name,
+            changed_files=changed_files,
+            changed_keys=[],
+            note=f"配置解析失败: {str(exc)[:240]}"
+        )
+        if runtime.fail_policy == "abort":
+            abort_run(f"配置热加载失败(phase={phase_name}): {exc}")
+        return
+    finally:
+        # load_config 会更新全局 OBC_TIMEOUT；热加载探测阶段不应产生隐式副作用。
+        globals()["OBC_TIMEOUT"] = prev_obc_timeout
+
+    reloadable_keys = {
+        "log_level",
+        "config_hot_reload_mode",
+        "config_hot_reload_interval_sec",
+        "config_hot_reload_fail_policy",
+    }
+    changed_keys = sorted(
+        key for key in reloadable_keys
+        if str(candidate_settings.get(key, "")) != str(settings.get(key, ""))
+    )
+    immutable_candidates: List[str] = []
+    for key in (
+        "source_schemas",
+        "remap_file",
+        "fixup_dir",
+        "report_dir",
+        "check_primary_types",
+        "check_extra_types",
+        "check_dependencies",
+        "generate_fixup",
+        "generate_grants",
+    ):
+        if str(candidate_settings.get(key, "")) != str(settings.get(key, "")):
+            immutable_candidates.append(f"SETTINGS.{key}")
+    if current_ora_cfg:
+        for key in ("user", "password", "dsn"):
+            if str(ora_cfg_new.get(key, "")) != str(current_ora_cfg.get(key, "")):
+                immutable_candidates.append(f"ORACLE_SOURCE.{key}")
+    if current_ob_cfg:
+        for key in ("executable", "host", "port", "user_string", "password"):
+            if str(ob_cfg_new.get(key, "")) != str(current_ob_cfg.get(key, "")):
+                immutable_candidates.append(f"OCEANBASE_TARGET.{key}")
+    if immutable_candidates:
+        append_config_hot_reload_event(
+            runtime,
+            status="REQUIRES_RESTART",
+            phase=phase_name,
+            changed_files=changed_files,
+            changed_keys=immutable_candidates,
+            note="本轮仅允许运行态参数热加载，范围参数需重启生效"
+        )
+
+    applied_keys: List[str] = []
+    if "log_level" in changed_keys:
+        level_name = str(candidate_settings.get("log_level", "AUTO") or "AUTO").strip().upper()
+        level = resolve_console_log_level(level_name)
+        set_console_log_level(logging.getLogger(), level)
+        settings["log_level"] = level_name
+        applied_keys.append("SETTINGS.log_level")
+    if "config_hot_reload_interval_sec" in changed_keys:
+        runtime.interval_sec = parse_config_hot_reload_interval(candidate_settings.get("config_hot_reload_interval_sec"))
+        settings["config_hot_reload_interval_sec"] = str(runtime.interval_sec)
+        applied_keys.append("SETTINGS.config_hot_reload_interval_sec")
+    if "config_hot_reload_fail_policy" in changed_keys:
+        runtime.fail_policy = normalize_config_hot_reload_fail_policy(
+            candidate_settings.get("config_hot_reload_fail_policy")
+        )
+        settings["config_hot_reload_fail_policy"] = runtime.fail_policy
+        applied_keys.append("SETTINGS.config_hot_reload_fail_policy")
+    if "config_hot_reload_mode" in changed_keys:
+        mode = normalize_config_hot_reload_mode(candidate_settings.get("config_hot_reload_mode"))
+        if mode != "phase":
+            mode = "off"
+        runtime.mode = mode
+        settings["config_hot_reload_mode"] = mode
+        applied_keys.append("SETTINGS.config_hot_reload_mode")
+
+    if applied_keys:
+        append_config_hot_reload_event(
+            runtime,
+            status="APPLIED",
+            phase=phase_name,
+            changed_files=changed_files,
+            changed_keys=applied_keys,
+            note="已在阶段边界应用"
+        )
+    elif not immutable_candidates:
+        append_config_hot_reload_event(
+            runtime,
+            status="DEFERRED",
+            phase=phase_name,
+            changed_files=changed_files,
+            changed_keys=[],
+            note="检测到文件变化，但无可热加载项"
+        )
+
+    runtime.watch_paths = build_hot_reload_watch_paths(runtime.config_path, candidate_settings)
+    runtime.snapshot = build_hot_reload_snapshot(runtime.watch_paths)
+
+
+def write_config_hot_reload_events_file(
+    report_dir: Path,
+    timestamp: str,
+    runtime: Optional[ConfigHotReloadRuntime]
+) -> Optional[Path]:
+    if not runtime or not runtime.events:
+        return None
+    path = report_dir / f"config_reload_events_{timestamp}.txt"
+    lines = [
+        "# config hot reload events",
+        f"# mode={runtime.mode} interval_sec={runtime.interval_sec} fail_policy={runtime.fail_policy}",
+        "TS|STATUS|PHASE|CHANGED_FILES|CHANGED_KEYS|NOTE"
+    ]
+    for event in runtime.events:
+        lines.append(
+            "{ts}|{status}|{phase}|{files}|{keys}|{note}".format(
+                ts=event.get("ts", "-"),
+                status=event.get("status", "-"),
+                phase=event.get("phase", "-"),
+                files=event.get("changed_files", "-"),
+                keys=event.get("changed_keys", "-"),
+                note=event.get("note", "-")
+            )
+        )
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return path
 
 # --- 类型别名 ---
 OraConfig = Dict[str, str]
@@ -2770,6 +3049,25 @@ TABLE_DATA_PRESENCE_CHECK_MODE_ALIASES = {
     "enable": "on",
     "enabled": "on",
 }
+CONFIG_HOT_RELOAD_MODE_VALUES = {"off", "phase", "round"}
+CONFIG_HOT_RELOAD_MODE_ALIASES = {
+    "disable": "off",
+    "disabled": "off",
+    "false": "off",
+    "0": "off",
+    "on": "phase",
+    "true": "phase",
+    "1": "phase",
+}
+CONFIG_HOT_RELOAD_FAIL_POLICY_VALUES = {"keep_last_good", "abort"}
+CONFIG_HOT_RELOAD_FAIL_POLICY_ALIASES = {
+    "keep": "keep_last_good",
+    "continue": "keep_last_good",
+    "keep_last": "keep_last_good",
+    "stop": "abort",
+    "fail": "abort",
+}
+DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC = 5
 
 
 def normalize_report_detail_mode(raw_value: Optional[str]) -> str:
@@ -2791,6 +3089,53 @@ def normalize_table_data_presence_check_mode(raw_value: Optional[str]) -> str:
     if value not in TABLE_DATA_PRESENCE_CHECK_MODE_VALUES:
         log.warning("table_data_presence_check=%s 不在支持范围内，将回退为 auto。", raw_value)
         return "auto"
+    return value
+
+
+def normalize_config_hot_reload_mode(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "off"
+    value = str(raw_value).strip().lower()
+    value = CONFIG_HOT_RELOAD_MODE_ALIASES.get(value, value)
+    if value not in CONFIG_HOT_RELOAD_MODE_VALUES:
+        log.warning("config_hot_reload_mode=%s 不在支持范围内，将回退为 off。", raw_value)
+        return "off"
+    return value
+
+
+def normalize_config_hot_reload_fail_policy(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "keep_last_good"
+    value = str(raw_value).strip().lower()
+    value = CONFIG_HOT_RELOAD_FAIL_POLICY_ALIASES.get(value, value)
+    if value not in CONFIG_HOT_RELOAD_FAIL_POLICY_VALUES:
+        log.warning(
+            "config_hot_reload_fail_policy=%s 不在支持范围内，将回退为 keep_last_good。",
+            raw_value
+        )
+        return "keep_last_good"
+    return value
+
+
+def parse_config_hot_reload_interval(raw_value: Optional[str]) -> int:
+    if raw_value is None or not str(raw_value).strip():
+        return DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC
+    try:
+        value = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        log.warning(
+            "config_hot_reload_interval_sec=%s 非法，将回退为 %d。",
+            raw_value,
+            DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC
+        )
+        return DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC
+    if value < 1:
+        log.warning(
+            "config_hot_reload_interval_sec=%s 小于 1，将回退为 %d。",
+            raw_value,
+            DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC
+        )
+        return DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC
     return value
 
 
@@ -3870,6 +4215,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         # 运行日志目录与级别
         settings.setdefault('log_dir', 'logs')
         settings.setdefault('log_level', 'auto')
+        settings.setdefault('config_hot_reload_mode', 'off')
+        settings.setdefault('config_hot_reload_interval_sec', '5')
+        settings.setdefault('config_hot_reload_fail_policy', 'keep_last_good')
 
         enabled_primary_types = parse_type_list(
             settings.get('check_primary_types', ''),
@@ -3940,6 +4288,15 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             settings['usability_sample_ratio'] = 0.0
         settings['table_data_presence_check_mode'] = normalize_table_data_presence_check_mode(
             settings.get('table_data_presence_check', 'auto')
+        )
+        settings['config_hot_reload_mode'] = normalize_config_hot_reload_mode(
+            settings.get('config_hot_reload_mode', 'off')
+        )
+        settings['config_hot_reload_interval_sec'] = str(
+            parse_config_hot_reload_interval(settings.get('config_hot_reload_interval_sec', '5'))
+        )
+        settings['config_hot_reload_fail_policy'] = normalize_config_hot_reload_fail_policy(
+            settings.get('config_hot_reload_fail_policy', 'keep_last_good')
         )
         try:
             settings['table_data_presence_auto_max_tables'] = int(
@@ -4588,6 +4945,22 @@ def run_config_wizard(config_path: Path) -> None:
         if normalized in TABLE_DATA_PRESENCE_CHECK_MODE_VALUES:
             return True, ""
         return False, "仅支持 off/auto/on"
+
+    def _validate_config_hot_reload_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = CONFIG_HOT_RELOAD_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in CONFIG_HOT_RELOAD_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 off/phase/round"
+
+    def _validate_config_hot_reload_fail_policy(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = CONFIG_HOT_RELOAD_FAIL_POLICY_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in CONFIG_HOT_RELOAD_FAIL_POLICY_VALUES:
+            return True, ""
+        return False, "仅支持 keep_last_good/abort"
 
     def _validate_column_visibility_policy(val: str) -> Tuple[bool, str]:
         if not val.strip():
@@ -5323,6 +5696,29 @@ def run_config_wizard(config_path: Path) -> None:
         "是否保存完整报告 JSON (true/false)",
         default=cfg.get("SETTINGS", "report_db_save_full_json", fallback="false"),
         transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "config_hot_reload_mode",
+        "配置热加载模式 (off/phase/round；主程序建议 phase)",
+        default=cfg.get("SETTINGS", "config_hot_reload_mode", fallback="off"),
+        validator=_validate_config_hot_reload_mode,
+        transform=normalize_config_hot_reload_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "config_hot_reload_interval_sec",
+        "配置热加载检查间隔（秒，>=1）",
+        default=cfg.get("SETTINGS", "config_hot_reload_interval_sec", fallback="5"),
+        validator=_validate_positive_int,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "config_hot_reload_fail_policy",
+        "配置热加载失败策略 (keep_last_good/abort)",
+        default=cfg.get("SETTINGS", "config_hot_reload_fail_policy", fallback="keep_last_good"),
+        validator=_validate_config_hot_reload_fail_policy,
+        transform=normalize_config_hot_reload_fail_policy,
     )
     _prompt_field(
         "SETTINGS",
@@ -34694,6 +35090,13 @@ def build_run_summary(
     else:
         actions_skipped.append("schema 推导: infer_schema_mapping=false")
 
+    if ctx.hot_reload_mode == "phase":
+        actions_done.append(f"配置热加载: mode=phase, events={ctx.hot_reload_events_count}")
+        if ctx.hot_reload_events_file:
+            actions_done.append(f"配置热加载事件: {ctx.hot_reload_events_file}")
+    else:
+        actions_skipped.append("配置热加载: config_hot_reload_mode=off")
+
     if ctx.fixup_enabled:
         actions_done.append(f"修补脚本生成: 启用 (目录 {ctx.fixup_dir})")
     else:
@@ -34795,6 +35198,13 @@ def build_run_summary(
                 unknown=table_presence_unknown_cnt,
                 skipped=table_presence_skipped_cnt,
                 mode=table_presence_summary.mode
+            )
+        )
+    if ctx.hot_reload_mode == "phase":
+        findings.append(
+            "配置热加载: events={count}{suffix}".format(
+                count=ctx.hot_reload_events_count,
+                suffix=f", file={ctx.hot_reload_events_file}" if ctx.hot_reload_events_file else ""
             )
         )
     if noise_suppressed_count:
@@ -36881,6 +37291,8 @@ def main():
     run_start_perf = time.perf_counter()
     phase_durations: Dict[str, float] = OrderedDict()
     phase_skip_reasons: Dict[str, str] = {}
+    hot_reload_runtime: Optional[ConfigHotReloadRuntime] = None
+    hot_reload_events_file: Optional[Path] = None
 
     if args.wizard:
         run_config_wizard(config_path)
@@ -36972,6 +37384,13 @@ def main():
             log_subsection("配置诊断")
             for item in config_diagnostics:
                 log.warning("[CONFIG] %s", item)
+        hot_reload_runtime = init_config_hot_reload_runtime(config_path, settings)
+        if hot_reload_runtime and hot_reload_runtime.mode == "phase":
+            log.info(
+                "配置热加载已启用: mode=phase, interval=%ss, fail_policy=%s",
+                hot_reload_runtime.interval_sec,
+                hot_reload_runtime.fail_policy
+            )
 
     generate_fixup_enabled = settings.get('generate_fixup', 'true').strip().lower() in ('true', '1', 'yes')
     if not enabled_extra_types:
@@ -36988,6 +37407,7 @@ def main():
         phase_skip_reasons["修补脚本生成"] = "generate_fixup=false"
 
     log_section("对象映射准备")
+    apply_config_hot_reload_at_phase(hot_reload_runtime, "对象映射准备", settings, ora_cfg, ob_cfg)
     with phase_timer("对象映射准备", phase_durations):
         # 2) 加载 Remap 规则
         remap_rules = load_remap_rules(settings['remap_file'])
@@ -37223,6 +37643,25 @@ def main():
             "mismatched": [],
             "skipped_reason": "主校验清单为空，未执行注释比对。"
         }
+        if hot_reload_runtime and hot_reload_runtime.events:
+            hot_reload_events_file = write_config_hot_reload_events_file(report_dir, timestamp, hot_reload_runtime)
+            if hot_reload_events_file:
+                log.info("配置热加载事件已输出: %s", hot_reload_events_file)
+            if config_diagnostics is None:
+                config_diagnostics = []
+            status_counts: Dict[str, int] = defaultdict(int)
+            for item in hot_reload_runtime.events:
+                status_counts[str(item.get("status") or "-").upper()] += 1
+            status_summary = ", ".join(f"{k}={v}" for k, v in sorted(status_counts.items()))
+            config_diagnostics.append(
+                "配置热加载事件: mode={mode}, count={count}, {summary}".format(
+                    mode=hot_reload_runtime.mode,
+                    count=len(hot_reload_runtime.events),
+                    summary=status_summary or "-"
+                )
+            )
+            if hot_reload_events_file:
+                config_diagnostics.append(f"配置热加载明细: {hot_reload_events_file}")
         report_start_perf = time.perf_counter()
         trigger_summary_stub = None
         trigger_list_path = settings.get("trigger_list", "").strip()
@@ -37256,7 +37695,10 @@ def main():
             dependency_chain_file=None,
             view_chain_file=None,
             trigger_list_summary=trigger_summary_stub,
-            report_start_perf=report_start_perf
+            report_start_perf=report_start_perf,
+            hot_reload_mode=(hot_reload_runtime.mode if hot_reload_runtime else "off"),
+            hot_reload_events_count=(len(hot_reload_runtime.events) if hot_reload_runtime else 0),
+            hot_reload_events_file=hot_reload_events_file
         )
         run_summary = print_final_report(
             tv_results,
@@ -37317,6 +37759,7 @@ def main():
         return
 
     log_section("元数据转储")
+    apply_config_hot_reload_at_phase(hot_reload_runtime, "OceanBase 元数据转储", settings, ora_cfg, ob_cfg)
     with phase_timer("OceanBase 元数据转储", phase_durations):
         log_subsection("OceanBase 元数据")
         # 6) 计算目标端 schema 集合并一次性 dump OB 元数据
@@ -37356,6 +37799,7 @@ def main():
 
     # 7) 主对象校验
     excluded_object_report_rows: List[Dict[str, object]] = []
+    apply_config_hot_reload_at_phase(hot_reload_runtime, "Oracle 元数据转储", settings, ora_cfg, ob_cfg)
     with phase_timer("Oracle 元数据转储", phase_durations):
         log_subsection("Oracle 元数据")
         oracle_meta = dump_oracle_metadata(
@@ -37631,6 +38075,7 @@ def main():
         if (t.upper() in checked_primary_types) or (t.upper() in enabled_extra_types)
     ) or ('TABLE',)
 
+    apply_config_hot_reload_at_phase(hot_reload_runtime, "主对象校验", settings, ora_cfg, ob_cfg)
     with phase_timer("主对象校验", phase_durations):
         object_counts_summary = compute_object_counts(full_object_mapping, ob_meta, oracle_meta, monitored_types)
         tv_results = check_primary_objects(
@@ -37670,6 +38115,7 @@ def main():
 
     table_presence_summary: Optional[TablePresenceSummary] = None
     if enable_table_presence_check and "TABLE" in enabled_primary_types:
+        apply_config_hot_reload_at_phase(hot_reload_runtime, "表数据存在性校验", settings, ora_cfg, ob_cfg)
         with phase_timer("表数据存在性校验", phase_durations):
             table_presence_summary = check_table_data_presence(
                 settings,
@@ -37682,6 +38128,8 @@ def main():
             )
 
     # 8) 扩展对象校验 (索引/约束/序列/触发器)
+    if enabled_extra_types:
+        apply_config_hot_reload_at_phase(hot_reload_runtime, "扩展对象校验", settings, ora_cfg, ob_cfg)
     extra_check_ctx = phase_timer("扩展对象校验", phase_durations) if enabled_extra_types else nullcontext()
     with extra_check_ctx:
         extra_results = check_extra_objects(
@@ -37719,6 +38167,7 @@ def main():
 
     usability_summary: Optional[UsabilitySummary] = None
     if enable_usability_check:
+        apply_config_hot_reload_at_phase(hot_reload_runtime, "对象可用性校验", settings, ora_cfg, ob_cfg)
         with phase_timer("对象可用性校验", phase_durations):
             usability_summary = check_object_usability(
                 settings,
@@ -37811,6 +38260,7 @@ def main():
             )
 
     if enable_dependencies_check:
+        apply_config_hot_reload_at_phase(hot_reload_runtime, "依赖/授权校验", settings, ora_cfg, ob_cfg)
         with phase_timer("依赖/授权校验", phase_durations):
             dependency_grant_catalog: Optional[ObGrantCatalog] = None
             if expected_dependency_pairs:
@@ -37865,6 +38315,7 @@ def main():
     if generate_fixup_enabled:
         fixup_dir_label = settings.get('fixup_dir', 'fixup_scripts') or 'fixup_scripts'
         log.info('已开启修补脚本生成，开始写入 %s 目录...', fixup_dir_label)
+        apply_config_hot_reload_at_phase(hot_reload_runtime, "修补脚本生成", settings, ora_cfg, ob_cfg)
         with phase_timer("修补脚本生成", phase_durations):
             grant_plan = None
             if enable_grant_generation:
@@ -38026,6 +38477,26 @@ def main():
         if enable_grant_generation:
             log.info("[GRANT] generate_fixup=false，授权脚本生成已跳过。")
 
+    if hot_reload_runtime and hot_reload_runtime.events:
+        hot_reload_events_file = write_config_hot_reload_events_file(report_dir, timestamp, hot_reload_runtime)
+        if hot_reload_events_file:
+            log.info("配置热加载事件已输出: %s", hot_reload_events_file)
+        if config_diagnostics is None:
+            config_diagnostics = []
+        status_counts: Dict[str, int] = defaultdict(int)
+        for item in hot_reload_runtime.events:
+            status_counts[str(item.get("status") or "-").upper()] += 1
+        status_summary = ", ".join(f"{k}={v}" for k, v in sorted(status_counts.items()))
+        config_diagnostics.append(
+            "配置热加载事件: mode={mode}, count={count}, {summary}".format(
+                mode=hot_reload_runtime.mode,
+                count=len(hot_reload_runtime.events),
+                summary=status_summary or "-"
+            )
+        )
+        if hot_reload_events_file:
+            config_diagnostics.append(f"配置热加载明细: {hot_reload_events_file}")
+
     # 10) 输出最终报告
     total_checked = sum(
         1 for _, _, obj_type in master_list
@@ -38050,7 +38521,10 @@ def main():
         dependency_chain_file=dependency_chain_file,
         view_chain_file=view_chain_file,
         trigger_list_summary=trigger_list_summary,
-        report_start_perf=report_start_perf
+        report_start_perf=report_start_perf,
+        hot_reload_mode=(hot_reload_runtime.mode if hot_reload_runtime else "off"),
+        hot_reload_events_count=(len(hot_reload_runtime.events) if hot_reload_runtime else 0),
+        hot_reload_events_file=hot_reload_events_file
         )
     run_summary = print_final_report(
         tv_results,
