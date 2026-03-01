@@ -2,6 +2,29 @@
 
 本文件记录 OceanBase Comparator Toolkit 的重要变更。
 
+## [0.9.8.7] - 2026-03-01
+
+### 新增
+- `run_fixup.py` 新增并发执行防护：同一 `fixup_dir` 下使用 `.run_fixup.lock` 防止重复并发执行。
+- `run_fixup.py` 新增状态账本：`.fixup_state_ledger.json` 记录已执行脚本指纹，避免“执行成功但移动失败”后的重复执行。
+- `table_data_presence_check=auto` 增强二次探针：对 `NUM_ROWS=0` 的源/目标表进行回表确认，降低统计信息滞后带来的误判。
+- 新增 `table_data_presence_zero_probe_workers`（默认 1，最大 32），用于控制 Oracle 零行二次探针并发度。
+
+### 变更
+- `run_fixup.py` 迭代模式每轮自动清理 auto-grant 阻断缓存，避免临时阻断跨轮遗留。
+- VIEW DDL 清洗由正则前缀匹配改为 token 扫描，降低注释/字符串命中导致的误清洗风险。
+- `SqlPunctuationMasker` 补齐 Q-quote 掩码路径，标点清洗不再误伤 Q-quote 字面量。
+- `mask_sql_for_scan` 不再掩码双引号标识符，降低列清单与别名解析偏差。
+- `blacklist_rules.json` 在关键路径采用严格解析（fail-fast），解析失败会终止流程，防止规则失效后静默放行。
+
+### 修复
+- `run_fixup.py` 备份失败后的文件移动行为收敛，避免覆盖既有 `done/` 脚本引发审计信息丢失。
+- `run_fixup.py` 重编译成功判定增强：不再仅依赖进程返回码，改为编译后再次校验 INVALID 状态。
+- `clean_storage_clauses` 对引号 TABLESPACE 名称的处理增强，降低清洗漏网。
+
+### 文档
+- README / readme_lite / readme_config / ARCHITECTURE / ADVANCED_USAGE / TECHNICAL_SPECIFICATION / DEPLOYMENT 同步到 `0.9.8.7`。
+
 ## [0.9.8.6] - 2026-02-27
 
 ### 新增

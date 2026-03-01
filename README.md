@@ -1,16 +1,17 @@
 # OceanBase Comparator Toolkit
 
-> 当前版本：V0.9.8.6  
+> 当前版本：V0.9.8.7  
 > 面向 Oracle → OceanBase (Oracle 模式) 的结构一致性校验与修补脚本生成工具  
 > 核心理念：一次转储、本地对比、脚本审计优先
 
-## 近期更新（0.9.8.6）
-- 授权链路增强：新增“延后授权”机制，目标对象未落地且本轮不创建时从 `grants_miss` 分流到 `grants_deferred` 路径。
-- 新增延后授权明细：`deferred_grants_detail_<ts>.txt`，并写入 report_db，避免后续授权遗漏。
-- 新增兜底提醒：即使无法自动产出 deferred SQL，也会生成 `fixup_scripts/grants_deferred/README.txt`。
-- 同名约束/索引修复链路增强：`name_collision` 在 run_fixup 中前置执行，低版本 OB 自动回退 `DROP+ADD` 策略。
-- 黑名单与系统派生对象口径优化：`MLOG$_*` 默认 EXCLUDED；`LONG/LOB_OVERSIZE` 作为风险项不再一刀切阻断依赖检查。
-- 文档与版本标记全面同步到 `0.9.8.6`。
+## 近期更新（0.9.8.7）
+- `run_fixup` 稳定性增强：新增并发运行锁（`.run_fixup.lock`）与执行状态账本（`.fixup_state_ledger.json`），避免并发重入与 move 失败后的重复执行。
+- `run_fixup` 迭代授权链路增强：每轮自动清理阻断缓存，防止前一轮临时阻断导致后续轮次长期跳过。
+- SQL/DDL 清洗增强：补齐 Q-quote 掩码、修复双引号扫描误伤、注释剥离后再判定 `WITH CHECK OPTION` / `WITH READ ONLY`。
+- 视图 DDL 清洗增强：`CREATE ... VIEW` 前缀改为 token 扫描，降低注释/字符串命中导致的误改风险。
+- 表数据存在性校验增强：`auto` 模式下对 `NUM_ROWS=0` 做源端/目标端二次探针，新增 `table_data_presence_zero_probe_workers` 并限制最大并发为 32。
+- 黑名单规则增强：`blacklist_rules.json` 解析失败可致命中止（fail-fast），避免规则失效后“静默全量放行”。
+- 近期能力与文档总览统一补齐（README / readme_config / docs/* / release notes / version diff）。
 
 ## 核心能力
 - **对象覆盖完整**：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。
@@ -62,7 +63,7 @@ pip install -r requirements.txt
 
 ### 2) 生成配置
 ```bash
-cp config.ini.template config.ini
+cp config.ini.template.txt config.ini
 ```
 
 最小示例（只列关键项）：

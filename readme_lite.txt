@@ -1,4 +1,5 @@
 OceanBase 对比工具极简手册（现场版）
+当前版本：V0.9.8.7
 
 0. 先更新版本
 - 项目地址：https://github.com/Minorli/ob_comparator
@@ -7,7 +8,7 @@ OceanBase 对比工具极简手册（现场版）
 1. 你需要的文件（同目录）
 - schema_diff_reconciler.py（主程序）
 - run_fixup.py（修复执行器）
-- config.ini（由 config.ini.template 复制）
+- config.ini（由 config.ini.template.txt 复制）
 - remap_rules.txt（remap 规则）
 - blacklist_rules.json（黑名单规则）
 - exclude_objects.txt（可选：手工排除对象）
@@ -28,7 +29,7 @@ export PATH=$JAVA_HOME/bin:$PATH
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp config.ini.template config.ini
+cp config.ini.template.txt config.ini
 
 4. 安装（离线包）
 tar -zxvf pa_comparator_offline_pkg.tar.gz
@@ -38,7 +39,7 @@ python3.7 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install --no-index --find-links=wheelhouse -r requirements.txt
-cp config.ini.template config.ini
+cp config.ini.template.txt config.ini
 
 5. 最小配置
 - 在 config.ini 填写源库/目标库连接、source_schemas。

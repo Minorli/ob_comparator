@@ -1,6 +1,6 @@
 # 数据库对象对比工具 - 跨平台打包与执行指南 (Wheelhouse 版)
 
-> 适用版本：V0.9.8.6
+> 适用版本：V0.9.8.7
 
 > 适用场景：需要在无网络或不同机器上运行本工具，且保持源码不改。  
 > 方案：wheelhouse + venv，无需 PyInstaller。
@@ -59,7 +59,7 @@ pip install --no-index --find-links=./wheelhouse -r requirements.txt
 ## 4. 配置与运行
 ```bash
 # 配置（尽量使用绝对路径）
-cp config.ini.template config.ini
+cp config.ini.template.txt config.ini
 
 # 运行主对比
 python schema_diff_reconciler.py

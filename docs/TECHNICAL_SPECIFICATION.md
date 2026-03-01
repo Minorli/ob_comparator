@@ -1,8 +1,8 @@
 # Oracle → OceanBase 结构一致性校验与修复引擎
 ## 技术规格说明 (Technical Specification)
 
-**版本**：0.9.8.6  
-**日期**：2026-02-27  
+**版本**：0.9.8.7  
+**日期**：2026-03-01  
 **适用场景**：Oracle → OceanBase（Oracle 模式）迁移后的结构一致性校验、对象补全、DDL 兼容性修复。
 
 ---
@@ -172,17 +172,19 @@
 ### 8.5 安全与保护
 - `fixup_max_sql_file_mb` 限制单个 SQL 文件读取大小，超限脚本会被跳过并记录错误。
 - `fixup_dir_allow_outside_repo=false` 时，run_fixup 不允许 fixup_dir 指向项目外目录。
-- 成功执行脚本移动到 `done/` 时会自动备份同名文件，避免覆盖历史结果。
+- 成功执行脚本移动到 `done/` 前会尝试备份同名文件；备份失败会阻断覆盖，避免历史结果被冲掉。
 - 自动补权限缓存支持 `fixup_auto_grant_cache_limit` 控制，避免长时间运行内存膨胀。
 - 默认跳过 `fixup_scripts/table/`，防止误创建空表；需要显式 `--allow-table-create` 才可执行建表脚本。
+- `run_fixup` 采用 `.run_fixup.lock` 防止同目录并发重入。
+- `run_fixup` 采用 `.fixup_state_ledger.json` 防止“已执行但移动失败”脚本被重复执行。
 
 ---
 
 ## 9. 报告体系
-- `report_*.txt`：主报告
-- `package_compare_*.txt`：包对比明细
-- `remap_conflicts_*.txt`：推导冲突
-- `VIEWs_chain_*.txt`：VIEW 链路
+- `run_<ts>/report_<ts>.txt`：主报告
+- `run_<ts>/package_compare_<ts>.txt`：包对比明细
+- `run_<ts>/remap_conflicts_<ts>.txt`：推导冲突
+- `run_<ts>/VIEWs_chain_<ts>.txt`：VIEW 链路
 - `unsupported_<TYPE>_detail_*.txt`：按类型不支持明细（含 ROOT_CAUSE，如 VIEW_X$ 及命中对象）
 - `filtered_grants.txt`：过滤权限
 
@@ -192,6 +194,8 @@
 - 大部分逻辑在内存执行，避免高频 DB 访问。
 - 可配置超时与并发线程数。
 - dbcat 输出缓存复用，减少重复扫描。
+- `table_data_presence_check=auto` 对 `NUM_ROWS=0` 会做二次探针确认，降低统计信息滞后造成的误判。
+- `table_data_presence_zero_probe_workers` 控制 Oracle 零行探针并发（默认 1，最大 32）。
 
 ---
 
@@ -203,7 +207,7 @@
 ---
 
 ## 12. 已知限制
-- 对极端复杂 DDL（如 `q'[...]'` 字符串）需人工复核清洗结果。
+- 对极端复杂 DDL 仍建议人工复核清洗结果（例如多层动态 SQL 与复杂嵌套注释组合）。
 - `init_users_roles.py` 通过交互输入初始口令，仍建议上线后执行统一改密策略。
 
 ---

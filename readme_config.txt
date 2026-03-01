@@ -1,5 +1,5 @@
 配置说明 (config.ini)
-版本：0.9.8.6（更新日期：2026-02-27）
+版本：0.9.8.7（更新日期：2026-03-01）
 本文件为完整配置说明书，覆盖所有可配置项（含最近新增功能）。
 
 通用约定
@@ -72,6 +72,8 @@
 - fixup_dir：修补脚本输出目录。默认：fixup_scripts。
 - fixup_dir_allow_outside_repo：是否允许 fixup_dir 指向项目目录外。默认：false。
 - fixup_max_sql_file_mb：run_fixup 单文件最大读取大小（MB）。默认：50；<=0 表示不限制。
+- run_fixup 并发保护：执行器会在 `fixup_dir` 下创建 `.run_fixup.lock`，同一目录并发执行会被拦截。
+- run_fixup 状态账本：执行器会维护 `.fixup_state_ledger.json`，用于避免“脚本已执行但 move/done 失败”后被重复执行。
 - fixup_force_clean：强制清理 fixup_dir。默认：false。
 - fixup_clean_outside_repo：是否允许清理项目目录外的 fixup_dir。默认：false。
   说明：仓外目录默认只允许写入、不允许清理；如需清理仓外目录，必须同时设置

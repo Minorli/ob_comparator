@@ -33,7 +33,7 @@ try:
 except ImportError:
     oracledb = None
 
-__version__ = "0.9.8.6"
+__version__ = "0.9.8.7"
 
 
 REPORT_TABLES = {

@@ -1,6 +1,6 @@
 # 高级使用指南
 
-本手册聚焦四类高级能力：Remap 推导、授权生成、DDL 清洗、run_fixup 高级执行。
+本手册聚焦六类高级能力：Remap 推导、授权生成、DDL 清洗、报告入库、run_fixup 高级执行、表数据风险校验。
 
 ---
 
@@ -223,35 +223,45 @@ ORDER BY SCHEMA_NAME, TRIGGER_NAME;
 
 ## 6. run_fixup 高级执行
 
-### 5.1 依赖感知顺序（--smart-order）
+### 6.1 依赖感知顺序（--smart-order）
 示例层级：
 ```
 sequence -> table -> table_alter -> grants -> view -> procedure -> package -> constraint -> trigger
 ```
 
-### 5.2 授权文件修剪
+### 6.2 授权文件修剪
 - 授权脚本逐条执行
 - 成功的 GRANT 自动从原文件移除
 - 失败项保留并输出 `fixup_scripts/errors/` 错误报告
 
-### 5.3 迭代执行（--iterative）
+### 6.3 迭代执行（--iterative）
 - 多轮重试失败脚本
 - 适合依赖链复杂对象（VIEW/PLSQL）
 - 支持 `--max-rounds` / `--min-progress`
 
-### 5.4 VIEW 链路自动修复（--view-chain-autofix）
+### 6.4 VIEW 链路自动修复（--view-chain-autofix）
 - 读取 `main_reports/VIEWs_chain_*.txt`
 - 为每个 VIEW 生成 plan + SQL
 - 支持从 `fixup_scripts/done/` 兜底 DDL
 
-### 5.5 过滤执行
+### 6.5 过滤执行
 - `--only-dirs` / `--exclude-dirs`
 - `--only-types` / `--glob`
 
-### 5.6 建表脚本安全门禁（--allow-table-create）
+### 6.6 建表脚本安全门禁（--allow-table-create）
 - 默认安全模式会跳过 `fixup_scripts/table/`，防止误建空表。
 - 即使传入 `--only-dirs table` 或 `--only-types TABLE`，未显式开启时仍会被拦截。
 - 只有在明确需要执行建表脚本时，才加 `--allow-table-create`。
+
+### 6.7 并发与重复执行防护（默认开启）
+- 同一 `fixup_dir` 下，`run_fixup` 使用 `.run_fixup.lock` 防止并发重入。
+- 使用 `.fixup_state_ledger.json` 记录已执行脚本指纹，避免“执行成功但移动到 done 失败”后的重复执行。
+- 迭代模式每轮会清理 auto-grant 阻断缓存，避免临时阻断在后续轮次持续生效。
+
+### 6.8 表数据风险校验（TABLE_PRESENCE）
+- `table_data_presence_check=auto` 时优先读统计信息（`NUM_ROWS`），当命中 `NUM_ROWS=0` 会做二次探针确认。
+- 二次探针并发由 `table_data_presence_zero_probe_workers` 控制，默认 1，最大 32。
+- 当日志显示 TABLE_PRESENCE 耗时较长，可降低候选规模或临时设置 `table_data_presence_check=off`。
 
 ---
 
@@ -285,4 +295,4 @@ A: `check_primary_types` 限制后，未包含的类型不会加载/推导/生�
 5) 复杂 VIEW 依赖场景再执行：`python3 run_fixup.py --view-chain-autofix`。  
 6) 完成后再次运行主程序做收敛验证（确保缺失/不支持数量符合预期）。
 
-更新时间：2026-02-27 (V0.9.8.6)
+更新时间：2026-03-01 (V0.9.8.7)
