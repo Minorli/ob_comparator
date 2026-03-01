@@ -1427,13 +1427,29 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
     repo_root = config_path.parent.resolve()
     fixup_dir = parser.get("SETTINGS", "fixup_dir", fallback=DEFAULT_FIXUP_DIR).strip()
     fixup_path = (repo_root / fixup_dir).resolve()
+    settings_has = parser.has_section("SETTINGS")
+    allow_key_missing = (not settings_has) or (not parser.has_option("SETTINGS", "fixup_dir_allow_outside_repo"))
+    force_clean_key_missing = (not settings_has) or (not parser.has_option("SETTINGS", "fixup_force_clean"))
+    if allow_key_missing or force_clean_key_missing:
+        missing_keys: List[str] = []
+        if allow_key_missing:
+            missing_keys.append("fixup_dir_allow_outside_repo")
+        if force_clean_key_missing:
+            missing_keys.append("fixup_force_clean")
+        log.warning(
+            "[MIGRATION] 检测到配置未显式设置 %s。v0.9.8.7 默认值已调整，建议在 config.ini 中明确声明。",
+            ",".join(missing_keys)
+        )
     allow_outside = parse_bool_flag(
         parser.get("SETTINGS", "fixup_dir_allow_outside_repo", fallback="false"),
         False
     )
     if not allow_outside:
         if fixup_path != repo_root and repo_root not in fixup_path.parents:
-            raise ConfigError(f"fixup_dir 不允许在项目目录之外: {fixup_path}")
+            raise ConfigError(
+                f"fixup_dir 不允许在项目目录之外: {fixup_path} "
+                "(如确需仓外目录，请显式配置 fixup_dir_allow_outside_repo=true)"
+            )
 
     if not fixup_path.exists():
         raise ConfigError(f"修补脚本目录不存在: {fixup_path}")
@@ -4732,6 +4748,7 @@ def run_view_chain_autofix(
     sql_dir = fixup_dir / "view_chain_sql"
     plan_dir.mkdir(parents=True, exist_ok=True)
     sql_dir.mkdir(parents=True, exist_ok=True)
+    state_ledger = FixupStateLedger(fixup_dir)
 
     obclient_cmd = build_obclient_command(ob_cfg)
     ob_timeout = resolve_timeout_value(ob_cfg.get("timeout"))
@@ -4878,6 +4895,23 @@ def run_view_chain_autofix(
             log.info("%s [VIEW_CHAIN] %s 无需执行。", label, view_key)
             continue
 
+        try:
+            relative_path = sql_path.relative_to(repo_root)
+        except ValueError:
+            relative_path = sql_path.resolve()
+        fingerprint = FixupStateLedger.fingerprint(sql_text or "")
+        if state_ledger.is_completed(relative_path, fingerprint):
+            skipped_views += 1
+            status = classify_view_chain_status(False, True, root_exists, 0)
+            view_results.append((view_key, status, ["state ledger hit"]))
+            log.warning(
+                "%s [VIEW_CHAIN] %s 跳过执行：状态账本命中 (%s)。",
+                label,
+                view_key,
+                relative_path
+            )
+            continue
+
         summary = execute_sql_statements(obclient_cmd, sql_text, ob_timeout)
         invalidate_exists_cache(exists_cache, planned_objects | {(view_key, root_type)})
         post_exists = check_object_exists(
@@ -4907,6 +4941,7 @@ def run_view_chain_autofix(
         view_results.append((view_key, status, reasons))
 
         if status == "SUCCESS":
+            state_ledger.mark_completed(relative_path, fingerprint, "VIEW_CHAIN_SUCCESS")
             executed_views += 1
             log.info("%s [VIEW_CHAIN] %s 执行成功 (%d statements)。", label, view_key, summary.statements)
         elif status == "PARTIAL":
@@ -4928,6 +4963,7 @@ def run_view_chain_autofix(
                 summary.statements
             )
 
+    state_ledger.flush()
     log_section("VIEW 链路修复完成")
     log.info("视图总数: %d", total_views)
     log.info("执行成功: %d", executed_views)

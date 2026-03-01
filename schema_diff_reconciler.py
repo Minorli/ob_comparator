@@ -1044,6 +1044,13 @@ PRINT_ONLY_PRIMARY_REASONS: Dict[str, str] = {
     'MATERIALIZED VIEW': "OB 暂不支持 MATERIALIZED VIEW，仅打印不校验"
 }
 
+MANUAL_FIXUP_PRIMARY_TYPES: Set[str] = {"JOB", "SCHEDULE"}
+MANUAL_FIXUP_REASON_CODE = "AUTO_FIXUP_UNAVAILABLE"
+MANUAL_FIXUP_REASON_TEXT = "当前版本不自动导出该对象类型"
+MANUAL_FIXUP_ACTION_TEXT = "人工导出并执行"
+MANUAL_FIXUP_SEMI_AUTO_ACTION_TEXT = "生成半自动草案并人工完善"
+MANUAL_FIXUP_SEMI_AUTO_DETAIL_TEXT = "若无法获取源端DDL，将输出草案模板供人工补录"
+
 OB_FEATURE_GATE_VERSION = "4.4.2"
 INTERVAL_PARTITION_FIXUP_MODE_VALUES: Set[str] = {"auto", "true", "false"}
 INTERVAL_PARTITION_FIXUP_MODE_ALIASES: Dict[str, str] = {
@@ -1636,7 +1643,12 @@ def is_temp_table_blacklist_reason_code(reason_code: Optional[str]) -> bool:
     token = (reason_code or "").strip().upper()
     if not token:
         return False
-    return any(bt in token for bt in TEMP_TABLE_BLACKLIST_TYPES)
+    if token in TEMP_TABLE_BLACKLIST_TYPES:
+        return True
+    if token.startswith("BLACKLIST_"):
+        suffix = token[len("BLACKLIST_"):]
+        return suffix in TEMP_TABLE_BLACKLIST_TYPES
+    return False
 
 
 def is_rename_only_blacklist(entries: Optional[Dict[Tuple[str, str], BlacklistEntry]]) -> bool:
@@ -3049,6 +3061,18 @@ TABLE_DATA_PRESENCE_CHECK_MODE_ALIASES = {
     "enable": "on",
     "enabled": "on",
 }
+JOB_SCHEDULE_FIXUP_MODE_VALUES = {"manual", "semi_auto"}
+JOB_SCHEDULE_FIXUP_MODE_ALIASES = {
+    "off": "manual",
+    "false": "manual",
+    "0": "manual",
+    "on": "semi_auto",
+    "true": "semi_auto",
+    "1": "semi_auto",
+    "semi": "semi_auto",
+    "semi-auto": "semi_auto",
+    "semiauto": "semi_auto",
+}
 CONFIG_HOT_RELOAD_MODE_VALUES = {"off", "phase", "round"}
 CONFIG_HOT_RELOAD_MODE_ALIASES = {
     "disable": "off",
@@ -3089,6 +3113,17 @@ def normalize_table_data_presence_check_mode(raw_value: Optional[str]) -> str:
     if value not in TABLE_DATA_PRESENCE_CHECK_MODE_VALUES:
         log.warning("table_data_presence_check=%s 不在支持范围内，将回退为 auto。", raw_value)
         return "auto"
+    return value
+
+
+def normalize_job_schedule_fixup_mode(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "manual"
+    value = str(raw_value).strip().lower()
+    value = JOB_SCHEDULE_FIXUP_MODE_ALIASES.get(value, value)
+    if value not in JOB_SCHEDULE_FIXUP_MODE_VALUES:
+        log.warning("job_schedule_fixup_mode=%s 不在支持范围内，将回退为 manual。", raw_value)
+        return "manual"
     return value
 
 
@@ -3404,6 +3439,8 @@ class ConstraintMismatch(NamedTuple):
     extra_constraints: Set[str]
     detail_mismatch: List[str]
     downgraded_pk_constraints: Set[str]
+    check_suppressed_source_dup_count: int = 0
+    check_suppressed_target_dup_count: int = 0
 
 
 class SequenceMismatch(NamedTuple):
@@ -4126,6 +4163,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         # fixup 定向生成选项
         settings.setdefault('fixup_schemas', '')
         settings.setdefault('fixup_types', '')
+        settings.setdefault('job_schedule_fixup_mode', 'manual')
         settings.setdefault('fixup_idempotent_mode', 'replace')
         settings.setdefault('fixup_idempotent_types', '')
         settings.setdefault('fixup_auto_grant', 'true')
@@ -4521,6 +4559,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         )
         settings['sequence_remap_policy'] = normalize_sequence_remap_policy(
             settings.get('sequence_remap_policy', 'source_only')
+        )
+        settings['job_schedule_fixup_mode'] = normalize_job_schedule_fixup_mode(
+            settings.get('job_schedule_fixup_mode', 'manual')
         )
         settings['fixup_idempotent_mode'] = normalize_fixup_idempotent_mode(
             settings.get('fixup_idempotent_mode', 'replace')
@@ -4945,6 +4986,14 @@ def run_config_wizard(config_path: Path) -> None:
         if normalized in TABLE_DATA_PRESENCE_CHECK_MODE_VALUES:
             return True, ""
         return False, "仅支持 off/auto/on"
+
+    def _validate_job_schedule_fixup_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = JOB_SCHEDULE_FIXUP_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in JOB_SCHEDULE_FIXUP_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 manual/semi_auto"
 
     def _validate_config_hot_reload_mode(val: str) -> Tuple[bool, str]:
         if not val.strip():
@@ -5537,6 +5586,14 @@ def run_config_wizard(config_path: Path) -> None:
     )
     _prompt_field(
         "SETTINGS",
+        "job_schedule_fixup_mode",
+        "JOB/SCHEDULE 修补模式 (manual/semi_auto，默认 manual)",
+        default=cfg.get("SETTINGS", "job_schedule_fixup_mode", fallback="manual"),
+        validator=_validate_job_schedule_fixup_mode,
+        transform=normalize_job_schedule_fixup_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
         "fixup_idempotent_mode",
         "修补脚本幂等模式 (off/guard/replace/drop_create)",
         default=cfg.get("SETTINGS", "fixup_idempotent_mode", fallback="replace"),
@@ -5877,6 +5934,9 @@ def load_remap_rules(file_path: str) -> RemapRules:
         with open(file_path, 'r', encoding='utf-8') as f:
             for i, line in enumerate(f):
                 line = line.strip()
+                # 支持行内注释：仅在注释符前存在空白时生效，避免误伤对象名中的 '#'
+                line = re.sub(r'\s+#.*$', '', line).strip()
+                line = re.sub(r'\s+--.*$', '', line).strip()
                 if not line or line.startswith('#'):
                     continue
 
@@ -6783,6 +6843,9 @@ def classify_missing_objects(
     view_rules = settings.get("view_compat_rules") or {}
     dblink_policy = settings.get("view_dblink_policy", "block")
     view_constraint_mode = settings.get("view_constraint_cleanup", "auto")
+    job_schedule_fixup_mode = normalize_job_schedule_fixup_mode(
+        settings.get("job_schedule_fixup_mode", "manual")
+    )
 
     missing_items = tv_results.get("missing", []) or []
     missing_views: List[Tuple[str, str]] = []
@@ -7024,6 +7087,18 @@ def classify_missing_objects(
             reason = "源端对象无效"
             dependency = "-"
             action = "先修复源端"
+        elif obj_type_u in MANUAL_FIXUP_PRIMARY_TYPES:
+            support_state = SUPPORT_STATE_UNSUPPORTED
+            reason_code = MANUAL_FIXUP_REASON_CODE
+            reason = MANUAL_FIXUP_REASON_TEXT
+            dependency = "-"
+            if job_schedule_fixup_mode == "semi_auto":
+                action = MANUAL_FIXUP_SEMI_AUTO_ACTION_TEXT
+                detail = MANUAL_FIXUP_SEMI_AUTO_DETAIL_TEXT
+            else:
+                action = MANUAL_FIXUP_ACTION_TEXT
+                detail = "仅校验存在性，需人工导出 DDL 后执行"
+            root_cause = f"{src_full}({MANUAL_FIXUP_REASON_CODE})"
         elif obj_type_u == "TABLE":
             entries = oracle_meta.blacklist_tables.get((src_schema, src_obj))
             if entries:
@@ -7126,7 +7201,8 @@ def classify_missing_objects(
                 dependency = ",".join(sorted({n[0] for n in blocked_refs}))
 
         if support_state == SUPPORT_STATE_UNSUPPORTED:
-            root_cause = _root_cause_label((src_full, obj_type_u))
+            if not root_cause:
+                root_cause = _root_cause_label((src_full, obj_type_u))
         elif support_state == SUPPORT_STATE_BLOCKED:
             root_cause = _resolve_root_cause((src_full, obj_type_u))
             if not root_cause and dependency and dependency != "-":
@@ -9302,7 +9378,9 @@ def apply_noise_suppression(
             missing_constraints=new_missing,
             extra_constraints=new_extra,
             detail_mismatch=new_detail,
-            downgraded_pk_constraints=item.downgraded_pk_constraints
+            downgraded_pk_constraints=item.downgraded_pk_constraints,
+            check_suppressed_source_dup_count=int(getattr(item, "check_suppressed_source_dup_count", 0) or 0),
+            check_suppressed_target_dup_count=int(getattr(item, "check_suppressed_target_dup_count", 0) or 0)
         ))
     filtered_extra["constraint_ok"] = constraint_ok
     filtered_extra["constraint_mismatched"] = filtered_constraint_mismatched
@@ -9534,7 +9612,9 @@ def classify_unsupported_check_constraints(
             missing_constraints=new_missing,
             extra_constraints=new_extra,
             detail_mismatch=new_detail,
-            downgraded_pk_constraints=item.downgraded_pk_constraints
+            downgraded_pk_constraints=item.downgraded_pk_constraints,
+            check_suppressed_source_dup_count=int(getattr(item, "check_suppressed_source_dup_count", 0) or 0),
+            check_suppressed_target_dup_count=int(getattr(item, "check_suppressed_target_dup_count", 0) or 0)
         ))
 
     extra_results["constraint_mismatched"] = updated_mismatches
@@ -16203,6 +16283,8 @@ def compare_constraints_for_table(
     missing: Set[str] = set()
     extra: Set[str] = set()
     downgraded_missing: Set[str] = set()
+    check_suppressed_source_dup_count = 0
+    check_suppressed_target_dup_count = 0
 
     def _norm_cols(name: str, cons: Dict, *, is_source: bool) -> Tuple[str, ...]:
         if is_source:
@@ -16414,6 +16496,7 @@ def compare_constraints_for_table(
         src_list: List[Tuple[str, str, str, str, str]],
         tgt_list: List[Tuple[str, str, str, str, str]]
     ) -> None:
+        nonlocal check_suppressed_source_dup_count, check_suppressed_target_dup_count
         tgt_by_expr: Dict[str, List[str]] = defaultdict(list)
         tgt_by_name: Dict[str, Tuple[str, str, str, str]] = {}
         for expr_key, name, raw_expr, deferrable, deferred in tgt_list:
@@ -16466,6 +16549,7 @@ def compare_constraints_for_table(
                 continue
             # 源端同语义重复 CHECK：目标端已有同语义命中时，不再继续标记 missing。
             if expr_key in matched_expr_keys_any:
+                check_suppressed_source_dup_count += 1
                 continue
             missing.add(name)
             detail_mismatch.append(
@@ -16479,6 +16563,7 @@ def compare_constraints_for_table(
             # 目标端同表达式重复 CHECK（常见于历史重复执行或迁移工具副产物）不再计为 extra。
             # 若源端存在同名 CHECK（哪怕表达式不同），保留 extra 以暴露“同名漂移 + 旁路重复”的风险。
             if expr_key in src_expr_keys and expr_key not in expr_keys_with_name_match:
+                check_suppressed_target_dup_count += 1
                 continue
             extra.add(name)
             detail_mismatch.append(
@@ -16517,6 +16602,15 @@ def compare_constraints_for_table(
     mark_extra_constraints("UNIQUE KEY", tgt_uk_list, tgt_uk_used)
     match_foreign_keys(grouped_src_fk, grouped_tgt_fk)
     match_check_constraints(grouped_src_ck, grouped_tgt_ck)
+    if detail_mismatch:
+        if check_suppressed_source_dup_count > 0:
+            detail_mismatch.append(
+                f"CHECK_SUPPRESSED: SOURCE_DUP_EXPR={check_suppressed_source_dup_count}"
+            )
+        if check_suppressed_target_dup_count > 0:
+            detail_mismatch.append(
+                f"CHECK_SUPPRESSED: TARGET_DUP_EXPR={check_suppressed_target_dup_count}"
+            )
 
     all_good = (not missing) and (not extra) and (not detail_mismatch)
     if all_good:
@@ -16527,7 +16621,9 @@ def compare_constraints_for_table(
             missing_constraints=missing,
             extra_constraints=extra,
             detail_mismatch=detail_mismatch,
-            downgraded_pk_constraints=downgraded_missing
+            downgraded_pk_constraints=downgraded_missing,
+            check_suppressed_source_dup_count=check_suppressed_source_dup_count,
+            check_suppressed_target_dup_count=check_suppressed_target_dup_count
         )
 
 
@@ -18439,51 +18535,51 @@ def check_table_data_presence(
                 "; ".join(err_parts)
             )
         else:
-            source_zero_keys = sorted({
+            source_probe_keys = sorted({
                 (src_schema, src_table)
                 for src_schema, src_table, _tgt_schema, _tgt_table in candidates
-                if source_stats.get((src_schema, src_table)) == 0
+                if source_stats.get((src_schema, src_table)) in (0, None)
             })
-            target_zero_keys = sorted({
+            target_probe_keys = sorted({
                 (tgt_schema, tgt_table)
                 for _src_schema, _src_table, tgt_schema, tgt_table in candidates
-                if target_stats.get((tgt_schema, tgt_table)) == 0
+                if target_stats.get((tgt_schema, tgt_table)) in (0, None)
             })
             source_zero_probe: Dict[Tuple[str, str], Tuple[Optional[bool], str, int]] = {}
             target_zero_probe: Dict[Tuple[str, str], Tuple[Optional[bool], str, int]] = {}
-            if source_zero_keys:
+            if source_probe_keys:
                 log.info(
-                    "[TABLE_PRESENCE] SOURCE 零行二次探测开始：tables=%d, workers=%d",
-                    len(source_zero_keys),
+                    "[TABLE_PRESENCE] SOURCE 零行/缺统二次探测开始：tables=%d, workers=%d",
+                    len(source_probe_keys),
                     source_zero_workers
                 )
                 source_zero_probe = _probe_oracle_table_has_rows_batch(
                     ora_cfg,
-                    source_zero_keys,
+                    source_probe_keys,
                     oracle_timeout_ms,
                     source_zero_workers
                 )
                 source_unknown = sum(1 for v in source_zero_probe.values() if v[0] is None)
                 log.info(
-                    "[TABLE_PRESENCE] SOURCE 零行二次探测完成：tables=%d, unknown=%d",
+                    "[TABLE_PRESENCE] SOURCE 零行/缺统二次探测完成：tables=%d, unknown=%d",
                     len(source_zero_probe),
                     source_unknown
                 )
-            if target_zero_keys:
+            if target_probe_keys:
                 log.info(
-                    "[TABLE_PRESENCE] TARGET 零行二次探测开始：tables=%d, chunk_size=%d",
-                    len(target_zero_keys),
+                    "[TABLE_PRESENCE] TARGET 零行/缺统二次探测开始：tables=%d, chunk_size=%d",
+                    len(target_probe_keys),
                     chunk_size
                 )
                 target_zero_probe = _probe_ob_table_has_rows_batch(
                     ob_cfg,
-                    target_zero_keys,
+                    target_probe_keys,
                     chunk_size,
                     ob_timeout
                 )
                 target_unknown = sum(1 for v in target_zero_probe.values() if v[0] is None)
                 log.info(
-                    "[TABLE_PRESENCE] TARGET 零行二次探测完成：tables=%d, unknown=%d",
+                    "[TABLE_PRESENCE] TARGET 零行/缺统二次探测完成：tables=%d, unknown=%d",
                     len(target_zero_probe),
                     target_unknown
                 )
@@ -18496,7 +18592,7 @@ def check_table_data_presence(
                 tgt_has = None if tgt_num_rows is None else tgt_num_rows > 0
                 src_probe_ms = 0
                 tgt_probe_ms = 0
-                if src_num_rows == 0:
+                if src_num_rows in (0, None):
                     src_probe_flag, _src_probe_err, src_probe_ms = source_zero_probe.get(
                         (src_schema, src_table),
                         (None, "SRC_ZERO_PROBE_MISSING", 0)
@@ -18507,7 +18603,7 @@ def check_table_data_presence(
                         src_has = False
                     else:
                         src_has = None
-                if tgt_num_rows == 0:
+                if tgt_num_rows in (0, None):
                     tgt_probe_flag, _tgt_probe_err, tgt_probe_ms = target_zero_probe.get(
                         (tgt_schema, tgt_table),
                         (None, "TGT_ZERO_PROBE_MISSING", 0)
@@ -18525,7 +18621,19 @@ def check_table_data_presence(
                     f"TGT_NUM_ROWS={_format_table_num_rows_value(tgt_num_rows)}",
                 ]
                 if src_num_rows is None:
-                    detail_parts.append("SRC_STATS_MISSING")
+                    src_probe_flag, src_probe_err, _src_probe_ms = source_zero_probe.get(
+                        (src_schema, src_table),
+                        (None, "SRC_ZERO_PROBE_MISSING", 0)
+                    )
+                    if src_probe_flag is True:
+                        detail_parts.append("SRC_MISSING_PROBE=NONEMPTY")
+                    elif src_probe_flag is False:
+                        detail_parts.append("SRC_MISSING_PROBE=EMPTY")
+                    else:
+                        detail_parts.append("SRC_STATS_MISSING")
+                        detail_parts.append(
+                            f"SRC_MISSING_PROBE_ERR={src_probe_err or 'UNKNOWN'}"
+                        )
                 elif src_num_rows == 0:
                     src_probe_flag, src_probe_err, _src_probe_ms = source_zero_probe.get(
                         (src_schema, src_table),
@@ -18540,7 +18648,19 @@ def check_table_data_presence(
                             f"SRC_ZERO_PROBE_ERR={src_probe_err or 'UNKNOWN'}"
                         )
                 if tgt_num_rows is None:
-                    detail_parts.append("TGT_STATS_MISSING")
+                    tgt_probe_flag, tgt_probe_err, _tgt_probe_ms = target_zero_probe.get(
+                        (tgt_schema, tgt_table),
+                        (None, "TGT_ZERO_PROBE_MISSING", 0)
+                    )
+                    if tgt_probe_flag is True:
+                        detail_parts.append("TGT_MISSING_PROBE=NONEMPTY")
+                    elif tgt_probe_flag is False:
+                        detail_parts.append("TGT_MISSING_PROBE=EMPTY")
+                    else:
+                        detail_parts.append("TGT_STATS_MISSING")
+                        detail_parts.append(
+                            f"TGT_MISSING_PROBE_ERR={tgt_probe_err or 'UNKNOWN'}"
+                        )
                 elif tgt_num_rows == 0:
                     tgt_probe_flag, tgt_probe_err, _tgt_probe_ms = target_zero_probe.get(
                         (tgt_schema, tgt_table),
@@ -24154,15 +24274,6 @@ def format_oracle_column_type(
     if '(' in dt and override_length is None:
         return apply_varchar_pref(dt)
 
-    # Length semantics suffix for VARCHAR/VARCHAR2 (CHAR vs BYTE)
-    def _char_suffix(base_type: str) -> str:
-        if base_type not in ("VARCHAR", "VARCHAR2"):
-            return ""
-        if char_used == "C":
-            return " CHAR"
-        # BYTE 语义不需要显式指定（OceanBase 默认就是 BYTE）
-        return ""
-
     # Choose effective length with optional override
     def _pick_length(default_len: Optional[int]) -> Optional[int]:
         return override_length if override_length is not None else default_len
@@ -24216,15 +24327,18 @@ def format_oracle_column_type(
     if dt in ("VARCHAR", "VARCHAR2"):
         ln = _pick_length(char_length if char_used == "C" else (char_length or data_length))
         if ln is not None:
-            return apply_varchar_pref(f"{dt}({int(ln)}){_char_suffix(dt)}")
+            if char_used == "C":
+                return apply_varchar_pref(f"{dt}({int(ln)} CHAR)")
+            return apply_varchar_pref(f"{dt}({int(ln)})")
         return apply_varchar_pref(dt)
     
     # CHAR type (separate from VARCHAR length semantics)
     if dt == "CHAR":
         ln = _pick_length(char_length if char_used == "C" else (char_length or data_length))
         if ln is not None:
-            suffix = " CHAR" if char_used == "C" else ""
-            return f"{dt}({int(ln)}){suffix}"
+            if char_used == "C":
+                return f"{dt}({int(ln)} CHAR)"
+            return f"{dt}({int(ln)})"
         return dt
 
     # National character types (length is character-based; no CHAR/BYTE suffix)
@@ -25626,6 +25740,12 @@ def generate_fixup_scripts(
         settings.get("constraint_missing_fixup_validate_mode", "safe_novalidate")
     )
     trigger_validity_sync_mode = settings.get("trigger_validity_sync_mode", "compile")
+    job_schedule_fixup_mode = normalize_job_schedule_fixup_mode(
+        settings.get("job_schedule_fixup_mode", "manual")
+    )
+    job_schedule_semi_auto_enabled = (job_schedule_fixup_mode == "semi_auto")
+    if job_schedule_semi_auto_enabled:
+        log.info("[FIXUP] job_schedule_fixup_mode=semi_auto，JOB/SCHEDULE 缺失对象将生成半自动草案模板。")
     deferred_validation_rows: List[ConstraintValidateDeferredRow] = []
     deferred_validation_lock = threading.Lock()
     invalid_view_keys: Set[Tuple[str, str]] = set()
@@ -25662,6 +25782,17 @@ def generate_fixup_scripts(
     else:
         base_dir = base_dir.resolve()
     allow_outside_default = "fixup_dir_allow_outside_repo" not in settings
+    force_clean_default = "fixup_force_clean" not in settings
+    if allow_outside_default or force_clean_default:
+        missing_keys: List[str] = []
+        if allow_outside_default:
+            missing_keys.append("fixup_dir_allow_outside_repo")
+        if force_clean_default:
+            missing_keys.append("fixup_force_clean")
+        log.warning(
+            "[MIGRATION] 检测到配置未显式设置 %s。v0.9.8.7 默认值已调整，建议在 config.ini 中明确声明以避免升级歧义。",
+            ",".join(missing_keys)
+        )
     allow_outside_repo = parse_bool_flag(
         settings.get("fixup_dir_allow_outside_repo", "true" if allow_outside_default else "false"),
         allow_outside_default
@@ -25932,6 +26063,35 @@ def generate_fixup_scripts(
             f"action: {row.action or '-'}",
             f"detail: {row.detail or '-'}",
         ]
+
+    def build_job_schedule_semi_auto_draft_sql(
+        obj_type: str,
+        src_schema: str,
+        src_obj: str,
+        tgt_schema: str,
+        tgt_obj: str,
+    ) -> str:
+        obj_type_u = (obj_type or "").upper()
+        source_view = "DBA_SCHEDULER_JOBS" if obj_type_u == "JOB" else "DBA_SCHEDULER_SCHEDULES"
+        name_column = "JOB_NAME" if obj_type_u == "JOB" else "SCHEDULE_NAME"
+        create_hint = "DBMS_SCHEDULER.CREATE_JOB(...)" if obj_type_u == "JOB" else "DBMS_SCHEDULER.CREATE_SCHEDULE(...)"
+        src_full = f"{src_schema}.{src_obj}".upper()
+        tgt_full = f"{tgt_schema}.{tgt_obj}".upper()
+        lines = [
+            f"-- {obj_type_u} 半自动草案模板（源端 DDL 未命中）",
+            f"-- 源对象: {src_full}",
+            f"-- 目标对象: {tgt_full}",
+            "-- 说明: 当前文件仅为模板，不会自动创建对象；请按下列步骤补录后再执行。",
+            "-- Step 1) 在 Oracle 源端导出对象定义（示例 SQL）:",
+            f"--   SELECT * FROM {source_view} WHERE OWNER='{src_schema.upper()}' AND {name_column}='{src_obj.upper()}';",
+            "-- Step 2) 按源端定义整理 OceanBase 可执行语句（建议使用 DBMS_SCHEDULER 语法）。",
+            f"--   参考调用: {create_hint}",
+            "-- Step 3) 将最终可执行 SQL 粘贴到本文件下方（保留分号），再执行 run_fixup。",
+            "",
+            "-- TODO: 在此粘贴可执行 DDL",
+            f"-- {obj_type_u} {quote_qualified_parts(tgt_schema, tgt_obj)}",
+        ]
+        return "\n".join(lines).rstrip() + "\n"
 
     def allow_fixup(obj_type: str, tgt_schema: str, src_schema: Optional[str] = None) -> bool:
         nonlocal fixup_schema_used_source_match
@@ -26425,10 +26585,7 @@ def generate_fixup_scripts(
     def is_temporary_support_row(row: Optional[ObjectSupportReportRow]) -> bool:
         if not row:
             return False
-        code = (row.reason_code or "").upper()
-        if "TEMPORARY_TABLE" in code or "TEMP_TABLE" in code:
-            return True
-        return False
+        return is_temp_table_blacklist_reason_code(row.reason_code)
 
     for (obj_type, tgt_name, src_name) in tv_results.get('missing', []):
         obj_type_u = obj_type.upper()
@@ -27716,6 +27873,36 @@ def generate_fixup_scripts(
                     return
                 ddl, ddl_source_label, _elapsed = fetch_result
                 if not ddl:
+                    if job_schedule_semi_auto_enabled and (ot or "").upper() in MANUAL_FIXUP_PRIMARY_TYPES:
+                        obj_full = f"{ts}.{to}"
+                        draft_sql = build_job_schedule_semi_auto_draft_sql(ot, ss, so, ts, to)
+                        subdir = f"unsupported/{obj_type_to_dir.get(ot, ot.lower())}"
+                        filename = f"{ts}.{to}.sql"
+                        header = f"不支持对象 DDL {obj_full} (源: {ss}.{so}) [semi_auto 草案]"
+                        log.warning(
+                            "[FIXUP][SEMI_AUTO] 未找到 %s %s.%s 的源端 DDL，已生成草案模板: %s/%s",
+                            ot,
+                            ss,
+                            so,
+                            subdir,
+                            filename
+                        )
+                        write_fixup_file(
+                            base_dir,
+                            subdir,
+                            filename,
+                            draft_sql,
+                            header,
+                            extra_comments=[
+                                "support_state: UNSUPPORTED",
+                                f"reason_code: {MANUAL_FIXUP_REASON_CODE}",
+                                f"reason: {MANUAL_FIXUP_REASON_TEXT}",
+                                f"action: {MANUAL_FIXUP_SEMI_AUTO_ACTION_TEXT}",
+                                f"detail: {MANUAL_FIXUP_SEMI_AUTO_DETAIL_TEXT}",
+                            ]
+                        )
+                        mark_source(ot, 'missing')
+                        return
                     log.warning("[FIXUP] 未找到 %s %s.%s 的 dbcat DDL。", ot, ss, so)
                     mark_source(ot, 'missing')
                     return
@@ -27818,6 +28005,32 @@ def generate_fixup_scripts(
                         return
                     ddl, ddl_source_label, _elapsed = fetch_result
                     if not ddl:
+                        if job_schedule_semi_auto_enabled and (ot or "").upper() in MANUAL_FIXUP_PRIMARY_TYPES:
+                            obj_full = f"{ts}.{to}"
+                            draft_sql = build_job_schedule_semi_auto_draft_sql(ot, ss, so, ts, to)
+                            subdir = f"unsupported/{obj_type_to_dir.get(ot, ot.lower())}"
+                            filename = f"{ts}.{to}.sql"
+                            header = f"不支持对象 DDL {obj_full} (源: {ss}.{so}) [semi_auto 草案]"
+                            extra_comments = build_support_comments(sr)
+                            extra_comments.append("semi_auto: 源端DDL未命中，已生成人工补录模板。")
+                            log.warning(
+                                "[FIXUP][SEMI_AUTO] 未找到 %s %s.%s 的源端 DDL，已生成草案模板: %s/%s",
+                                ot,
+                                ss,
+                                so,
+                                subdir,
+                                filename
+                            )
+                            write_fixup_file(
+                                base_dir,
+                                subdir,
+                                filename,
+                                draft_sql,
+                                header,
+                                extra_comments=extra_comments
+                            )
+                            mark_source(ot, 'missing')
+                            return
                         log.warning("[FIXUP] 未找到 %s %s.%s 的 dbcat DDL。", ot, ss, so)
                         mark_source(ot, 'missing')
                         return
@@ -31714,6 +31927,7 @@ def _build_report_detail_rows(
     trigger_status_rows: Optional[List[TriggerStatusReportRow]] = None,
     constraint_status_rows: Optional[List[ConstraintStatusDriftRow]] = None,
     trigger_validity_mode: str = "off",
+    additional_missing_rows: Optional[List[ObjectSupportReportRow]] = None,
 ) -> Tuple[List[Dict[str, object]], bool, int]:
     detail_modes = settings.get("report_db_detail_mode_set") or set(DEFAULT_REPORT_DB_DETAIL_MODES)
     max_rows = int(settings.get("report_db_detail_max_rows", 0) or 0)
@@ -31734,6 +31948,11 @@ def _build_report_detail_rows(
             row for row in support_summary.unsupported_rows
             if row.support_state in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED, SUPPORT_STATE_RISKY}
         ]
+    if additional_missing_rows:
+        missing_supported.extend(
+            row for row in additional_missing_rows
+            if row.support_state == SUPPORT_STATE_SUPPORTED
+        )
 
     mismatch_rows = tv_results.get("mismatched", []) or []
     ok_rows = tv_results.get("ok", []) or []
@@ -31919,6 +32138,12 @@ def _build_report_detail_rows(
                     "extra_constraints": sorted(list(row.extra_constraints)),
                     "detail": row.detail_mismatch,
                     "downgraded_pk": sorted(list(row.downgraded_pk_constraints)),
+                    "check_suppressed_source_dup_count": int(
+                        getattr(row, "check_suppressed_source_dup_count", 0) or 0
+                    ),
+                    "check_suppressed_target_dup_count": int(
+                        getattr(row, "check_suppressed_target_dup_count", 0) or 0
+                    ),
                 }, ensure_ascii=False)
             })
         for row in extra_sequence_mismatched:
@@ -32211,6 +32436,22 @@ def _build_report_detail_item_rows(
             _push({**base, "item_type": "EXTRA_CONSTRAINT", "item_key": name, "item_value": ""})
         for name in sorted(item.downgraded_pk_constraints or []):
             _push({**base, "item_type": "DOWNGRADED_PK", "item_key": name, "item_value": ""})
+        suppressed_src = int(getattr(item, "check_suppressed_source_dup_count", 0) or 0)
+        suppressed_tgt = int(getattr(item, "check_suppressed_target_dup_count", 0) or 0)
+        if suppressed_src > 0:
+            _push({
+                **base,
+                "item_type": "SUPPRESSED_CHECK_DUP_SOURCE",
+                "item_key": "",
+                "item_value": str(suppressed_src)
+            })
+        if suppressed_tgt > 0:
+            _push({
+                **base,
+                "item_type": "SUPPRESSED_CHECK_DUP_TARGET",
+                "item_key": "",
+                "item_value": str(suppressed_tgt)
+            })
         for detail in item.detail_mismatch or []:
             _push({**base, "item_type": "CONSTRAINT_DETAIL", "item_key": "", "item_value": detail})
 
@@ -34615,8 +34856,15 @@ def save_report_to_db(
     )
     unsupported_count = sum(int(v or 0) for v in unsupported_by_type.values())
     missing_fixable_count = sum(int(v or 0) for v in fixable_missing_by_type.values())
+    missing_count_from_counts = sum_primary_missing_count(
+        object_counts_summary,
+        set(settings.get("enabled_primary_types") or set(PRIMARY_OBJECT_TYPES))
+    )
+    if missing_count_from_counts is not None:
+        missing_count = int(missing_count_from_counts)
     excluded_by_type = build_excluded_summary_counts(excluded_object_rows)
     excluded_count = sum(int(v or 0) for v in excluded_by_type.values())
+    package_missing_rows = build_package_missing_support_rows(package_results)
 
     # SQL template file (pre-filled report_id) for DB report queries
     build_report_sql_template_file(report_dir, report_timestamp, report_id)
@@ -34651,7 +34899,8 @@ def save_report_to_db(
             table_target_map,
             trigger_status_rows=trigger_status_rows,
             constraint_status_rows=constraint_status_rows,
-            trigger_validity_mode=settings.get("trigger_validity_sync_mode", "compile")
+            trigger_validity_mode=settings.get("trigger_validity_sync_mode", "compile"),
+            additional_missing_rows=package_missing_rows
         )
     else:
         detail_rows, detail_truncated, detail_truncated_count = [], False, 0
@@ -34975,6 +35224,92 @@ def build_missing_breakdown_counts(
         unsupported[obj_type] = uns_clamped
         fixable[obj_type] = max(0, total - uns_clamped)
     return total_missing, unsupported, fixable
+
+
+def build_package_missing_support_rows(
+    package_results: Optional[PackageCompareResults]
+) -> List[ObjectSupportReportRow]:
+    """
+    将 PACKAGE/PACKAGE BODY 的 MISSING_TARGET 结果转换为“缺失且可修补”行，
+    用于 migration_focus / missing_detail / report_db 统一口径。
+    """
+    rows: List[ObjectSupportReportRow] = []
+    if not package_results:
+        return rows
+    for item in (package_results.get("rows") or []):
+        if (item.result or "").upper() != "MISSING_TARGET":
+            continue
+        if not item.src_full or not item.tgt_full or not item.obj_type:
+            continue
+        rows.append(
+            ObjectSupportReportRow(
+                obj_type=(item.obj_type or "").upper(),
+                src_full=(item.src_full or "").upper(),
+                tgt_full=(item.tgt_full or "").upper(),
+                support_state=SUPPORT_STATE_SUPPORTED,
+                reason_code="-",
+                reason="-",
+                dependency="-",
+                action="FIXUP",
+                detail="-",
+                root_cause=""
+            )
+        )
+    return rows
+
+
+def sum_primary_missing_count(
+    object_counts_summary: Optional[ObjectCountSummary],
+    enabled_primary_types: Optional[Set[str]]
+) -> Optional[int]:
+    """
+    基于“检查汇总”口径计算主对象缺失总数，用于与 missing_fixable/migration_focus 对齐。
+    """
+    if not object_counts_summary:
+        return None
+    missing_by_type = dict((object_counts_summary or {}).get("missing", {}) or {})
+    if not missing_by_type:
+        return 0
+    primary_types = {t.upper() for t in (enabled_primary_types or set(PRIMARY_OBJECT_TYPES))}
+    return sum(int(missing_by_type.get(obj_type, 0) or 0) for obj_type in primary_types)
+
+
+def compute_count_invariant_mismatches(
+    oracle_counts: Dict[str, int],
+    ob_counts: Dict[str, int],
+    fixable_missing_counts: Dict[str, int],
+    unsupported_summary_counts: Dict[str, int],
+    excluded_summary_counts: Optional[Dict[str, int]] = None,
+    count_types: Optional[List[str]] = None
+) -> List[Tuple[str, int, int, int, int, int]]:
+    """
+    计算检查汇总口径不一致项。
+
+    口径定义：
+      Oracle(应校验) = OceanBase(命中) + 缺失(可修补) + 缺失(不支持/阻断/待确认)
+
+    注意：EXCLUDED 对象通常已从 Oracle(应校验) 基数中剔除，因此不参与等式右侧求和。
+    """
+    excluded_summary_counts = excluded_summary_counts or {}
+    if count_types is None:
+        count_types = sorted(
+            set(oracle_counts)
+            | set(ob_counts)
+            | set(fixable_missing_counts)
+            | set(unsupported_summary_counts)
+            | set(excluded_summary_counts)
+        )
+    mismatches: List[Tuple[str, int, int, int, int, int]] = []
+    for obj_type in count_types:
+        lhs = int(oracle_counts.get(obj_type, 0) or 0)
+        hit = int(ob_counts.get(obj_type, 0) or 0)
+        fixable = int(fixable_missing_counts.get(obj_type, 0) or 0)
+        unsupported = int(unsupported_summary_counts.get(obj_type, 0) or 0)
+        excluded = int(excluded_summary_counts.get(obj_type, 0) or 0)
+        rhs = hit + fixable + unsupported
+        if lhs != rhs:
+            mismatches.append((obj_type, lhs, hit, fixable, unsupported, excluded))
+    return mismatches
 
 
 def summarize_extra_missing_counts(
@@ -35593,6 +35928,7 @@ def print_final_report(
     package_src_invalid_cnt = int(package_summary.get("SOURCE_INVALID", 0) or 0)
     package_tgt_invalid_cnt = int(package_summary.get("TARGET_INVALID", 0) or 0)
     package_status_mismatch_cnt = int(package_summary.get("STATUS_MISMATCH", 0) or 0)
+    package_missing_support_rows = build_package_missing_support_rows(package_results)
     support_counts = dict(support_summary.missing_support_counts) if support_summary else {}
     unsupported_rows = list(support_summary.unsupported_rows) if support_summary else []
     missing_detail_rows = list(support_summary.missing_detail_rows) if support_summary else []
@@ -35626,7 +35962,16 @@ def print_final_report(
     if extra_missing_rows:
         combined_missing_rows.extend(extra_missing_rows)
         missing_supported_rows.extend(extra_missing_rows)
+    if package_missing_support_rows:
+        combined_missing_rows.extend(package_missing_support_rows)
+        missing_supported_rows.extend(package_missing_support_rows)
     missing_supported_cnt = len(missing_supported_rows)
+    missing_count_from_counts = sum_primary_missing_count(
+        object_counts_summary,
+        set(settings.get("enabled_primary_types") or set(PRIMARY_OBJECT_TYPES))
+    )
+    if missing_count_from_counts is not None:
+        missing_count = int(missing_count_from_counts)
     unsupported_blocked_cnt = len([
         row for row in unsupported_rows
         if row.support_state in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED, SUPPORT_STATE_RISKY}
@@ -36149,6 +36494,8 @@ def print_final_report(
         addition_counts: Dict[str, int] = defaultdict(int)
         for obj_type, _, _ in tv_results.get('missing', []):
             addition_counts[obj_type.upper()] += 1
+        for row in package_missing_support_rows:
+            addition_counts[row.obj_type.upper()] += 1
         for item in extra_results.get("index_mismatched", []):
             addition_counts["INDEX"] += len(item.missing_indexes)
         for item in extra_results.get("constraint_mismatched", []):
@@ -36223,7 +36570,14 @@ def print_final_report(
             | set(excluded_summary_counts)
             | set(extra_counts)
         )
-        count_invariant_mismatches: List[Tuple[str, int, int, int, int, int]] = []
+        count_invariant_mismatches = compute_count_invariant_mismatches(
+            oracle_counts=oracle_counts,
+            ob_counts=ob_counts,
+            fixable_missing_counts=fixable_missing_counts,
+            unsupported_summary_counts=unsupported_summary_counts,
+            excluded_summary_counts=excluded_summary_counts,
+            count_types=count_types
+        )
         for obj_type in count_types:
             ora_val = oracle_counts.get(obj_type, 0)
             ob_val = ob_counts.get(obj_type, 0)
@@ -36231,12 +36585,6 @@ def print_final_report(
             extra_val = extra_counts.get(obj_type, 0)
             unsupported_val = int(unsupported_summary_counts.get(obj_type, 0) or 0)
             excluded_val = int(excluded_summary_counts.get(obj_type, 0) or 0)
-            lhs = int(ora_val or 0)
-            rhs = int(ob_val or 0) + miss_fixable_val + unsupported_val + excluded_val
-            if lhs != rhs:
-                count_invariant_mismatches.append(
-                    (obj_type, lhs, int(ob_val or 0), miss_fixable_val, unsupported_val, excluded_val)
-                )
             count_table.add_row(
                 obj_type,
                 str(ora_val),
@@ -36570,8 +36918,8 @@ def print_final_report(
         "fixup_scripts/package       : 缺失 PACKAGE 的 CREATE 脚本\n"
         "fixup_scripts/package_body  : 缺失 PACKAGE BODY 的 CREATE 脚本\n"
         "fixup_scripts/synonym       : 缺失 SYNONYM 的 CREATE 脚本\n"
-        "fixup_scripts/job           : 缺失 JOB 的 CREATE 脚本\n"
-        "fixup_scripts/schedule      : 缺失 SCHEDULE 的 CREATE 脚本\n"
+        "fixup_scripts/job           : JOB 缺失脚本（默认人工；semi_auto 可输出草案）\n"
+        "fixup_scripts/schedule      : SCHEDULE 缺失脚本（默认人工；semi_auto 可输出草案）\n"
         "fixup_scripts/type          : 缺失 TYPE 的 CREATE 脚本\n"
         "fixup_scripts/type_body     : 缺失 TYPE BODY 的 CREATE 脚本\n"
         "fixup_scripts/index         : 缺失 INDEX 的 CREATE 脚本\n"
@@ -36804,7 +37152,7 @@ def print_final_report(
             if not path:
                 continue
             type_rows = [
-                row for row in (missing_detail_rows + extra_missing_rows)
+                row for row in combined_missing_rows
                 if row.support_state == SUPPORT_STATE_SUPPORTED and row.obj_type.upper() == obj_type
             ]
             _add_index_entry(
@@ -37194,6 +37542,7 @@ def parse_cli_args() -> argparse.Namespace:
             extra_check_progress_interval 扩展对象校验进度日志间隔（秒）
             fixup_schemas           仅对指定目标 schema 生成订正 SQL（逗号分隔，留空为全部）
             fixup_types             仅生成指定对象类型的订正 SQL（留空为全部，例如 TABLE,TRIGGER）
+            job_schedule_fixup_mode JOB/SCHEDULE 修补模式 (manual/semi_auto)
             fixup_idempotent_mode   修补脚本幂等模式 (off/guard/replace/drop_create)
             fixup_idempotent_types  幂等模式作用对象类型（逗号分隔，留空用默认）
             fixup_drop_sys_c_columns 是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE (true/false)
