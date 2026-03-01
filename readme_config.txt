@@ -202,6 +202,9 @@
   可选值：TABLE, VIEW, MATERIALIZED VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY,
            SYNONYM, JOB, SCHEDULE, TYPE, TYPE BODY, SEQUENCE, TRIGGER, INDEX, CONSTRAINT。
   注意：fixup_types 包含 INDEX/CONSTRAINT/TRIGGER 时，需要 check_primary_types 含 TABLE 才能生成。
+- job_schedule_fixup_mode：JOB/SCHEDULE 修补模式。默认：manual。
+  可选值：manual（保持人工处理，不生成缺失脚本）、semi_auto（当源端 DDL 缺失时输出草案模板到 `fixup_scripts/unsupported/job|schedule/`）。
+  说明：semi_auto 仅提供人工补录模板，不改变 JOB/SCHEDULE 的“不支持自动修补”统计口径。
 - fixup_idempotent_mode：修补脚本幂等模式。默认：replace。
   可选值：off（不处理）、replace（CREATE OR REPLACE）、guard（存在则跳过创建）、drop_create（存在则 DROP 再创建）。
 - fixup_idempotent_types：幂等模式作用对象类型（逗号分隔）。默认：空（使用安全默认集）。
