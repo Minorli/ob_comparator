@@ -125,6 +125,8 @@
   说明：on 模式下每个 chunk 使用一次 obclient 多语句探测，失败时自动回退为单表探测。
 - table_data_presence_obclient_timeout：OB 批量探测超时（秒）。默认：空（沿用 obclient_timeout）。
   说明：该参数影响 auto 模式统计查询与 on 模式目标端探测。
+- table_data_presence_zero_probe_workers：Oracle 零行二次探针并发。默认：1，最大：32。
+  说明：仅在 auto 模式触发“NUM_ROWS=0 回表探测”时生效；每个 worker 使用独立 Oracle 连接。
   排障：若日志长时间停留在 TABLE_PRESENCE，可临时设为 off 跳过，或降低 table_data_presence_auto_max_tables 以减少 auto 执行范围。
 - column_visibility_policy：列可见性(INVISIBLE)处理策略。默认：auto。
   可选值：auto（元数据可用时校验并生成修补）、enforce（强制校验/修补）、ignore（跳过可见性校验）。

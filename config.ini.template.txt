@@ -267,6 +267,8 @@ table_data_presence_auto_max_tables = 20000
 table_data_presence_chunk_size = 500
 # auto 模式统计查询与 on 模式探测超时（秒）；留空表示沿用 obclient_timeout
 table_data_presence_obclient_timeout =
+# auto 模式 Oracle 零行二次探针并发（每个 worker 使用独立连接，默认 1，最大 32）
+table_data_presence_zero_probe_workers = 1
 # 列可见性(INVISIBLE)处理策略
 #   auto    -> 元数据可用时校验并生成修补（默认）
 #   enforce -> 强制校验/生成修补（即使元数据不完整）

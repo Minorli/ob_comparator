@@ -487,6 +487,7 @@ TABLE_PRESENCE_STATUS_RISK = "RISK_SOURCE_NONEMPTY_TARGET_EMPTY"
 TABLE_PRESENCE_STATUS_OK_BOTH_NONEMPTY = "OK_BOTH_NONEMPTY"
 TABLE_PRESENCE_STATUS_OK_BOTH_EMPTY = "OK_BOTH_EMPTY"
 TABLE_PRESENCE_STATUS_UNKNOWN = "UNKNOWN"
+TABLE_PRESENCE_MAX_ZERO_PROBE_WORKERS = 32
 TABLE_PRESENCE_FLAG_YES = "YES"
 TABLE_PRESENCE_FLAG_NO = "NO"
 TABLE_PRESENCE_FLAG_UNKNOWN = "UNKNOWN"
@@ -2454,7 +2455,7 @@ def extract_ob_version_number(raw: Optional[str]) -> Optional[str]:
     return match.group(0) if match else None
 
 
-def load_blacklist_rules(path_value: Optional[str]) -> List[BlacklistRule]:
+def load_blacklist_rules(path_value: Optional[str], strict: bool = False) -> List[BlacklistRule]:
     if not path_value or not str(path_value).strip():
         return []
     path = Path(str(path_value).strip()).expanduser()
@@ -2464,7 +2465,10 @@ def load_blacklist_rules(path_value: Optional[str]) -> List[BlacklistRule]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
-        log.warning("blacklist_rules_path 解析失败: %s (%s)", path, exc)
+        msg = f"blacklist_rules_path 解析失败: {path} ({exc})"
+        if strict:
+            abort_run(msg)
+        log.warning(msg)
         return []
 
     raw_rules: List[dict] = []
@@ -2473,7 +2477,10 @@ def load_blacklist_rules(path_value: Optional[str]) -> List[BlacklistRule]:
     elif isinstance(payload, dict):
         raw_rules = payload.get("rules") or []
     else:
-        log.warning("blacklist_rules_path 内容格式不支持: %s", path)
+        msg = f"blacklist_rules_path 内容格式不支持: {path}"
+        if strict:
+            abort_run(msg)
+        log.warning(msg)
         return []
 
     rules: List[BlacklistRule] = []
@@ -3820,6 +3827,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('table_data_presence_auto_max_tables', '20000')
         settings.setdefault('table_data_presence_chunk_size', '500')
         settings.setdefault('table_data_presence_obclient_timeout', '')
+        settings.setdefault('table_data_presence_zero_probe_workers', '1')
         settings.setdefault('generate_interval_partition_fixup', 'auto')
         settings.setdefault('mview_check_fixup_mode', 'auto')
         settings.setdefault('interval_partition_cutoff', '20280301')
@@ -3957,6 +3965,22 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
                 settings['table_data_presence_obclient_timeout'] = int(settings.get('obclient_timeout', 60))
         else:
             settings['table_data_presence_obclient_timeout'] = int(settings.get('obclient_timeout', 60))
+        try:
+            settings['table_data_presence_zero_probe_workers'] = int(
+                settings.get('table_data_presence_zero_probe_workers', '1') or 1
+            )
+        except (TypeError, ValueError):
+            settings['table_data_presence_zero_probe_workers'] = 1
+        if settings['table_data_presence_zero_probe_workers'] <= 0:
+            settings['table_data_presence_zero_probe_workers'] = 1
+        if settings['table_data_presence_zero_probe_workers'] > TABLE_PRESENCE_MAX_ZERO_PROBE_WORKERS:
+            log.warning(
+                "table_data_presence_zero_probe_workers=%s 超过上限 %d，将按 %d 执行。",
+                settings['table_data_presence_zero_probe_workers'],
+                TABLE_PRESENCE_MAX_ZERO_PROBE_WORKERS,
+                TABLE_PRESENCE_MAX_ZERO_PROBE_WORKERS
+            )
+            settings['table_data_presence_zero_probe_workers'] = TABLE_PRESENCE_MAX_ZERO_PROBE_WORKERS
         settings['fixup_drop_sys_c_columns'] = parse_bool_flag(
             settings.get('fixup_drop_sys_c_columns', 'true'),
             False
@@ -5015,6 +5039,13 @@ def run_config_wizard(config_path: Path) -> None:
         "表数据存在性校验 OB 超时（秒，留空沿用 obclient_timeout）",
         default=cfg.get("SETTINGS", "table_data_presence_obclient_timeout", fallback=""),
         validator=lambda v: _validate_positive_int(v) if v.strip() else (True, ""),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "table_data_presence_zero_probe_workers",
+        "表数据存在性校验 Oracle 零行探针并发（默认 1）",
+        default=cfg.get("SETTINGS", "table_data_presence_zero_probe_workers", fallback="1"),
+        validator=_validate_positive_int,
     )
     _prompt_field(
         "SETTINGS",
@@ -12092,7 +12123,7 @@ def dump_oracle_metadata(
 
                         if use_rules:
                             rules_path = settings.get("blacklist_rules_path", "")
-                            rules = load_blacklist_rules(rules_path)
+                            rules = load_blacklist_rules(rules_path, strict=True)
                             if not rules:
                                 log.warning("黑名单规则文件为空或不可用，将跳过规则引擎。")
                             else:
@@ -17795,6 +17826,84 @@ def _probe_ob_table_has_rows_batch(
     return result
 
 
+def _probe_oracle_table_has_rows_batch(
+    ora_cfg: OraConfig,
+    table_keys: List[Tuple[str, str]],
+    timeout_ms: int,
+    workers: int = 1
+) -> Dict[Tuple[str, str], Tuple[Optional[bool], str, int]]:
+    if not table_keys:
+        return {}
+    timeout_ms = max(1, int(timeout_ms or 1))
+    workers = max(1, int(workers or 1))
+
+    def _probe_one_chunk(keys: List[Tuple[str, str]]) -> Dict[Tuple[str, str], Tuple[Optional[bool], str, int]]:
+        chunk_result: Dict[Tuple[str, str], Tuple[Optional[bool], str, int]] = {}
+        conn: Optional[oracledb.Connection] = None
+        try:
+            conn = oracledb.connect(
+                user=ora_cfg["user"],
+                password=ora_cfg["password"],
+                dsn=ora_cfg["dsn"]
+            )
+            for schema_u, table_u in keys:
+                sql = f"SELECT 1 FROM {quote_qualified_parts(schema_u, table_u)} WHERE ROWNUM=1"
+                start = time.perf_counter()
+                probe_flag: Optional[bool] = None
+                probe_err = ""
+                try:
+                    with conn.cursor() as cursor:
+                        cursor.call_timeout = timeout_ms
+                        cursor.execute(sql)
+                        probe_flag = cursor.fetchone() is not None
+                except Exception as exc:
+                    probe_flag = None
+                    probe_err = normalize_error_text(str(exc))
+                chunk_result[(schema_u, table_u)] = (
+                    probe_flag,
+                    probe_err,
+                    int((time.perf_counter() - start) * 1000)
+                )
+        except Exception as exc:
+            conn_err = normalize_error_text(str(exc))
+            for schema_u, table_u in keys:
+                chunk_result[(schema_u, table_u)] = (None, conn_err, 0)
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        return chunk_result
+
+    if workers == 1 or len(table_keys) <= 1:
+        return _probe_one_chunk(table_keys)
+
+    worker_count = min(workers, len(table_keys))
+    chunks: List[List[Tuple[str, str]]] = [[] for _ in range(worker_count)]
+    for idx, table_key in enumerate(table_keys):
+        chunks[idx % worker_count].append(table_key)
+
+    result: Dict[Tuple[str, str], Tuple[Optional[bool], str, int]] = {}
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_chunk = {
+            executor.submit(_probe_one_chunk, chunk): chunk
+            for chunk in chunks
+            if chunk
+        }
+        for future in as_completed(future_to_chunk):
+            chunk = future_to_chunk[future]
+            try:
+                chunk_result = future.result()
+            except Exception as exc:
+                err = normalize_error_text(str(exc))
+                for schema_u, table_u in chunk:
+                    result[(schema_u, table_u)] = (None, err, 0)
+                continue
+            result.update(chunk_result)
+    return result
+
+
 def check_table_data_presence(
     settings: Dict,
     master_list: MasterCheckList,
@@ -17890,13 +17999,23 @@ def check_table_data_presence(
     chunk_size = max(1, int(settings.get("table_data_presence_chunk_size", 500) or 500))
     ob_timeout = max(1, int(settings.get("table_data_presence_obclient_timeout", settings.get("obclient_timeout", 60)) or 60))
     oracle_timeout_ms = ob_timeout * 1000
+    source_zero_workers_raw = max(1, int(settings.get("table_data_presence_zero_probe_workers", 1) or 1))
+    source_zero_workers = min(TABLE_PRESENCE_MAX_ZERO_PROBE_WORKERS, source_zero_workers_raw)
+    if source_zero_workers_raw > TABLE_PRESENCE_MAX_ZERO_PROBE_WORKERS:
+        log.warning(
+            "[TABLE_PRESENCE] table_data_presence_zero_probe_workers=%d 超过上限 %d，已按 %d 执行。",
+            source_zero_workers_raw,
+            TABLE_PRESENCE_MAX_ZERO_PROBE_WORKERS,
+            TABLE_PRESENCE_MAX_ZERO_PROBE_WORKERS
+        )
 
     if mode == "auto":
         log.info(
-            "[TABLE_PRESENCE] 开始校验：mode=auto(strategy=stats_only), candidates=%d, chunk_size=%d, ob_timeout=%ds",
+            "[TABLE_PRESENCE] 开始校验：mode=auto(strategy=stats_only), candidates=%d, chunk_size=%d, ob_timeout=%ds, src_zero_workers=%d",
             total_candidates,
             chunk_size,
-            ob_timeout
+            ob_timeout,
+            source_zero_workers
         )
         start_perf = time.perf_counter()
         source_keys = sorted({(src_schema, src_table) for src_schema, src_table, _tgt_schema, _tgt_table in candidates})
@@ -17924,12 +18043,85 @@ def check_table_data_presence(
                 "; ".join(err_parts)
             )
         else:
+            source_zero_keys = sorted({
+                (src_schema, src_table)
+                for src_schema, src_table, _tgt_schema, _tgt_table in candidates
+                if source_stats.get((src_schema, src_table)) == 0
+            })
+            target_zero_keys = sorted({
+                (tgt_schema, tgt_table)
+                for _src_schema, _src_table, tgt_schema, tgt_table in candidates
+                if target_stats.get((tgt_schema, tgt_table)) == 0
+            })
+            source_zero_probe: Dict[Tuple[str, str], Tuple[Optional[bool], str, int]] = {}
+            target_zero_probe: Dict[Tuple[str, str], Tuple[Optional[bool], str, int]] = {}
+            if source_zero_keys:
+                log.info(
+                    "[TABLE_PRESENCE] SOURCE 零行二次探测开始：tables=%d, workers=%d",
+                    len(source_zero_keys),
+                    source_zero_workers
+                )
+                source_zero_probe = _probe_oracle_table_has_rows_batch(
+                    ora_cfg,
+                    source_zero_keys,
+                    oracle_timeout_ms,
+                    source_zero_workers
+                )
+                source_unknown = sum(1 for v in source_zero_probe.values() if v[0] is None)
+                log.info(
+                    "[TABLE_PRESENCE] SOURCE 零行二次探测完成：tables=%d, unknown=%d",
+                    len(source_zero_probe),
+                    source_unknown
+                )
+            if target_zero_keys:
+                log.info(
+                    "[TABLE_PRESENCE] TARGET 零行二次探测开始：tables=%d, chunk_size=%d",
+                    len(target_zero_keys),
+                    chunk_size
+                )
+                target_zero_probe = _probe_ob_table_has_rows_batch(
+                    ob_cfg,
+                    target_zero_keys,
+                    chunk_size,
+                    ob_timeout
+                )
+                target_unknown = sum(1 for v in target_zero_probe.values() if v[0] is None)
+                log.info(
+                    "[TABLE_PRESENCE] TARGET 零行二次探测完成：tables=%d, unknown=%d",
+                    len(target_zero_probe),
+                    target_unknown
+                )
+
             rows: List[TablePresenceResult] = []
             for src_schema, src_table, tgt_schema, tgt_table in candidates:
                 src_num_rows = source_stats.get((src_schema, src_table))
                 tgt_num_rows = target_stats.get((tgt_schema, tgt_table))
                 src_has = None if src_num_rows is None else src_num_rows > 0
                 tgt_has = None if tgt_num_rows is None else tgt_num_rows > 0
+                src_probe_ms = 0
+                tgt_probe_ms = 0
+                if src_num_rows == 0:
+                    src_probe_flag, _src_probe_err, src_probe_ms = source_zero_probe.get(
+                        (src_schema, src_table),
+                        (None, "SRC_ZERO_PROBE_MISSING", 0)
+                    )
+                    if src_probe_flag is True:
+                        src_has = True
+                    elif src_probe_flag is False:
+                        src_has = False
+                    else:
+                        src_has = None
+                if tgt_num_rows == 0:
+                    tgt_probe_flag, _tgt_probe_err, tgt_probe_ms = target_zero_probe.get(
+                        (tgt_schema, tgt_table),
+                        (None, "TGT_ZERO_PROBE_MISSING", 0)
+                    )
+                    if tgt_probe_flag is True:
+                        tgt_has = True
+                    elif tgt_probe_flag is False:
+                        tgt_has = False
+                    else:
+                        tgt_has = None
                 status = _classify_table_presence_status(src_has, tgt_has)
                 detail_parts = [
                     "MODE=STATS_ONLY",
@@ -17938,8 +18130,34 @@ def check_table_data_presence(
                 ]
                 if src_num_rows is None:
                     detail_parts.append("SRC_STATS_MISSING")
+                elif src_num_rows == 0:
+                    src_probe_flag, src_probe_err, _src_probe_ms = source_zero_probe.get(
+                        (src_schema, src_table),
+                        (None, "SRC_ZERO_PROBE_MISSING", 0)
+                    )
+                    if src_probe_flag is True:
+                        detail_parts.append("SRC_ZERO_PROBE=NONEMPTY")
+                    elif src_probe_flag is False:
+                        detail_parts.append("SRC_ZERO_PROBE=EMPTY")
+                    else:
+                        detail_parts.append(
+                            f"SRC_ZERO_PROBE_ERR={src_probe_err or 'UNKNOWN'}"
+                        )
                 if tgt_num_rows is None:
                     detail_parts.append("TGT_STATS_MISSING")
+                elif tgt_num_rows == 0:
+                    tgt_probe_flag, tgt_probe_err, _tgt_probe_ms = target_zero_probe.get(
+                        (tgt_schema, tgt_table),
+                        (None, "TGT_ZERO_PROBE_MISSING", 0)
+                    )
+                    if tgt_probe_flag is True:
+                        detail_parts.append("TGT_ZERO_PROBE=NONEMPTY")
+                    elif tgt_probe_flag is False:
+                        detail_parts.append("TGT_ZERO_PROBE=EMPTY")
+                    else:
+                        detail_parts.append(
+                            f"TGT_ZERO_PROBE_ERR={tgt_probe_err or 'UNKNOWN'}"
+                        )
                 if status == TABLE_PRESENCE_STATUS_UNKNOWN and src_has is False and tgt_has is True:
                     detail_parts.append("源端空表但目标端非空")
                 rows.append(TablePresenceResult(
@@ -17951,8 +18169,8 @@ def check_table_data_presence(
                     target_has_rows=_table_presence_flag(tgt_has),
                     status=status,
                     detail="; ".join(detail_parts),
-                    source_probe_ms=0,
-                    target_probe_ms=0
+                    source_probe_ms=int(src_probe_ms or 0),
+                    target_probe_ms=int(tgt_probe_ms or 0)
                 ))
 
             summary = _summarize_table_presence_rows(
@@ -19402,14 +19620,108 @@ class SqlPunctuationMasker:
         self.masked_sql = re.sub(pattern, _repl, self.masked_sql, flags=flags)
 
     def _mask(self) -> None:
-        # 1) 字符串字面量
-        self._mask_pattern(r"'(?:''|[^'])*'", self.literals, "PUNC_STR")
-        # 2) 块注释
-        self._mask_pattern(r"/\*.*?\*/", self.comments, "PUNC_CMT_BLK", flags=re.DOTALL)
-        # 3) 行注释
-        self._mask_pattern(r"--.*?$", self.comments, "PUNC_CMT_LN", flags=re.MULTILINE)
-        # 4) 双引号标识符
-        self._mask_pattern(r'"(?:\"\"|[^"])*"', self.quoted_identifiers, "PUNC_QID")
+        text = self.masked_sql
+        if not text:
+            return
+        q_quote_pairs = {
+            "[": "]",
+            "{": "}",
+            "(": ")",
+            "<": ">",
+        }
+        out: List[str] = []
+        i = 0
+        n = len(text)
+
+        while i < n:
+            ch = text[i]
+            nxt = text[i + 1] if i + 1 < n else ""
+
+            if ch == "-" and nxt == "-":
+                j = i + 2
+                while j < n and text[j] not in ("\n", "\r"):
+                    j += 1
+                key = f"###PUNC_CMT_LN_{len(self.comments)}###"
+                self.comments[key] = text[i:j]
+                out.append(key)
+                i = j
+                continue
+
+            if ch == "/" and nxt == "*":
+                j = i + 2
+                depth = 1
+                while j < n and depth > 0:
+                    c = text[j]
+                    nn = text[j + 1] if j + 1 < n else ""
+                    if c == "/" and nn == "*":
+                        depth += 1
+                        j += 2
+                        continue
+                    if c == "*" and nn == "/":
+                        depth -= 1
+                        j += 2
+                        continue
+                    j += 1
+                key = f"###PUNC_CMT_BLK_{len(self.comments)}###"
+                self.comments[key] = text[i:j]
+                out.append(key)
+                i = j
+                continue
+
+            if ch in ("q", "Q") and nxt == "'" and i + 2 < n:
+                delim = text[i + 2]
+                if not delim.isspace():
+                    end_delim = q_quote_pairs.get(delim, delim)
+                    j = i + 3
+                    while j + 1 < n:
+                        if text[j] == end_delim and text[j + 1] == "'":
+                            j += 2
+                            break
+                        j += 1
+                    else:
+                        j = n
+                    key = f"###PUNC_STR_{len(self.literals)}###"
+                    self.literals[key] = text[i:j]
+                    out.append(key)
+                    i = j
+                    continue
+
+            if ch == "'":
+                j = i + 1
+                while j < n:
+                    if text[j] == "'":
+                        if j + 1 < n and text[j + 1] == "'":
+                            j += 2
+                            continue
+                        j += 1
+                        break
+                    j += 1
+                key = f"###PUNC_STR_{len(self.literals)}###"
+                self.literals[key] = text[i:j]
+                out.append(key)
+                i = j
+                continue
+
+            if ch == '"':
+                j = i + 1
+                while j < n:
+                    if text[j] == '"':
+                        if j + 1 < n and text[j + 1] == '"':
+                            j += 2
+                            continue
+                        j += 1
+                        break
+                    j += 1
+                key = f"###PUNC_QID_{len(self.quoted_identifiers)}###"
+                self.quoted_identifiers[key] = text[i:j]
+                out.append(key)
+                i = j
+                continue
+
+            out.append(ch)
+            i += 1
+
+        self.masked_sql = "".join(out)
 
     def unmask(self, sql: str) -> str:
         for k, v in self.quoted_identifiers.items():
@@ -19668,7 +19980,6 @@ def mask_sql_for_scan(sql: str) -> str:
     chars = list(sql)
     i = 0
     in_single = False
-    in_double = False
     in_line_comment = False
     in_block_comment = False
     length = len(chars)
@@ -19701,16 +20012,6 @@ def mask_sql_for_scan(sql: str) -> str:
                 in_single = False
             i += 1
             continue
-        if in_double:
-            chars[i] = " "
-            if ch == '"' and nxt == '"':
-                chars[i + 1] = " "
-                i += 2
-                continue
-            if ch == '"':
-                in_double = False
-            i += 1
-            continue
         if ch == "-" and nxt == "-":
             chars[i] = " "
             chars[i + 1] = " "
@@ -19726,11 +20027,6 @@ def mask_sql_for_scan(sql: str) -> str:
         if ch == "'":
             chars[i] = " "
             in_single = True
-            i += 1
-            continue
-        if ch == '"':
-            chars[i] = " "
-            in_double = True
             i += 1
             continue
         i += 1
@@ -19855,7 +20151,9 @@ def _summarize_view_constraint_item(item: str) -> str:
 
 
 def _detect_view_constraint_state(item: str) -> Tuple[bool, str]:
-    upper = re.sub(r'\s+', ' ', item.strip()).upper()
+    no_block = re.sub(r'/\*.*?\*/', ' ', item or '', flags=re.DOTALL)
+    no_comment = re.sub(r'--.*$', '', no_block, flags=re.MULTILINE)
+    upper = re.sub(r'\s+', ' ', no_comment.strip()).upper()
     if "ENABLE" in upper and "DISABLE" not in upper:
         return False, "ENABLE"
     if "DISABLE" in upper:
@@ -22069,7 +22367,11 @@ def clean_storage_clauses(ddl: str) -> str:
             spans.append((start, end))
 
     # TABLESPACE <name>：仅移除代码中的 TABLESPACE 子句
-    for match in re.finditer(r'\s+TABLESPACE\s+[A-Z0-9_$#]+', masked_upper, flags=re.IGNORECASE):
+    for match in re.finditer(
+        r'\s+TABLESPACE\s+(?:"(?:[^"]|"")+"|[A-Z0-9_$#]+)',
+        masked_upper,
+        flags=re.IGNORECASE
+    ):
         spans.append((match.start(), match.end()))
 
     if not spans:
@@ -36514,6 +36816,7 @@ def parse_cli_args() -> argparse.Namespace:
             table_data_presence_auto_max_tables auto 模式候选表阈值（默认 20000）
             table_data_presence_chunk_size OB 批量探测 chunk 大小（默认 500）
             table_data_presence_obclient_timeout OB 批量探测超时（秒，默认沿用 obclient_timeout）
+            table_data_presence_zero_probe_workers Oracle 零行探针并发数（默认 1，最大 32）
             generate_grants         true/false 控制授权脚本生成
             grant_tab_privs_scope   owner/owner_or_grantee 控制 DBA_TAB_PRIVS 抽取范围
             grant_merge_privileges  true/false 合并同对象多权限授权

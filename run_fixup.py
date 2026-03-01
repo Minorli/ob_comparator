@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import fnmatch
+import hashlib
 import json
 import logging
 import re
@@ -47,10 +48,15 @@ import subprocess
 import sys
 import textwrap
 from collections import defaultdict, OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+try:
+    import fcntl
+except Exception:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 __version__ = "0.9.8.6"
 
@@ -63,6 +69,8 @@ DEFAULT_ERROR_REPORT_LIMIT = 200
 DEFAULT_FIXUP_MAX_SQL_FILE_MB = 50
 DEFAULT_FIXUP_AUTO_GRANT_CACHE_LIMIT = 10000
 MAX_RECOMPILE_RETRIES = 5
+STATE_LEDGER_FILENAME = ".fixup_state_ledger.json"
+FIXUP_RUN_LOCK_FILENAME = ".run_fixup.lock"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
 REPO_ISSUES_URL = f"{REPO_URL}/issues"
 
@@ -651,6 +659,97 @@ class ConfigError(Exception):
     """Custom exception for configuration issues."""
 
 
+@contextmanager
+def acquire_fixup_run_lock(fixup_dir: Path):
+    """Best-effort process lock to avoid concurrent run_fixup execution."""
+    lock_path = fixup_dir / FIXUP_RUN_LOCK_FILENAME
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fp = lock_path.open("a+", encoding="utf-8")
+    locked = False
+    try:
+        if fcntl is None:
+            yield
+            return
+        try:
+            fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+        except BlockingIOError as exc:
+            raise ConfigError(f"检测到另一个 run_fixup 正在执行: {lock_path}") from exc
+        yield
+    finally:
+        if locked and fcntl is not None:
+            try:
+                fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+        try:
+            fp.close()
+        except Exception:
+            pass
+
+
+class FixupStateLedger:
+    """Local ledger to avoid duplicate replay after move-to-done failures."""
+
+    def __init__(self, fixup_dir: Path):
+        self.path = fixup_dir / STATE_LEDGER_FILENAME
+        self._data: Dict[str, Dict[str, str]] = {}
+        self._dirty = False
+        self._load()
+
+    @staticmethod
+    def fingerprint(sql_text: str) -> str:
+        return hashlib.sha1((sql_text or "").encode("utf-8")).hexdigest()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            self._data = {}
+            return
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                self._data = payload.get("completed", {}) if isinstance(payload.get("completed"), dict) else {}
+            else:
+                self._data = {}
+        except Exception as exc:
+            log.warning("[STATE] 读取状态账本失败，将忽略旧账本: %s", exc)
+            self._data = {}
+
+    def flush(self) -> None:
+        if not self._dirty:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"version": 1, "completed": self._data}
+            self.path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8"
+            )
+            self._dirty = False
+        except Exception as exc:
+            log.warning("[STATE] 写入状态账本失败: %s", exc)
+
+    def is_completed(self, relative_path: Path, fingerprint: str) -> bool:
+        key = str(relative_path).replace("\\", "/")
+        item = self._data.get(key)
+        return bool(item and item.get("fingerprint") == fingerprint)
+
+    def mark_completed(self, relative_path: Path, fingerprint: str, note: str) -> None:
+        key = str(relative_path).replace("\\", "/")
+        self._data[key] = {
+            "fingerprint": fingerprint,
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "note": note[:300],
+        }
+        self._dirty = True
+
+    def clear(self, relative_path: Path) -> None:
+        key = str(relative_path).replace("\\", "/")
+        if key in self._data:
+            self._data.pop(key, None)
+            self._dirty = True
+
+
 def read_sql_text_with_limit(sql_path: Path, max_bytes: Optional[int]) -> Tuple[Optional[str], Optional[str]]:
     """Read SQL file with optional size limit."""
     try:
@@ -672,16 +771,130 @@ def extract_sql_error(output: str) -> Optional[str]:
     return None
 
 
+def _scan_sql_word_tokens(sql_text: str) -> List[Tuple[str, int, int]]:
+    """Scan SQL words outside literals/comments; returns (UPPER_WORD, start, end)."""
+    tokens: List[Tuple[str, int, int]] = []
+    i = 0
+    n = len(sql_text or "")
+    in_single = False
+    in_double = False
+    in_q_quote = False
+    q_quote_end = ""
+    block_comment_depth = 0
+    line_comment = False
+    while i < n:
+        ch = sql_text[i]
+        nxt = sql_text[i + 1] if i + 1 < n else ""
+
+        if line_comment:
+            if ch in ("\n", "\r"):
+                line_comment = False
+            i += 1
+            continue
+
+        if block_comment_depth > 0:
+            if ch == "/" and nxt == "*":
+                block_comment_depth += 1
+                i += 2
+                continue
+            if ch == "*" and nxt == "/":
+                block_comment_depth -= 1
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if in_q_quote:
+            if ch == q_quote_end and nxt == "'":
+                in_q_quote = False
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if in_single:
+            if ch == "'" and nxt == "'":
+                i += 2
+                continue
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+
+        if in_double:
+            if ch == '"' and nxt == '"':
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+
+        if ch == "-" and nxt == "-":
+            line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            block_comment_depth += 1
+            i += 2
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
+        if ch in ("q", "Q") and nxt == "'" and i + 2 < n:
+            delimiter = sql_text[i + 2]
+            if not delimiter.isspace():
+                q_quote_end = Q_QUOTE_DELIMS.get(delimiter, delimiter)
+                in_q_quote = True
+                i += 3
+                continue
+
+        if ch.isalpha() or ch in ("_", "$", "#"):
+            start = i
+            i += 1
+            while i < n:
+                c = sql_text[i]
+                if c.isalnum() or c in ("_", "$", "#"):
+                    i += 1
+                    continue
+                break
+            word = sql_text[start:i]
+            tokens.append((word.upper(), start, i))
+            continue
+        i += 1
+    return tokens
+
+
 def sanitize_view_chain_view_ddl(ddl_text: str) -> str:
     if not ddl_text:
         return ddl_text
-    match = re.search(
-        r"(?is)\bCREATE\b(?P<or_replace>\s+OR\s+REPLACE)?(?P<mid>.*?)\bVIEW\b",
-        ddl_text
-    )
-    if not match:
+    tokens = _scan_sql_word_tokens(ddl_text)
+    if not tokens or tokens[0][0] != "CREATE":
         return ddl_text
-    mid = match.group("mid") or ""
+    idx = 1
+    has_or_replace = False
+    if idx + 1 < len(tokens) and tokens[idx][0] == "OR" and tokens[idx + 1][0] == "REPLACE":
+        has_or_replace = True
+        idx += 2
+    view_idx: Optional[int] = None
+    for pos in range(idx, len(tokens)):
+        if tokens[pos][0] == "VIEW":
+            view_idx = pos
+            break
+        if tokens[pos][0] in ("AS", "SELECT", "WITH"):
+            break
+    if view_idx is None:
+        return ddl_text
+
+    create_start = tokens[0][1]
+    view_end = tokens[view_idx][2]
+    mid_start = tokens[idx - 1][2] if has_or_replace else tokens[0][2]
+    mid = ddl_text[mid_start:tokens[view_idx][1]]
     mid_clean = re.sub(
         r"(?is)\bNO\s+FORCE\b|\bFORCE\b|\bEDITIONABLE\b|\bNONEDITIONABLE\b",
         " ",
@@ -689,10 +902,10 @@ def sanitize_view_chain_view_ddl(ddl_text: str) -> str:
     )
     mid_clean = " ".join(mid_clean.split())
     prefix = "CREATE"
-    if match.group("or_replace"):
+    if has_or_replace:
         prefix += " OR REPLACE"
     replacement = prefix + (" " + mid_clean if mid_clean else "") + " VIEW"
-    return ddl_text[:match.start()] + replacement + ddl_text[match.end():]
+    return ddl_text[:create_start] + replacement + ddl_text[view_end:]
 
 
 def move_sql_to_done(sql_path: Path, done_dir: Path) -> str:
@@ -827,6 +1040,7 @@ class AutoGrantContext:
     planned_object_privs_with_option: Set[Tuple[str, str, str]]
     planned_sys_privs: Set[Tuple[str, str]]
     applied_grants: Set[str]
+    blocked_objects: Set[Tuple[str, str]]
     stats: AutoGrantStats
 
 
@@ -1658,6 +1872,7 @@ def init_auto_grant_context(
         planned_object_privs_with_option=set(),
         planned_sys_privs=set(),
         applied_grants=set(),
+        blocked_objects=set(),
         stats=stats
     )
     log.info(
@@ -1729,13 +1944,21 @@ def execute_auto_grant_for_object(
 ) -> Tuple[int, bool]:
     if not ctx.settings.enabled:
         return 0, False
+    obj_full_u = normalize_full_name(obj_full)
     obj_type_u = normalize_object_type(obj_type)
     if obj_type_u not in ctx.settings.types:
         ctx.stats.skipped += 1
         return 0, False
-    plan_lines, sql_lines, blocked = build_auto_grant_plan_for_object(ctx, obj_full, obj_type_u)
+    obj_key = (obj_full_u, obj_type_u)
+    if obj_key in ctx.blocked_objects:
+        ctx.stats.skipped += 1
+        log.info("%s [AUTO-GRANT] %s(%s) 已阻断，跳过重复规划。", label, obj_full_u, obj_type_u)
+        return 0, True
+    plan_lines, sql_lines, blocked = build_auto_grant_plan_for_object(ctx, obj_full_u, obj_type_u)
     if blocked:
         ctx.stats.blocked += 1
+        if not sql_lines:
+            ctx.blocked_objects.add(obj_key)
     if not sql_lines:
         return 0, blocked
     ctx.stats.planned += len(sql_lines)
@@ -1750,6 +1973,16 @@ def execute_auto_grant_for_object(
         ctx.stats.executed += summary.statements
         log.info("%s [AUTO-GRANT] %s(%s) 授权成功 %d", label, obj_full, obj_type_u, summary.statements)
     return summary.statements, blocked
+
+
+def reset_auto_grant_round_cache(ctx: Optional[AutoGrantContext], round_num: int) -> int:
+    if not ctx:
+        return 0
+    cleared = len(ctx.blocked_objects)
+    if cleared:
+        ctx.blocked_objects.clear()
+        log.info("[AUTO-GRANT] 第 %d 轮开始，已清理上一轮阻断缓存 %d 项。", round_num, cleared)
+    return cleared
 
 
 def find_latest_view_chain_file(report_dir: Path) -> Optional[Path]:
@@ -1785,6 +2018,19 @@ def check_object_exists(
     exists = count > 0
     exists_cache[key] = exists
     return exists
+
+
+def invalidate_exists_cache(
+    exists_cache: Dict[Tuple[str, str], bool],
+    planned_objects: Set[Tuple[str, str]]
+) -> int:
+    removed = 0
+    for full_name, obj_type in planned_objects:
+        key = (normalize_identifier(full_name), normalize_object_type(obj_type))
+        if key in exists_cache:
+            exists_cache.pop(key, None)
+            removed += 1
+    return removed
 
 
 def load_roles_for_grantee(
@@ -2909,8 +3155,13 @@ def build_auto_grant_statement(
     priv_u = required_priv.strip().upper()
     if not grantee_u or not object_u or not priv_u:
         return None
+    obj_schema, obj_name = parse_object_token(object_u)
+    if obj_schema:
+        object_ref = quote_qualified_name(obj_schema, obj_name)
+    else:
+        object_ref = quote_identifier(obj_name)
     suffix = " WITH GRANT OPTION" if with_grant_option else ""
-    return f"GRANT {priv_u} ON {object_u} TO {grantee_u}{suffix};"
+    return f"GRANT {priv_u} ON {object_ref} TO {quote_identifier(grantee_u)}{suffix};"
 
 
 def split_grant_list(raw: str) -> List[str]:
@@ -3192,7 +3443,8 @@ def execute_grant_file_with_prune(
     label_prefix: str,
     error_entries: List[ErrorReportEntry],
     error_limit: int,
-    max_sql_file_bytes: Optional[int]
+    max_sql_file_bytes: Optional[int],
+    state_ledger: Optional[FixupStateLedger] = None
 ) -> Tuple[ScriptResult, ExecutionSummary, int, int, bool]:
     relative_path = sql_path.relative_to(repo_root)
     sql_text, read_error = read_sql_text_with_limit(sql_path, max_sql_file_bytes)
@@ -3201,6 +3453,11 @@ def execute_grant_file_with_prune(
         log.error("%s %s -> ERROR (%s)", label_prefix, relative_path, msg)
         failure = StatementFailure(0, msg, "")
         return ScriptResult(relative_path, "ERROR", msg, layer), ExecutionSummary(0, [failure]), 0, 0, False
+    fingerprint = FixupStateLedger.fingerprint(sql_text or "")
+    if state_ledger and state_ledger.is_completed(relative_path, fingerprint):
+        msg = "状态账本命中，跳过重复执行"
+        log.warning("%s %s -> SKIP (%s)", label_prefix, relative_path, msg)
+        return ScriptResult(relative_path, "SKIPPED", msg, layer), ExecutionSummary(0, []), 0, 0, False
 
     statements = split_sql_statements(sql_text or "")
     kept_statements: List[str] = []
@@ -3263,9 +3520,13 @@ def execute_grant_file_with_prune(
     if summary.success:
         move_note = move_sql_to_done(sql_path, done_dir)
         if "移动失败" in move_note:
+            if state_ledger:
+                state_ledger.mark_completed(relative_path, fingerprint, "EXECUTED_BUT_MOVE_FAILED")
             log.error("%s %s -> ERROR %s", label_prefix, relative_path, move_note)
             failure = StatementFailure(0, move_note.strip("()"), "")
             return ScriptResult(relative_path, "ERROR", move_note.strip(), layer), ExecutionSummary(executed_count, [failure]), removed_count, 0, truncated
+        if state_ledger:
+            state_ledger.clear(relative_path)
         log.info(
             "%s %s -> OK %s (已清理授权 %d 条)",
             label_prefix,
@@ -3305,7 +3566,8 @@ def execute_script_with_summary(
     timeout: Optional[int],
     layer: int,
     label_prefix: str,
-    max_sql_file_bytes: Optional[int]
+    max_sql_file_bytes: Optional[int],
+    state_ledger: Optional[FixupStateLedger] = None
 ) -> Tuple[ScriptResult, ExecutionSummary]:
     relative_path = sql_path.relative_to(repo_root)
     sql_text, read_error = read_sql_text_with_limit(sql_path, max_sql_file_bytes)
@@ -3313,6 +3575,11 @@ def execute_script_with_summary(
         msg = read_error
         log.error("%s %s -> ERROR (%s)", label_prefix, relative_path, msg)
         return ScriptResult(relative_path, "ERROR", msg, layer), ExecutionSummary(0, [StatementFailure(0, msg, "")])
+    fingerprint = FixupStateLedger.fingerprint(sql_text or "")
+    if state_ledger and state_ledger.is_completed(relative_path, fingerprint):
+        msg = "状态账本命中，跳过重复执行"
+        log.warning("%s %s -> SKIP (%s)", label_prefix, relative_path, msg)
+        return ScriptResult(relative_path, "SKIPPED", msg, layer), ExecutionSummary(0, [])
 
     if not (sql_text or "").strip():
         log.warning("%s %s -> SKIP (文件为空)", label_prefix, relative_path)
@@ -3326,9 +3593,13 @@ def execute_script_with_summary(
     if summary.success:
         move_note = move_sql_to_done(sql_path, done_dir)
         if "移动失败" in move_note:
+            if state_ledger:
+                state_ledger.mark_completed(relative_path, fingerprint, "EXECUTED_BUT_MOVE_FAILED")
             log.error("%s %s -> ERROR %s", label_prefix, relative_path, move_note)
             failure = StatementFailure(0, move_note.strip("()"), "")
             return ScriptResult(relative_path, "ERROR", move_note.strip(), layer), ExecutionSummary(summary.statements, [failure])
+        if state_ledger:
+            state_ledger.clear(relative_path)
         log.info("%s %s -> OK %s", label_prefix, relative_path, move_note)
         return ScriptResult(relative_path, "SUCCESS", move_note.strip(), layer), summary
 
@@ -3388,6 +3659,26 @@ def query_invalid_objects(
         return []
 
 
+def is_object_invalid(
+    obclient_cmd: List[str],
+    timeout: Optional[int],
+    owner: str,
+    obj_name: str,
+    obj_type: str
+) -> Optional[bool]:
+    sql = (
+        "SELECT COUNT(*) FROM DBA_OBJECTS "
+        f"WHERE OWNER='{escape_sql_literal(owner)}' "
+        f"AND OBJECT_NAME='{escape_sql_literal(obj_name)}' "
+        f"AND OBJECT_TYPE='{escape_sql_literal(obj_type)}' "
+        "AND STATUS='INVALID'"
+    )
+    count = query_count(obclient_cmd, sql, timeout)
+    if count is None:
+        return None
+    return count > 0
+
+
 def build_compile_statement(owner: str, obj_name: str, obj_type: str) -> Optional[str]:
     if not owner or not obj_name or not obj_type:
         return None
@@ -3438,8 +3729,14 @@ def recompile_invalid_objects(
                 result = run_sql(obclient_cmd, compile_sql, timeout)
                 error_msg = extract_execution_error(result)
                 if not error_msg:
-                    recompiled_this_round += 1
-                    log.info("  OK %s.%s (%s)", owner, obj_name, obj_type)
+                    still_invalid = is_object_invalid(obclient_cmd, timeout, owner, obj_name, obj_type)
+                    if still_invalid is False:
+                        recompiled_this_round += 1
+                        log.info("  OK %s.%s (%s)", owner, obj_name, obj_type)
+                    elif still_invalid is True:
+                        log.warning("  FAIL %s.%s (%s): still INVALID after COMPILE", owner, obj_name, obj_type)
+                    else:
+                        log.warning("  WARN %s.%s (%s): 无法确认编译后状态，未计入成功", owner, obj_name, obj_type)
                 else:
                     log.warning(
                         "  FAIL %s.%s (%s): %s",
@@ -3695,33 +3992,34 @@ def main() -> None:
     min_progress = getattr(args, 'min_progress', 1)
     
     try:
-        if getattr(args, "view_chain_autofix", False):
-            run_view_chain_autofix(
-                args,
-                ob_cfg,
-                fixup_dir,
-                repo_root,
-                report_dir,
-                only_dirs,
-                exclude_dirs,
-                fixup_settings,
-                max_sql_file_bytes
-            )
-        elif iterative_mode:
-            run_iterative_fixup(
-                args, ob_cfg, fixup_dir, repo_root, report_dir,
-                only_dirs, exclude_dirs,
-                fixup_settings,
-                max_sql_file_bytes,
-                max_rounds, min_progress
-            )
-        else:
-            run_single_fixup(
-                args, ob_cfg, fixup_dir, repo_root, report_dir,
-                only_dirs, exclude_dirs,
-                fixup_settings,
-                max_sql_file_bytes
-            )
+        with acquire_fixup_run_lock(fixup_dir):
+            if getattr(args, "view_chain_autofix", False):
+                run_view_chain_autofix(
+                    args,
+                    ob_cfg,
+                    fixup_dir,
+                    repo_root,
+                    report_dir,
+                    only_dirs,
+                    exclude_dirs,
+                    fixup_settings,
+                    max_sql_file_bytes
+                )
+            elif iterative_mode:
+                run_iterative_fixup(
+                    args, ob_cfg, fixup_dir, repo_root, report_dir,
+                    only_dirs, exclude_dirs,
+                    fixup_settings,
+                    max_sql_file_bytes,
+                    max_rounds, min_progress
+                )
+            else:
+                run_single_fixup(
+                    args, ob_cfg, fixup_dir, repo_root, report_dir,
+                    only_dirs, exclude_dirs,
+                    fixup_settings,
+                    max_sql_file_bytes
+                )
     except ConfigError as exc:
         log.error("执行失败: %s", exc)
         sys.exit(1)
@@ -3747,6 +4045,7 @@ def run_single_fixup(
     
     done_dir = fixup_dir / DONE_DIR_NAME
     done_dir.mkdir(exist_ok=True)
+    state_ledger = FixupStateLedger(fixup_dir)
     
     # Collect SQL files
     files_with_layer = collect_sql_files_by_layer(
@@ -3824,7 +4123,8 @@ def run_single_fixup(
                 label,
                 error_entries,
                 DEFAULT_ERROR_REPORT_LIMIT,
-                max_sql_file_bytes
+                max_sql_file_bytes,
+                state_ledger=state_ledger
             )
             error_truncated = error_truncated or truncated
             results.append(result)
@@ -3844,7 +4144,8 @@ def run_single_fixup(
                 ob_timeout,
                 layer,
                 label,
-                max_sql_file_bytes
+                max_sql_file_bytes,
+                state_ledger=state_ledger
             )
             if result.status == "SUCCESS":
                 results.append(result)
@@ -3892,7 +4193,8 @@ def run_single_fixup(
                     ob_timeout,
                     layer,
                     f"{label} (retry)",
-                    max_sql_file_bytes
+                    max_sql_file_bytes,
+                    state_ledger=state_ledger
                 )
                 results.append(retry_result)
                 if retry_result.status == "FAILED":
@@ -4003,6 +4305,7 @@ def run_single_fixup(
     )
     if report_path:
         log.info("错误报告已输出: %s", report_path)
+    state_ledger.flush()
 
     log_section("执行结束")
     
@@ -4229,7 +4532,7 @@ def run_view_chain_autofix(
             continue
 
         summary = execute_sql_statements(obclient_cmd, sql_text, ob_timeout)
-        exists_cache.pop((view_key.upper(), normalize_object_type(root_type)), None)
+        invalidate_exists_cache(exists_cache, planned_objects | {(view_key, root_type)})
         post_exists = check_object_exists(
             obclient_cmd,
             ob_timeout,
@@ -4345,6 +4648,7 @@ def run_iterative_fixup(
     
     done_dir = fixup_dir / DONE_DIR_NAME
     done_dir.mkdir(exist_ok=True)
+    state_ledger = FixupStateLedger(fixup_dir)
     
     obclient_cmd = build_obclient_command(ob_cfg)
     ob_timeout = resolve_timeout_value(ob_cfg.get("timeout"))
@@ -4374,6 +4678,7 @@ def run_iterative_fixup(
     
     while round_num < max_rounds:
         round_num += 1
+        reset_auto_grant_round_cache(auto_grant_ctx, round_num)
         
         log_section(f"第 {round_num}/{max_rounds} 轮")
         
@@ -4385,6 +4690,11 @@ def run_iterative_fixup(
             exclude_dirs=set(exclude_dirs),
             glob_patterns=args.glob_patterns or None,
         )
+        stale_failed = [path for path in sorted(active_failed_paths, key=str) if not path.exists()]
+        if stale_failed:
+            for path in stale_failed:
+                active_failed_paths.discard(path)
+            log.info("历史失败脚本已不存在，已从失败集合移除: %d", len(stale_failed))
         
         if not files_with_layer:
             log.info("✓ 所有脚本已成功执行！")
@@ -4426,12 +4736,13 @@ def run_iterative_fixup(
                     repo_root,
                     done_dir,
                     ob_timeout,
-                    layer,
-                    label,
-                    error_entries,
-                    DEFAULT_ERROR_REPORT_LIMIT,
-                    max_sql_file_bytes
-                )
+                layer,
+                label,
+                error_entries,
+                DEFAULT_ERROR_REPORT_LIMIT,
+                max_sql_file_bytes,
+                state_ledger=state_ledger
+            )
                 error_truncated = error_truncated or truncated
                 round_results.append(result)
                 continue
@@ -4452,7 +4763,8 @@ def run_iterative_fixup(
                 ob_timeout,
                 layer,
                 label,
-                max_sql_file_bytes
+                max_sql_file_bytes,
+                state_ledger=state_ledger
             )
 
             if result.status == "SUCCESS":
@@ -4507,7 +4819,8 @@ def run_iterative_fixup(
                                 ob_timeout,
                                 layer,
                                 "[DEPS]",
-                                max_sql_file_bytes
+                                max_sql_file_bytes,
+                                state_ledger=state_ledger
                             )
                             pre_executed.add(dep_path)
                             round_results.append(dep_result)
@@ -4543,7 +4856,8 @@ def run_iterative_fixup(
                     ob_timeout,
                     layer,
                     f"{label} (retry)",
-                    max_sql_file_bytes
+                    max_sql_file_bytes,
+                    state_ledger=state_ledger
                 )
                 round_results.append(retry_result)
                 if retry_result.status == "FAILED":
@@ -4678,6 +4992,7 @@ def run_iterative_fixup(
     )
     if report_path:
         log.info("错误报告已输出: %s", report_path)
+    state_ledger.flush()
 
     log_section("执行结束")
     
