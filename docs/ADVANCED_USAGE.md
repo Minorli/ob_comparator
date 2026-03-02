@@ -123,6 +123,7 @@
 
 ### 5.3 报告存库（默认开启，obclient）
 - `report_to_db=true` 后，会将报告写入 OceanBase（仅 obclient；不影响本地报告文件）。
+- `DIFF_REPORT_SUMMARY.WRITE_STATUS='READY'` 才表示该 report_id 已完整写入并通过口径复核；`WRITING/FAILED` 不用于结论判断。
 - 运行后会在 run 目录输出 `report_sql_<timestamp>.txt`（预填 report_id 的 SQL 模板）。
 - 当 `report_db_store_scope=core/full` 时，会尝试创建只读分析视图：
   `DIFF_REPORT_ACTIONS_V` / `DIFF_REPORT_OBJECT_PROFILE_V` / `DIFF_REPORT_TRENDS_V`
@@ -166,6 +167,7 @@
 ```sql
 SELECT REPORT_ID, RUN_TIMESTAMP, TOTAL_CHECKED, MISSING_COUNT, MISMATCHED_COUNT, CONCLUSION
 FROM DIFF_REPORT_SUMMARY
+WHERE NVL(WRITE_STATUS, 'READY') = 'READY'
 ORDER BY RUN_TIMESTAMP DESC
 FETCH FIRST 10 ROWS ONLY;
 ```

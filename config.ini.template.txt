@@ -150,6 +150,16 @@ fixup_auto_grant        = true
 fixup_auto_grant_types  = VIEW,MATERIALIZED VIEW,SYNONYM,PROCEDURE,FUNCTION,PACKAGE,PACKAGE BODY,TYPE,TYPE BODY
 fixup_auto_grant_fallback = true
 fixup_auto_grant_cache_limit = 10000
+# run_fixup SQL 执行粒度
+# fixup_exec_mode:
+#   auto      -> 非 grants_* 目录默认按文件执行；grants_* 保持逐语句剪枝
+#   file      -> 非 grants_* 目录按文件执行
+#   statement -> 非 grants_* 目录逐语句执行（兼容旧行为）
+# fixup_exec_file_fallback:
+#   true  -> file 模式失败时自动回退一次 statement（默认）
+#   false -> file 模式失败后直接报错
+fixup_exec_mode         = auto
+fixup_exec_file_fallback = true
 # 授权抽取范围（DBA_TAB_PRIVS）
 # owner: 仅加载源 schema 拥有的对象权限（默认，性能更佳）
 # owner_or_grantee: 兼容旧逻辑，额外加载 grantee 在源 schema 的对象授权

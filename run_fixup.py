@@ -70,6 +70,8 @@ DEFAULT_ERROR_REPORT_LIMIT = 200
 DEFAULT_FIXUP_MAX_SQL_FILE_MB = 50
 DEFAULT_FIXUP_AUTO_GRANT_CACHE_LIMIT = 10000
 DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC = 5
+DEFAULT_FIXUP_EXEC_MODE = "auto"
+DEFAULT_FIXUP_EXEC_FILE_FALLBACK = True
 MAX_RECOMPILE_RETRIES = 5
 STATE_LEDGER_FILENAME = ".fixup_state_ledger.json"
 FIXUP_RUN_LOCK_FILENAME = ".run_fixup.lock"
@@ -79,6 +81,7 @@ REPO_ISSUES_URL = f"{REPO_URL}/issues"
 
 CONFIG_HOT_RELOAD_MODE_VALUES = {"off", "phase", "round"}
 CONFIG_HOT_RELOAD_FAIL_POLICY_VALUES = {"keep_last_good", "abort"}
+FIXUP_EXEC_MODE_VALUES = {"auto", "file", "statement"}
 
 LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOG_FILE_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
@@ -876,6 +879,41 @@ def _scan_sql_word_tokens(sql_text: str) -> List[Tuple[str, int, int]]:
     return tokens
 
 
+def detect_session_sensitive_reason(sql_text: str) -> Optional[str]:
+    """
+    Detect SQL patterns that require same-session execution semantics.
+    Keep CURRENT_SCHEMA-only statements out of this rule to preserve
+    existing per-statement behavior.
+    """
+    tokens = [token for token, _start, _end in _scan_sql_word_tokens(sql_text or "")]
+    if not tokens:
+        return None
+
+    n = len(tokens)
+    for i in range(n - 1):
+        if tokens[i] == "ALTER" and tokens[i + 1] == "SESSION":
+            # "ALTER SESSION SET CURRENT_SCHEMA" 已由 per-statement 注入补偿处理。
+            if i + 3 < n and tokens[i + 2] == "SET" and tokens[i + 3] == "CURRENT_SCHEMA":
+                continue
+            return "ALTER SESSION"
+        if tokens[i] == "SET" and tokens[i + 1] == "ROLE":
+            return "SET ROLE"
+
+    for token in tokens:
+        if token in {"DBMS_SESSION", "DBMS_APPLICATION_INFO"}:
+            return token
+
+    for i in range(max(0, n - 3)):
+        if (
+            tokens[i] == "CREATE"
+            and tokens[i + 1] == "GLOBAL"
+            and tokens[i + 2] == "TEMPORARY"
+            and tokens[i + 3] == "TABLE"
+        ):
+            return "GLOBAL TEMPORARY TABLE"
+    return None
+
+
 def sanitize_view_chain_view_ddl(ddl_text: str) -> str:
     if not ddl_text:
         return ddl_text
@@ -976,6 +1014,8 @@ class FixupAutoGrantSettings:
     types: Set[str]
     fallback: bool
     cache_limit: int
+    exec_mode: str = DEFAULT_FIXUP_EXEC_MODE
+    exec_file_fallback: bool = DEFAULT_FIXUP_EXEC_FILE_FALLBACK
 
 
 @dataclass
@@ -1335,6 +1375,8 @@ def apply_fixup_hot_reload_at_round(
             "SETTINGS.fixup_auto_grant_types",
             "SETTINGS.fixup_auto_grant_fallback",
             "SETTINGS.fixup_auto_grant_cache_limit",
+            "SETTINGS.fixup_exec_mode",
+            "SETTINGS.fixup_exec_file_fallback",
         ])
 
     if candidate_max_sql_file_bytes != current_max_sql_file_bytes:
@@ -1476,11 +1518,24 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
     )
     if auto_grant_cache_limit < 0:
         auto_grant_cache_limit = DEFAULT_FIXUP_AUTO_GRANT_CACHE_LIMIT
+    exec_mode = normalize_fixup_exec_mode(
+        parser.get("SETTINGS", "fixup_exec_mode", fallback=DEFAULT_FIXUP_EXEC_MODE)
+    )
+    exec_file_fallback = parse_bool_flag(
+        parser.get(
+            "SETTINGS",
+            "fixup_exec_file_fallback",
+            fallback="true" if DEFAULT_FIXUP_EXEC_FILE_FALLBACK else "false"
+        ),
+        DEFAULT_FIXUP_EXEC_FILE_FALLBACK
+    )
     fixup_settings = FixupAutoGrantSettings(
         enabled=auto_grant_enabled,
         types=auto_grant_types,
         fallback=auto_grant_fallback,
-        cache_limit=auto_grant_cache_limit
+        cache_limit=auto_grant_cache_limit,
+        exec_mode=exec_mode,
+        exec_file_fallback=exec_file_fallback
     )
     max_sql_mb = parser.getint(
         "SETTINGS",
@@ -1701,6 +1756,18 @@ def parse_bool_flag(value: Optional[str], default: bool = True) -> bool:
     if value is None:
         return default
     return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def normalize_fixup_exec_mode(raw_value: Optional[str]) -> str:
+    value = (raw_value or DEFAULT_FIXUP_EXEC_MODE).strip().lower()
+    if value not in FIXUP_EXEC_MODE_VALUES:
+        log.warning(
+            "fixup_exec_mode=%s 非法，回退为 %s（支持: auto/file/statement）",
+            raw_value,
+            DEFAULT_FIXUP_EXEC_MODE
+        )
+        return DEFAULT_FIXUP_EXEC_MODE
+    return value
 
 
 def parse_fixup_auto_grant_types(raw_value: str) -> Set[str]:
@@ -3022,13 +3089,99 @@ def run_sql(obclient_cmd: List[str], sql_text: str, timeout: Optional[int]) -> s
         raise ConfigError(f"调用 obclient 失败: {exc}") from exc
 
 
+def resolve_script_exec_mode(config_mode: str, sql_path: Path) -> str:
+    """
+    Resolve effective execution mode for one SQL file.
+    Grant directories remain statement-level to preserve prune semantics.
+    """
+    mode = normalize_fixup_exec_mode(config_mode)
+    if is_grant_dir(sql_path.parent.name):
+        return "statement"
+    if mode == "auto":
+        return "file"
+    return mode
+
+
+def new_exec_mode_stats() -> Dict[str, int]:
+    return {
+        "file": 0,
+        "statement": 0,
+        "grants_statement": 0,
+        "fallback_retried": 0,
+        "fallback_success": 0,
+    }
+
+
+def bump_exec_mode_stat(exec_stats: Optional[Dict[str, int]], key: str, inc: int = 1) -> None:
+    if exec_stats is None:
+        return
+    exec_stats[key] = int(exec_stats.get(key, 0)) + inc
+
+
 def execute_sql_statements(
     obclient_cmd: List[str],
     sql_text: str,
-    timeout: Optional[int]
+    timeout: Optional[int],
+    mode: str = "statement"
 ) -> ExecutionSummary:
+    mode = normalize_fixup_exec_mode(mode)
+    if mode == "auto":
+        mode = "statement"
     statements = split_sql_statements(sql_text)
+    effective_statements = [stmt for stmt in statements if stmt and stmt.strip()]
     failures: List[StatementFailure] = []
+    if not effective_statements:
+        return ExecutionSummary(statements=0, failures=failures)
+
+    if mode == "file":
+        try:
+            result = run_sql(obclient_cmd, sql_text, timeout)
+        except subprocess.TimeoutExpired:
+            timeout_label = "no-timeout" if timeout is None else f"> {timeout} 秒"
+            failures.append(
+                StatementFailure(
+                    1,
+                    f"执行超时 ({timeout_label})",
+                    sql_text
+                )
+            )
+            return ExecutionSummary(statements=len(effective_statements), failures=failures)
+        error_msg = extract_execution_error(result)
+        if error_msg:
+            failures.append(
+                StatementFailure(
+                    1,
+                    error_msg,
+                    sql_text
+                )
+            )
+        return ExecutionSummary(statements=len(effective_statements), failures=failures)
+
+    session_sensitive_reason = detect_session_sensitive_reason(sql_text)
+    if session_sensitive_reason and len(effective_statements) > 1:
+        try:
+            result = run_sql(obclient_cmd, sql_text, timeout)
+        except subprocess.TimeoutExpired:
+            timeout_label = "no-timeout" if timeout is None else f"> {timeout} 秒"
+            failures.append(
+                StatementFailure(
+                    1,
+                    f"执行超时 ({timeout_label})",
+                    sql_text
+                )
+            )
+            return ExecutionSummary(statements=len(effective_statements), failures=failures)
+        error_msg = extract_execution_error(result)
+        if error_msg:
+            failures.append(
+                StatementFailure(
+                    1,
+                    f"{error_msg} [session-sensitive={session_sensitive_reason}]",
+                    sql_text
+                )
+            )
+        return ExecutionSummary(statements=len(effective_statements), failures=failures)
+
     current_schema: Optional[str] = None
 
     for idx, statement in enumerate(statements, start=1):
@@ -3051,7 +3204,60 @@ def execute_sql_statements(
         if error_msg:
             failures.append(StatementFailure(idx, error_msg, statement_to_run))
 
-    return ExecutionSummary(statements=len(statements), failures=failures)
+    return ExecutionSummary(statements=len(effective_statements), failures=failures)
+
+
+def execute_sql_with_mode(
+    obclient_cmd: List[str],
+    sql_text: str,
+    timeout: Optional[int],
+    exec_mode: str,
+    exec_file_fallback: bool,
+    exec_stats: Optional[Dict[str, int]] = None,
+    context_label: str = "",
+) -> ExecutionSummary:
+    mode = normalize_fixup_exec_mode(exec_mode)
+    if mode == "auto":
+        mode = "statement"
+    bump_exec_mode_stat(exec_stats, mode)
+
+    summary = execute_sql_statements(
+        obclient_cmd,
+        sql_text,
+        timeout,
+        mode=mode
+    )
+    if mode == "file" and summary.failures and exec_file_fallback:
+        bump_exec_mode_stat(exec_stats, "fallback_retried")
+        if context_label:
+            log.warning("%s FILE 模式失败，回退 statement 重试一次。", context_label)
+        else:
+            log.warning("FILE 模式失败，回退 statement 重试一次。")
+        fallback_summary = execute_sql_statements(
+            obclient_cmd,
+            sql_text,
+            timeout,
+            mode="statement"
+        )
+        if fallback_summary.success:
+            bump_exec_mode_stat(exec_stats, "fallback_success")
+        return fallback_summary
+    return summary
+
+
+def log_exec_mode_summary(
+    exec_stats: Dict[str, int],
+    configured_mode: str,
+    exec_file_fallback: bool
+) -> None:
+    log_subsection("执行模式统计")
+    log.info("配置模式   : %s", configured_mode)
+    log.info("file 执行  : %d", int(exec_stats.get("file", 0)))
+    log.info("statement 执行 : %d", int(exec_stats.get("statement", 0)))
+    log.info("grants statement : %d", int(exec_stats.get("grants_statement", 0)))
+    if exec_file_fallback:
+        log.info("file->statement 回退尝试 : %d", int(exec_stats.get("fallback_retried", 0)))
+        log.info("file->statement 回退成功 : %d", int(exec_stats.get("fallback_success", 0)))
 
 
 def check_obclient_connectivity(
@@ -3924,7 +4130,10 @@ def execute_script_with_summary(
     layer: int,
     label_prefix: str,
     max_sql_file_bytes: Optional[int],
-    state_ledger: Optional[FixupStateLedger] = None
+    state_ledger: Optional[FixupStateLedger] = None,
+    exec_mode: str = "statement",
+    exec_file_fallback: bool = True,
+    exec_stats: Optional[Dict[str, int]] = None,
 ) -> Tuple[ScriptResult, ExecutionSummary]:
     relative_path = sql_path.relative_to(repo_root)
     sql_text, read_error = read_sql_text_with_limit(sql_path, max_sql_file_bytes)
@@ -3942,7 +4151,16 @@ def execute_script_with_summary(
         log.warning("%s %s -> SKIP (文件为空)", label_prefix, relative_path)
         return ScriptResult(relative_path, "SKIPPED", "文件为空", layer), ExecutionSummary(0, [])
 
-    summary = execute_sql_statements(obclient_cmd, sql_text or "", timeout=timeout)
+    effective_mode = resolve_script_exec_mode(exec_mode, sql_path)
+    summary = execute_sql_with_mode(
+        obclient_cmd,
+        sql_text or "",
+        timeout=timeout,
+        exec_mode=effective_mode,
+        exec_file_fallback=exec_file_fallback,
+        exec_stats=exec_stats,
+        context_label=f"{label_prefix} {relative_path}"
+    )
     if summary.statements == 0:
         log.warning("%s %s -> SKIP (文件无有效语句)", label_prefix, relative_path)
         return ScriptResult(relative_path, "SKIPPED", "文件无有效语句", layer), summary
@@ -3957,16 +4175,17 @@ def execute_script_with_summary(
             return ScriptResult(relative_path, "ERROR", move_note.strip(), layer), ExecutionSummary(summary.statements, [failure])
         if state_ledger:
             state_ledger.clear(relative_path)
-        log.info("%s %s -> OK %s", label_prefix, relative_path, move_note)
+        log.info("%s %s -> OK %s [mode=%s]", label_prefix, relative_path, move_note, effective_mode)
         return ScriptResult(relative_path, "SUCCESS", move_note.strip(), layer), summary
 
     first_error = summary.failures[0].error if summary.failures else "执行失败"
     log.warning(
-        "%s %s -> FAIL (%d/%d statements)",
+        "%s %s -> FAIL (%d/%d statements) [mode=%s]",
         label_prefix,
         relative_path,
         len(summary.failures),
-        summary.statements
+        summary.statements,
+        effective_mode
     )
     for failure in summary.failures[:3]:
         log.warning("  [%d] %s", failure.index, safe_first_line(failure.error, 200, "执行失败"))
@@ -4448,10 +4667,16 @@ def run_single_fixup(
     results: List[ScriptResult] = []
     error_entries: List[ErrorReportEntry] = []
     error_truncated = False
+    exec_stats = new_exec_mode_stats()
     
     log_section("执行配置")
     log.info("目录: %s", fixup_dir)
     log.info("模式: %s", "依赖感知排序 (SMART ORDER)" if args.smart_order else "标准优先级排序")
+    log.info(
+        "执行粒度: mode=%s, file_fallback=%s",
+        fixup_settings.exec_mode,
+        str(bool(fixup_settings.exec_file_fallback)).lower()
+    )
     if args.recompile:
         log.info("重编译: 启用 (最多 %d 次重试)", args.max_retries)
     if only_dirs:
@@ -4476,6 +4701,7 @@ def run_single_fixup(
         label = format_progress_label(idx, total_scripts, width)
         
         if is_grant_dir(sql_path.parent.name):
+            bump_exec_mode_stat(exec_stats, "grants_statement")
             result, summary, _removed, _kept, truncated = execute_grant_file_with_prune(
                 obclient_cmd,
                 sql_path,
@@ -4508,7 +4734,10 @@ def run_single_fixup(
                 layer,
                 label,
                 max_sql_file_bytes,
-                state_ledger=state_ledger
+                state_ledger=state_ledger,
+                exec_mode=fixup_settings.exec_mode,
+                exec_file_fallback=fixup_settings.exec_file_fallback,
+                exec_stats=exec_stats,
             )
             if result.status == "SUCCESS":
                 results.append(result)
@@ -4557,7 +4786,10 @@ def run_single_fixup(
                     layer,
                     f"{label} (retry)",
                     max_sql_file_bytes,
-                    state_ledger=state_ledger
+                    state_ledger=state_ledger,
+                    exec_mode=fixup_settings.exec_mode,
+                    exec_file_fallback=fixup_settings.exec_file_fallback,
+                    exec_stats=exec_stats,
                 )
                 results.append(retry_result)
                 if retry_result.status == "FAILED":
@@ -4616,6 +4848,7 @@ def run_single_fixup(
     log.info("成功       : %d", success)
     log.info("失败       : %d", failed)
     log.info("跳过       : %d", skipped)
+    log_exec_mode_summary(exec_stats, fixup_settings.exec_mode, fixup_settings.exec_file_fallback)
     
     if args.recompile:
         log_subsection("重编译统计")
@@ -4691,6 +4924,11 @@ def run_view_chain_autofix(
     log.info("配置文件: %s", Path(args.config).resolve())
     log.info("报告目录: %s", report_dir)
     log.info("项目主页: %s (问题反馈: %s)", REPO_URL, REPO_ISSUES_URL)
+    log.info(
+        "执行粒度: mode=%s, file_fallback=%s",
+        fixup_settings.exec_mode,
+        str(bool(fixup_settings.exec_file_fallback)).lower()
+    )
     if only_dirs:
         log.info("子目录过滤: %s", sorted(set(only_dirs)))
     if exclude_dirs:
@@ -4779,6 +5017,7 @@ def run_view_chain_autofix(
     executed_views = 0
     skipped_views = 0
     view_results: List[Tuple[str, str, List[str]]] = []
+    exec_stats = new_exec_mode_stats()
 
     log.info("读取 VIEW 依赖链: %d", total_views)
 
@@ -4912,7 +5151,15 @@ def run_view_chain_autofix(
             )
             continue
 
-        summary = execute_sql_statements(obclient_cmd, sql_text, ob_timeout)
+        summary = execute_sql_with_mode(
+            obclient_cmd,
+            sql_text,
+            ob_timeout,
+            exec_mode=resolve_script_exec_mode(fixup_settings.exec_mode, sql_path),
+            exec_file_fallback=fixup_settings.exec_file_fallback,
+            exec_stats=exec_stats,
+            context_label=f"{label} [VIEW_CHAIN] {view_key}"
+        )
         invalidate_exists_cache(exists_cache, planned_objects | {(view_key, root_type)})
         post_exists = check_object_exists(
             obclient_cmd,
@@ -4971,6 +5218,7 @@ def run_view_chain_autofix(
     log.info("跳过已存在: %d", skipped_views)
     log.info("阻塞跳过: %d", blocked_views)
     log.info("执行失败: %d", failed_views)
+    log_exec_mode_summary(exec_stats, fixup_settings.exec_mode, fixup_settings.exec_file_fallback)
 
     if view_results:
         log_subsection("VIEW 链路结果详情")
@@ -5028,6 +5276,11 @@ def run_iterative_fixup(
     log.info("  - 自动重试失败的脚本")
     log.info("  - 逐轮解决依赖关系")
     log.info("  - 收敛检测停止条件")
+    log.info(
+        "  - 执行粒度: mode=%s, file_fallback=%s",
+        fixup_settings.exec_mode,
+        str(bool(fixup_settings.exec_file_fallback)).lower()
+    )
     log.info("")
     
     done_dir = fixup_dir / DONE_DIR_NAME
@@ -5063,6 +5316,7 @@ def run_iterative_fixup(
     recompile_owners: Set[str] = set()
     
     all_round_results = []
+    exec_stats = new_exec_mode_stats()
     
     while round_num < max_rounds:
         round_num += 1
@@ -5143,19 +5397,20 @@ def run_iterative_fixup(
                 continue
 
             if is_grant_dir(sql_path.parent.name):
+                bump_exec_mode_stat(exec_stats, "grants_statement")
                 result, summary, _removed, _kept, truncated = execute_grant_file_with_prune(
                     obclient_cmd,
                     sql_path,
                     repo_root,
                     done_dir,
                     ob_timeout,
-                layer,
-                label,
-                error_entries,
-                DEFAULT_ERROR_REPORT_LIMIT,
-                max_sql_file_bytes,
+                    layer,
+                    label,
+                    error_entries,
+                    DEFAULT_ERROR_REPORT_LIMIT,
+                    current_max_sql_file_bytes,
                     state_ledger=state_ledger
-            )
+                )
                 error_truncated = error_truncated or truncated
                 round_results.append(result)
                 continue
@@ -5177,7 +5432,10 @@ def run_iterative_fixup(
                 layer,
                 label,
                 current_max_sql_file_bytes,
-                state_ledger=state_ledger
+                state_ledger=state_ledger,
+                exec_mode=current_fixup_settings.exec_mode,
+                exec_file_fallback=current_fixup_settings.exec_file_fallback,
+                exec_stats=exec_stats,
             )
 
             if result.status == "SUCCESS":
@@ -5233,7 +5491,10 @@ def run_iterative_fixup(
                                 layer,
                                 "[DEPS]",
                                 current_max_sql_file_bytes,
-                                state_ledger=state_ledger
+                                state_ledger=state_ledger,
+                                exec_mode=current_fixup_settings.exec_mode,
+                                exec_file_fallback=current_fixup_settings.exec_file_fallback,
+                                exec_stats=exec_stats,
                             )
                             pre_executed.add(dep_path)
                             round_results.append(dep_result)
@@ -5270,7 +5531,10 @@ def run_iterative_fixup(
                     layer,
                     f"{label} (retry)",
                     current_max_sql_file_bytes,
-                    state_ledger=state_ledger
+                    state_ledger=state_ledger,
+                    exec_mode=current_fixup_settings.exec_mode,
+                    exec_file_fallback=current_fixup_settings.exec_file_fallback,
+                    exec_stats=exec_stats,
                 )
                 round_results.append(retry_result)
                 if retry_result.status == "FAILED":
@@ -5375,6 +5639,11 @@ def run_iterative_fixup(
     log.info("执行轮次: %d", round_num)
     log.info("总计成功: %d", cumulative_success)
     log.info("总计失败: %d", cumulative_failed)
+    log_exec_mode_summary(
+        exec_stats,
+        current_fixup_settings.exec_mode,
+        current_fixup_settings.exec_file_fallback
+    )
     
     if args.recompile:
         log_subsection("最终重编译统计")

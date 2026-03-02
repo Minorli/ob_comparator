@@ -45,6 +45,7 @@
   说明：若存在“触发器挂在临时表”场景，会额外输出 triggers_temp_table_unsupported_detail_<timestamp>.txt（不受 report_detail_mode 影响）。
 - report_to_db：是否将报告存储到 OceanBase（obclient 方式）。默认：true。
   说明：开启后仍会保留本地文本报告，写库失败时是否中断由 report_db_fail_abort 控制。
+  说明：写库采用发布门禁；DIFF_REPORT_SUMMARY.WRITE_STATUS=READY 才表示可用于正式排查（WRITING/FAILED 为未完成或失败）。
   说明：开启后会在 run 目录输出 report_sql_<timestamp>.txt（预填 report_id 的 SQL 模板），并尝试创建只读分析视图（actions/profile/trends/pending/grant/usability）。
   说明：当 report_db_store_scope=full 时，会将 run 目录下所有 txt 逐行写入 DIFF_REPORT_ARTIFACT_LINE，实现 txt 内容 100% 可查询覆盖。
 - report_db_schema：报告存库 schema。默认：空（使用 OCEANBASE_TARGET 连接用户）。
@@ -235,6 +236,11 @@
   说明：关闭后仅使用 grants_miss/grants_all，找不到授权则记录提示并继续执行。
 - fixup_auto_grant_cache_limit：自动补权限缓存大小（条目数）。默认：10000。
   说明：限制 run_fixup 查询缓存占用，0/负数表示不限制。
+- fixup_exec_mode：run_fixup 非授权脚本执行粒度。默认：auto。
+  可选值：auto / file / statement。
+  说明：auto 下 `grants_*` 仍按逐语句执行并保留剪枝；其他目录按文件执行。
+- fixup_exec_file_fallback：file 模式失败后是否自动回退一次 statement。默认：true。
+  说明：建议保持 true，可兼顾性能与兼容性；关闭后 file 失败将直接报错。
 
 同义词与触发器
 - synonym_check_scope：同义词校验范围。默认：public_only。

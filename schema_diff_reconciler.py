@@ -1329,11 +1329,78 @@ NOISE_REASON_OBNOTNULL_CONSTRAINT = "OBNOTNULL_CONSTRAINT"
 OB_OBCHECK_NAME_PATTERN = re.compile(r"_OBCHECK_\d+$", re.IGNORECASE)
 MVIEW_LOG_TABLE_NAME_PATTERN = re.compile(r"^MLOG\$_", re.IGNORECASE)
 
+CASE_SENSITIVE_IDENTIFIER_SAMPLE_LIMIT = 30
+METADATA_VOLUME_WARN_TABLES = 200000
+METADATA_VOLUME_WARN_COLUMNS = 5000000
+METADATA_VOLUME_WARN_INDEXES = 1000000
+METADATA_VOLUME_WARN_CONSTRAINTS = 1000000
+METADATA_VOLUME_WARN_TRIGGERS = 500000
+
 
 def normalize_identifier_name(name: Optional[str]) -> str:
     if not name:
         return ""
     return str(name).strip().strip('"').upper()
+
+
+def is_case_sensitive_identifier(raw_name: Optional[str]) -> bool:
+    if raw_name is None:
+        return False
+    text = str(raw_name).strip()
+    if not text:
+        return False
+    return text != text.upper()
+
+
+def report_and_abort_case_sensitive_identifiers(
+    rows: Set[Tuple[str, str, str]],
+    source: str
+) -> None:
+    if not rows:
+        return
+    samples = sorted(rows)[:CASE_SENSITIVE_IDENTIFIER_SAMPLE_LIMIT]
+    log.error(
+        "检测到大小写敏感(双引号)标识符，共 %d 个（来源: %s）。当前版本不支持该场景，已终止本次运行。",
+        len(rows),
+        source
+    )
+    for owner_raw, name_raw, obj_type in samples:
+        log.error("  - %s.%s (%s)", owner_raw or "?", name_raw or "?", obj_type or "?")
+    if len(rows) > len(samples):
+        log.error("  ... 其余 %d 个已省略。", len(rows) - len(samples))
+    log.error(
+        "处理建议: 统一对象/列命名为非双引号常规标识符（全大写语义），"
+        "或将这批对象从本次校验范围中排除。"
+    )
+    abort_run()
+
+
+def log_metadata_volume_warning(
+    side: str,
+    table_count: int,
+    column_count: int,
+    index_count: int,
+    constraint_count: int,
+    trigger_count: int
+) -> None:
+    warning_items: List[str] = []
+    if table_count >= METADATA_VOLUME_WARN_TABLES:
+        warning_items.append(f"tables={table_count}")
+    if column_count >= METADATA_VOLUME_WARN_COLUMNS:
+        warning_items.append(f"columns={column_count}")
+    if index_count >= METADATA_VOLUME_WARN_INDEXES:
+        warning_items.append(f"indexes={index_count}")
+    if constraint_count >= METADATA_VOLUME_WARN_CONSTRAINTS:
+        warning_items.append(f"constraints={constraint_count}")
+    if trigger_count >= METADATA_VOLUME_WARN_TRIGGERS:
+        warning_items.append(f"triggers={trigger_count}")
+    if not warning_items:
+        return
+    log.warning(
+        "[%s] 元数据体量较大(%s)，当前版本为全量内存比对架构。建议按 schema/对象类型分批执行，避免内存峰值过高。",
+        side,
+        ", ".join(warning_items)
+    )
 
 
 def parse_column_id(value: Optional[object]) -> Optional[int]:
@@ -3073,6 +3140,15 @@ JOB_SCHEDULE_FIXUP_MODE_ALIASES = {
     "semi-auto": "semi_auto",
     "semiauto": "semi_auto",
 }
+FIXUP_EXEC_MODE_VALUES = {"auto", "file", "statement"}
+FIXUP_EXEC_MODE_ALIASES = {
+    "single": "file",
+    "per_file": "file",
+    "per-file": "file",
+    "legacy": "statement",
+    "per_statement": "statement",
+    "per-statement": "statement",
+}
 CONFIG_HOT_RELOAD_MODE_VALUES = {"off", "phase", "round"}
 CONFIG_HOT_RELOAD_MODE_ALIASES = {
     "disable": "off",
@@ -3124,6 +3200,17 @@ def normalize_job_schedule_fixup_mode(raw_value: Optional[str]) -> str:
     if value not in JOB_SCHEDULE_FIXUP_MODE_VALUES:
         log.warning("job_schedule_fixup_mode=%s 不在支持范围内，将回退为 manual。", raw_value)
         return "manual"
+    return value
+
+
+def normalize_fixup_exec_mode(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "auto"
+    value = str(raw_value).strip().lower()
+    value = FIXUP_EXEC_MODE_ALIASES.get(value, value)
+    if value not in FIXUP_EXEC_MODE_VALUES:
+        log.warning("fixup_exec_mode=%s 不在支持范围内，将回退为 auto。", raw_value)
+        return "auto"
     return value
 
 
@@ -4173,6 +4260,8 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         )
         settings.setdefault('fixup_auto_grant_fallback', 'true')
         settings.setdefault('fixup_auto_grant_cache_limit', '10000')
+        settings.setdefault('fixup_exec_mode', 'auto')
+        settings.setdefault('fixup_exec_file_fallback', 'true')
         settings.setdefault('synonym_check_scope', 'public_only')
         settings.setdefault('synonym_fixup_scope', 'public_only')
         settings.setdefault('name_collision_mode', 'fixup')
@@ -4587,6 +4676,13 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             settings.get('fixup_auto_grant_fallback', 'true'),
             True
         )
+        settings['fixup_exec_mode'] = normalize_fixup_exec_mode(
+            settings.get('fixup_exec_mode', 'auto')
+        )
+        settings['fixup_exec_file_fallback'] = parse_bool_flag(
+            settings.get('fixup_exec_file_fallback', 'true'),
+            True
+        )
         settings['fixup_dir_allow_outside_repo'] = parse_bool_flag(
             settings.get('fixup_dir_allow_outside_repo', 'false'),
             False
@@ -4963,6 +5059,14 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "仅支持 off/guard/replace/drop_create"
 
+    def _validate_fixup_exec_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = FIXUP_EXEC_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in FIXUP_EXEC_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 auto/file/statement"
+
     def _validate_interval_fixup_mode(val: str) -> Tuple[bool, str]:
         if not val.strip():
             return True, ""
@@ -5247,6 +5351,21 @@ def run_config_wizard(config_path: Path) -> None:
         "自动补权限缓存大小（条目数，<=0 表示不限制）",
         default=cfg.get("SETTINGS", "fixup_auto_grant_cache_limit", fallback="10000"),
         validator=_validate_non_negative_int,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "fixup_exec_mode",
+        "run_fixup SQL 执行粒度 (auto/file/statement)",
+        default=cfg.get("SETTINGS", "fixup_exec_mode", fallback="auto"),
+        validator=_validate_fixup_exec_mode,
+        transform=normalize_fixup_exec_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "fixup_exec_file_fallback",
+        "run_fixup file 模式失败后回退 statement 重试一次 (true/false)",
+        default=cfg.get("SETTINGS", "fixup_exec_file_fallback", fallback="true"),
+        transform=_bool_transform,
     )
     _prompt_field(
         "SETTINGS",
@@ -7588,6 +7707,7 @@ def get_source_objects(
     source_objects: SourceObjectMap = defaultdict(set)
     mview_pairs: Set[Tuple[str, str]] = set()
     table_pairs: Set[Tuple[str, str]] = set()
+    case_sensitive_issues: Set[Tuple[str, str, str]] = set()
     skipped_iot = 0
     added_synonyms = 0
     added_public_synonyms = 0
@@ -7616,9 +7736,13 @@ def get_source_objects(
                         )
                         cursor.execute(sql, chunk)
                         for row in cursor:
-                            owner = (row[0] or '').strip().upper()
-                            obj_name = (row[1] or '').strip().upper()
+                            owner_raw = (row[0] or '').strip()
+                            obj_name_raw = (row[1] or '').strip()
                             obj_type = (row[2] or '').strip().upper()
+                            if is_case_sensitive_identifier(owner_raw) or is_case_sensitive_identifier(obj_name_raw):
+                                case_sensitive_issues.add((owner_raw, obj_name_raw, obj_type))
+                            owner = owner_raw.upper()
+                            obj_name = obj_name_raw.upper()
                             if not owner or not obj_name or not obj_type:
                                 continue
                             if obj_name.startswith("SYS_IOT_OVER_"):
@@ -7650,10 +7774,21 @@ def get_source_objects(
                                 sql = sql_tpl.format(owner_ph=owner_ph, target_ph=target_ph)
                                 cursor.execute(sql, owner_chunk + target_chunk)
                                 for row in cursor:
-                                    owner = (row[0] or '').strip().upper()
-                                    syn_name = (row[1] or '').strip().upper()
-                                    table_owner = (row[2] or '').strip().upper()
-                                    table_name = (row[3] or '').strip().upper()
+                                    owner_raw = (row[0] or '').strip()
+                                    syn_name_raw = (row[1] or '').strip()
+                                    table_owner_raw = (row[2] or '').strip()
+                                    table_name_raw = (row[3] or '').strip()
+                                    if (
+                                        is_case_sensitive_identifier(owner_raw)
+                                        or is_case_sensitive_identifier(syn_name_raw)
+                                        or is_case_sensitive_identifier(table_owner_raw)
+                                        or is_case_sensitive_identifier(table_name_raw)
+                                    ):
+                                        case_sensitive_issues.add((owner_raw, syn_name_raw, "SYNONYM"))
+                                    owner = owner_raw.upper()
+                                    syn_name = syn_name_raw.upper()
+                                    table_owner = table_owner_raw.upper()
+                                    table_name = table_name_raw.upper()
                                     if not owner or not syn_name or not table_owner or not table_name:
                                         continue
                                     full_name = f"{owner}.{syn_name}"
@@ -7691,6 +7826,8 @@ def get_source_objects(
     except oracledb.Error as e:
         log.error(f"严重错误: 连接或查询 Oracle 失败: {e}")
         abort_run()
+
+    report_and_abort_case_sensitive_identifiers(case_sensitive_issues, "Oracle.DBA_OBJECTS/DBA_SYNONYMS")
 
     # Materialized View 在 DBA_OBJECTS 中通常会同时作为 TABLE 出现，去重以避免误将 MV 当成 TABLE 校验/抽取。
     mview_dedup = 0
@@ -11215,6 +11352,19 @@ def dump_ob_metadata(
         partition_key_columns=partition_key_columns,
         constraint_deferrable_supported=constraint_deferrable_supported
     )
+    ob_table_count = len(ob_meta.tab_columns)
+    ob_column_count = sum(len(cols) for cols in ob_meta.tab_columns.values())
+    ob_index_count = sum(len(items) for items in ob_meta.indexes.values())
+    ob_constraint_count = sum(len(items) for items in ob_meta.constraints.values())
+    ob_trigger_count = sum(len(items) for items in ob_meta.triggers.values())
+    log_metadata_volume_warning(
+        "OB",
+        ob_table_count,
+        ob_column_count,
+        ob_index_count,
+        ob_constraint_count,
+        ob_trigger_count
+    )
     return normalize_ob_metadata_public_owner(ob_meta)
 
 
@@ -12777,6 +12927,20 @@ def dump_oracle_metadata(
             for table_meta in table_columns.values()
             for meta in table_meta.values()
         )
+
+    ora_table_count = len(table_columns)
+    ora_column_count = sum(len(cols) for cols in table_columns.values())
+    ora_index_count = sum(len(items) for items in indexes.values())
+    ora_constraint_count = sum(len(items) for items in constraints.values())
+    ora_trigger_count = sum(len(items) for items in triggers.values())
+    log_metadata_volume_warning(
+        "ORACLE",
+        ora_table_count,
+        ora_column_count,
+        ora_index_count,
+        ora_constraint_count,
+        ora_trigger_count
+    )
 
     return OracleMetadata(
         table_columns=table_columns,
@@ -17873,11 +18037,10 @@ def check_object_usability(
         start = time.perf_counter()
         try:
             conn = _get_oracle_conn()
-            cur = conn.cursor()
-            if timeout_sec:
-                cur.call_timeout = int(timeout_sec * 1000)
-            cur.execute(sql)
-            cur.close()
+            with conn.cursor() as cur:
+                if timeout_sec:
+                    cur.call_timeout = int(timeout_sec * 1000)
+                cur.execute(sql)
             return True, "", int((time.perf_counter() - start) * 1000), False
         except Exception as exc:
             msg = normalize_error_text(str(exc))
@@ -20496,6 +20659,7 @@ def mask_sql_for_scan(sql: str) -> str:
     chars = list(sql)
     i = 0
     in_single = False
+    in_double = False
     in_line_comment = False
     in_block_comment = False
     length = len(chars)
@@ -20528,6 +20692,16 @@ def mask_sql_for_scan(sql: str) -> str:
                 in_single = False
             i += 1
             continue
+        if in_double:
+            chars[i] = " "
+            if ch == '"' and nxt == '"':
+                chars[i + 1] = " "
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
         if ch == "-" and nxt == "-":
             chars[i] = " "
             chars[i + 1] = " "
@@ -20543,6 +20717,11 @@ def mask_sql_for_scan(sql: str) -> str:
         if ch == "'":
             chars[i] = " "
             in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            chars[i] = " "
+            in_double = True
             i += 1
             continue
         i += 1
@@ -22882,13 +23061,31 @@ def clean_storage_clauses(ddl: str) -> str:
         if end is not None and end > start:
             spans.append((start, end))
 
-    # TABLESPACE <name>：仅移除代码中的 TABLESPACE 子句
-    for match in re.finditer(
-        r'\s+TABLESPACE\s+(?:"(?:[^"]|"")+"|[A-Z0-9_$#]+)',
-        masked_upper,
-        flags=re.IGNORECASE
-    ):
-        spans.append((match.start(), match.end()))
+    # TABLESPACE <name>：使用原始 SQL 逐字符解析，避免带引号名称时误吞后续关键字。
+    for match in re.finditer(r'\s+TABLESPACE\b', masked_upper, flags=re.IGNORECASE):
+        start = match.start()
+        idx = match.end()
+        while idx < len(ddl) and ddl[idx].isspace():
+            idx += 1
+        if idx >= len(ddl):
+            continue
+        if ddl[idx] == '"':
+            idx += 1
+            while idx < len(ddl):
+                ch = ddl[idx]
+                nxt = ddl[idx + 1] if idx + 1 < len(ddl) else ""
+                if ch == '"' and nxt == '"':
+                    idx += 2
+                    continue
+                if ch == '"':
+                    idx += 1
+                    break
+                idx += 1
+            spans.append((start, idx))
+            continue
+        m_ident = re.match(r'[A-Za-z0-9_$#]+', ddl[idx:])
+        if m_ident:
+            spans.append((start, idx + m_ident.end()))
 
     if not spans:
         return ddl
@@ -23553,6 +23750,18 @@ def _ensure_create_or_replace(ddl: str) -> str:
     )
 
 
+_SQL_IDENTIFIER_RE = re.compile(r"^[A-Z_][A-Z0-9_$#]*$")
+
+
+def _normalize_sql_identifier(value: str) -> Optional[str]:
+    text = str(value or "").strip().upper()
+    if not text:
+        return None
+    if not _SQL_IDENTIFIER_RE.match(text):
+        return None
+    return text
+
+
 def _escape_sql_literal(value: str) -> str:
     return value.replace("'", "''")
 
@@ -23568,8 +23777,12 @@ def _build_q_quote_literal(text: str) -> str:
 
 def _build_exist_check_sql(obj_type: str, schema: str, name: str) -> Optional[str]:
     obj_type_u = (obj_type or "").upper()
-    schema_u = _escape_sql_literal(schema.upper())
-    name_u = _escape_sql_literal(name.upper())
+    schema_norm = _normalize_sql_identifier(schema)
+    name_norm = _normalize_sql_identifier(name)
+    if not schema_norm or not name_norm:
+        return None
+    schema_u = _escape_sql_literal(schema_norm)
+    name_u = _escape_sql_literal(name_norm)
     if obj_type_u == "TABLE":
         return f"SELECT COUNT(*) INTO v_count FROM ALL_TABLES WHERE OWNER='{schema_u}' AND TABLE_NAME='{name_u}'"
     if obj_type_u == "VIEW":
@@ -31229,6 +31442,9 @@ REPORT_DB_VIEWS = {
 }
 REPORT_DB_CLOB_CHUNK_SIZE = 2000
 REPORT_DB_WRITE_ERROR_SNIPPET_MAX = 4000
+REPORT_DB_WRITE_STATUS_READY = "READY"
+REPORT_DB_WRITE_STATUS_WRITING = "WRITING"
+REPORT_DB_WRITE_STATUS_FAILED = "FAILED"
 
 
 def _sanitize_sql_literal_text(value: str) -> str:
@@ -31306,6 +31522,102 @@ def build_report_db_schema_prefix(settings: Dict) -> str:
     return f"{schema}." if schema else ""
 
 
+def _parse_obclient_scalar_int(output: str) -> Optional[int]:
+    for raw in (output or "").splitlines():
+        line = (raw or "").strip()
+        if not line:
+            continue
+        match = re.search(r"-?\d+", line)
+        if not match:
+            continue
+        try:
+            return int(match.group(0))
+        except Exception:
+            continue
+    return None
+
+
+def _count_report_db_rows_by_report_id(
+    ob_cfg: ObConfig,
+    schema_prefix: str,
+    table_name: str,
+    report_id: str
+) -> Tuple[Optional[int], str]:
+    sql = (
+        f"SELECT COUNT(*) FROM {schema_prefix}{table_name} "
+        f"WHERE REPORT_ID = {sql_quote_literal(report_id)}"
+    )
+    ok, out, err = obclient_run_sql(ob_cfg, sql)
+    if not ok:
+        return None, normalize_error_text(err)
+    count_val = _parse_obclient_scalar_int(out)
+    if count_val is None:
+        return None, "无法解析 COUNT(*) 返回值"
+    return int(count_val), ""
+
+
+def _set_report_db_summary_write_status(
+    ob_cfg: ObConfig,
+    schema_prefix: str,
+    report_id: str,
+    status: str,
+    note: Optional[str] = None,
+    expected_rows: Optional[int] = None,
+    actual_rows: Optional[int] = None
+) -> bool:
+    status_u = (status or "").strip().upper() or REPORT_DB_WRITE_STATUS_FAILED
+    note_text = normalize_error_text(note or "")
+    if len(note_text) > 900:
+        note_text = note_text[:900] + "..."
+    updates = [
+        f"WRITE_STATUS = {sql_quote_literal(status_u)}",
+        "WRITE_CHECKED_AT = SYSTIMESTAMP",
+    ]
+    updates.append(
+        f"WRITE_NOTE = {sql_quote_literal(note_text)}" if note_text else "WRITE_NOTE = NULL"
+    )
+    if expected_rows is not None:
+        updates.append(f"WRITE_EXPECTED_ROWS = {int(expected_rows)}")
+    if actual_rows is not None:
+        updates.append(f"WRITE_ACTUAL_ROWS = {int(actual_rows)}")
+    sql = (
+        f"UPDATE {schema_prefix}{REPORT_DB_TABLES['summary']} "
+        f"SET {', '.join(updates)} "
+        f"WHERE REPORT_ID = {sql_quote_literal(report_id)}"
+    )
+    ok, _out, err = obclient_run_sql_commit(ob_cfg, sql)
+    if not ok:
+        log.warning("[REPORT_DB] 更新写入状态失败 report_id=%s status=%s: %s", report_id, status_u, err)
+    return bool(ok)
+
+
+def _verify_report_db_row_consistency(
+    ob_cfg: ObConfig,
+    schema_prefix: str,
+    report_id: str,
+    expected_counts: Dict[str, int]
+) -> Tuple[bool, Dict[str, int], str]:
+    actual_counts: Dict[str, int] = {}
+    mismatches: List[str] = []
+    for table_key, expected in expected_counts.items():
+        table_name = REPORT_DB_TABLES.get(table_key)
+        if not table_name:
+            continue
+        actual, err = _count_report_db_rows_by_report_id(ob_cfg, schema_prefix, table_name, report_id)
+        if actual is None:
+            mismatches.append(f"{table_name}: 查询失败({err})")
+            continue
+        actual_counts[table_key] = actual
+        if int(actual) != int(expected):
+            mismatches.append(f"{table_name}: expected={int(expected)}, actual={int(actual)}")
+    if mismatches:
+        detail = "; ".join(mismatches[:8])
+        if len(mismatches) > 8:
+            detail += f" ... (+{len(mismatches) - 8})"
+        return False, actual_counts, detail
+    return True, actual_counts, ""
+
+
 def generate_report_id(timestamp: str) -> str:
     short_uuid = uuid.uuid4().hex[:8]
     return f"{timestamp}_{short_uuid}"
@@ -31364,6 +31676,11 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['summary']} (
     CONCLUSION          VARCHAR2(32),
     CONCLUSION_DETAIL   VARCHAR2(1000),
     FULL_REPORT_JSON    CLOB,
+    WRITE_STATUS        VARCHAR2(16) DEFAULT 'READY',
+    WRITE_NOTE          VARCHAR2(1000),
+    WRITE_EXPECTED_ROWS NUMBER DEFAULT 0,
+    WRITE_ACTUAL_ROWS   NUMBER DEFAULT 0,
+    WRITE_CHECKED_AT    TIMESTAMP,
     TOOL_VERSION        VARCHAR2(64),
     HOSTNAME            VARCHAR2(256),
     RUN_DIR             VARCHAR2(512),
@@ -31662,6 +31979,8 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['resolution']} (
          f"CREATE INDEX IDX_DIFF_REPORT_DATE ON {schema_prefix}{REPORT_DB_TABLES['summary']}(RUN_DATE)"),
         ("IDX_DIFF_REPORT_CONCLUSION",
          f"CREATE INDEX IDX_DIFF_REPORT_CONCLUSION ON {schema_prefix}{REPORT_DB_TABLES['summary']}(CONCLUSION)"),
+        ("IDX_DIFF_REPORT_WRITE_STATUS",
+         f"CREATE INDEX IDX_DIFF_REPORT_WRITE_STATUS ON {schema_prefix}{REPORT_DB_TABLES['summary']}(WRITE_STATUS, RUN_TIMESTAMP)"),
         ("IDX_DIFF_DETAIL_REPORT_ID",
          f"CREATE INDEX IDX_DIFF_DETAIL_REPORT_ID ON {schema_prefix}{REPORT_DB_TABLES['detail']}(REPORT_ID)"),
         ("IDX_DIFF_DETAIL_TYPE",
@@ -31877,6 +32196,11 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['resolution']} (
     for table_name, col_name, col_ddl in [
         (REPORT_DB_TABLES["summary"], "EXCLUDED_COUNT", "NUMBER DEFAULT 0"),
         (REPORT_DB_TABLES["summary"], "MISSING_FIXABLE_COUNT", "NUMBER DEFAULT 0"),
+        (REPORT_DB_TABLES["summary"], "WRITE_STATUS", "VARCHAR2(16) DEFAULT 'READY'"),
+        (REPORT_DB_TABLES["summary"], "WRITE_NOTE", "VARCHAR2(1000)"),
+        (REPORT_DB_TABLES["summary"], "WRITE_EXPECTED_ROWS", "NUMBER DEFAULT 0"),
+        (REPORT_DB_TABLES["summary"], "WRITE_ACTUAL_ROWS", "NUMBER DEFAULT 0"),
+        (REPORT_DB_TABLES["summary"], "WRITE_CHECKED_AT", "TIMESTAMP"),
         (REPORT_DB_TABLES["counts"], "EXCLUDED_COUNT", "NUMBER DEFAULT 0"),
         (REPORT_DB_TABLES["counts"], "MISSING_FIXABLE_COUNT", "NUMBER DEFAULT 0"),
     ]:
@@ -34165,15 +34489,9 @@ def _insert_report_oms_missing_rows(
     return ok_all
 
 
-def _insert_report_grant_rows(
-    ob_cfg: ObConfig,
-    schema_prefix: str,
-    report_id: str,
-    grant_plan: GrantPlan,
-    batch_size: int
-) -> bool:
+def _build_report_grant_rows(grant_plan: GrantPlan) -> List[Dict[str, object]]:
     if not grant_plan:
-        return True
+        return []
     rows: List[Dict[str, object]] = []
     for grantee, entries in (grant_plan.object_grants or {}).items():
         for entry in entries:
@@ -34232,6 +34550,17 @@ def _insert_report_grant_rows(
             "status": "FILTERED",
             "filter_reason": filtered.reason,
         })
+    return rows
+
+
+def _insert_report_grant_rows(
+    ob_cfg: ObConfig,
+    schema_prefix: str,
+    report_id: str,
+    grant_plan: GrantPlan,
+    batch_size: int
+) -> bool:
+    rows = _build_report_grant_rows(grant_plan)
 
     if not rows:
         return True
@@ -34382,87 +34711,117 @@ def _build_report_db_view_ddls(schema_prefix: str) -> Dict[str, str]:
     ddls: Dict[str, str] = {}
     ddls[actions_view] = f"""
 CREATE OR REPLACE VIEW {actions_view} AS
-SELECT report_id,
+SELECT d.report_id,
        'FIXUP' AS action_type,
-       object_type,
-       source_schema AS schema_name,
-       source_name AS object_name,
-       target_schema,
-       target_name,
-       report_type,
-       status,
-       reason
-  FROM {detail}
- WHERE report_type IN ('MISSING','MISMATCHED')
-   AND (status IS NULL OR status NOT IN ('UNSUPPORTED','BLOCKED','RISKY'))
+       d.object_type,
+       d.source_schema AS schema_name,
+       d.source_name AS object_name,
+       d.target_schema,
+       d.target_name,
+       d.report_type,
+       d.status,
+       d.reason
+  FROM {detail} d
+ WHERE d.report_type IN ('MISSING','MISMATCHED')
+   AND (d.status IS NULL OR d.status NOT IN ('UNSUPPORTED','BLOCKED','RISKY'))
+   AND EXISTS (
+       SELECT 1 FROM {summary} s
+        WHERE s.report_id = d.report_id
+          AND NVL(s.write_status, 'READY') = 'READY'
+   )
 UNION ALL
-SELECT report_id,
+SELECT d.report_id,
        'REFACTOR' AS action_type,
-       object_type,
-       source_schema,
-       source_name,
-       target_schema,
-       target_name,
-       report_type,
-       status,
-       reason
-  FROM {detail}
- WHERE report_type = 'UNSUPPORTED'
-   AND status = 'UNSUPPORTED'
+       d.object_type,
+       d.source_schema,
+       d.source_name,
+       d.target_schema,
+       d.target_name,
+       d.report_type,
+       d.status,
+       d.reason
+  FROM {detail} d
+ WHERE d.report_type = 'UNSUPPORTED'
+   AND d.status = 'UNSUPPORTED'
+   AND EXISTS (
+       SELECT 1 FROM {summary} s
+        WHERE s.report_id = d.report_id
+          AND NVL(s.write_status, 'READY') = 'READY'
+   )
 UNION ALL
-SELECT report_id,
+SELECT d.report_id,
        'DEPENDENCY' AS action_type,
-       object_type,
-       source_schema,
-       source_name,
-       target_schema,
-       target_name,
-       report_type,
-       status,
-       reason
-  FROM {detail}
- WHERE report_type = 'UNSUPPORTED'
-   AND status = 'BLOCKED'
+       d.object_type,
+       d.source_schema,
+       d.source_name,
+       d.target_schema,
+       d.target_name,
+       d.report_type,
+       d.status,
+       d.reason
+  FROM {detail} d
+ WHERE d.report_type = 'UNSUPPORTED'
+   AND d.status = 'BLOCKED'
+   AND EXISTS (
+       SELECT 1 FROM {summary} s
+        WHERE s.report_id = d.report_id
+          AND NVL(s.write_status, 'READY') = 'READY'
+   )
 UNION ALL
-SELECT report_id,
+SELECT d.report_id,
        'REVIEW' AS action_type,
-       object_type,
-       source_schema,
-       source_name,
-       target_schema,
-       target_name,
-       report_type,
-       status,
-       reason
-  FROM {detail}
- WHERE report_type = 'UNSUPPORTED'
-   AND status = 'RISKY'
+       d.object_type,
+       d.source_schema,
+       d.source_name,
+       d.target_schema,
+       d.target_name,
+       d.report_type,
+       d.status,
+       d.reason
+  FROM {detail} d
+ WHERE d.report_type = 'UNSUPPORTED'
+   AND d.status = 'RISKY'
+   AND EXISTS (
+       SELECT 1 FROM {summary} s
+        WHERE s.report_id = d.report_id
+          AND NVL(s.write_status, 'READY') = 'READY'
+   )
 UNION ALL
-SELECT report_id,
+SELECT g.report_id,
        'GRANT_REQUIRED' AS action_type,
-       target_type AS object_type,
-       target_schema AS schema_name,
-       target_name AS object_name,
-       target_schema,
-       target_name,
+       g.target_type AS object_type,
+       g.target_schema AS schema_name,
+       g.target_name AS object_name,
+       g.target_schema,
+       g.target_name,
        'GRANT' AS report_type,
-       status,
-       NVL(filter_reason, privilege) AS reason
-  FROM {grants}
- WHERE status = 'MISSING'
+       g.status,
+       NVL(g.filter_reason, g.privilege) AS reason
+  FROM {grants} g
+ WHERE g.status = 'MISSING'
+   AND EXISTS (
+       SELECT 1 FROM {summary} s
+        WHERE s.report_id = g.report_id
+          AND NVL(s.write_status, 'READY') = 'READY'
+   )
 UNION ALL
-SELECT report_id,
+SELECT u.report_id,
        'VERIFY' AS action_type,
-       object_type,
-       schema_name,
-       object_name,
+       u.object_type,
+       u.schema_name,
+       u.object_name,
        NULL AS target_schema,
        NULL AS target_name,
        'USABILITY' AS report_type,
-       status,
-       reason
-  FROM {usability}
- WHERE status <> 'OK'
+       u.status,
+       u.reason
+  FROM {usability} u
+ WHERE u.status <> 'OK'
+   AND EXISTS (
+       SELECT 1 FROM {summary} s
+        WHERE s.report_id = u.report_id
+          AND NVL(s.write_status, 'READY') = 'READY'
+   )
 """
 
     ddls[object_profile_view] = f"""
@@ -34483,6 +34842,9 @@ SELECT d.report_id,
        b.status AS blacklist_status,
        b.reason AS blacklist_reason
   FROM {detail} d
+  JOIN {summary} s
+    ON s.report_id = d.report_id
+   AND NVL(s.write_status, 'READY') = 'READY'
   LEFT JOIN {usability} u
     ON u.report_id = d.report_id
    AND u.object_type = d.object_type
@@ -34510,6 +34872,7 @@ SELECT s.report_id,
   FROM {summary} s
   JOIN {counts} c
     ON s.report_id = c.report_id
+ WHERE NVL(s.write_status, 'READY') = 'READY'
 """
 
     ddls[pending_actions_view] = f"""
@@ -34559,7 +34922,12 @@ SELECT report_id,
          WHEN status IS NULL THEN 'UNKNOWN'
          ELSE status
        END AS grant_class
-  FROM {grants}
+  FROM {grants} g
+ WHERE EXISTS (
+       SELECT 1 FROM {summary} s
+        WHERE s.report_id = g.report_id
+          AND NVL(s.write_status, 'READY') = 'READY'
+ )
 """
 
     ddls[usability_class_view] = f"""
@@ -34591,7 +34959,12 @@ SELECT report_id,
               OR INSTR(UPPER(reason), 'BLOCK') > 0 THEN 'DEPENDENCY'
          ELSE 'OTHER'
        END AS reason_class
-  FROM {usability}
+  FROM {usability} u
+ WHERE EXISTS (
+       SELECT 1 FROM {summary} s
+        WHERE s.report_id = u.report_id
+          AND NVL(s.write_status, 'READY') = 'READY'
+ )
 """
     return ddls
 
@@ -34946,7 +35319,9 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
     TOTAL_CHECKED, MISSING_COUNT, MISSING_FIXABLE_COUNT, EXCLUDED_COUNT, MISMATCHED_COUNT, OK_COUNT, SKIPPED_COUNT, UNSUPPORTED_COUNT,
     INDEX_MISSING, INDEX_MISMATCHED, CONSTRAINT_MISSING, CONSTRAINT_MISMATCH,
     TRIGGER_MISSING, SEQUENCE_MISSING, DETAIL_TRUNCATED, DETAIL_TRUNCATED_COUNT,
-    CONCLUSION, CONCLUSION_DETAIL, FULL_REPORT_JSON, TOOL_VERSION, HOSTNAME, RUN_DIR
+    CONCLUSION, CONCLUSION_DETAIL, FULL_REPORT_JSON,
+    WRITE_STATUS, WRITE_NOTE, WRITE_EXPECTED_ROWS, WRITE_ACTUAL_ROWS, WRITE_CHECKED_AT,
+    TOOL_VERSION, HOSTNAME, RUN_DIR
 ) VALUES (
     {sql_quote_literal(report_id)},
     TO_TIMESTAMP({sql_quote_literal(report_timestamp.replace('_', ''))}, 'YYYYMMDDHH24MISS'),
@@ -34984,6 +35359,11 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
     {sql_quote_literal(conclusion)},
     {sql_quote_literal(conclusion_detail)},
     {sql_clob_literal(full_json) if full_json else "NULL"},
+    {sql_quote_literal(REPORT_DB_WRITE_STATUS_WRITING)},
+    {sql_quote_literal("写入中")},
+    0,
+    0,
+    NULL,
     {sql_quote_literal(__version__)},
     {sql_quote_literal(socket.gethostname())},
     {sql_quote_literal(report_dir_val)}
@@ -35007,6 +35387,14 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
 
     batch_size = int(settings.get("report_db_insert_batch", 200) or 200)
     max_rows = int(settings.get("report_db_detail_max_rows", 0) or 0)
+    expected_rows_by_table: Dict[str, int] = {"summary": 1}
+    write_failures: List[str] = []
+
+    def _record_write_failure(message: str) -> None:
+        msg = normalize_error_text(message or "未知写入失败")
+        write_failures.append(msg)
+        log.warning("[REPORT_DB] %s", msg)
+
     count_rows = _build_report_counts_rows(
         object_counts_summary,
         unsupported_by_type,
@@ -35014,39 +35402,127 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
         excluded_by_type
     )
     if count_rows:
+        expected_rows_by_table["counts"] = len(count_rows)
         ok_counts = _insert_report_counts_rows(ob_cfg, schema_prefix, report_id, count_rows, batch_size)
-        if not ok_counts and settings.get("report_db_fail_abort"):
-            return False, "写入 DIFF_REPORT_COUNTS 失败"
+        if not ok_counts:
+            _record_write_failure("写入 DIFF_REPORT_COUNTS 失败")
+
+    usability_rows: List[Dict[str, object]] = []
+    table_presence_rows: List[Dict[str, object]] = []
+    package_rows: List[Dict[str, object]] = []
+    trigger_rows: List[Dict[str, object]] = []
+    excluded_rows: List[Dict[str, object]] = []
+    dep_rows: List[Dict[str, object]] = []
+    view_chain_rows: List[Dict[str, object]] = []
+    remap_rows: List[Dict[str, object]] = []
+    mapping_rows: List[Dict[str, object]] = []
+    blacklist_rows: List[Dict[str, object]] = []
+    skip_rows: List[Dict[str, object]] = []
+    oms_rows: List[Dict[str, object]] = []
+
     if store_scope in {"core", "full"}:
-        _insert_report_detail_rows(ob_cfg, schema_prefix, report_id, detail_rows, batch_size)
+        expected_rows_by_table["detail"] = len(detail_rows)
+        ok_detail = _insert_report_detail_rows(ob_cfg, schema_prefix, report_id, detail_rows, batch_size)
+        if not ok_detail:
+            _record_write_failure("写入 DIFF_REPORT_DETAIL 失败")
+
         if detail_item_enable and detail_item_rows:
-            _insert_report_detail_item_rows(ob_cfg, schema_prefix, report_id, detail_item_rows, batch_size)
-        if grant_plan:
-            _insert_report_grant_rows(ob_cfg, schema_prefix, report_id, grant_plan, batch_size)
+            expected_rows_by_table["detail_item"] = len(detail_item_rows)
+            ok_detail_item = _insert_report_detail_item_rows(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                detail_item_rows,
+                batch_size
+            )
+            if not ok_detail_item:
+                _record_write_failure("写入 DIFF_REPORT_DETAIL_ITEM 失败")
+
+        grant_rows = _build_report_grant_rows(grant_plan)
+        if grant_rows:
+            expected_rows_by_table["grants"] = len(grant_rows)
+            ok_grants = _insert_report_grant_rows(ob_cfg, schema_prefix, report_id, grant_plan, batch_size)
+            if not ok_grants:
+                _record_write_failure("写入 DIFF_REPORT_GRANT 失败")
+
         usability_rows = _build_report_usability_rows(usability_summary)
         if usability_rows:
-            _insert_report_usability_rows(ob_cfg, schema_prefix, report_id, usability_rows, batch_size)
+            expected_rows_by_table["usability"] = len(usability_rows)
+            ok_usability = _insert_report_usability_rows(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                usability_rows,
+                batch_size
+            )
+            if not ok_usability:
+                _record_write_failure("写入 DIFF_REPORT_USABILITY 失败")
+
         table_presence_rows = _build_report_table_presence_rows(table_presence_summary)
         if table_presence_rows:
-            _insert_report_table_presence_rows(ob_cfg, schema_prefix, report_id, table_presence_rows, batch_size)
+            expected_rows_by_table["table_presence"] = len(table_presence_rows)
+            ok_presence = _insert_report_table_presence_rows(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                table_presence_rows,
+                batch_size
+            )
+            if not ok_presence:
+                _record_write_failure("写入 DIFF_REPORT_TABLE_PRESENCE 失败")
+
         package_rows = _build_report_package_compare_rows(package_results, report_dir, report_timestamp)
         if package_rows:
-            _insert_report_package_compare_rows(ob_cfg, schema_prefix, report_id, package_rows, batch_size)
+            expected_rows_by_table["package_compare"] = len(package_rows)
+            ok_package = _insert_report_package_compare_rows(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                package_rows,
+                batch_size
+            )
+            if not ok_package:
+                _record_write_failure("写入 DIFF_REPORT_PACKAGE_COMPARE 失败")
+
         trigger_rows = _build_report_trigger_status_rows(trigger_status_rows)
         if trigger_rows:
-            _insert_report_trigger_status_rows(ob_cfg, schema_prefix, report_id, trigger_rows, batch_size)
+            expected_rows_by_table["trigger_status"] = len(trigger_rows)
+            ok_trigger = _insert_report_trigger_status_rows(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                trigger_rows,
+                batch_size
+            )
+            if not ok_trigger:
+                _record_write_failure("写入 DIFF_REPORT_TRIGGER_STATUS 失败")
+
         excluded_rows, _ex_trunc, _ex_trunc_cnt = _build_report_excluded_objects_rows(
             excluded_object_rows,
             max_rows
         )
         if excluded_rows:
-            _insert_report_excluded_objects_rows(ob_cfg, schema_prefix, report_id, excluded_rows, batch_size)
+            expected_rows_by_table["excluded_objects"] = len(excluded_rows)
+            ok_excluded = _insert_report_excluded_objects_rows(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                excluded_rows,
+                batch_size
+            )
+            if not ok_excluded:
+                _record_write_failure("写入 DIFF_REPORT_EXCLUDED_OBJECT 失败")
 
     artifact_rows = _build_report_artifact_rows(report_dir, store_scope, detail_modes, detail_truncated)
     if view_artifacts:
         artifact_rows.extend(view_artifacts)
     if artifact_rows:
-        _insert_report_artifact_rows(ob_cfg, schema_prefix, report_id, artifact_rows, batch_size)
+        expected_rows_by_table["artifact"] = len(artifact_rows)
+        ok_artifact = _insert_report_artifact_rows(ob_cfg, schema_prefix, report_id, artifact_rows, batch_size)
+        if not ok_artifact:
+            _record_write_failure("写入 DIFF_REPORT_ARTIFACT 失败")
+
+    art_line_count = 0
     if store_scope == "full":
         line_iter = _iter_report_artifact_line_rows(report_dir)
         ok_art_lines, art_line_count = _insert_report_artifact_line_rows(
@@ -35056,11 +35532,11 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
             line_iter,
             batch_size
         )
-        if not ok_art_lines and settings.get("report_db_fail_abort"):
-            return False, "写入 DIFF_REPORT_ARTIFACT_LINE 失败"
         if not ok_art_lines:
+            _record_write_failure("写入 DIFF_REPORT_ARTIFACT_LINE 失败")
             _mark_artifact_line_partial(ob_cfg, schema_prefix, report_id)
-        if art_line_count > 0:
+        elif art_line_count > 0:
+            expected_rows_by_table["artifact_line"] = art_line_count
             log.info("[REPORT_DB] artifact 行级文本已写入: %d", art_line_count)
 
     if store_scope == "full":
@@ -35071,21 +35547,42 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
             store_expected=True
         )
         if dep_rows:
-            _insert_report_dependency_rows(ob_cfg, schema_prefix, report_id, dep_rows, batch_size)
+            expected_rows_by_table["dependency"] = len(dep_rows)
+            ok_dep = _insert_report_dependency_rows(ob_cfg, schema_prefix, report_id, dep_rows, batch_size)
+            if not ok_dep:
+                _record_write_failure("写入 DIFF_REPORT_DEPENDENCY 失败")
 
         view_chain_rows, _vc_trunc, _vc_trunc_cnt = _build_report_view_chain_rows(
             view_chain_file,
             max_rows
         )
         if view_chain_rows:
-            _insert_report_view_chain_rows(ob_cfg, schema_prefix, report_id, view_chain_rows, batch_size)
+            expected_rows_by_table["view_chain"] = len(view_chain_rows)
+            ok_view_chain = _insert_report_view_chain_rows(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                view_chain_rows,
+                batch_size
+            )
+            if not ok_view_chain:
+                _record_write_failure("写入 DIFF_REPORT_VIEW_CHAIN 失败")
 
         remap_rows, _remap_trunc, _remap_trunc_cnt = _build_report_remap_conflict_rows(
             remap_conflicts,
             max_rows
         )
         if remap_rows:
-            _insert_report_remap_conflict_rows(ob_cfg, schema_prefix, report_id, remap_rows, batch_size)
+            expected_rows_by_table["remap_conflict"] = len(remap_rows)
+            ok_remap = _insert_report_remap_conflict_rows(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                remap_rows,
+                batch_size
+            )
+            if not ok_remap:
+                _record_write_failure("写入 DIFF_REPORT_REMAP_CONFLICT 失败")
 
         mapping_rows, _map_trunc, _map_trunc_cnt = _build_report_object_mapping_rows(
             full_object_mapping,
@@ -35093,21 +35590,42 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
             max_rows
         )
         if mapping_rows:
-            _insert_report_object_mapping_rows(ob_cfg, schema_prefix, report_id, mapping_rows, batch_size)
+            expected_rows_by_table["object_mapping"] = len(mapping_rows)
+            ok_mapping = _insert_report_object_mapping_rows(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                mapping_rows,
+                batch_size
+            )
+            if not ok_mapping:
+                _record_write_failure("写入 DIFF_REPORT_OBJECT_MAPPING 失败")
 
         blacklist_rows, _bl_trunc, _bl_trunc_cnt = _build_report_blacklist_rows(
             blacklist_report_rows,
             max_rows
         )
         if blacklist_rows:
-            _insert_report_blacklist_rows(ob_cfg, schema_prefix, report_id, blacklist_rows, batch_size)
+            expected_rows_by_table["blacklist"] = len(blacklist_rows)
+            ok_blacklist = _insert_report_blacklist_rows(
+                ob_cfg,
+                schema_prefix,
+                report_id,
+                blacklist_rows,
+                batch_size
+            )
+            if not ok_blacklist:
+                _record_write_failure("写入 DIFF_REPORT_BLACKLIST 失败")
 
         skip_rows, _skip_trunc, _skip_trunc_cnt = _build_report_fixup_skip_rows(
             fixup_skip_summary,
             max_rows
         )
         if skip_rows:
-            _insert_report_fixup_skip_rows(ob_cfg, schema_prefix, report_id, skip_rows, batch_size)
+            expected_rows_by_table["fixup_skip"] = len(skip_rows)
+            ok_skip = _insert_report_fixup_skip_rows(ob_cfg, schema_prefix, report_id, skip_rows, batch_size)
+            if not ok_skip:
+                _record_write_failure("写入 DIFF_REPORT_FIXUP_SKIP 失败")
 
         oms_rows, _oms_trunc, _oms_trunc_cnt = _build_report_oms_missing_rows(
             tv_results,
@@ -35116,13 +35634,54 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
             max_rows
         )
         if oms_rows:
-            _insert_report_oms_missing_rows(ob_cfg, schema_prefix, report_id, oms_rows, batch_size)
+            expected_rows_by_table["oms_missing"] = len(oms_rows)
+            ok_oms = _insert_report_oms_missing_rows(ob_cfg, schema_prefix, report_id, oms_rows, batch_size)
+            if not ok_oms:
+                _record_write_failure("写入 DIFF_REPORT_OMS_MISSING 失败")
+
+    verify_ok, actual_rows_by_table, verify_detail = _verify_report_db_row_consistency(
+        ob_cfg,
+        schema_prefix,
+        report_id,
+        expected_rows_by_table
+    )
+    if not verify_ok:
+        _record_write_failure(f"写库行数复核失败: {verify_detail}")
+
+    expected_total_rows = sum(int(v or 0) for v in expected_rows_by_table.values())
+    actual_total_rows = sum(int(v or 0) for v in actual_rows_by_table.values())
+
+    final_status = REPORT_DB_WRITE_STATUS_READY
+    final_note = "写库完成，口径复核通过"
+    if write_failures:
+        final_status = REPORT_DB_WRITE_STATUS_FAILED
+        final_note = "; ".join(write_failures[:8])
+        if len(write_failures) > 8:
+            final_note += f" ... (+{len(write_failures) - 8})"
+
+    status_ok = _set_report_db_summary_write_status(
+        ob_cfg,
+        schema_prefix,
+        report_id,
+        final_status,
+        note=final_note,
+        expected_rows=expected_total_rows,
+        actual_rows=actual_total_rows
+    )
+    if not status_ok:
+        write_failures.append("更新 DIFF_REPORT_SUMMARY 写入状态失败")
 
     retention_days = int(settings.get("report_retention_days", 0) or 0)
     if retention_days > 0:
         purge_report_db_retention(ob_cfg, schema_prefix, retention_days)
 
-    log.info("[REPORT_DB] 报告已写入数据库: report_id=%s", report_id)
+    if write_failures:
+        log.warning("[REPORT_DB] 报告写入不完整: report_id=%s", report_id)
+        if settings.get("report_db_fail_abort"):
+            return False, "; ".join(write_failures[:3])
+        return True, report_id
+
+    log.info("[REPORT_DB] 报告已写入数据库并发布 READY: report_id=%s", report_id)
     return True, report_id
 
 def collect_blacklisted_missing_tables(
