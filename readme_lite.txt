@@ -19,6 +19,7 @@ OceanBase 对比工具极简手册（现场版）
 - Oracle Instant Client
 - obclient
 - Java 8+（dbcat 需要）
+- 安全说明：运行时不会把 OB/dbcat 密码作为明文参数暴露在 `ps` 中。
 
 示例环境变量（按实际路径改）：
 export LD_LIBRARY_PATH=/path/to/instantclient:$LD_LIBRARY_PATH

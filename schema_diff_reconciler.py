@@ -61,6 +61,7 @@
    - Instant Client / dbcat / JAVA_HOME / Remap 前置校验，发现致命问题立即终止。
 """
 
+import atexit
 import argparse
 import configparser
 import hashlib
@@ -121,6 +122,22 @@ LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOG_FILE_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
 LOG_SECTION_WIDTH = 80
 OBC_TIMEOUT = 60
+OBCLIENT_SECURE_OPT = "--defaults-extra-file"
+_OBCLIENT_SECURE_FILES: Set[Path] = set()
+_OBCLIENT_SECURE_LOCK = threading.Lock()
+
+
+def _cleanup_obclient_secure_files() -> None:
+    for path in list(_OBCLIENT_SECURE_FILES):
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        finally:
+            _OBCLIENT_SECURE_FILES.discard(path)
+
+
+atexit.register(_cleanup_obclient_secure_files)
 
 
 class FatalError(RuntimeError):
@@ -10164,6 +10181,53 @@ def reconcile_object_counts_summary(
 
 # ====================== obclient + 一次性元数据转储 ======================
 
+def _escape_obclient_option_value(value: str) -> str:
+    return (value or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _ensure_obclient_defaults_file(ob_cfg: ObConfig) -> str:
+    cached = str(ob_cfg.get("__ob_defaults_file", "") or "").strip()
+    cached_path = Path(cached) if cached else None
+    if cached_path and cached_path.exists():
+        return str(cached_path)
+    with _OBCLIENT_SECURE_LOCK:
+        cached = str(ob_cfg.get("__ob_defaults_file", "") or "").strip()
+        cached_path = Path(cached) if cached else None
+        if cached_path and cached_path.exists():
+            return str(cached_path)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix="ob_reconcile_",
+            suffix=".cnf",
+            delete=False
+        ) as tmp:
+            tmp.write("[client]\n")
+            tmp.write(f'password="{_escape_obclient_option_value(str(ob_cfg.get("password", "") or ""))}"\n')
+            tmp_path = Path(tmp.name)
+        try:
+            tmp_path.chmod(0o600)
+        except Exception:
+            pass
+        ob_cfg["__ob_defaults_file"] = str(tmp_path)
+        _OBCLIENT_SECURE_FILES.add(tmp_path)
+        return str(tmp_path)
+
+
+def _build_obclient_command_args(ob_cfg: ObConfig, extra_args: Optional[List[str]] = None) -> List[str]:
+    defaults_file = _ensure_obclient_defaults_file(ob_cfg)
+    command_args: List[str] = [
+        ob_cfg['executable'],
+        f"{OBCLIENT_SECURE_OPT}={defaults_file}",
+        '-h', ob_cfg['host'],
+        '-P', ob_cfg['port'],
+        '-u', ob_cfg['user_string'],
+    ]
+    if extra_args:
+        command_args.extend(extra_args)
+    return command_args
+
+
 def obclient_run_sql(ob_cfg: ObConfig, sql_query: str, timeout: Optional[int] = None) -> Tuple[bool, str, str]:
     """运行 obclient CLI 命令并返回 (Success, stdout, stderr)，带 timeout。"""
     timeout_val = OBC_TIMEOUT if timeout is None else max(1, int(timeout))
@@ -10172,14 +10236,7 @@ def obclient_run_sql(ob_cfg: ObConfig, sql_query: str, timeout: Optional[int] = 
         sql_payload += ";"
     if sql_payload:
         sql_payload += "\n"
-    command_args = [
-        ob_cfg['executable'],
-        '-h', ob_cfg['host'],
-        '-P', ob_cfg['port'],
-        '-u', ob_cfg['user_string'],
-        '-p' + ob_cfg['password'],
-        '-ss',  # Silent 模式
-    ]
+    command_args = _build_obclient_command_args(ob_cfg, extra_args=['-ss'])  # Silent 模式
 
     def _extract_obclient_error(text: str) -> str:
         if not text:
@@ -10214,6 +10271,14 @@ def obclient_run_sql(ob_cfg: ObConfig, sql_query: str, timeout: Optional[int] = 
         if result.returncode != 0:
             err_line = _extract_obclient_error(stderr_clean) or _extract_obclient_error(stdout_clean)
             err_text = err_line or stderr_clean or stdout_clean or f"obclient return code {result.returncode}"
+            err_text_lower = err_text.lower()
+            if "unknown option" in err_text_lower and OBCLIENT_SECURE_OPT in err_text_lower:
+                log.error(
+                    "严重错误: 当前 obclient 不支持安全凭据参数 %s，"
+                    "已阻断运行以避免回退到明文 -p。",
+                    OBCLIENT_SECURE_OPT
+                )
+                abort_run()
             log.error("  [OBClient 错误] SQL: %s | 错误: %s", sql_query.strip(), err_text)
             return False, stdout_clean, err_text
         err_line = _extract_obclient_error(stderr_clean) or _extract_obclient_error(stdout_clean)
@@ -19067,14 +19132,10 @@ def collect_ob_env_info(ob_cfg: ObConfig) -> Dict[str, str]:
         "current_user": configured_user
     }
 
-    status_cmd = [
-        ob_cfg["executable"],
-        "-h", ob_cfg["host"],
-        "-P", ob_cfg["port"],
-        "-u", ob_cfg["user_string"],
-        "-p" + ob_cfg["password"],
-        "-e", "status"
-    ]
+    status_cmd = _build_obclient_command_args(
+        ob_cfg,
+        extra_args=["-e", "status"]
+    )
     try:
         result = subprocess.run(
             status_cmd,
@@ -19715,6 +19776,34 @@ def fetch_dbcat_schema_objects(
     # 用于保护共享数据的锁
     results_lock = threading.Lock()
     error_occurred = threading.Event()
+
+    def _quote_dbcat_arg(arg: object) -> str:
+        text = str(arg if arg is not None else "")
+        if not text:
+            return '""'
+        escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+        if re.search(r'[\s"#]', text):
+            return f'"{escaped}"'
+        return escaped
+
+    def _write_dbcat_argfile(args: List[str]) -> Path:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix="dbcat_args_",
+            suffix=".txt",
+            delete=False
+        ) as tmp:
+            for item in args:
+                tmp.write(_quote_dbcat_arg(item))
+                tmp.write("\n")
+            tmp_path = Path(tmp.name)
+        try:
+            tmp_path.chmod(0o600)
+        except Exception:
+            pass
+        _OBCLIENT_SECURE_FILES.add(tmp_path)
+        return tmp_path
     
     def _export_single_schema(schema: str, prepared: List[Tuple[str, str, List[str]]]) -> Optional[str]:
         """导出单个 schema 的所有对象，返回错误信息或 None"""
@@ -19732,8 +19821,7 @@ def fetch_dbcat_schema_objects(
             chunk_idx: int,
             total_chunks: int
         ) -> Optional[str]:
-            cmd = [
-                str(dbcat_cli),
+            dbcat_args = [
                 'convert',
                 '-H', host,
                 '-P', port,
@@ -19746,12 +19834,12 @@ def fetch_dbcat_schema_objects(
                 '-f', str(run_dir)
             ]
             if service:
-                cmd.extend(['--service-name', service])
+                dbcat_args.extend(['--service-name', service])
             if dbcat_no_cal_dep:
-                cmd.append('--no-cal-dep')
+                dbcat_args.append('--no-cal-dep')
             if dbcat_query_meta_thread:
-                cmd.extend(['--query-meta-thread', str(dbcat_query_meta_thread)])
-            cmd.extend([option, ','.join(chunk_names)])
+                dbcat_args.extend(['--query-meta-thread', str(dbcat_query_meta_thread)])
+            dbcat_args.extend([option, ','.join(chunk_names)])
 
             env = os.environ.copy()
             env['JAVA_HOME'] = java_home
@@ -19762,6 +19850,8 @@ def fetch_dbcat_schema_objects(
                 schema, option, chunk_idx, total_chunks, len(chunk_names)
             )
             start_time = time.time()
+            argfile_path = _write_dbcat_argfile(dbcat_args)
+            cmd = [str(dbcat_cli), f"@{argfile_path}"]
             try:
                 with tempfile.TemporaryFile() as stdout_buf, tempfile.TemporaryFile() as stderr_buf:
                     proc = subprocess.Popen(
@@ -19793,6 +19883,12 @@ def fetch_dbcat_schema_objects(
                     stdout_text = stdout_buf.read().decode('utf-8', errors='ignore')
                     stderr_text = stderr_buf.read().decode('utf-8', errors='ignore')
                     if proc.returncode != 0:
+                        lowered = f"{stderr_text}\n{stdout_text}".lower()
+                        if "unknown option" in lowered and "@".lower() in cmd[1].lower():
+                            return (
+                                "[dbcat] 当前版本不支持 @argfile 安全参数注入，"
+                                "已阻断运行以避免密码出现在命令行参数。"
+                            )
                         return f"[dbcat] 转换 schema={schema} 失败: {stderr_text or stdout_text}"
                 log.info(
                     "[dbcat] 导出 schema=%s option=%s chunk=%d/%d 完成，用时 %.2fs。",
@@ -19806,6 +19902,12 @@ def fetch_dbcat_schema_objects(
                 return None
             except Exception as e:
                 return f"[dbcat] 转换 schema={schema} 异常: {e}"
+            finally:
+                try:
+                    argfile_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                _OBCLIENT_SECURE_FILES.discard(argfile_path)
         
         # 执行所有 chunk
         for option, obj_type, name_list in prepared:

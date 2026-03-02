@@ -36,6 +36,7 @@ Usage:
 
 from __future__ import annotations
 
+import atexit
 import argparse
 import configparser
 import fnmatch
@@ -46,6 +47,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from collections import defaultdict, OrderedDict
@@ -78,6 +80,7 @@ FIXUP_RUN_LOCK_FILENAME = ".run_fixup.lock"
 FIXUP_HOT_RELOAD_EVENTS_DIR = "errors"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
 REPO_ISSUES_URL = f"{REPO_URL}/issues"
+OBCLIENT_SECURE_OPT = "--defaults-extra-file"
 
 CONFIG_HOT_RELOAD_MODE_VALUES = {"off", "phase", "round"}
 CONFIG_HOT_RELOAD_FAIL_POLICY_VALUES = {"keep_last_good", "abort"}
@@ -86,6 +89,44 @@ FIXUP_EXEC_MODE_VALUES = {"auto", "file", "statement"}
 LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOG_FILE_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
 LOG_SECTION_WIDTH = 80
+
+_SECURE_CREDENTIAL_FILES: Set[Path] = set()
+
+
+def _cleanup_secure_credential_files() -> None:
+    for path in list(_SECURE_CREDENTIAL_FILES):
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        finally:
+            _SECURE_CREDENTIAL_FILES.discard(path)
+
+
+atexit.register(_cleanup_secure_credential_files)
+
+
+def _escape_obclient_option_value(value: str) -> str:
+    return (value or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _create_obclient_defaults_file(password: str) -> Path:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="ob_fixup_",
+        suffix=".cnf",
+        delete=False
+    ) as tmp:
+        tmp.write("[client]\n")
+        tmp.write(f'password="{_escape_obclient_option_value(password)}"\n')
+        tmp_path = Path(tmp.name)
+    try:
+        tmp_path.chmod(0o600)
+    except Exception:
+        pass
+    _SECURE_CREDENTIAL_FILES.add(tmp_path)
+    return tmp_path
 
 CURRENT_SCHEMA_PATTERN = re.compile(
     r'^\s*ALTER\s+SESSION\s+SET\s+CURRENT_SCHEMA\s*=\s*(?P<schema>"[^"]+"|[A-Z0-9_$#]+)\s*;?\s*$',
@@ -560,6 +601,55 @@ SYS_PRIV_IMPLICATIONS = {
         "REFERENCES ANY TABLE",
     },
 }
+
+DICTIONARY_OWNER_SCHEMAS = {"SYS", "SYSTEM"}
+
+
+def resolve_implied_sys_privileges(
+    required_priv: str,
+    target_full: Optional[str] = None,
+    target_type: Optional[str] = None
+) -> Set[str]:
+    """
+    Resolve system privilege implication set for a target object.
+
+    SELECT ANY DICTIONARY is only valid for dictionary owners (SYS/SYSTEM).
+    It must not be treated as generic SELECT on business schemas.
+    """
+    required_u = (required_priv or "").upper()
+    target_type_u = normalize_object_type(target_type or "")
+    implied: Set[str]
+
+    # Tighten privilege implication by object type to avoid false positives.
+    if required_u == "SELECT":
+        if target_type_u in {"TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM"}:
+            implied = {"SELECT ANY TABLE"}
+        elif target_type_u == "SEQUENCE":
+            implied = {"SELECT ANY SEQUENCE"}
+        else:
+            implied = set()
+    elif required_u == "EXECUTE":
+        if target_type_u in {"PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE BODY", "JOB", "SCHEDULE"}:
+            implied = {"EXECUTE ANY PROCEDURE"}
+        elif target_type_u in {"TYPE", "TYPE BODY"}:
+            implied = {"EXECUTE ANY TYPE"}
+        else:
+            implied = set()
+    elif required_u == "REFERENCES":
+        implied = {"REFERENCES ANY TABLE"} if target_type_u == "TABLE" else set()
+    else:
+        implied = set(SYS_PRIV_IMPLICATIONS.get(required_u, set()))
+
+    if required_u != "SELECT":
+        return implied
+    if not target_full:
+        return implied
+    schema, _ = parse_object_token(target_full)
+    if schema and schema.upper() in DICTIONARY_OWNER_SCHEMAS and target_type_u in {
+        "TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM"
+    }:
+        implied.add("SELECT ANY DICTIONARY")
+    return implied
 
 
 def is_grant_dir(dir_name: str) -> bool:
@@ -1548,12 +1638,17 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
 
 def build_obclient_command(ob_cfg: Dict[str, str]) -> List[str]:
     """Assemble the obclient command line."""
+    defaults_file = (ob_cfg.get("__ob_defaults_file") or "").strip()
+    defaults_path: Optional[Path] = Path(defaults_file) if defaults_file else None
+    if defaults_path is None or not defaults_path.exists():
+        defaults_path = _create_obclient_defaults_file(ob_cfg["password"])
+        ob_cfg["__ob_defaults_file"] = str(defaults_path)
     return [
         ob_cfg["executable"],
+        f"{OBCLIENT_SECURE_OPT}={defaults_path}",
         "-h", ob_cfg["host"],
         "-P", ob_cfg["port"],
         "-u", ob_cfg["user_string"],
-        f"-p{ob_cfg['password']}",
         "--prompt", "fixup>",
         "--silent",
     ]
@@ -2549,6 +2644,7 @@ def has_required_privilege(
     timeout: Optional[int],
     grantee: str,
     ref_full: str,
+    target_type: str,
     required_priv: str,
     roles_cache: Dict[str, Set[str]],
     tab_privs_cache: Dict[Tuple[str, str, str], Set[str]],
@@ -2578,7 +2674,7 @@ def has_required_privilege(
         return True
     if (grantee_u, required_u, ref_full.upper()) in planned_object_privs_with_option:
         return True
-    implied = SYS_PRIV_IMPLICATIONS.get(required_u, set())
+    implied = resolve_implied_sys_privileges(required_u, ref_full, target_type)
     if implied and any((grantee_u, p) in planned_sys_privs for p in implied):
         return True
 
@@ -2648,6 +2744,7 @@ def plan_object_grant_for_dependency(
         timeout,
         grantee,
         target_full,
+        target_type,
         required_priv,
         roles_cache,
         tab_privs_cache,
@@ -2664,6 +2761,7 @@ def plan_object_grant_for_dependency(
     entries, source_label = find_grant_entries_by_priority(
         grantee,
         target_full,
+        target_type,
         required_priv,
         grant_index_miss,
         grant_index_all,
@@ -2932,6 +3030,27 @@ def build_view_chain_plan(
         if exists:
             plan_lines.append(f"EXISTS: {dep_full}({dep_type})")
             continue
+        if dep_type.upper() == "SYNONYM" and node in synonym_targets:
+            target_full, target_type = synonym_targets[node]
+            target_exists = check_object_exists(
+                obclient_cmd,
+                timeout,
+                target_full,
+                target_type,
+                exists_cache,
+                planned_objects
+            )
+            if target_exists is None:
+                plan_lines.append(
+                    f"BLOCK: 无法确认同义词目标是否存在 {target_full}({target_type})"
+                )
+                blocked = True
+                continue
+            if target_exists:
+                plan_lines.append(
+                    f"SKIP DDL: {dep_full}(SYNONYM) 缺少脚本，使用 {target_full}({target_type})"
+                )
+                continue
         ddl_path, ddl_source = select_fixup_script_for_node_with_fallback(
             node,
             object_index,
@@ -3073,7 +3192,7 @@ def split_sql_statements(sql_text: str) -> List[str]:
 def run_sql(obclient_cmd: List[str], sql_text: str, timeout: Optional[int]) -> subprocess.CompletedProcess:
     """Execute SQL text by piping it to obclient."""
     try:
-        return subprocess.run(
+        result = subprocess.run(
             obclient_cmd,
             input=sql_text,
             capture_output=True,
@@ -3081,6 +3200,14 @@ def run_sql(obclient_cmd: List[str], sql_text: str, timeout: Optional[int]) -> s
             check=False,
             timeout=timeout,
         )
+        if result.returncode != 0:
+            err_text = f"{result.stderr or ''}\n{result.stdout or ''}".lower()
+            if "unknown option" in err_text and OBCLIENT_SECURE_OPT in err_text:
+                raise ConfigError(
+                    "当前 obclient 不支持安全凭据参数 --defaults-extra-file，"
+                    "已阻断运行以避免回退到明文 -p。"
+                )
+        return result
     except FileNotFoundError as exc:
         raise ConfigError(f"obclient 不存在或不可执行: {exc}") from exc
     except PermissionError as exc:
@@ -3839,9 +3966,11 @@ def select_object_grant_entries_for_priv(
 def select_system_grant_entries_for_priv(
     grant_index: GrantIndex,
     grantee: str,
+    target_full: str,
+    target_type: str,
     required_priv: str
 ) -> List[GrantEntry]:
-    implied = SYS_PRIV_IMPLICATIONS.get((required_priv or "").upper(), set())
+    implied = resolve_implied_sys_privileges(required_priv, target_full, target_type)
     if not implied:
         return []
     entries = grant_index.by_grantee_sys.get(grantee, [])
@@ -3857,6 +3986,7 @@ def select_system_grant_entries_for_priv(
 def find_grant_entries_by_priority(
     grantee: str,
     target_full: str,
+    target_type: str,
     required_priv: str,
     grant_index_miss: GrantIndex,
     grant_index_all: GrantIndex,
@@ -3873,12 +4003,12 @@ def find_grant_entries_by_priority(
     if entries:
         return entries, "grants_all"
     entries = select_system_grant_entries_for_priv(
-        grant_index_miss, grantee, required_priv
+        grant_index_miss, grantee, target_full, target_type, required_priv
     )
     if entries:
         return entries, "grants_miss"
     entries = select_system_grant_entries_for_priv(
-        grant_index_all, grantee, required_priv
+        grant_index_all, grantee, target_full, target_type, required_priv
     )
     if entries:
         return entries, "grants_all"

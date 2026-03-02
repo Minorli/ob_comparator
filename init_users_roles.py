@@ -24,6 +24,7 @@ Reads config.ini ([ORACLE_SOURCE], [OCEANBASE_TARGET], [SETTINGS]) and:
 
 from __future__ import annotations
 
+import atexit
 import argparse
 import configparser
 import getpass
@@ -31,6 +32,7 @@ import logging
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -49,11 +51,49 @@ CONFIG_DEFAULT_PATH = "config.ini"
 DEFAULT_OUTPUT_SUBDIR = "init_users_roles"
 DEFAULT_OBCLIENT_TIMEOUT = 60
 DEFAULT_FIXUP_TIMEOUT = 3600
+OBCLIENT_SECURE_OPT = "--defaults-extra-file"
 
 LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOG_FILE_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
 
 IDENT_SIMPLE_RE = re.compile(r"^[A-Z][A-Z0-9_$#]*$")
+_SECURE_CREDENTIAL_FILES: Set[Path] = set()
+
+
+def _cleanup_secure_credential_files() -> None:
+    for path in list(_SECURE_CREDENTIAL_FILES):
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        finally:
+            _SECURE_CREDENTIAL_FILES.discard(path)
+
+
+atexit.register(_cleanup_secure_credential_files)
+
+
+def _escape_obclient_option_value(value: str) -> str:
+    return (value or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _create_obclient_defaults_file(password: str) -> Path:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="ob_init_",
+        suffix=".cnf",
+        delete=False
+    ) as tmp:
+        tmp.write("[client]\n")
+        tmp.write(f'password="{_escape_obclient_option_value(password)}"\n')
+        tmp_path = Path(tmp.name)
+    try:
+        tmp_path.chmod(0o600)
+    except Exception:
+        pass
+    _SECURE_CREDENTIAL_FILES.add(tmp_path)
+    return tmp_path
 
 
 def init_console_logging(level: int) -> None:
@@ -127,12 +167,17 @@ def build_obclient_command(ob_cfg: Dict[str, str]) -> List[str]:
         raise ValueError(f"[OCEANBASE_TARGET] missing keys: {', '.join(missing)}")
 
     ob_cfg["port"] = str(int(ob_cfg["port"]))
+    defaults_file = (ob_cfg.get("__ob_defaults_file") or "").strip()
+    defaults_path: Optional[Path] = Path(defaults_file) if defaults_file else None
+    if defaults_path is None or not defaults_path.exists():
+        defaults_path = _create_obclient_defaults_file(ob_cfg["password"])
+        ob_cfg["__ob_defaults_file"] = str(defaults_path)
     return [
         ob_cfg["executable"],
+        f"{OBCLIENT_SECURE_OPT}={defaults_path}",
         "-h", ob_cfg["host"],
         "-P", ob_cfg["port"],
         "-u", ob_cfg["user_string"],
-        f"-p{ob_cfg['password']}",
         "--prompt", "init>",
         "--silent",
     ]
@@ -184,7 +229,7 @@ def run_sql(
     sql_text: str,
     timeout: Optional[int],
 ) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    result = subprocess.run(
         list(obclient_cmd),
         input=sql_text,
         capture_output=True,
@@ -192,6 +237,14 @@ def run_sql(
         check=False,
         timeout=timeout,
     )
+    if result.returncode != 0:
+        err_text = f"{result.stderr or ''}\n{result.stdout or ''}".lower()
+        if "unknown option" in err_text and OBCLIENT_SECURE_OPT in err_text:
+            raise RuntimeError(
+                "当前 obclient 不支持安全凭据参数 --defaults-extra-file，"
+                "已阻断运行以避免回退到明文 -p。"
+            )
+    return result
 
 
 def run_query_lines(

@@ -24,6 +24,7 @@
 - port：OceanBase 端口（必填）。
 - user_string：完整的 obclient -u 参数（必填）。
 - password：OceanBase 密码（必填）。
+  说明：运行时不会把密码放进 obclient 进程参数（ps 不显示明文密码）。
 
 4) [SETTINGS]
 

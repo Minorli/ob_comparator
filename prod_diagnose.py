@@ -15,6 +15,7 @@ Output:
 
 from __future__ import annotations
 
+import atexit
 import argparse
 import configparser
 import json
@@ -22,6 +23,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -47,6 +49,47 @@ SUPPORTED_REPORT_TYPES = {"MISSING", "MISMATCHED", "UNSUPPORTED"}
 
 ORA_CODE_RE = re.compile(r"(ORA-\d{5})")
 LINE_SEP = "\x1f"
+OBCLIENT_SECURE_OPT = "--defaults-extra-file"
+_SECURE_CREDENTIAL_FILES: Dict[Tuple[str, str, str], Path] = {}
+
+
+def _cleanup_secure_credential_files() -> None:
+    for path in list(_SECURE_CREDENTIAL_FILES.values()):
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    _SECURE_CREDENTIAL_FILES.clear()
+
+
+atexit.register(_cleanup_secure_credential_files)
+
+
+def _escape_obclient_option_value(value: str) -> str:
+    return (value or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _resolve_obclient_defaults_file(ob_cfg: "ObCfg") -> Path:
+    cache_key = (ob_cfg.executable, ob_cfg.user_string, ob_cfg.password)
+    cached = _SECURE_CREDENTIAL_FILES.get(cache_key)
+    if cached and cached.exists():
+        return cached
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="ob_triage_",
+        suffix=".cnf",
+        delete=False
+    ) as tmp:
+        tmp.write("[client]\n")
+        tmp.write(f'password="{_escape_obclient_option_value(ob_cfg.password)}"\n')
+        tmp_path = Path(tmp.name)
+    try:
+        tmp_path.chmod(0o600)
+    except Exception:
+        pass
+    _SECURE_CREDENTIAL_FILES[cache_key] = tmp_path
+    return tmp_path
 
 
 @dataclass
@@ -235,12 +278,13 @@ def read_config(config_path: Path) -> Tuple[OracleCfg, ObCfg, ToolSettings]:
 
 
 def _ob_cmd(ob_cfg: ObCfg) -> List[str]:
+    defaults_path = _resolve_obclient_defaults_file(ob_cfg)
     return [
         ob_cfg.executable,
+        f"{OBCLIENT_SECURE_OPT}={defaults_path}",
         "-h", ob_cfg.host,
         "-P", str(ob_cfg.port),
         "-u", ob_cfg.user_string,
-        f"-p{ob_cfg.password}",
         "-N",
         "-B",
         "--silent",
@@ -259,6 +303,12 @@ def ob_query(ob_cfg: ObCfg, sql: str, timeout: Optional[int] = None) -> List[Lis
     stderr = (proc.stderr or "").strip()
     stdout = proc.stdout or ""
     if proc.returncode != 0:
+        secure_err = f"{stderr}\n{stdout}".lower()
+        if "unknown option" in secure_err and OBCLIENT_SECURE_OPT in secure_err:
+            raise TriageError(
+                "当前 obclient 不支持安全凭据参数 --defaults-extra-file，"
+                "已阻断运行以避免回退到明文 -p。"
+            )
         raise TriageError(f"obclient 查询失败({proc.returncode}): {stderr or stdout.strip()}")
     if "ORA-" in stderr.upper():
         raise TriageError(f"obclient 错误: {stderr}")
