@@ -25224,12 +25224,10 @@ def _fit_collision_name(preferred: str, semantic_key: str) -> str:
     name = _sanitize_name_token(preferred, "OBJ")
     if len(name) <= NAME_COLLISION_IDENTIFIER_MAX:
         return name
-    digest = _short_hash(semantic_key, 8)
-    keep = max(1, NAME_COLLISION_IDENTIFIER_MAX - len(digest) - 1)
-    short = name[:keep].rstrip("_")
+    short = name[:NAME_COLLISION_IDENTIFIER_MAX].rstrip("_")
     if not short:
-        short = name[:keep]
-    return f"{short}_{digest}"
+        short = name[:NAME_COLLISION_IDENTIFIER_MAX]
+    return short
 
 
 def _allocate_collision_name(
@@ -25244,7 +25242,18 @@ def _allocate_collision_name(
         reserved.add(base)
         return base
 
-    for i in range(1, 10000):
+    for i in range(1, 1000000):
+        suffix = f"_{i:03d}" if i < 1000 else f"_{i}"
+        keep = max(1, NAME_COLLISION_IDENTIFIER_MAX - len(suffix))
+        candidate = (base[:keep].rstrip("_") or base[:keep]) + suffix
+        candidate = candidate[:NAME_COLLISION_IDENTIFIER_MAX]
+        if candidate in reserved or candidate in forbidden:
+            continue
+        reserved.add(candidate)
+        return candidate
+
+    # 极端场景下继续扩号段，保持数字后缀策略，不引入哈希后缀。
+    for i in range(1000000, 2000000):
         suffix = f"_{i}"
         keep = max(1, NAME_COLLISION_IDENTIFIER_MAX - len(suffix))
         candidate = (base[:keep].rstrip("_") or base[:keep]) + suffix
@@ -25254,9 +25263,9 @@ def _allocate_collision_name(
         reserved.add(candidate)
         return candidate
 
-    fallback = _fit_collision_name(f"{base}_{_short_hash(semantic_key + '|FALLBACK', 10)}", semantic_key)
-    if fallback in forbidden:
-        fallback = _fit_collision_name(f"{fallback}_{_short_hash(semantic_key + '|ALT', 6)}", semantic_key)
+    fallback = _fit_collision_name("OBJ_COLLISION", semantic_key)
+    if fallback in reserved or fallback in forbidden:
+        fallback = _fit_collision_name("OBJ_COLLISION_001", semantic_key)
     reserved.add(fallback)
     return fallback
 
@@ -25479,15 +25488,7 @@ def build_name_collision_plan(
 
     planned_desired_names_by_schema: Dict[str, Set[str]] = defaultdict(set)
     for entry in planned_entries:
-        preferred = _build_collision_preferred_name(
-            str(entry.get("object_type")),
-            str(entry.get("table")),
-            str(entry.get("constraint_type") or ""),
-            list(entry.get("columns") or []),
-            list(entry.get("expressions") or []),
-            str(entry.get("search_condition") or ""),
-        )
-        desired = _fit_collision_name(preferred, _build_collision_semantic_key(entry))
+        desired = normalize_identifier_name(entry.get("name"))
         entry["desired_name"] = desired
         planned_desired_names_by_schema[str(entry["schema"])].add(desired)
 
@@ -25577,39 +25578,54 @@ def build_name_collision_plan(
         planned_old_groups[(str(entry["schema"]), str(entry["name"]))] += 1
 
     planned_reserved: Dict[str, Set[str]] = defaultdict(set)
+    existing_occupied_names: Dict[str, Set[str]] = defaultdict(set)
     if mode_u == "fixup" and rename_existing and existing_candidates:
         for schema, names in reserved_non_candidate.items():
             planned_reserved[schema].update(names)
+            existing_occupied_names[schema].update(names)
         for gid, final_name in existing_final_name_map.items():
             planned_reserved[gid[0]].add(final_name)
+            existing_occupied_names[gid[0]].add(final_name)
     else:
         for entry in existing_entries:
             planned_reserved[str(entry["schema"])].add(str(entry["name"]))
+            existing_occupied_names[str(entry["schema"])].add(str(entry["name"]))
 
     for entry in sorted(
         planned_entries,
         key=lambda e: (str(e["schema"]), str(e["object_type"]), str(e["table"]), str(e["name"]))
     ):
         schema = str(entry["schema"])
+        old_name = str(entry["name"]).upper()
         key = (
             schema,
             str(entry["object_type"]).upper(),
             str(entry["table"]).upper(),
-            str(entry["name"]).upper()
+            old_name
         )
-        preferred = _build_collision_preferred_name(
-            str(entry.get("object_type")),
-            str(entry.get("table")),
-            str(entry.get("constraint_type") or ""),
-            list(entry.get("columns") or []),
-            list(entry.get("expressions") or []),
-            str(entry.get("search_condition") or ""),
-        )
-        final_name = _allocate_collision_name(
-            preferred,
-            _build_collision_semantic_key(entry),
-            planned_reserved.setdefault(schema, set())
-        )
+        reserved = planned_reserved.setdefault(schema, set())
+        has_existing_conflict = old_name in existing_occupied_names.get(schema, set())
+        if not has_existing_conflict and old_name not in reserved:
+            final_name = old_name
+            reserved.add(final_name)
+        else:
+            preferred = _build_collision_preferred_name(
+                str(entry.get("object_type")),
+                str(entry.get("table")),
+                str(entry.get("constraint_type") or ""),
+                list(entry.get("columns") or []),
+                list(entry.get("expressions") or []),
+                str(entry.get("search_condition") or ""),
+            )
+            forbidden: Set[str] = set()
+            if old_name in reserved or has_existing_conflict:
+                forbidden.add(old_name)
+            final_name = _allocate_collision_name(
+                preferred,
+                _build_collision_semantic_key(entry),
+                reserved,
+                forbidden=forbidden
+            )
         planned_name_map[key] = final_name
 
     rename_actions: List[Dict[str, object]] = []
@@ -25687,12 +25703,10 @@ def build_name_collision_plan(
         key = (schema, object_type, table, old_name)
         new_name = planned_name_map.get(key, old_name)
         conflict_types: List[str] = []
-        if (schema, old_name) in existing_name_groups:
+        if old_name in existing_occupied_names.get(schema, set()):
             conflict_types.append("PLANNED_VS_EXISTING")
         if planned_old_groups.get((schema, old_name), 0) > 1:
             conflict_types.append("PLANNED_INTERNAL_DUP")
-        if new_name != old_name and "PLANNED_VS_EXISTING" not in conflict_types:
-            conflict_types.append("POLICY_RENAME")
         if not conflict_types:
             continue
         conflict_with_set: Set[str] = set()
