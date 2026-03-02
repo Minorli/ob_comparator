@@ -686,6 +686,15 @@ class ViewConstraintReportRow(NamedTuple):
     constraints: str
 
 
+class CaseSensitiveIdentifierFinding(NamedTuple):
+    side: str  # SOURCE/TARGET
+    owner: str
+    object_name: str
+    object_type: str
+    context: str
+    mode: str
+
+
 class SupportClassificationResult(NamedTuple):
     support_state_map: Dict[Tuple[str, str], ObjectSupportReportRow]
     missing_detail_rows: List[ObjectSupportReportRow]
@@ -860,6 +869,7 @@ class ObMetadata(NamedTuple):
     package_errors: Dict[Tuple[str, str, str], "PackageErrorInfo"]  # (OWNER, NAME, TYPE) -> error summary
     package_errors_complete: bool                        # 目标端错误信息是否完整
     partition_key_columns: Dict[Tuple[str, str], List[str]]  # (OWNER, TABLE_NAME) -> [PARTITION_COLS...]
+    case_sensitive_findings: Tuple[CaseSensitiveIdentifierFinding, ...] = ()  # case-sensitive 标识符发现
     constraint_deferrable_supported: bool = False         # 是否支持读取 DEFERRABLE/DEFERRED 元数据
 
 
@@ -1369,27 +1379,79 @@ def is_case_sensitive_identifier(raw_name: Optional[str]) -> bool:
     return text != text.upper()
 
 
-def report_and_abort_case_sensitive_identifiers(
+def should_ignore_case_sensitive_finding(
+    owner_raw: Optional[str],
+    object_name_raw: Optional[str],
+    obj_type: Optional[str],
+) -> bool:
+    """
+    过滤已知的大小写噪声：
+    - PUBLIC 同义词在 Oracle 侧为 PUBLIC，在 OB 侧常表现为 __public。
+    - 这属于跨库实现差异，不应当被当成“大小写敏感(双引号)对象”告警。
+    - 但若同义词名本身包含大小写（例如 MixedCase），仍需保留告警。
+    """
+    obj_type_u = (obj_type or "").strip().upper()
+    if obj_type_u != "SYNONYM":
+        return False
+    owner_norm = normalize_public_owner(owner_raw)
+    if owner_norm != "PUBLIC":
+        return False
+    return not is_case_sensitive_identifier(object_name_raw)
+
+
+def handle_case_sensitive_identifiers(
     rows: Set[Tuple[str, str, str]],
-    source: str
-) -> None:
+    source: str,
+    mode: str
+) -> Tuple[CaseSensitiveIdentifierFinding, ...]:
     if not rows:
-        return
-    samples = sorted(rows)[:CASE_SENSITIVE_IDENTIFIER_SAMPLE_LIMIT]
-    log.error(
-        "检测到大小写敏感(双引号)标识符，共 %d 个（来源: %s）。当前版本不支持该场景，已终止本次运行。",
-        len(rows),
-        source
+        return ()
+    mode_u = normalize_case_sensitive_identifier_mode(mode)
+    source_u = (source or "").strip().upper()
+    is_target = source_u.startswith("OCEANBASE") or source_u.startswith("OB.") or source_u.startswith("TARGET")
+    side = "TARGET" if is_target else "SOURCE"
+    filtered_rows: List[Tuple[str, str, str]] = []
+    for owner_raw, name_raw, obj_type in sorted(rows):
+        if should_ignore_case_sensitive_finding(owner_raw, name_raw, obj_type):
+            continue
+        filtered_rows.append((owner_raw, name_raw, obj_type))
+    if not filtered_rows:
+        return ()
+    findings = tuple(
+        CaseSensitiveIdentifierFinding(
+            side=side,
+            owner=(owner_raw or "").strip(),
+            object_name=(name_raw or "").strip(),
+            object_type=(obj_type or "").strip().upper(),
+            context=source,
+            mode=mode_u,
+        )
+        for owner_raw, name_raw, obj_type in filtered_rows
     )
-    for owner_raw, name_raw, obj_type in samples:
-        log.error("  - %s.%s (%s)", owner_raw or "?", name_raw or "?", obj_type or "?")
-    if len(rows) > len(samples):
-        log.error("  ... 其余 %d 个已省略。", len(rows) - len(samples))
-    log.error(
-        "处理建议: 统一对象/列命名为非双引号常规标识符（全大写语义），"
-        "或将这批对象从本次校验范围中排除。"
+    samples = findings[:CASE_SENSITIVE_IDENTIFIER_SAMPLE_LIMIT]
+    if mode_u == "abort":
+        log.error(
+            "检测到大小写敏感(双引号)标识符，共 %d 个（来源: %s），mode=abort，已终止运行。",
+            len(findings),
+            source
+        )
+        for item in samples:
+            log.error("  - %s.%s (%s)", item.owner or "?", item.object_name or "?", item.object_type or "?")
+        if len(findings) > len(samples):
+            log.error("  ... 其余 %d 个已省略。", len(findings) - len(samples))
+        log.error("处理建议: 改用 case_sensitive_identifier_mode=warn 或 strict_fixup 继续运行。")
+        abort_run()
+    log.warning(
+        "检测到大小写敏感(双引号)标识符，共 %d 个（来源: %s），mode=%s，继续运行并输出专项明细。",
+        len(findings),
+        source,
+        mode_u
     )
-    abort_run()
+    for item in samples:
+        log.warning("  - %s.%s (%s)", item.owner or "?", item.object_name or "?", item.object_type or "?")
+    if len(findings) > len(samples):
+        log.warning("  ... 其余 %d 个请查看专项明细。", len(findings) - len(samples))
+    return findings
 
 
 def log_metadata_volume_warning(
@@ -3166,6 +3228,23 @@ FIXUP_EXEC_MODE_ALIASES = {
     "per_statement": "statement",
     "per-statement": "statement",
 }
+CASE_SENSITIVE_IDENTIFIER_MODE_VALUES = {"abort", "warn", "strict_fixup"}
+CASE_SENSITIVE_IDENTIFIER_MODE_ALIASES = {
+    "on": "warn",
+    "true": "warn",
+    "1": "warn",
+    "off": "abort",
+    "false": "abort",
+    "0": "abort",
+    "strict": "strict_fixup",
+    "strict-fixup": "strict_fixup",
+}
+METADATA_LOAD_MODE_VALUES = {"auto", "full", "schema_chunk"}
+METADATA_LOAD_MODE_ALIASES = {
+    "chunk": "schema_chunk",
+    "schema-chunk": "schema_chunk",
+    "stream": "schema_chunk",
+}
 CONFIG_HOT_RELOAD_MODE_VALUES = {"off", "phase", "round"}
 CONFIG_HOT_RELOAD_MODE_ALIASES = {
     "disable": "off",
@@ -3227,6 +3306,28 @@ def normalize_fixup_exec_mode(raw_value: Optional[str]) -> str:
     value = FIXUP_EXEC_MODE_ALIASES.get(value, value)
     if value not in FIXUP_EXEC_MODE_VALUES:
         log.warning("fixup_exec_mode=%s 不在支持范围内，将回退为 auto。", raw_value)
+        return "auto"
+    return value
+
+
+def normalize_case_sensitive_identifier_mode(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "warn"
+    value = str(raw_value).strip().lower()
+    value = CASE_SENSITIVE_IDENTIFIER_MODE_ALIASES.get(value, value)
+    if value not in CASE_SENSITIVE_IDENTIFIER_MODE_VALUES:
+        log.warning("case_sensitive_identifier_mode=%s 不在支持范围内，将回退为 warn。", raw_value)
+        return "warn"
+    return value
+
+
+def normalize_metadata_load_mode(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "auto"
+    value = str(raw_value).strip().lower()
+    value = METADATA_LOAD_MODE_ALIASES.get(value, value)
+    if value not in METADATA_LOAD_MODE_VALUES:
+        log.warning("metadata_load_mode=%s 不在支持范围内，将回退为 auto。", raw_value)
         return "auto"
     return value
 
@@ -4279,6 +4380,8 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('fixup_auto_grant_cache_limit', '10000')
         settings.setdefault('fixup_exec_mode', 'auto')
         settings.setdefault('fixup_exec_file_fallback', 'true')
+        settings.setdefault('case_sensitive_identifier_mode', 'warn')
+        settings.setdefault('metadata_load_mode', 'auto')
         settings.setdefault('synonym_check_scope', 'public_only')
         settings.setdefault('synonym_fixup_scope', 'public_only')
         settings.setdefault('name_collision_mode', 'fixup')
@@ -4700,6 +4803,12 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             settings.get('fixup_exec_file_fallback', 'true'),
             True
         )
+        settings['case_sensitive_identifier_mode'] = normalize_case_sensitive_identifier_mode(
+            settings.get('case_sensitive_identifier_mode', 'warn')
+        )
+        settings['metadata_load_mode'] = normalize_metadata_load_mode(
+            settings.get('metadata_load_mode', 'auto')
+        )
         settings['fixup_dir_allow_outside_repo'] = parse_bool_flag(
             settings.get('fixup_dir_allow_outside_repo', 'false'),
             False
@@ -5084,6 +5193,25 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "仅支持 auto/file/statement"
 
+    def _validate_case_sensitive_identifier_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = CASE_SENSITIVE_IDENTIFIER_MODE_ALIASES.get(
+            val.strip().lower(),
+            val.strip().lower()
+        )
+        if normalized in CASE_SENSITIVE_IDENTIFIER_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 abort/warn/strict_fixup"
+
+    def _validate_metadata_load_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = METADATA_LOAD_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in METADATA_LOAD_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 auto/full/schema_chunk"
+
     def _validate_interval_fixup_mode(val: str) -> Tuple[bool, str]:
         if not val.strip():
             return True, ""
@@ -5383,6 +5511,22 @@ def run_config_wizard(config_path: Path) -> None:
         "run_fixup file 模式失败后回退 statement 重试一次 (true/false)",
         default=cfg.get("SETTINGS", "fixup_exec_file_fallback", fallback="true"),
         transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "case_sensitive_identifier_mode",
+        "大小写敏感标识符处理模式 (abort/warn/strict_fixup)",
+        default=cfg.get("SETTINGS", "case_sensitive_identifier_mode", fallback="warn"),
+        validator=_validate_case_sensitive_identifier_mode,
+        transform=normalize_case_sensitive_identifier_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "metadata_load_mode",
+        "元数据加载模式 (auto/full/schema_chunk)",
+        default=cfg.get("SETTINGS", "metadata_load_mode", fallback="auto"),
+        validator=_validate_metadata_load_mode,
+        transform=normalize_metadata_load_mode,
     )
     _prompt_field(
         "SETTINGS",
@@ -7699,8 +7843,9 @@ def get_source_objects(
     ora_cfg: OraConfig,
     schemas_list: List[str],
     object_types: Optional[Set[str]] = None,
-    synonym_check_scope: str = "all"
-) -> SourceObjectMap:
+    synonym_check_scope: str = "all",
+    case_sensitive_mode: str = "warn",
+) -> Tuple[SourceObjectMap, Tuple[CaseSensitiveIdentifierFinding, ...]]:
     """
     从 Oracle 源端获取所有需要纳入 remap/依赖分析的对象：
       TABLE / VIEW / MATERIALIZED VIEW / PROCEDURE / FUNCTION / PACKAGE / PACKAGE BODY /
@@ -7718,7 +7863,7 @@ def get_source_objects(
         object_types_for_objects.discard('SYNONYM')
     if not object_types_for_objects and not include_synonyms:
         log.warning("未启用任何可管理对象类型，源端对象列表为空。")
-        return {}
+        return {}, ()
     object_types_clause = ",".join(f"'{obj}'" for obj in sorted(object_types_for_objects)) if object_types_for_objects else ""
 
     source_objects: SourceObjectMap = defaultdict(set)
@@ -7844,7 +7989,11 @@ def get_source_objects(
         log.error(f"严重错误: 连接或查询 Oracle 失败: {e}")
         abort_run()
 
-    report_and_abort_case_sensitive_identifiers(case_sensitive_issues, "Oracle.DBA_OBJECTS/DBA_SYNONYMS")
+    case_sensitive_findings = handle_case_sensitive_identifiers(
+        case_sensitive_issues,
+        "Oracle.DBA_OBJECTS/DBA_SYNONYMS",
+        case_sensitive_mode
+    )
 
     # Materialized View 在 DBA_OBJECTS 中通常会同时作为 TABLE 出现，去重以避免误将 MV 当成 TABLE 校验/抽取。
     mview_dedup = 0
@@ -7886,7 +8035,7 @@ def get_source_objects(
         )
     if skipped_iot:
         log.info("已跳过 %d 个 SYS_IOT_OVER_* IOT 表，不参与对比或修补脚本生成。", skipped_iot)
-    return dict(source_objects)
+    return dict(source_objects), case_sensitive_findings
 
 
 # 依附对象到父表的映射类型（触发器/同义词等需要跟随父表 schema）
@@ -10418,6 +10567,7 @@ def dump_ob_metadata(
     target_schemas: Set[str],
     tracked_object_types: Optional[Set[str]] = None,
     synonym_check_scope: str = "all",
+    case_sensitive_mode: str = "warn",
     include_tab_columns: bool = True,
     include_column_order: bool = False,
     include_indexes: bool = True,
@@ -10453,6 +10603,7 @@ def dump_ob_metadata(
             package_errors={},
             package_errors_complete=False,
             partition_key_columns={},
+            case_sensitive_findings=(),
             constraint_deferrable_supported=False
         )
 
@@ -10485,6 +10636,7 @@ def dump_ob_metadata(
     # --- 1. DBA_OBJECTS ---
     objects_by_type: Dict[str, Set[str]] = {}
     object_statuses: Dict[Tuple[str, str, str], str] = {}
+    case_sensitive_issues: Set[Tuple[str, str, str]] = set()
     object_types_filter = tracked_object_types or set(ALL_TRACKED_OBJECT_TYPES)
     if not object_types_filter:
         object_types_filter = {'TABLE'}
@@ -10512,8 +10664,12 @@ def dump_ob_metadata(
             parts = line.split('\t')
             if len(parts) < 3:
                 continue
-            owner = parts[0].strip().upper()
-            name = parts[1].strip().upper()
+            owner_raw = parts[0].strip()
+            name_raw = parts[1].strip()
+            if is_case_sensitive_identifier(owner_raw) or is_case_sensitive_identifier(name_raw):
+                case_sensitive_issues.add((owner_raw, name_raw, parts[2].strip().upper()))
+            owner = owner_raw.upper()
+            name = name_raw.upper()
             obj_type = parts[2].strip().upper()
             status = parts[3].strip().upper() if len(parts) > 3 else "UNKNOWN"
             if obj_type == 'SYNONYM' and owner == '__PUBLIC':
@@ -10523,6 +10679,12 @@ def dump_ob_metadata(
             full = f"{owner}.{name}"
             objects_by_type.setdefault(obj_type, set()).add(full)
             object_statuses[(owner, name, obj_type)] = status or "UNKNOWN"
+
+    case_sensitive_findings = handle_case_sensitive_identifiers(
+        case_sensitive_issues,
+        "OceanBase.DBA_OBJECTS",
+        case_sensitive_mode
+    )
 
     # 补充 DBA_TYPES (部分 OB 环境中 TYPE 不出现在 DBA_OBJECTS)
     # 注意：DBA_TYPES.TYPECODE=OBJECT 仅表示对象类型，本身不代表存在 TYPE BODY，
@@ -11415,6 +11577,7 @@ def dump_ob_metadata(
         package_errors=package_errors,
         package_errors_complete=package_errors_complete,
         partition_key_columns=partition_key_columns,
+        case_sensitive_findings=case_sensitive_findings,
         constraint_deferrable_supported=constraint_deferrable_supported
     )
     ob_table_count = len(ob_meta.tab_columns)
@@ -29732,6 +29895,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "对象可用性校验明细"
     if name.startswith("table_data_presence_detail_"):
         return "DETAIL", "表数据存在性风险明细"
+    if name.startswith("case_sensitive_identifiers_detail_"):
+        return "DETAIL", "大小写敏感标识符明细"
     if name.startswith("missing_") and "_detail_" in name:
         match = re.match(r"missing_(.+)_detail_", name)
         if match:
@@ -29851,6 +30016,35 @@ def export_unsupported_objects_detail(
         for row in rows_sorted
     ]
     return write_pipe_report("不支持/阻断对象明细", header_fields, data_rows, output_path)
+
+
+def export_case_sensitive_identifier_detail(
+    findings: List[CaseSensitiveIdentifierFinding],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出大小写敏感(双引号)标识符明细。
+    """
+    if not report_dir or not findings or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"case_sensitive_identifiers_detail_{report_timestamp}.txt"
+    rows_sorted = sorted(
+        findings,
+        key=lambda r: (
+            (r.side or "").upper(),
+            (r.owner or "").upper(),
+            (r.object_name or "").upper(),
+            (r.object_type or "").upper(),
+            (r.context or "")
+        )
+    )
+    header_fields = ["SIDE", "OWNER", "OBJECT_NAME", "OBJECT_TYPE", "CONTEXT", "MODE"]
+    data_rows = [
+        [row.side, row.owner, row.object_name, row.object_type, row.context, row.mode]
+        for row in rows_sorted
+    ]
+    return write_pipe_report("大小写敏感标识符明细", header_fields, data_rows, output_path)
 
 
 def convert_constraint_unsupported_rows(
@@ -32368,6 +32562,7 @@ def _build_report_detail_rows(
     constraint_status_rows: Optional[List[ConstraintStatusDriftRow]] = None,
     trigger_validity_mode: str = "off",
     additional_missing_rows: Optional[List[ObjectSupportReportRow]] = None,
+    case_sensitive_findings: Optional[List[CaseSensitiveIdentifierFinding]] = None,
 ) -> Tuple[List[Dict[str, object]], bool, int]:
     detail_modes = settings.get("report_db_detail_mode_set") or set(DEFAULT_REPORT_DB_DETAIL_MODES)
     max_rows = int(settings.get("report_db_detail_max_rows", 0) or 0)
@@ -32415,6 +32610,7 @@ def _build_report_detail_rows(
     if "unsupported" in detail_modes:
         total_count += len(unsupported_rows) or 0
         total_count += len(extra_index_unsupported) + len(extra_constraint_unsupported)
+        total_count += len(case_sensitive_findings or [])
     if "mismatched" in detail_modes:
         total_count += len(mismatch_rows)
         total_count += len(extra_index_mismatched) + len(extra_constraint_mismatched)
@@ -32512,6 +32708,28 @@ def _build_report_detail_rows(
                     "search_condition": row.search_condition,
                     "ob_error_hint": row.ob_error_hint,
                 }, ensure_ascii=False)
+            })
+        for row in case_sensitive_findings or []:
+            side = (row.side or "").upper()
+            src_schema = row.owner if side == "SOURCE" else ""
+            src_name = row.object_name if side == "SOURCE" else ""
+            tgt_schema = row.owner if side == "TARGET" else ""
+            tgt_name = row.object_name if side == "TARGET" else ""
+            _push({
+                "report_type": "UNSUPPORTED",
+                "object_type": row.object_type or "OBJECT",
+                "source_schema": src_schema,
+                "source_name": src_name,
+                "target_schema": tgt_schema,
+                "target_name": tgt_name,
+                "status": "CASE_SENSITIVE_IDENTIFIER",
+                "reason": "CASE_SENSITIVE_IDENTIFIER",
+                "detail_json": json.dumps({
+                    "reason_code": "CASE_SENSITIVE_IDENTIFIER",
+                    "side": row.side,
+                    "context": row.context,
+                    "mode": row.mode,
+                }, ensure_ascii=False),
             })
 
     if "mismatched" in detail_modes:
@@ -32712,7 +32930,8 @@ def _build_report_detail_item_rows(
     trigger_status_rows: Optional[List[TriggerStatusReportRow]] = None,
     constraint_status_rows: Optional[List[ConstraintStatusDriftRow]] = None,
     trigger_validity_mode: str = "off",
-    name_collision_rows: Optional[List[NameCollisionDetailRow]] = None
+    name_collision_rows: Optional[List[NameCollisionDetailRow]] = None,
+    case_sensitive_findings: Optional[List[CaseSensitiveIdentifierFinding]] = None
 ) -> Tuple[List[Dict[str, object]], bool, int]:
     rows: List[Dict[str, object]] = []
     seen_keys: Set[Tuple[str, ...]] = set()
@@ -32796,6 +33015,27 @@ def _build_report_detail_item_rows(
                 _push({**base, "item_type": "ROOT_CAUSE", "item_key": "", "item_value": row.root_cause})
             if row.detail:
                 _push({**base, "item_type": "DETAIL", "item_key": "", "item_value": row.detail})
+
+    # 1.b) 大小写敏感标识符专项明细
+    for item in case_sensitive_findings or []:
+        side = (item.side or "").upper()
+        row_base = {
+            "report_type": "UNSUPPORTED",
+            "object_type": item.object_type or "OBJECT",
+            "source_schema": item.owner if side == "SOURCE" else "",
+            "source_name": item.object_name if side == "SOURCE" else "",
+            "target_schema": item.owner if side == "TARGET" else "",
+            "target_name": item.object_name if side == "TARGET" else "",
+            "status": "CASE_SENSITIVE_IDENTIFIER",
+        }
+        _push({
+            **row_base,
+            "item_type": "CASE_SENSITIVE_IDENTIFIER",
+            "item_key": item.object_name,
+            "src_value": item.side,
+            "tgt_value": item.mode,
+            "item_value": f"context={item.context}; owner={item.owner}",
+        })
 
     # 2) TABLE 列差异（主对象）
     for obj_type, tgt_name, missing, extra, length_mismatches, type_mismatches in tv_results.get("mismatched", []):
@@ -33278,6 +33518,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "BLACKLIST_TABLES"
     if name.startswith("excluded_objects_detail_"):
         return "EXCLUDED_OBJECTS_DETAIL"
+    if name.startswith("case_sensitive_identifiers_detail_"):
+        return "CASE_SENSITIVE_IDENTIFIER_DETAIL"
     if name.startswith("fixup_skip_summary_"):
         return "FIXUP_SKIP_SUMMARY"
     if name.startswith("filtered_grants"):
@@ -33324,6 +33566,7 @@ def _infer_artifact_status(
         "PACKAGE_COMPARE",
         "TRIGGER_STATUS",
         "TRIGGER_TEMP_UNSUPPORTED_DETAIL",
+        "CASE_SENSITIVE_IDENTIFIER_DETAIL",
         "USABILITY_DETAIL",
         "TABLE_PRESENCE_DETAIL",
         "FILTERED_GRANTS",
@@ -35272,6 +35515,7 @@ def save_report_to_db(
     if store_scope != "full":
         detail_item_enable = False
     detail_item_max_rows = int(settings.get("report_db_detail_item_max_rows", 0) or 0)
+    case_sensitive_findings = list(settings.get("_case_sensitive_findings") or [])
 
     # 兼容两种形态：
     # 1) 嵌套结构: {"oracle": {...}, "oceanbase": {...}}
@@ -35389,7 +35633,8 @@ def save_report_to_db(
             trigger_status_rows=trigger_status_rows,
             constraint_status_rows=constraint_status_rows,
             trigger_validity_mode=settings.get("trigger_validity_sync_mode", "compile"),
-            additional_missing_rows=package_missing_rows
+            additional_missing_rows=package_missing_rows,
+            case_sensitive_findings=case_sensitive_findings
         )
     else:
         detail_rows, detail_truncated, detail_truncated_count = [], False, 0
@@ -35407,7 +35652,8 @@ def save_report_to_db(
             trigger_status_rows=trigger_status_rows,
             constraint_status_rows=constraint_status_rows,
             trigger_validity_mode=settings.get("trigger_validity_sync_mode", "compile"),
-            name_collision_rows=name_collision_rows
+            name_collision_rows=name_collision_rows,
+            case_sensitive_findings=case_sensitive_findings
         )
         if detail_item_truncated:
             detail_truncated = True
@@ -36566,6 +36812,8 @@ def print_final_report(
     table_presence_skipped_cnt = 0
     table_presence_checked_cnt = 0
     table_presence_mode = "-"
+    case_sensitive_findings = list((settings or {}).get("_case_sensitive_findings") or [])
+    case_sensitive_findings_count = len(case_sensitive_findings)
     if usability_summary:
         usability_checked_cnt = usability_summary.total_checked
         usability_usable_cnt = usability_summary.total_usable
@@ -36751,6 +36999,8 @@ def print_final_report(
             lines.append(
                 f"迁移聚焦: 缺失可修补 {missing_supported_cnt}, 不兼容/阻断/待确认 {unsupported_blocked_cnt}"
             )
+        if case_sensitive_findings_count:
+            lines.append(f"大小写敏感(双引号)对象: {case_sensitive_findings_count} (需人工确认映射与DDL)")
         if blocked_total:
             lines.append(f"不支持/阻断/待确认: {blocked_total}")
         next_steps: List[str] = []
@@ -36762,6 +37012,8 @@ def print_final_report(
         if blocked_total:
             suffix = f"_{report_ts}" if report_ts else "_*"
             next_steps.append(f"查看 unsupported_objects_detail{suffix}.txt 或 blacklist_tables.txt")
+        if case_sensitive_findings_count and report_ts:
+            next_steps.append(f"查看 case_sensitive_identifiers_detail_{report_ts}.txt 并确认 remap/DDL 策略")
         if report_ts:
             next_steps.append(f"查看 migration_focus_{report_ts}.txt 汇总迁移动作清单")
         if next_steps:
@@ -36787,6 +37039,15 @@ def print_final_report(
     schema_text.append("源 schema 未获取到对象: ", style="mismatch")
     schema_text.append(f"{source_missing_schema_cnt}")
     summary_table.add_row("[bold]Schema 覆盖[/bold]", schema_text)
+
+    if case_sensitive_findings_count:
+        case_text = Text()
+        case_text.append("检测到大小写敏感(双引号)对象: ", style="mismatch")
+        case_text.append(str(case_sensitive_findings_count), style="mismatch")
+        if emit_detail_files and report_ts:
+            case_text.append("\n详见: ", style="info")
+            case_text.append(f"case_sensitive_identifiers_detail_{report_ts}.txt", style="info")
+        summary_table.add_row("[bold]大小写敏感标识符[/bold]", case_text)
 
     blacklist_missing_cnt = len(blacklisted_missing_tables or {})
     primary_text = Text()
@@ -37749,6 +38010,7 @@ def print_final_report(
         view_constraint_cleaned_path = None
         view_constraint_uncleanable_path = None
         name_collision_detail_path = None
+        case_sensitive_detail_path = None
         missing_by_type_paths: Dict[str, Optional[Path]] = {}
         unsupported_by_type_paths: Dict[str, Optional[Path]] = {}
         name_collision_rows = list((settings or {}).get("_name_collision_rows") or [])
@@ -37787,6 +38049,12 @@ def print_final_report(
                 report_ts
             )
         if report_ts:
+            case_sensitive_detail_path = export_case_sensitive_identifier_detail(
+                case_sensitive_findings,
+                report_path.parent,
+                report_ts
+            )
+        if report_ts:
             migration_focus_path = export_migration_focus_report(
                 combined_missing_rows,
                 unsupported_rows,
@@ -37804,6 +38072,12 @@ def print_final_report(
             unsupported_detail_path,
             len(unsupported_detail_rows or []),
             "不支持/阻断对象明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            case_sensitive_detail_path,
+            case_sensitive_findings_count if case_sensitive_detail_path else None,
+            "大小写敏感标识符明细"
         )
         _add_index_entry(
             "DETAIL",
@@ -38122,6 +38396,8 @@ def print_final_report(
                 log.info("缺失对象支持性明细已输出到: %s", missing_detail_path)
             if unsupported_detail_path:
                 log.info("不支持/阻断对象明细已输出到: %s", unsupported_detail_path)
+            if case_sensitive_detail_path:
+                log.info("大小写敏感标识符明细已输出到: %s", case_sensitive_detail_path)
             if missing_by_type_paths:
                 for path in sorted(p for p in missing_by_type_paths.values() if p):
                     log.info("缺失按类型明细已输出到: %s", path)
@@ -38437,11 +38713,13 @@ def main():
         remap_rules = load_remap_rules(settings['remap_file'])
 
         # 3) 加载源端主对象 (TABLE/VIEW/PROC/FUNC/PACKAGE/PACKAGE BODY/SYNONYM)
-        source_objects = get_source_objects(
+        source_objects, source_case_sensitive_findings = get_source_objects(
             ora_cfg,
             settings['source_schemas_list'],
-            synonym_check_scope=settings.get('synonym_check_scope', 'public_only')
+            synonym_check_scope=settings.get('synonym_check_scope', 'public_only'),
+            case_sensitive_mode=settings.get('case_sensitive_identifier_mode', 'warn')
         )
+        settings["_case_sensitive_findings"] = list(source_case_sensitive_findings or [])
 
         # 4) 验证 Remap 规则
         extraneous_rules = validate_remap_rules(remap_rules, source_objects, settings.get("remap_file"))
@@ -38796,6 +39074,7 @@ def main():
             target_schemas,
             tracked_object_types=tracked_types,
             synonym_check_scope=settings.get('synonym_check_scope', 'public_only'),
+            case_sensitive_mode=settings.get('case_sensitive_identifier_mode', 'warn'),
             include_tab_columns='TABLE' in enabled_primary_types,
             include_column_order=enable_column_order_check,
             include_indexes='INDEX' in enabled_extra_types,
@@ -38806,6 +39085,25 @@ def main():
             include_roles=enable_grant_generation,
             target_table_pairs=target_table_pairs if enable_comment_check else set()
         )
+        if ob_meta.case_sensitive_findings:
+            merged_case_sensitive: Dict[Tuple[str, str, str, str], CaseSensitiveIdentifierFinding] = {}
+            for item in (settings.get("_case_sensitive_findings") or []):
+                key = (
+                    (item.side or "").upper(),
+                    (item.owner or "").upper(),
+                    (item.object_name or "").upper(),
+                    (item.object_type or "").upper()
+                )
+                merged_case_sensitive[key] = item
+            for item in ob_meta.case_sensitive_findings:
+                key = (
+                    (item.side or "").upper(),
+                    (item.owner or "").upper(),
+                    (item.object_name or "").upper(),
+                    (item.object_type or "").upper()
+                )
+                merged_case_sensitive[key] = item
+            settings["_case_sensitive_findings"] = list(merged_case_sensitive.values())
         ob_dependencies: Set[Tuple[str, str, str, str]] = set()
         if enable_dependencies_check:
             ob_dependencies = load_ob_dependencies(

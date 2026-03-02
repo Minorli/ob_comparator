@@ -34,6 +34,14 @@
 - remap_file：Remap 规则文件路径。默认：空（按 1:1 映射）。
   说明：规则格式为 `SRC_SCHEMA.OBJECT = TGT_SCHEMA.OBJECT`，支持注释与空行。
   注意：文件不存在会报警但继续。
+- case_sensitive_identifier_mode：大小写敏感(双引号)标识符处理模式。默认：warn。
+  可选值：abort / warn / strict_fixup。
+  说明：`abort` 发现即终止；`warn` 继续运行并输出专项明细；
+       `strict_fixup` 为严格修补策略预留模式（当前仍以告警与明细输出为主）。
+- metadata_load_mode：元数据加载模式。默认：auto。
+  可选值：auto / full / schema_chunk。
+  说明：当前版本 `auto` 与 `full` 行为一致；`schema_chunk` 为分块加载预留模式，
+       现阶段会回退到 full 并保持统计口径一致。
 
 输出与日志
 - report_dir：主报告输出目录。默认：main_reports。

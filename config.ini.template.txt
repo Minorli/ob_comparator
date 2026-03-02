@@ -21,6 +21,16 @@ source_schemas          = ORA_APP,ORA_FIN,ORA_BI
 # Remap 规则文件路径（迁移时需要改变 schema 的对象映射）
 # 留空表示按 1:1 映射处理
 remap_file              = remap_rules.txt
+# 大小写敏感(双引号)标识符处理模式：
+#   abort        -> 发现即中止（最严格）
+#   warn         -> 继续运行并输出专项明细（默认）
+#   strict_fixup -> 继续运行，允许严格模式下的后续修补策略
+case_sensitive_identifier_mode = warn
+# 元数据加载模式：
+#   auto         -> 默认自动模式（当前等同 full，保留后续扩展）
+#   full         -> 全量加载元数据（当前默认实现）
+#   schema_chunk -> 预留分块模式（当前回退为 full）
+metadata_load_mode      = auto
 
 # dbcat 调用的 CLI 超时，单位秒；对象多时可调大
 # 建议值：300~1800（视对象数量与网络情况而定）
