@@ -3705,6 +3705,16 @@ class TriggerStatusReportRow(NamedTuple):
     detail: str
 
 
+class TriggerViewReferenceRow(NamedTuple):
+    trigger_full: str
+    location: str
+    source_reference: str
+    resolved_reference: str
+    reference_type: str
+    note: str
+    action: str
+
+
 class ConstraintStatusDriftRow(NamedTuple):
     table_full: str
     constraint_type: str
@@ -4733,7 +4743,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             settings.get('report_to_db', 'true'),
             True
         )
-        settings['report_db_schema'] = (settings.get('report_db_schema', '') or '').strip().upper()
+        settings['report_db_schema'] = normalize_report_db_schema(
+            settings.get('report_db_schema', '')
+        )
         try:
             settings['report_retention_days'] = int(settings.get('report_retention_days', '90'))
         except (TypeError, ValueError):
@@ -4960,6 +4972,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         return ora_cfg, ob_cfg, settings
     except KeyError as e:
         log.error(f"严重错误: 配置文件中缺少必要的部分: {e}")
+        abort_run()
+    except ValueError as e:
+        log.error(f"严重错误: 配置项非法: {e}")
         abort_run()
 
 
@@ -5327,6 +5342,15 @@ def run_config_wizard(config_path: Path) -> None:
         if normalized in REPORT_DB_STORE_SCOPE_VALUES:
             return True, ""
         return False, "仅支持 summary/core/full"
+
+    def _validate_report_db_schema(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        try:
+            normalize_report_db_schema(val)
+        except ValueError:
+            return False, "仅支持 Oracle 普通标识符（字母/数字/_/$/#，且不能包含点号）"
+        return True, ""
 
     def _validate_view_dblink_policy(val: str) -> Tuple[bool, str]:
         if not val.strip():
@@ -6000,6 +6024,8 @@ def run_config_wizard(config_path: Path) -> None:
         "report_db_schema",
         "报告存库 schema（可选，留空使用目标连接用户）",
         default=cfg.get("SETTINGS", "report_db_schema", fallback=""),
+        validator=_validate_report_db_schema,
+        transform=normalize_report_db_schema,
     )
     _prompt_field(
         "SETTINGS",
@@ -8321,6 +8347,49 @@ def resolve_synonym_terminal_source(
         owner_u, name_u = next_owner, next_name
 
     return None
+
+
+def load_oracle_view_like_object_keys(
+    ora_cfg: OraConfig,
+    schemas_list: List[str]
+) -> Set[str]:
+    """
+    读取源端 VIEW/MATERIALIZED VIEW 全名集合（OWNER.OBJECT）。
+    用于在 check_primary_types 未启用 VIEW 时，触发器重写仍可识别“视图语义”。
+    """
+    owners = sorted({(item or "").strip().upper() for item in (schemas_list or []) if (item or "").strip()})
+    if not owners:
+        return set()
+
+    sql_tpl = """
+        SELECT OWNER, OBJECT_NAME
+          FROM DBA_OBJECTS
+         WHERE OWNER IN ({owner_ph})
+           AND OBJECT_TYPE IN ('VIEW', 'MATERIALIZED VIEW')
+    """
+    result: Set[str] = set()
+    try:
+        with oracledb.connect(
+            user=ora_cfg['user'],
+            password=ora_cfg['password'],
+            dsn=ora_cfg['dsn']
+        ) as connection:
+            with connection.cursor() as cursor:
+                for owner_chunk in chunk_list(owners, ORACLE_IN_BATCH_SIZE):
+                    owner_ph = build_bind_placeholders(len(owner_chunk))
+                    sql = sql_tpl.format(owner_ph=owner_ph)
+                    cursor.execute(sql, owner_chunk)
+                    for row in cursor:
+                        owner = (row[0] or "").strip().upper()
+                        name = (row[1] or "").strip().upper()
+                        if owner and name:
+                            result.add(f"{owner}.{name}")
+    except oracledb.Error as exc:
+        log.warning("[TRIGGER] 读取源端 VIEW/MVIEW 名单失败，视图语义识别将仅基于映射类型: %s", exc)
+
+    if result:
+        log.info("[TRIGGER] 已加载源端 VIEW/MVIEW 对象 %d 个（用于触发器视图语义保护）。", len(result))
+    return result
 
 
 def validate_remap_rules(
@@ -22814,12 +22883,18 @@ def remap_trigger_object_references(
     tgt_trigger: Optional[str],
     *,
     on_target: Optional[Tuple[str, str]] = None,
-    qualify_schema: bool = True
+    qualify_schema: bool = True,
+    remap_rules: Optional[RemapRules] = None,
+    synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]] = None,
+    trigger_full: Optional[str] = None,
+    trigger_view_reference_rows: Optional[List[TriggerViewReferenceRow]] = None,
+    source_view_keys: Optional[Set[str]] = None,
 ) -> str:
     """
     触发器 DDL 的 schema 补全与 remap 重写：
     - CREATE TRIGGER 主对象名强制带目标 schema
     - ON 子句与触发器体内 DML/序列引用补全 schema
+    - 触发器体内同义词引用优先解析到终点对象后再 remap
     - 已带 schema 的引用按 remap 规则重写
     """
     if not ddl:
@@ -22830,26 +22905,197 @@ def remap_trigger_object_references(
     src_schema_u = (source_schema or "").upper()
     tgt_schema_u = (tgt_schema or "").upper()
     tgt_trigger_u = (tgt_trigger or "").upper()
+    trigger_full_u = (trigger_full or "").upper()
+    if not trigger_full_u and tgt_schema_u and tgt_trigger_u:
+        trigger_full_u = f"{tgt_schema_u}.{tgt_trigger_u}"
+    elif not trigger_full_u and src_schema_u and tgt_trigger_u:
+        trigger_full_u = f"{src_schema_u}.{tgt_trigger_u}"
     on_schema_u = (on_target[0] or "").upper() if on_target else ""
     on_table_u = (on_target[1] or "").upper() if on_target else ""
+    remap_rules_u: Dict[str, str] = {
+        (k or "").upper(): (v or "").upper()
+        for k, v in (remap_rules or {}).items()
+        if (k or "").strip() and (v or "").strip()
+    }
+    synonym_meta = synonym_meta or {}
+    source_view_keys_u: Set[str] = {str(item).upper() for item in (source_view_keys or set()) if str(item).strip()}
+    dml_preferred_types: Tuple[str, ...] = ("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM")
+    view_like_types: Set[str] = {"VIEW", "MATERIALIZED VIEW"}
 
     def _strip_quotes(text: str) -> str:
         return (text or "").strip().strip('"').upper()
 
-    def _map_full_name(schema: str, obj: str) -> Optional[str]:
-        if not schema or not obj:
-            return None
-        src_full = f"{schema}.{obj}".upper()
-        return find_mapped_target_any_type(
-            full_object_mapping,
-            src_full,
-            preferred_types=TRIGGER_REF_PREFERRED_TYPES
+    def _split_full_name(full_name: str) -> Tuple[str, str]:
+        full_u = (full_name or "").upper()
+        if "." not in full_u:
+            return "", ""
+        return full_u.split(".", 1)
+
+    def _mapping_types(full_name: str) -> Dict[str, str]:
+        return dict(full_object_mapping.get((full_name or "").upper(), {}) or {})
+
+    def _pick_source_type(full_name: str, preferred_types: Tuple[str, ...]) -> str:
+        type_map = _mapping_types(full_name)
+        for obj_type in preferred_types:
+            if obj_type in type_map:
+                return obj_type
+        if type_map:
+            return sorted(type_map.keys())[0]
+        return ""
+
+    def _pick_mapped_with_type(
+        full_name: str,
+        preferred_types: Tuple[str, ...]
+    ) -> Tuple[Optional[str], str]:
+        type_map = _mapping_types(full_name)
+        for obj_type in preferred_types:
+            mapped = type_map.get(obj_type)
+            if mapped:
+                return mapped.upper(), obj_type
+        if not type_map:
+            return None, ""
+        # 回退与 find_mapped_target_any_type 保持同口径：按映射值字典序取最小值。
+        mapped, mapped_type = sorted(
+            ((value.upper(), obj_type) for obj_type, value in type_map.items() if value),
+            key=lambda item: item[0]
+        )[0]
+        return mapped, mapped_type
+
+    def _has_view_semantics(full_name: str) -> bool:
+        if (full_name or "").upper() in source_view_keys_u:
+            return True
+        type_map = _mapping_types(full_name)
+        return any(obj_type in view_like_types for obj_type in type_map.keys())
+
+    class _ResolvedTriggerReference(NamedTuple):
+        target_full: Optional[str]
+        source_full: str
+        source_type: str
+        resolved_by_synonym: bool
+
+    def _record_trigger_view_reference(
+        *,
+        location: str,
+        source_reference: str,
+        resolved: _ResolvedTriggerReference
+    ) -> None:
+        if trigger_view_reference_rows is None:
+            return
+        source_ref_u = (source_reference or "").upper()
+        resolved_ref_u = (resolved.target_full or "").upper()
+        if not source_ref_u or not resolved_ref_u:
+            return
+        note = (
+            "触发器引用对象为视图（或同义词终点为视图），已保留视图语义，仅补全 schema。"
+            if resolved.resolved_by_synonym
+            else "触发器引用对象为视图，已保留视图语义，仅补全 schema。"
+        )
+        trigger_view_reference_rows.append(
+            TriggerViewReferenceRow(
+                trigger_full=trigger_full_u or "-",
+                location=(location or "").upper() or "UNKNOWN",
+                source_reference=source_ref_u,
+                resolved_reference=resolved_ref_u,
+                reference_type=resolved.source_type or "VIEW",
+                note=note,
+                action="建议人工确认该视图语义与目标端依赖，必要时改造触发器逻辑。"
+            )
         )
 
-    def _map_unqualified(name: str) -> Optional[str]:
+    def _resolve_object_target(
+        schema: str,
+        obj: str,
+        *,
+        preferred_types: Tuple[str, ...],
+        allow_public_fallback: bool = False,
+        fallback_identity: bool = False,
+    ) -> _ResolvedTriggerReference:
+        schema_u = (schema or "").upper()
+        obj_u = (obj or "").upper()
+        if not schema_u or not obj_u:
+            return _ResolvedTriggerReference(None, "", "", False)
+        src_full = f"{schema_u}.{obj_u}"
+        source_full = src_full
+        explicit = remap_rules_u.get(src_full)
+        resolved_by_synonym = False
+        source_type = _pick_source_type(source_full, preferred_types)
+        if not source_type and source_full in source_view_keys_u:
+            source_type = "VIEW"
+
+        if synonym_meta:
+            terminal_source = resolve_synonym_terminal_source(schema_u, obj_u, synonym_meta)
+            if terminal_source:
+                source_full = terminal_source.upper()
+                explicit = remap_rules_u.get(source_full)
+                source_type = _pick_source_type(source_full, preferred_types) or "SYNONYM"
+                if source_type == "SYNONYM" and source_full in source_view_keys_u:
+                    source_type = "VIEW"
+                resolved_by_synonym = True
+            elif allow_public_fallback and schema_u != "PUBLIC":
+                terminal_source = resolve_synonym_terminal_source("PUBLIC", obj_u, synonym_meta)
+                if terminal_source:
+                    source_full = terminal_source.upper()
+                    explicit = remap_rules_u.get(source_full)
+                    source_type = _pick_source_type(source_full, preferred_types) or "SYNONYM"
+                    if source_type == "SYNONYM" and source_full in source_view_keys_u:
+                        source_type = "VIEW"
+                    resolved_by_synonym = True
+
+        mapped, mapped_type = _pick_mapped_with_type(source_full, preferred_types)
+        if (
+            mapped
+            and explicit
+            and mapped.upper() == source_full
+            and explicit.upper() != source_full
+        ):
+            mapped = explicit.upper()
+            mapped_type = "EXPLICIT"
+        if not mapped and explicit:
+            mapped = explicit.upper()
+            mapped_type = "EXPLICIT"
+
+        source_is_view_like = source_type in view_like_types or _has_view_semantics(source_full)
+        if source_is_view_like:
+            if not mapped and fallback_identity:
+                mapped = source_full
+                mapped_type = source_type or "VIEW"
+            if mapped:
+                mapped_schema_u, _mapped_obj_u = _split_full_name(mapped)
+                _source_schema_u, source_obj_u = _split_full_name(source_full)
+                if not mapped_schema_u:
+                    mapped_schema_u = _source_schema_u or schema_u
+                # 视图引用保持视图名，不将对象名改写成 TABLE 名称。
+                mapped = f"{mapped_schema_u}.{source_obj_u or obj_u}"
+                mapped_type = source_type or mapped_type or "VIEW"
+            return _ResolvedTriggerReference(mapped.upper() if mapped else None, source_full, source_type, resolved_by_synonym)
+
+        # 防止在“无显式 remap 且非同义词终点”场景误改对象名，仅允许 schema 漂移。
+        if (
+            mapped
+            and not explicit
+            and not resolved_by_synonym
+            and "." in mapped
+        ):
+            tgt_schema_tmp, tgt_obj_tmp = mapped.upper().split(".", 1)
+            if tgt_obj_tmp != obj_u:
+                mapped = f"{tgt_schema_tmp}.{obj_u}"
+
+        if not mapped and fallback_identity:
+            mapped = src_full
+        return _ResolvedTriggerReference(mapped.upper() if mapped else None, source_full, source_type, resolved_by_synonym)
+
+    def _map_unqualified(name: str) -> _ResolvedTriggerReference:
         if not src_schema_u or not name:
-            return None
-        return _map_full_name(src_schema_u, name)
+            return _ResolvedTriggerReference(None, "", "", False)
+        if name.upper() in {"NEW", "OLD", "DUAL"}:
+            return _ResolvedTriggerReference(None, "", "", False)
+        return _resolve_object_target(
+            src_schema_u,
+            name.upper(),
+            preferred_types=dml_preferred_types,
+            allow_public_fallback=True,
+            fallback_identity=True,
+        )
 
     masker = SqlMasker(ddl)
     working_sql = masker.masked_sql
@@ -22891,8 +23137,22 @@ def remap_trigger_object_references(
         obj = _strip_quotes(match.group("object"))
         if schema in ("NEW", "OLD"):
             return match.group(0)
-        tgt_full = _map_full_name(schema, obj)
-        return ensure_quoted_qualified(tgt_full) if tgt_full else match.group(0)
+        resolved = _resolve_object_target(
+            schema,
+            obj,
+            preferred_types=TRIGGER_REF_PREFERRED_TYPES,
+            allow_public_fallback=False,
+            fallback_identity=False,
+        )
+        if resolved.target_full and (
+            resolved.source_type in view_like_types or _has_view_semantics(resolved.source_full)
+        ):
+            _record_trigger_view_reference(
+                location="QUALIFIED",
+                source_reference=f"{schema}.{obj}",
+                resolved=resolved
+            )
+        return ensure_quoted_qualified(resolved.target_full) if resolved.target_full else match.group(0)
 
     working_sql = TRIGGER_QUALIFIED_REF_PATTERN.sub(_replace_qualified, working_sql)
 
@@ -22903,14 +23163,27 @@ def remap_trigger_object_references(
         name_clean = _strip_quotes(name_raw)
         if not name_clean or "." in name_clean:
             return match.group(0)
+        if name_clean in {"NEW", "OLD", "DUAL"}:
+            return match.group(0)
         text = match.string
         pos = match.end()
         while pos < len(text) and text[pos].isspace():
             pos += 1
         if pos < len(text) and text[pos] == ".":
             return match.group(0)
-        tgt_full = _map_unqualified(name_clean)
-        return f"{prefix}{ensure_quoted_qualified(tgt_full)}" if tgt_full else match.group(0)
+        resolved = _map_unqualified(name_clean)
+        if resolved.target_full and (
+            resolved.source_type in view_like_types or _has_view_semantics(resolved.source_full)
+        ):
+            _record_trigger_view_reference(
+                location=f"DML:{prefix.strip().upper()}",
+                source_reference=f"{src_schema_u}.{name_clean}",
+                resolved=resolved
+            )
+        return (
+            f"{prefix}{ensure_quoted_qualified(resolved.target_full)}"
+            if resolved.target_full else match.group(0)
+        )
 
     for pattern in TRIGGER_DML_PATTERNS:
         working_sql = pattern.sub(_replace_dml, working_sql)
@@ -22955,7 +23228,12 @@ def remap_plsql_object_references(
     trigger_qualify_schema: bool = True,
     trigger_on_target: Optional[Tuple[str, str]] = None,
     trigger_tgt_schema: Optional[str] = None,
-    trigger_tgt_name: Optional[str] = None
+    trigger_tgt_name: Optional[str] = None,
+    remap_rules: Optional[RemapRules] = None,
+    synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]] = None,
+    trigger_full: Optional[str] = None,
+    trigger_view_reference_rows: Optional[List[TriggerViewReferenceRow]] = None,
+    trigger_source_view_keys: Optional[Set[str]] = None,
 ) -> str:
     """
     重映射PL/SQL对象（PROCEDURE、FUNCTION、PACKAGE等）中的对象引用
@@ -22978,7 +23256,12 @@ def remap_plsql_object_references(
             trigger_tgt_schema,
             trigger_tgt_name,
             on_target=trigger_on_target,
-            qualify_schema=trigger_qualify_schema
+            qualify_schema=trigger_qualify_schema,
+            remap_rules=remap_rules,
+            synonym_meta=synonym_meta,
+            trigger_full=trigger_full,
+            trigger_view_reference_rows=trigger_view_reference_rows,
+            source_view_keys=trigger_source_view_keys,
         )
     
     masker = SqlMasker(ddl)
@@ -24047,6 +24330,23 @@ def _normalize_sql_identifier(value: str) -> Optional[str]:
     if not _SQL_IDENTIFIER_RE.match(text):
         return None
     return text
+
+
+def normalize_report_db_schema(raw_value: object) -> str:
+    """
+    规范化 report_db_schema。
+    允许留空；非空时必须满足 Oracle 普通标识符白名单。
+    """
+    text = str(raw_value or "").strip()
+    if not text:
+        return ""
+    normalized = _normalize_sql_identifier(text)
+    if not normalized:
+        raise ValueError(
+            f"SETTINGS.report_db_schema 非法: {text} "
+            "(仅允许 Oracle 普通标识符，例如 DIFF_REPORT)"
+        )
+    return normalized
 
 
 def _escape_sql_literal(value: str) -> str:
@@ -26224,6 +26524,7 @@ def generate_fixup_scripts(
     settings["_name_collision_fixup_sql_count"] = 0
     settings["_deferred_filtered_grants"] = []
     settings["_sys_c_force_candidates"] = []
+    settings["_trigger_view_reference_rows"] = []
     trigger_filter_set = {t.upper() for t in (trigger_filter_entries or set())}
     support_state_map = support_state_map or {}
     table_target_map = build_table_target_map(master_list)
@@ -26265,6 +26566,7 @@ def generate_fixup_scripts(
     deferred_validation_lock = threading.Lock()
     invalid_view_keys: Set[Tuple[str, str]] = set()
     invalid_trigger_keys: Set[Tuple[str, str]] = set()
+    trigger_source_view_keys: Set[str] = set()
     for (owner, name, obj_type), status in (oracle_meta.object_statuses or {}).items():
         if normalize_object_status(status) != "INVALID":
             continue
@@ -26277,6 +26579,24 @@ def generate_fixup_scripts(
             invalid_view_keys.add((owner_u, name_u))
         elif obj_type_u == "TRIGGER":
             invalid_trigger_keys.add((owner_u, name_u))
+    for owner, name, obj_type in (oracle_meta.object_statuses or {}).keys():
+        owner_u = (owner or "").upper()
+        name_u = (name or "").upper()
+        obj_type_u = (obj_type or "").upper()
+        if owner_u and name_u and obj_type_u in {"VIEW", "MATERIALIZED VIEW"}:
+            trigger_source_view_keys.add(f"{owner_u}.{name_u}")
+    enabled_primary_types_cfg = {
+        str(item).upper()
+        for item in (settings.get("enabled_primary_types") or set())
+        if str(item).strip()
+    }
+    if not ({"VIEW", "MATERIALIZED VIEW"} & enabled_primary_types_cfg):
+        fallback_view_keys = load_oracle_view_like_object_keys(
+            ora_cfg,
+            settings.get("source_schemas_list", []) or []
+        )
+        if fallback_view_keys:
+            trigger_source_view_keys.update(fallback_view_keys)
     if trigger_filter_enabled:
         log.info("[FIXUP] 已启用 trigger_list 过滤，清单条目数=%d。", len(trigger_filter_set))
         if not trigger_filter_set:
@@ -29081,6 +29401,8 @@ def generate_fixup_scripts(
 
     log.info("[FIXUP] (7/9) 正在生成 TRIGGER 脚本...")
     trigger_progress = build_progress_tracker(len(trigger_tasks), "[FIXUP] (7/9) TRIGGER")
+    trigger_view_reference_rows: List[TriggerViewReferenceRow] = []
+    trigger_view_reference_lock = threading.Lock()
     trigger_jobs: List[Callable[[], None]] = []
     for src_schema, trg_name, tgt_schema, tgt_obj, src_table, tgt_table_schema, tgt_table in trigger_tasks:
         def _job(
@@ -29126,6 +29448,7 @@ def generate_fixup_scripts(
                 )
                 # 重映射触发器中的对象引用并补全 schema
                 trigger_qualify_schema = bool(settings.get('trigger_qualify_schema', True))
+                local_view_refs: List[TriggerViewReferenceRow] = []
                 ddl_adj = remap_plsql_object_references(
                     ddl_adj,
                     'TRIGGER',
@@ -29134,8 +29457,16 @@ def generate_fixup_scripts(
                     trigger_qualify_schema=trigger_qualify_schema,
                     trigger_on_target=(tts, tt) if tts and tt else None,
                     trigger_tgt_schema=ts,
-                    trigger_tgt_name=to
+                    trigger_tgt_name=to,
+                    remap_rules=remap_rules,
+                    synonym_meta=synonym_meta_map,
+                    trigger_full=f"{ts}.{to}",
+                    trigger_view_reference_rows=local_view_refs,
+                    trigger_source_view_keys=trigger_source_view_keys,
                 )
+                if local_view_refs:
+                    with trigger_view_reference_lock:
+                        trigger_view_reference_rows.extend(local_view_refs)
                 if not trigger_qualify_schema:
                     # 保持旧逻辑：仅补全 CREATE TRIGGER 与 ON 子句
                     def _rewrite_trigger_name_and_on(text: str) -> str:
@@ -29220,6 +29551,23 @@ def generate_fixup_scripts(
                 trigger_progress()
         trigger_jobs.append(_job)
     run_tasks(trigger_jobs, "TRIGGER")
+    if trigger_view_reference_rows:
+        dedup_rows = sorted(
+            set(trigger_view_reference_rows),
+            key=lambda row: (
+                row.trigger_full,
+                row.location,
+                row.source_reference,
+                row.resolved_reference
+            )
+        )
+        settings["_trigger_view_reference_rows"] = dedup_rows
+        log.info(
+            "[FIXUP] 触发器视图引用提醒：%d 条（已保留视图语义，不改写为表）。",
+            len(dedup_rows)
+        )
+    else:
+        settings["_trigger_view_reference_rows"] = []
 
     if (
         generate_status_fixup
@@ -29917,6 +30265,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "触发器依赖阻断明细"
     if name.startswith("triggers_temp_table_unsupported_detail_"):
         return "DETAIL", "临时表触发器不支持明细"
+    if name.startswith("triggers_view_reference_detail_"):
+        return "DETAIL", "触发器视图引用提醒明细"
     if name.startswith("migration_focus_"):
         return "DETAIL", "迁移聚焦清单"
     if name.startswith("extra_targets_detail_"):
@@ -30628,6 +30978,49 @@ def export_triggers_temp_table_unsupported_detail(
             row.root_cause or "-",
         ])
     return write_pipe_report("临时表触发器不支持明细", header_fields, data_rows, output_path)
+
+
+def export_trigger_view_references_detail(
+    rows: List[TriggerViewReferenceRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出触发器中“视图引用保留”提醒明细，便于人工评估是否需要改造。
+    """
+    if not report_dir or not report_timestamp or not rows:
+        return None
+    output_path = Path(report_dir) / f"triggers_view_reference_detail_{report_timestamp}.txt"
+    rows_sorted = sorted(
+        rows,
+        key=lambda r: (
+            r.trigger_full or "-",
+            r.location or "-",
+            r.source_reference or "-",
+            r.resolved_reference or "-",
+        )
+    )
+    header_fields = [
+        "TRIGGER",
+        "LOCATION",
+        "SOURCE_REFERENCE",
+        "RESOLVED_REFERENCE",
+        "REFERENCE_TYPE",
+        "NOTE",
+        "ACTION",
+    ]
+    data_rows: List[List[str]] = []
+    for row in rows_sorted:
+        data_rows.append([
+            row.trigger_full or "-",
+            row.location or "-",
+            row.source_reference or "-",
+            row.resolved_reference or "-",
+            row.reference_type or "-",
+            row.note or "-",
+            row.action or "-",
+        ])
+    return write_pipe_report("触发器视图引用提醒明细", header_fields, data_rows, output_path)
 
 
 def export_migration_focus_report(
@@ -31927,7 +32320,7 @@ def _record_report_db_write_error(
 
 
 def build_report_db_schema_prefix(settings: Dict) -> str:
-    schema = (settings.get("report_db_schema") or "").strip()
+    schema = normalize_report_db_schema(settings.get("report_db_schema") or "")
     return f"{schema}." if schema else ""
 
 
@@ -32033,7 +32426,10 @@ def generate_report_id(timestamp: str) -> str:
 
 
 def ensure_report_db_tables_exist(ob_cfg: ObConfig, settings: Dict) -> Tuple[bool, str]:
-    schema = (settings.get("report_db_schema") or "").strip().upper()
+    try:
+        schema = normalize_report_db_schema(settings.get("report_db_schema") or "")
+    except ValueError as exc:
+        return False, str(exc)
     schema_prefix = f"{schema}." if schema else ""
     owner_clause = f"OWNER = '{schema}'" if schema else "OWNER = USER"
     table_names = "', '".join(REPORT_DB_TABLES.values())
@@ -33631,6 +34027,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "UNSUPPORTED_GRANT_DETAIL"
     if name.startswith("triggers_temp_table_unsupported_detail_"):
         return "TRIGGER_TEMP_UNSUPPORTED_DETAIL"
+    if name.startswith("triggers_view_reference_detail_"):
+        return "TRIGGER_VIEW_REFERENCE_DETAIL"
     if "missed_tables_views_for_OMS" in rel_path:
         return "OMS_MISSING_RULES"
     return "OTHER"
@@ -33667,6 +34065,7 @@ def _infer_artifact_status(
         "PACKAGE_COMPARE",
         "TRIGGER_STATUS",
         "TRIGGER_TEMP_UNSUPPORTED_DETAIL",
+        "TRIGGER_VIEW_REFERENCE_DETAIL",
         "CASE_SENSITIVE_IDENTIFIER_DETAIL",
         "SYS_C_FORCE_CANDIDATES_DETAIL",
         "USABILITY_DETAIL",
@@ -36919,6 +37318,8 @@ def print_final_report(
     sys_c_force_candidates = list((settings or {}).get("_sys_c_force_candidates") or [])
     sys_c_force_candidate_count = len(sys_c_force_candidates)
     sys_c_force_enabled = bool((settings or {}).get("fixup_drop_sys_c_columns", False))
+    trigger_view_reference_rows = list((settings or {}).get("_trigger_view_reference_rows") or [])
+    trigger_view_reference_count = len(trigger_view_reference_rows)
     if usability_summary:
         usability_checked_cnt = usability_summary.total_checked
         usability_usable_cnt = usability_summary.total_usable
@@ -37004,6 +37405,14 @@ def print_final_report(
         row for row in unsupported_rows
         if row.support_state in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED, SUPPORT_STATE_RISKY}
     ])
+    missing_view_cnt = sum(
+        1 for obj_type, _tgt_name, _src_name in (tv_results.get("missing", []) or [])
+        if (obj_type or "").upper() == "VIEW"
+    )
+    unsupported_view_cnt = sum(
+        1 for row in unsupported_rows
+        if (row.obj_type or "").upper() == "VIEW"
+    )
 
     console.print(Panel.fit(f"[bold]数据库对象迁移校验报告 (V{__version__} - Rich)[/bold]", style="title"))
     console.print(f"[info]项目主页: {REPO_URL} | 问题反馈: {REPO_ISSUES_URL}[/info]")
@@ -37115,6 +37524,10 @@ def print_final_report(
                 )
         if case_sensitive_findings_count:
             lines.append(f"大小写敏感(双引号)对象: {case_sensitive_findings_count} (需人工确认映射与DDL)")
+        if trigger_view_reference_count:
+            lines.append(
+                f"触发器视图引用提醒: {trigger_view_reference_count} (已保留视图语义，不改写为表)"
+            )
         if blocked_total:
             lines.append(f"不支持/阻断/待确认: {blocked_total}")
         next_steps: List[str] = []
@@ -37126,10 +37539,14 @@ def print_final_report(
         if blocked_total:
             suffix = f"_{report_ts}" if report_ts else "_*"
             next_steps.append(f"查看 unsupported_objects_detail{suffix}.txt 或 blacklist_tables.txt")
+        if missing_view_cnt or unsupported_view_cnt:
+            next_steps.append("视图依赖链修复建议执行: python3 run_fixup.py --view-chain-autofix")
         if sys_c_force_candidate_count and report_ts:
             next_steps.append(f"查看 sys_c_force_candidates_detail_{report_ts}.txt 评估 FORCE 范围")
         if case_sensitive_findings_count and report_ts:
             next_steps.append(f"查看 case_sensitive_identifiers_detail_{report_ts}.txt 并确认 remap/DDL 策略")
+        if trigger_view_reference_count and report_ts:
+            next_steps.append(f"查看 triggers_view_reference_detail_{report_ts}.txt 并确认是否需触发器改造")
         if report_ts:
             next_steps.append(f"查看 migration_focus_{report_ts}.txt 汇总迁移动作清单")
         if next_steps:
@@ -37348,6 +37765,17 @@ def print_final_report(
             temp_trg_text.append(f"triggers_temp_table_unsupported_detail_{report_ts}.txt", style="info")
         summary_table.add_row("[bold]触发器兼容性[/bold]", temp_trg_text)
 
+    if trigger_view_reference_count:
+        trigger_view_text = Text()
+        trigger_view_text.append("触发器中检测到视图引用: ", style="mismatch")
+        trigger_view_text.append(str(trigger_view_reference_count), style="mismatch")
+        trigger_view_text.append("\n处理策略: ", style="info")
+        trigger_view_text.append("保留视图语义，仅补全 schema，不改写为表。", style="info")
+        if report_ts:
+            trigger_view_text.append("\n详见: ", style="info")
+            trigger_view_text.append(f"triggers_view_reference_detail_{report_ts}.txt", style="info")
+        summary_table.add_row("[bold]触发器视图引用[/bold]", trigger_view_text)
+
     if trigger_list_summary and trigger_list_summary.get("enabled"):
         filter_text = Text()
         if trigger_list_summary.get("error"):
@@ -37531,6 +37959,10 @@ def print_final_report(
         if temp_trigger_unsupported_rows and report_ts:
             detail_hint_lines.append(
                 f"临时表触发器不支持明细: triggers_temp_table_unsupported_detail_{report_ts}.txt"
+            )
+        if trigger_view_reference_count and report_ts:
+            detail_hint_lines.append(
+                f"触发器视图引用提醒明细: triggers_view_reference_detail_{report_ts}.txt"
             )
         console.print(Panel.fit("\n".join(detail_hint_lines), style="info", width=section_width))
 
@@ -38310,6 +38742,17 @@ def print_final_report(
             len(temp_trigger_unsupported_rows) if temp_trigger_unsupported_path else None,
             "临时表触发器不支持明细"
         )
+        trigger_view_reference_path = export_trigger_view_references_detail(
+            trigger_view_reference_rows,
+            report_path.parent,
+            report_ts
+        )
+        _add_index_entry(
+            "DETAIL",
+            trigger_view_reference_path,
+            trigger_view_reference_count if trigger_view_reference_path else None,
+            "触发器视图引用提醒明细"
+        )
         deferred_validate_detail_path = None
         deferred_validate_count = int((settings or {}).get("_constraint_validate_deferred_count", 0) or 0)
         deferred_validate_path_raw = str((settings or {}).get("_constraint_validate_deferred_report_path", "") or "").strip()
@@ -38559,6 +39002,8 @@ def print_final_report(
                 log.info("约束不支持明细已输出到: %s", constraint_unsupported_path)
             if temp_trigger_unsupported_path:
                 log.info("临时表触发器不支持明细已输出到: %s", temp_trigger_unsupported_path)
+            if trigger_view_reference_path:
+                log.info("触发器视图引用提醒明细已输出到: %s", trigger_view_reference_path)
             if blocked_index_path:
                 log.info("索引阻断明细已输出到: %s", blocked_index_path)
             if blocked_constraint_path:

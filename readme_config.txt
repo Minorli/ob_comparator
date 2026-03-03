@@ -58,6 +58,7 @@
   说明：开启后会在 run 目录输出 report_sql_<timestamp>.txt（预填 report_id 的 SQL 模板），并尝试创建只读分析视图（actions/profile/trends/pending/grant/usability）。
   说明：当 report_db_store_scope=full 时，会将 run 目录下所有 txt 逐行写入 DIFF_REPORT_ARTIFACT_LINE，实现 txt 内容 100% 可查询覆盖。
 - report_db_schema：报告存库 schema。默认：空（使用 OCEANBASE_TARGET 连接用户）。
+  说明：非空时必须是 Oracle 普通标识符（示例：DIFF_REPORT），不支持点号/引号/分号；非法值会在启动阶段直接阻断。
 - report_retention_days：报告保留天数。默认：90；设为 0 表示不自动清理。
 - report_db_fail_abort：报告写库失败是否中止主流程。默认：false。
 - report_db_store_scope：写库范围（summary/core/full）。默认：full。
@@ -266,6 +267,7 @@
 - trigger_list：触发器清单文件（每行 SCHEMA.TRIGGER_NAME）。默认：空。
   注意：配置后仅生成列表内触发器，并输出 trigger_status_report.txt 报告；清单读取失败会回退全量触发器。
 - trigger_qualify_schema：触发器 DDL 是否强制补全 schema 前缀。默认：true。
+  说明：开启后会在触发器体内 DML 位点补全 schema，并把同义词引用优先解析到终点对象（如 TABLE/VIEW）后再重写，减少跨 schema 误绑定。
 
 DDL 清洗
 - ddl_punct_sanitize：清洗 PL/SQL DDL 中的全角标点。默认：true。

@@ -68,6 +68,7 @@ report_detail_mode      = split
 # 报告存库（默认开启）
 # report_to_db: 是否写入 OceanBase（obclient 方式）
 # report_db_schema: 存储 schema（留空使用目标连接用户）
+#   非空时必须是 Oracle 普通标识符，例如 DIFF_REPORT（不允许点号/引号/分号）
 # report_retention_days: 历史保留天数（0 表示不清理）
 # report_db_fail_abort: 写库失败是否中止
 # report_db_store_scope: 写库范围（summary/core/full）
@@ -224,6 +225,7 @@ name_collision_rename_existing = true
 # 配置后仅生成列表内触发器脚本，并输出 report_dir/trigger_status_report.txt 记录清单与状态差异
 trigger_list            =
 # 触发器 DDL 是否强制补全 schema 前缀 (true/false)
+# 说明：开启后会在触发器体内按安全位点补全 schema，并将同义词引用解析到终点对象后再重写。
 trigger_qualify_schema  = true
 
 # 可选：限制本次只检查的对象类型/模块，留空表示全量（大小写不敏感，逗号分隔）

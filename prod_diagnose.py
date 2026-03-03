@@ -48,9 +48,23 @@ REPORT_TABLES = {
 SUPPORTED_REPORT_TYPES = {"MISSING", "MISMATCHED", "UNSUPPORTED"}
 
 ORA_CODE_RE = re.compile(r"(ORA-\d{5})")
+SQL_IDENTIFIER_RE = re.compile(r"^[A-Z_][A-Z0-9_$#]*$")
 LINE_SEP = "\x1f"
 OBCLIENT_SECURE_OPT = "--defaults-extra-file"
 _SECURE_CREDENTIAL_FILES: Dict[Tuple[str, str, str], Path] = {}
+
+
+def normalize_report_db_schema(raw_value: object) -> str:
+    text = str(raw_value or "").strip()
+    if not text:
+        return ""
+    normalized = text.upper()
+    if not SQL_IDENTIFIER_RE.match(normalized):
+        raise ValueError(
+            f"SETTINGS.report_db_schema 非法: {text} "
+            "(仅允许 Oracle 普通标识符，例如 DIFF_REPORT)"
+        )
+    return normalized
 
 
 def _cleanup_secure_credential_files() -> None:
@@ -266,7 +280,12 @@ def read_config(config_path: Path) -> Tuple[OracleCfg, ObCfg, ToolSettings]:
         raise TriageError(f"[OCEANBASE_TARGET] 端口非法: {ob_cfg.port}") from exc
 
     base_dir = config_path.parent.resolve()
-    report_db_schema = str(st_sec.get("report_db_schema", "")).strip().upper() if st_sec else ""
+    try:
+        report_db_schema = normalize_report_db_schema(
+            st_sec.get("report_db_schema", "") if st_sec else ""
+        )
+    except ValueError as exc:
+        raise TriageError(str(exc)) from exc
     report_dir = (base_dir / str(st_sec.get("report_dir", "main_reports"))).resolve() if st_sec else (base_dir / "main_reports")
     fixup_dir = (base_dir / str(st_sec.get("fixup_dir", "fixup_scripts"))).resolve() if st_sec else (base_dir / "fixup_scripts")
     settings = ToolSettings(
@@ -332,7 +351,8 @@ def ob_query(ob_cfg: ObCfg, sql: str, timeout: Optional[int] = None) -> List[Lis
 
 
 def _schema_prefix(settings: ToolSettings) -> str:
-    return f"{settings.report_db_schema}." if settings.report_db_schema else ""
+    schema = normalize_report_db_schema(settings.report_db_schema)
+    return f"{schema}." if schema else ""
 
 
 def _object_type_to_oracle_type(object_type: str) -> str:

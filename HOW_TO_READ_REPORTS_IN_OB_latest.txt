@@ -1298,6 +1298,17 @@ SELECT object_type, src_schema, src_name, tgt_schema, tgt_name, map_source
    AND src_name='MG_PBS_PREM_INFO'
  ORDER BY object_type, map_source;
 
+------------------------------------------------------------
+J. 触发器视图引用提醒（SQL-87）
+------------------------------------------------------------
+
+-- SQL-87 触发器中视图引用提醒明细（保留视图语义，不改写为表）
+SELECT file_path, line_no, DBMS_LOB.SUBSTR(line_text, 4000, 1) AS line_text
+  FROM DIFF_REPORT_ARTIFACT_LINE
+ WHERE report_id = :report_id
+   AND artifact_type = 'TRIGGER_VIEW_REFERENCE_DETAIL'
+ ORDER BY file_path, line_no;
+
 ============================================================
 建议排查顺序（实战）
 1) SQL-01/02/08/10 先建立全局认知。
@@ -1309,4 +1320,5 @@ SELECT object_type, src_schema, src_name, tgt_schema, tgt_name, map_source
 7) SQL-74~77 专项核查“多余对象/多余同义词”。
 8) SQL-78~81 单独处理“源有数据/目标空表”风险清单。
 9) SQL-82~86 复核单对象根因（对客户反馈点做一锤定音）。
+10) SQL-87 排查触发器中的视图引用（确认是否需要人工改造）。
 ============================================================
