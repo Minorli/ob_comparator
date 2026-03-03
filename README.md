@@ -196,6 +196,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/triggers_temp_table_unsupported_detail_<ts>.txt`：临时表触发器不支持明细（`TRIGGER_ON_TEMP_TABLE_UNSUPPORTED`）
 - `main_reports/run_<ts>/table_data_presence_detail_<ts>.txt`：表数据存在性风险明细（源有数据/目标空表）
 - `main_reports/run_<ts>/case_sensitive_identifiers_detail_<ts>.txt`：大小写敏感(双引号)标识符明细
+- `main_reports/run_<ts>/sys_c_force_candidates_detail_<ts>.txt`：SYS_C* FORCE 候选表明细（用于评估是否开启 `fixup_drop_sys_c_columns`）
 - `main_reports/run_<ts>/missing_objects_detail_<ts>.txt`：缺失对象支持性明细（report_detail_mode=split）
 - `main_reports/run_<ts>/unsupported_objects_detail_<ts>.txt`：不支持/阻断对象明细（report_detail_mode=split）
 - `main_reports/run_<ts>/extra_mismatch_detail_<ts>.txt`：扩展对象差异明细（report_detail_mode=split）

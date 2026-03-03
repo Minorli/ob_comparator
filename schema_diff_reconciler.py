@@ -695,6 +695,14 @@ class CaseSensitiveIdentifierFinding(NamedTuple):
     mode: str
 
 
+class SysCForceCandidateRow(NamedTuple):
+    source_schema: str
+    source_table: str
+    target_schema: str
+    target_table: str
+    sys_c_columns: Tuple[str, ...]
+
+
 class SupportClassificationResult(NamedTuple):
     support_state_map: Dict[Tuple[str, str], ObjectSupportReportRow]
     missing_detail_rows: List[ObjectSupportReportRow]
@@ -1514,6 +1522,20 @@ def is_sys_c_column_name(name: Optional[str]) -> bool:
     if probe.startswith("_"):
         probe = probe[1:]
     return bool(probe) and probe[0].isdigit()
+
+
+def extract_sys_c_extra_columns(extra_cols: Iterable[str]) -> List[str]:
+    """
+    提取目标端额外列中的 SYS_C* 列（规范化后去重）。
+    """
+    normalized: Set[str] = set()
+    for col in (extra_cols or []):
+        col_u = normalize_identifier_name(col)
+        if not col_u:
+            continue
+        if is_sys_c_column_name(col_u):
+            normalized.add(col_u)
+    return sorted(normalized)
 
 
 def classify_noise_column(name: Optional[str]) -> Optional[str]:
@@ -4335,7 +4357,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('fixup_max_sql_file_mb', '50')
         settings.setdefault('fixup_force_clean', 'false')
         settings.setdefault('fixup_clean_outside_repo', 'false')
-        settings.setdefault('fixup_drop_sys_c_columns', 'true')
+        settings.setdefault('fixup_drop_sys_c_columns', 'false')
         settings.setdefault('generate_extra_cleanup', 'false')
         # obclient 超时时间 (秒)
         settings.setdefault('obclient_timeout', '60')
@@ -4586,7 +4608,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             )
             settings['table_data_presence_zero_probe_workers'] = TABLE_PRESENCE_MAX_ZERO_PROBE_WORKERS
         settings['fixup_drop_sys_c_columns'] = parse_bool_flag(
-            settings.get('fixup_drop_sys_c_columns', 'true'),
+            settings.get('fixup_drop_sys_c_columns', 'false'),
             False
         )
         settings['enable_column_order_check'] = parse_bool_flag(
@@ -5456,7 +5478,7 @@ def run_config_wizard(config_path: Path) -> None:
         "SETTINGS",
         "fixup_drop_sys_c_columns",
         "是否对 SYS_C* 列生成 ALTER TABLE FORCE (true/false)",
-        default=cfg.get("SETTINGS", "fixup_drop_sys_c_columns", fallback="true"),
+        default=cfg.get("SETTINGS", "fixup_drop_sys_c_columns", fallback="false"),
         transform=_bool_transform,
     )
     _prompt_field(
@@ -25102,21 +25124,21 @@ def generate_alter_for_table_columns(
 
     # 多余列：DROP（默认注释掉，供人工评估；SYS_C* 可选 FORCE）
     if extra_cols:
-        lines.append("")
-        sys_c_cols = {
-            normalize_identifier_name(col)
-            for col in extra_cols
-            if is_sys_c_column_name(col)
-        }
+        sys_c_cols = set(extract_sys_c_extra_columns(extra_cols))
+        non_sys_cols = [
+            col.upper()
+            for col in sorted(extra_cols)
+            if normalize_identifier_name(col) not in sys_c_cols
+        ]
         if drop_sys_c_columns and sys_c_cols:
+            lines.append("")
             lines.append("-- 目标端存在而源端不存在的列：SYS_C* 无法 DROP，将通过 FORCE 清理。")
             lines.append(f"ALTER TABLE {table_full} FORCE;")
-        else:
+        # fixup_drop_sys_c_columns=false 时，不输出任何 SYS_C* 的修复 DDL/注释建议
+        if non_sys_cols:
+            lines.append("")
             lines.append("-- 目标端存在而源端不存在的列，以下 DROP COLUMN 为建议操作，请谨慎执行：")
-        for col in sorted(extra_cols):
-            col_u = col.upper()
-            if drop_sys_c_columns and normalize_identifier_name(col) in sys_c_cols:
-                continue
+        for col_u in non_sys_cols:
             lines.append(
                 f"-- ALTER TABLE {table_full} "
                 f"DROP COLUMN {col_u};"
@@ -26201,6 +26223,7 @@ def generate_fixup_scripts(
     settings["_name_collision_report_path"] = ""
     settings["_name_collision_fixup_sql_count"] = 0
     settings["_deferred_filtered_grants"] = []
+    settings["_sys_c_force_candidates"] = []
     trigger_filter_set = {t.upper() for t in (trigger_filter_entries or set())}
     support_state_map = support_state_map or {}
     table_target_map = build_table_target_map(master_list)
@@ -28011,6 +28034,8 @@ def generate_fixup_scripts(
         run_tasks(table_unsup_jobs, "TABLE_UNSUPPORTED")
 
     log.info("[FIXUP] (3/9) 正在生成 TABLE ALTER 脚本...")
+    sys_c_force_candidates: List[SysCForceCandidateRow] = []
+    sys_c_force_candidate_seen: Set[Tuple[str, str]] = set()
     for (obj_type, tgt_name, missing_cols, extra_cols, length_mismatches, type_mismatches) in tv_results.get('mismatched', []):
         if obj_type.upper() != 'TABLE' or "获取失败" in tgt_name:
             continue
@@ -28021,6 +28046,20 @@ def generate_fixup_scripts(
         tgt_schema, tgt_table = tgt_name.split('.')
         if (src_schema.upper(), src_table.upper()) in unsupported_table_keys:
             continue
+        sys_c_cols = extract_sys_c_extra_columns(extra_cols)
+        if sys_c_cols:
+            candidate_key = (tgt_schema.upper(), tgt_table.upper())
+            if candidate_key not in sys_c_force_candidate_seen:
+                sys_c_force_candidates.append(
+                    SysCForceCandidateRow(
+                        source_schema=src_schema.upper(),
+                        source_table=src_table.upper(),
+                        target_schema=tgt_schema.upper(),
+                        target_table=tgt_table.upper(),
+                        sys_c_columns=tuple(sys_c_cols),
+                    )
+                )
+                sys_c_force_candidate_seen.add(candidate_key)
         alter_sql = generate_alter_for_table_columns(
             oracle_meta,
             src_schema,
@@ -28038,6 +28077,13 @@ def generate_fixup_scripts(
             filename = f"{tgt_schema}.{tgt_table}.alter_columns.sql"
             header = f"基于列差异的 ALTER TABLE 订正 SQL: {tgt_schema}.{tgt_table} (源: {src_schema}.{src_table})"
             write_fixup_file(base_dir, 'table_alter', filename, alter_sql, header)
+    settings["_sys_c_force_candidates"] = sys_c_force_candidates
+    if sys_c_force_candidates:
+        log.info(
+            "[FIXUP] 检测到 SYS_C* FORCE 候选表 %d 张（fixup_drop_sys_c_columns=%s）。",
+            len(sys_c_force_candidates),
+            "true" if settings.get("fixup_drop_sys_c_columns", False) else "false"
+        )
 
     if settings.get("generate_interval_partition_fixup"):
         log.info("[FIXUP] (3b/9) 正在生成 interval 分区补齐脚本...")
@@ -29897,6 +29943,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "表数据存在性风险明细"
     if name.startswith("case_sensitive_identifiers_detail_"):
         return "DETAIL", "大小写敏感标识符明细"
+    if name.startswith("sys_c_force_candidates_detail_"):
+        return "DETAIL", "SYS_C FORCE 候选表明细"
     if name.startswith("missing_") and "_detail_" in name:
         match = re.match(r"missing_(.+)_detail_", name)
         if match:
@@ -30045,6 +30093,57 @@ def export_case_sensitive_identifier_detail(
         for row in rows_sorted
     ]
     return write_pipe_report("大小写敏感标识符明细", header_fields, data_rows, output_path)
+
+
+def export_sys_c_force_candidates_detail(
+    rows: List[SysCForceCandidateRow],
+    force_enabled: bool,
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出 SYS_C* FORCE 候选表明细。
+    当 fixup_drop_sys_c_columns=false 时，仅报告候选，不生成 SYS_C* 修复 DDL。
+    """
+    if not report_dir or not rows or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"sys_c_force_candidates_detail_{report_timestamp}.txt"
+    rows_sorted = sorted(
+        rows,
+        key=lambda r: (
+            (r.target_schema or "").upper(),
+            (r.target_table or "").upper(),
+            (r.source_schema or "").upper(),
+            (r.source_table or "").upper(),
+        )
+    )
+    action_text = (
+        "FORCE_ENABLED_WILL_GENERATE"
+        if force_enabled
+        else "FORCE_DISABLED_REPORT_ONLY"
+    )
+    header_fields = [
+        "SOURCE_SCHEMA",
+        "SOURCE_TABLE",
+        "TARGET_SCHEMA",
+        "TARGET_TABLE",
+        "SYS_C_COLUMN_COUNT",
+        "SYS_C_COLUMNS",
+        "ACTION",
+    ]
+    data_rows = [
+        [
+            row.source_schema,
+            row.source_table,
+            row.target_schema,
+            row.target_table,
+            str(len(row.sys_c_columns or ())),
+            ",".join(row.sys_c_columns or ()),
+            action_text,
+        ]
+        for row in rows_sorted
+    ]
+    return write_pipe_report("SYS_C FORCE 候选表明细", header_fields, data_rows, output_path)
 
 
 def convert_constraint_unsupported_rows(
@@ -33520,6 +33619,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "EXCLUDED_OBJECTS_DETAIL"
     if name.startswith("case_sensitive_identifiers_detail_"):
         return "CASE_SENSITIVE_IDENTIFIER_DETAIL"
+    if name.startswith("sys_c_force_candidates_detail_"):
+        return "SYS_C_FORCE_CANDIDATES_DETAIL"
     if name.startswith("fixup_skip_summary_"):
         return "FIXUP_SKIP_SUMMARY"
     if name.startswith("filtered_grants"):
@@ -33567,6 +33668,7 @@ def _infer_artifact_status(
         "TRIGGER_STATUS",
         "TRIGGER_TEMP_UNSUPPORTED_DETAIL",
         "CASE_SENSITIVE_IDENTIFIER_DETAIL",
+        "SYS_C_FORCE_CANDIDATES_DETAIL",
         "USABILITY_DETAIL",
         "TABLE_PRESENCE_DETAIL",
         "FILTERED_GRANTS",
@@ -36814,6 +36916,9 @@ def print_final_report(
     table_presence_mode = "-"
     case_sensitive_findings = list((settings or {}).get("_case_sensitive_findings") or [])
     case_sensitive_findings_count = len(case_sensitive_findings)
+    sys_c_force_candidates = list((settings or {}).get("_sys_c_force_candidates") or [])
+    sys_c_force_candidate_count = len(sys_c_force_candidates)
+    sys_c_force_enabled = bool((settings or {}).get("fixup_drop_sys_c_columns", False))
     if usability_summary:
         usability_checked_cnt = usability_summary.total_checked
         usability_usable_cnt = usability_summary.total_usable
@@ -36999,6 +37104,15 @@ def print_final_report(
             lines.append(
                 f"迁移聚焦: 缺失可修补 {missing_supported_cnt}, 不兼容/阻断/待确认 {unsupported_blocked_cnt}"
             )
+        if sys_c_force_candidate_count:
+            if sys_c_force_enabled:
+                lines.append(
+                    f"SYS_C FORCE 候选表: {sys_c_force_candidate_count} (已生成 FORCE 修复 DDL)"
+                )
+            else:
+                lines.append(
+                    f"SYS_C FORCE 候选表: {sys_c_force_candidate_count} (当前仅报告，不生成 SYS_C 修复 DDL)"
+                )
         if case_sensitive_findings_count:
             lines.append(f"大小写敏感(双引号)对象: {case_sensitive_findings_count} (需人工确认映射与DDL)")
         if blocked_total:
@@ -37012,6 +37126,8 @@ def print_final_report(
         if blocked_total:
             suffix = f"_{report_ts}" if report_ts else "_*"
             next_steps.append(f"查看 unsupported_objects_detail{suffix}.txt 或 blacklist_tables.txt")
+        if sys_c_force_candidate_count and report_ts:
+            next_steps.append(f"查看 sys_c_force_candidates_detail_{report_ts}.txt 评估 FORCE 范围")
         if case_sensitive_findings_count and report_ts:
             next_steps.append(f"查看 case_sensitive_identifiers_detail_{report_ts}.txt 并确认 remap/DDL 策略")
         if report_ts:
@@ -37048,6 +37164,20 @@ def print_final_report(
             case_text.append("\n详见: ", style="info")
             case_text.append(f"case_sensitive_identifiers_detail_{report_ts}.txt", style="info")
         summary_table.add_row("[bold]大小写敏感标识符[/bold]", case_text)
+
+    if sys_c_force_candidate_count:
+        sysc_text = Text()
+        sysc_text.append("候选表: ", style="info")
+        sysc_text.append(str(sys_c_force_candidate_count), style="info")
+        sysc_text.append("\n模式: ", style="info")
+        if sys_c_force_enabled:
+            sysc_text.append("force_on (生成 FORCE DDL)", style="ok")
+        else:
+            sysc_text.append("force_off (仅报告，不生成 SYS_C 修复 DDL)", style="mismatch")
+        if emit_detail_files and report_ts:
+            sysc_text.append("\n详见: ", style="info")
+            sysc_text.append(f"sys_c_force_candidates_detail_{report_ts}.txt", style="info")
+        summary_table.add_row("[bold]SYS_C FORCE 候选[/bold]", sysc_text)
 
     blacklist_missing_cnt = len(blacklisted_missing_tables or {})
     primary_text = Text()
@@ -37380,6 +37510,10 @@ def print_final_report(
         if table_presence_summary and report_ts:
             detail_hint_lines.append(
                 f"表数据存在性风险明细: table_data_presence_detail_{report_ts}.txt"
+            )
+        if sys_c_force_candidate_count and report_ts:
+            detail_hint_lines.append(
+                f"SYS_C FORCE 候选明细: sys_c_force_candidates_detail_{report_ts}.txt"
             )
         if emit_detail_files and report_ts:
             if blocked_index_rows:
@@ -38011,6 +38145,7 @@ def print_final_report(
         view_constraint_uncleanable_path = None
         name_collision_detail_path = None
         case_sensitive_detail_path = None
+        sys_c_force_detail_path = None
         missing_by_type_paths: Dict[str, Optional[Path]] = {}
         unsupported_by_type_paths: Dict[str, Optional[Path]] = {}
         name_collision_rows = list((settings or {}).get("_name_collision_rows") or [])
@@ -38054,6 +38189,12 @@ def print_final_report(
                 report_path.parent,
                 report_ts
             )
+            sys_c_force_detail_path = export_sys_c_force_candidates_detail(
+                sys_c_force_candidates,
+                sys_c_force_enabled,
+                report_path.parent,
+                report_ts
+            )
         if report_ts:
             migration_focus_path = export_migration_focus_report(
                 combined_missing_rows,
@@ -38078,6 +38219,12 @@ def print_final_report(
             case_sensitive_detail_path,
             case_sensitive_findings_count if case_sensitive_detail_path else None,
             "大小写敏感标识符明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            sys_c_force_detail_path,
+            sys_c_force_candidate_count if sys_c_force_detail_path else None,
+            "SYS_C FORCE 候选表明细"
         )
         _add_index_entry(
             "DETAIL",
@@ -38398,6 +38545,8 @@ def print_final_report(
                 log.info("不支持/阻断对象明细已输出到: %s", unsupported_detail_path)
             if case_sensitive_detail_path:
                 log.info("大小写敏感标识符明细已输出到: %s", case_sensitive_detail_path)
+            if sys_c_force_detail_path:
+                log.info("SYS_C FORCE 候选表明细已输出到: %s", sys_c_force_detail_path)
             if missing_by_type_paths:
                 for path in sorted(p for p in missing_by_type_paths.values() if p):
                     log.info("缺失按类型明细已输出到: %s", path)

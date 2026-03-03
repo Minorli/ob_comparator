@@ -52,8 +52,9 @@ fixup_max_sql_file_mb   = 50
 fixup_force_clean       = false
 # fixup_clean_outside_repo: 是否允许清理项目目录外的 fixup_dir（默认关闭，防误删）
 fixup_clean_outside_repo = false
-# fixup_drop_sys_c_columns：是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE（默认 true）
-fixup_drop_sys_c_columns = true
+# fixup_drop_sys_c_columns：是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE（默认 false）
+# false：仅输出 SYS_C FORCE 候选明细，不生成 SYS_C* 修复 DDL
+fixup_drop_sys_c_columns = false
 report_dir              = main_reports
 # 报告目录布局：
 #   flat    -> 输出到 report_dir 根目录（旧行为）

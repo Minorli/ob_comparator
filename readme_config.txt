@@ -200,8 +200,9 @@
   `constraint_validate_deferred_detail_<ts>.txt`，用于数据清理后执行二次 VALIDATE。
 - trigger_validity_sync_mode：触发器有效性同步模式。默认：compile。
   可选值：off（不处理 VALID/INVALID）、compile（当源 VALID 且目标 INVALID 时生成 COMPILE）。
-- fixup_drop_sys_c_columns：是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE。默认：true。
-  说明：仅对“目标端多出来且列名匹配 SYS_C\\d+”的列生成 FORCE 清理；其余多余列仍保持注释建议。
+- fixup_drop_sys_c_columns：是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE。默认：false。
+  说明：true 时对命中的表生成 `ALTER TABLE ... FORCE`；false 时彻底关闭 SYS_C* 修复 DDL（不生成 FORCE，也不生成 SYS_C* DROP 注释）。
+  说明：无论开关取值如何，都会输出 `sys_c_force_candidates_detail_<ts>.txt` 统计候选表与列，便于人工评估执行范围。
 - generate_interval_partition_fixup：interval 分区补齐模式。默认：auto。
   可选值：auto（OB>=4.4.2 默认关闭；低版本默认开启）、true（强制开启）、false（强制关闭）。
   说明：当 mode=auto 且 OB 版本无法识别时，为兼容旧行为会回退为“开启”并在日志提示。
