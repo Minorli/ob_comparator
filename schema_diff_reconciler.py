@@ -23091,6 +23091,10 @@ TRIGGER_DML_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(r'(\bFROM\s+)(?P<name>"?[A-Z0-9_\$#]+"?)', re.IGNORECASE),
     re.compile(r'(\bJOIN\s+)(?P<name>"?[A-Z0-9_\$#]+"?)', re.IGNORECASE),
 )
+TRIGGER_EVENT_HEADER_PATTERN = re.compile(
+    r'\bCREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\b.*?\bON\s+(?:"?[A-Z0-9_\$#]+"?(?:\s*\.\s*"?[A-Z0-9_\$#]+"?)?)',
+    re.IGNORECASE | re.DOTALL
+)
 
 
 def remap_trigger_object_references(
@@ -23342,6 +23346,13 @@ def remap_trigger_object_references(
             count=1
         )
 
+    # 事件头保护区（CREATE TRIGGER ... UPDATE/INSERT/... ON <table>）：
+    # 仅用于避免把事件关键字 ON/OR 当作 DML 对象名重写。
+    trigger_event_header_end = -1
+    header_match = TRIGGER_EVENT_HEADER_PATTERN.search(working_sql)
+    if header_match:
+        trigger_event_header_end = header_match.end()
+
     # 替换已带 schema 的引用
     def _replace_qualified(match: re.Match) -> str:
         # 避免误匹配触发器伪记录 :NEW/:OLD 之类的字段引用
@@ -23377,6 +23388,14 @@ def remap_trigger_object_references(
     # 补全触发器体内 DML 对象引用
     def _replace_dml(match: re.Match) -> str:
         prefix = match.group(1)
+        prefix_u = (prefix or "").strip().upper()
+        if (
+            prefix_u.startswith("UPDATE")
+            and trigger_event_header_end > 0
+            and match.start() < trigger_event_header_end
+        ):
+            # BEFORE UPDATE [OR INSERT] ON ... 事件头，跳过。
+            return match.group(0)
         name_raw = match.group("name")
         name_clean = _strip_quotes(name_raw)
         if not name_clean or "." in name_clean:
