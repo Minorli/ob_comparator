@@ -4084,6 +4084,22 @@ GRANT_PRIVILEGE_BY_TYPE: Dict[str, str] = {
     'SCHEDULE': 'EXECUTE'
 }
 
+# Oracle 角色到 OceanBase 兼容角色的内置映射。
+# 典型场景：OB 不存在 SELECT_CATALOG_ROLE，由团队落地 OB_CATALOG_ROLE 承接能力。
+GRANT_ROLE_ALIAS_MAP: Dict[str, str] = {
+    "SELECT_CATALOG_ROLE": "OB_CATALOG_ROLE",
+}
+GRANT_ROLE_ALIAS_REVERSE_MAP: Dict[str, str] = {
+    target: source for source, target in GRANT_ROLE_ALIAS_MAP.items()
+}
+
+
+def remap_grant_role_alias(role_name: Optional[str]) -> str:
+    role_u = (role_name or "").strip().upper()
+    if not role_u:
+        return ""
+    return GRANT_ROLE_ALIAS_MAP.get(role_u, role_u)
+
 # OceanBase Oracle 模式下常用对象权限（缺省白名单，可在配置中覆盖）
 DEFAULT_SUPPORTED_OBJECT_PRIVS: Set[str] = {
     'SELECT',
@@ -14690,9 +14706,13 @@ def build_role_name_set(
     role_privileges: List[OracleRolePrivilege],
     source_schema_set: Set[str]
 ) -> Set[str]:
-    roles: Set[str] = {item.role.upper() for item in role_privileges if item.role}
+    roles: Set[str] = {
+        remap_grant_role_alias(item.role)
+        for item in role_privileges
+        if item.role
+    }
     for item in role_privileges:
-        grantee = (item.grantee or "").upper()
+        grantee = remap_grant_role_alias(item.grantee)
         if grantee and grantee not in source_schema_set:
             roles.add(grantee)
     return roles
@@ -14957,8 +14977,8 @@ def build_grant_plan(
     ob_users = {u.upper() for u in (ob_users or set())}
     ob_roles_loaded = ob_roles_input is not None
     ob_users_loaded = ob_users_input is not None
-    role_candidates = {r.upper() for r in role_names}
-    role_candidates.update({r.upper() for r in oracle_roles.keys()})
+    role_candidates = {remap_grant_role_alias(r) for r in role_names}
+    role_candidates.update({remap_grant_role_alias(r) for r in oracle_roles.keys()})
     missing_role_grantees: Set[str] = set()
     missing_user_grantees: Set[str] = set()
     skipped_missing_grants = 0
@@ -14971,6 +14991,7 @@ def build_grant_plan(
         if cached is not None:
             return cached
         mapped = remap_grantee_schema(g_u, schema_mapping, role_names)
+        mapped = remap_grant_role_alias(mapped)
         grantee_cache[g_u] = mapped
         return mapped
 
@@ -15161,7 +15182,10 @@ def build_grant_plan(
         if not grantee_exists(grantee_u):
             skipped_missing_grants += 1
             continue
-        role_privs[grantee_u].add(RoleGrantEntry(item.role.upper(), bool(item.admin_option)))
+        target_role_u = remap_grant_role_alias(item.role)
+        if not target_role_u:
+            continue
+        role_privs[grantee_u].add(RoleGrantEntry(target_role_u, bool(item.admin_option)))
 
     # 3) Dependency-derived grants
     dep_records = dependencies or []
@@ -15229,21 +15253,21 @@ def build_grant_plan(
 
     # 4) Role DDL (user-defined roles referenced by grants)
     referenced_roles: Set[str] = set()
-    known_roles: Set[str] = {r.upper() for r in oracle_roles.keys()}
-    referenced_roles.update({item.role.upper() for item in oracle_meta.role_privileges if item.role})
+    known_roles: Set[str] = {remap_grant_role_alias(r) for r in oracle_roles.keys()}
+    referenced_roles.update({remap_grant_role_alias(item.role) for item in oracle_meta.role_privileges if item.role})
     if not known_roles:
         known_roles = set(referenced_roles)
     if known_roles:
         for item in oracle_meta.role_privileges:
-            grantee = (item.grantee or "").upper()
+            grantee = remap_grant_role_alias(item.grantee)
             if grantee in known_roles:
                 referenced_roles.add(grantee)
         for item in oracle_meta.sys_privileges:
-            grantee = (item.grantee or "").upper()
+            grantee = remap_grant_role_alias(item.grantee)
             if grantee in known_roles:
                 referenced_roles.add(grantee)
         for item in oracle_meta.object_privileges:
-            grantee = (item.grantee or "").upper()
+            grantee = remap_grant_role_alias(item.grantee)
             if grantee in known_roles:
                 referenced_roles.add(grantee)
 
@@ -15255,6 +15279,9 @@ def build_grant_plan(
         if not role_u or role_u == "PUBLIC":
             continue
         info = oracle_roles.get(role_u)
+        if not info:
+            source_role_u = GRANT_ROLE_ALIAS_REVERSE_MAP.get(role_u, role_u)
+            info = oracle_roles.get(source_role_u)
         if info and info.oracle_maintained and not include_oracle_maintained_roles:
             skipped_oracle_maintained.add(role_u)
             continue

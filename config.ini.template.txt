@@ -185,6 +185,7 @@ grant_merge_grantees    = true
 # grant_supported_sys_privs: 支持的系统权限清单（逗号分隔，留空自动探测）
 # grant_supported_object_privs: 支持的对象权限清单（逗号分隔，留空使用默认）
 # grant_include_oracle_maintained_roles: 是否生成 ORACLE_MAINTAINED 角色 (true/false)
+# 内置角色兼容映射：SELECT_CATALOG_ROLE -> OB_CATALOG_ROLE
 grant_supported_sys_privs       = 
 grant_supported_object_privs    = 
 grant_include_oracle_maintained_roles = false

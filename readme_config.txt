@@ -242,6 +242,9 @@
 - grant_supported_sys_privs：支持的系统权限清单（逗号分隔）。默认：空（自动探测）。
 - grant_supported_object_privs：支持的对象权限清单（逗号分隔）。默认：空（内置白名单）。
 - grant_include_oracle_maintained_roles：是否生成 ORACLE_MAINTAINED 角色。默认：false。
+- 角色兼容映射（内置）：`SELECT_CATALOG_ROLE -> OB_CATALOG_ROLE`。
+  说明：生成授权脚本时会自动替换；若目标端不存在该角色，工具可能仅生成 `CREATE ROLE OB_CATALOG_ROLE`（不含目录视图授权），
+  仍需先按运维基线补齐 `OB_CATALOG_ROLE` 的对象授权模型。
 - fixup_auto_grant：run_fixup 自动补权限。默认：true。
   说明：基于 dependency_chains 与 VIEWs_chain 预判依赖授权，执行前自动应用 grants_miss/grants_all 中的授权。
   说明：run_fixup 默认跳过 `fixup_scripts/grants_deferred/`，对象补齐后需显式执行该目录。
