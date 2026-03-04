@@ -136,6 +136,11 @@
 - usability_sample_ratio：可用性校验抽样比例（0~1）。默认：0（不抽样）。
   说明：仅当 max_usability_objects>0 且 usability_sample_ratio>0 时才启用抽样。
   说明：被抽样跳过的对象不会写入明细报告，仅计入汇总的“跳过”数量。
+- object_created_before：对象创建时间截止（created-only 口径）。默认：空（全量）。
+  支持格式：`YYYYMMDD HH24MISS` 或 `YYYY-MM-DD HH24:MI:SS`。
+  说明：启用后仅纳入 `CREATED <= cutoff` 的对象；`CREATED > cutoff` 的对象会输出到
+  `objects_after_cutoff_detail_<ts>.txt` 并写入 `DIFF_REPORT_EXCLUDED_OBJECT`（`STATUS=FILTERED_BY_CREATED_AFTER_CUTOFF`）。
+  说明：该开关不使用 `LAST_DDL_TIME`，对象若创建早于截止但后续被修改，仍会纳入本次校验。
 - table_data_presence_check：表数据存在性风险校验模式（仅 TABLE）。默认：auto。
   可选值：off（关闭）、auto（统计口径，优先看 NUM_ROWS）、on（严格回表探测）。
 - table_data_presence_auto_max_tables：auto 模式候选表阈值。默认：20000。
@@ -267,7 +272,8 @@
 - trigger_list：触发器清单文件（每行 SCHEMA.TRIGGER_NAME）。默认：空。
   注意：配置后仅生成列表内触发器，并输出 trigger_status_report.txt 报告；清单读取失败会回退全量触发器。
 - trigger_qualify_schema：触发器 DDL 是否强制补全 schema 前缀。默认：true。
-  说明：开启后会在触发器体内 DML 位点补全 schema，并把同义词引用优先解析到终点对象（如 TABLE/VIEW）后再重写，减少跨 schema 误绑定。
+  说明：开启后会在触发器体内 DML 位点补全 schema，并把同义词引用优先解析到终点对象（如 TABLE/VIEW）后再重写；
+  对未限定 schema 的序列 `NEXTVAL/CURRVAL` 也会补全为 `schema.sequence`，减少跨 schema 误绑定。
 
 DDL 清洗
 - ddl_punct_sanitize：清洗 PL/SQL DDL 中的全角标点。默认：true。

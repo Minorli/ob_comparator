@@ -32,6 +32,7 @@
 - **迁移聚焦报告**：按“可修补缺失 vs 不支持/阻断”拆分，保留全量明细并可在主报告快速定位。
 - **可用性校验**：支持 VIEW/SYNONYM 查询可用性检查（`WHERE 1=2`）与根因输出。
 - **表数据风险校验**：`table_data_presence_check` 识别“源端有数据、目标空表”风险；`auto` 为统计口径，`on` 为严格回表。
+- **对象时间截断**：`object_created_before` 可按 `CREATED` 截止时间冻结校验范围，并输出 `objects_after_cutoff_detail_<ts>.txt` 与 report_db 对齐明细。
 - **run_fixup 增强**：支持 `--iterative`、`--view-chain-autofix`、语句级继续执行、授权修剪与错误报告。
 - **run_fixup 安全门禁**：默认跳过 `fixup_scripts/table/`，需显式 `--allow-table-create` 才执行建表脚本。
 - **状态漂移修复**：支持 TRIGGER/CONSTRAINT 的状态差异检测与状态修补脚本生成。
@@ -94,6 +95,7 @@ report_dir_layout = per_run
 report_detail_mode = split
 report_to_db = true
 table_data_presence_check = auto
+object_created_before =
 table_data_presence_auto_max_tables = 20000
 table_data_presence_chunk_size = 500
 config_hot_reload_mode = off

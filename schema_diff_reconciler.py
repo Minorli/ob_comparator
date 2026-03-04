@@ -623,6 +623,7 @@ OraConfig = Dict[str, str]
 ObConfig = Dict[str, str]
 RemapRules = Dict[str, str]
 SourceObjectMap = Dict[str, Set[str]]  # {'OWNER.OBJ': {'TYPE1', 'TYPE2'}}
+ObjectCreatedAtMap = Dict[Tuple[str, str], datetime]  # {(OWNER.OBJ, OBJECT_TYPE): CREATED}
 FullObjectMapping = Dict[str, Dict[str, str]]  # {'OWNER.OBJ': {'TYPE': 'TGT_OWNER.OBJ'}}
 MasterCheckList = List[Tuple[str, str, str]]  # [(src_name, tgt_name, type)]
 ReportResults = Dict[str, List]
@@ -1166,6 +1167,7 @@ BLACKLIST_REASON_BY_TYPE: Dict[str, str] = {
     'NAME_PATTERN': "表名命中黑名单关键字规则，建议排除迁移或人工确认",
     'RENAME': "表名命中黑名单关键字规则，建议排除迁移或人工确认",
 }
+EXCLUDED_STATUS_FILTERED_BY_CREATED_AFTER_CUTOFF = "FILTERED_BY_CREATED_AFTER_CUTOFF"
 TEMP_TABLE_BLACKLIST_TYPES: Set[str] = {"TEMP_TABLE", "TEMPORARY_TABLE"}
 TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON_CODE = "TRIGGER_ON_TEMP_TABLE_UNSUPPORTED"
 TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON = "OB 不支持在临时表上创建 DML 触发器（实测 ORA-00600/-4007）"
@@ -2884,6 +2886,24 @@ def parse_interval_cutoff_date(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def parse_object_created_before(value: Optional[str]) -> Optional[datetime]:
+    """
+    解析对象创建时间截止参数 object_created_before。
+    支持格式：
+      - YYYYMMDD HH24MISS
+      - YYYY-MM-DD HH24:MI:SS
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%Y%m%d %H%M%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def parse_interval_cutoff_numeric(value: Optional[str]) -> Optional[Decimal]:
     raw = (value or "").strip()
     if not raw:
@@ -3061,6 +3081,13 @@ def collect_fixup_config_diagnostics(
     if settings.get("mview_check_fixup_mode") == "auto" and not settings.get("ob_version_known"):
         diagnostics.append(
             "mview_check_fixup_mode=auto 但 OB 版本不可识别，已按旧行为回退为仅打印。"
+        )
+
+    if settings.get("object_created_before_enabled"):
+        cutoff_text = format_object_created_ts(settings.get("object_created_before_dt"))
+        diagnostics.append(
+            "object_created_before 已启用（created-only 口径）：仅纳入 CREATED<=%s 的对象。"
+            % cutoff_text
         )
 
     status_check_types: Set[str] = set(settings.get("check_status_drift_type_set", set()) or set())
@@ -4447,6 +4474,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('usability_check_workers', '10')
         settings.setdefault('max_usability_objects', '')
         settings.setdefault('usability_sample_ratio', '')
+        settings.setdefault('object_created_before', '')
         settings.setdefault('table_data_presence_check', 'auto')
         settings.setdefault('table_data_presence_auto_max_tables', '20000')
         settings.setdefault('table_data_presence_chunk_size', '500')
@@ -4577,6 +4605,17 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings['config_hot_reload_fail_policy'] = normalize_config_hot_reload_fail_policy(
             settings.get('config_hot_reload_fail_policy', 'keep_last_good')
         )
+        object_created_before_raw = (settings.get('object_created_before', '') or '').strip()
+        object_created_before_dt = parse_object_created_before(object_created_before_raw)
+        if object_created_before_raw and object_created_before_dt is None:
+            log.error(
+                "严重错误: object_created_before=%s 格式非法。支持格式: YYYYMMDD HH24MISS 或 YYYY-MM-DD HH24:MI:SS",
+                object_created_before_raw
+            )
+            abort_run()
+        settings['object_created_before'] = object_created_before_raw
+        settings['object_created_before_dt'] = object_created_before_dt
+        settings['object_created_before_enabled'] = object_created_before_dt is not None
         try:
             settings['table_data_presence_auto_max_tables'] = int(
                 settings.get('table_data_presence_auto_max_tables', '20000') or 20000
@@ -5273,6 +5312,14 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "仅支持 off/auto/on"
 
+    def _validate_object_created_before(val: str) -> Tuple[bool, str]:
+        raw = (val or "").strip()
+        if not raw:
+            return True, ""
+        if parse_object_created_before(raw) is not None:
+            return True, ""
+        return False, "格式需为 YYYYMMDD HH24MISS 或 YYYY-MM-DD HH24:MI:SS"
+
     def _validate_job_schedule_fixup_mode(val: str) -> Tuple[bool, str]:
         if not val.strip():
             return True, ""
@@ -5758,6 +5805,13 @@ def run_config_wizard(config_path: Path) -> None:
         "可用性校验抽样比例（0~1，留空/0 表示不抽样）",
         default=cfg.get("SETTINGS", "usability_sample_ratio", fallback="0"),
         validator=_validate_ratio_0_1,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "object_created_before",
+        "对象创建时间截止（留空=全量；格式 YYYYMMDD HH24MISS 或 YYYY-MM-DD HH24:MI:SS）",
+        default=cfg.get("SETTINGS", "object_created_before", fallback=""),
+        validator=_validate_object_created_before,
     )
     _prompt_field(
         "SETTINGS",
@@ -7885,6 +7939,170 @@ def init_oracle_client_from_settings(settings: Dict) -> None:
         log.error("请确认 instant client 路径和 LD_LIBRARY_PATH 设置正确。")
         log.error(f"错误详情: {exc}")
         abort_run()
+
+
+def normalize_object_created_ts(value: Optional[object]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if hasattr(value, "year") and hasattr(value, "month") and hasattr(value, "day"):
+        try:
+            return datetime(
+                int(getattr(value, "year")),
+                int(getattr(value, "month")),
+                int(getattr(value, "day")),
+                int(getattr(value, "hour", 0) or 0),
+                int(getattr(value, "minute", 0) or 0),
+                int(getattr(value, "second", 0) or 0),
+            )
+        except Exception:
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d",
+    ):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def format_object_created_ts(value: Optional[datetime]) -> str:
+    if value is None:
+        return "-"
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def load_source_object_created_map(
+    ora_cfg: OraConfig,
+    schemas_list: List[str],
+    source_objects: SourceObjectMap,
+    synonym_check_scope: str = "public_only",
+) -> ObjectCreatedAtMap:
+    """
+    加载源对象的 CREATED 时间，键为 (OWNER.OBJECT, OBJECT_TYPE)。
+    """
+    if not source_objects:
+        return {}
+
+    tracked_types = sorted({
+        (obj_type or "").upper()
+        for types in source_objects.values()
+        for obj_type in (types or set())
+        if obj_type
+    })
+    if not tracked_types:
+        return {}
+
+    owners = {s.upper() for s in schemas_list if s}
+    scope = normalize_synonym_check_scope(synonym_check_scope)
+    if scope in {"public_only", "all"}:
+        has_public_synonym = any(
+            full_name.upper().startswith("PUBLIC.") and "SYNONYM" in {t.upper() for t in (obj_types or set())}
+            for full_name, obj_types in source_objects.items()
+        )
+        if has_public_synonym:
+            owners.add("PUBLIC")
+
+    if not owners:
+        return {}
+
+    types_clause = ",".join("'" + obj_type.replace("'", "''") + "'" for obj_type in tracked_types)
+    created_map: ObjectCreatedAtMap = {}
+    sql_tpl = f"""
+        SELECT OWNER, OBJECT_NAME, OBJECT_TYPE, CREATED
+        FROM DBA_OBJECTS
+        WHERE OWNER IN ({{placeholders}})
+          AND OBJECT_TYPE IN ({types_clause})
+    """
+
+    try:
+        with oracledb.connect(
+            user=ora_cfg["user"],
+            password=ora_cfg["password"],
+            dsn=ora_cfg["dsn"],
+        ) as connection:
+            with connection.cursor() as cursor:
+                for placeholders, chunk in iter_in_chunks(sorted(owners)):
+                    sql = sql_tpl.format(placeholders=placeholders)
+                    cursor.execute(sql, chunk)
+                    for row in cursor:
+                        owner = (row[0] or "").strip().upper()
+                        obj_name = (row[1] or "").strip().upper()
+                        obj_type = (row[2] or "").strip().upper()
+                        created_ts = normalize_object_created_ts(row[3] if len(row) > 3 else None)
+                        if not owner or not obj_name or not obj_type or created_ts is None:
+                            continue
+                        created_map[(f"{owner}.{obj_name}", obj_type)] = created_ts
+    except oracledb.Error as exc:
+        log.error("严重错误: 加载 Oracle 对象 CREATED 时间失败: %s", exc)
+        abort_run()
+
+    return created_map
+
+
+def apply_object_created_before_filter(
+    source_objects: SourceObjectMap,
+    created_map: ObjectCreatedAtMap,
+    cutoff: datetime,
+) -> Tuple[SourceObjectMap, List[Dict[str, object]], Set[DependencyNode], List[Tuple[str, str]]]:
+    """
+    按 CREATED <= cutoff 过滤 source_objects。
+    返回:
+      - filtered source_objects
+      - 被过滤对象行（用于 excluded/report_db）
+      - 被过滤节点集合
+      - 缺失 CREATED 的对象键列表
+    """
+    filtered: SourceObjectMap = {}
+    excluded_rows: List[Dict[str, object]] = []
+    excluded_nodes: Set[DependencyNode] = set()
+    missing_created_keys: List[Tuple[str, str]] = []
+    cutoff_text = format_object_created_ts(cutoff)
+
+    for src_full, obj_types in source_objects.items():
+        src_full_u = (src_full or "").upper()
+        keep_types: Set[str] = set()
+        for obj_type in sorted({(t or "").upper() for t in (obj_types or set()) if t}):
+            created_ts = created_map.get((src_full_u, obj_type))
+            if created_ts is None:
+                missing_created_keys.append((src_full_u, obj_type))
+                continue
+            if created_ts <= cutoff:
+                keep_types.add(obj_type)
+                continue
+
+            excluded_nodes.add((src_full_u, obj_type))
+            if "." in src_full_u:
+                schema_u, obj_name_u = src_full_u.split(".", 1)
+            else:
+                schema_u, obj_name_u = "", src_full_u
+            detail = "CREATED={created} > CUTOFF={cutoff}".format(
+                created=format_object_created_ts(created_ts),
+                cutoff=cutoff_text,
+            )
+            excluded_rows.append(
+                {
+                    "status": EXCLUDED_STATUS_FILTERED_BY_CREATED_AFTER_CUTOFF,
+                    "line_no": 0,
+                    "object_type": obj_type,
+                    "schema_name": schema_u,
+                    "object_name": obj_name_u,
+                    "detail": detail,
+                    "created_ts": format_object_created_ts(created_ts),
+                    "cutoff_ts": cutoff_text,
+                }
+            )
+        if keep_types:
+            filtered[src_full_u] = keep_types
+
+    return filtered, excluded_rows, excluded_nodes, missing_created_keys
 
 
 def get_source_objects(
@@ -23195,6 +23413,10 @@ def remap_trigger_object_references(
         name_clean = _strip_quotes(name_raw)
         if not name_clean:
             return match.group(0)
+        if name_clean in {"NEW", "OLD", "DUAL"}:
+            return match.group(0)
+        if not src_schema_u:
+            return match.group(0)
         text = match.string
         pos = match.start() - 1
         while pos >= 0 and text[pos].isspace():
@@ -23205,13 +23427,40 @@ def remap_trigger_object_references(
                 pos -= 1
         if pos >= 0 and text[pos] == ".":
             return match.group(0)
-        tgt_full = find_mapped_target_any_type(
-            full_object_mapping,
-            f"{src_schema_u}.{name_clean}" if src_schema_u else name_clean,
-            preferred_types=("SEQUENCE",)
-        )
+
+        src_full = f"{src_schema_u}.{name_clean}"
+        explicit = remap_rules_u.get(src_full)
+        tgt_full = get_mapped_target(full_object_mapping, src_full, "SEQUENCE")
+        if (
+            tgt_full
+            and explicit
+            and tgt_full.upper() == src_full
+            and explicit.upper() != src_full
+        ):
+            tgt_full = explicit.upper()
+        if not tgt_full and explicit:
+            tgt_full = explicit.upper()
+
+        if not tgt_full and synonym_meta:
+            terminal_source = resolve_synonym_terminal_source(src_schema_u, name_clean, synonym_meta)
+            if not terminal_source:
+                terminal_source = resolve_synonym_terminal_source("PUBLIC", name_clean, synonym_meta)
+            if terminal_source:
+                terminal_u = terminal_source.upper()
+                tgt_full = get_mapped_target(full_object_mapping, terminal_u, "SEQUENCE")
+                if (
+                    tgt_full
+                    and remap_rules_u.get(terminal_u)
+                    and tgt_full.upper() == terminal_u
+                    and remap_rules_u[terminal_u].upper() != terminal_u
+                ):
+                    tgt_full = remap_rules_u[terminal_u].upper()
+                if not tgt_full and remap_rules_u.get(terminal_u):
+                    tgt_full = remap_rules_u[terminal_u].upper()
+
+        # 即使无 remap，也补齐源 schema，避免触发器运行时绑定到错误对象。
         if not tgt_full:
-            return match.group(0)
+            tgt_full = src_full
         return f"{ensure_quoted_qualified(tgt_full)}.{suffix}"
 
     working_sql = TRIGGER_SEQ_UNQUALIFIED_PATTERN.sub(_replace_seq, working_sql)
@@ -30247,6 +30496,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "缺失对象支持性明细"
     if name.startswith("unsupported_objects_detail_"):
         return "DETAIL", "不支持/阻断对象明细"
+    if name.startswith("objects_after_cutoff_detail_"):
+        return "DETAIL", "截止时间后对象过滤明细"
     if name.startswith("view_constraint_cleaned_detail_"):
         return "DETAIL", "VIEW 列清单约束清洗明细"
     if name.startswith("view_constraint_uncleanable_detail_"):
@@ -32020,6 +32271,46 @@ def export_filtered_grants(
     except OSError as exc:
         log.warning("写入 filtered_grants 报告失败 %s: %s", output_path, exc)
         return None
+
+
+def export_objects_after_cutoff_detail(
+    excluded_rows: List[Dict[str, object]],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    导出 object_created_before 截断后被过滤对象明细。
+    """
+    if not report_dir or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"objects_after_cutoff_detail_{report_timestamp}.txt"
+    rows: List[List[str]] = []
+    for row in (excluded_rows or []):
+        status = str(row.get("status") or "").upper()
+        if status != EXCLUDED_STATUS_FILTERED_BY_CREATED_AFTER_CUTOFF:
+            continue
+        rows.append([
+            str(row.get("object_type") or "").upper(),
+            str(row.get("schema_name") or "").upper(),
+            str(row.get("object_name") or "").upper(),
+            str(row.get("created_ts") or "-"),
+            str(row.get("cutoff_ts") or "-"),
+            str(row.get("detail") or ""),
+        ])
+    if not rows:
+        try:
+            if output_path.exists():
+                output_path.unlink()
+        except OSError:
+            pass
+        return None
+    rows = sorted(rows, key=lambda x: (x[0], x[1], x[2], x[3], x[4], x[5]))
+    return write_pipe_report(
+        "创建时间截止过滤对象明细",
+        ["OBJECT_TYPE", "SCHEMA_NAME", "OBJECT_NAME", "CREATED_TS", "CUTOFF_TS", "DETAIL"],
+        rows,
+        output_path
+    )
 
 
 def build_unsupported_grant_detail_rows(
@@ -34013,6 +34304,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "BLACKLIST_TABLES"
     if name.startswith("excluded_objects_detail_"):
         return "EXCLUDED_OBJECTS_DETAIL"
+    if name.startswith("objects_after_cutoff_detail_"):
+        return "OBJECTS_AFTER_CUTOFF_DETAIL"
     if name.startswith("case_sensitive_identifiers_detail_"):
         return "CASE_SENSITIVE_IDENTIFIER_DETAIL"
     if name.startswith("sys_c_force_candidates_detail_"):
@@ -34066,6 +34359,7 @@ def _infer_artifact_status(
         "TRIGGER_STATUS",
         "TRIGGER_TEMP_UNSUPPORTED_DETAIL",
         "TRIGGER_VIEW_REFERENCE_DETAIL",
+        "OBJECTS_AFTER_CUTOFF_DETAIL",
         "CASE_SENSITIVE_IDENTIFIER_DETAIL",
         "SYS_C_FORCE_CANDIDATES_DETAIL",
         "USABILITY_DETAIL",
@@ -35472,15 +35766,16 @@ def _build_report_counts_rows(
     fixable_missing_counts: Optional[Dict[str, int]],
     excluded_counts: Optional[Dict[str, int]] = None
 ) -> List[Dict[str, object]]:
-    if not object_counts_summary:
-        return []
-    oracle_counts = dict(object_counts_summary.get("oracle", {}))
-    ob_counts = dict(object_counts_summary.get("oceanbase", {}))
-    missing_counts = dict(object_counts_summary.get("missing", {}))
-    fixable_missing_counts = dict(fixable_missing_counts or {})
-    extra_counts = dict(object_counts_summary.get("extra", {}))
     unsupported_counts = dict(unsupported_counts or {})
+    fixable_missing_counts = dict(fixable_missing_counts or {})
     excluded_counts = dict(excluded_counts or {})
+    if not object_counts_summary and not unsupported_counts and not fixable_missing_counts and not excluded_counts:
+        return []
+    summary = object_counts_summary or {}
+    oracle_counts = dict(summary.get("oracle", {}))
+    ob_counts = dict(summary.get("oceanbase", {}))
+    missing_counts = dict(summary.get("missing", {}))
+    extra_counts = dict(summary.get("extra", {}))
     all_types = sorted(
         set(oracle_counts)
         | set(ob_counts)
@@ -36602,6 +36897,7 @@ def build_excluded_summary_counts(
       - APPLIED: 规则命中
       - CASCADED: 依赖连带排除
       - APPLIED_SYSTEM: 系统派生对象（如 MLOG$_*）命中
+      - FILTERED_BY_CREATED_AFTER_CUTOFF: object_created_before 截断过滤
     """
     counts: Dict[str, int] = defaultdict(int)
     if not excluded_rows:
@@ -36611,6 +36907,7 @@ def build_excluded_summary_counts(
         "APPLIED",
         "CASCADED",
         "APPLIED_SYSTEM",
+        EXCLUDED_STATUS_FILTERED_BY_CREATED_AFTER_CUTOFF,
     }
     for row in excluded_rows:
         status = str(row.get("status") or "").upper()
@@ -39116,6 +39413,7 @@ def parse_cli_args() -> argparse.Namespace:
             ddl_format_timeout      SQLcl 批次超时（秒，0 不超时）
             check_dependencies      true/false 控制依赖校验
             check_column_order      true/false 控制列顺序校验（默认 false）
+            object_created_before   对象创建时间截止 (YYYYMMDD HH24MISS 或 YYYY-MM-DD HH24:MI:SS；留空=全量)
             table_data_presence_check 表数据存在性风险校验 (off/auto/on, 默认 auto)
             table_data_presence_auto_max_tables auto 模式候选表阈值（默认 20000）
             table_data_presence_chunk_size OB 批量探测 chunk 大小（默认 500）
@@ -39145,6 +39443,7 @@ def parse_cli_args() -> argparse.Namespace:
           main_reports/run_<ts>/ddl_format_report_<ts>.txt SQLcl DDL 格式化报告 (ddl_format_enable=true)
           main_reports/run_<ts>/missing_objects_detail_<ts>.txt 缺失对象支持性明细 (report_detail_mode=split)
           main_reports/run_<ts>/unsupported_objects_detail_<ts>.txt 不支持/阻断对象明细 (report_detail_mode=split)
+          main_reports/run_<ts>/objects_after_cutoff_detail_<ts>.txt 截止时间后对象过滤明细 (object_created_before 启用且命中时)
           main_reports/run_<ts>/view_constraint_cleaned_detail_<ts>.txt VIEW 列清单约束清洗明细 (report_detail_mode=split)
           main_reports/run_<ts>/view_constraint_uncleanable_detail_<ts>.txt VIEW 列清单约束无法清洗明细 (report_detail_mode=split)
           main_reports/run_<ts>/table_data_presence_detail_<ts>.txt 表数据存在性风险明细
@@ -39300,6 +39599,9 @@ def main():
     if not generate_fixup_enabled:
         phase_skip_reasons["修补脚本生成"] = "generate_fixup=false"
 
+    object_created_after_cutoff_rows: List[Dict[str, object]] = []
+    object_created_after_cutoff_nodes: Set[DependencyNode] = set()
+
     log_section("对象映射准备")
     apply_config_hot_reload_at_phase(hot_reload_runtime, "对象映射准备", settings, ora_cfg, ob_cfg)
     with phase_timer("对象映射准备", phase_durations):
@@ -39314,9 +39616,67 @@ def main():
             case_sensitive_mode=settings.get('case_sensitive_identifier_mode', 'warn')
         )
         settings["_case_sensitive_findings"] = list(source_case_sensitive_findings or [])
+        source_objects_full_scope: SourceObjectMap = {
+            (full_name or "").upper(): {
+                (obj_type or "").upper()
+                for obj_type in (obj_types or set())
+                if obj_type
+            }
+            for full_name, obj_types in (source_objects or {}).items()
+        }
+        source_objects = source_objects_full_scope
+
+        if settings.get("object_created_before_enabled"):
+            cutoff_dt = settings.get("object_created_before_dt")
+            if not isinstance(cutoff_dt, datetime):
+                log.error("严重错误: object_created_before_enabled=true 但 object_created_before_dt 为空。")
+                abort_run()
+            cutoff_text = format_object_created_ts(cutoff_dt)
+            created_map = load_source_object_created_map(
+                ora_cfg,
+                settings['source_schemas_list'],
+                source_objects,
+                synonym_check_scope=settings.get('synonym_check_scope', 'public_only'),
+            )
+            (
+                source_objects,
+                object_created_after_cutoff_rows,
+                object_created_after_cutoff_nodes,
+                missing_created_keys,
+            ) = apply_object_created_before_filter(
+                source_objects,
+                created_map,
+                cutoff_dt,
+            )
+            if missing_created_keys:
+                sample = ", ".join(
+                    f"{full}/{obj_type}" for full, obj_type in missing_created_keys[:20]
+                )
+                log.error(
+                    "严重错误: object_created_before=%s 已启用，但存在 %d 个对象缺少 CREATED 元数据，"
+                    "无法确定纳入范围。样例: %s",
+                    cutoff_text,
+                    len(missing_created_keys),
+                    sample or "-"
+                )
+                abort_run()
+            before_scope_cnt = sum(len(v) for v in source_objects_full_scope.values())
+            after_scope_cnt = sum(len(v) for v in source_objects.values())
+            log.info(
+                "[CUTOFF] object_created_before=%s 生效: 保留对象=%d, 过滤对象=%d。",
+                cutoff_text,
+                after_scope_cnt,
+                len(object_created_after_cutoff_rows)
+            )
+            if before_scope_cnt < after_scope_cnt:
+                log.warning(
+                    "[CUTOFF] 检测到范围计数异常: before=%d, after=%d。请检查 CREATED 数据口径。",
+                    before_scope_cnt,
+                    after_scope_cnt
+                )
 
         # 4) 验证 Remap 规则
-        extraneous_rules = validate_remap_rules(remap_rules, source_objects, settings.get("remap_file"))
+        extraneous_rules = validate_remap_rules(remap_rules, source_objects_full_scope, settings.get("remap_file"))
         schema_mapping_from_tables: Optional[Dict[str, str]] = None
         
         # 4.1) 获取依附对象（如 TRIGGER）的父表映射，用于 one-to-many schema 拆分场景
@@ -39364,6 +39724,30 @@ def main():
         view_dependency_map: Dict[Tuple[str, str], Set[str]] = build_view_dependency_map(
             source_dependencies_set
         ) if source_dependencies_set else {}
+        if object_created_after_cutoff_nodes:
+            source_dependencies_set = filter_source_dependencies_by_nodes(
+                source_dependencies_set,
+                object_created_after_cutoff_nodes
+            )
+            oracle_dependencies_internal = filter_dependency_records_by_nodes(
+                oracle_dependencies_internal,
+                object_created_after_cutoff_nodes
+            ) or []
+            oracle_dependencies_for_grants = filter_dependency_records_by_nodes(
+                oracle_dependencies_for_grants,
+                object_created_after_cutoff_nodes
+            ) or []
+            object_parent_map = filter_object_parent_map_by_nodes(
+                object_parent_map,
+                source_objects,
+                object_created_after_cutoff_nodes
+            ) or {}
+            dependency_graph = build_dependency_graph(source_dependencies_set) if source_dependencies_set else {}
+            view_dependency_map = build_view_dependency_map(source_dependencies_set) if source_dependencies_set else {}
+            log.info(
+                "[CUTOFF] 已同步更新依赖/父对象图，移除截止后对象节点=%d。",
+                len(object_created_after_cutoff_nodes)
+            )
         # 4.2.b) 预计算递归依赖表集合（性能优化：避免每对象 DFS）
         transitive_table_cache: Optional[TransitiveTableCache] = None
         if settings.get("enable_schema_mapping_infer") and dependency_graph:
@@ -39493,6 +39877,14 @@ def main():
     grant_plan: Optional[GrantPlan] = None
     object_counts_summary: Optional[ObjectCountSummary] = None
     schema_summary: Optional[Dict[str, List[str]]] = None
+    excluded_object_report_rows: List[Dict[str, object]] = list(object_created_after_cutoff_rows or [])
+    objects_after_cutoff_detail_path = export_objects_after_cutoff_detail(
+        excluded_object_report_rows,
+        report_dir,
+        timestamp
+    )
+    if objects_after_cutoff_detail_path:
+        log.info("截止时间后对象过滤明细已输出: %s", objects_after_cutoff_detail_path)
 
     if not master_list:
         for phase in (
@@ -39617,7 +40009,8 @@ def main():
             config_diagnostics=config_diagnostics,
             fixup_skip_summary=None,
             usability_summary=None,
-            table_presence_summary=None
+            table_presence_summary=None,
+            excluded_object_rows=excluded_object_report_rows
         )
         if run_summary:
             log_run_summary(run_summary)
@@ -39648,7 +40041,8 @@ def main():
                 remap_rules=None,
                 blacklist_report_rows=None,
                 fixup_skip_summary=None,
-                blacklisted_table_keys=set()
+                blacklisted_table_keys=set(),
+                excluded_object_rows=excluded_object_report_rows
             )
             if not db_ok:
                 abort_run()
@@ -39714,7 +40108,6 @@ def main():
         )
 
     # 7) 主对象校验
-    excluded_object_report_rows: List[Dict[str, object]] = []
     apply_config_hot_reload_at_phase(hot_reload_runtime, "Oracle 元数据转储", settings, ora_cfg, ob_cfg)
     with phase_timer("Oracle 元数据转储", phase_durations):
         log_subsection("Oracle 元数据")
