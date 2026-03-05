@@ -1168,6 +1168,7 @@ BLACKLIST_REASON_BY_TYPE: Dict[str, str] = {
     'RENAME': "表名命中黑名单关键字规则，建议排除迁移或人工确认",
 }
 EXCLUDED_STATUS_FILTERED_BY_CREATED_AFTER_CUTOFF = "FILTERED_BY_CREATED_AFTER_CUTOFF"
+EXCLUDED_STATUS_FILTERED_BY_MISSING_CREATED = "FILTERED_BY_MISSING_CREATED"
 TEMP_TABLE_BLACKLIST_TYPES: Set[str] = {"TEMP_TABLE", "TEMPORARY_TABLE"}
 TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON_CODE = "TRIGGER_ON_TEMP_TABLE_UNSUPPORTED"
 TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON = "OB 不支持在临时表上创建 DML 触发器（实测 ORA-00600/-4007）"
@@ -3085,9 +3086,13 @@ def collect_fixup_config_diagnostics(
 
     if settings.get("object_created_before_enabled"):
         cutoff_text = format_object_created_ts(settings.get("object_created_before_dt"))
+        missing_policy = normalize_object_created_missing_policy(
+            settings.get("object_created_before_missing_created_policy", "strict")
+        )
         diagnostics.append(
-            "object_created_before 已启用（created-only 口径）：仅纳入 CREATED<=%s 的对象。"
-            % cutoff_text
+            "object_created_before 已启用（created-only 口径）：仅纳入 CREATED<=%s 的对象；"
+            "缺失 CREATED 处理策略=%s。"
+            % (cutoff_text, missing_policy)
         )
 
     status_check_types: Set[str] = set(settings.get("check_status_drift_type_set", set()) or set())
@@ -3256,6 +3261,19 @@ TABLE_DATA_PRESENCE_CHECK_MODE_ALIASES = {
     "enable": "on",
     "enabled": "on",
 }
+OBJECT_CREATED_MISSING_POLICY_VALUES = {"strict", "include_missing", "exclude_missing"}
+OBJECT_CREATED_MISSING_POLICY_ALIASES = {
+    "fail": "strict",
+    "fail_fast": "strict",
+    "abort": "strict",
+    "error": "strict",
+    "include": "include_missing",
+    "in_scope": "include_missing",
+    "keep": "include_missing",
+    "exclude": "exclude_missing",
+    "drop": "exclude_missing",
+    "skip": "exclude_missing",
+}
 JOB_SCHEDULE_FIXUP_MODE_VALUES = {"manual", "semi_auto"}
 JOB_SCHEDULE_FIXUP_MODE_ALIASES = {
     "off": "manual",
@@ -3334,6 +3352,20 @@ def normalize_table_data_presence_check_mode(raw_value: Optional[str]) -> str:
     if value not in TABLE_DATA_PRESENCE_CHECK_MODE_VALUES:
         log.warning("table_data_presence_check=%s 不在支持范围内，将回退为 auto。", raw_value)
         return "auto"
+    return value
+
+
+def normalize_object_created_missing_policy(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "strict"
+    value = str(raw_value).strip().lower()
+    value = OBJECT_CREATED_MISSING_POLICY_ALIASES.get(value, value)
+    if value not in OBJECT_CREATED_MISSING_POLICY_VALUES:
+        log.warning(
+            "object_created_before_missing_created_policy=%s 不在支持范围内，将回退为 strict。",
+            raw_value
+        )
+        return "strict"
     return value
 
 
@@ -4089,9 +4121,72 @@ GRANT_PRIVILEGE_BY_TYPE: Dict[str, str] = {
 GRANT_ROLE_ALIAS_MAP: Dict[str, str] = {
     "SELECT_CATALOG_ROLE": "OB_CATALOG_ROLE",
 }
-GRANT_ROLE_ALIAS_REVERSE_MAP: Dict[str, str] = {
-    target: source for source, target in GRANT_ROLE_ALIAS_MAP.items()
-}
+
+
+def build_validated_grant_role_alias_reverse_map(alias_map: Dict[str, str]) -> Dict[str, str]:
+    """
+    构建 Oracle->OB 角色别名映射的反向索引，并校验一对一完整性。
+    约束：
+    1. 规范化（strip + upper）后，source/target 角色名均不能为空；
+    2. 不允许多个 source 映射到同一个 target（many-to-one）；
+    3. 不允许同一个 source（大小写变体）映射到多个 target。
+    """
+    source_to_target: Dict[str, Set[str]] = defaultdict(set)
+    target_to_source: Dict[str, Set[str]] = defaultdict(set)
+    reverse_map: Dict[str, str] = {}
+
+    for source_raw, target_raw in (alias_map or {}).items():
+        source_u = (source_raw or "").strip().upper()
+        target_u = (target_raw or "").strip().upper()
+        if not source_u or not target_u:
+            raise ValueError(
+                f"检测到空角色名映射: source={source_raw!r}, target={target_raw!r}"
+            )
+        source_to_target[source_u].add(target_u)
+        target_to_source[target_u].add(source_u)
+
+    source_collisions: List[str] = []
+    for source_u, target_set in sorted(source_to_target.items()):
+        if len(target_set) > 1:
+            source_collisions.append(f"{source_u}=>{','.join(sorted(target_set))}")
+
+    target_collisions: List[str] = []
+    for target_u, source_set in sorted(target_to_source.items()):
+        if len(source_set) > 1:
+            target_collisions.append(f"{target_u}<={','.join(sorted(source_set))}")
+
+    if source_collisions or target_collisions:
+        detail_parts: List[str] = []
+        if source_collisions:
+            detail_parts.append("source冲突[" + "; ".join(source_collisions) + "]")
+        if target_collisions:
+            detail_parts.append("target冲突[" + "; ".join(target_collisions) + "]")
+        raise ValueError(
+            "GRANT_ROLE_ALIAS_MAP 不是一对一映射: " + " | ".join(detail_parts)
+        )
+
+    for target_u, source_set in target_to_source.items():
+        reverse_map[target_u] = next(iter(source_set))
+    return reverse_map
+
+
+def ensure_grant_role_alias_map_integrity() -> None:
+    """
+    运行期校验 GRANT_ROLE_ALIAS_MAP 的一对一完整性，失败则阻断启动。
+    """
+    global GRANT_ROLE_ALIAS_REVERSE_MAP
+    try:
+        GRANT_ROLE_ALIAS_REVERSE_MAP = build_validated_grant_role_alias_reverse_map(
+            GRANT_ROLE_ALIAS_MAP
+        )
+    except ValueError as exc:
+        log.error("严重错误: GRANT_ROLE_ALIAS_MAP 校验失败: %s", exc)
+        abort_run()
+
+
+GRANT_ROLE_ALIAS_REVERSE_MAP: Dict[str, str] = build_validated_grant_role_alias_reverse_map(
+    GRANT_ROLE_ALIAS_MAP
+)
 
 
 def remap_grant_role_alias(role_name: Optional[str]) -> str:
@@ -4393,6 +4488,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         config_path = Path(config_file).expanduser().resolve()
         settings['config_file'] = str(config_path)
         settings['config_dir'] = str(config_path.parent)
+        ensure_grant_role_alias_map_integrity()
 
         schemas_raw = settings.get('source_schemas', '')
         schemas_list = [s.strip().upper() for s in schemas_raw.split(',') if s.strip()]
@@ -4491,6 +4587,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('max_usability_objects', '')
         settings.setdefault('usability_sample_ratio', '')
         settings.setdefault('object_created_before', '')
+        settings.setdefault('object_created_before_missing_created_policy', 'strict')
         settings.setdefault('table_data_presence_check', 'auto')
         settings.setdefault('table_data_presence_auto_max_tables', '20000')
         settings.setdefault('table_data_presence_chunk_size', '500')
@@ -4632,6 +4729,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings['object_created_before'] = object_created_before_raw
         settings['object_created_before_dt'] = object_created_before_dt
         settings['object_created_before_enabled'] = object_created_before_dt is not None
+        settings['object_created_before_missing_created_policy'] = normalize_object_created_missing_policy(
+            settings.get('object_created_before_missing_created_policy', 'strict')
+        )
         try:
             settings['table_data_presence_auto_max_tables'] = int(
                 settings.get('table_data_presence_auto_max_tables', '20000') or 20000
@@ -5336,6 +5436,17 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "格式需为 YYYYMMDD HH24MISS 或 YYYY-MM-DD HH24:MI:SS"
 
+    def _validate_object_created_missing_policy(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = OBJECT_CREATED_MISSING_POLICY_ALIASES.get(
+            val.strip().lower(),
+            val.strip().lower()
+        )
+        if normalized in OBJECT_CREATED_MISSING_POLICY_VALUES:
+            return True, ""
+        return False, "仅支持 strict/include_missing/exclude_missing"
+
     def _validate_job_schedule_fixup_mode(val: str) -> Tuple[bool, str]:
         if not val.strip():
             return True, ""
@@ -5828,6 +5939,14 @@ def run_config_wizard(config_path: Path) -> None:
         "对象创建时间截止（留空=全量；格式 YYYYMMDD HH24MISS 或 YYYY-MM-DD HH24:MI:SS）",
         default=cfg.get("SETTINGS", "object_created_before", fallback=""),
         validator=_validate_object_created_before,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "object_created_before_missing_created_policy",
+        "截止过滤下缺失 CREATED 的处理策略 (strict/include_missing/exclude_missing)",
+        default=cfg.get("SETTINGS", "object_created_before_missing_created_policy", fallback="strict"),
+        validator=_validate_object_created_missing_policy,
+        transform=normalize_object_created_missing_policy,
     )
     _prompt_field(
         "SETTINGS",
@@ -8067,15 +8186,21 @@ def apply_object_created_before_filter(
     source_objects: SourceObjectMap,
     created_map: ObjectCreatedAtMap,
     cutoff: datetime,
+    missing_created_policy: str = "strict",
 ) -> Tuple[SourceObjectMap, List[Dict[str, object]], Set[DependencyNode], List[Tuple[str, str]]]:
     """
     按 CREATED <= cutoff 过滤 source_objects。
+    missing_created_policy:
+      - strict: 缺失 CREATED 仅记录 missing_keys（通常由上层中止）
+      - include_missing: 缺失 CREATED 继续纳入范围
+      - exclude_missing: 缺失 CREATED 排除并写入 excluded_rows
     返回:
       - filtered source_objects
       - 被过滤对象行（用于 excluded/report_db）
       - 被过滤节点集合
       - 缺失 CREATED 的对象键列表
     """
+    missing_policy = normalize_object_created_missing_policy(missing_created_policy)
     filtered: SourceObjectMap = {}
     excluded_rows: List[Dict[str, object]] = []
     excluded_nodes: Set[DependencyNode] = set()
@@ -8089,6 +8214,27 @@ def apply_object_created_before_filter(
             created_ts = created_map.get((src_full_u, obj_type))
             if created_ts is None:
                 missing_created_keys.append((src_full_u, obj_type))
+                if missing_policy == "include_missing":
+                    keep_types.add(obj_type)
+                    continue
+                if missing_policy == "exclude_missing":
+                    excluded_nodes.add((src_full_u, obj_type))
+                    if "." in src_full_u:
+                        schema_u, obj_name_u = src_full_u.split(".", 1)
+                    else:
+                        schema_u, obj_name_u = "", src_full_u
+                    excluded_rows.append(
+                        {
+                            "status": EXCLUDED_STATUS_FILTERED_BY_MISSING_CREATED,
+                            "line_no": 0,
+                            "object_type": obj_type,
+                            "schema_name": schema_u,
+                            "object_name": obj_name_u,
+                            "detail": "CREATED=<NULL>; POLICY=exclude_missing; CUTOFF=%s" % cutoff_text,
+                            "created_ts": "-",
+                            "cutoff_ts": cutoff_text,
+                        }
+                    )
                 continue
             if created_ts <= cutoff:
                 keep_types.add(obj_type)
@@ -8119,6 +8265,49 @@ def apply_object_created_before_filter(
             filtered[src_full_u] = keep_types
 
     return filtered, excluded_rows, excluded_nodes, missing_created_keys
+
+
+def summarize_missing_created_keys(
+    missing_created_keys: Sequence[Tuple[str, str]],
+    *,
+    max_types: int = 10,
+    sample_per_type: int = 3,
+) -> Tuple[str, str]:
+    """
+    汇总 object_created_before 缺失 CREATED 的对象键，返回：
+      - 按类型计数字符串，如 "TABLE=10, VIEW=2"
+      - 按类型样例字符串，如 "TABLE:A.T1|A.T2; VIEW:A.V1"
+    """
+    if not missing_created_keys:
+        return "-", "-"
+
+    count_by_type: Dict[str, int] = defaultdict(int)
+    sample_by_type: Dict[str, List[str]] = defaultdict(list)
+
+    for full_name, obj_type in missing_created_keys:
+        obj_type_u = (obj_type or "").strip().upper() or "UNKNOWN"
+        full_u = (full_name or "").strip().upper() or "-"
+        count_by_type[obj_type_u] += 1
+        bucket = sample_by_type[obj_type_u]
+        if len(bucket) < max(1, sample_per_type) and full_u not in bucket:
+            bucket.append(full_u)
+
+    sorted_types = sorted(count_by_type.keys())
+    limited_types = sorted_types[:max(1, max_types)]
+    omitted_types = len(sorted_types) - len(limited_types)
+
+    count_parts = [f"{obj_type}={count_by_type[obj_type]}" for obj_type in limited_types]
+    if omitted_types > 0:
+        count_parts.append(f"...+{omitted_types}个类型")
+
+    sample_parts = [
+        f"{obj_type}:{'|'.join(sample_by_type.get(obj_type) or ['-'])}"
+        for obj_type in limited_types
+    ]
+    if omitted_types > 0:
+        sample_parts.append(f"...+{omitted_types}个类型")
+
+    return ", ".join(count_parts), "; ".join(sample_parts)
 
 
 def get_source_objects(
@@ -19591,6 +19780,16 @@ def collect_oracle_env_info(ora_cfg: OraConfig) -> Dict[str, str]:
                     row = cursor.fetchone()
                     if row and row[0]:
                         info["service_name"] = str(row[0])
+                except Exception:
+                    pass
+                try:
+                    cursor.execute("SELECT DBTIMEZONE, SESSIONTIMEZONE FROM dual")
+                    row = cursor.fetchone()
+                    if row:
+                        if row[0]:
+                            info["db_timezone"] = str(row[0])
+                        if len(row) > 1 and row[1]:
+                            info["session_timezone"] = str(row[1])
                 except Exception:
                     pass
     except Exception as exc:
@@ -32325,7 +32524,10 @@ def export_objects_after_cutoff_detail(
     report_timestamp: Optional[str]
 ) -> Optional[Path]:
     """
-    导出 object_created_before 截断后被过滤对象明细。
+    导出 object_created_before 范围过滤对象明细。
+    包含：
+      - FILTERED_BY_CREATED_AFTER_CUTOFF
+      - FILTERED_BY_MISSING_CREATED（exclude_missing 策略）
     """
     if not report_dir or not report_timestamp:
         return None
@@ -32333,9 +32535,13 @@ def export_objects_after_cutoff_detail(
     rows: List[List[str]] = []
     for row in (excluded_rows or []):
         status = str(row.get("status") or "").upper()
-        if status != EXCLUDED_STATUS_FILTERED_BY_CREATED_AFTER_CUTOFF:
+        if status not in {
+            EXCLUDED_STATUS_FILTERED_BY_CREATED_AFTER_CUTOFF,
+            EXCLUDED_STATUS_FILTERED_BY_MISSING_CREATED,
+        }:
             continue
         rows.append([
+            status,
             str(row.get("object_type") or "").upper(),
             str(row.get("schema_name") or "").upper(),
             str(row.get("object_name") or "").upper(),
@@ -32352,8 +32558,8 @@ def export_objects_after_cutoff_detail(
         return None
     rows = sorted(rows, key=lambda x: (x[0], x[1], x[2], x[3], x[4], x[5]))
     return write_pipe_report(
-        "创建时间截止过滤对象明细",
-        ["OBJECT_TYPE", "SCHEMA_NAME", "OBJECT_NAME", "CREATED_TS", "CUTOFF_TS", "DETAIL"],
+        "创建时间范围过滤对象明细",
+        ["STATUS", "OBJECT_TYPE", "SCHEMA_NAME", "OBJECT_NAME", "CREATED_TS", "CUTOFF_TS", "DETAIL"],
         rows,
         output_path
     )
@@ -36944,6 +37150,7 @@ def build_excluded_summary_counts(
       - CASCADED: 依赖连带排除
       - APPLIED_SYSTEM: 系统派生对象（如 MLOG$_*）命中
       - FILTERED_BY_CREATED_AFTER_CUTOFF: object_created_before 截断过滤
+      - FILTERED_BY_MISSING_CREATED: object_created_before 缺失 CREATED 且策略排除
     """
     counts: Dict[str, int] = defaultdict(int)
     if not excluded_rows:
@@ -36954,6 +37161,7 @@ def build_excluded_summary_counts(
         "CASCADED",
         "APPLIED_SYSTEM",
         EXCLUDED_STATUS_FILTERED_BY_CREATED_AFTER_CUTOFF,
+        EXCLUDED_STATUS_FILTERED_BY_MISSING_CREATED,
     }
     for row in excluded_rows:
         status = str(row.get("status") or "").upper()
@@ -37780,6 +37988,10 @@ def print_final_report(
                 lines.append(f"容器: {info['container']}")
             if info.get("service_name"):
                 lines.append(f"服务名: {info['service_name']}")
+            if info.get("db_timezone"):
+                lines.append(f"DB 时区: {info['db_timezone']}")
+            if info.get("session_timezone"):
+                lines.append(f"会话时区: {info['session_timezone']}")
         else:
             if info.get("current_database"):
                 lines.append(f"当前库: {info['current_database']}")
@@ -39460,6 +39672,7 @@ def parse_cli_args() -> argparse.Namespace:
             check_dependencies      true/false 控制依赖校验
             check_column_order      true/false 控制列顺序校验（默认 false）
             object_created_before   对象创建时间截止 (YYYYMMDD HH24MISS 或 YYYY-MM-DD HH24:MI:SS；留空=全量)
+            object_created_before_missing_created_policy 截止过滤下缺失 CREATED 的处理策略 (strict/include_missing/exclude_missing)
             table_data_presence_check 表数据存在性风险校验 (off/auto/on, 默认 auto)
             table_data_presence_auto_max_tables auto 模式候选表阈值（默认 20000）
             table_data_presence_chunk_size OB 批量探测 chunk 大小（默认 500）
@@ -39489,7 +39702,7 @@ def parse_cli_args() -> argparse.Namespace:
           main_reports/run_<ts>/ddl_format_report_<ts>.txt SQLcl DDL 格式化报告 (ddl_format_enable=true)
           main_reports/run_<ts>/missing_objects_detail_<ts>.txt 缺失对象支持性明细 (report_detail_mode=split)
           main_reports/run_<ts>/unsupported_objects_detail_<ts>.txt 不支持/阻断对象明细 (report_detail_mode=split)
-          main_reports/run_<ts>/objects_after_cutoff_detail_<ts>.txt 截止时间后对象过滤明细 (object_created_before 启用且命中时)
+          main_reports/run_<ts>/objects_after_cutoff_detail_<ts>.txt 创建时间范围过滤明细 (含 created_after / missing_created_exclude)
           main_reports/run_<ts>/view_constraint_cleaned_detail_<ts>.txt VIEW 列清单约束清洗明细 (report_detail_mode=split)
           main_reports/run_<ts>/view_constraint_uncleanable_detail_<ts>.txt VIEW 列清单约束无法清洗明细 (report_detail_mode=split)
           main_reports/run_<ts>/table_data_presence_detail_<ts>.txt 表数据存在性风险明细
@@ -39567,6 +39780,12 @@ def main():
             "oracle": oracle_env_info,
             "oceanbase": ob_env_info
         }
+        if oracle_env_info.get("db_timezone") or oracle_env_info.get("session_timezone"):
+            log.info(
+                "Oracle 时区信息: db_timezone=%s, session_timezone=%s",
+                oracle_env_info.get("db_timezone") or "-",
+                oracle_env_info.get("session_timezone") or "-"
+            )
         ob_version = extract_ob_version_number(ob_env_info.get("version", ""))
         gate_info = apply_ob_feature_gates(settings, ob_version)
 
@@ -39693,24 +39912,51 @@ def main():
                 source_objects,
                 created_map,
                 cutoff_dt,
+                settings.get("object_created_before_missing_created_policy", "strict"),
             )
             if missing_created_keys:
-                sample = ", ".join(
-                    f"{full}/{obj_type}" for full, obj_type in missing_created_keys[:20]
+                count_summary, sample_summary = summarize_missing_created_keys(
+                    missing_created_keys,
+                    max_types=12,
+                    sample_per_type=3
                 )
-                log.error(
-                    "严重错误: object_created_before=%s 已启用，但存在 %d 个对象缺少 CREATED 元数据，"
-                    "无法确定纳入范围。样例: %s",
-                    cutoff_text,
-                    len(missing_created_keys),
-                    sample or "-"
+                missing_policy = normalize_object_created_missing_policy(
+                    settings.get("object_created_before_missing_created_policy", "strict")
                 )
-                abort_run()
+                if missing_policy == "strict":
+                    log.error(
+                        "严重错误: object_created_before=%s 已启用，且策略为 strict，但存在 %d 个对象缺少 CREATED 元数据，"
+                        "无法确定纳入范围。分布: %s。样例: %s",
+                        cutoff_text,
+                        len(missing_created_keys),
+                        count_summary,
+                        sample_summary
+                    )
+                    abort_run()
+                if missing_policy == "include_missing":
+                    log.warning(
+                        "[CUTOFF] object_created_before=%s 已启用，策略 include_missing：%d 个缺失 CREATED 对象已纳入校验范围。分布: %s。样例: %s",
+                        cutoff_text,
+                        len(missing_created_keys),
+                        count_summary,
+                        sample_summary
+                    )
+                else:
+                    log.warning(
+                        "[CUTOFF] object_created_before=%s 已启用，策略 exclude_missing：%d 个缺失 CREATED 对象已排除并记入 excluded/report_db。分布: %s。样例: %s",
+                        cutoff_text,
+                        len(missing_created_keys),
+                        count_summary,
+                        sample_summary
+                    )
             before_scope_cnt = sum(len(v) for v in source_objects_full_scope.values())
             after_scope_cnt = sum(len(v) for v in source_objects.values())
             log.info(
-                "[CUTOFF] object_created_before=%s 生效: 保留对象=%d, 过滤对象=%d。",
+                "[CUTOFF] object_created_before=%s 生效: policy=%s, 保留对象=%d, 过滤对象=%d。",
                 cutoff_text,
+                normalize_object_created_missing_policy(
+                    settings.get("object_created_before_missing_created_policy", "strict")
+                ),
                 after_scope_cnt,
                 len(object_created_after_cutoff_rows)
             )
@@ -39930,7 +40176,7 @@ def main():
         timestamp
     )
     if objects_after_cutoff_detail_path:
-        log.info("截止时间后对象过滤明细已输出: %s", objects_after_cutoff_detail_path)
+        log.info("创建时间范围过滤对象明细已输出: %s", objects_after_cutoff_detail_path)
 
     if not master_list:
         for phase in (

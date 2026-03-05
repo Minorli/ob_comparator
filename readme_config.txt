@@ -139,8 +139,13 @@
 - object_created_before：对象创建时间截止（created-only 口径）。默认：空（全量）。
   支持格式：`YYYYMMDD HH24MISS` 或 `YYYY-MM-DD HH24:MI:SS`。
   说明：启用后仅纳入 `CREATED <= cutoff` 的对象；`CREATED > cutoff` 的对象会输出到
-  `objects_after_cutoff_detail_<ts>.txt` 并写入 `DIFF_REPORT_EXCLUDED_OBJECT`（`STATUS=FILTERED_BY_CREATED_AFTER_CUTOFF`）。
+  `objects_after_cutoff_detail_<ts>.txt` 并写入 `DIFF_REPORT_EXCLUDED_OBJECT`
+  （`STATUS=FILTERED_BY_CREATED_AFTER_CUTOFF` 或 `FILTERED_BY_MISSING_CREATED`）。
+  说明：cutoff 判定时间基于 Oracle 源端会话时区，报告环境区块会显示 `DBTIMEZONE/SESSIONTIMEZONE` 供核对。
   说明：该开关不使用 `LAST_DDL_TIME`，对象若创建早于截止但后续被修改，仍会纳入本次校验。
+- object_created_before_missing_created_policy：截止过滤下缺失 CREATED 的处理策略。默认：strict。
+  可选值：strict（缺失即中止）、include_missing（缺失对象纳入范围）、exclude_missing（缺失对象排除并记入 excluded/report_db）。
+  说明：`exclude_missing` 会把缺失 CREATED 的对象标记为 `FILTERED_BY_MISSING_CREATED`。
 - table_data_presence_check：表数据存在性风险校验模式（仅 TABLE）。默认：auto。
   可选值：off（关闭）、auto（统计口径，优先看 NUM_ROWS）、on（严格回表探测）。
 - table_data_presence_auto_max_tables：auto 模式候选表阈值。默认：20000。

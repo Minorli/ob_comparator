@@ -32,7 +32,7 @@
 - **迁移聚焦报告**：按“可修补缺失 vs 不支持/阻断”拆分，保留全量明细并可在主报告快速定位。
 - **可用性校验**：支持 VIEW/SYNONYM 查询可用性检查（`WHERE 1=2`）与根因输出。
 - **表数据风险校验**：`table_data_presence_check` 识别“源端有数据、目标空表”风险；`auto` 为统计口径，`on` 为严格回表。
-- **对象时间截断**：`object_created_before` 可按 `CREATED` 截止时间冻结校验范围，并输出 `objects_after_cutoff_detail_<ts>.txt` 与 report_db 对齐明细。
+- **对象时间截断**：`object_created_before` 可按 `CREATED` 截止时间冻结校验范围，支持缺失 CREATED 策略（`strict/include_missing/exclude_missing`），并输出 `objects_after_cutoff_detail_<ts>.txt` 与 report_db 对齐明细。
 - **run_fixup 增强**：支持 `--iterative`、`--view-chain-autofix`、语句级继续执行、授权修剪与错误报告。
 - **run_fixup 安全门禁**：默认跳过 `fixup_scripts/table/`，需显式 `--allow-table-create` 才执行建表脚本。
 - **状态漂移修复**：支持 TRIGGER/CONSTRAINT 的状态差异检测与状态修补脚本生成。
@@ -96,6 +96,7 @@ report_detail_mode = split
 report_to_db = true
 table_data_presence_check = auto
 object_created_before =
+object_created_before_missing_created_policy = strict
 table_data_presence_auto_max_tables = 20000
 table_data_presence_chunk_size = 500
 config_hot_reload_mode = off
@@ -197,6 +198,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/trigger_status_report.txt`：触发器清单/状态差异报告
 - `main_reports/run_<ts>/triggers_temp_table_unsupported_detail_<ts>.txt`：临时表触发器不支持明细（`TRIGGER_ON_TEMP_TABLE_UNSUPPORTED`）
 - `main_reports/run_<ts>/table_data_presence_detail_<ts>.txt`：表数据存在性风险明细（源有数据/目标空表）
+- `main_reports/run_<ts>/objects_after_cutoff_detail_<ts>.txt`：创建时间范围过滤对象明细（`FILTERED_BY_CREATED_AFTER_CUTOFF` / `FILTERED_BY_MISSING_CREATED`）
 - `main_reports/run_<ts>/case_sensitive_identifiers_detail_<ts>.txt`：大小写敏感(双引号)标识符明细
 - `main_reports/run_<ts>/sys_c_force_candidates_detail_<ts>.txt`：SYS_C* FORCE 候选表明细（用于评估是否开启 `fixup_drop_sys_c_columns`）
 - `main_reports/run_<ts>/missing_objects_detail_<ts>.txt`：缺失对象支持性明细（report_detail_mode=split）

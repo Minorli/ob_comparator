@@ -303,6 +303,11 @@ usability_sample_ratio  = 0
 #   配置 -> 仅纳入 CREATED <= cutoff 的对象
 #   支持格式：YYYYMMDD HH24MISS 或 YYYY-MM-DD HH24:MI:SS
 object_created_before   =
+# object_created_before 下缺失 CREATED 元数据的处理策略：
+#   strict          -> 缺失即中止（默认，最安全）
+#   include_missing -> 缺失对象继续纳入校验
+#   exclude_missing -> 缺失对象排除并写入 excluded/report_db
+object_created_before_missing_created_policy = strict
 # 表数据存在性风险校验（仅 TABLE）：
 #   off  -> 关闭
 #   auto -> 统计口径（优先比较 OB/Oracle NUM_ROWS）
