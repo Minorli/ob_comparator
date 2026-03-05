@@ -14083,11 +14083,13 @@ def resolve_synonym_chain_target(
     target_source = resolve_synonym_terminal_source(owner, name, synonym_meta)
     if not target_source:
         return None, None
-    mapped = find_mapped_target_any_type(
+    mapped_auto = find_mapped_target_any_type(
         full_object_mapping,
         target_source,
         preferred_types=("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM", "FUNCTION", "PROCEDURE", "PACKAGE", "TYPE")
-    ) or remap_rules.get(target_source) or target_source
+    )
+    explicit = remap_rules.get(target_source)
+    mapped = explicit or mapped_auto or target_source
     target_type = infer_type_from_mapping(
         full_object_mapping,
         target_source,
@@ -14140,9 +14142,15 @@ def build_view_fixup_chains(
                     ref_source,
                     preferred_types
                 )
+                mapped_ref = find_mapped_target_any_type(
+                    full_object_mapping,
+                    ref_source,
+                    preferred_types=preferred_types
+                )
+                explicit_ref = remap_rules.get(ref_source)
                 ref_full = (
-                    find_mapped_target_any_type(full_object_mapping, ref_source, preferred_types=preferred_types)
-                    or remap_rules.get(ref_source)
+                    explicit_ref
+                    or mapped_ref
                     or ref_source
                 ).upper()
                 if not ref_type and '.' in ref_source and synonym_meta:
@@ -22185,15 +22193,8 @@ def remap_view_dependencies(
             preferred_types=preferred_types
         )
         explicit = remap_rules.get(terminal_source)
-        # 当 full_object_mapping 因冲突回退为 1:1 时，显式 remap 规则优先。
-        if (
-            mapped
-            and explicit
-            and mapped.upper() == terminal_source
-            and explicit.upper() != terminal_source
-        ):
-            mapped = explicit
-        if not mapped:
+        # 显式 remap 规则始终优先于自动映射，避免类型歧义导致误替换。
+        if explicit:
             mapped = explicit
         return (mapped or terminal_source).upper()
 
@@ -22230,10 +22231,8 @@ def remap_view_dependencies(
                 preferred_types=preferred_types
             )
             explicit = explicit_dep_target
-            # 当 full_object_mapping 因冲突回退为 1:1 时，显式 remap 规则优先。
-            if mapped_target and explicit and mapped_target.upper() == dep_u and explicit.upper() != dep_u:
-                mapped_target = explicit
-            if not mapped_target:
+            # 显式 remap 规则始终优先于自动映射，避免被 VIEW/SYNONYM 自动推导覆盖。
+            if explicit:
                 mapped_target = explicit
             # 若直接映射缺失，或落在 identity 映射，尝试同 schema 私有同义词
             if (not mapped_target) or (mapped_target.upper() == dep_u):
@@ -22315,11 +22314,13 @@ def remap_synonym_target(
         if '.' not in normalized:
             return match.group(0)
 
-        mapped = find_mapped_target_any_type(
+        mapped_auto = find_mapped_target_any_type(
             full_object_mapping,
             normalized,
             preferred_types=("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM")
-        ) or remap_rules.get(normalized)
+        )
+        explicit = remap_rules.get(normalized)
+        mapped = explicit or mapped_auto
 
         if not mapped or '.' not in mapped:
             return match.group(0)
