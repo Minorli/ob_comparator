@@ -195,6 +195,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/VIEWs_chain_<ts>.txt`：VIEW 依赖链报告
 - `main_reports/run_<ts>/blacklist_tables.txt`：黑名单表清单
 - `main_reports/run_<ts>/filtered_grants.txt`：过滤授权清单
+- `main_reports/run_<ts>/target_extra_grants_detail_<ts>.txt`：目标端额外对象授权明细（含 PUBLIC 扩权风险）
 - `main_reports/run_<ts>/trigger_status_report.txt`：触发器清单/状态差异报告
 - `main_reports/run_<ts>/triggers_temp_table_unsupported_detail_<ts>.txt`：临时表触发器不支持明细（`TRIGGER_ON_TEMP_TABLE_UNSUPPORTED`）
 - `main_reports/run_<ts>/table_data_presence_detail_<ts>.txt`：表数据存在性风险明细（源有数据/目标空表）
@@ -209,6 +210,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/missed_tables_views_for_OMS/`：OMS 缺失 TABLE/VIEW 规则
 - `fixup_scripts/`：修补脚本输出（执行前需人工审核）
 - `fixup_scripts/grants_miss/`：缺失授权脚本
+- `fixup_scripts/grants_revoke/`：目标端额外 PUBLIC 授权回收建议（默认仅 PUBLIC 自动给出 REVOKE）
 - `fixup_scripts/tables_unsupported/`：不支持 TABLE 的 DDL（默认不执行）
 - `fixup_scripts/unsupported/`：不支持/阻断对象 DDL（默认不执行）
 - `fixup_scripts/view_chain_plans/`：VIEW 链路修复计划

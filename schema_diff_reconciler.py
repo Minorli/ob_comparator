@@ -995,6 +995,17 @@ class FilteredGrantEntry(NamedTuple):
     reason: str
 
 
+class ExtraObjectGrantDriftRow(NamedTuple):
+    category: str
+    grantee: str
+    privilege: str
+    object_full: str
+    grantable: bool
+    reason_code: str
+    reason: str
+    action: str
+
+
 class UnsupportedGrantDetailRow(NamedTuple):
     category: str
     grantee: str
@@ -12288,6 +12299,130 @@ def load_ob_grant_catalog(
     )
 
 
+def load_ob_object_privileges_by_owners(
+    ob_cfg: ObConfig,
+    owners: Set[str]
+) -> Optional[Set[Tuple[str, str, str, bool]]]:
+    """
+    按 OWNER 范围读取 OceanBase 端对象授权（DBA_TAB_PRIVS）。
+    返回集合元素: (GRANTEE, PRIVILEGE, OWNER.OBJECT, GRANTABLE)
+    """
+    owner_set = {o.upper() for o in (owners or set()) if o}
+    if not owner_set:
+        return set()
+
+    def _sql_list(vals: List[str]) -> str:
+        safe_vals = [v.replace("'", "''") for v in vals if v]
+        return ",".join(f"'{v}'" for v in safe_vals)
+
+    rows: Set[Tuple[str, str, str, bool]] = set()
+    try:
+        for chunk in chunk_list(sorted(owner_set), 900):
+            owner_list = _sql_list([o.upper() for o in chunk if o])
+            if not owner_list:
+                continue
+            sql = textwrap.dedent(f"""
+                SELECT GRANTEE, PRIVILEGE, OWNER, TABLE_NAME, GRANTABLE
+                FROM DBA_TAB_PRIVS
+                WHERE OWNER IN ({owner_list})
+            """).strip()
+            ok, out, err = obclient_run_sql(ob_cfg, sql)
+            if not ok:
+                log.warning("[GRANT_AUDIT] 读取 DBA_TAB_PRIVS(owner scoped) 失败: %s", err)
+                return None
+            if not out:
+                continue
+            for line in out.splitlines():
+                parts = line.split('\t')
+                if len(parts) < 5:
+                    continue
+                grantee = (parts[0] or "").strip().upper()
+                privilege = (parts[1] or "").strip().upper()
+                owner = (parts[2] or "").strip().upper()
+                name = (parts[3] or "").strip().upper()
+                grantable = (parts[4] or "").strip().upper() == "YES"
+                if not grantee or not privilege or not owner or not name:
+                    continue
+                rows.add((grantee, privilege, f"{owner}.{name}", grantable))
+    except Exception as exc:  # pragma: no cover
+        log.warning("[GRANT_AUDIT] 读取目标对象授权失败: %s", exc)
+        return None
+
+    return rows
+
+
+def build_target_extra_object_grant_rows(
+    expected_object_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]],
+    target_object_grants: Set[Tuple[str, str, str, bool]]
+) -> List[ExtraObjectGrantDriftRow]:
+    """
+    识别“目标端存在但源端期望中不存在”的对象授权。
+    规则：
+      - 目标存在且期望不存在：TARGET_ONLY_OBJECT_GRANT / TARGET_ONLY_PUBLIC_OBJECT_GRANT
+      - 目标带 WITH GRANT OPTION 但期望不带：TARGET_ONLY_OBJECT_GRANT_OPTION
+    """
+    expected_basic: Set[Tuple[str, str, str]] = set()
+    expected_grantable: Set[Tuple[str, str, str]] = set()
+    for grantee, entries in (expected_object_grants_by_grantee or {}).items():
+        grantee_u = (grantee or "").upper()
+        if not grantee_u:
+            continue
+        for entry in (entries or set()):
+            privilege_u = (entry.privilege or "").upper()
+            object_u = (entry.object_full or "").upper()
+            if not privilege_u or not object_u:
+                continue
+            key = (grantee_u, privilege_u, object_u)
+            expected_basic.add(key)
+            if entry.grantable:
+                expected_grantable.add(key)
+
+    rows: List[ExtraObjectGrantDriftRow] = []
+    for grantee_u, privilege_u, object_u, grantable in sorted(
+        target_object_grants or set(),
+        key=lambda item: (item[0], item[1], item[2], "1" if item[3] else "0")
+    ):
+        key = (grantee_u, privilege_u, object_u)
+        if key not in expected_basic:
+            if grantee_u == "PUBLIC":
+                reason_code = "TARGET_ONLY_PUBLIC_OBJECT_GRANT"
+                reason = "目标端存在源端未声明的 PUBLIC 对象授权。"
+                action = "REVOKE_PUBLIC"
+            else:
+                reason_code = "TARGET_ONLY_OBJECT_GRANT"
+                reason = "目标端存在源端未声明的对象授权。"
+                action = "MANUAL_REVIEW"
+            rows.append(
+                ExtraObjectGrantDriftRow(
+                    category="OBJECT",
+                    grantee=grantee_u,
+                    privilege=privilege_u,
+                    object_full=object_u,
+                    grantable=bool(grantable),
+                    reason_code=reason_code,
+                    reason=reason,
+                    action=action,
+                )
+            )
+            continue
+
+        if grantable and key not in expected_grantable:
+            rows.append(
+                ExtraObjectGrantDriftRow(
+                    category="OBJECT",
+                    grantee=grantee_u,
+                    privilege=privilege_u,
+                    object_full=object_u,
+                    grantable=True,
+                    reason_code="TARGET_ONLY_OBJECT_GRANT_OPTION",
+                    reason="目标端对象授权带 WITH GRANT OPTION，但源端未声明该选项。",
+                    action="MANUAL_REVIEW",
+                )
+            )
+
+    return rows
+
+
 # ====================== Oracle 侧辅助函数 ======================
 
 def load_oracle_role_privileges(
@@ -14926,7 +15061,11 @@ def remap_grantee_schema(
     if g_u == "PUBLIC" or g_u in role_names:
         return g_u
     if schema_mapping and g_u in schema_mapping:
-        return schema_mapping[g_u].upper()
+        mapped = schema_mapping[g_u].upper()
+        # 防止普通 schema 因推导映射被放大为 PUBLIC 授权。
+        if mapped in {"PUBLIC", "__PUBLIC"}:
+            return g_u
+        return mapped
     return g_u
 
 
@@ -27018,6 +27157,7 @@ def generate_fixup_scripts(
     settings["_name_collision_report_path"] = ""
     settings["_name_collision_fixup_sql_count"] = 0
     settings["_deferred_filtered_grants"] = []
+    settings["_extra_object_grant_rows"] = []
     settings["_sys_c_force_candidates"] = []
     settings["_trigger_view_reference_rows"] = []
     trigger_filter_set = {t.upper() for t in (trigger_filter_entries or set())}
@@ -28228,6 +28368,7 @@ def generate_fixup_scripts(
     role_privs_missing_by_grantee: Dict[str, Set[RoleGrantEntry]] = {}
     deferred_object_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]] = {}
     deferred_filtered_grants: List[FilteredGrantEntry] = []
+    extra_object_grant_rows: List[ExtraObjectGrantDriftRow] = []
 
     if grant_enabled:
         pre_added = pre_add_cross_schema_grants(constraint_tasks, trigger_tasks)
@@ -28260,6 +28401,25 @@ def generate_fixup_scripts(
                 "true" if merge_privileges else "false",
                 "true" if merge_grantees else "false"
             )
+        audit_owners = {owner for owner in grant_owner_allowlist if is_allowed_grant_owner(owner)}
+        target_object_grants = load_ob_object_privileges_by_owners(ob_cfg, audit_owners)
+        if target_object_grants is None:
+            log.warning("[GRANT_AUDIT] 目标端额外授权审计失败，已跳过 extra grant 检查。")
+        else:
+            extra_object_grant_rows = build_target_extra_object_grant_rows(
+                object_grants_by_grantee,
+                target_object_grants
+            )
+            settings["_extra_object_grant_rows"] = list(extra_object_grant_rows)
+            if extra_object_grant_rows:
+                extra_public_cnt = sum(1 for row in extra_object_grant_rows if row.grantee == "PUBLIC")
+                extra_manual_cnt = len(extra_object_grant_rows) - extra_public_cnt
+                log.warning(
+                    "[GRANT_AUDIT] 检测到目标端额外对象授权 %d 条 (PUBLIC=%d, MANUAL=%d)。",
+                    len(extra_object_grant_rows),
+                    extra_public_cnt,
+                    extra_manual_cnt
+                )
 
     # 分离 VIEW 对象和其他对象（支持/不支持）
     view_missing_supported: List[Tuple[str, str, str, str]] = []
@@ -30435,6 +30595,68 @@ def generate_fixup_scripts(
         else:
             if not grant_plan.role_ddls:
                 log.info("[FIXUP] (9/9) 无需生成授权脚本。")
+
+        if extra_object_grant_rows:
+            grant_dir_revoke = "grants_revoke"
+            public_revoke_rows = [
+                row for row in extra_object_grant_rows
+                if row.action == "REVOKE_PUBLIC" and row.grantee == "PUBLIC"
+            ]
+            manual_review_rows = [
+                row for row in extra_object_grant_rows
+                if row.action != "REVOKE_PUBLIC" or row.grantee != "PUBLIC"
+            ]
+
+            if public_revoke_rows:
+                revoke_lines: List[str] = []
+                for row in public_revoke_rows:
+                    if "." not in row.object_full:
+                        continue
+                    owner_u, obj_u = row.object_full.split(".", 1)
+                    revoke_lines.append(
+                        f"REVOKE {row.privilege.upper()} ON {quote_qualified_parts(owner_u, obj_u)} FROM PUBLIC;"
+                    )
+                revoke_lines = sorted(set(revoke_lines))
+                if revoke_lines:
+                    write_fixup_file(
+                        base_dir,
+                        grant_dir_revoke,
+                        "revoke_public_object_grants.sql",
+                        "\n".join(revoke_lines),
+                        "目标端多余 PUBLIC 对象授权回收建议",
+                        extra_comments=[
+                            f"rows={len(public_revoke_rows)}",
+                            "仅基于源端授权比对结果生成，请执行前复核业务影响。",
+                        ]
+                    )
+
+            if manual_review_rows:
+                review_dir = Path(base_dir) / grant_dir_revoke
+                review_lines: List[str] = [
+                    "# 目标端额外对象授权人工复核清单",
+                    f"# total={len(manual_review_rows)}",
+                    "# 字段: CATEGORY | GRANTEE | PRIVILEGE | OBJECT | GRANTABLE | REASON_CODE | ACTION",
+                ]
+                for row in manual_review_rows:
+                    review_lines.append(
+                        " | ".join([
+                            row.category,
+                            row.grantee,
+                            row.privilege,
+                            row.object_full,
+                            "YES" if row.grantable else "NO",
+                            row.reason_code,
+                            row.action,
+                        ])
+                    )
+                try:
+                    review_dir.mkdir(parents=True, exist_ok=True)
+                    (review_dir / "review_extra_object_grants.txt").write_text(
+                        "\n".join(review_lines).rstrip() + "\n",
+                        encoding="utf-8"
+                    )
+                except OSError as exc:
+                    log.warning("[FIXUP] 写入 grants_revoke 审计清单失败: %s", exc)
     else:
         log.info("[FIXUP] (9/9) 授权脚本生成已关闭。")
 
@@ -30730,6 +30952,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "延后授权明细"
     if name.startswith("unsupported_grant_detail_"):
         return "DETAIL", "不支持授权明细"
+    if name.startswith("target_extra_grants_detail_"):
+        return "DETAIL", "目标端额外授权明细"
     if name.startswith("fixup_skip_summary_"):
         return "AUX", "Fixup 跳过汇总"
     if name.startswith("ddl_format_report_"):
@@ -32517,6 +32741,49 @@ def export_filtered_grants(
     except OSError as exc:
         log.warning("写入 filtered_grants 报告失败 %s: %s", output_path, exc)
         return None
+
+
+def export_target_extra_grant_detail(
+    extra_rows: List[ExtraObjectGrantDriftRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出目标端额外对象授权明细（源端未声明）。
+    """
+    if not report_dir or not report_timestamp or not extra_rows:
+        return None
+    output_path = Path(report_dir) / f"target_extra_grants_detail_{report_timestamp}.txt"
+    rows = sorted(
+        extra_rows,
+        key=lambda r: (
+            (r.category or "").upper(),
+            (r.grantee or "").upper(),
+            (r.privilege or "").upper(),
+            (r.object_full or "").upper(),
+            "1" if r.grantable else "0",
+            (r.reason_code or "").upper(),
+            (r.action or "").upper(),
+        )
+    )
+    return write_pipe_report(
+        "目标端额外对象授权明细（源端未声明）",
+        ["CATEGORY", "GRANTEE", "PRIVILEGE", "OBJECT", "GRANTABLE", "REASON_CODE", "REASON", "ACTION"],
+        [
+            [
+                row.category,
+                row.grantee,
+                row.privilege,
+                row.object_full,
+                "YES" if row.grantable else "NO",
+                row.reason_code,
+                row.reason,
+                row.action,
+            ]
+            for row in rows
+        ],
+        output_path
+    )
 
 
 def export_objects_after_cutoff_detail(
@@ -34571,6 +34838,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "DEFERRED_GRANT_DETAIL"
     if name.startswith("unsupported_grant_detail_"):
         return "UNSUPPORTED_GRANT_DETAIL"
+    if name.startswith("target_extra_grants_detail_"):
+        return "TARGET_EXTRA_GRANT_DETAIL"
     if name.startswith("triggers_temp_table_unsupported_detail_"):
         return "TRIGGER_TEMP_UNSUPPORTED_DETAIL"
     if name.startswith("triggers_view_reference_detail_"):
@@ -34620,6 +34889,7 @@ def _infer_artifact_status(
         "FILTERED_GRANTS",
         "UNSUPPORTED_GRANT_DETAIL",
         "DEFERRED_GRANT_DETAIL",
+        "TARGET_EXTRA_GRANT_DETAIL",
     }:
         return ("IN_DB", "") if store_scope in {"core", "full"} else ("TXT_ONLY", "")
     if artifact_type == "NAME_COLLISION_DETAIL":
@@ -37326,6 +37596,9 @@ def build_run_summary(
     report_file: Optional[Path],
     filtered_grants_path: Optional[Path] = None,
     filtered_grants_count: int = 0,
+    extra_grant_detail_path: Optional[Path] = None,
+    extra_public_grant_count: int = 0,
+    extra_object_grant_count: int = 0,
     config_diagnostics: Optional[List[str]] = None,
     fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None,
     support_summary: Optional[SupportClassificationResult] = None,
@@ -37526,6 +37799,15 @@ def build_run_summary(
             findings.append(f"权限兼容过滤: {filtered_grants_count} 条 (见 {filtered_grants_path})")
         else:
             findings.append(f"权限兼容过滤: {filtered_grants_count} 条")
+    if extra_object_grant_count:
+        if extra_grant_detail_path:
+            findings.append(
+                f"目标端额外对象授权: {extra_object_grant_count} 条 (PUBLIC={extra_public_grant_count}, 见 {extra_grant_detail_path})"
+            )
+        else:
+            findings.append(
+                f"目标端额外对象授权: {extra_object_grant_count} 条 (PUBLIC={extra_public_grant_count})"
+            )
     if fixup_skip_summary and fixup_skip_summary.get("INDEX"):
         idx_summary = fixup_skip_summary.get("INDEX") or {}
         skipped_map = idx_summary.get("skipped", {}) or {}
@@ -37582,6 +37864,8 @@ def build_run_summary(
         attention.append("授权脚本生成已关闭，权限调整需人工确认。")
     elif ctx.enable_grant_generation and not ctx.fixup_enabled:
         attention.append("授权脚本生成依赖 generate_fixup=true，当前未输出授权脚本。")
+    if extra_public_grant_count:
+        attention.append("检测到目标端存在源端未声明的 PUBLIC 对象授权，存在扩大授权风险。")
     if config_diagnostics:
         attention.append(f"配置诊断提示 {len(config_diagnostics)} 项（详见报告）。")
 
@@ -37629,6 +37913,12 @@ def build_run_summary(
                 all=Path(ctx.fixup_dir) / 'grants_all'
             )
         )
+        if extra_public_grant_count:
+            next_steps.append(
+                "优先审核并执行 {revoke}，回收目标端多余 PUBLIC 授权。".format(
+                    revoke=Path(ctx.fixup_dir) / "grants_revoke"
+                )
+            )
     if fixup_skip_summary and fixup_skip_summary.get("INDEX"):
         if report_file:
             report_parent = Path(report_file).parent
@@ -37747,6 +38037,7 @@ def print_final_report(
     package_results: Optional[PackageCompareResults] = None,
     run_summary_ctx: Optional[RunSummaryContext] = None,
     filtered_grants: Optional[List[FilteredGrantEntry]] = None,
+    extra_object_grant_rows: Optional[List[ExtraObjectGrantDriftRow]] = None,
     config_diagnostics: Optional[List[str]] = None,
     fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None,
     support_summary: Optional[SupportClassificationResult] = None,
@@ -37808,6 +38099,7 @@ def print_final_report(
     trigger_status_rows = trigger_status_rows or []
     constraint_status_rows = constraint_status_rows or []
     noise_suppressed_details = noise_suppressed_details or []
+    extra_object_grant_rows = extra_object_grant_rows or []
     if schema_summary is None:
         schema_summary = {
             "source_missing": [],
@@ -38991,6 +39283,7 @@ def print_final_report(
         "fixup_scripts/grants_miss   : 缺失授权脚本 (对象/角色/系统)\n"
         "fixup_scripts/grants_deferred: 延后授权脚本 (对象补齐后执行)\n"
         "fixup_scripts/grants_all    : 全量授权脚本 (对象/角色/系统)\n"
+        "fixup_scripts/grants_revoke : 目标端额外 PUBLIC 授权回收建议\n"
         "fixup_scripts/table_alter   : 列不匹配 TABLE 的 ALTER 修补脚本\n"
         + interval_fixup_line +
         "[bold]请在 OceanBase 执行前逐一人工审核上述脚本。[/bold]",
@@ -39005,6 +39298,14 @@ def print_final_report(
         filtered_grants_path = None
         if filtered_grants_count and report_file:
             filtered_grants_path = Path(report_file).parent / "filtered_grants.txt"
+        extra_object_grant_count = len(extra_object_grant_rows or [])
+        extra_public_grant_count = sum(
+            1 for row in (extra_object_grant_rows or [])
+            if (row.grantee or "").upper() == "PUBLIC"
+        )
+        extra_grant_detail_path = None
+        if extra_object_grant_count and report_file and report_ts:
+            extra_grant_detail_path = Path(report_file).parent / f"target_extra_grants_detail_{report_ts}.txt"
         noise_detail_path = None
         if noise_suppressed_count and report_file and emit_detail_files and report_ts:
             noise_detail_path = Path(report_file).parent / f"noise_suppressed_detail_{report_ts}.txt"
@@ -39020,6 +39321,9 @@ def print_final_report(
             report_file,
             filtered_grants_path=filtered_grants_path,
             filtered_grants_count=filtered_grants_count,
+            extra_grant_detail_path=extra_grant_detail_path,
+            extra_public_grant_count=extra_public_grant_count,
+            extra_object_grant_count=extra_object_grant_count,
             config_diagnostics=config_diagnostics,
             fixup_skip_summary=fixup_skip_summary,
             support_summary=support_summary,
@@ -39119,6 +39423,17 @@ def print_final_report(
             unsupported_grant_detail_path,
             len(filtered_grants or []) if unsupported_grant_detail_path else None,
             "不支持授权明细"
+        )
+        target_extra_grant_detail_path = export_target_extra_grant_detail(
+            extra_object_grant_rows or [],
+            report_path.parent,
+            report_ts
+        )
+        _add_index_entry(
+            "DETAIL",
+            target_extra_grant_detail_path,
+            len(extra_object_grant_rows or []) if target_extra_grant_detail_path else None,
+            "目标端额外授权明细"
         )
         fixup_skip_path = export_fixup_skip_summary(
             fixup_skip_summary or {},
@@ -39536,6 +39851,8 @@ def print_final_report(
                 log.info("延后授权明细已输出到: %s", deferred_grants_detail_path)
             if unsupported_grant_detail_path:
                 log.info("不支持授权明细已输出到: %s", unsupported_grant_detail_path)
+            if target_extra_grant_detail_path:
+                log.info("目标端额外授权明细已输出到: %s", target_extra_grant_detail_path)
             if fixup_skip_path:
                 log.info("Fixup 跳过汇总已输出到: %s", fixup_skip_path)
             if missing_detail_path:
@@ -40299,6 +40616,7 @@ def main():
             package_results=package_results,
             run_summary_ctx=run_summary_ctx,
             filtered_grants=None,
+            extra_object_grant_rows=list(settings.get("_extra_object_grant_rows") or []),
             config_diagnostics=config_diagnostics,
             fixup_skip_summary=None,
             usability_summary=None,
@@ -41148,6 +41466,7 @@ def main():
         package_results=package_results,
         run_summary_ctx=run_summary_ctx,
         filtered_grants=(grant_plan.filtered_grants if grant_plan else None),
+        extra_object_grant_rows=list(settings.get("_extra_object_grant_rows") or []),
         config_diagnostics=config_diagnostics,
         fixup_skip_summary=fixup_skip_summary,
         support_summary=support_summary,

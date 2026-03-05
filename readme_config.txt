@@ -240,6 +240,8 @@
   说明：当目标对象当前不存在且本轮不会创建时，授权会延后到 `fixup_scripts/grants_deferred/`，
   同时写入 `deferred_grants_detail_<ts>.txt`，避免误执行失败。
   说明：若延后授权因 owner 策略无法自动输出 SQL，`fixup_scripts/grants_deferred/README.txt` 仍会保留完整提醒。
+  说明：程序会额外审计目标端“源端未声明”的对象授权，输出 `target_extra_grants_detail_<ts>.txt`；
+  其中 PUBLIC 额外授权会生成 `fixup_scripts/grants_revoke/revoke_public_object_grants.sql` 回收建议。
 - grant_tab_privs_scope：DBA_TAB_PRIVS 抽取范围。默认：owner。
   可选值：owner（仅源 schema 所拥有对象）、owner_or_grantee（兼容旧逻辑）。
 - grant_merge_privileges：合并同一对象的多权限授权。默认：true。
