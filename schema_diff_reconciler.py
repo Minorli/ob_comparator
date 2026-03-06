@@ -22352,40 +22352,54 @@ def remap_view_dependencies(
         mapped_target: Optional[str] = None
         explicit_dep_target = remap_rules.get(dep_u)
         resolved_by_synonym = False
-        if dep_schema == "PUBLIC":
-            mapped_target = _resolve_synonym("PUBLIC", dep_obj)
-            if mapped_target:
-                resolved_by_synonym = True
-        else:
-            # 同义词依赖优先解析为终点对象，再做 remap，避免停留在目标同义词名。
-            mapped_target = _resolve_synonym(dep_schema, dep_obj)
-            if mapped_target:
-                resolved_by_synonym = True
-            if not mapped_target and dep_schema == view_schema_u:
-                mapped_target = _resolve_synonym("PUBLIC", dep_obj)
-                if mapped_target:
-                    resolved_by_synonym = True
-
-        if not mapped_target:
+        dep_type_map = dict(full_object_mapping.get(dep_u, {}) or {})
+        has_direct_non_synonym = any(
+            (obj_type or "").upper() != "SYNONYM"
+            for obj_type in dep_type_map.keys()
+        )
+        # 显式 remap 对该依赖对象拥有最高优先级（包括存在同名同义词时），
+        # 避免同义词链把本应映射到 TABLE 的对象误改为 *_VW 等终点对象名。
+        if explicit_dep_target:
+            mapped_target = explicit_dep_target
+        elif has_direct_non_synonym:
+            # 若源端该标识符本身存在非同义词对象映射（TABLE/VIEW/...），
+            # 则优先按对象本体 remap，避免被同名同义词（尤其 PUBLIC）劫持。
             mapped_target = find_mapped_target_any_type(
                 full_object_mapping,
                 dep_u,
                 preferred_types=preferred_types
             )
-            explicit = explicit_dep_target
-            # 显式 remap 规则始终优先于自动映射，避免被 VIEW/SYNONYM 自动推导覆盖。
-            if explicit:
-                mapped_target = explicit
-            # 若直接映射缺失，或落在 identity 映射，尝试同 schema 私有同义词
-            if (not mapped_target) or (mapped_target.upper() == dep_u):
-                mapped_syn = _resolve_synonym(dep_schema, dep_obj)
-                if mapped_syn:
-                    mapped_target = mapped_syn
-            # 对当前 VIEW schema 的裸名引用，继续兜底 PUBLIC 同义词
-            if ((not mapped_target) or (mapped_target.upper() == dep_u)) and dep_schema == view_schema_u:
-                mapped_public = _resolve_synonym("PUBLIC", dep_obj)
-                if mapped_public:
-                    mapped_target = mapped_public
+        else:
+            if dep_schema == "PUBLIC":
+                mapped_target = _resolve_synonym("PUBLIC", dep_obj)
+                if mapped_target:
+                    resolved_by_synonym = True
+            else:
+                # 同义词依赖优先解析为终点对象，再做 remap，避免停留在目标同义词名。
+                mapped_target = _resolve_synonym(dep_schema, dep_obj)
+                if mapped_target:
+                    resolved_by_synonym = True
+                if not mapped_target and dep_schema == view_schema_u:
+                    mapped_target = _resolve_synonym("PUBLIC", dep_obj)
+                    if mapped_target:
+                        resolved_by_synonym = True
+
+            if not mapped_target:
+                mapped_target = find_mapped_target_any_type(
+                    full_object_mapping,
+                    dep_u,
+                    preferred_types=preferred_types
+                )
+                # 若直接映射缺失，或落在 identity 映射，尝试同 schema 私有同义词
+                if (not mapped_target) or (mapped_target.upper() == dep_u):
+                    mapped_syn = _resolve_synonym(dep_schema, dep_obj)
+                    if mapped_syn:
+                        mapped_target = mapped_syn
+                # 对当前 VIEW schema 的裸名引用，继续兜底 PUBLIC 同义词
+                if ((not mapped_target) or (mapped_target.upper() == dep_u)) and dep_schema == view_schema_u:
+                    mapped_public = _resolve_synonym("PUBLIC", dep_obj)
+                    if mapped_public:
+                        mapped_target = mapped_public
         if not mapped_target:
             continue
         # 保护规则：
@@ -23607,13 +23621,15 @@ def remap_trigger_object_references(
             return _ResolvedTriggerReference(None, "", "", False)
         src_full = f"{schema_u}.{obj_u}"
         source_full = src_full
-        explicit = remap_rules_u.get(src_full)
+        explicit_src = remap_rules_u.get(src_full)
+        explicit = explicit_src
         resolved_by_synonym = False
         source_type = _pick_source_type(source_full, preferred_types)
         if not source_type and source_full in source_view_keys_u:
             source_type = "VIEW"
 
-        if synonym_meta:
+        allow_synonym_resolution = (not explicit_src) and (source_type in {"", "SYNONYM"})
+        if synonym_meta and allow_synonym_resolution:
             terminal_source = resolve_synonym_terminal_source(schema_u, obj_u, synonym_meta)
             if terminal_source:
                 source_full = terminal_source.upper()
