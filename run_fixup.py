@@ -726,8 +726,8 @@ RE_CREATE_VIEW = re.compile(
     r"^\s*CREATE\s+(OR\s+REPLACE\s+)?(FORCE\s+)?(MATERIALIZED\s+)?VIEW\b",
     re.IGNORECASE
 )
-RE_ERROR_CODE = re.compile(r"(ORA-\d{5}|OB-\d+)", re.IGNORECASE)
-RE_SQL_ERROR = re.compile(r"(ORA-\d{5}|OB-\d+|ERROR\s+\d+)", re.IGNORECASE)
+RE_ERROR_CODE = re.compile(r"(ORA-\d{5}|OBE?-\d+)", re.IGNORECASE)
+RE_SQL_ERROR = re.compile(r"(ORA-\d{5}|OBE?-\d+|ERROR\s+\d+)", re.IGNORECASE)
 RE_GRANT_ON = re.compile(
     r"^GRANT\s+.+?\s+ON\s+(?P<object>[^\s]+)\s+TO\s+(?P<grantee>[^\s;]+)",
     re.IGNORECASE | re.DOTALL
@@ -1965,6 +1965,44 @@ def is_comment_only_statement(statement: str) -> bool:
     return not has_code
 
 
+def strip_leading_sql_comments(statement: str) -> str:
+    if not statement:
+        return ""
+    idx = 0
+    length = len(statement)
+
+    while idx < length:
+        while idx < length and statement[idx].isspace():
+            idx += 1
+        if idx >= length:
+            return ""
+        nxt = statement[idx + 1] if idx + 1 < length else ""
+        if statement[idx] == "-" and nxt == "-":
+            line_end = statement.find("\n", idx)
+            if line_end == -1:
+                return ""
+            idx = line_end + 1
+            continue
+        if statement[idx] == "/" and nxt == "*":
+            idx += 2
+            depth = 1
+            while idx < length and depth > 0:
+                ch = statement[idx]
+                nxt = statement[idx + 1] if idx + 1 < length else ""
+                if ch == "/" and nxt == "*":
+                    depth += 1
+                    idx += 2
+                    continue
+                if ch == "*" and nxt == "/":
+                    depth -= 1
+                    idx += 2
+                    continue
+                idx += 1
+            continue
+        break
+    return statement[idx:]
+
+
 def extract_execution_error(result: subprocess.CompletedProcess) -> Optional[str]:
     error_msg = extract_sql_error(result.stderr) or extract_sql_error(result.stdout)
     if error_msg:
@@ -1985,7 +2023,7 @@ def parse_error_code(message: str) -> str:
 
 
 def parse_grant_object(statement: str) -> str:
-    flat = " ".join(statement.split())
+    flat = " ".join(strip_leading_sql_comments(statement).split())
     match = RE_GRANT_ON.match(flat)
     if not match:
         return "-"
@@ -1993,6 +2031,20 @@ def parse_grant_object(statement: str) -> str:
     if schema:
         return f"{schema}.{name}"
     return name
+
+
+def infer_error_object(statement: str, relative_path: Path) -> str:
+    object_name = parse_grant_object(statement)
+    if object_name != "-":
+        return object_name
+    if is_grant_dir(relative_path.parent.name):
+        return "-"
+    schema, name = parse_object_from_filename(relative_path)
+    if schema and name:
+        return f"{schema}.{name}"
+    if name:
+        return name
+    return "-"
 
 
 def grant_statement_has_option(statement: str) -> bool:
@@ -4085,7 +4137,7 @@ def record_error_entry(
     if len(entries) >= limit:
         return False
     error_code = parse_error_code(error_message)
-    object_name = parse_grant_object(statement)
+    object_name = infer_error_object(statement, relative_path)
     message = " ".join((error_message or "").split())
     if len(message) > 200:
         message = message[:200] + "..."

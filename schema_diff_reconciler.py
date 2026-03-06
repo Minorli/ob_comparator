@@ -12356,7 +12356,8 @@ def load_ob_object_privileges_by_owners(
 
 def build_target_extra_object_grant_rows(
     expected_object_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]],
-    target_object_grants: Set[Tuple[str, str, str, bool]]
+    target_object_grants: Set[Tuple[str, str, str, bool]],
+    declared_filtered_grants: Optional[List[FilteredGrantEntry]] = None
 ) -> List[ExtraObjectGrantDriftRow]:
     """
     识别“目标端存在但源端期望中不存在”的对象授权。
@@ -12379,6 +12380,25 @@ def build_target_extra_object_grant_rows(
             expected_basic.add(key)
             if entry.grantable:
                 expected_grantable.add(key)
+
+    # 兼容性过滤后的对象授权（例如源端存在 PUBLIC ALTER，但当前 OB 侧不支持该对象权限）
+    # 仍然属于“源端已声明授权”，不应在 extra-grant 审计中被判定为目标端多余授权，
+    # 更不能进一步生成 REVOKE_PUBLIC。
+    #
+    # 这里保守地同时加入 expected_basic / expected_grantable：
+    # filtered_grants 当前不保留 grantable 明细，extra 审计若继续对 grant option 严格比较，
+    # 会把“源端已声明但不可执行的权限”误报为 TARGET_ONLY_OBJECT_GRANT_OPTION。
+    for item in (declared_filtered_grants or []):
+        if (item.category or "").upper() != "OBJECT":
+            continue
+        grantee_u = (item.grantee or "").upper()
+        privilege_u = (item.privilege or "").upper()
+        object_u = (item.object_full or "").upper()
+        if not grantee_u or not privilege_u or not object_u:
+            continue
+        key = (grantee_u, privilege_u, object_u)
+        expected_basic.add(key)
+        expected_grantable.add(key)
 
     rows: List[ExtraObjectGrantDriftRow] = []
     for grantee_u, privilege_u, object_u, grantable in sorted(
@@ -28427,7 +28447,8 @@ def generate_fixup_scripts(
         else:
             extra_object_grant_rows = build_target_extra_object_grant_rows(
                 object_grants_by_grantee,
-                target_object_grants
+                target_object_grants,
+                declared_filtered_grants=grant_plan.filtered_grants if grant_plan else None
             )
             settings["_extra_object_grant_rows"] = list(extra_object_grant_rows)
             if extra_object_grant_rows:
