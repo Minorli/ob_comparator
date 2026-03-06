@@ -4195,7 +4195,10 @@ def ensure_grant_role_alias_map_integrity() -> None:
         abort_run()
 
 
-GRANT_ROLE_ALIAS_REVERSE_MAP: Dict[str, str] = build_validated_grant_role_alias_reverse_map(
+# NOTE:
+# 某些旧版 Python 解析器在“函数内 global + 模块级 annotated assignment”组合下
+# 会误报 `annotated name ... can't be global`。这里避免模块级变量注解，保持兼容性。
+GRANT_ROLE_ALIAS_REVERSE_MAP = build_validated_grant_role_alias_reverse_map(
     GRANT_ROLE_ALIAS_MAP
 )
 
