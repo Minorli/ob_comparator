@@ -726,8 +726,11 @@ RE_CREATE_VIEW = re.compile(
     r"^\s*CREATE\s+(OR\s+REPLACE\s+)?(FORCE\s+)?(MATERIALIZED\s+)?VIEW\b",
     re.IGNORECASE
 )
-RE_ERROR_CODE = re.compile(r"(ORA-\d{5}|OBE?-\d+)", re.IGNORECASE)
-RE_SQL_ERROR = re.compile(r"(ORA-\d{5}|OBE?-\d+|ERROR\s+\d+)", re.IGNORECASE)
+RE_ERROR_CODE = re.compile(r"(ORA-\d{5}|OBE?-\d+|PLS-\d{5}|SP2-\d{4})", re.IGNORECASE)
+RE_SQL_ERROR = re.compile(r"(ORA-\d{5}|OBE?-\d+|PLS-\d{5}|SP2-\d{4}|ERROR\s+\d+)", re.IGNORECASE)
+RE_PLS_ERROR = re.compile(r"\bPLS-\d{5}\b", re.IGNORECASE)
+RE_SP2_ERROR = re.compile(r"\bSP2-\d{4}\b", re.IGNORECASE)
+RE_GENERIC_ERROR_CODE = re.compile(r"\bERROR\s+\d+\b", re.IGNORECASE)
 RE_GRANT_ON = re.compile(
     r"^GRANT\s+.+?\s+ON\s+(?P<object>[^\s]+)\s+TO\s+(?P<grantee>[^\s;]+)",
     re.IGNORECASE | re.DOTALL
@@ -864,9 +867,41 @@ def read_sql_text_with_limit(sql_path: Path, max_bytes: Optional[int]) -> Tuple[
 def extract_sql_error(output: str) -> Optional[str]:
     if not output:
         return None
-    for line in output.splitlines():
-        if RE_SQL_ERROR.search(line):
-            return line.strip()
+
+    best_line: Optional[str] = None
+    best_score = -1
+    best_index = 10 ** 9
+    for idx, raw_line in enumerate(output.splitlines()):
+        score = score_execution_error_line(raw_line)
+        if score is None:
+            continue
+        line = raw_line.strip()
+        if score > best_score or (score == best_score and idx < best_index):
+            best_score = score
+            best_index = idx
+            best_line = line
+    return best_line
+
+
+def score_execution_error_line(line: str) -> Optional[int]:
+    if not line:
+        return None
+    stripped = line.strip()
+    if not stripped:
+        return None
+    upper = stripped.upper()
+    if RE_PLS_ERROR.search(stripped):
+        return 140
+    if "ORA-06512" in upper:
+        return 20
+    if "ORA-06550" in upper:
+        return 110
+    if RE_ERROR_CODE.search(stripped):
+        return 130
+    if RE_SP2_ERROR.search(stripped):
+        return 100
+    if RE_GENERIC_ERROR_CODE.search(stripped):
+        return 90
     return None
 
 
@@ -2004,9 +2039,18 @@ def strip_leading_sql_comments(statement: str) -> str:
 
 
 def extract_execution_error(result: subprocess.CompletedProcess) -> Optional[str]:
-    error_msg = extract_sql_error(result.stderr) or extract_sql_error(result.stdout)
-    if error_msg:
-        return error_msg
+    stderr_error = extract_sql_error(result.stderr)
+    stdout_error = extract_sql_error(result.stdout)
+    if stderr_error and stdout_error:
+        stderr_score = score_execution_error_line(stderr_error) or 0
+        stdout_score = score_execution_error_line(stdout_error) or 0
+        if stdout_score > stderr_score:
+            return stdout_error
+        return stderr_error
+    if stderr_error:
+        return stderr_error
+    if stdout_error:
+        return stdout_error
     if result.returncode != 0:
         stderr = (result.stderr or "").strip()
         return stderr or "执行失败"
