@@ -47,3 +47,6 @@ scripts/
 test_*.py
 collect_source_object_stats.py
 init_test.py
+tmp_fixup_public_grant/
+tmp_reports_public_grant/
+.comparator_notice_state.json

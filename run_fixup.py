@@ -61,6 +61,8 @@ try:
 except Exception:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 
+from comparator_notices import RuntimeNotice, load_notice_state, persist_seen_notices, select_unseen_notices
+
 __version__ = "0.9.8.7"
 
 CONFIG_DEFAULT_PATH = "config.ini"
@@ -692,6 +694,52 @@ def resolve_grant_dirs(
 
     # preserve order, remove duplicates
     return list(dict.fromkeys(grant_dirs))
+
+
+def build_run_fixup_change_notices(
+    args,
+    fixup_dir: Path,
+    only_dirs: List[str]
+) -> List[RuntimeNotice]:
+    notices: List[RuntimeNotice] = []
+    selected_dirs = {str(item).lower() for item in (only_dirs or []) if str(item).strip()}
+    selected_all = not selected_dirs
+    if not getattr(args, "allow_table_create", False) and (
+        "table" in selected_dirs or (selected_all and (fixup_dir / "table").exists())
+    ):
+        notices.append(RuntimeNotice(
+            "fixup_table_safe_gate",
+            "0.9.8.7",
+            "建表脚本默认不执行",
+            "run_fixup 默认跳过 table/；确需建表请显式加 --allow-table-create。",
+        ))
+    if (selected_all or "grants_revoke" in selected_dirs) and (fixup_dir / "grants_revoke").exists():
+        notices.append(RuntimeNotice(
+            "public_grants_revoke_audit",
+            "0.9.8.7",
+            "PUBLIC 扩权现在会单独审计",
+            "若出现 grants_revoke，请先核对源端是否声明，再决定是否回收。",
+        ))
+    if (
+        (selected_all or "view" in selected_dirs)
+        and (fixup_dir / "view").exists()
+        and not getattr(args, "view_chain_autofix", False)
+    ):
+        notices.append(RuntimeNotice(
+            "view_chain_autofix",
+            "0.9.8.6",
+            "视图链可自动修复",
+            "缺失 VIEW 或依赖复杂时，可尝试 python3 run_fixup.py config.ini --view-chain-autofix。",
+        ))
+    return notices
+
+
+def log_change_notices_block(notices: List[RuntimeNotice]) -> None:
+    if not notices:
+        return
+    log_section("本次相关变化提醒")
+    for idx, notice in enumerate(notices, start=1):
+        log.warning("%d. %s：%s", idx, notice.title, notice.message)
 
 CREATE_OBJECT_DIRS = {
     "sequence",
@@ -4787,6 +4835,16 @@ def main() -> None:
         log.info("日志级别: console=%s", logging.getLevelName(level))
     set_console_log_level(level)
     log.info("run_fixup v%s", __version__)
+    notice_state_path: Optional[Path] = None
+    notice_state: Optional[Dict[str, object]] = None
+    notices_to_mark_seen: List[RuntimeNotice] = []
+    try:
+        notice_state_path, notice_state = load_notice_state(config_arg.resolve().parent)
+        runtime_notices = build_run_fixup_change_notices(args, fixup_dir, only_dirs)
+        notices_to_mark_seen = select_unseen_notices(notice_state, runtime_notices)
+        log_change_notices_block(notices_to_mark_seen)
+    except Exception as exc:
+        log.debug("加载运行时提醒状态失败，已跳过: %s", exc)
     
     # Check if iterative mode requested via config or args
     iterative_mode = getattr(args, 'iterative', False)
@@ -4831,6 +4889,12 @@ def main() -> None:
     except ConfigError as exc:
         log.error("执行失败: %s", exc)
         sys.exit(1)
+    finally:
+        if notice_state_path and notice_state is not None and notices_to_mark_seen:
+            try:
+                persist_seen_notices(notice_state_path, notice_state, __version__, notices_to_mark_seen)
+            except Exception as exc:
+                log.debug("持久化运行时提醒状态失败，已忽略: %s", exc)
 
 
 def run_single_fixup(

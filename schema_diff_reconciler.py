@@ -89,6 +89,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, NamedTuple, NoReturn, Optional, Sequence, Set, Tuple, Union
 
+from comparator_notices import RuntimeNotice, load_notice_state, persist_seen_notices, select_unseen_notices
+
 __version__ = "0.9.8.7"
 
 __author__ = "Minor Li"
@@ -251,6 +253,7 @@ class RunSummary(NamedTuple):
     actions_skipped: List[str]
     findings: List[str]
     attention: List[str]
+    change_notices: List[str]
     next_steps: List[str]
 
 
@@ -25354,6 +25357,30 @@ def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 
+def collect_recent_fixup_top_level_dirs(base_dir: Path, started_at: float) -> List[str]:
+    cutoff = max(0.0, float(started_at or 0.0) - 0.5)
+    top_level_dirs: Set[str] = set()
+    if not base_dir.exists():
+        return []
+    try:
+        for path in base_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.name == "README_FIRST.txt":
+                continue
+            try:
+                if path.stat().st_mtime < cutoff:
+                    continue
+            except OSError:
+                continue
+            rel = path.relative_to(base_dir)
+            if rel.parts and rel.parts[0] != "done":
+                top_level_dirs.add(rel.parts[0])
+    except OSError:
+        return []
+    return sorted(top_level_dirs)
+
+
 def write_fixup_file(
     base_dir: Path,
     subdir: str,
@@ -25388,6 +25415,111 @@ def write_fixup_file(
                 f.write(f"{grant_stmt}\n")
 
     log.info(f"[FIXUP] 生成目标端订正 SQL: {file_path}")
+
+
+def write_fixup_root_readme(
+    base_dir: Path,
+    report_dir: Optional[Path],
+    report_timestamp: Optional[str],
+    generated_dirs: Optional[Sequence[str]] = None
+) -> Optional[Path]:
+    if generated_dirs is None:
+        try:
+            existing_dirs = sorted(
+                path.name for path in base_dir.iterdir()
+                if path.is_dir() and path.name != "done"
+            )
+        except OSError as exc:
+            log.warning("[FIXUP] 读取 fixup 根目录失败，无法写入 README_FIRST.txt: %s", exc)
+            return None
+    else:
+        existing_dirs = sorted({
+            Path(str(item)).parts[0]
+            for item in generated_dirs
+            if str(item).strip() and Path(str(item)).parts
+        })
+
+    if not existing_dirs:
+        return None
+
+    report_hint = "report_<ts>.txt"
+    if report_dir and report_timestamp:
+        report_hint = str(Path(report_dir) / f"report_{report_timestamp}.txt")
+
+    lines: List[str] = [
+        "# Fixup 使用导航",
+        "# 运行初期建议先看",
+    ]
+    intro_steps: List[str] = [
+        f"先看 {report_hint} 里的“执行结论”和“本次建议处理顺序”。"
+    ]
+    if "tables_unsupported" in existing_dirs or "unsupported" in existing_dirs:
+        intro_steps.append("先确认 tables_unsupported/ 与 unsupported/ 里的对象，这些目录默认不建议直接执行。")
+    if "table" in existing_dirs:
+        intro_steps.append("table/ 是缺表 CREATE 脚本，默认不要直接执行；run_fixup 需显式 --allow-table-create。")
+    if "grants_revoke" in existing_dirs:
+        intro_steps.append("grants_revoke/ 是目标端多余 PUBLIC 授权回收建议，先核对源端声明后再执行。")
+    elif "grants_deferred" in existing_dirs:
+        intro_steps.append("grants_deferred/ 需要在对象补齐后再执行，不要作为首次 fixup 的默认目录。")
+    else:
+        intro_steps.append("确认以上风险项后，再按默认顺序执行 run_fixup.py。")
+    for idx, step in enumerate(intro_steps, start=1):
+        lines.append(f"{idx}. {step}")
+
+    lines.extend([
+        "",
+        "# 本次生成目录说明",
+    ])
+
+    descriptions: Dict[str, str] = {
+        "table": "缺表 CREATE 脚本；默认不要直接执行。",
+        "table_alter": "表列差异修补脚本；通常是首批可执行目录。",
+        "tables_unsupported": "不支持 TABLE 的 DDL；默认不执行。",
+        "unsupported": "不支持/阻断对象 DDL；默认不执行。",
+        "view": "缺失 VIEW 的 CREATE 脚本。",
+        "materialized_view": "MATERIALIZED VIEW 相关输出（可能仅打印不生成）。",
+        "procedure": "缺失 PROCEDURE 的 CREATE 脚本。",
+        "function": "缺失 FUNCTION 的 CREATE 脚本。",
+        "package": "缺失 PACKAGE 的 CREATE 脚本。",
+        "package_body": "缺失 PACKAGE BODY 的 CREATE 脚本。",
+        "type": "缺失 TYPE 的 CREATE 脚本。",
+        "type_body": "缺失 TYPE BODY 的 CREATE 脚本。",
+        "synonym": "缺失 SYNONYM 的 CREATE 脚本。",
+        "sequence": "缺失 SEQUENCE 的 CREATE 脚本。",
+        "index": "缺失 INDEX 的 CREATE 脚本。",
+        "constraint": "缺失约束脚本。",
+        "trigger": "缺失 TRIGGER 的 CREATE 脚本。",
+        "compile": "依赖重编译脚本。",
+        "name_collision": "重名约束/索引处理脚本，通常应先于 constraint/index。",
+        "constraint_validate_later": "后置 VALIDATE 脚本，默认不建议首次执行。",
+        "grants_miss": "缺失授权脚本，适合补齐当前缺口。",
+        "grants_all": "全量授权审计脚本，主要用于核对，不等于都要执行。",
+        "grants_deferred": "延后授权脚本，需对象补齐后再执行。",
+        "grants_revoke": "目标端多余 PUBLIC 授权回收建议，先审后执行。",
+        "view_prereq_grants": "VIEW 前置授权，通常先于 view/ 执行。",
+        "view_post_grants": "VIEW 创建后授权。",
+        "status": "状态漂移修补脚本（trigger/constraint）。",
+        "job": "JOB 草案或修补脚本，通常需人工确认。",
+        "schedule": "SCHEDULE 草案或修补脚本，通常需人工确认。",
+        "cleanup_candidates": "目标端多余对象清理候选，默认不自动执行。",
+    }
+
+    for dir_name in existing_dirs:
+        lines.append(f"- {dir_name}/ : {descriptions.get(dir_name, '本次运行生成的 fixup 目录。')}")
+
+    lines.extend([
+        "",
+        "# 推荐执行方式",
+        f"python3 run_fixup.py config.ini --smart-order --recompile",
+    ])
+
+    output_path = base_dir / "README_FIRST.txt"
+    try:
+        output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        return output_path
+    except OSError as exc:
+        log.warning("[FIXUP] 写入 README_FIRST.txt 失败 %s: %s", output_path, exc)
+        return None
 
 
 def count_lines_with_limit(path: Path, max_lines: int) -> Tuple[int, bool]:
@@ -27199,6 +27331,8 @@ def generate_fixup_scripts(
     settings["_extra_object_grant_rows"] = []
     settings["_sys_c_force_candidates"] = []
     settings["_trigger_view_reference_rows"] = []
+    settings["_generated_fixup_dirs"] = []
+    settings["_fixup_root_readme_path"] = ""
     trigger_filter_set = {t.upper() for t in (trigger_filter_entries or set())}
     support_state_map = support_state_map or {}
     table_target_map = build_table_target_map(master_list)
@@ -27417,6 +27551,7 @@ def generate_fixup_scripts(
         return None
 
     log.info(f"[FIXUP] 目标端订正 SQL 将生成到目录: {base_dir.resolve()}")
+    fixup_write_started_at = time.time()
     if not settings.get('enable_ddl_punct_sanitize', True):
         log.info("[DDL_CLEAN] 已关闭 PL/SQL 全角标点清洗。")
     hint_policy = settings.get('ddl_hint_policy', DDL_HINT_POLICY_DEFAULT)
@@ -30759,6 +30894,18 @@ def generate_fixup_scripts(
         if hint_report_path:
             log.info("[DDL_HINT] hint 清洗报告已输出: %s", hint_report_path)
 
+    generated_fixup_dirs = collect_recent_fixup_top_level_dirs(base_dir, fixup_write_started_at)
+    settings["_generated_fixup_dirs"] = list(generated_fixup_dirs)
+    fixup_root_readme_path = write_fixup_root_readme(
+        base_dir,
+        report_dir,
+        report_timestamp,
+        generated_dirs=generated_fixup_dirs,
+    )
+    settings["_fixup_root_readme_path"] = str(fixup_root_readme_path) if fixup_root_readme_path else ""
+    if fixup_root_readme_path:
+        log.info("[FIXUP] 根目录导航已输出: %s", fixup_root_readme_path)
+
     format_report_path = format_fixup_outputs(settings, base_dir, report_dir, report_timestamp)
     if format_report_path:
         log.info("[DDL_FORMAT] DDL 格式化报告已输出: %s", format_report_path)
@@ -31071,6 +31218,215 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
     return "AUX", "其他报告输出"
 
 
+def _append_unique_guide_step(steps: List[str], text: str) -> None:
+    value = (text or "").strip()
+    if value and value not in steps:
+        steps.append(value)
+
+
+def build_operator_handling_order(
+    *,
+    settings: Optional[Dict],
+    report_file: Optional[Union[str, Path]],
+    report_ts: Optional[str],
+    fixup_dir: Optional[Union[str, Path]],
+    fixup_root_readme_path: Optional[Union[str, Path]] = None,
+    actionable_cnt: int,
+    blocked_total: int,
+    table_presence_risk_cnt: int,
+    missing_view_cnt: int,
+    unsupported_view_cnt: int,
+    sys_c_force_candidate_count: int = 0,
+    case_sensitive_findings_count: int = 0,
+    trigger_view_reference_count: int = 0,
+    extra_public_grant_count: int = 0,
+) -> List[str]:
+    report_parent = Path(report_file).parent if report_file else None
+    report_ts_text = (report_ts or "").strip()
+    fixup_dir_text = str(fixup_dir or "fixup_scripts").strip() or "fixup_scripts"
+    steps: List[str] = []
+
+    if table_presence_risk_cnt:
+        if report_parent:
+            _append_unique_guide_step(
+                steps,
+                f"先处理 {report_parent}/table_data_presence_detail_*.txt 中的源有数据目标空表风险，再考虑执行 fixup。"
+            )
+        else:
+            _append_unique_guide_step(
+                steps,
+                "先处理 table_data_presence_detail_*.txt 中的源有数据目标空表风险，再考虑执行 fixup。"
+            )
+    if blocked_total:
+        suffix = f"_{report_ts_text}" if report_ts_text else "_*"
+        if report_parent:
+            _append_unique_guide_step(
+                steps,
+                f"先看 {report_parent}/unsupported_objects_detail{suffix}.txt 和 blacklist_tables.txt，区分哪些对象默认不应直接执行。"
+            )
+        else:
+            _append_unique_guide_step(
+                steps,
+                f"先看 unsupported_objects_detail{suffix}.txt 和 blacklist_tables.txt，区分哪些对象默认不应直接执行。"
+            )
+    if report_parent and report_ts_text:
+        _append_unique_guide_step(
+            steps,
+            f"再看 {report_parent}/migration_focus_{report_ts_text}.txt，区分可修补缺失和需人工处理项。"
+        )
+    elif report_ts_text:
+        _append_unique_guide_step(
+            steps,
+            f"再看 migration_focus_{report_ts_text}.txt，区分可修补缺失和需人工处理项。"
+        )
+    if extra_public_grant_count:
+        if report_parent and report_ts_text:
+            _append_unique_guide_step(
+                steps,
+                f"若存在 PUBLIC 扩权，先审 {report_parent}/target_extra_grants_detail_{report_ts_text}.txt，再决定是否执行 {Path(fixup_dir_text) / 'grants_revoke'}。"
+            )
+        else:
+            _append_unique_guide_step(
+                steps,
+                f"若存在 PUBLIC 扩权，先审 target_extra_grants_detail_*.txt，再决定是否执行 {Path(fixup_dir_text) / 'grants_revoke'}。"
+            )
+    if actionable_cnt:
+        if settings and not bool(settings.get("generate_fixup", True)):
+            _append_unique_guide_step(steps, "如需生成修补脚本，请先开启 generate_fixup。")
+        else:
+            if fixup_root_readme_path:
+                _append_unique_guide_step(
+                    steps,
+                    f"确认风险项后，再审 {fixup_root_readme_path} 和 {fixup_dir_text}/ 下的修补脚本。"
+                )
+            else:
+                _append_unique_guide_step(
+                    steps,
+                    f"确认风险项后，再审 {fixup_dir_text}/ 下的修补脚本。"
+                )
+    if missing_view_cnt or unsupported_view_cnt:
+        _append_unique_guide_step(
+            steps,
+            "如视图依赖复杂，可使用: python3 run_fixup.py config.ini --view-chain-autofix"
+        )
+    if sys_c_force_candidate_count and report_ts_text:
+        _append_unique_guide_step(
+            steps,
+            f"若涉及 SYS_C* 列，再看 sys_c_force_candidates_detail_{report_ts_text}.txt 评估是否需要 FORCE。"
+        )
+    if case_sensitive_findings_count and report_ts_text:
+        _append_unique_guide_step(
+            steps,
+            f"若存在双引号大小写对象，再看 case_sensitive_identifiers_detail_{report_ts_text}.txt。"
+        )
+    if trigger_view_reference_count and report_ts_text:
+        _append_unique_guide_step(
+            steps,
+            f"若触发器引用视图，再看 triggers_view_reference_detail_{report_ts_text}.txt 评估是否需要改造。"
+        )
+    return steps
+
+
+def build_report_index_guide_entries(
+    *,
+    report_path: Path,
+    fixup_root_readme_path: Optional[Union[str, Path]],
+    migration_focus_path: Optional[Path],
+    unsupported_detail_path: Optional[Path],
+    table_presence_detail_path: Optional[Path],
+    target_extra_grant_detail_path: Optional[Path],
+    blocked_total: int,
+    table_presence_risk_cnt: int,
+    extra_public_grant_count: int,
+) -> List[ReportIndexEntry]:
+    entries: List[ReportIndexEntry] = []
+
+    def _add(path: Optional[Path], description: str) -> None:
+        if not path:
+            return
+        if not Path(path).exists():
+            return
+        rel_path = _report_index_relpath(report_path.parent, path)
+        if rel_path:
+            entries.append(ReportIndexEntry("GUIDE", rel_path, "-", description))
+
+    _add(report_path, "先看主报告里的“执行结论”和“本次建议处理顺序”")
+    if table_presence_risk_cnt > 0:
+        _add(table_presence_detail_path, "若存在数据风险，优先处理源有数据目标空表")
+    if blocked_total > 0:
+        _add(unsupported_detail_path, "先确认不支持/阻断对象，这些对象默认不应直接执行")
+    _add(migration_focus_path, "再看迁移聚焦，区分可修补缺失与需人工处理项")
+    if extra_public_grant_count > 0:
+        _add(target_extra_grant_detail_path, "若存在 PUBLIC 扩权，先审这里，再决定是否执行 grants_revoke")
+    if fixup_root_readme_path:
+        _add(Path(str(fixup_root_readme_path)), "进入 fixup_scripts 前，先看这个目录导航文件")
+    return entries
+
+
+def build_runtime_change_notices(
+    *,
+    settings: Optional[Dict],
+    summary: RunSummary,
+    ctx: RunSummaryContext,
+    report_file: Optional[Path],
+) -> List[RuntimeNotice]:
+    notices: List[RuntimeNotice] = []
+    generated_fixup_dirs = {
+        str(item).strip().lower()
+        for item in ((settings or {}).get("_generated_fixup_dirs") or [])
+        if str(item).strip()
+    }
+    fixup_root_readme_path_raw = str((settings or {}).get("_fixup_root_readme_path", "") or "").strip()
+    fixup_root_readme_path = Path(fixup_root_readme_path_raw) if fixup_root_readme_path_raw else None
+    report_index_hint = "report_index_*.txt"
+    if report_file:
+        report_index_hint = str(Path(report_file).parent / f"report_index_{Path(report_file).stem[len('report_'): ]}.txt")
+
+    if report_file and summary.next_steps:
+        notices.append(RuntimeNotice(
+            "embedded_report_guidance",
+            "0.9.8.7",
+            "报告现在自带导航",
+            "主报告和 report_index 已直接给出本次处理顺序，不必先翻 README。",
+        ))
+    if ctx.fixup_enabled and fixup_root_readme_path:
+        notices.append(RuntimeNotice(
+            "fixup_root_readme",
+            "0.9.8.7",
+            "fixup 根目录现在有导航文件",
+            f"{fixup_root_readme_path} 会解释本次目录用途和默认执行边界。",
+        ))
+    if ctx.fixup_enabled and "table" in generated_fixup_dirs:
+        notices.append(RuntimeNotice(
+            "fixup_table_safe_gate",
+            "0.9.8.7",
+            "建表脚本默认不执行",
+            "run_fixup 默认跳过 table/；确需建表请显式加 --allow-table-create。",
+        ))
+    if any("--view-chain-autofix" in step for step in (summary.next_steps or [])):
+        notices.append(RuntimeNotice(
+            "view_chain_autofix",
+            "0.9.8.6",
+            "视图链可自动修复",
+            "存在缺失 VIEW 或复杂依赖时，可直接使用 --view-chain-autofix。",
+        ))
+    if any("grants_revoke" in step for step in (summary.next_steps or [])):
+        notices.append(RuntimeNotice(
+            "public_grants_revoke_audit",
+            "0.9.8.7",
+            "PUBLIC 扩权现在会单独审计",
+            "若出现 grants_revoke，请先核对源端是否声明，再决定是否回收。",
+        ))
+    if settings and str(settings.get("object_created_before", "") or "").strip():
+        notices.append(RuntimeNotice(
+            "object_created_before_scope",
+            "0.9.8.6",
+            "当前运行可能不是全量范围",
+            f"本次启用了 object_created_before；after-cutoff 对象请结合 {report_index_hint} 继续核对。",
+        ))
+    return notices
+
+
 def export_report_index(
     entries: List[ReportIndexEntry],
     report_dir: Path,
@@ -31094,7 +31450,18 @@ def export_report_index(
         return None
     output_path = Path(report_dir) / f"report_index_{report_timestamp}.txt"
     header_fields = ["CATEGORY", "PATH", "ROWS", "DESCRIPTION"]
-    return write_pipe_report("报告索引", header_fields, rows, output_path)
+    result = write_pipe_report("报告索引", header_fields, rows, output_path)
+    if not result:
+        return None
+    try:
+        if any((row[0] or "").upper() == "GUIDE" for row in rows):
+            lines = output_path.read_text(encoding="utf-8").splitlines()
+            if "# 使用建议:" not in "\n".join(lines[:8]):
+                lines.insert(4, "# 使用建议: 优先查看 CATEGORY=GUIDE 的条目，再按 REPORT/DETAIL/AUX 展开。")
+                output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    except OSError as exc:
+        log.warning("补写报告索引使用建议失败 %s: %s", output_path, exc)
+    return result
 
 
 def export_missing_objects_detail(
@@ -37645,7 +38012,8 @@ def build_run_summary(
     noise_suppressed_count: int = 0,
     noise_suppressed_path: Optional[Path] = None,
     table_presence_summary: Optional[TablePresenceSummary] = None,
-    excluded_object_rows: Optional[List[Dict[str, object]]] = None
+    excluded_object_rows: Optional[List[Dict[str, object]]] = None,
+    fixup_root_readme_path: str = "",
 ) -> RunSummary:
     end_time = datetime.now()
     total_seconds = time.perf_counter() - ctx.start_perf
@@ -37766,6 +38134,14 @@ def build_run_summary(
     remap_conflict_cnt = len(remap_conflicts)
     extraneous_count = len(extraneous_rules)
     blacklist_missing_cnt = len(blacklisted_missing_tables or {})
+    missing_view_cnt = sum(
+        1 for obj_type, _tgt_name, _src_name in (tv_results.get("missing", []) or [])
+        if (obj_type or "").upper() == "VIEW"
+    )
+    unsupported_view_cnt = sum(
+        1 for row in (support_summary.unsupported_rows if support_summary else [])
+        if (row.obj_type or "").upper() == "VIEW"
+    )
     comment_mis_cnt = len(comment_results.get("mismatched", []))
     idx_mis_cnt = len(extra_results.get("index_mismatched", []))
     cons_mis_cnt = len(extra_results.get("constraint_mismatched", []))
@@ -37783,6 +38159,7 @@ def build_run_summary(
     table_presence_unknown_cnt = int((table_presence_summary.total_unknown if table_presence_summary else 0) or 0)
     table_presence_skipped_cnt = int((table_presence_summary.total_skipped if table_presence_summary else 0) or 0)
     unsupported_by_type: Dict[str, int] = build_unsupported_summary_counts(support_summary, extra_results)
+    unsupported_total = sum(int(v or 0) for v in unsupported_by_type.values())
     excluded_by_type: Dict[str, int] = build_excluded_summary_counts(excluded_object_rows)
     findings: List[str] = [
         f"主对象: 缺失 {missing_count}, 不匹配 {mismatched_count}, 多余 {extra_target_cnt}, 仅打印 {skipped_count}"
@@ -37909,70 +38286,60 @@ def build_run_summary(
     if config_diagnostics:
         attention.append(f"配置诊断提示 {len(config_diagnostics)} 项（详见报告）。")
 
-    next_steps: List[str] = []
+    next_steps = build_operator_handling_order(
+        settings={"generate_fixup": ctx.fixup_enabled},
+        report_file=report_file,
+        report_ts=(Path(report_file).stem.split("_", 1)[1] if report_file and "_" in Path(report_file).stem else None),
+        fixup_dir=ctx.fixup_dir,
+        fixup_root_readme_path=fixup_root_readme_path,
+        actionable_cnt=(missing_count + mismatched_count + idx_mis_cnt + cons_mis_cnt + seq_mis_cnt + trg_mis_cnt + table_presence_risk_cnt),
+        blocked_total=unsupported_total,
+        table_presence_risk_cnt=table_presence_risk_cnt,
+        missing_view_cnt=missing_view_cnt,
+        unsupported_view_cnt=unsupported_view_cnt,
+        extra_public_grant_count=extra_public_grant_count,
+    )
     if remap_conflict_cnt:
-        next_steps.append("补充 remap_rules.txt，为无法推导对象显式配置映射。")
-    if missing_count or mismatched_count or idx_mis_cnt or cons_mis_cnt or seq_mis_cnt or trg_mis_cnt:
-        if ctx.fixup_enabled:
-            next_steps.append(f"审核并执行 {ctx.fixup_dir} 中的修补脚本。")
-        else:
-            next_steps.append("如需自动生成修补脚本，请设置 generate_fixup=true。")
+        _append_unique_guide_step(next_steps, "如仍存在无法推导对象，请补充 remap_rules.txt。")
     if missing_count:
         if report_file:
             report_parent = Path(report_file).parent
-            next_steps.append(
-                f"将 {report_parent}/missed_tables_views_for_OMS 下的 schema_T.txt / schema_V.txt 规则提供给 OMS 进行迁移。"
+            _append_unique_guide_step(
+                next_steps,
+                f"如需交付 OMS 规则，再看 {report_parent}/missed_tables_views_for_OMS 下的 schema_T.txt / schema_V.txt。"
             )
         else:
-            next_steps.append("将 missed_tables_views_for_OMS 下的 schema_T.txt / schema_V.txt 规则提供给 OMS 进行迁移。")
-    if blacklist_missing_cnt:
-        if report_file:
-            report_parent = Path(report_file).parent
-            next_steps.append(f"查看 {report_parent}/blacklist_tables.txt，确认黑名单表处理方案。")
-        else:
-            next_steps.append("查看 blacklist_tables.txt，确认黑名单表处理方案。")
+            _append_unique_guide_step(next_steps, "如需交付 OMS 规则，再看 missed_tables_views_for_OMS 下的 schema_T.txt / schema_V.txt。")
     if trigger_summary.get("invalid_entries") or trigger_summary.get("not_found"):
-        next_steps.append("修正 trigger_list 清单内容后重新运行。")
+        _append_unique_guide_step(next_steps, "若触发器清单有误，请修正 trigger_list 后重新运行。")
     if dep_missing_cnt or dep_unexpected_cnt:
-        next_steps.append("根据依赖差异报告补齐编译或授权。")
-    if table_presence_risk_cnt:
-        if report_file:
-            report_parent = Path(report_file).parent
-            next_steps.append(
-                f"优先处理 {report_parent}/table_data_presence_detail_*.txt 中的 RISK_SOURCE_NONEMPTY_TARGET_EMPTY 表。"
-            )
-        else:
-            next_steps.append("优先处理 table_data_presence_detail_*.txt 中的 RISK_SOURCE_NONEMPTY_TARGET_EMPTY 表。")
+        _append_unique_guide_step(next_steps, "若依赖差异存在，请按依赖报告补齐编译或授权。")
     if comment_mis_cnt:
-        next_steps.append("确认注释差异是否需要修复。")
+        _append_unique_guide_step(next_steps, "如业务要求注释一致，再确认 comment mismatch 明细。")
     if ctx.enable_grant_generation and ctx.fixup_enabled:
-        next_steps.append(
-            "审核 {miss} 中的授权脚本；对象补齐后再执行 {deferred}（全量审计见 {all}）。".format(
+        _append_unique_guide_step(
+            next_steps,
+            "授权目录建议先看 {miss}，对象补齐后再看 {deferred}，全量参考在 {all}。".format(
                 miss=Path(ctx.fixup_dir) / 'grants_miss',
                 deferred=Path(ctx.fixup_dir) / 'grants_deferred',
                 all=Path(ctx.fixup_dir) / 'grants_all'
             )
         )
-        if extra_public_grant_count:
-            next_steps.append(
-                "优先审核并执行 {revoke}，回收目标端多余 PUBLIC 授权。".format(
-                    revoke=Path(ctx.fixup_dir) / "grants_revoke"
-                )
-            )
     if fixup_skip_summary and fixup_skip_summary.get("INDEX"):
         if report_file:
             report_parent = Path(report_file).parent
-            next_steps.append(f"查看 {report_parent}/fixup_skip_summary_*.txt，确认索引修补跳过原因。")
+            _append_unique_guide_step(next_steps, f"如索引脚本数量和预期不符，再看 {report_parent}/fixup_skip_summary_*.txt。")
         else:
-            next_steps.append("查看 fixup_skip_summary_*.txt，确认索引修补跳过原因。")
+            _append_unique_guide_step(next_steps, "如索引脚本数量和预期不符，再看 fixup_skip_summary_*.txt。")
     if unsupported_by_type:
         if report_file:
             report_parent = Path(report_file).parent
-            next_steps.append(
-                f"如需明细，设置 report_detail_mode=split 后查看 {report_parent}/report_index_*.txt，定位 unsupported_<type>_detail_*.txt。"
+            _append_unique_guide_step(
+                next_steps,
+                f"若需要按类型展开，再看 {report_parent}/report_index_*.txt 里的 GUIDE/DETAIL 条目。"
             )
         else:
-            next_steps.append("如需明细，设置 report_detail_mode=split 后查看 report_index_*.txt，定位 unsupported_<type>_detail_*.txt。")
+            _append_unique_guide_step(next_steps, "若需要按类型展开，再看 report_index_*.txt 里的 GUIDE/DETAIL 条目。")
 
     return RunSummary(
         start_time=ctx.start_time,
@@ -37983,6 +38350,7 @@ def build_run_summary(
         actions_skipped=actions_skipped,
         findings=findings,
         attention=attention,
+        change_notices=[],
         next_steps=next_steps
     )
 
@@ -38014,9 +38382,10 @@ def render_run_summary_panel(summary: RunSummary, width: int) -> Panel:
     skipped = render_section("本次未执行", summary.actions_skipped, empty_text="无")
     findings = render_section("关键发现", summary.findings, empty_text="无")
     attention = render_section("需要注意", summary.attention, empty_text="无")
-    next_steps = render_section("下一步建议", summary.next_steps, empty_text="无")
+    notices = render_section("本次相关变化提醒", summary.change_notices, empty_text="无")
+    next_steps = render_section("本次建议处理顺序", summary.next_steps, empty_text="无")
 
-    text = "\n\n".join([overview, phases, actions, skipped, findings, attention, next_steps])
+    text = "\n\n".join([overview, phases, actions, skipped, findings, attention, notices, next_steps])
     return Panel.fit(text, title="[info]运行总结", border_style="info", width=width)
 
 
@@ -38050,7 +38419,14 @@ def log_run_summary(summary: RunSummary) -> None:
     else:
         log.info("无")
 
-    log_subsection("下一步建议")
+    log_subsection("本次相关变化提醒")
+    if summary.change_notices:
+        for item in summary.change_notices:
+            log.info("%s", item)
+    else:
+        log.info("无")
+
+    log_subsection("本次建议处理顺序")
     if summary.next_steps:
         for item in summary.next_steps:
             log.info("%s", item)
@@ -38116,6 +38492,11 @@ def print_final_report(
         report_name = Path(report_file).name
         if report_name.startswith("report_") and report_name.endswith(".txt"):
             report_ts = report_name[len("report_"):-4]
+    extra_object_grant_rows = list(extra_object_grant_rows or [])
+    extra_public_grant_count = sum(
+        1 for row in extra_object_grant_rows
+        if (row.grantee or "").upper() == "PUBLIC"
+    )
 
     if extra_results is None:
         extra_results = {
@@ -38418,27 +38799,24 @@ def print_final_report(
             )
         if blocked_total:
             lines.append(f"不支持/阻断/待确认: {blocked_total}")
-        next_steps: List[str] = []
-        if actionable_cnt:
-            if settings and not bool(settings.get("generate_fixup", True)):
-                next_steps.append("如需生成修补脚本，请开启 generate_fixup")
-            else:
-                next_steps.append("查看 fixup_scripts/ 下的缺失与修补脚本")
-        if blocked_total:
-            suffix = f"_{report_ts}" if report_ts else "_*"
-            next_steps.append(f"查看 unsupported_objects_detail{suffix}.txt 或 blacklist_tables.txt")
-        if missing_view_cnt or unsupported_view_cnt:
-            next_steps.append("视图依赖链修复建议执行: python3 run_fixup.py --view-chain-autofix")
-        if sys_c_force_candidate_count and report_ts:
-            next_steps.append(f"查看 sys_c_force_candidates_detail_{report_ts}.txt 评估 FORCE 范围")
-        if case_sensitive_findings_count and report_ts:
-            next_steps.append(f"查看 case_sensitive_identifiers_detail_{report_ts}.txt 并确认 remap/DDL 策略")
-        if trigger_view_reference_count and report_ts:
-            next_steps.append(f"查看 triggers_view_reference_detail_{report_ts}.txt 并确认是否需触发器改造")
-        if report_ts:
-            next_steps.append(f"查看 migration_focus_{report_ts}.txt 汇总迁移动作清单")
+        next_steps = build_operator_handling_order(
+            settings={"generate_fixup": bool(settings.get("generate_fixup", True)) if settings else True},
+            report_file=report_file,
+            report_ts=report_ts,
+            fixup_dir=(settings.get("fixup_dir", "fixup_scripts") if settings else "fixup_scripts"),
+            fixup_root_readme_path=(settings.get("_fixup_root_readme_path", "") if settings else ""),
+            actionable_cnt=actionable_cnt,
+            blocked_total=blocked_total,
+            table_presence_risk_cnt=table_presence_risk_cnt,
+            missing_view_cnt=missing_view_cnt,
+            unsupported_view_cnt=unsupported_view_cnt,
+            sys_c_force_candidate_count=sys_c_force_candidate_count,
+            case_sensitive_findings_count=case_sensitive_findings_count,
+            trigger_view_reference_count=trigger_view_reference_count,
+            extra_public_grant_count=extra_public_grant_count,
+        )
         if next_steps:
-            lines.append("下一步: " + "；".join(next_steps))
+            lines.append("本次建议处理顺序: " + "；".join(next_steps))
         return Panel.fit("\n".join(lines), title="[header]执行结论", border_style="info")
 
     console.print(build_execution_conclusion())
@@ -39332,6 +39710,9 @@ def print_final_report(
     )
     console.print(fixup_panel)
     run_summary: Optional[RunSummary] = None
+    notice_state_path: Optional[Path] = None
+    notice_state: Optional[Dict[str, object]] = None
+    notices_to_mark_seen: List[RuntimeNotice] = []
     if run_summary_ctx:
         run_summary_ctx.phase_durations["报告输出"] = time.perf_counter() - run_summary_ctx.report_start_perf
         filtered_grants_count = len(filtered_grants or [])
@@ -39370,8 +39751,25 @@ def print_final_report(
             noise_suppressed_count=noise_suppressed_count,
             noise_suppressed_path=noise_detail_path,
             table_presence_summary=table_presence_summary,
-            excluded_object_rows=excluded_object_rows
+            excluded_object_rows=excluded_object_rows,
+            fixup_root_readme_path=(settings.get("_fixup_root_readme_path", "") if settings else ""),
         )
+        notice_state_path, notice_state = load_notice_state(settings.get("config_dir") if settings else None)
+        runtime_notices = build_runtime_change_notices(
+            settings=settings,
+            summary=run_summary,
+            ctx=run_summary_ctx,
+            report_file=Path(report_file) if report_file else None,
+        )
+        unseen_notices = select_unseen_notices(notice_state, runtime_notices)
+        if unseen_notices:
+            run_summary = run_summary._replace(
+                change_notices=[
+                    f"{notice.title}: {notice.message}"
+                    for notice in unseen_notices
+                ]
+            )
+            notices_to_mark_seen = list(unseen_notices)
         console.print(render_run_summary_panel(run_summary, section_width))
 
     if report_file:
@@ -39953,6 +40351,31 @@ def print_final_report(
                 category, description = _infer_report_index_meta(item)
                 index_entries.append(ReportIndexEntry(category, rel_path, "-", description))
                 existing_paths.add(rel_path)
+            blocked_total_for_guide = (
+                unsupported_total
+                + idx_blocked_cnt
+                + idx_unsupported_cnt
+                + cons_blocked_cnt
+                + cons_unsupported_cnt
+                + trg_blocked_cnt
+            )
+            guide_entries = build_report_index_guide_entries(
+                report_path=report_path,
+                fixup_root_readme_path=(settings.get("_fixup_root_readme_path", "") if settings else ""),
+                migration_focus_path=migration_focus_path,
+                unsupported_detail_path=unsupported_detail_path,
+                table_presence_detail_path=table_presence_detail_path,
+                target_extra_grant_detail_path=target_extra_grant_detail_path,
+                blocked_total=blocked_total_for_guide,
+                table_presence_risk_cnt=table_presence_risk_cnt,
+                extra_public_grant_count=extra_public_grant_count,
+            )
+            if guide_entries:
+                guide_paths = {entry.path for entry in guide_entries}
+                index_entries = guide_entries + [
+                    entry for entry in index_entries
+                    if not (entry.category == "GUIDE" and entry.path in guide_paths)
+                ]
             index_path = export_report_index(
                 index_entries,
                 report_path.parent,
@@ -39963,6 +40386,13 @@ def print_final_report(
                 log.info("报告索引已输出到: %s", index_path)
         except OSError as exc:
             console.print(f"[missing]报告写入失败: {exc}")
+        if notice_state_path and notice_state is not None:
+            try:
+                persist_seen_notices(notice_state_path, notice_state, __version__, notices_to_mark_seen)
+                if notices_to_mark_seen:
+                    log.info("变化提醒状态已更新: %s", notice_state_path)
+            except OSError as exc:
+                log.warning("写入变化提醒状态失败 %s: %s", notice_state_path, exc)
 
     console.print(Panel.fit("[bold]报告结束[/bold]", style="title"))
 

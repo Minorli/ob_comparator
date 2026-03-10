@@ -52,9 +52,15 @@ python3 schema_diff_reconciler.py config.ini
 
 重点看：
 - main_reports/run_<ts>/report_<ts>.txt
+- main_reports/run_<ts>/report_index_<ts>.txt
 - main_reports/run_<ts>/missing_objects_detail_<ts>.txt
 - main_reports/run_<ts>/unsupported_objects_detail_<ts>.txt
 - fixup_scripts/
+
+运行初期优先看：
+- report_<ts>.txt 里的“执行结论”和“本次建议处理顺序”
+- fixup_scripts/README_FIRST.txt（会提示哪些目录默认不要直接执行）
+- 如果看到“本次相关变化提醒”，优先花 10 秒看完；同一提醒默认只展示一次
 
 7. 执行修复（run_fixup）
 - 默认安全执行（不会跑 table/ 建表脚本）：

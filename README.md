@@ -122,6 +122,13 @@ python3 schema_diff_reconciler.py --wizard
 python3 run_fixup.py --smart-order --recompile
 ```
 
+主程序跑完后，优先看两处：
+- `report_<ts>.txt` 里的 `执行结论` 和 `本次建议处理顺序`
+- `fixup_scripts/README_FIRST.txt`
+  说明：这个文件会按本次实际生成的目录解释哪些可以先看、哪些默认不要直接执行。
+
+说明：若本次运行命中了你还没见过的新行为，运行总结里会额外出现 `本次相关变化提醒`，且同一提醒默认只展示一次。
+
 ## 交付前正确性自检
 建议在发版/交付前固定执行以下检查：
 ```bash
@@ -190,6 +197,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 
 ## 主要输出
 - `main_reports/run_<ts>/report_<ts>.txt`：完整对比报告（默认 per_run）
+- `main_reports/run_<ts>/report_index_<ts>.txt`：报告索引，包含 `GUIDE` 行，提示先看哪些文件
 - `main_reports/run_<ts>/package_compare_<ts>.txt`：PACKAGE/PKG BODY 明细
 - `main_reports/run_<ts>/remap_conflicts_<ts>.txt`：Remap 冲突清单
 - `main_reports/run_<ts>/VIEWs_chain_<ts>.txt`：VIEW 依赖链报告
@@ -209,6 +217,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `*_detail_*.txt` 明细文件采用 `|` 分隔，并包含 `# total/# 字段说明` 头，格式与 `package_compare` 一致，便于 Excel 直接分隔导入。
 - `main_reports/run_<ts>/missed_tables_views_for_OMS/`：OMS 缺失 TABLE/VIEW 规则
 - `fixup_scripts/`：修补脚本输出（执行前需人工审核）
+- `fixup_scripts/README_FIRST.txt`：fixup 根目录导航，说明本次生成目录的用途与默认执行边界
 - `fixup_scripts/grants_miss/`：缺失授权脚本
 - `fixup_scripts/grants_revoke/`：目标端额外 PUBLIC 授权回收建议（默认仅 PUBLIC 自动给出 REVOKE）
 - `fixup_scripts/tables_unsupported/`：不支持 TABLE 的 DDL（默认不执行）
