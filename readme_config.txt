@@ -242,12 +242,15 @@
   说明：若延后授权因 owner 策略无法自动输出 SQL，`fixup_scripts/grants_deferred/README.txt` 仍会保留完整提醒。
   说明：程序会额外审计目标端“源端未声明”的对象授权，输出 `target_extra_grants_detail_<ts>.txt`；
   其中 PUBLIC 额外授权会生成 `fixup_scripts/grants_revoke/revoke_public_object_grants.sql` 回收建议。
+  说明：程序会为每次运行生成 `grant_capability_detail_<ts>.txt`，记录本次授权动态规则库：
+  源端权限、目标端目录权限、是否支持、是否存在目录别名（如 `DEBUG -> OTHERS`）、以及最终决策。
 - grant_tab_privs_scope：DBA_TAB_PRIVS 抽取范围。默认：owner。
   可选值：owner（仅源 schema 所拥有对象）、owner_or_grantee（兼容旧逻辑）。
 - grant_merge_privileges：合并同一对象的多权限授权。默认：true。
 - grant_merge_grantees：合并同一权限的多 grantee 授权。默认：true。
-- grant_supported_sys_privs：支持的系统权限清单（逗号分隔）。默认：空（自动探测）。
-- grant_supported_object_privs：支持的对象权限清单（逗号分隔）。默认：空（内置白名单）。
+- grant_supported_sys_privs：系统权限人工 override 清单（逗号分隔）。默认：空（使用本次运行动态规则库）。
+- grant_supported_object_privs：对象权限人工 override 清单（逗号分隔）。默认：空（使用本次运行动态规则库）。
+  说明：这两个配置不再是“默认白名单”，而是人工强制覆盖；仅在需要临时收口/兜底时使用。
 - grant_include_oracle_maintained_roles：是否生成 ORACLE_MAINTAINED 角色。默认：false。
 - 角色兼容映射（内置）：`SELECT_CATALOG_ROLE -> OB_CATALOG_ROLE`。
   说明：生成授权脚本时会自动替换；若目标端不存在该角色，工具可能仅生成 `CREATE ROLE OB_CATALOG_ROLE`（不含目录视图授权），

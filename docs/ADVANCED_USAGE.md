@@ -72,9 +72,10 @@
 - `grant_merge_grantees = true`：合并同权限多 grantee
 
 ### 3.3 兼容过滤
-- `grant_supported_sys_privs` / `grant_supported_object_privs`：白名单覆盖
+- `grant_supported_sys_privs` / `grant_supported_object_privs`：人工 override；默认留空时使用每次运行动态生成的授权规则库
 - `grant_include_oracle_maintained_roles`：是否保留 Oracle 维护角色
 - 过滤结果输出到 `main_reports/filtered_grants.txt`
+- 动态规则库输出到 `main_reports/grant_capability_detail_<ts>.txt`
 
 ### 3.4 VIEW 与同义词下探
 - VIEW 被授予非 owner 时，会补齐 owner 对依赖对象的 `WITH GRANT OPTION`

@@ -203,6 +203,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/VIEWs_chain_<ts>.txt`：VIEW 依赖链报告
 - `main_reports/run_<ts>/blacklist_tables.txt`：黑名单表清单
 - `main_reports/run_<ts>/filtered_grants.txt`：过滤授权清单
+- `main_reports/run_<ts>/grant_capability_detail_<ts>.txt`：本次授权动态规则库明细（含目标端目录权限别名，如 `DEBUG -> OTHERS`）
 - `main_reports/run_<ts>/target_extra_grants_detail_<ts>.txt`：目标端额外对象授权明细（含 PUBLIC 扩权风险）
 - `main_reports/run_<ts>/ddl_cleanup_detail_<ts>.txt`：DDL 清理/改写明细（区分 `format_only / syntax_compat / environment_detach / semantic_rewrite`，并标记 `evidence_level`）
 - `main_reports/run_<ts>/trigger_status_report.txt`：触发器清单/状态差异报告

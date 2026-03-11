@@ -192,6 +192,7 @@
 - `run_<ts>/VIEWs_chain_<ts>.txt`：VIEW 链路
 - `unsupported_<TYPE>_detail_*.txt`：按类型不支持明细（含 ROOT_CAUSE，如 VIEW_X$ 及命中对象）
 - `filtered_grants.txt`：过滤权限
+- `grant_capability_detail_<ts>.txt`：动态授权规则库明细（支持结果、目录别名、最终决策）
 
 ---
 

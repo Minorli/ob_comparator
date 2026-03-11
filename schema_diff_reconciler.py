@@ -83,7 +83,7 @@ import uuid
 from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -1109,6 +1109,8 @@ class ExtraObjectGrantDriftRow(NamedTuple):
     reason_code: str
     reason: str
     action: str
+    object_type: str = ""
+    target_catalog_privilege: str = ""
 
 
 class UnsupportedGrantDetailRow(NamedTuple):
@@ -1129,6 +1131,42 @@ class GrantPlan(NamedTuple):
     role_ddls: List[str]
     filtered_grants: List[FilteredGrantEntry]
     view_grant_targets: Set[str]
+    object_target_types: Optional[Dict[str, str]] = None
+
+
+@dataclass(frozen=True)
+class GrantCapabilityDecision:
+    support_status: str
+    decision: str
+    reason_code: str = ""
+    target_catalog_privilege: str = ""
+    error_code: str = ""
+    error_message: str = ""
+    sample_sql: str = ""
+
+
+class GrantCapabilityDetailRow(NamedTuple):
+    category: str
+    source_privilege: str
+    object_type: str
+    target_catalog_privilege: str
+    support_status: str
+    decision: str
+    reason_code: str
+    error_code: str
+    error_message: str
+    sample_sql: str
+
+
+@dataclass
+class GrantCapabilityLibrary:
+    system_decisions: Dict[str, GrantCapabilityDecision] = field(default_factory=dict)
+    object_decisions: Dict[Tuple[str, str], GrantCapabilityDecision] = field(default_factory=dict)
+    object_alias_to_logical: Dict[Tuple[str, str], str] = field(default_factory=dict)
+    object_logical_to_catalog: Dict[Tuple[str, str], str] = field(default_factory=dict)
+    known_logical_object_privileges: Set[str] = field(default_factory=set)
+    detail_rows: List[GrantCapabilityDetailRow] = field(default_factory=list)
+    probe_complete: bool = True
 
 
 class ObGrantCatalog(NamedTuple):
@@ -1298,11 +1336,36 @@ SUPPORT_STATE_RISKY = "RISKY"
 
 UNSUPPORTED_GRANT_TARGET_REASON_PREFIX = "UNSUPPORTED_TARGET_"
 DEFERRED_GRANT_REASON_TARGET_MISSING_NOT_PLANNED = "DEFERRED_TARGET_MISSING_NOT_PLANNED"
+GRANT_CAPABILITY_SUPPORT_SUPPORTED = "SUPPORTED"
+GRANT_CAPABILITY_SUPPORT_SUPPORTED_ALIAS = "SUPPORTED_ALIAS"
+GRANT_CAPABILITY_SUPPORT_UNSUPPORTED = "UNSUPPORTED"
+GRANT_CAPABILITY_SUPPORT_UNKNOWN = "UNKNOWN"
+GRANT_CAPABILITY_SUPPORT_SUPPORTED_OVERRIDE = "SUPPORTED_OVERRIDE"
+GRANT_CAPABILITY_SUPPORT_UNSUPPORTED_OVERRIDE = "UNSUPPORTED_OVERRIDE"
+GRANT_CAPABILITY_DECISION_ALLOW = "ALLOW"
+GRANT_CAPABILITY_DECISION_FILTER = "FILTER"
+GRANT_CAPABILITY_DECISION_MANUAL = "MANUAL_REVIEW"
+GRANT_CAPABILITY_REASON_UNSUPPORTED = "UNSUPPORTED_IN_OB"
+GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE = "GRANT_CAPABILITY_PROBE_INCOMPLETE"
+GRANT_CAPABILITY_REASON_OVERRIDE_EXCLUDED = "GRANT_CAPABILITY_OVERRIDE_EXCLUDED"
+GRANT_CAPABILITY_REASON_TARGET_UNKNOWN = "TARGET_UNKNOWN_OBJECT_PRIVILEGE"
 UNSUPPORTED_GRANT_REASON_DEFAULTS: Dict[str, Tuple[str, str]] = {
     "UNSUPPORTED_OBJECT_PRIV_IN_OB": ("OB 不支持该对象权限", "移除该权限或改造对象后手工授权"),
     "UNSUPPORTED_SYS_PRIV_IN_OB": ("OB 不支持该系统权限", "移除该权限或改造后手工授权"),
     "NOT_IN_ORACLE_OBJECT_PRIVILEGE_MAP": ("源端对象权限映射缺失", "检查源端权限定义与元数据"),
     "NOT_IN_ORACLE_SYSTEM_PRIVILEGE_MAP": ("源端系统权限映射缺失", "检查源端权限定义与元数据"),
+    GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE: (
+        "当前运行未完成该权限能力探针，已降级为人工确认。",
+        "检查 grant_capability_detail 明细后人工处理该授权。"
+    ),
+    GRANT_CAPABILITY_REASON_OVERRIDE_EXCLUDED: (
+        "该权限未包含在人工 override 清单中。",
+        "检查 grant_supported_sys_privs / grant_supported_object_privs 配置，或人工处理授权。"
+    ),
+    GRANT_CAPABILITY_REASON_TARGET_UNKNOWN: (
+        "目标端存在无法归一化的对象权限标记，已降级为人工复核。",
+        "检查 target_extra_grants_detail 与 grant_capability_detail，确认后再决定是否回收。"
+    ),
     DEFERRED_GRANT_REASON_TARGET_MISSING_NOT_PLANNED: (
         "目标对象当前不存在且本轮不会创建，授权已延后。",
         "先补齐对象（OMS/手工）后执行 grants_deferred 目录脚本。"
@@ -11019,7 +11082,12 @@ def _build_obclient_command_args(ob_cfg: ObConfig, extra_args: Optional[List[str
     return command_args
 
 
-def obclient_run_sql(ob_cfg: ObConfig, sql_query: str, timeout: Optional[int] = None) -> Tuple[bool, str, str]:
+def obclient_run_sql(
+    ob_cfg: ObConfig,
+    sql_query: str,
+    timeout: Optional[int] = None,
+    quiet_error: bool = False
+) -> Tuple[bool, str, str]:
     """运行 obclient CLI 命令并返回 (Success, stdout, stderr)，带 timeout。"""
     timeout_val = OBC_TIMEOUT if timeout is None else max(1, int(timeout))
     sql_payload = (sql_query or "").strip()
@@ -11070,11 +11138,13 @@ def obclient_run_sql(ob_cfg: ObConfig, sql_query: str, timeout: Optional[int] = 
                     OBCLIENT_SECURE_OPT
                 )
                 abort_run()
-            log.error("  [OBClient 错误] SQL: %s | 错误: %s", sql_query.strip(), err_text)
+            if not quiet_error:
+                log.error("  [OBClient 错误] SQL: %s | 错误: %s", sql_query.strip(), err_text)
             return False, stdout_clean, err_text
         err_line = _extract_obclient_error(stderr_clean) or _extract_obclient_error(stdout_clean)
         if err_line:
-            log.error("  [OBClient 错误] SQL: %s | 错误: %s", sql_query.strip(), err_line)
+            if not quiet_error:
+                log.error("  [OBClient 错误] SQL: %s | 错误: %s", sql_query.strip(), err_line)
             return False, stdout_clean, err_line
         if stderr_clean:
             if re.search(r"warning|警告", stderr_clean, flags=re.IGNORECASE):
@@ -12301,13 +12371,508 @@ def load_ob_users(ob_cfg: ObConfig) -> Optional[Set[str]]:
     return users
 
 
+def build_grant_capability_library(
+    oracle_meta: OracleMetadata,
+    ob_cfg: ObConfig,
+    source_objects: Optional[SourceObjectMap],
+    supported_sys_override: Optional[Set[str]] = None,
+    supported_object_override: Optional[Set[str]] = None,
+) -> GrantCapabilityLibrary:
+    """
+    基于当前源端实际权限 + OB 运行期实测，生成本次运行的动态授权能力库。
+    - system privilege: 临时 role GRANT/REVOKE probe
+    - object privilege: 按 (privilege, object_type) 对临时代表对象 probe
+    """
+    supported_sys_override = {p.upper() for p in (supported_sys_override or set()) if p}
+    supported_object_override = {p.upper() for p in (supported_object_override or set()) if p}
+    sys_priv_candidates, object_priv_candidates = collect_source_grant_capability_candidates(
+        oracle_meta,
+        source_objects,
+    )
+    known_logical_object_privileges: Set[str] = {
+        (name or "").strip().upper()
+        for name in (oracle_meta.table_privilege_map or set())
+        if (name or "").strip()
+    }
+    known_logical_object_privileges.update(priv for priv, _obj_type in object_priv_candidates)
+    detail_rows: List[GrantCapabilityDetailRow] = []
+    system_decisions: Dict[str, GrantCapabilityDecision] = {}
+    object_decisions: Dict[Tuple[str, str], GrantCapabilityDecision] = {}
+    object_alias_to_logical: Dict[Tuple[str, str], str] = {}
+    object_logical_to_catalog: Dict[Tuple[str, str], str] = {}
+    probe_complete = True
+
+    owner_u = load_ob_current_user_name(ob_cfg)
+    role_name = _build_probe_identifier("CODX_GCAP_ROLE")
+
+    def _append_system_row(
+        privilege: str,
+        support_status: str,
+        decision: str,
+        *,
+        reason_code: str = "",
+        target_catalog_privilege: str = "",
+        error_code: str = "",
+        error_message: str = "",
+        sample_sql: str = "",
+    ) -> None:
+        detail_rows.append(
+            GrantCapabilityDetailRow(
+                category="SYSTEM",
+                source_privilege=privilege,
+                object_type="-",
+                target_catalog_privilege=target_catalog_privilege or privilege,
+                support_status=support_status,
+                decision=decision,
+                reason_code=reason_code,
+                error_code=error_code,
+                error_message=_sanitize_probe_message(error_message),
+                sample_sql=sample_sql,
+            )
+        )
+        system_decisions[privilege] = GrantCapabilityDecision(
+            support_status=support_status,
+            decision=decision,
+            reason_code=reason_code,
+            target_catalog_privilege=target_catalog_privilege or privilege,
+            error_code=error_code,
+            error_message=_sanitize_probe_message(error_message),
+            sample_sql=sample_sql,
+        )
+
+    def _append_object_row(
+        privilege: str,
+        object_type: str,
+        support_status: str,
+        decision: str,
+        *,
+        reason_code: str = "",
+        target_catalog_privilege: str = "",
+        error_code: str = "",
+        error_message: str = "",
+        sample_sql: str = "",
+    ) -> None:
+        key = (privilege, normalize_privilege_object_type(object_type))
+        detail_rows.append(
+            GrantCapabilityDetailRow(
+                category="OBJECT",
+                source_privilege=privilege,
+                object_type=key[1] or "-",
+                target_catalog_privilege=target_catalog_privilege or privilege,
+                support_status=support_status,
+                decision=decision,
+                reason_code=reason_code,
+                error_code=error_code,
+                error_message=_sanitize_probe_message(error_message),
+                sample_sql=sample_sql,
+            )
+        )
+        object_decisions[key] = GrantCapabilityDecision(
+            support_status=support_status,
+            decision=decision,
+            reason_code=reason_code,
+            target_catalog_privilege=target_catalog_privilege or privilege,
+            error_code=error_code,
+            error_message=_sanitize_probe_message(error_message),
+            sample_sql=sample_sql,
+        )
+        if target_catalog_privilege:
+            object_logical_to_catalog[key] = target_catalog_privilege.upper()
+            object_alias_to_logical[(key[1], target_catalog_privilege.upper())] = privilege.upper()
+
+    ob_supported_sys_catalog = load_ob_supported_sys_privs(ob_cfg) if sys_priv_candidates else set()
+    if sys_priv_candidates and not ob_supported_sys_catalog and not supported_sys_override:
+        probe_complete = False
+    for privilege in sorted(sys_priv_candidates):
+        sample_sql = f"GRANT {privilege} TO {role_name};"
+        if supported_sys_override:
+            if privilege in supported_sys_override:
+                _append_system_row(
+                    privilege,
+                    GRANT_CAPABILITY_SUPPORT_SUPPORTED_OVERRIDE,
+                    GRANT_CAPABILITY_DECISION_ALLOW,
+                    target_catalog_privilege=privilege,
+                    sample_sql=sample_sql,
+                )
+            else:
+                _append_system_row(
+                    privilege,
+                    GRANT_CAPABILITY_SUPPORT_UNSUPPORTED_OVERRIDE,
+                    GRANT_CAPABILITY_DECISION_FILTER,
+                    reason_code=GRANT_CAPABILITY_REASON_OVERRIDE_EXCLUDED,
+                    target_catalog_privilege=privilege,
+                    sample_sql=sample_sql,
+                )
+        elif ob_supported_sys_catalog:
+            if privilege in ob_supported_sys_catalog:
+                _append_system_row(
+                    privilege,
+                    GRANT_CAPABILITY_SUPPORT_SUPPORTED,
+                    GRANT_CAPABILITY_DECISION_ALLOW,
+                    target_catalog_privilege=privilege,
+                    sample_sql=sample_sql,
+                )
+            else:
+                _append_system_row(
+                    privilege,
+                    GRANT_CAPABILITY_SUPPORT_UNSUPPORTED,
+                    GRANT_CAPABILITY_DECISION_FILTER,
+                    reason_code="UNSUPPORTED_SYS_PRIV_IN_OB",
+                    target_catalog_privilege=privilege,
+                    sample_sql=sample_sql,
+                )
+        else:
+            _append_system_row(
+                privilege,
+                GRANT_CAPABILITY_SUPPORT_UNKNOWN,
+                GRANT_CAPABILITY_DECISION_MANUAL,
+                reason_code=GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE,
+                target_catalog_privilege=privilege,
+                error_message="未能从目标端目录读取系统权限集合。",
+                sample_sql=sample_sql,
+            )
+
+    if not sys_priv_candidates and not object_priv_candidates:
+        return GrantCapabilityLibrary(
+            system_decisions=system_decisions,
+            object_decisions=object_decisions,
+            object_alias_to_logical=object_alias_to_logical,
+            object_logical_to_catalog=object_logical_to_catalog,
+            known_logical_object_privileges=known_logical_object_privileges,
+            detail_rows=detail_rows,
+            probe_complete=True,
+        )
+
+    if not owner_u:
+        probe_complete = False
+        for privilege, object_type in sorted(object_priv_candidates):
+            sample_sql = f"GRANT {privilege} ON <{object_type}> TO {role_name};"
+            if supported_object_override:
+                if privilege in supported_object_override:
+                    _append_object_row(
+                        privilege,
+                        object_type,
+                        GRANT_CAPABILITY_SUPPORT_SUPPORTED_OVERRIDE,
+                        GRANT_CAPABILITY_DECISION_ALLOW,
+                        reason_code=GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE,
+                        sample_sql=sample_sql,
+                    )
+                else:
+                    _append_object_row(
+                        privilege,
+                        object_type,
+                        GRANT_CAPABILITY_SUPPORT_UNSUPPORTED_OVERRIDE,
+                        GRANT_CAPABILITY_DECISION_FILTER,
+                        reason_code=GRANT_CAPABILITY_REASON_OVERRIDE_EXCLUDED,
+                        sample_sql=sample_sql,
+                    )
+            else:
+                _append_object_row(
+                    privilege,
+                    object_type,
+                    GRANT_CAPABILITY_SUPPORT_UNKNOWN,
+                    GRANT_CAPABILITY_DECISION_MANUAL,
+                    reason_code=GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE,
+                    error_message="目标端当前用户获取失败，无法完成对象权限探针。",
+                    sample_sql=sample_sql,
+                )
+        return GrantCapabilityLibrary(
+            system_decisions=system_decisions,
+            object_decisions=object_decisions,
+            object_alias_to_logical=object_alias_to_logical,
+            object_logical_to_catalog=object_logical_to_catalog,
+            known_logical_object_privileges=known_logical_object_privileges,
+            detail_rows=detail_rows,
+            probe_complete=probe_complete,
+        )
+
+    created_types: Set[str] = set()
+    fixture_names: Dict[str, str] = {}
+    cleanup_sqls: List[str] = []
+
+    ok_role, _out_role, err_role = _run_ob_probe_sql(ob_cfg, f"CREATE ROLE {quote_identifier(role_name)}")
+    if not ok_role:
+        probe_complete = False
+        role_error_code = _extract_probe_error_code(err_role)
+        for privilege, object_type in sorted(object_priv_candidates):
+            sample_sql = f"GRANT {privilege} ON <{object_type}> TO {role_name};"
+            if supported_object_override:
+                if privilege in supported_object_override:
+                    _append_object_row(
+                        privilege,
+                        object_type,
+                        GRANT_CAPABILITY_SUPPORT_SUPPORTED_OVERRIDE,
+                        GRANT_CAPABILITY_DECISION_ALLOW,
+                        reason_code=GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE,
+                        error_code=role_error_code,
+                        error_message=err_role,
+                        sample_sql=sample_sql,
+                    )
+                else:
+                    _append_object_row(
+                        privilege,
+                        object_type,
+                        GRANT_CAPABILITY_SUPPORT_UNSUPPORTED_OVERRIDE,
+                        GRANT_CAPABILITY_DECISION_FILTER,
+                        reason_code=GRANT_CAPABILITY_REASON_OVERRIDE_EXCLUDED,
+                        error_code=role_error_code,
+                        error_message=err_role,
+                        sample_sql=sample_sql,
+                    )
+            else:
+                _append_object_row(
+                    privilege,
+                    object_type,
+                    GRANT_CAPABILITY_SUPPORT_UNKNOWN,
+                    GRANT_CAPABILITY_DECISION_MANUAL,
+                    reason_code=GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE,
+                    error_code=role_error_code,
+                    error_message=err_role,
+                    sample_sql=sample_sql,
+                )
+        return GrantCapabilityLibrary(
+            system_decisions=system_decisions,
+            object_decisions=object_decisions,
+            object_alias_to_logical=object_alias_to_logical,
+            object_logical_to_catalog=object_logical_to_catalog,
+            known_logical_object_privileges=known_logical_object_privileges,
+            detail_rows=detail_rows,
+            probe_complete=probe_complete,
+        )
+
+    try:
+        for privilege, object_type in sorted(object_priv_candidates, key=lambda x: (x[1], x[0])):
+            obj_type_u = normalize_privilege_object_type(object_type)
+            ok_fixture, fixture_err = _ensure_object_probe_fixture(
+                ob_cfg,
+                owner_u,
+                fixture_names,
+                created_types,
+                cleanup_sqls,
+                obj_type_u,
+            )
+            object_name = fixture_names.get(obj_type_u, "")
+            sample_sql = (
+                f"GRANT {privilege} ON {owner_u}.{object_name or '<UNKNOWN>'} TO {role_name};"
+            )
+            if not ok_fixture or not object_name:
+                probe_complete = False
+                if supported_object_override:
+                    if privilege in supported_object_override:
+                        _append_object_row(
+                            privilege,
+                            obj_type_u,
+                            GRANT_CAPABILITY_SUPPORT_SUPPORTED_OVERRIDE,
+                            GRANT_CAPABILITY_DECISION_ALLOW,
+                            reason_code=GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE,
+                            error_message=fixture_err or "probe fixture unavailable",
+                            sample_sql=sample_sql,
+                        )
+                    else:
+                        _append_object_row(
+                            privilege,
+                            obj_type_u,
+                            GRANT_CAPABILITY_SUPPORT_UNSUPPORTED_OVERRIDE,
+                            GRANT_CAPABILITY_DECISION_FILTER,
+                            reason_code=GRANT_CAPABILITY_REASON_OVERRIDE_EXCLUDED,
+                            error_message=fixture_err or "probe fixture unavailable",
+                            sample_sql=sample_sql,
+                        )
+                else:
+                    _append_object_row(
+                        privilege,
+                        obj_type_u,
+                        GRANT_CAPABILITY_SUPPORT_UNKNOWN,
+                        GRANT_CAPABILITY_DECISION_MANUAL,
+                        reason_code=GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE,
+                        error_message=fixture_err or "probe fixture unavailable",
+                        sample_sql=sample_sql,
+                    )
+                continue
+
+            ok, _out, err = _run_ob_probe_sql(
+                ob_cfg,
+                f"GRANT {privilege} ON {quote_identifier(object_name)} TO {quote_identifier(role_name)}"
+            )
+            error_code = _extract_probe_error_code(err)
+            target_catalog_privilege = privilege
+            if ok:
+                ok_query, tokens, err_query = _query_ob_catalog_object_privileges(
+                    ob_cfg,
+                    owner_u,
+                    object_name.upper(),
+                    role_name.upper(),
+                )
+                _run_ob_probe_sql(
+                    ob_cfg,
+                    f"REVOKE {privilege} ON {quote_identifier(object_name)} FROM {quote_identifier(role_name)}"
+                )
+                if ok_query and tokens:
+                    if privilege in tokens:
+                        target_catalog_privilege = privilege
+                    elif len(tokens) == 1:
+                        target_catalog_privilege = tokens[0]
+                    else:
+                        probe_complete = False
+                        if supported_object_override:
+                            if privilege in supported_object_override:
+                                _append_object_row(
+                                    privilege,
+                                    obj_type_u,
+                                    GRANT_CAPABILITY_SUPPORT_SUPPORTED_OVERRIDE,
+                                    GRANT_CAPABILITY_DECISION_ALLOW,
+                                    reason_code=GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE,
+                                    error_message=f"catalog returned multiple privilege tokens: {', '.join(tokens)}",
+                                    sample_sql=sample_sql,
+                                )
+                            else:
+                                _append_object_row(
+                                    privilege,
+                                    obj_type_u,
+                                    GRANT_CAPABILITY_SUPPORT_UNSUPPORTED_OVERRIDE,
+                                    GRANT_CAPABILITY_DECISION_FILTER,
+                                    reason_code=GRANT_CAPABILITY_REASON_OVERRIDE_EXCLUDED,
+                                    error_message=f"catalog returned multiple privilege tokens: {', '.join(tokens)}",
+                                    sample_sql=sample_sql,
+                                )
+                        else:
+                            _append_object_row(
+                                privilege,
+                                obj_type_u,
+                                GRANT_CAPABILITY_SUPPORT_UNKNOWN,
+                                GRANT_CAPABILITY_DECISION_MANUAL,
+                                reason_code=GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE,
+                                error_message=f"catalog returned multiple privilege tokens: {', '.join(tokens)}",
+                                sample_sql=sample_sql,
+                            )
+                        continue
+
+                    if supported_object_override:
+                        if privilege in supported_object_override:
+                            _append_object_row(
+                                privilege,
+                                obj_type_u,
+                                GRANT_CAPABILITY_SUPPORT_SUPPORTED_OVERRIDE,
+                                GRANT_CAPABILITY_DECISION_ALLOW,
+                                target_catalog_privilege=target_catalog_privilege,
+                                sample_sql=sample_sql,
+                            )
+                        else:
+                            _append_object_row(
+                                privilege,
+                                obj_type_u,
+                                GRANT_CAPABILITY_SUPPORT_UNSUPPORTED_OVERRIDE,
+                                GRANT_CAPABILITY_DECISION_FILTER,
+                                reason_code=GRANT_CAPABILITY_REASON_OVERRIDE_EXCLUDED,
+                                target_catalog_privilege=target_catalog_privilege,
+                                sample_sql=sample_sql,
+                            )
+                    else:
+                        _append_object_row(
+                            privilege,
+                            obj_type_u,
+                            GRANT_CAPABILITY_SUPPORT_SUPPORTED
+                            if target_catalog_privilege == privilege else GRANT_CAPABILITY_SUPPORT_SUPPORTED_ALIAS,
+                            GRANT_CAPABILITY_DECISION_ALLOW,
+                            target_catalog_privilege=target_catalog_privilege,
+                            sample_sql=sample_sql,
+                        )
+                    continue
+
+                probe_complete = False
+                if supported_object_override:
+                    if privilege in supported_object_override:
+                        _append_object_row(
+                            privilege,
+                            obj_type_u,
+                            GRANT_CAPABILITY_SUPPORT_SUPPORTED_OVERRIDE,
+                            GRANT_CAPABILITY_DECISION_ALLOW,
+                            reason_code=GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE,
+                            error_message=err_query or "target catalog returned no rows",
+                            sample_sql=sample_sql,
+                        )
+                    else:
+                        _append_object_row(
+                            privilege,
+                            obj_type_u,
+                            GRANT_CAPABILITY_SUPPORT_UNSUPPORTED_OVERRIDE,
+                            GRANT_CAPABILITY_DECISION_FILTER,
+                            reason_code=GRANT_CAPABILITY_REASON_OVERRIDE_EXCLUDED,
+                            error_message=err_query or "target catalog returned no rows",
+                            sample_sql=sample_sql,
+                        )
+                else:
+                    _append_object_row(
+                        privilege,
+                        obj_type_u,
+                        GRANT_CAPABILITY_SUPPORT_UNKNOWN,
+                        GRANT_CAPABILITY_DECISION_MANUAL,
+                        reason_code=GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE,
+                        error_message=err_query or "target catalog returned no rows",
+                        sample_sql=sample_sql,
+                    )
+                continue
+
+            if supported_object_override:
+                if privilege in supported_object_override:
+                    _append_object_row(
+                        privilege,
+                        obj_type_u,
+                        GRANT_CAPABILITY_SUPPORT_SUPPORTED_OVERRIDE,
+                        GRANT_CAPABILITY_DECISION_ALLOW,
+                        reason_code=GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE,
+                        error_code=error_code,
+                        error_message=err,
+                        sample_sql=sample_sql,
+                    )
+                else:
+                    _append_object_row(
+                        privilege,
+                        obj_type_u,
+                        GRANT_CAPABILITY_SUPPORT_UNSUPPORTED_OVERRIDE,
+                        GRANT_CAPABILITY_DECISION_FILTER,
+                        reason_code=GRANT_CAPABILITY_REASON_OVERRIDE_EXCLUDED,
+                        error_code=error_code,
+                        error_message=err,
+                        sample_sql=sample_sql,
+                    )
+            else:
+                _append_object_row(
+                    privilege,
+                    obj_type_u,
+                    GRANT_CAPABILITY_SUPPORT_UNSUPPORTED,
+                    GRANT_CAPABILITY_DECISION_FILTER,
+                    reason_code="UNSUPPORTED_OBJECT_PRIV_IN_OB",
+                    error_code=error_code,
+                    error_message=err,
+                    sample_sql=sample_sql,
+                )
+    finally:
+        for sql in reversed(cleanup_sqls):
+            _drop_ob_probe_sql(ob_cfg, sql)
+        _drop_ob_probe_sql(ob_cfg, f"DROP ROLE {quote_identifier(role_name)}")
+
+    return GrantCapabilityLibrary(
+        system_decisions=system_decisions,
+        object_decisions=object_decisions,
+        object_alias_to_logical=object_alias_to_logical,
+        object_logical_to_catalog=object_logical_to_catalog,
+        known_logical_object_privileges=known_logical_object_privileges,
+        detail_rows=detail_rows,
+        probe_complete=probe_complete,
+    )
+
+
 def load_ob_grant_catalog(
     ob_cfg: ObConfig,
     grantees: Set[str]
 ) -> Optional[ObGrantCatalog]:
     """
     读取 OceanBase 端权限目录，用于缺失授权计算。
-    仅检查直接授权（DBA_TAB_PRIVS / DBA_SYS_PRIVS / DBA_ROLE_PRIVS）。
+    读取范围：
+      - DBA_ROLE_PRIVS：递归展开 grantee -> role -> role...
+      - DBA_TAB_PRIVS：对 grantee 及其角色读取直接对象权限
+      - DBA_SYS_PRIVS：对 grantee 及其角色读取系统权限
     """
     if not grantees:
         return ObGrantCatalog(set(), set(), set(), set(), set(), set())
@@ -12324,15 +12889,56 @@ def load_ob_grant_catalog(
     role_privs_admin: Set[Tuple[str, str]] = set()
 
     try:
-        for chunk in chunk_list(sorted(grantees), 900):
-            grantee_list = _sql_list([g.upper() for g in chunk if g])
-            if not grantee_list:
+        pending: Set[str] = {(g or "").upper() for g in grantees if g}
+        seen_role_grantees: Set[str] = set()
+        identities: Set[str] = set(pending)
+
+        while pending:
+            batch = sorted(pending - seen_role_grantees)
+            if not batch:
+                break
+            seen_role_grantees.update(batch)
+            for chunk in chunk_list(batch, 900):
+                grantee_list = _sql_list([g.upper() for g in chunk if g])
+                if not grantee_list:
+                    continue
+                role_sql = textwrap.dedent(f"""
+                    SELECT GRANTEE, GRANTED_ROLE, ADMIN_OPTION
+                    FROM DBA_ROLE_PRIVS
+                    WHERE GRANTEE IN ({grantee_list})
+                """).strip()
+                ok, out, err = obclient_run_sql(ob_cfg, role_sql)
+                if not ok:
+                    log.warning("[GRANT_MISS] 读取 DBA_ROLE_PRIVS 失败: %s", err)
+                    return None
+                if not out:
+                    continue
+                for line in out.splitlines():
+                    parts = line.split('\t')
+                    if len(parts) < 3:
+                        continue
+                    grantee = (parts[0] or "").strip().upper()
+                    role = (parts[1] or "").strip().upper()
+                    admin = (parts[2] or "").strip().upper() == "YES"
+                    if not grantee or not role:
+                        continue
+                    key = (grantee, role)
+                    role_privs.add(key)
+                    if admin:
+                        role_privs_admin.add(key)
+                    if role not in identities:
+                        identities.add(role)
+                        pending.add(role)
+
+        for chunk in chunk_list(sorted(identities), 900):
+            identity_list = _sql_list([g.upper() for g in chunk if g])
+            if not identity_list:
                 continue
 
             tab_sql = textwrap.dedent(f"""
                 SELECT GRANTEE, PRIVILEGE, OWNER, TABLE_NAME, GRANTABLE
                 FROM DBA_TAB_PRIVS
-                WHERE GRANTEE IN ({grantee_list})
+                WHERE GRANTEE IN ({identity_list})
             """).strip()
             ok, out, err = obclient_run_sql(ob_cfg, tab_sql)
             if not ok:
@@ -12358,7 +12964,7 @@ def load_ob_grant_catalog(
             sys_sql = textwrap.dedent(f"""
                 SELECT GRANTEE, PRIVILEGE, ADMIN_OPTION
                 FROM DBA_SYS_PRIVS
-                WHERE GRANTEE IN ({grantee_list})
+                WHERE GRANTEE IN ({identity_list})
             """).strip()
             ok, out, err = obclient_run_sql(ob_cfg, sys_sql)
             if not ok:
@@ -12378,30 +12984,6 @@ def load_ob_grant_catalog(
                     sys_privs.add(key)
                     if admin:
                         sys_privs_admin.add(key)
-
-            role_sql = textwrap.dedent(f"""
-                SELECT GRANTEE, GRANTED_ROLE, ADMIN_OPTION
-                FROM DBA_ROLE_PRIVS
-                WHERE GRANTEE IN ({grantee_list})
-            """).strip()
-            ok, out, err = obclient_run_sql(ob_cfg, role_sql)
-            if not ok:
-                log.warning("[GRANT_MISS] 读取 DBA_ROLE_PRIVS 失败: %s", err)
-                return None
-            if out:
-                for line in out.splitlines():
-                    parts = line.split('\t')
-                    if len(parts) < 3:
-                        continue
-                    grantee = (parts[0] or "").strip().upper()
-                    role = (parts[1] or "").strip().upper()
-                    admin = (parts[2] or "").strip().upper() == "YES"
-                    if not grantee or not role:
-                        continue
-                    key = (grantee, role)
-                    role_privs.add(key)
-                    if admin:
-                        role_privs_admin.add(key)
     except Exception as exc:  # pragma: no cover
         log.warning("[GRANT_MISS] 读取 OB 权限目录失败: %s", exc)
         return None
@@ -12471,7 +13053,9 @@ def load_ob_object_privileges_by_owners(
 def build_target_extra_object_grant_rows(
     expected_object_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]],
     target_object_grants: Set[Tuple[str, str, str, bool]],
-    declared_filtered_grants: Optional[List[FilteredGrantEntry]] = None
+    declared_filtered_grants: Optional[List[FilteredGrantEntry]] = None,
+    capability_library: Optional[GrantCapabilityLibrary] = None,
+    object_target_types: Optional[Dict[str, str]] = None,
 ) -> List[ExtraObjectGrantDriftRow]:
     """
     识别“目标端存在但源端期望中不存在”的对象授权。
@@ -12481,6 +13065,11 @@ def build_target_extra_object_grant_rows(
     """
     expected_basic: Set[Tuple[str, str, str]] = set()
     expected_grantable: Set[Tuple[str, str, str]] = set()
+    object_target_types = {
+        (key or "").upper(): normalize_privilege_object_type(value)
+        for key, value in (object_target_types or {}).items()
+        if key
+    }
     for grantee, entries in (expected_object_grants_by_grantee or {}).items():
         grantee_u = (grantee or "").upper()
         if not grantee_u:
@@ -12515,11 +13104,33 @@ def build_target_extra_object_grant_rows(
         expected_grantable.add(key)
 
     rows: List[ExtraObjectGrantDriftRow] = []
-    for grantee_u, privilege_u, object_u, grantable in sorted(
+    for grantee_u, target_privilege_u, object_u, grantable in sorted(
         target_object_grants or set(),
         key=lambda item: (item[0], item[1], item[2], "1" if item[3] else "0")
     ):
-        key = (grantee_u, privilege_u, object_u)
+        object_type_u = object_target_types.get((object_u or "").upper(), "")
+        logical_privilege_u, resolved = normalize_target_object_privilege(
+            target_privilege_u,
+            object_type_u,
+            capability_library,
+        )
+        key = (grantee_u, logical_privilege_u, object_u)
+        if not resolved:
+            rows.append(
+                ExtraObjectGrantDriftRow(
+                    category="OBJECT",
+                    grantee=grantee_u,
+                    privilege=logical_privilege_u or target_privilege_u,
+                    object_full=object_u,
+                    grantable=bool(grantable),
+                    reason_code=GRANT_CAPABILITY_REASON_TARGET_UNKNOWN,
+                    reason="目标端存在无法归一化的对象权限标记，不能自动判断是否多余。",
+                    action="MANUAL_REVIEW",
+                    object_type=object_type_u,
+                    target_catalog_privilege=target_privilege_u,
+                )
+            )
+            continue
         if key not in expected_basic:
             if grantee_u == "PUBLIC":
                 reason_code = "TARGET_ONLY_PUBLIC_OBJECT_GRANT"
@@ -12533,12 +13144,14 @@ def build_target_extra_object_grant_rows(
                 ExtraObjectGrantDriftRow(
                     category="OBJECT",
                     grantee=grantee_u,
-                    privilege=privilege_u,
+                    privilege=logical_privilege_u,
                     object_full=object_u,
                     grantable=bool(grantable),
                     reason_code=reason_code,
                     reason=reason,
                     action=action,
+                    object_type=object_type_u,
+                    target_catalog_privilege=target_privilege_u,
                 )
             )
             continue
@@ -12548,12 +13161,14 @@ def build_target_extra_object_grant_rows(
                 ExtraObjectGrantDriftRow(
                     category="OBJECT",
                     grantee=grantee_u,
-                    privilege=privilege_u,
+                    privilege=logical_privilege_u,
                     object_full=object_u,
                     grantable=True,
                     reason_code="TARGET_ONLY_OBJECT_GRANT_OPTION",
                     reason="目标端对象授权带 WITH GRANT OPTION，但源端未声明该选项。",
                     action="MANUAL_REVIEW",
+                    object_type=object_type_u,
+                    target_catalog_privilege=target_privilege_u,
                 )
             )
 
@@ -14900,7 +15515,9 @@ def filter_missing_grant_entries(
     object_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]],
     sys_privs_by_grantee: Dict[str, Set[SystemGrantEntry]],
     role_privs_by_grantee: Dict[str, Set[RoleGrantEntry]],
-    ob_catalog: Optional[ObGrantCatalog]
+    ob_catalog: Optional[ObGrantCatalog],
+    capability_library: Optional[GrantCapabilityLibrary] = None,
+    object_target_types: Optional[Dict[str, str]] = None,
 ) -> Tuple[
     Dict[str, Set[ObjectGrantEntry]],
     Dict[str, Set[SystemGrantEntry]],
@@ -14917,12 +15534,96 @@ def filter_missing_grant_entries(
     miss_sys: Dict[str, Set[SystemGrantEntry]] = defaultdict(set)
     miss_role: Dict[str, Set[RoleGrantEntry]] = defaultdict(set)
 
-    obj_basic = ob_catalog.object_privs
-    obj_grantable = ob_catalog.object_privs_grantable
+    object_target_types = {
+        (key or "").upper(): normalize_privilege_object_type(value)
+        for key, value in (object_target_types or {}).items()
+        if key
+    }
+    obj_basic: Set[Tuple[str, str, str]] = set()
+    obj_grantable: Set[Tuple[str, str, str]] = set()
+    for grantee_u, priv_u_raw, obj_u in (ob_catalog.object_privs or set()):
+        obj_type_u = object_target_types.get((obj_u or "").upper(), "")
+        normalized_priv, resolved = normalize_target_object_privilege(
+            priv_u_raw,
+            obj_type_u,
+            capability_library,
+        )
+        if not normalized_priv:
+            continue
+        if resolved:
+            obj_basic.add((grantee_u, normalized_priv, obj_u))
+        else:
+            obj_basic.add((grantee_u, (priv_u_raw or "").upper(), obj_u))
+    for grantee_u, priv_u_raw, obj_u in (ob_catalog.object_privs_grantable or set()):
+        obj_type_u = object_target_types.get((obj_u or "").upper(), "")
+        normalized_priv, resolved = normalize_target_object_privilege(
+            priv_u_raw,
+            obj_type_u,
+            capability_library,
+        )
+        if not normalized_priv:
+            continue
+        if resolved:
+            obj_grantable.add((grantee_u, normalized_priv, obj_u))
+        else:
+            obj_grantable.add((grantee_u, (priv_u_raw or "").upper(), obj_u))
     sys_basic = ob_catalog.sys_privs
     sys_admin = ob_catalog.sys_privs_admin
     role_basic = ob_catalog.role_privs
     role_admin = ob_catalog.role_privs_admin
+
+    role_graph: Dict[str, Set[str]] = defaultdict(set)
+    for grantee_u, role_u in (role_basic or set()):
+        if grantee_u and role_u:
+            role_graph[grantee_u].add(role_u)
+
+    role_closure_cache: Dict[str, Set[str]] = {}
+
+    def _expand_roles(identity: str) -> Set[str]:
+        ident_u = (identity or "").upper()
+        if not ident_u:
+            return set()
+        cached = role_closure_cache.get(ident_u)
+        if cached is not None:
+            return cached
+        seen: Set[str] = set()
+        stack: List[str] = list(role_graph.get(ident_u, set()))
+        while stack:
+            role_u = stack.pop()
+            if role_u in seen:
+                continue
+            seen.add(role_u)
+            for next_role in role_graph.get(role_u, set()):
+                if next_role not in seen:
+                    stack.append(next_role)
+        role_closure_cache[ident_u] = seen
+        return seen
+
+    def _sys_satisfies(identity: str, required_priv: str) -> bool:
+        implied = SYS_PRIV_IMPLICATIONS.get((required_priv or "").upper(), set())
+        if not implied:
+            return False
+        ident_u = (identity or "").upper()
+        for sys_priv in implied:
+            key = (ident_u, sys_priv)
+            if key in sys_basic or key in sys_admin:
+                return True
+        return False
+
+    def _effective_object_priv_satisfied(grantee_u: str, priv_u: str, obj_u: str) -> bool:
+        key = (grantee_u, priv_u, obj_u)
+        if key in obj_basic or key in obj_grantable:
+            return True
+        for role_u in _expand_roles(grantee_u):
+            role_key = (role_u, priv_u, obj_u)
+            if role_key in obj_basic or role_key in obj_grantable:
+                return True
+        if _sys_satisfies(grantee_u, priv_u):
+            return True
+        for role_u in _expand_roles(grantee_u):
+            if _sys_satisfies(role_u, priv_u):
+                return True
+        return False
 
     for grantee, entries in object_grants_by_grantee.items():
         g_u = (grantee or "").upper()
@@ -14938,7 +15639,7 @@ def filter_missing_grant_entries(
                 if key in obj_grantable:
                     continue
             else:
-                if key in obj_basic or key in obj_grantable:
+                if _effective_object_priv_satisfied(g_u, priv_u, obj_u):
                     continue
             miss_obj[g_u].add(entry)
 
@@ -15169,6 +15870,336 @@ def infer_privilege_object_type(
         if cand in types_u:
             return cand
     return sorted(types_u)[0] if types_u else ""
+
+
+def remember_object_target_type(
+    object_target_types: Dict[str, str],
+    object_full: str,
+    obj_type: Optional[str]
+) -> None:
+    object_u = (object_full or "").upper()
+    obj_type_u = normalize_privilege_object_type(obj_type)
+    if not object_u or not obj_type_u:
+        return
+    existing = object_target_types.get(object_u, "")
+    if not existing:
+        object_target_types[object_u] = obj_type_u
+        return
+    existing_rank = PRIVILEGE_TYPE_PRIORITY.index(existing) if existing in PRIVILEGE_TYPE_PRIORITY else len(PRIVILEGE_TYPE_PRIORITY)
+    new_rank = PRIVILEGE_TYPE_PRIORITY.index(obj_type_u) if obj_type_u in PRIVILEGE_TYPE_PRIORITY else len(PRIVILEGE_TYPE_PRIORITY)
+    if new_rank < existing_rank:
+        object_target_types[object_u] = obj_type_u
+
+
+def _extract_probe_error_code(message: str) -> str:
+    text = (message or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"(ORA-\d{5}|OBE-\d+|OB-\d+|ERROR\s+\d+)", text, flags=re.IGNORECASE)
+    return match.group(1).upper() if match else ""
+
+
+def _sanitize_probe_message(message: str, limit: int = 240) -> str:
+    text = " ".join((message or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _build_probe_identifier(prefix: str) -> str:
+    token = uuid.uuid4().hex[:10].upper()
+    base = re.sub(r"[^A-Z0-9_]+", "_", (prefix or "CODX_GCAP").upper()).strip("_") or "CODX_GCAP"
+    ident = f"{base}_{token}"
+    return ident[:30]
+
+
+def load_ob_current_user_name(ob_cfg: ObConfig) -> Optional[str]:
+    ok, out, err = obclient_run_sql(ob_cfg, "SELECT USER FROM DUAL")
+    if not ok:
+        log.warning("[GRANT_CAP] 读取目标端当前用户失败: %s", err)
+        return None
+    for raw in (out or "").splitlines():
+        name = (raw or "").strip().upper()
+        if name:
+            return name
+    log.warning("[GRANT_CAP] 读取目标端当前用户为空。")
+    return None
+
+
+def _run_ob_probe_sql(
+    ob_cfg: ObConfig,
+    sql: str,
+    *,
+    timeout: Optional[int] = None
+) -> Tuple[bool, str, str]:
+    return obclient_run_sql(ob_cfg, sql, timeout=timeout, quiet_error=True)
+
+
+def _drop_ob_probe_sql(ob_cfg: ObConfig, sql: str) -> None:
+    try:
+        _run_ob_probe_sql(ob_cfg, sql)
+    except Exception:
+        pass
+
+
+def _build_object_probe_sql(
+    obj_type: str,
+    owner_u: str,
+    names: Dict[str, str]
+) -> Tuple[Optional[List[str]], List[str]]:
+    obj_type_u = normalize_privilege_object_type(obj_type)
+    table_name = names.get("TABLE", "")
+    cleanup_sqls: List[str] = []
+    if obj_type_u == "TABLE":
+        name = names.setdefault("TABLE", _build_probe_identifier("CODX_GCAP_TAB"))
+        cleanup_sqls.append(f"DROP TABLE {quote_identifier(name)}")
+        return [f"CREATE TABLE {quote_identifier(name)} (ID NUMBER)"], cleanup_sqls
+    if obj_type_u == "VIEW":
+        if not table_name:
+            return None, []
+        name = names.setdefault("VIEW", _build_probe_identifier("CODX_GCAP_VIEW"))
+        cleanup_sqls.append(f"DROP VIEW {quote_identifier(name)}")
+        return ([
+            f"CREATE OR REPLACE VIEW {quote_identifier(name)} AS "
+            f"SELECT ID FROM {quote_identifier(table_name)}"
+        ], cleanup_sqls)
+    if obj_type_u == "MATERIALIZED VIEW":
+        if not table_name:
+            return None, []
+        name = names.setdefault("MATERIALIZED VIEW", _build_probe_identifier("CODX_GCAP_MV"))
+        cleanup_sqls.append(f"DROP MATERIALIZED VIEW {quote_identifier(name)}")
+        return ([
+            f"CREATE MATERIALIZED VIEW {quote_identifier(name)} "
+            f"BUILD IMMEDIATE REFRESH COMPLETE ON DEMAND AS "
+            f"SELECT ID FROM {quote_identifier(table_name)}"
+        ], cleanup_sqls)
+    if obj_type_u == "SEQUENCE":
+        name = names.setdefault("SEQUENCE", _build_probe_identifier("CODX_GCAP_SEQ"))
+        cleanup_sqls.append(f"DROP SEQUENCE {quote_identifier(name)}")
+        return [f"CREATE SEQUENCE {quote_identifier(name)} START WITH 1 INCREMENT BY 1"], cleanup_sqls
+    if obj_type_u == "PROCEDURE":
+        name = names.setdefault("PROCEDURE", _build_probe_identifier("CODX_GCAP_PROC"))
+        cleanup_sqls.append(f"DROP PROCEDURE {quote_identifier(name)}")
+        return [f"CREATE OR REPLACE PROCEDURE {quote_identifier(name)} AS BEGIN NULL; END;"], cleanup_sqls
+    if obj_type_u == "FUNCTION":
+        name = names.setdefault("FUNCTION", _build_probe_identifier("CODX_GCAP_FUNC"))
+        cleanup_sqls.append(f"DROP FUNCTION {quote_identifier(name)}")
+        return ([
+            f"CREATE OR REPLACE FUNCTION {quote_identifier(name)} RETURN NUMBER "
+            f"AS BEGIN RETURN 1; END;"
+        ], cleanup_sqls)
+    if obj_type_u == "PACKAGE":
+        name = names.setdefault("PACKAGE", _build_probe_identifier("CODX_GCAP_PKG"))
+        cleanup_sqls.append(f"DROP PACKAGE {quote_identifier(name)}")
+        return ([
+            f"CREATE OR REPLACE PACKAGE {quote_identifier(name)} AS PROCEDURE P; END;\n"
+            ,
+            f"CREATE OR REPLACE PACKAGE BODY {quote_identifier(name)} AS PROCEDURE P AS BEGIN NULL; END; END;",
+        ], cleanup_sqls)
+    if obj_type_u == "TYPE":
+        name = names.setdefault("TYPE", _build_probe_identifier("CODX_GCAP_TYP"))
+        cleanup_sqls.append(f"DROP TYPE {quote_identifier(name)} FORCE")
+        return [f"CREATE OR REPLACE TYPE {quote_identifier(name)} AS OBJECT (ID NUMBER)"], cleanup_sqls
+    if obj_type_u == "SYNONYM":
+        if not table_name:
+            return None, []
+        name = names.setdefault("SYNONYM", _build_probe_identifier("CODX_GCAP_SYN"))
+        cleanup_sqls.append(f"DROP SYNONYM {quote_identifier(name)}")
+        return ([f"CREATE OR REPLACE SYNONYM {quote_identifier(name)} FOR {quote_identifier(table_name)}"], cleanup_sqls)
+    if obj_type_u == "INDEX":
+        if not table_name:
+            return None, []
+        name = names.setdefault("INDEX", _build_probe_identifier("CODX_GCAP_IDX"))
+        cleanup_sqls.append(f"DROP INDEX {quote_identifier(name)}")
+        return ([f"CREATE INDEX {quote_identifier(name)} ON {quote_identifier(table_name)}(ID)"], cleanup_sqls)
+    if obj_type_u == "TRIGGER":
+        if not table_name:
+            return None, []
+        name = names.setdefault("TRIGGER", _build_probe_identifier("CODX_GCAP_TRG"))
+        cleanup_sqls.append(f"DROP TRIGGER {quote_identifier(name)}")
+        return ([
+            f"CREATE OR REPLACE TRIGGER {quote_identifier(name)} "
+            f"BEFORE INSERT ON {quote_identifier(table_name)} "
+            f"BEGIN NULL; END;"
+        ], cleanup_sqls)
+    if obj_type_u == "SCHEDULE":
+        name = names.setdefault("SCHEDULE", _build_probe_identifier("CODX_GCAP_SCH"))
+        cleanup_sqls.append(
+            f"BEGIN DBMS_SCHEDULER.DROP_SCHEDULE(schedule_name => '{name}', force => TRUE); END;"
+        )
+        return ([
+            f"BEGIN DBMS_SCHEDULER.CREATE_SCHEDULE("
+            f"schedule_name => '{name}', repeat_interval => 'FREQ=DAILY'); END;"
+        ], cleanup_sqls)
+    if obj_type_u == "JOB":
+        name = names.setdefault("JOB", _build_probe_identifier("CODX_GCAP_JOB"))
+        cleanup_sqls.append(
+            f"BEGIN DBMS_SCHEDULER.DROP_JOB(job_name => '{name}', force => TRUE); END;"
+        )
+        return ([
+            f"BEGIN DBMS_SCHEDULER.CREATE_JOB("
+            f"job_name => '{name}', job_type => 'PLSQL_BLOCK', "
+            f"job_action => 'BEGIN NULL; END;', enabled => FALSE); END;"
+        ], cleanup_sqls)
+    return None, []
+
+
+def _ensure_object_probe_fixture(
+    ob_cfg: ObConfig,
+    owner_u: str,
+    names: Dict[str, str],
+    created_types: Set[str],
+    cleanup_sqls: List[str],
+    obj_type: str
+) -> Tuple[bool, str]:
+    obj_type_u = normalize_privilege_object_type(obj_type)
+    if obj_type_u in created_types:
+        return True, ""
+    if obj_type_u in {"VIEW", "MATERIALIZED VIEW", "SYNONYM", "INDEX", "TRIGGER"} and "TABLE" not in created_types:
+        ok, err = _ensure_object_probe_fixture(ob_cfg, owner_u, names, created_types, cleanup_sqls, "TABLE")
+        if not ok:
+            return False, err
+    create_sqls, local_cleanup = _build_object_probe_sql(obj_type_u, owner_u, names)
+    if not create_sqls:
+        return False, "unsupported_probe_object_type"
+    for stmt in create_sqls:
+        ok, _out, err = _run_ob_probe_sql(ob_cfg, stmt)
+        if not ok:
+            return False, err
+    cleanup_sqls.extend(local_cleanup)
+    created_types.add(obj_type_u)
+    return True, ""
+
+
+def _query_ob_catalog_object_privileges(
+    ob_cfg: ObConfig,
+    owner_u: str,
+    object_name_u: str,
+    grantee_u: str
+) -> Tuple[bool, List[str], str]:
+    sql = textwrap.dedent(f"""
+        SELECT PRIVILEGE
+        FROM DBA_TAB_PRIVS
+        WHERE OWNER = '{owner_u}'
+          AND TABLE_NAME = '{object_name_u}'
+          AND GRANTEE = '{grantee_u}'
+        ORDER BY PRIVILEGE
+    """).strip()
+    ok, out, err = _run_ob_probe_sql(ob_cfg, sql)
+    if not ok:
+        return False, [], err
+    tokens = [
+        (line or "").strip().upper()
+        for line in (out or "").splitlines()
+        if (line or "").strip()
+    ]
+    return True, tokens, ""
+
+
+def collect_source_grant_capability_candidates(
+    oracle_meta: OracleMetadata,
+    source_objects: Optional[SourceObjectMap]
+) -> Tuple[Set[str], Set[Tuple[str, str]]]:
+    sys_privs: Set[str] = set()
+    object_privs: Set[Tuple[str, str]] = set()
+    for item in (oracle_meta.sys_privileges or []):
+        priv_u = (item.privilege or "").strip().upper()
+        if priv_u:
+            sys_privs.add(priv_u)
+    for item in (oracle_meta.object_privileges or []):
+        priv_u = (item.privilege or "").strip().upper()
+        obj_type_u = normalize_privilege_object_type(item.object_type)
+        if not obj_type_u:
+            src_full = f"{(item.owner or '').upper()}.{(item.object_name or '').upper()}".strip(".")
+            obj_type_u = infer_privilege_object_type(src_full, source_objects) or ""
+        if priv_u and obj_type_u:
+            object_privs.add((priv_u, obj_type_u))
+    for obj_type_u, privilege_u in (GRANT_PRIVILEGE_BY_TYPE or {}).items():
+        norm_type = normalize_privilege_object_type(obj_type_u)
+        priv_norm = (privilege_u or "").strip().upper()
+        if norm_type and priv_norm:
+            object_privs.add((priv_norm, norm_type))
+    object_privs.add(("REFERENCES", "TABLE"))
+    return sys_privs, object_privs
+
+
+def normalize_target_object_privilege(
+    target_privilege: str,
+    object_type: Optional[str],
+    capability_library: Optional[GrantCapabilityLibrary]
+) -> Tuple[str, bool]:
+    target_priv_u = (target_privilege or "").strip().upper()
+    obj_type_u = normalize_privilege_object_type(object_type)
+    if not target_priv_u:
+        return "", False
+    if not capability_library:
+        return target_priv_u, True
+    alias = capability_library.object_alias_to_logical.get((obj_type_u, target_priv_u))
+    if alias:
+        return alias, True
+    if target_priv_u in (capability_library.known_logical_object_privileges or set()):
+        return target_priv_u, True
+    return target_priv_u, False
+
+
+def build_ob_object_type_map(ob_meta: Optional[ObMetadata]) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    if not ob_meta:
+        return result
+    for obj_type, full_names in (ob_meta.objects_by_type or {}).items():
+        obj_type_u = normalize_privilege_object_type(obj_type)
+        for full_name in (full_names or set()):
+            remember_object_target_type(result, full_name, obj_type_u)
+    return result
+
+
+def summarize_grant_capability_rows(
+    rows: List[GrantCapabilityDetailRow]
+) -> Dict[str, int]:
+    summary = {
+        "total_rows": 0,
+        "allow_rows": 0,
+        "filter_rows": 0,
+        "manual_rows": 0,
+        "supported_alias_rows": 0,
+    }
+    for row in rows:
+        summary["total_rows"] += 1
+        decision_u = (row.decision or "").upper()
+        status_u = (row.support_status or "").upper()
+        if decision_u == GRANT_CAPABILITY_DECISION_ALLOW:
+            summary["allow_rows"] += 1
+        elif decision_u == GRANT_CAPABILITY_DECISION_FILTER:
+            summary["filter_rows"] += 1
+        elif decision_u == GRANT_CAPABILITY_DECISION_MANUAL:
+            summary["manual_rows"] += 1
+        if status_u == GRANT_CAPABILITY_SUPPORT_SUPPORTED_ALIAS:
+            summary["supported_alias_rows"] += 1
+    return summary
+
+
+def get_system_priv_decision_from_library(
+    privilege: str,
+    capability_library: Optional[GrantCapabilityLibrary]
+) -> Optional[GrantCapabilityDecision]:
+    if not capability_library:
+        return None
+    return capability_library.system_decisions.get((privilege or "").strip().upper())
+
+
+def get_object_priv_decision_from_library(
+    privilege: str,
+    object_type: Optional[str],
+    capability_library: Optional[GrantCapabilityLibrary]
+) -> Optional[GrantCapabilityDecision]:
+    if not capability_library:
+        return None
+    return capability_library.object_decisions.get(
+        (
+            (privilege or "").strip().upper(),
+            normalize_privilege_object_type(object_type),
+        )
+    )
 
 
 def build_role_name_set(
@@ -15413,6 +16444,7 @@ def build_grant_plan(
     source_schema_set: Set[str],
     remap_conflicts: Optional[RemapConflictMap],
     synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]],
+    capability_library: Optional[GrantCapabilityLibrary] = None,
     supported_sys_privs: Optional[Set[str]] = None,
     supported_object_privs: Optional[Set[str]] = None,
     oracle_sys_privs_map: Optional[Set[str]] = None,
@@ -15438,9 +16470,9 @@ def build_grant_plan(
     obj_type_cache: Dict[str, str] = {}
     grantee_cache: Dict[str, str] = {}
     supported_sys_privs = {p.upper() for p in (supported_sys_privs or set())}
-    if not supported_object_privs:
+    if capability_library is None and not supported_object_privs:
         supported_object_privs = set(DEFAULT_SUPPORTED_OBJECT_PRIVS)
-    supported_object_privs = {p.upper() for p in supported_object_privs}
+    supported_object_privs = {p.upper() for p in (supported_object_privs or set())}
     oracle_sys_privs_map = oracle_sys_privs_map or oracle_meta.system_privilege_map or set()
     oracle_obj_privs_map = oracle_obj_privs_map or oracle_meta.table_privilege_map or set()
     oracle_roles = oracle_roles or oracle_meta.role_metadata or {}
@@ -15455,6 +16487,7 @@ def build_grant_plan(
     missing_role_grantees: Set[str] = set()
     missing_user_grantees: Set[str] = set()
     skipped_missing_grants = 0
+    object_target_types: Dict[str, str] = {}
 
     def map_grantee(grantee: str) -> str:
         g_u = (grantee or "").upper()
@@ -15526,14 +16559,36 @@ def build_grant_plan(
         priv_u = (privilege or "").upper()
         if oracle_sys_privs_map and priv_u not in oracle_sys_privs_map:
             return False, "NOT_IN_ORACLE_SYSTEM_PRIVILEGE_MAP"
+        decision = get_system_priv_decision_from_library(priv_u, capability_library)
+        if capability_library is not None:
+            if decision is None:
+                return False, GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE
+            if decision.decision == GRANT_CAPABILITY_DECISION_ALLOW:
+                return True, None
+            if decision.reason_code:
+                return False, decision.reason_code
+            if decision.decision == GRANT_CAPABILITY_DECISION_MANUAL:
+                return False, GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE
+            return False, "UNSUPPORTED_SYS_PRIV_IN_OB"
         if supported_sys_privs and priv_u not in supported_sys_privs:
             return False, "UNSUPPORTED_SYS_PRIV_IN_OB"
         return True, None
 
-    def is_supported_object_priv(privilege: str) -> Tuple[bool, Optional[str]]:
+    def is_supported_object_priv(privilege: str, obj_type: Optional[str]) -> Tuple[bool, Optional[str]]:
         priv_u = (privilege or "").upper()
         if oracle_obj_privs_map and priv_u not in oracle_obj_privs_map:
             return False, "NOT_IN_ORACLE_OBJECT_PRIVILEGE_MAP"
+        decision = get_object_priv_decision_from_library(priv_u, obj_type, capability_library)
+        if capability_library is not None:
+            if decision is None:
+                return False, GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE
+            if decision.decision == GRANT_CAPABILITY_DECISION_ALLOW:
+                return True, None
+            if decision.reason_code:
+                return False, decision.reason_code
+            if decision.decision == GRANT_CAPABILITY_DECISION_MANUAL:
+                return False, GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE
+            return False, "UNSUPPORTED_OBJECT_PRIV_IN_OB"
         if supported_object_privs and priv_u not in supported_object_privs:
             return False, "UNSUPPORTED_OBJECT_PRIV_IN_OB"
         return True, None
@@ -15602,7 +16657,13 @@ def build_grant_plan(
             continue
         src_full = f"{item.owner}.{item.object_name}".upper()
         priv_u = (item.privilege or "").upper()
-        ok, reason = is_supported_object_priv(priv_u)
+        obj_type = normalize_privilege_object_type(item.object_type)
+        if not obj_type:
+            obj_type = obj_type_cache.get(src_full, "")
+            if not obj_type:
+                obj_type = infer_privilege_object_type(src_full, source_objects) or ""
+                obj_type_cache[src_full] = obj_type
+        ok, reason = is_supported_object_priv(priv_u, obj_type)
         if not ok:
             record_filtered("OBJECT", grantee_u, priv_u, src_full, reason or "UNSUPPORTED_OBJECT_PRIV")
             if total_obj and (idx == total_obj or (time.time() - last_log) >= progress_interval):
@@ -15610,16 +16671,11 @@ def build_grant_plan(
                 log.info("[GRANT] 对象权限进度 %d/%d (%.1f%%)。", idx, total_obj, pct)
                 last_log = time.time()
             continue
-        obj_type = normalize_privilege_object_type(item.object_type)
-        if not obj_type:
-            obj_type = obj_type_cache.get(src_full, "")
-            if not obj_type:
-                obj_type = infer_privilege_object_type(src_full, source_objects) or ""
-                obj_type_cache[src_full] = obj_type
         target = resolve_target_cached(src_full, obj_type)
         if not target:
             skipped_object_privs += 1
             continue
+        remember_object_target_type(object_target_types, target.upper(), obj_type)
         add_object_grant_entry(grantee_u, priv_u, target.upper(), bool(item.grantable))
         if total_obj and (idx == total_obj or (time.time() - last_log) >= progress_interval):
             pct = idx * 100.0 / total_obj if total_obj else 100.0
@@ -15692,16 +16748,19 @@ def build_grant_plan(
                 skipped_missing_grants += 1
                 continue
             grantable_for_view = dep_full in view_grant_targets and dep_type.upper() in {"VIEW", "MATERIALIZED VIEW"}
-            privilege = GRANT_PRIVILEGE_BY_TYPE.get(ref_type.upper())
+            ref_type_u = normalize_privilege_object_type(ref_type)
+            privilege = GRANT_PRIVILEGE_BY_TYPE.get(ref_type_u)
             if privilege:
-                ok, reason = is_supported_object_priv(privilege)
+                ok, reason = is_supported_object_priv(privilege, ref_type_u)
                 if ok:
+                    remember_object_target_type(object_target_types, ref_full.upper(), ref_type_u)
                     add_object_grant_entry(dep_schema, privilege, ref_full.upper(), grantable_for_view)
                 else:
                     record_filtered("OBJECT", dep_schema, privilege, ref_full.upper(), reason or "UNSUPPORTED_OBJECT_PRIV")
             if ref_type.upper() == "TABLE" and dep_type.upper() == "TABLE":
-                ok, reason = is_supported_object_priv("REFERENCES")
+                ok, reason = is_supported_object_priv("REFERENCES", "TABLE")
                 if ok:
+                    remember_object_target_type(object_target_types, ref_full.upper(), "TABLE")
                     add_object_grant_entry(dep_schema, "REFERENCES", ref_full.upper(), False)
                 else:
                     record_filtered("OBJECT", dep_schema, "REFERENCES", ref_full.upper(), reason or "UNSUPPORTED_OBJECT_PRIV")
@@ -15793,7 +16852,8 @@ def build_grant_plan(
         role_privs=role_privs,
         role_ddls=role_ddls,
         filtered_grants=filtered_grants,
-        view_grant_targets=view_grant_targets
+        view_grant_targets=view_grant_targets,
+        object_target_types=object_target_types,
     )
 
 
@@ -15998,6 +17058,7 @@ def filter_grant_plan_unsupported_targets(
         role_ddls=list(grant_plan.role_ddls or []),
         filtered_grants=filtered_entries,
         view_grant_targets=set(grant_plan.view_grant_targets or set()),
+        object_target_types=dict(grant_plan.object_target_types or {}),
     )
     return updated_plan, skipped
 
@@ -28659,7 +29720,8 @@ def generate_fixup_scripts(
             role_privs={},
             role_ddls=[],
             filtered_grants=[],
-            view_grant_targets=set()
+            view_grant_targets=set(),
+            object_target_types={},
         )
     if not grant_enabled:
         grant_plan = GrantPlan(
@@ -28668,7 +29730,8 @@ def generate_fixup_scripts(
             role_privs={},
             role_ddls=[],
             filtered_grants=[],
-            view_grant_targets=set()
+            view_grant_targets=set(),
+            object_target_types={},
         )
 
     object_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
@@ -29269,6 +30332,7 @@ def generate_fixup_scripts(
     deferred_object_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]] = {}
     deferred_filtered_grants: List[FilteredGrantEntry] = []
     extra_object_grant_rows: List[ExtraObjectGrantDriftRow] = []
+    grant_capability_library: Optional[GrantCapabilityLibrary] = settings.get("_grant_capability_library")
 
     if grant_enabled:
         pre_added = pre_add_cross_schema_grants(constraint_tasks, trigger_tasks)
@@ -29288,7 +30352,9 @@ def generate_fixup_scripts(
             object_grants_by_grantee,
             sys_privs_by_grantee,
             role_privs_by_grantee,
-            ob_grant_catalog
+            ob_grant_catalog,
+            capability_library=grant_capability_library,
+            object_target_types=(grant_plan.object_target_types if grant_plan else None),
         )
         if object_grants_by_grantee:
             raw_count, merged_count, object_grant_lookup, grants_by_owner = build_object_grant_statements_for(
@@ -29309,7 +30375,12 @@ def generate_fixup_scripts(
             extra_object_grant_rows = build_target_extra_object_grant_rows(
                 object_grants_by_grantee,
                 target_object_grants,
-                declared_filtered_grants=grant_plan.filtered_grants if grant_plan else None
+                declared_filtered_grants=grant_plan.filtered_grants if grant_plan else None,
+                capability_library=grant_capability_library,
+                object_target_types={
+                    **build_ob_object_type_map(ob_meta),
+                    **((grant_plan.object_target_types or {}) if grant_plan else {}),
+                },
             )
             settings["_extra_object_grant_rows"] = list(extra_object_grant_rows)
             if extra_object_grant_rows:
@@ -34005,12 +35076,25 @@ def export_target_extra_grant_detail(
     )
     return write_pipe_report(
         "目标端额外对象授权明细（源端未声明）",
-        ["CATEGORY", "GRANTEE", "PRIVILEGE", "OBJECT", "GRANTABLE", "REASON_CODE", "REASON", "ACTION"],
+        [
+            "CATEGORY",
+            "GRANTEE",
+            "PRIVILEGE",
+            "TARGET_CATALOG_PRIVILEGE",
+            "OBJECT_TYPE",
+            "OBJECT",
+            "GRANTABLE",
+            "REASON_CODE",
+            "REASON",
+            "ACTION",
+        ],
         [
             [
                 row.category,
                 row.grantee,
                 row.privilege,
+                row.target_catalog_privilege or row.privilege,
+                row.object_type or "-",
                 row.object_full,
                 "YES" if row.grantable else "NO",
                 row.reason_code,
@@ -34176,6 +35260,54 @@ def export_unsupported_grant_detail(
         for row in rows
     ]
     return write_pipe_report("不支持授权明细", header_fields, data_rows, output_path)
+
+
+def export_grant_capability_detail(
+    capability_rows: List[GrantCapabilityDetailRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not report_timestamp or not capability_rows:
+        return None
+    output_path = Path(report_dir) / f"grant_capability_detail_{report_timestamp}.txt"
+    rows = sorted(
+        capability_rows,
+        key=lambda x: (
+            (x.category or "").upper(),
+            (x.source_privilege or "").upper(),
+            (x.object_type or "").upper(),
+            (x.support_status or "").upper(),
+            (x.decision or "").upper(),
+        )
+    )
+    header_fields = [
+        "CATEGORY",
+        "SOURCE_PRIVILEGE",
+        "OBJECT_TYPE",
+        "TARGET_CATALOG_PRIVILEGE",
+        "SUPPORT_STATUS",
+        "DECISION",
+        "REASON_CODE",
+        "ERROR_CODE",
+        "ERROR_MESSAGE",
+        "SAMPLE_SQL",
+    ]
+    data_rows = [
+        [
+            row.category,
+            row.source_privilege,
+            row.object_type,
+            row.target_catalog_privilege,
+            row.support_status,
+            row.decision,
+            row.reason_code or "-",
+            row.error_code or "-",
+            row.error_message or "-",
+            row.sample_sql or "-",
+        ]
+        for row in rows
+    ]
+    return write_pipe_report("动态授权能力明细", header_fields, data_rows, output_path)
 
 
 def export_deferred_grant_detail(
@@ -36077,6 +37209,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "UNSUPPORTED_GRANT_DETAIL"
     if name.startswith("target_extra_grants_detail_"):
         return "TARGET_EXTRA_GRANT_DETAIL"
+    if name.startswith("grant_capability_detail_"):
+        return "GRANT_CAPABILITY_DETAIL"
     if name.startswith("ddl_cleanup_detail_"):
         return "DDL_CLEANUP_DETAIL"
     if name.startswith("triggers_temp_table_unsupported_detail_"):
@@ -36131,6 +37265,7 @@ def _infer_artifact_status(
         "UNSUPPORTED_GRANT_DETAIL",
         "DEFERRED_GRANT_DETAIL",
         "TARGET_EXTRA_GRANT_DETAIL",
+        "GRANT_CAPABILITY_DETAIL",
         "DDL_CLEANUP_DETAIL",
     }:
         return ("IN_DB", "") if store_scope in {"core", "full"} else ("TXT_ONLY", "")
@@ -37938,9 +39073,9 @@ def ensure_report_db_views_exist(
     return artifacts
 
 
-REPORT_SQL_PLAYBOOK_TEMPLATE_VERSION = "20260311_08"
+REPORT_SQL_PLAYBOOK_TEMPLATE_VERSION = "20260311_12"
 REPORT_SQL_PLAYBOOK_LATEST_FILENAME = "HOW_TO_READ_REPORTS_IN_OB_latest.txt"
-REPORT_SQL_PLAYBOOK_SNAPSHOT_FILENAME = "HOW_TO_READ_REPORTS_IN_OB_20260311_08_sqls.txt"
+REPORT_SQL_PLAYBOOK_SNAPSHOT_FILENAME = "HOW_TO_READ_REPORTS_IN_OB_20260311_12_sqls.txt"
 REPORT_SQL_PLAYBOOK_TEMPLATE = """# 说明: 本文件仅提供 report_id 与 HOW TO 入口，不内嵌 HOW TO 正文。
 当前 report_id: :report_id_value
 建议阅读:
@@ -39367,6 +40502,7 @@ def print_final_report(
         if settings and settings.get("_ddl_cleanup_report_path")
         else None
     )
+    grant_capability_summary = dict((settings.get("_grant_capability_summary") or {}) if settings else {})
 
     if extra_results is None:
         extra_results = {
@@ -39814,6 +40950,23 @@ def print_final_report(
             cleanup_text.append("\n详见: ", style="info")
             cleanup_text.append(ddl_cleanup_report_path.name, style="info")
         summary_table.add_row("[bold]DDL 清理/改写[/bold]", cleanup_text)
+
+    if grant_capability_summary:
+        capability_text = Text()
+        capability_text.append("总计: ", style="info")
+        capability_text.append(str(int(grant_capability_summary.get("total_rows", 0) or 0)), style="info")
+        capability_text.append("\n允许: ", style="ok")
+        capability_text.append(str(int(grant_capability_summary.get("allow_rows", 0) or 0)), style="ok")
+        capability_text.append("\n别名兼容: ", style="info")
+        capability_text.append(str(int(grant_capability_summary.get("supported_alias_rows", 0) or 0)), style="info")
+        capability_text.append("\n过滤: ", style="mismatch")
+        capability_text.append(str(int(grant_capability_summary.get("filter_rows", 0) or 0)), style="mismatch")
+        capability_text.append("\n人工复核: ", style="mismatch")
+        capability_text.append(str(int(grant_capability_summary.get("manual_rows", 0) or 0)), style="mismatch")
+        if report_ts:
+            capability_text.append("\n详见: ", style="info")
+            capability_text.append(f"grant_capability_detail_{report_ts}.txt", style="info")
+        summary_table.add_row("[bold]授权能力探针[/bold]", capability_text)
 
     if package_rows:
         pkg_text = Text()
@@ -40790,6 +41943,17 @@ def print_final_report(
             len(extra_object_grant_rows or []) if target_extra_grant_detail_path else None,
             "目标端额外授权明细"
         )
+        grant_capability_detail_path = export_grant_capability_detail(
+            list((settings or {}).get("_grant_capability_detail_rows") or []),
+            report_path.parent,
+            report_ts
+        )
+        _add_index_entry(
+            "DETAIL",
+            grant_capability_detail_path,
+            int((grant_capability_summary or {}).get("total_rows", 0) or 0) if grant_capability_detail_path else None,
+            "动态授权能力明细"
+        )
         fixup_skip_path = export_fixup_skip_summary(
             fixup_skip_summary or {},
             report_path.parent,
@@ -41222,6 +42386,8 @@ def print_final_report(
                 log.info("不支持授权明细已输出到: %s", unsupported_grant_detail_path)
             if target_extra_grant_detail_path:
                 log.info("目标端额外授权明细已输出到: %s", target_extra_grant_detail_path)
+            if grant_capability_detail_path:
+                log.info("动态授权能力明细已输出到: %s", grant_capability_detail_path)
             if fixup_skip_path:
                 log.info("Fixup 跳过汇总已输出到: %s", fixup_skip_path)
             if missing_detail_path:
@@ -42650,11 +43816,7 @@ def main():
                     grant_progress_interval = 10.0
                 grant_progress_interval = max(1.0, grant_progress_interval)
                 supported_sys_privs = settings.get('grant_supported_sys_privs_set', set())
-                if not supported_sys_privs:
-                    supported_sys_privs = load_ob_supported_sys_privs(ob_cfg)
                 supported_object_privs = settings.get('grant_supported_object_privs_set', set())
-                if not supported_object_privs:
-                    supported_object_privs = set(DEFAULT_SUPPORTED_OBJECT_PRIVS)
                 include_oracle_maintained_roles = bool(settings.get('grant_include_oracle_maintained_roles', False))
                 ob_roles: Optional[Set[str]] = None
                 if ob_meta and ob_meta.roles:
@@ -42662,12 +43824,34 @@ def main():
                 elif enable_grant_generation:
                     ob_roles = load_ob_roles(ob_cfg)
                 ob_users = load_ob_users(ob_cfg) if enable_grant_generation else None
-                if not supported_sys_privs:
-                    log.warning("[GRANT] 未获取到 OceanBase 系统权限清单，将仅依据 Oracle 权限合法性过滤。")
+                if supported_sys_privs:
+                    log.warning(
+                        "[GRANT] grant_supported_sys_privs 已显式配置，将覆盖本次系统权限动态探针的默认支持结论。"
+                    )
+                if supported_object_privs:
+                    log.warning(
+                        "[GRANT] grant_supported_object_privs 已显式配置，将覆盖本次对象权限动态探针的默认支持结论。"
+                    )
+                grant_capability_library = build_grant_capability_library(
+                    oracle_meta,
+                    ob_cfg,
+                    source_objects,
+                    supported_sys_override=supported_sys_privs,
+                    supported_object_override=supported_object_privs,
+                )
+                settings["_grant_capability_library"] = grant_capability_library
+                settings["_grant_capability_detail_rows"] = list(grant_capability_library.detail_rows or [])
+                settings["_grant_capability_summary"] = summarize_grant_capability_rows(
+                    grant_capability_library.detail_rows or []
+                )
                 log.info(
-                    "[GRANT] 权限过滤参数：sys_privs=%d, obj_privs=%d, include_oracle_maintained_roles=%s, ob_roles=%d, ob_users=%d",
-                    len(supported_sys_privs),
-                    len(supported_object_privs),
+                    "[GRANT] 权限能力探针：rows=%d, allow=%d, alias=%d, filter=%d, manual=%d, probe_complete=%s, include_oracle_maintained_roles=%s, ob_roles=%d, ob_users=%d",
+                    int(settings["_grant_capability_summary"].get("total_rows", 0) or 0),
+                    int(settings["_grant_capability_summary"].get("allow_rows", 0) or 0),
+                    int(settings["_grant_capability_summary"].get("supported_alias_rows", 0) or 0),
+                    int(settings["_grant_capability_summary"].get("filter_rows", 0) or 0),
+                    int(settings["_grant_capability_summary"].get("manual_rows", 0) or 0),
+                    "true" if grant_capability_library.probe_complete else "false",
                     "true" if include_oracle_maintained_roles else "false",
                     len(ob_roles or set()),
                     len(ob_users or set())
@@ -42692,6 +43876,7 @@ def main():
                     source_schema_set,
                     remap_conflicts,
                     synonym_meta,
+                    capability_library=grant_capability_library,
                     supported_sys_privs=supported_sys_privs,
                     supported_object_privs=supported_object_privs,
                     oracle_sys_privs_map=oracle_meta.system_privilege_map,
@@ -42796,6 +43981,7 @@ def main():
                         )
                     ),
                     view_grant_targets=set(grant_plan.view_grant_targets or set()),
+                    object_target_types=dict(grant_plan.object_target_types or {}),
                 )
     else:
         log.info('已根据配置跳过修补脚本生成，仅打印对比报告。')
