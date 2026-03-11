@@ -53,14 +53,28 @@ python3 schema_diff_reconciler.py config.ini
 重点看：
 - main_reports/run_<ts>/report_<ts>.txt
 - main_reports/run_<ts>/report_index_<ts>.txt
+- main_reports/run_<ts>/ddl_cleanup_detail_<ts>.txt
 - main_reports/run_<ts>/missing_objects_detail_<ts>.txt
 - main_reports/run_<ts>/unsupported_objects_detail_<ts>.txt
 - fixup_scripts/
+- 触发器专项时，再看：
+  main_reports/run_<ts>/triggers_view_reference_detail_<ts>.txt
+  main_reports/run_<ts>/triggers_literal_object_path_detail_<ts>.txt
 
 运行初期优先看：
 - report_<ts>.txt 里的“执行结论”和“本次建议处理顺序”
 - fixup_scripts/README_FIRST.txt（会提示哪些目录默认不要直接执行）
 - 如果看到“本次相关变化提醒”，优先花 10 秒看完；同一提醒默认只展示一次
+
+触发器补充规则：
+- 触发器里完整等于 `SCHEMA.OBJECT` 的字符串字面量，会按 remap 自动改写。
+- `SCHEMA.OBJECT.COLUMN` 这类三段式字符串默认不自动改，避免把列名/日志文本改坏；需要看 `triggers_literal_object_path_detail_<ts>.txt` 人工确认。
+- `PRAGMA AUTONOMOUS_TRANSACTION` 会保留。
+
+DDL 清理补充规则：
+- `ddl_cleanup_detail_<ts>.txt` 会标出是“格式整理”还是“语义改写”。
+- `PRAGMA SERIALLY_REUSABLE`、`STORAGE(...)` 默认也会保留，不再静默删掉；`TABLESPACE` 也不再按“不支持语法”自动删除。
+- 如果 fixup SQL 头里看到 `DDL_REWRITE:`，说明发生了类型/分区这类兼容性改写，执行前要人工复核。
 
 7. 执行修复（run_fixup）
 - 默认安全执行（不会跑 table/ 建表脚本）：

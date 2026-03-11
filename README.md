@@ -38,7 +38,7 @@
 - **状态漂移修复**：支持 TRIGGER/CONSTRAINT 的状态差异检测与状态修补脚本生成。
 - **约束策略增强**：支持缺失约束的 `safe_novalidate/source/force_validate` 策略与后置 `validate_later` 脚本。
 - **视图兼容治理**：支持 VIEW 兼容规则、DBLINK 策略、列清单约束清洗与依赖链修复。
-- **DDL 清洗与格式化**：支持全角标点清洗、hint 策略清洗、SQLcl 格式化（可按类型/体积/超时控制）。
+- **DDL 清洗与格式化**：支持 `ddl_cleanup_detail_<ts>.txt` 审计明细、全角标点清洗、hint 策略清洗、SQLcl 格式化（可按类型/体积/超时控制）；语义改写会在脚本头写 `DDL_REWRITE` 注释。
 - **黑名单与排除机制**：支持规则引擎、名称模式、显式排除清单（`exclude_objects_file`）与依赖联动过滤。
 - **版本门控**：按 OB 版本动态处理 MVIEW、interval 分区等能力差异，降低跨版本误报。
 
@@ -204,8 +204,11 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/blacklist_tables.txt`：黑名单表清单
 - `main_reports/run_<ts>/filtered_grants.txt`：过滤授权清单
 - `main_reports/run_<ts>/target_extra_grants_detail_<ts>.txt`：目标端额外对象授权明细（含 PUBLIC 扩权风险）
+- `main_reports/run_<ts>/ddl_cleanup_detail_<ts>.txt`：DDL 清理/改写明细（区分 `format_only / syntax_compat / environment_detach / semantic_rewrite`，并标记 `evidence_level`）
 - `main_reports/run_<ts>/trigger_status_report.txt`：触发器清单/状态差异报告
 - `main_reports/run_<ts>/triggers_temp_table_unsupported_detail_<ts>.txt`：临时表触发器不支持明细（`TRIGGER_ON_TEMP_TABLE_UNSUPPORTED`）
+- `main_reports/run_<ts>/triggers_view_reference_detail_<ts>.txt`：触发器中引用视图的提醒明细（保留视图语义，不改写为表）
+- `main_reports/run_<ts>/triggers_literal_object_path_detail_<ts>.txt`：触发器中 `SCHEMA.OBJECT.COLUMN` 字符串路径提醒明细（默认不自动改写）
 - `main_reports/run_<ts>/table_data_presence_detail_<ts>.txt`：表数据存在性风险明细（源有数据/目标空表）
 - `main_reports/run_<ts>/objects_after_cutoff_detail_<ts>.txt`：创建时间范围过滤对象明细（`FILTERED_BY_CREATED_AFTER_CUTOFF` / `FILTERED_BY_MISSING_CREATED`）
 - `main_reports/run_<ts>/case_sensitive_identifiers_detail_<ts>.txt`：大小写敏感(双引号)标识符明细
@@ -224,6 +227,17 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `fixup_scripts/unsupported/`：不支持/阻断对象 DDL（默认不执行）
 - `fixup_scripts/view_chain_plans/`：VIEW 链路修复计划
 - `fixup_scripts/errors/`：run_fixup 错误报告
+
+## 触发器专项说明
+- 触发器中的真实对象引用会继续按现有规则做 schema 补全和 remap。
+- 如果触发器字符串字面量完整等于 `SCHEMA.OBJECT`，也会按 remap 自动改写，例如 `'LIFEBASE.T1' -> 'BASEDATA.T1'`。
+- 如果字符串字面量是 `SCHEMA.OBJECT.COLUMN` 三段式路径，程序默认不自动改写，避免把列名、协议文本或日志内容误改坏；这类情况会输出到 `triggers_literal_object_path_detail_<ts>.txt` 供人工确认。
+- 触发器中的 `PRAGMA AUTONOMOUS_TRANSACTION` 现在会保留，不再被清洗掉。
+
+## DDL 清理治理
+- `ddl_cleanup_detail_<ts>.txt` 会把每条清理/保留动作拆成 `STATUS/RULE/CATEGORY/EVIDENCE_LEVEL/CHANGE_COUNT`，便于区分“格式整理”和“真实兼容性改写”。
+- `PRAGMA AUTONOMOUS_TRANSACTION`、`PRAGMA SERIALLY_REUSABLE`、`STORAGE(...)` 现在默认保留；`TABLESPACE` 不再按“语法不支持”自动删除。
+- `LONG -> CLOB`、`LONG RAW/BFILE -> BLOB`、`INTERVAL` 分区处理属于语义改写，会在 fixup SQL 头部追加 `DDL_REWRITE: ...` 注释，并同步进入 `ddl_cleanup_detail_<ts>.txt`。
 
 ## 黑名单规则
 - 默认启用 `blacklist_rules.json` 规则并尝试读取 `OMS_USER.TMP_BLACK_TABLE`（`blacklist_mode=auto`）。

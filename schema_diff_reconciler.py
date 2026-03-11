@@ -89,13 +89,92 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, NamedTuple, NoReturn, Optional, Sequence, Set, Tuple, Union
 
-from comparator_notices import RuntimeNotice, load_notice_state, persist_seen_notices, select_unseen_notices
-
 __version__ = "0.9.8.7"
 
 __author__ = "Minor Li"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
 REPO_ISSUES_URL = f"{REPO_URL}/issues"
+NOTICE_STATE_FILENAME = ".comparator_notice_state.json"
+NOTICE_STATE_SCHEMA_VERSION = 1
+
+
+class RuntimeNotice(NamedTuple):
+    notice_id: str
+    introduced_in: str
+    title: str
+    message: str
+
+
+def resolve_notice_state_path(config_dir: Optional[Union[str, Path]]) -> Path:
+    base_dir = Path(config_dir).expanduser() if config_dir else Path.cwd()
+    try:
+        base_dir = base_dir.resolve()
+    except Exception:
+        base_dir = Path.cwd().resolve()
+    return base_dir / NOTICE_STATE_FILENAME
+
+
+def load_notice_state(config_dir: Optional[Union[str, Path]]) -> Tuple[Path, Dict[str, object]]:
+    state_path = resolve_notice_state_path(config_dir)
+    state: Dict[str, object] = {
+        "schema_version": NOTICE_STATE_SCHEMA_VERSION,
+        "last_seen_tool_version": "",
+        "seen_notices": {},
+    }
+    if not state_path.exists():
+        return state_path, state
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            seen = payload.get("seen_notices")
+            if not isinstance(seen, dict):
+                seen = {}
+            state["seen_notices"] = {
+                str(key): str(value)
+                for key, value in seen.items()
+                if str(key).strip()
+            }
+            last_seen = payload.get("last_seen_tool_version")
+            if isinstance(last_seen, str):
+                state["last_seen_tool_version"] = last_seen
+    except Exception:
+        return state_path, state
+    return state_path, state
+
+
+def select_unseen_notices(
+    state: Dict[str, object],
+    notices: Sequence[RuntimeNotice]
+) -> List[RuntimeNotice]:
+    seen_notices = state.get("seen_notices")
+    if not isinstance(seen_notices, dict):
+        seen_notices = {}
+    return [
+        notice for notice in notices
+        if notice.notice_id not in seen_notices
+    ]
+
+
+def persist_seen_notices(
+    state_path: Path,
+    state: Dict[str, object],
+    current_version: str,
+    notices: Sequence[RuntimeNotice],
+) -> None:
+    seen_notices = state.get("seen_notices")
+    if not isinstance(seen_notices, dict):
+        seen_notices = {}
+    for notice in notices:
+        seen_notices[notice.notice_id] = current_version
+    payload = {
+        "schema_version": NOTICE_STATE_SCHEMA_VERSION,
+        "last_seen_tool_version": current_version,
+        "seen_notices": seen_notices,
+    }
+    state_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 # 尝试导入 oracledb，如果失败则提示安装
 try:
@@ -735,8 +814,31 @@ class IntervalPartitionInfo(NamedTuple):
 class DdlCleanReportRow(NamedTuple):
     obj_type: str
     obj_full: str
-    replaced: int
-    samples: List[Tuple[str, str]]
+    action_status: str
+    rule_name: str
+    category: str
+    evidence_level: str
+    change_count: int
+    note: str
+    samples: List[str]
+
+
+class DdlCleanupAction(NamedTuple):
+    action_status: str
+    rule_name: str
+    category: str
+    evidence_level: str
+    change_count: int
+    note: str
+    samples: List[str]
+
+
+class DdlCleanupRuleMeta(NamedTuple):
+    rule_name: str
+    category: str
+    evidence_level: str
+    note: str
+    sample_builder: Optional[Callable[[str, str], Tuple[int, List[str]]]] = None
 
 
 class DdlHintCleanReportRow(NamedTuple):
@@ -3784,6 +3886,15 @@ class TriggerViewReferenceRow(NamedTuple):
     source_reference: str
     resolved_reference: str
     reference_type: str
+    note: str
+    action: str
+
+
+class TriggerLiteralPathAlertRow(NamedTuple):
+    trigger_full: str
+    literal_text: str
+    matched_reference: str
+    suggested_reference: str
     note: str
     action: str
 
@@ -20872,9 +20983,9 @@ def fetch_dbcat_schema_objects(
 def setup_metadata_session(ora_conn):
     plsql = """
     BEGIN
-      DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM,'SEGMENT_ATTRIBUTES',FALSE);
-      DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM,'STORAGE',FALSE);
-      DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM,'TABLESPACE',FALSE);
+      DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM,'SEGMENT_ATTRIBUTES',TRUE);
+      DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM,'STORAGE',TRUE);
+      DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM,'TABLESPACE',TRUE);
       DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM,'CONSTRAINTS',TRUE);
     END;
     """
@@ -21029,7 +21140,337 @@ def apply_ob_feature_gates(settings: Dict, ob_version: Optional[str]) -> Dict[st
     }
 
 
-def clean_view_ddl_for_oceanbase(ddl: str, ob_version: Optional[str] = None) -> str:
+DDL_CLEAN_ACTION_APPLIED = "APPLIED"
+DDL_CLEAN_ACTION_PRESERVED = "PRESERVED"
+
+DDL_CLEAN_CATEGORY_FORMAT_ONLY = "format_only"
+DDL_CLEAN_CATEGORY_SYNTAX_COMPAT = "syntax_compat"
+DDL_CLEAN_CATEGORY_ENVIRONMENT_DETACH = "environment_detach"
+DDL_CLEAN_CATEGORY_SEMANTIC_REWRITE = "semantic_rewrite"
+
+DDL_CLEAN_EVIDENCE_VERIFIED_UNSUPPORTED = "verified_unsupported"
+DDL_CLEAN_EVIDENCE_VERIFIED_SUPPORTED = "verified_supported"
+DDL_CLEAN_EVIDENCE_UNVERIFIED = "unverified"
+DDL_CLEAN_EVIDENCE_NOT_APPLICABLE = "not_applicable"
+
+DDL_CLEAN_SAMPLE_LIMIT = 6
+
+
+def _append_unique_cleanup_sample(samples: List[str], value: str, limit: int = DDL_CLEAN_SAMPLE_LIMIT) -> None:
+    text = str(value or "").strip()
+    if not text or text in samples or len(samples) >= limit:
+        return
+    samples.append(text)
+
+
+def _build_keyword_cleanup_samples(before: str, keywords: List[str]) -> Tuple[int, List[str]]:
+    masked = mask_sql_for_scan(before)
+    total = 0
+    samples: List[str] = []
+    for keyword in keywords:
+        count = len(re.findall(rf"\b{re.escape(keyword)}\b", masked, flags=re.IGNORECASE))
+        if count <= 0:
+            continue
+        total += count
+        _append_unique_cleanup_sample(samples, f"{keyword.upper()} -> removed")
+    return total, samples
+
+
+def _build_end_schema_prefix_samples(before: str, _after: str) -> Tuple[int, List[str]]:
+    matches = list(END_SCHEMA_PREFIX_PATTERN.finditer(before or ""))
+    samples: List[str] = []
+    for match in matches:
+        obj = (match.group("obj") or "").strip()
+        if obj:
+            _append_unique_cleanup_sample(samples, f"{match.group(0).strip()} -> END {obj};")
+    return len(matches), samples
+
+
+def _build_interval_cleanup_samples(before: str, _after: str) -> Tuple[int, List[str]]:
+    count = len(re.findall(r"\bINTERVAL\b", mask_sql_for_scan(before), flags=re.IGNORECASE))
+    samples = ["INTERVAL (...) -> removed"] if count else []
+    return count, samples
+
+
+def _find_table_type_rewrite_edits(ddl: str) -> List[Tuple[int, int, str, str]]:
+    if not ddl:
+        return []
+    masked = mask_sql_for_scan(ddl)
+    edits: List[Tuple[int, int, str, str]] = []
+    occupied: List[Tuple[int, int]] = []
+
+    def _occupied(start: int, end: int) -> bool:
+        for s, e in occupied:
+            if start < e and end > s:
+                return True
+        return False
+
+    for match in re.finditer(r"\bLONG\s+RAW\b", masked, flags=re.IGNORECASE):
+        edits.append((match.start(), match.end(), "BLOB", "LONG RAW"))
+        occupied.append((match.start(), match.end()))
+    for match in re.finditer(r"\bBFILE\b", masked, flags=re.IGNORECASE):
+        if _occupied(match.start(), match.end()):
+            continue
+        edits.append((match.start(), match.end(), "BLOB", "BFILE"))
+        occupied.append((match.start(), match.end()))
+    for match in re.finditer(r"\bLONG\b", masked, flags=re.IGNORECASE):
+        if _occupied(match.start(), match.end()):
+            continue
+        edits.append((match.start(), match.end(), "CLOB", "LONG"))
+    return edits
+
+
+def _build_table_type_rewrite_samples(before: str, _after: str) -> Tuple[int, List[str]]:
+    edits = _find_table_type_rewrite_edits(before)
+    samples: List[str] = []
+    for _start, _end, replacement, src_type in edits:
+        _append_unique_cleanup_sample(samples, f"{src_type} -> {replacement}")
+    return len(edits), samples
+
+
+def _build_xmlschema_cleanup_samples(before: str, _after: str) -> Tuple[int, List[str]]:
+    count = len(re.findall(r"\bXMLTYPE\s+COLUMN\b", mask_sql_for_scan(before), flags=re.IGNORECASE))
+    samples = ["XMLTYPE COLUMN ... XMLSCHEMA -> removed"] if count else []
+    return count, samples
+
+
+def _build_sequence_option_cleanup_samples(before: str, _after: str) -> Tuple[int, List[str]]:
+    return _build_keyword_cleanup_samples(before, ["NOKEEP", "NOSCALE", "GLOBAL"])
+
+
+def _build_editionable_cleanup_samples(before: str, _after: str) -> Tuple[int, List[str]]:
+    return _build_keyword_cleanup_samples(before, ["EDITIONABLE", "NONEDITIONABLE"])
+
+
+DDL_CLEAN_RULE_META: Dict[str, DdlCleanupRuleMeta] = {
+    "clean_end_schema_prefix": DdlCleanupRuleMeta(
+        rule_name="clean_end_schema_prefix",
+        category=DDL_CLEAN_CATEGORY_SYNTAX_COMPAT,
+        evidence_level=DDL_CLEAN_EVIDENCE_VERIFIED_UNSUPPORTED,
+        note="END schema.obj; 在当前 OB 上不兼容，自动去除 schema 前缀。",
+        sample_builder=_build_end_schema_prefix_samples,
+    ),
+    "clean_for_loop_single_dot_range": DdlCleanupRuleMeta(
+        rule_name="clean_for_loop_single_dot_range",
+        category=DDL_CLEAN_CATEGORY_FORMAT_ONLY,
+        evidence_level=DDL_CLEAN_EVIDENCE_NOT_APPLICABLE,
+        note="修正 FOR 范围中的单点拼写错误，避免生成无效的 PL/SQL。",
+    ),
+    "clean_for_loop_collection_attr_range": DdlCleanupRuleMeta(
+        rule_name="clean_for_loop_collection_attr_range",
+        category=DDL_CLEAN_CATEGORY_FORMAT_ONLY,
+        evidence_level=DDL_CLEAN_EVIDENCE_NOT_APPLICABLE,
+        note="修正集合范围中的单点拼写错误，避免生成无效的 PL/SQL。",
+    ),
+    "clean_plsql_ending": DdlCleanupRuleMeta(
+        rule_name="clean_plsql_ending",
+        category=DDL_CLEAN_CATEGORY_FORMAT_ONLY,
+        evidence_level=DDL_CLEAN_EVIDENCE_NOT_APPLICABLE,
+        note="整理 PL/SQL 结尾的多余分号/斜杠排布。",
+    ),
+    "clean_semicolon_before_slash": DdlCleanupRuleMeta(
+        rule_name="clean_semicolon_before_slash",
+        category=DDL_CLEAN_CATEGORY_FORMAT_ONLY,
+        evidence_level=DDL_CLEAN_EVIDENCE_NOT_APPLICABLE,
+        note="移除 / 前单独一行的多余分号。",
+    ),
+    "clean_extra_semicolons": DdlCleanupRuleMeta(
+        rule_name="clean_extra_semicolons",
+        category=DDL_CLEAN_CATEGORY_FORMAT_ONLY,
+        evidence_level=DDL_CLEAN_EVIDENCE_NOT_APPLICABLE,
+        note="收敛连续分号，避免重复终止符。",
+    ),
+    "clean_extra_dots": DdlCleanupRuleMeta(
+        rule_name="clean_extra_dots",
+        category=DDL_CLEAN_CATEGORY_FORMAT_ONLY,
+        evidence_level=DDL_CLEAN_EVIDENCE_NOT_APPLICABLE,
+        note="收敛明显多余的连续点号，不改变合法 .. 范围运算。",
+    ),
+    "clean_trailing_whitespace": DdlCleanupRuleMeta(
+        rule_name="clean_trailing_whitespace",
+        category=DDL_CLEAN_CATEGORY_FORMAT_ONLY,
+        evidence_level=DDL_CLEAN_EVIDENCE_NOT_APPLICABLE,
+        note="清理行尾空白。",
+    ),
+    "clean_empty_lines": DdlCleanupRuleMeta(
+        rule_name="clean_empty_lines",
+        category=DDL_CLEAN_CATEGORY_FORMAT_ONLY,
+        evidence_level=DDL_CLEAN_EVIDENCE_NOT_APPLICABLE,
+        note="压缩多余空行。",
+    ),
+    "clean_editionable_flags": DdlCleanupRuleMeta(
+        rule_name="clean_editionable_flags",
+        category=DDL_CLEAN_CATEGORY_SYNTAX_COMPAT,
+        evidence_level=DDL_CLEAN_EVIDENCE_VERIFIED_UNSUPPORTED,
+        note="EDITIONABLE/NONEDITIONABLE 在当前 OB 上不兼容，自动移除。",
+        sample_builder=_build_editionable_cleanup_samples,
+    ),
+    "rewrite_unsupported_table_oracle_types": DdlCleanupRuleMeta(
+        rule_name="rewrite_unsupported_table_oracle_types",
+        category=DDL_CLEAN_CATEGORY_SEMANTIC_REWRITE,
+        evidence_level=DDL_CLEAN_EVIDENCE_VERIFIED_UNSUPPORTED,
+        note="Oracle 专有列类型已改写为 OB 兼容类型，属于语义改写。",
+        sample_builder=_build_table_type_rewrite_samples,
+    ),
+    "clean_interval_partition_clause": DdlCleanupRuleMeta(
+        rule_name="clean_interval_partition_clause",
+        category=DDL_CLEAN_CATEGORY_SEMANTIC_REWRITE,
+        evidence_level=DDL_CLEAN_EVIDENCE_VERIFIED_UNSUPPORTED,
+        note="INTERVAL 分区语法在当前 OB 上不兼容，已按兼容性改写处理。",
+        sample_builder=_build_interval_cleanup_samples,
+    ),
+    "clean_xmltype_xmlschema_clause": DdlCleanupRuleMeta(
+        rule_name="clean_xmltype_xmlschema_clause",
+        category=DDL_CLEAN_CATEGORY_SYNTAX_COMPAT,
+        evidence_level=DDL_CLEAN_EVIDENCE_VERIFIED_UNSUPPORTED,
+        note="XMLTYPE XMLSCHEMA 子句在当前 OB 上不兼容，自动移除。",
+        sample_builder=_build_xmlschema_cleanup_samples,
+    ),
+    "clean_sequence_unsupported_options": DdlCleanupRuleMeta(
+        rule_name="clean_sequence_unsupported_options",
+        category=DDL_CLEAN_CATEGORY_SYNTAX_COMPAT,
+        evidence_level=DDL_CLEAN_EVIDENCE_VERIFIED_UNSUPPORTED,
+        note="SEQUENCE 的 NOKEEP/NOSCALE/GLOBAL 选项在当前 OB 上不兼容，自动移除。",
+        sample_builder=_build_sequence_option_cleanup_samples,
+    ),
+    "sanitize_plsql_punctuation": DdlCleanupRuleMeta(
+        rule_name="sanitize_plsql_punctuation",
+        category=DDL_CLEAN_CATEGORY_FORMAT_ONLY,
+        evidence_level=DDL_CLEAN_EVIDENCE_NOT_APPLICABLE,
+        note="将全角标点替换为半角，避免解析失败。",
+    ),
+}
+
+
+def _build_cleanup_action_from_rule(
+    rule_func: Callable[[str], str],
+    before: str,
+    after: str
+) -> Optional[DdlCleanupAction]:
+    if before == after:
+        return None
+    meta = DDL_CLEAN_RULE_META.get(
+        getattr(rule_func, "__name__", ""),
+        DdlCleanupRuleMeta(
+            rule_name=getattr(rule_func, "__name__", "custom_cleanup"),
+            category=DDL_CLEAN_CATEGORY_FORMAT_ONLY,
+            evidence_level=DDL_CLEAN_EVIDENCE_UNVERIFIED,
+            note="自定义或未登记的 DDL 清洗规则。",
+            sample_builder=None,
+        )
+    )
+    change_count = 1
+    samples: List[str] = []
+    if meta.sample_builder:
+        try:
+            change_count, samples = meta.sample_builder(before, after)
+        except Exception as exc:
+            log.warning("DDL 清理规则样本提取失败 %s: %s", meta.rule_name, exc)
+            change_count, samples = 1, []
+    if change_count <= 0:
+        change_count = 1
+    return DdlCleanupAction(
+        action_status=DDL_CLEAN_ACTION_APPLIED,
+        rule_name=meta.rule_name,
+        category=meta.category,
+        evidence_level=meta.evidence_level,
+        change_count=change_count,
+        note=meta.note,
+        samples=samples,
+    )
+
+
+def _build_punctuation_cleanup_action(
+    replaced: int,
+    samples: List[Tuple[str, str]]
+) -> Optional[DdlCleanupAction]:
+    if replaced <= 0:
+        return None
+    meta = DDL_CLEAN_RULE_META["sanitize_plsql_punctuation"]
+    return DdlCleanupAction(
+        action_status=DDL_CLEAN_ACTION_APPLIED,
+        rule_name=meta.rule_name,
+        category=meta.category,
+        evidence_level=meta.evidence_level,
+        change_count=replaced,
+        note=meta.note,
+        samples=[f"{src}->{dst}" for src, dst in (samples or [])],
+    )
+
+
+def _scan_preserved_cleanup_actions(ddl: str, obj_type: str) -> List[DdlCleanupAction]:
+    if not ddl:
+        return []
+    obj_type_u = (obj_type or "").upper()
+    masked = mask_sql_for_scan(ddl)
+    actions: List[DdlCleanupAction] = []
+
+    def _add_if_matches(
+        rule_name: str,
+        category: str,
+        evidence_level: str,
+        note: str,
+        pattern: str,
+        sample_text: str
+    ) -> None:
+        count = len(re.findall(pattern, masked, flags=re.IGNORECASE))
+        if count <= 0:
+            return
+        actions.append(
+            DdlCleanupAction(
+                action_status=DDL_CLEAN_ACTION_PRESERVED,
+                rule_name=rule_name,
+                category=category,
+                evidence_level=evidence_level,
+                change_count=count,
+                note=note,
+                samples=[sample_text],
+            )
+        )
+
+    if obj_type_u in {"PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE BODY", "TYPE", "TYPE BODY", "TRIGGER"}:
+        _add_if_matches(
+            "preserve_autonomous_transaction",
+            DDL_CLEAN_CATEGORY_SYNTAX_COMPAT,
+            DDL_CLEAN_EVIDENCE_VERIFIED_SUPPORTED,
+            "PRAGMA AUTONOMOUS_TRANSACTION 在当前目标版本/对象类型上已验证可用，默认保留。",
+            r"\bPRAGMA\s+AUTONOMOUS_TRANSACTION\b",
+            "PRAGMA AUTONOMOUS_TRANSACTION preserved",
+        )
+        _add_if_matches(
+            "preserve_serially_reusable",
+            DDL_CLEAN_CATEGORY_SYNTAX_COMPAT,
+            DDL_CLEAN_EVIDENCE_VERIFIED_SUPPORTED,
+            "PRAGMA SERIALLY_REUSABLE 在当前已验证对象类型上默认保留。",
+            r"\bPRAGMA\s+SERIALLY_REUSABLE\b",
+            "PRAGMA SERIALLY_REUSABLE preserved",
+        )
+
+    if obj_type_u == "TABLE":
+        _add_if_matches(
+            "preserve_storage_clause",
+            DDL_CLEAN_CATEGORY_ENVIRONMENT_DETACH,
+            DDL_CLEAN_EVIDENCE_VERIFIED_SUPPORTED,
+            "STORAGE 子句在当前 OB 上已验证可保留，默认不再自动移除。",
+            r"\bSTORAGE\s*\(",
+            "STORAGE (...) preserved",
+        )
+        _add_if_matches(
+            "preserve_tablespace_clause",
+            DDL_CLEAN_CATEGORY_ENVIRONMENT_DETACH,
+            DDL_CLEAN_EVIDENCE_UNVERIFIED,
+            "TABLESPACE 子句不再默认视为不支持语法；若目标环境不存在对应 tablespace，需人工处理。",
+            r"\bTABLESPACE\b",
+            "TABLESPACE <name> preserved",
+        )
+
+    return actions
+
+
+def clean_view_ddl_for_oceanbase_with_audit(
+    ddl: str,
+    ob_version: Optional[str] = None
+) -> Tuple[str, List[DdlCleanupAction]]:
     """
     清理Oracle VIEW DDL，使其兼容OceanBase
     
@@ -21038,11 +21479,12 @@ def clean_view_ddl_for_oceanbase(ddl: str, ob_version: Optional[str] = None) -> 
         ob_version: OceanBase版本号
     
     Returns:
-        清理后的DDL
+        (清理后的DDL, 审计动作列表)
     """
     if not ddl:
-        return ddl
-    
+        return ddl, []
+
+    actions: List[DdlCleanupAction] = []
     cleaned_ddl = ddl
 
     # 移除 CREATE ... FORCE [EDITIONABLE] VIEW 中的 FORCE 关键字（兼容多关键字场景）
@@ -21058,14 +21500,30 @@ def clean_view_ddl_for_oceanbase(ddl: str, ob_version: Optional[str] = None) -> 
             return f"{prefix}{middle} {view_kw}"
         return f"{prefix}{view_kw}"
 
+    previous = cleaned_ddl
     cleaned_ddl = re.sub(
         r'(\bCREATE\s+(?:OR\s+REPLACE\s+)?)(.*?)\b((?:MATERIALIZED\s+)?VIEW)\b',
         _strip_force_in_create_view,
         cleaned_ddl,
         flags=re.IGNORECASE | re.DOTALL
     )
+    if previous != cleaned_ddl:
+        force_count = len(re.findall(r'\bNO\s+FORCE\b|\bFORCE\b', mask_sql_for_scan(previous), flags=re.IGNORECASE))
+        samples = ["FORCE -> removed"] if force_count else []
+        actions.append(
+            DdlCleanupAction(
+                action_status=DDL_CLEAN_ACTION_APPLIED,
+                rule_name="clean_view_force_keyword",
+                category=DDL_CLEAN_CATEGORY_SYNTAX_COMPAT,
+                evidence_level=DDL_CLEAN_EVIDENCE_VERIFIED_UNSUPPORTED,
+                change_count=max(force_count, 1),
+                note="VIEW/MVIEW 头部的 FORCE/NO FORCE 在当前 OB 上不兼容，自动移除。",
+                samples=samples,
+            )
+        )
 
     # 先移除 WITH CHECK OPTION 的 CONSTRAINT 名称（保留 CHECK OPTION 本身）
+    previous = cleaned_ddl
     cleaned_ddl = re.sub(
         r'(\bWITH\s+CHECK\s+OPTION)\s+CONSTRAINT\s+("(?:""|[^"])*"|[A-Za-z0-9_#$]+)',
         r'\1',
@@ -21079,21 +21537,71 @@ def clean_view_ddl_for_oceanbase(ddl: str, ob_version: Optional[str] = None) -> 
         cleaned_ddl,
         flags=re.IGNORECASE
     )
+    if previous != cleaned_ddl:
+        count = len(re.findall(r'\bWITH\s+CHECK\s+OPTION\s+CONSTRAINT\b', mask_sql_for_scan(previous), flags=re.IGNORECASE))
+        actions.append(
+            DdlCleanupAction(
+                action_status=DDL_CLEAN_ACTION_APPLIED,
+                rule_name="clean_view_check_option_constraint_name",
+                category=DDL_CLEAN_CATEGORY_SYNTAX_COMPAT,
+                evidence_level=DDL_CLEAN_EVIDENCE_VERIFIED_UNSUPPORTED,
+                change_count=max(count, 1),
+                note="当前 OB 支持 WITH CHECK OPTION，但不支持其后的命名 CONSTRAINT 子句，已仅保留 CHECK OPTION。",
+                samples=["WITH CHECK OPTION CONSTRAINT <name> -> WITH CHECK OPTION"],
+            )
+        )
 
     # 需要移除的关键字模式
-    patterns_to_remove = [
-        # EDITIONABLE 在所有版本都需要移除
-        r'\s+EDITIONABLE\s+',
-        r'\s+NONEDITIONABLE\s+',
-        # BEQUEATH 子句
-        r'\s+BEQUEATH\s+(?:CURRENT_USER|DEFINER)',
-        # SHARING 子句 (Oracle 12c+)
-        r'\s+SHARING\s*=\s*(?:METADATA|DATA|EXTENDED\s+DATA|NONE)',
-        # DEFAULT COLLATION 子句
-        r'\s+DEFAULT\s+COLLATION\s+\w+',
-        # CONTAINER 子句
-        r'\s+CONTAINER_MAP\s*',
-        r'\s+CONTAINERS_DEFAULT\s*',
+    patterns_to_remove: List[Tuple[str, str, str, str, List[str]]] = [
+        (
+            "clean_view_editionable_flags",
+            r'\s+EDITIONABLE\s+',
+            DDL_CLEAN_CATEGORY_SYNTAX_COMPAT,
+            DDL_CLEAN_EVIDENCE_VERIFIED_UNSUPPORTED,
+            ["EDITIONABLE -> removed"],
+        ),
+        (
+            "clean_view_noneditionable_flags",
+            r'\s+NONEDITIONABLE\s+',
+            DDL_CLEAN_CATEGORY_SYNTAX_COMPAT,
+            DDL_CLEAN_EVIDENCE_VERIFIED_UNSUPPORTED,
+            ["NONEDITIONABLE -> removed"],
+        ),
+        (
+            "clean_view_bequeath_clause",
+            r'\s+BEQUEATH\s+(?:CURRENT_USER|DEFINER)',
+            DDL_CLEAN_CATEGORY_SYNTAX_COMPAT,
+            DDL_CLEAN_EVIDENCE_UNVERIFIED,
+            ["BEQUEATH <mode> -> removed"],
+        ),
+        (
+            "clean_view_sharing_clause",
+            r'\s+SHARING\s*=\s*(?:METADATA|DATA|EXTENDED\s+DATA|NONE)',
+            DDL_CLEAN_CATEGORY_SYNTAX_COMPAT,
+            DDL_CLEAN_EVIDENCE_UNVERIFIED,
+            ["SHARING = <mode> -> removed"],
+        ),
+        (
+            "clean_view_default_collation_clause",
+            r'\s+DEFAULT\s+COLLATION\s+\w+',
+            DDL_CLEAN_CATEGORY_SYNTAX_COMPAT,
+            DDL_CLEAN_EVIDENCE_UNVERIFIED,
+            ["DEFAULT COLLATION <name> -> removed"],
+        ),
+        (
+            "clean_view_container_map_clause",
+            r'\s+CONTAINER_MAP\s*',
+            DDL_CLEAN_CATEGORY_SYNTAX_COMPAT,
+            DDL_CLEAN_EVIDENCE_UNVERIFIED,
+            ["CONTAINER_MAP -> removed"],
+        ),
+        (
+            "clean_view_containers_default_clause",
+            r'\s+CONTAINERS_DEFAULT\s*',
+            DDL_CLEAN_CATEGORY_SYNTAX_COMPAT,
+            DDL_CLEAN_EVIDENCE_UNVERIFIED,
+            ["CONTAINERS_DEFAULT -> removed"],
+        ),
     ]
     
     # 版本相关的清理
@@ -21102,16 +21610,43 @@ def clean_view_ddl_for_oceanbase(ddl: str, ob_version: Optional[str] = None) -> 
         # 如果版本 >= 4.2.5.7，可保留 WITH CHECK OPTION
         remove_check_option = compare_version(ob_version, "4.2.5.7") < 0
     if remove_check_option:
-        patterns_to_remove.append(r'\s+WITH\s+CHECK\s+OPTION')
+        patterns_to_remove.append(
+            (
+                "clean_view_check_option_clause",
+                r'\s+WITH\s+CHECK\s+OPTION',
+                DDL_CLEAN_CATEGORY_SYNTAX_COMPAT,
+                DDL_CLEAN_EVIDENCE_VERIFIED_UNSUPPORTED,
+                ["WITH CHECK OPTION -> removed"],
+            )
+        )
 
-    for pattern in patterns_to_remove:
+    for rule_name, pattern, category, evidence_level, samples in patterns_to_remove:
+        previous = cleaned_ddl
         cleaned_ddl = re.sub(pattern, ' ', cleaned_ddl, flags=re.IGNORECASE)
+        if previous != cleaned_ddl:
+            count = len(re.findall(pattern, mask_sql_for_scan(previous), flags=re.IGNORECASE))
+            actions.append(
+                DdlCleanupAction(
+                    action_status=DDL_CLEAN_ACTION_APPLIED,
+                    rule_name=rule_name,
+                    category=category,
+                    evidence_level=evidence_level,
+                    change_count=max(count, 1),
+                    note=f"VIEW DDL 清理规则 {rule_name} 已应用。",
+                    samples=samples,
+                )
+            )
     
     # 清理多余的空格（保留换行，避免行注释吞行）
     cleaned_ddl = re.sub(r'[ \t\r\f\v]+', ' ', cleaned_ddl)
     cleaned_ddl = re.sub(r' *\n *', '\n', cleaned_ddl)
     cleaned_ddl = cleaned_ddl.strip()
-    
+
+    return cleaned_ddl, actions
+
+
+def clean_view_ddl_for_oceanbase(ddl: str, ob_version: Optional[str] = None) -> str:
+    cleaned_ddl, _actions = clean_view_ddl_for_oceanbase_with_audit(ddl, ob_version)
     return cleaned_ddl
 
 
@@ -22804,7 +23339,10 @@ def adjust_ddl_for_object(
     src_name_u = (src_name or "").upper()
     tgt_schema_u = (tgt_schema or "").upper()
     tgt_name_u = (tgt_name or "").upper()
+    obj_type_u = (obj_type or "").upper()
     mapping_changed = (src_schema_u != tgt_schema_u) or (src_name_u != tgt_name_u)
+    masker = SqlMasker(ddl) if obj_type_u == "TRIGGER" else None
+    working_text = masker.masked_sql if masker else ddl
 
     def replace_identifier(text: str, src_s: str, src_n: str, tgt_s: str, tgt_n: str) -> str:
         if not src_s or not src_n or not tgt_s or not tgt_n:
@@ -22948,7 +23486,7 @@ def adjust_ddl_for_object(
 
         return name_pattern.sub(_repl, text)
 
-    result = replace_identifier(ddl, src_schema, src_name, tgt_schema, tgt_name)
+    result = replace_identifier(working_text, src_schema, src_name, tgt_schema, tgt_name)
     
     # 处理主对象的裸名引用（如 END package_name）
     if mapping_changed and src_name_u != tgt_name_u:
@@ -23076,7 +23614,7 @@ def adjust_ddl_for_object(
             return result
         result = qualify_main_object_creation(result)
 
-    return result
+    return masker.unmask(result) if masker else result
 
 
 DELIMITER_LINE_PATTERN = re.compile(r'^\s*DELIMITER\b.*$', re.IGNORECASE)
@@ -23489,6 +24027,14 @@ TRIGGER_SEQ_UNQUALIFIED_PATTERN = re.compile(
     r'(?<!\.)\b(?P<name>"?[A-Z0-9_\$#]+"?)\s*\.\s*(?P<suffix>NEXTVAL|CURRVAL)\b',
     re.IGNORECASE
 )
+TRIGGER_LITERAL_FULL_OBJECT_PATTERN = re.compile(
+    r'^\s*(?P<schema>"[^"]+"|[A-Z0-9_\$#]+)\s*\.\s*(?P<object>"[^"]+"|[A-Z0-9_\$#]+)\s*$',
+    re.IGNORECASE
+)
+TRIGGER_LITERAL_THREE_PART_PATTERN = re.compile(
+    r'^\s*(?P<schema>"[^"]+"|[A-Z0-9_\$#]+)\s*\.\s*(?P<object>"[^"]+"|[A-Z0-9_\$#]+)\s*\.\s*(?P<column>"[^"]+"|[A-Z0-9_\$#]+)\s*$',
+    re.IGNORECASE
+)
 TRIGGER_DML_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(r'(\bINSERT\s+INTO\s+)(?P<name>"?[A-Z0-9_\$#]+"?)', re.IGNORECASE),
     re.compile(r'(\bUPDATE\s+)(?!OF\b)(?P<name>"?[A-Z0-9_\$#]+"?)', re.IGNORECASE),
@@ -23501,6 +24047,23 @@ TRIGGER_EVENT_HEADER_PATTERN = re.compile(
     r'\bCREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\b.*?\bON\s+(?:"?[A-Z0-9_\$#]+"?(?:\s*\.\s*"?[A-Z0-9_\$#]+"?)?)',
     re.IGNORECASE | re.DOTALL
 )
+TRIGGER_LITERAL_REMAP_PREFERRED_TYPES: Tuple[str, ...] = (
+    "TABLE",
+    "VIEW",
+    "MATERIALIZED VIEW",
+    "SYNONYM",
+)
+
+
+def _decode_standard_single_quoted_literal(literal: str) -> Optional[str]:
+    text = str(literal or "")
+    if len(text) < 2 or not text.startswith("'") or not text.endswith("'"):
+        return None
+    return text[1:-1].replace("''", "'")
+
+
+def _encode_standard_single_quoted_literal(content: str) -> str:
+    return "'" + str(content or "").replace("'", "''") + "'"
 
 
 def remap_trigger_object_references(
@@ -23516,6 +24079,7 @@ def remap_trigger_object_references(
     synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]] = None,
     trigger_full: Optional[str] = None,
     trigger_view_reference_rows: Optional[List[TriggerViewReferenceRow]] = None,
+    trigger_literal_alert_rows: Optional[List[TriggerLiteralPathAlertRow]] = None,
     source_view_keys: Optional[Set[str]] = None,
 ) -> str:
     """
@@ -23627,6 +24191,30 @@ def remap_trigger_object_references(
                 reference_type=resolved.source_type or "VIEW",
                 note=note,
                 action="建议人工确认该视图语义与目标端依赖，必要时改造触发器逻辑。"
+            )
+        )
+
+    def _record_trigger_literal_alert(
+        *,
+        literal_text: str,
+        matched_reference: str,
+        suggested_reference: str,
+    ) -> None:
+        if trigger_literal_alert_rows is None:
+            return
+        literal_text_u = (literal_text or "").strip()
+        matched_u = (matched_reference or "").upper()
+        suggested_u = (suggested_reference or "").upper()
+        if not literal_text_u or not matched_u:
+            return
+        trigger_literal_alert_rows.append(
+            TriggerLiteralPathAlertRow(
+                trigger_full=trigger_full_u or "-",
+                literal_text=literal_text_u,
+                matched_reference=matched_u,
+                suggested_reference=suggested_u or "-",
+                note="检测到三段式对象路径字符串，当前未自动 remap，避免将列名/协议文本误改坏。",
+                action="请人工确认该字符串是否要求保留原样；若确需改造，请按目标对象前缀手工调整。"
             )
         )
 
@@ -23892,6 +24480,62 @@ def remap_trigger_object_references(
 
     working_sql = TRIGGER_SEQ_UNQUALIFIED_PATTERN.sub(_replace_seq, working_sql)
 
+    # 处理触发器中的字符串字面量：
+    # 1. 仅对完整匹配 SCHEMA.OBJECT 的标准单引号字面量做 remap
+    # 2. 对完整匹配 SCHEMA.OBJECT.COLUMN 的字面量只做提醒，不自动改写
+    for key, literal in list(masker.literals.items()):
+        literal_content = _decode_standard_single_quoted_literal(literal)
+        if literal_content is None:
+            continue
+        literal_stripped = literal_content.strip()
+        if not literal_stripped:
+            continue
+
+        full_match = TRIGGER_LITERAL_FULL_OBJECT_PATTERN.match(literal_stripped)
+        if full_match:
+            schema = _strip_quotes(full_match.group("schema"))
+            obj = _strip_quotes(full_match.group("object"))
+            resolved = _resolve_object_target(
+                schema,
+                obj,
+                preferred_types=TRIGGER_LITERAL_REMAP_PREFERRED_TYPES,
+                allow_public_fallback=False,
+                fallback_identity=False,
+            )
+            if resolved.target_full and resolved.target_full.upper() != f"{schema}.{obj}":
+                prefix_len = len(literal_content) - len(literal_content.lstrip())
+                suffix_len = len(literal_content) - len(literal_content.rstrip())
+                prefix = literal_content[:prefix_len] if prefix_len > 0 else ""
+                suffix = literal_content[len(literal_content.rstrip()):] if suffix_len > 0 else ""
+                masker.literals[key] = _encode_standard_single_quoted_literal(
+                    "{prefix}{target}{suffix}".format(
+                        prefix=prefix,
+                        target=resolved.target_full.upper(),
+                        suffix=suffix,
+                    )
+                )
+            continue
+
+        three_part_match = TRIGGER_LITERAL_THREE_PART_PATTERN.match(literal_stripped)
+        if not three_part_match:
+            continue
+        schema = _strip_quotes(three_part_match.group("schema"))
+        obj = _strip_quotes(three_part_match.group("object"))
+        matched_ref = f"{schema}.{obj}"
+        resolved = _resolve_object_target(
+            schema,
+            obj,
+            preferred_types=TRIGGER_LITERAL_REMAP_PREFERRED_TYPES,
+            allow_public_fallback=False,
+            fallback_identity=False,
+        )
+        if resolved.target_full or _mapping_types(matched_ref) or remap_rules_u.get(matched_ref):
+            _record_trigger_literal_alert(
+                literal_text=literal_stripped,
+                matched_reference=matched_ref,
+                suggested_reference=resolved.target_full or matched_ref,
+            )
+
     return masker.unmask(working_sql)
 
 
@@ -23909,6 +24553,7 @@ def remap_plsql_object_references(
     synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]] = None,
     trigger_full: Optional[str] = None,
     trigger_view_reference_rows: Optional[List[TriggerViewReferenceRow]] = None,
+    trigger_literal_alert_rows: Optional[List[TriggerLiteralPathAlertRow]] = None,
     trigger_source_view_keys: Optional[Set[str]] = None,
 ) -> str:
     """
@@ -23937,6 +24582,7 @@ def remap_plsql_object_references(
             synonym_meta=synonym_meta,
             trigger_full=trigger_full,
             trigger_view_reference_rows=trigger_view_reference_rows,
+            trigger_literal_alert_rows=trigger_literal_alert_rows,
             source_view_keys=trigger_source_view_keys,
         )
     
@@ -24280,7 +24926,7 @@ def clean_oracle_hints(ddl: str) -> str:
 
 
 def clean_storage_clauses(ddl: str) -> str:
-    """移除 Oracle 特有的存储子句（仅处理 SQL 代码区域）。"""
+    """显式移除 STORAGE/TABLESPACE 子句（默认清洗链不再自动启用）。"""
     if not ddl:
         return ddl
 
@@ -24349,15 +24995,11 @@ def clean_storage_clauses(ddl: str) -> str:
     return cleaned
 
 
-def clean_pragma_statements(ddl: str) -> str:
-    """移除OceanBase不支持的PRAGMA语句"""
+def _clean_pragma_statements_by_name(ddl: str, unsupported_pragmas: Set[str]) -> str:
+    """按 pragma 名称清理不支持语句。"""
     if not ddl:
         return ddl
 
-    unsupported_pragmas = {
-        "AUTONOMOUS_TRANSACTION",
-        "SERIALLY_REUSABLE",
-    }
     pragma_pattern = re.compile(
         r'(^|\n)([ \t]*PRAGMA\s+([A-Z_][A-Z0-9_]*)\b[^;]*;)',
         flags=re.IGNORECASE
@@ -24372,18 +25014,28 @@ def clean_pragma_statements(ddl: str) -> str:
     return pragma_pattern.sub(_repl, ddl)
 
 
-def clean_oracle_specific_syntax(ddl: str) -> str:
-    """清理Oracle特有语法"""
+def clean_pragma_statements(ddl: str) -> str:
+    """保留 pragma；默认清洗链不再自动删除未证实不支持的 pragma。"""
+    return ddl
+
+
+def clean_trigger_pragma_statements(ddl: str) -> str:
+    """触发器默认保留 pragma；保留该入口仅兼容旧调用。"""
+    return ddl
+
+
+def clean_xmltype_xmlschema_clause(ddl: str) -> str:
+    """移除 XMLTYPE COLUMN ... XMLSCHEMA 子句。"""
     if not ddl:
         return ddl
-    
-    # 移除BFILE数据类型引用
-    cleaned = re.sub(r'\bBFILE\b', 'BLOB', ddl, flags=re.IGNORECASE)
-    
-    # 移除XMLTYPE特殊语法
-    cleaned = re.sub(r'\s+XMLTYPE\s+COLUMN\s+\w+\s+XMLSCHEMA[^;]*', '', cleaned, flags=re.IGNORECASE)
-    
+
+    cleaned = re.sub(r'\s+XMLTYPE\s+COLUMN\s+\w+\s+XMLSCHEMA[^;]*', '', ddl, flags=re.IGNORECASE)
     return cleaned
+
+
+def clean_oracle_specific_syntax(ddl: str) -> str:
+    """保留兼容的 Oracle 专有语法清理入口。"""
+    return clean_xmltype_xmlschema_clause(ddl)
 
 
 def clean_interval_partition_clause(ddl: str) -> str:
@@ -24489,44 +25141,33 @@ def clean_semicolon_before_slash(ddl: str) -> str:
     return "\n".join(cleaned)
 
 
-def clean_long_types_in_table_ddl(ddl: str) -> str:
+def rewrite_unsupported_table_oracle_types(ddl: str) -> str:
     """
-    将 TABLE DDL 中的 LONG/LONG RAW 转换为 CLOB/BLOB。
+    将 TABLE DDL 中当前 OB 不支持的 Oracle 专有列类型改写为兼容类型。
+    注意：这属于语义改写，不是纯格式清理。
     """
     if not ddl:
         return ddl
-    masked = mask_sql_for_scan(ddl)
-    edits: List[Tuple[int, int, str]] = []
-    occupied: List[Tuple[int, int]] = []
-
-    def _occupied(start: int, end: int) -> bool:
-        for s, e in occupied:
-            if start < e and end > s:
-                return True
-        return False
-
-    for m in re.finditer(r'\bLONG\s+RAW\b', masked, flags=re.IGNORECASE):
-        edits.append((m.start(), m.end(), 'BLOB'))
-        occupied.append((m.start(), m.end()))
-    for m in re.finditer(r'\bLONG\b', masked, flags=re.IGNORECASE):
-        if _occupied(m.start(), m.end()):
-            continue
-        edits.append((m.start(), m.end(), 'CLOB'))
-
+    edits = _find_table_type_rewrite_edits(ddl)
     if not edits:
         return ddl
 
     result = ddl
-    for start, end, replacement in sorted(edits, key=lambda x: x[0], reverse=True):
+    for start, end, replacement, _src_type in sorted(edits, key=lambda x: x[0], reverse=True):
         result = result[:start] + replacement + result[end:]
     return result
+
+
+def clean_long_types_in_table_ddl(ddl: str) -> str:
+    """兼容旧调用名，实际走 Oracle 专有类型兼容改写。"""
+    return rewrite_unsupported_table_oracle_types(ddl)
 
 
 # DDL清理规则配置（更新为包含生产环境规则）
 DDL_CLEANUP_RULES = {
     # PL/SQL对象需要特殊的结尾处理和PRAGMA清理
     'PLSQL_OBJECTS': {
-        'types': ['PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'TYPE', 'TYPE BODY', 'TRIGGER'],
+        'types': ['PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'TYPE', 'TYPE BODY'],
         'rules': [
             clean_end_schema_prefix,
             clean_editionable_flags,
@@ -24534,8 +25175,24 @@ DDL_CLEANUP_RULES = {
             clean_for_loop_collection_attr_range,
             clean_plsql_ending,
             clean_semicolon_before_slash,
-            clean_pragma_statements,
-            clean_oracle_specific_syntax,
+            clean_xmltype_xmlschema_clause,
+            clean_extra_semicolons,
+            clean_extra_dots,
+            clean_trailing_whitespace,
+            clean_empty_lines,
+        ]
+    },
+
+    'TRIGGER_OBJECTS': {
+        'types': ['TRIGGER'],
+        'rules': [
+            clean_end_schema_prefix,
+            clean_editionable_flags,
+            clean_for_loop_single_dot_range,
+            clean_for_loop_collection_attr_range,
+            clean_plsql_ending,
+            clean_semicolon_before_slash,
+            clean_xmltype_xmlschema_clause,
             clean_extra_semicolons,
             clean_extra_dots,
             clean_trailing_whitespace,
@@ -24547,10 +25204,9 @@ DDL_CLEANUP_RULES = {
     'TABLE_OBJECTS': {
         'types': ['TABLE'],
         'rules': [
-            clean_long_types_in_table_ddl,
+            rewrite_unsupported_table_oracle_types,
             clean_interval_partition_clause,
-            clean_storage_clauses,
-            clean_oracle_specific_syntax,
+            clean_xmltype_xmlschema_clause,
             clean_extra_semicolons,
             clean_extra_dots,
             clean_trailing_whitespace,
@@ -24563,7 +25219,7 @@ DDL_CLEANUP_RULES = {
         'types': ['SEQUENCE'],
         'rules': [
             clean_sequence_unsupported_options,
-            clean_oracle_specific_syntax,
+            clean_xmltype_xmlschema_clause,
             clean_extra_semicolons,
             clean_extra_dots,
             clean_trailing_whitespace,
@@ -24576,7 +25232,7 @@ DDL_CLEANUP_RULES = {
         'types': ['VIEW', 'MATERIALIZED VIEW', 'SYNONYM'],
         'rules': [
             clean_editionable_flags,
-            clean_oracle_specific_syntax,
+            clean_xmltype_xmlschema_clause,
             clean_extra_semicolons,
             clean_extra_dots,
             clean_trailing_whitespace,
@@ -24588,6 +25244,14 @@ DDL_CLEANUP_RULES_LOCK = threading.RLock()
 
 
 def apply_ddl_cleanup_rules(ddl: str, obj_type: str) -> str:
+    cleaned_ddl, _actions = apply_ddl_cleanup_rules_with_audit(ddl, obj_type)
+    return cleaned_ddl
+
+
+def apply_ddl_cleanup_rules_with_audit(
+    ddl: str,
+    obj_type: str
+) -> Tuple[str, List[DdlCleanupAction]]:
     """
     根据对象类型应用相应的DDL清理规则
     
@@ -24596,10 +25260,10 @@ def apply_ddl_cleanup_rules(ddl: str, obj_type: str) -> str:
         obj_type: 对象类型
     
     Returns:
-        清理后的DDL
+        (清理后的DDL, 审计动作列表)
     """
     if not ddl:
-        return ddl
+        return ddl, []
     
     obj_type_upper = obj_type.upper()
     
@@ -24616,15 +25280,20 @@ def apply_ddl_cleanup_rules(ddl: str, obj_type: str) -> str:
     
     # 依次应用所有规则
     cleaned_ddl = ddl
+    actions: List[DdlCleanupAction] = []
     for rule_func in rules_to_apply:
         previous = cleaned_ddl
         try:
             cleaned_ddl = rule_func(cleaned_ddl)
+            action = _build_cleanup_action_from_rule(rule_func, previous, cleaned_ddl)
+            if action:
+                actions.append(action)
         except Exception as exc:
             cleaned_ddl = previous
             log.warning("DDL清理规则 %s 执行失败: %s", rule_func.__name__, exc)
-    
-    return cleaned_ddl
+
+    actions.extend(_scan_preserved_cleanup_actions(cleaned_ddl, obj_type_upper))
+    return cleaned_ddl, actions
 
 
 def add_custom_cleanup_rule(rule_name: str, obj_types: List[str], rule_func: Callable[[str], str]):
@@ -27331,6 +28000,7 @@ def generate_fixup_scripts(
     settings["_extra_object_grant_rows"] = []
     settings["_sys_c_force_candidates"] = []
     settings["_trigger_view_reference_rows"] = []
+    settings["_trigger_literal_alert_rows"] = []
     settings["_generated_fixup_dirs"] = []
     settings["_fixup_root_readme_path"] = ""
     trigger_filter_set = {t.upper() for t in (trigger_filter_entries or set())}
@@ -27647,22 +28317,78 @@ def generate_fixup_scripts(
     hint_clean_records: List[DdlHintCleanReportRow] = []
     hint_clean_lock = threading.Lock()
 
-    def record_ddl_clean(
+    def record_ddl_clean_actions(
         obj_type: str,
         obj_full: str,
-        replaced: int,
-        samples: List[Tuple[str, str]]
+        actions: List[DdlCleanupAction]
     ) -> None:
-        if replaced <= 0:
+        if not actions:
             return
-        row = DdlCleanReportRow(
-            obj_type=obj_type.upper(),
-            obj_full=obj_full,
-            replaced=replaced,
-            samples=samples or []
-        )
         with ddl_clean_lock:
-            ddl_clean_records.append(row)
+            for action in actions:
+                ddl_clean_records.append(
+                    DdlCleanReportRow(
+                        obj_type=obj_type.upper(),
+                        obj_full=obj_full,
+                        action_status=action.action_status,
+                        rule_name=action.rule_name,
+                        category=action.category,
+                        evidence_level=action.evidence_level,
+                        change_count=int(action.change_count or 0),
+                        note=action.note,
+                        samples=list(action.samples or []),
+                    )
+                )
+
+    def build_ddl_cleanup_extra_comments(actions: List[DdlCleanupAction]) -> List[str]:
+        comments: List[str] = []
+        for action in actions:
+            if action.category != DDL_CLEAN_CATEGORY_SEMANTIC_REWRITE:
+                continue
+            comments.append(
+                "DDL_REWRITE: {rule} ({evidence}) x{count}. {note}".format(
+                    rule=action.rule_name,
+                    evidence=action.evidence_level,
+                    count=action.change_count,
+                    note=action.note,
+                )
+            )
+        return comments
+
+    def apply_fixup_cleanup_pipeline(
+        obj_type: str,
+        obj_full: str,
+        ddl_text: str,
+        *,
+        seed_actions: Optional[List[DdlCleanupAction]] = None,
+        sanitize_punctuation: bool = False,
+    ) -> Tuple[str, Optional[List[str]], List[DdlCleanupAction]]:
+        cleaned_ddl, cleanup_actions = apply_ddl_cleanup_rules_with_audit(ddl_text, obj_type)
+        actions = list(seed_actions or [])
+        actions.extend(cleanup_actions)
+        extra_comments = build_ddl_cleanup_extra_comments(actions)
+        if sanitize_punctuation and settings.get('enable_ddl_punct_sanitize', True):
+            cleaned_ddl, replaced, samples = sanitize_plsql_punctuation(cleaned_ddl, obj_type)
+            punctuation_action = _build_punctuation_cleanup_action(replaced, samples)
+            if punctuation_action:
+                sample_text = ", ".join(punctuation_action.samples)
+                suffix = f" 示例: {sample_text}" if sample_text else ""
+                log.info(
+                    "[DDL_CLEAN] %s %s 全角标点清洗 %d 处。%s",
+                    obj_type,
+                    obj_full,
+                    punctuation_action.change_count,
+                    suffix
+                )
+                actions.append(punctuation_action)
+                extra_comments.append(
+                    "DDL_CLEAN: 全角标点清洗 {count} 处。{suffix}".format(
+                        count=punctuation_action.change_count,
+                        suffix=suffix.strip() if suffix else ""
+                    ).rstrip()
+                )
+        record_ddl_clean_actions(obj_type, obj_full, actions)
+        return cleaned_ddl, (extra_comments or None), actions
 
     def record_hint_clean(
         obj_type: str,
@@ -28967,7 +29693,11 @@ def generate_fixup_scripts(
                 ddl_adj = normalize_ddl_for_ob(ddl_adj)
                 obj_full = f"{ts}.{tn}"
                 ddl_adj = apply_hint_filter('SEQUENCE', obj_full, ddl_adj)
-                ddl_adj = apply_ddl_cleanup_rules(ddl_adj, 'SEQUENCE')
+                ddl_adj, cleanup_comments, _cleanup_actions = apply_fixup_cleanup_pipeline(
+                    'SEQUENCE',
+                    obj_full,
+                    ddl_adj,
+                )
                 ddl_adj = strip_constraint_enable(ddl_adj)
                 ddl_adj = apply_fixup_idempotency(
                     ddl_adj,
@@ -28987,7 +29717,8 @@ def generate_fixup_scripts(
                     filename,
                     ddl_adj,
                     header,
-                    grants_to_add=grants_for_seq if grants_for_seq else None
+                    grants_to_add=grants_for_seq if grants_for_seq else None,
+                    extra_comments=cleanup_comments,
                 )
             finally:
                 seq_progress()
@@ -29054,7 +29785,11 @@ def generate_fixup_scripts(
                 ddl_adj = normalize_ddl_for_ob(ddl_adj)
                 obj_full = f"{ts}.{tt}"
                 ddl_adj = apply_hint_filter('TABLE', obj_full, ddl_adj)
-                ddl_adj = apply_ddl_cleanup_rules(ddl_adj, 'TABLE')
+                ddl_adj, cleanup_comments, _cleanup_actions = apply_fixup_cleanup_pipeline(
+                    'TABLE',
+                    obj_full,
+                    ddl_adj,
+                )
                 ddl_adj = strip_constraint_enable(ddl_adj)
                 ddl_adj = strip_enable_novalidate(ddl_adj)
                 invisible_sql = build_invisible_column_alter_sql(
@@ -29090,7 +29825,8 @@ def generate_fixup_scripts(
                     filename,
                     ddl_adj,
                     header,
-                    grants_to_add=grants_for_table if grants_for_table else None
+                    grants_to_add=grants_for_table if grants_for_table else None,
+                    extra_comments=cleanup_comments,
                 )
                 progress_label = ddl_source_label.lower()
             finally:
@@ -29147,7 +29883,11 @@ def generate_fixup_scripts(
                     ddl_adj = normalize_ddl_for_ob(ddl_adj)
                     obj_full = f"{ts}.{tt}"
                     ddl_adj = apply_hint_filter('TABLE', obj_full, ddl_adj)
-                    ddl_adj = apply_ddl_cleanup_rules(ddl_adj, 'TABLE')
+                    ddl_adj, cleanup_comments, _cleanup_actions = apply_fixup_cleanup_pipeline(
+                        'TABLE',
+                        obj_full,
+                        ddl_adj,
+                    )
                     ddl_adj = strip_constraint_enable(ddl_adj)
                     ddl_adj = strip_enable_novalidate(ddl_adj)
                     invisible_sql = build_invisible_column_alter_sql(
@@ -29176,7 +29916,7 @@ def generate_fixup_scripts(
                         filename,
                         ddl_adj,
                         header,
-                        extra_comments=extra_comments
+                        extra_comments=(list(extra_comments) + list(cleanup_comments or [])) or None
                     )
                 finally:
                     table_unsup_progress()
@@ -29386,7 +30126,7 @@ def generate_fixup_scripts(
                     mark_source('VIEW', 'missing')
                 
                 # 清理DDL使其兼容OceanBase
-                cleaned_ddl = clean_view_ddl_for_oceanbase(raw_ddl, ob_version)
+                cleaned_ddl, view_cleanup_actions = clean_view_ddl_for_oceanbase_with_audit(raw_ddl, ob_version)
 
                 # 修复 dbcat DDL 的注释/列名异常
                 col_meta = oracle_meta.table_columns.get((src_schema.upper(), src_obj.upper()), {}) or {}
@@ -29422,7 +30162,12 @@ def generate_fixup_scripts(
                 final_ddl = normalize_ddl_for_ob(final_ddl)
                 obj_full = f"{tgt_schema}.{tgt_obj}"
                 final_ddl = apply_hint_filter('VIEW', obj_full, final_ddl)
-                final_ddl = apply_ddl_cleanup_rules(final_ddl, 'VIEW')
+                final_ddl, cleanup_comments, _cleanup_actions = apply_fixup_cleanup_pipeline(
+                    'VIEW',
+                    obj_full,
+                    final_ddl,
+                    seed_actions=view_cleanup_actions,
+                )
                 final_ddl = strip_constraint_enable(final_ddl)
                 final_ddl = enforce_schema_for_ddl(final_ddl, tgt_schema, 'VIEW')
                 
@@ -29444,6 +30189,8 @@ def generate_fixup_scripts(
                 extra_comments = []
                 if compat and compat.rewrite_notes:
                     extra_comments.append("rewrite_notes: " + "; ".join(compat.rewrite_notes))
+                if cleanup_comments:
+                    extra_comments.extend(cleanup_comments)
                 grants_for_view = [] if view_grants_split_enabled else collect_grants_for_object(obj_full)
                 log.info("[FIXUP]%s 写入 VIEW 脚本: %s", source_tag(ddl_source_label), filename)
                 write_fixup_file(
@@ -29496,7 +30243,7 @@ def generate_fixup_scripts(
                 else:
                     mark_source('VIEW', 'missing')
 
-                cleaned_ddl = clean_view_ddl_for_oceanbase(raw_ddl, ob_version)
+                cleaned_ddl, view_cleanup_actions = clean_view_ddl_for_oceanbase_with_audit(raw_ddl, ob_version)
                 col_meta = oracle_meta.table_columns.get((src_schema.upper(), src_obj.upper()), {}) or {}
                 cleaned_ddl = sanitize_view_ddl(cleaned_ddl, set(col_meta.keys()))
                 remapped_ddl = remap_view_dependencies(
@@ -29524,7 +30271,12 @@ def generate_fixup_scripts(
                 final_ddl = normalize_ddl_for_ob(final_ddl)
                 obj_full = f"{tgt_schema}.{tgt_obj}"
                 final_ddl = apply_hint_filter('VIEW', obj_full, final_ddl)
-                final_ddl = apply_ddl_cleanup_rules(final_ddl, 'VIEW')
+                final_ddl, cleanup_comments, _cleanup_actions = apply_fixup_cleanup_pipeline(
+                    'VIEW',
+                    obj_full,
+                    final_ddl,
+                    seed_actions=view_cleanup_actions,
+                )
                 final_ddl = strip_constraint_enable(final_ddl)
                 final_ddl = enforce_schema_for_ddl(final_ddl, tgt_schema, 'VIEW')
                 if not final_ddl.rstrip().endswith(';'):
@@ -29535,6 +30287,8 @@ def generate_fixup_scripts(
                 extra_comments = build_support_comments(support_row)
                 if compat and compat.rewrite_notes:
                     extra_comments.append("rewrite_notes: " + "; ".join(compat.rewrite_notes))
+                if cleanup_comments:
+                    extra_comments.extend(cleanup_comments)
                 log.info("[FIXUP]%s 写入不支持 VIEW 脚本: %s", source_tag(ddl_source_label), filename)
                 write_fixup_file(
                     base_dir,
@@ -29630,22 +30384,12 @@ def generate_fixup_scripts(
                 ddl_adj = normalize_ddl_for_ob(ddl_adj)
                 obj_full = f"{ts}.{to}"
                 ddl_adj = apply_hint_filter(ot, obj_full, ddl_adj)
-                ddl_adj = apply_ddl_cleanup_rules(ddl_adj, ot)
-                clean_notes = None
-                if settings.get('enable_ddl_punct_sanitize', True):
-                    ddl_adj, replaced, samples = sanitize_plsql_punctuation(ddl_adj, ot)
-                    if replaced:
-                        sample_text = ", ".join(f"{src}->{dst}" for src, dst in samples)
-                        suffix = f" 示例: {sample_text}" if sample_text else ""
-                        log.info(
-                            "[DDL_CLEAN] %s %s 全角标点清洗 %d 处。%s",
-                            ot,
-                            obj_full,
-                            replaced,
-                            suffix
-                        )
-                        record_ddl_clean(ot, obj_full, replaced, samples)
-                        clean_notes = [f"DDL_CLEAN: 全角标点清洗 {replaced} 处。{suffix}"]
+                ddl_adj, cleanup_comments, _cleanup_actions = apply_fixup_cleanup_pipeline(
+                    ot,
+                    obj_full,
+                    ddl_adj,
+                    sanitize_punctuation=True,
+                )
                 ddl_adj = strip_constraint_enable(ddl_adj)
                 ddl_adj = enforce_schema_for_ddl(ddl_adj, ts, ot)
                 ddl_adj = apply_fixup_idempotency(
@@ -29671,7 +30415,7 @@ def generate_fixup_scripts(
                     ddl_adj,
                     header,
                     grants_to_add=grants_for_this_object,
-                    extra_comments=clean_notes
+                    extra_comments=cleanup_comments
                 )
             finally:
                 other_progress()
@@ -29753,22 +30497,12 @@ def generate_fixup_scripts(
                     ddl_adj = normalize_ddl_for_ob(ddl_adj)
                     obj_full = f"{ts}.{to}"
                     ddl_adj = apply_hint_filter(ot, obj_full, ddl_adj)
-                    ddl_adj = apply_ddl_cleanup_rules(ddl_adj, ot)
-                    clean_notes = None
-                    if settings.get('enable_ddl_punct_sanitize', True):
-                        ddl_adj, replaced, samples = sanitize_plsql_punctuation(ddl_adj, ot)
-                        if replaced:
-                            sample_text = ", ".join(f"{src}->{dst}" for src, dst in samples)
-                            suffix = f" 示例: {sample_text}" if sample_text else ""
-                            log.info(
-                                "[DDL_CLEAN] %s %s 全角标点清洗 %d 处。%s",
-                                ot,
-                                obj_full,
-                                replaced,
-                                suffix
-                            )
-                            record_ddl_clean(ot, obj_full, replaced, samples)
-                            clean_notes = [f"DDL_CLEAN: 全角标点清洗 {replaced} 处。{suffix}"]
+                    ddl_adj, cleanup_comments, _cleanup_actions = apply_fixup_cleanup_pipeline(
+                        ot,
+                        obj_full,
+                        ddl_adj,
+                        sanitize_punctuation=True,
+                    )
                     ddl_adj = strip_constraint_enable(ddl_adj)
                     ddl_adj = enforce_schema_for_ddl(ddl_adj, ts, ot)
 
@@ -29776,8 +30510,8 @@ def generate_fixup_scripts(
                     filename = f"{ts}.{to}.sql"
                     header = f"不支持对象 DDL {obj_full} (源: {ss}.{so})"
                     extra_comments = build_support_comments(sr)
-                    if clean_notes:
-                        extra_comments.extend(clean_notes)
+                    if cleanup_comments:
+                        extra_comments.extend(cleanup_comments)
                     log.info("[FIXUP]%s 写入不支持 %s 脚本: %s", source_tag(ddl_source_label), ot, filename)
                     write_fixup_file(
                         base_dir,
@@ -30233,6 +30967,8 @@ def generate_fixup_scripts(
     trigger_progress = build_progress_tracker(len(trigger_tasks), "[FIXUP] (7/9) TRIGGER")
     trigger_view_reference_rows: List[TriggerViewReferenceRow] = []
     trigger_view_reference_lock = threading.Lock()
+    trigger_literal_alert_rows: List[TriggerLiteralPathAlertRow] = []
+    trigger_literal_alert_lock = threading.Lock()
     trigger_jobs: List[Callable[[], None]] = []
     for src_schema, trg_name, tgt_schema, tgt_obj, src_table, tgt_table_schema, tgt_table in trigger_tasks:
         def _job(
@@ -30279,6 +31015,7 @@ def generate_fixup_scripts(
                 # 重映射触发器中的对象引用并补全 schema
                 trigger_qualify_schema = bool(settings.get('trigger_qualify_schema', True))
                 local_view_refs: List[TriggerViewReferenceRow] = []
+                local_literal_alerts: List[TriggerLiteralPathAlertRow] = []
                 ddl_adj = remap_plsql_object_references(
                     ddl_adj,
                     'TRIGGER',
@@ -30292,11 +31029,15 @@ def generate_fixup_scripts(
                     synonym_meta=synonym_meta_map,
                     trigger_full=f"{ts}.{to}",
                     trigger_view_reference_rows=local_view_refs,
+                    trigger_literal_alert_rows=local_literal_alerts,
                     trigger_source_view_keys=trigger_source_view_keys,
                 )
                 if local_view_refs:
                     with trigger_view_reference_lock:
                         trigger_view_reference_rows.extend(local_view_refs)
+                if local_literal_alerts:
+                    with trigger_literal_alert_lock:
+                        trigger_literal_alert_rows.extend(local_literal_alerts)
                 if not trigger_qualify_schema:
                     # 保持旧逻辑：仅补全 CREATE TRIGGER 与 ON 子句
                     def _rewrite_trigger_name_and_on(text: str) -> str:
@@ -30325,21 +31066,12 @@ def generate_fixup_scripts(
                 ddl_adj = prepend_set_schema(ddl_adj, ts)
                 obj_full = f"{ts}.{to}"
                 ddl_adj = apply_hint_filter('TRIGGER', obj_full, ddl_adj)
-                ddl_adj = apply_ddl_cleanup_rules(ddl_adj, 'TRIGGER')
-                clean_notes = None
-                if settings.get('enable_ddl_punct_sanitize', True):
-                    ddl_adj, replaced, samples = sanitize_plsql_punctuation(ddl_adj, 'TRIGGER')
-                    if replaced:
-                        sample_text = ", ".join(f"{src}->{dst}" for src, dst in samples)
-                        suffix = f" 示例: {sample_text}" if sample_text else ""
-                        log.info(
-                            "[DDL_CLEAN] TRIGGER %s 全角标点清洗 %d 处。%s",
-                            obj_full,
-                            replaced,
-                            suffix
-                        )
-                        record_ddl_clean('TRIGGER', obj_full, replaced, samples)
-                        clean_notes = [f"DDL_CLEAN: 全角标点清洗 {replaced} 处。{suffix}"]
+                ddl_adj, cleanup_comments, _cleanup_actions = apply_fixup_cleanup_pipeline(
+                    'TRIGGER',
+                    obj_full,
+                    ddl_adj,
+                    sanitize_punctuation=True,
+                )
                 ddl_adj = strip_constraint_enable(ddl_adj)
                 ddl_adj = enforce_schema_for_ddl(ddl_adj, ts, 'TRIGGER')
                 ddl_adj = apply_fixup_idempotency(
@@ -30375,7 +31107,7 @@ def generate_fixup_scripts(
                     ddl_adj,
                     header,
                     grants_to_add=sorted(grants_for_trigger) if grants_for_trigger else None,
-                    extra_comments=clean_notes
+                    extra_comments=cleanup_comments
                 )
             finally:
                 trigger_progress()
@@ -30398,6 +31130,23 @@ def generate_fixup_scripts(
         )
     else:
         settings["_trigger_view_reference_rows"] = []
+    if trigger_literal_alert_rows:
+        dedup_literal_rows = sorted(
+            set(trigger_literal_alert_rows),
+            key=lambda row: (
+                row.trigger_full,
+                row.literal_text,
+                row.matched_reference,
+                row.suggested_reference,
+            )
+        )
+        settings["_trigger_literal_alert_rows"] = dedup_literal_rows
+        log.info(
+            "[FIXUP] 触发器三段式对象路径字符串提醒：%d 条（未自动 remap）。",
+            len(dedup_literal_rows)
+        )
+    else:
+        settings["_trigger_literal_alert_rows"] = []
 
     if (
         generate_status_fixup
@@ -30877,7 +31626,11 @@ def generate_fixup_scripts(
     if ddl_clean_records and report_dir and report_timestamp:
         clean_report_path = export_ddl_clean_report(ddl_clean_records, report_dir, report_timestamp)
         if clean_report_path:
-            log.info("[DDL_CLEAN] 全角标点清洗报告已输出: %s", clean_report_path)
+            settings["_ddl_cleanup_report_path"] = str(clean_report_path)
+            log.info("[DDL_CLEAN] DDL 清理/改写明细已输出: %s", clean_report_path)
+    else:
+        settings.pop("_ddl_cleanup_report_path", None)
+    settings["_ddl_cleanup_summary"] = summarize_ddl_cleanup_records(ddl_clean_records)
 
     if hint_clean_records:
         total_removed = sum(row.removed for row in hint_clean_records)
@@ -31145,8 +31898,10 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "AUX", "Fixup 跳过汇总"
     if name.startswith("ddl_format_report_"):
         return "AUX", "DDL 格式化报告"
+    if name.startswith("ddl_cleanup_detail_"):
+        return "DETAIL", "DDL 清理/改写明细"
     if name.startswith("ddl_punct_clean_"):
-        return "AUX", "全角标点清洗报告"
+        return "AUX", "全角标点清洗报告(旧版)"
     if name.startswith("ddl_hint_clean_"):
         return "AUX", "DDL hint 清洗报告"
     if name.startswith("missing_objects_detail_"):
@@ -31175,6 +31930,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "临时表触发器不支持明细"
     if name.startswith("triggers_view_reference_detail_"):
         return "DETAIL", "触发器视图引用提醒明细"
+    if name.startswith("triggers_literal_object_path_detail_"):
+        return "DETAIL", "触发器对象路径字符串提醒明细"
     if name.startswith("migration_focus_"):
         return "DETAIL", "迁移聚焦清单"
     if name.startswith("extra_targets_detail_"):
@@ -31239,6 +31996,7 @@ def build_operator_handling_order(
     sys_c_force_candidate_count: int = 0,
     case_sensitive_findings_count: int = 0,
     trigger_view_reference_count: int = 0,
+    trigger_literal_alert_count: int = 0,
     extra_public_grant_count: int = 0,
 ) -> List[str]:
     report_parent = Path(report_file).parent if report_file else None
@@ -31324,6 +32082,11 @@ def build_operator_handling_order(
             steps,
             f"若触发器引用视图，再看 triggers_view_reference_detail_{report_ts_text}.txt 评估是否需要改造。"
         )
+    if trigger_literal_alert_count and report_ts_text:
+        _append_unique_guide_step(
+            steps,
+            f"若触发器中存在三段式对象路径字符串，再看 triggers_literal_object_path_detail_{report_ts_text}.txt 评估是否需要手工改造。"
+        )
     return steps
 
 
@@ -31335,9 +32098,11 @@ def build_report_index_guide_entries(
     unsupported_detail_path: Optional[Path],
     table_presence_detail_path: Optional[Path],
     target_extra_grant_detail_path: Optional[Path],
+    trigger_literal_alert_path: Optional[Path],
     blocked_total: int,
     table_presence_risk_cnt: int,
     extra_public_grant_count: int,
+    trigger_literal_alert_count: int,
 ) -> List[ReportIndexEntry]:
     entries: List[ReportIndexEntry] = []
 
@@ -31358,6 +32123,8 @@ def build_report_index_guide_entries(
     _add(migration_focus_path, "再看迁移聚焦，区分可修补缺失与需人工处理项")
     if extra_public_grant_count > 0:
         _add(target_extra_grant_detail_path, "若存在 PUBLIC 扩权，先审这里，再决定是否执行 grants_revoke")
+    if trigger_literal_alert_count > 0:
+        _add(trigger_literal_alert_path, "若触发器中有三段式对象路径字符串，先在这里确认哪些需要人工改造")
     if fixup_root_readme_path:
         _add(Path(str(fixup_root_readme_path)), "进入 fixup_scripts 前，先看这个目录导航文件")
     return entries
@@ -32151,6 +32918,47 @@ def export_trigger_view_references_detail(
     return write_pipe_report("触发器视图引用提醒明细", header_fields, data_rows, output_path)
 
 
+def export_trigger_literal_alert_detail(
+    rows: List[TriggerLiteralPathAlertRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出触发器中的三段式对象路径字符串提醒，便于人工确认是否需要改造。
+    """
+    if not report_dir or not report_timestamp or not rows:
+        return None
+    output_path = Path(report_dir) / f"triggers_literal_object_path_detail_{report_timestamp}.txt"
+    rows_sorted = sorted(
+        rows,
+        key=lambda r: (
+            r.trigger_full or "-",
+            r.literal_text or "-",
+            r.matched_reference or "-",
+            r.suggested_reference or "-",
+        )
+    )
+    header_fields = [
+        "TRIGGER",
+        "LITERAL_TEXT",
+        "MATCHED_REFERENCE",
+        "SUGGESTED_REFERENCE",
+        "NOTE",
+        "ACTION",
+    ]
+    data_rows: List[List[str]] = []
+    for row in rows_sorted:
+        data_rows.append([
+            row.trigger_full or "-",
+            row.literal_text or "-",
+            row.matched_reference or "-",
+            row.suggested_reference or "-",
+            row.note or "-",
+            row.action or "-",
+        ])
+    return write_pipe_report("触发器对象路径字符串提醒明细", header_fields, data_rows, output_path)
+
+
 def export_migration_focus_report(
     missing_rows: List[ObjectSupportReportRow],
     unsupported_rows: List[ObjectSupportReportRow],
@@ -32629,62 +33437,84 @@ def export_ddl_clean_report(
     report_timestamp: Optional[str]
 ) -> Optional[Path]:
     """
-    输出 PL/SQL 全角标点清洗报告。
+    输出 DDL 清理/改写明细报告。
     """
     if not report_dir or not rows or not report_timestamp:
         return None
 
-    output_path = Path(report_dir) / f"ddl_punct_clean_{report_timestamp}.txt"
+    output_path = Path(report_dir) / f"ddl_cleanup_detail_{report_timestamp}.txt"
     rows_sorted = sorted(rows, key=lambda r: (r.obj_type, r.obj_full))
-    total_replaced = sum(r.replaced for r in rows_sorted)
-    lines: List[str] = [
-        "# PL/SQL 全角标点清洗报告",
-        f"# total_objects={len(rows_sorted)} total_replacements={total_replaced}",
-        "# 字段说明: TYPE | OBJECT | REPLACED | SAMPLES"
+    header_fields = [
+        "TYPE",
+        "OBJECT",
+        "STATUS",
+        "RULE",
+        "CATEGORY",
+        "EVIDENCE_LEVEL",
+        "CHANGE_COUNT",
+        "NOTE",
+        "SAMPLES",
     ]
-
-    sample_texts: List[str] = []
+    report_rows: List[List[str]] = []
     for row in rows_sorted:
-        if row.samples:
-            sample_texts.append(", ".join(f"{src}->{dst}" for src, dst in row.samples))
-        else:
-            sample_texts.append("-")
-
-    type_w = max(len("TYPE"), max((len(r.obj_type) for r in rows_sorted), default=0))
-    obj_w = max(len("OBJECT"), max((len(r.obj_full) for r in rows_sorted), default=0))
-    replaced_w = max(len("REPLACED"), max((len(str(r.replaced)) for r in rows_sorted), default=0))
-    sample_w = max(len("SAMPLES"), max((len(text) for text in sample_texts), default=0))
-
-    header = (
-        f"{'TYPE'.ljust(type_w)}  "
-        f"{'OBJECT'.ljust(obj_w)}  "
-        f"{'REPLACED'.rjust(replaced_w)}  "
-        f"{'SAMPLES'.ljust(sample_w)}"
+        report_rows.append([
+            row.obj_type,
+            row.obj_full,
+            row.action_status,
+            row.rule_name,
+            row.category,
+            row.evidence_level,
+            str(int(row.change_count or 0)),
+            row.note or "-",
+            "; ".join(row.samples) if row.samples else "-",
+        ])
+    title = (
+        "DDL 清理/改写明细"
+        f" (rows={len(rows_sorted)}, changes={sum(int(r.change_count or 0) for r in rows_sorted)})"
     )
-    lines.append(header)
-    lines.append(
-        f"{'-' * type_w}  "
-        f"{'-' * obj_w}  "
-        f"{'-' * replaced_w}  "
-        f"{'-' * sample_w}"
-    )
+    result = write_pipe_report(title, header_fields, report_rows, output_path)
+    if not result:
+        log.warning("写入 DDL 清理/改写报告失败 %s", output_path)
+    return result
 
-    for row, sample in zip(rows_sorted, sample_texts):
-        lines.append(
-            f"{row.obj_type.ljust(type_w)}  "
-            f"{row.obj_full.ljust(obj_w)}  "
-            f"{str(row.replaced).rjust(replaced_w)}  "
-            f"{sample.ljust(sample_w)}"
-        )
 
-    try:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        content = "\n".join(lines).rstrip() + "\n"
-        output_path.write_text(content, encoding="utf-8")
-        return output_path
-    except OSError as exc:
-        log.warning("写入全角标点清洗报告失败 %s: %s", output_path, exc)
-        return None
+def summarize_ddl_cleanup_records(rows: List[DdlCleanReportRow]) -> Dict[str, object]:
+    summary: Dict[str, object] = {
+        "total_rows": 0,
+        "total_changes": 0,
+        "applied_rows": 0,
+        "applied_changes": 0,
+        "preserved_rows": 0,
+        "preserved_changes": 0,
+        "semantic_rewrite_rows": 0,
+        "semantic_rewrite_changes": 0,
+        "by_category": {},
+    }
+    if not rows:
+        return summary
+
+    by_category: Dict[str, Dict[str, int]] = defaultdict(lambda: {"rows": 0, "changes": 0})
+    for row in rows:
+        change_count = int(row.change_count or 0)
+        summary["total_rows"] += 1
+        summary["total_changes"] += change_count
+        category_bucket = by_category[row.category]
+        category_bucket["rows"] += 1
+        category_bucket["changes"] += change_count
+        if row.action_status == DDL_CLEAN_ACTION_APPLIED:
+            summary["applied_rows"] += 1
+            summary["applied_changes"] += change_count
+        elif row.action_status == DDL_CLEAN_ACTION_PRESERVED:
+            summary["preserved_rows"] += 1
+            summary["preserved_changes"] += change_count
+        if (
+            row.action_status == DDL_CLEAN_ACTION_APPLIED
+            and row.category == DDL_CLEAN_CATEGORY_SEMANTIC_REWRITE
+        ):
+            summary["semantic_rewrite_rows"] += 1
+            summary["semantic_rewrite_changes"] += change_count
+    summary["by_category"] = dict(by_category)
+    return summary
 
 
 def export_ddl_hint_clean_report(
@@ -35247,10 +36077,14 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "UNSUPPORTED_GRANT_DETAIL"
     if name.startswith("target_extra_grants_detail_"):
         return "TARGET_EXTRA_GRANT_DETAIL"
+    if name.startswith("ddl_cleanup_detail_"):
+        return "DDL_CLEANUP_DETAIL"
     if name.startswith("triggers_temp_table_unsupported_detail_"):
         return "TRIGGER_TEMP_UNSUPPORTED_DETAIL"
     if name.startswith("triggers_view_reference_detail_"):
         return "TRIGGER_VIEW_REFERENCE_DETAIL"
+    if name.startswith("triggers_literal_object_path_detail_"):
+        return "TRIGGER_LITERAL_OBJECT_PATH_DETAIL"
     if "missed_tables_views_for_OMS" in rel_path:
         return "OMS_MISSING_RULES"
     return "OTHER"
@@ -35297,6 +36131,7 @@ def _infer_artifact_status(
         "UNSUPPORTED_GRANT_DETAIL",
         "DEFERRED_GRANT_DETAIL",
         "TARGET_EXTRA_GRANT_DETAIL",
+        "DDL_CLEANUP_DETAIL",
     }:
         return ("IN_DB", "") if store_scope in {"core", "full"} else ("TXT_ONLY", "")
     if artifact_type == "NAME_COLLISION_DETAIL":
@@ -38014,6 +38849,10 @@ def build_run_summary(
     table_presence_summary: Optional[TablePresenceSummary] = None,
     excluded_object_rows: Optional[List[Dict[str, object]]] = None,
     fixup_root_readme_path: str = "",
+    trigger_view_reference_count: int = 0,
+    trigger_literal_alert_count: int = 0,
+    ddl_cleanup_summary: Optional[Dict[str, object]] = None,
+    ddl_cleanup_report_path: Optional[Path] = None,
 ) -> RunSummary:
     end_time = datetime.now()
     total_seconds = time.perf_counter() - ctx.start_perf
@@ -38161,6 +39000,10 @@ def build_run_summary(
     unsupported_by_type: Dict[str, int] = build_unsupported_summary_counts(support_summary, extra_results)
     unsupported_total = sum(int(v or 0) for v in unsupported_by_type.values())
     excluded_by_type: Dict[str, int] = build_excluded_summary_counts(excluded_object_rows)
+    ddl_cleanup_summary = dict(ddl_cleanup_summary or {})
+    ddl_cleanup_applied_rows = int(ddl_cleanup_summary.get("applied_rows", 0) or 0)
+    ddl_cleanup_preserved_rows = int(ddl_cleanup_summary.get("preserved_rows", 0) or 0)
+    ddl_cleanup_semantic_rows = int(ddl_cleanup_summary.get("semantic_rewrite_rows", 0) or 0)
     findings: List[str] = [
         f"主对象: 缺失 {missing_count}, 不匹配 {mismatched_count}, 多余 {extra_target_cnt}, 仅打印 {skipped_count}"
     ]
@@ -38170,6 +39013,14 @@ def build_run_summary(
     if unsupported_by_type:
         items = ", ".join(f"{k}={v}" for k, v in sorted(unsupported_by_type.items()))
         findings.append(f"缺失中不支持/阻断/待确认: {items}")
+    if ddl_cleanup_applied_rows or ddl_cleanup_preserved_rows:
+        findings.append(
+            "DDL 清理/改写: 应用 {applied}, 语义改写 {semantic}, 保留提醒 {preserved}".format(
+                applied=ddl_cleanup_applied_rows,
+                semantic=ddl_cleanup_semantic_rows,
+                preserved=ddl_cleanup_preserved_rows,
+            )
+        )
     if extraneous_count:
         findings.append(f"无效 remap 规则: {extraneous_count}")
     if remap_conflict_cnt:
@@ -38255,6 +39106,10 @@ def build_run_summary(
                     not_found=trigger_summary.get("not_found", 0)
                 )
             )
+    if trigger_view_reference_count:
+        findings.append(f"触发器视图引用提醒: {trigger_view_reference_count} 条")
+    if trigger_literal_alert_count:
+        findings.append(f"触发器对象路径字符串提醒: {trigger_literal_alert_count} 条")
 
     attention: List[str] = []
     if missing_count or mismatched_count or extra_target_cnt:
@@ -38283,6 +39138,12 @@ def build_run_summary(
         attention.append("授权脚本生成依赖 generate_fixup=true，当前未输出授权脚本。")
     if extra_public_grant_count:
         attention.append("检测到目标端存在源端未声明的 PUBLIC 对象授权，存在扩大授权风险。")
+    if trigger_literal_alert_count:
+        attention.append("触发器中存在 SCHEMA.OBJECT.COLUMN 形式的字符串路径，程序已保守保留原文，请人工确认。")
+    if ddl_cleanup_semantic_rows:
+        attention.append("本次 fixup 中存在 DDL 语义改写，请优先复核 ddl_cleanup_detail 明细和脚本头注释。")
+    if ddl_cleanup_preserved_rows:
+        attention.append("部分 Oracle 子句已改为默认保留策略，需结合目标环境确认是否仍需人工精简。")
     if config_diagnostics:
         attention.append(f"配置诊断提示 {len(config_diagnostics)} 项（详见报告）。")
 
@@ -38297,6 +39158,8 @@ def build_run_summary(
         table_presence_risk_cnt=table_presence_risk_cnt,
         missing_view_cnt=missing_view_cnt,
         unsupported_view_cnt=unsupported_view_cnt,
+        trigger_view_reference_count=trigger_view_reference_count,
+        trigger_literal_alert_count=trigger_literal_alert_count,
         extra_public_grant_count=extra_public_grant_count,
     )
     if remap_conflict_cnt:
@@ -38340,6 +39203,11 @@ def build_run_summary(
             )
         else:
             _append_unique_guide_step(next_steps, "若需要按类型展开，再看 report_index_*.txt 里的 GUIDE/DETAIL 条目。")
+    if ddl_cleanup_semantic_rows and ddl_cleanup_report_path:
+        _append_unique_guide_step(
+            next_steps,
+            f"脚本头出现 DDL_REWRITE 注释时，请同步核对 {ddl_cleanup_report_path} 中的语义改写明细。"
+        )
 
     return RunSummary(
         start_time=ctx.start_time,
@@ -38497,6 +39365,12 @@ def print_final_report(
         1 for row in extra_object_grant_rows
         if (row.grantee or "").upper() == "PUBLIC"
     )
+    ddl_cleanup_summary = dict((settings.get("_ddl_cleanup_summary") or {}) if settings else {})
+    ddl_cleanup_report_path = (
+        Path(settings["_ddl_cleanup_report_path"])
+        if settings and settings.get("_ddl_cleanup_report_path")
+        else None
+    )
 
     if extra_results is None:
         extra_results = {
@@ -38585,6 +39459,8 @@ def print_final_report(
     sys_c_force_enabled = bool((settings or {}).get("fixup_drop_sys_c_columns", False))
     trigger_view_reference_rows = list((settings or {}).get("_trigger_view_reference_rows") or [])
     trigger_view_reference_count = len(trigger_view_reference_rows)
+    trigger_literal_alert_rows = list((settings or {}).get("_trigger_literal_alert_rows") or [])
+    trigger_literal_alert_count = len(trigger_literal_alert_rows)
     if usability_summary:
         usability_checked_cnt = usability_summary.total_checked
         usability_usable_cnt = usability_summary.total_usable
@@ -38797,6 +39673,10 @@ def print_final_report(
             lines.append(
                 f"触发器视图引用提醒: {trigger_view_reference_count} (已保留视图语义，不改写为表)"
             )
+        if trigger_literal_alert_count:
+            lines.append(
+                f"触发器对象路径字符串提醒: {trigger_literal_alert_count} (SCHEMA.OBJECT.COLUMN 未自动改写)"
+            )
         if blocked_total:
             lines.append(f"不支持/阻断/待确认: {blocked_total}")
         next_steps = build_operator_handling_order(
@@ -38813,6 +39693,7 @@ def print_final_report(
             sys_c_force_candidate_count=sys_c_force_candidate_count,
             case_sensitive_findings_count=case_sensitive_findings_count,
             trigger_view_reference_count=trigger_view_reference_count,
+            trigger_literal_alert_count=trigger_literal_alert_count,
             extra_public_grant_count=extra_public_grant_count,
         )
         if next_steps:
@@ -38924,6 +39805,19 @@ def print_final_report(
         focus_text.append("\n详见: ", style="info")
         focus_text.append(f"migration_focus_{report_ts}.txt", style="info")
     summary_table.add_row("[bold]迁移聚焦[/bold]", focus_text)
+
+    if ddl_cleanup_summary:
+        cleanup_text = Text()
+        cleanup_text.append("已应用: ", style="info")
+        cleanup_text.append(str(int(ddl_cleanup_summary.get("applied_rows", 0) or 0)), style="ok")
+        cleanup_text.append("\n语义改写: ", style="mismatch")
+        cleanup_text.append(str(int(ddl_cleanup_summary.get("semantic_rewrite_rows", 0) or 0)))
+        cleanup_text.append("\n保留提醒: ", style="info")
+        cleanup_text.append(str(int(ddl_cleanup_summary.get("preserved_rows", 0) or 0)))
+        if ddl_cleanup_report_path:
+            cleanup_text.append("\n详见: ", style="info")
+            cleanup_text.append(ddl_cleanup_report_path.name, style="info")
+        summary_table.add_row("[bold]DDL 清理/改写[/bold]", cleanup_text)
 
     if package_rows:
         pkg_text = Text()
@@ -39041,6 +39935,17 @@ def print_final_report(
             trigger_view_text.append("\n详见: ", style="info")
             trigger_view_text.append(f"triggers_view_reference_detail_{report_ts}.txt", style="info")
         summary_table.add_row("[bold]触发器视图引用[/bold]", trigger_view_text)
+
+    if trigger_literal_alert_count:
+        trigger_literal_text = Text()
+        trigger_literal_text.append("触发器中检测到三段式对象路径字符串: ", style="mismatch")
+        trigger_literal_text.append(str(trigger_literal_alert_count), style="mismatch")
+        trigger_literal_text.append("\n处理策略: ", style="info")
+        trigger_literal_text.append("不自动 remap，避免将列名/协议文本误改坏。", style="info")
+        if report_ts:
+            trigger_literal_text.append("\n详见: ", style="info")
+            trigger_literal_text.append(f"triggers_literal_object_path_detail_{report_ts}.txt", style="info")
+        summary_table.add_row("[bold]触发器字符串对象路径[/bold]", trigger_literal_text)
 
     if trigger_list_summary and trigger_list_summary.get("enabled"):
         filter_text = Text()
@@ -39177,6 +40082,10 @@ def print_final_report(
                 detail_hint_lines.append(f"列顺序差异明细: column_order_mismatch_detail_{report_ts}.txt")
             if noise_suppressed_count and report_ts:
                 detail_hint_lines.append(f"降噪明细: noise_suppressed_detail_{report_ts}.txt")
+        if ddl_cleanup_report_path:
+            detail_hint_lines.append(
+                f"DDL 清理/改写明细: {ddl_cleanup_report_path.name}"
+            )
         if extra_results.get("index_unsupported"):
             suffix = f"_{report_ts}" if report_ts else ""
             detail_hint_lines.append(
@@ -39229,6 +40138,10 @@ def print_final_report(
         if trigger_view_reference_count and report_ts:
             detail_hint_lines.append(
                 f"触发器视图引用提醒明细: triggers_view_reference_detail_{report_ts}.txt"
+            )
+        if trigger_literal_alert_count and report_ts:
+            detail_hint_lines.append(
+                f"触发器对象路径字符串提醒明细: triggers_literal_object_path_detail_{report_ts}.txt"
             )
         console.print(Panel.fit("\n".join(detail_hint_lines), style="info", width=section_width))
 
@@ -39753,6 +40666,14 @@ def print_final_report(
             table_presence_summary=table_presence_summary,
             excluded_object_rows=excluded_object_rows,
             fixup_root_readme_path=(settings.get("_fixup_root_readme_path", "") if settings else ""),
+            trigger_view_reference_count=len((settings.get("_trigger_view_reference_rows") or []) if settings else []),
+            trigger_literal_alert_count=len((settings.get("_trigger_literal_alert_rows") or []) if settings else []),
+            ddl_cleanup_summary=(settings.get("_ddl_cleanup_summary") if settings else None),
+            ddl_cleanup_report_path=(
+                Path(settings["_ddl_cleanup_report_path"])
+                if settings and settings.get("_ddl_cleanup_report_path")
+                else None
+            ),
         )
         notice_state_path, notice_state = load_notice_state(settings.get("config_dir") if settings else None)
         runtime_notices = build_runtime_change_notices(
@@ -40062,6 +40983,17 @@ def print_final_report(
             trigger_view_reference_count if trigger_view_reference_path else None,
             "触发器视图引用提醒明细"
         )
+        trigger_literal_alert_path = export_trigger_literal_alert_detail(
+            trigger_literal_alert_rows,
+            report_path.parent,
+            report_ts
+        )
+        _add_index_entry(
+            "DETAIL",
+            trigger_literal_alert_path,
+            trigger_literal_alert_count if trigger_literal_alert_path else None,
+            "触发器对象路径字符串提醒明细"
+        )
         deferred_validate_detail_path = None
         deferred_validate_count = int((settings or {}).get("_constraint_validate_deferred_count", 0) or 0)
         deferred_validate_path_raw = str((settings or {}).get("_constraint_validate_deferred_report_path", "") or "").strip()
@@ -40254,9 +41186,12 @@ def print_final_report(
             ddl_format_path = report_path.parent / f"ddl_format_report_{report_ts}.txt"
             if ddl_format_path.exists():
                 _add_index_entry("AUX", ddl_format_path, None, "DDL 格式化报告")
+            ddl_cleanup_path = report_path.parent / f"ddl_cleanup_detail_{report_ts}.txt"
+            if ddl_cleanup_path.exists():
+                _add_index_entry("DETAIL", ddl_cleanup_path, None, "DDL 清理/改写明细")
             ddl_punct_path = report_path.parent / f"ddl_punct_clean_{report_ts}.txt"
             if ddl_punct_path.exists():
-                _add_index_entry("AUX", ddl_punct_path, None, "全角标点清洗报告")
+                _add_index_entry("AUX", ddl_punct_path, None, "全角标点清洗报告(旧版)")
             ddl_hint_path = report_path.parent / f"ddl_hint_clean_{report_ts}.txt"
             if ddl_hint_path.exists():
                 _add_index_entry("AUX", ddl_hint_path, None, "DDL hint 清洗报告")
@@ -40315,6 +41250,8 @@ def print_final_report(
                 log.info("临时表触发器不支持明细已输出到: %s", temp_trigger_unsupported_path)
             if trigger_view_reference_path:
                 log.info("触发器视图引用提醒明细已输出到: %s", trigger_view_reference_path)
+            if trigger_literal_alert_path:
+                log.info("触发器对象路径字符串提醒明细已输出到: %s", trigger_literal_alert_path)
             if blocked_index_path:
                 log.info("索引阻断明细已输出到: %s", blocked_index_path)
             if blocked_constraint_path:
@@ -40366,9 +41303,11 @@ def print_final_report(
                 unsupported_detail_path=unsupported_detail_path,
                 table_presence_detail_path=table_presence_detail_path,
                 target_extra_grant_detail_path=target_extra_grant_detail_path,
+                trigger_literal_alert_path=trigger_literal_alert_path,
                 blocked_total=blocked_total_for_guide,
                 table_presence_risk_cnt=table_presence_risk_cnt,
                 extra_public_grant_count=extra_public_grant_count,
+                trigger_literal_alert_count=trigger_literal_alert_count,
             )
             if guide_entries:
                 guide_paths = {entry.path for entry in guide_entries}

@@ -1316,6 +1316,37 @@ SELECT file_path, line_no, DBMS_LOB.SUBSTR(line_text, 4000, 1) AS line_text
    AND artifact_type = 'TRIGGER_VIEW_REFERENCE_DETAIL'
  ORDER BY file_path, line_no;
 
+------------------------------------------------------------
+K. 触发器对象路径字符串提醒（SQL-88）
+------------------------------------------------------------
+
+-- SQL-88 触发器中 SCHEMA.OBJECT.COLUMN 字符串路径提醒明细
+-- 说明：
+-- 1) 触发器中完整等于 SCHEMA.OBJECT 的字符串字面量，程序已按 remap 自动改写
+-- 2) 触发器中 SCHEMA.OBJECT.COLUMN 三段式字符串，程序默认不自动改，避免误改列名/协议文本/日志内容
+-- 3) 若这里出现记录，建议人工确认是否需要手工改造
+SELECT file_path, line_no, DBMS_LOB.SUBSTR(line_text, 4000, 1) AS line_text
+  FROM DIFF_REPORT_ARTIFACT_LINE
+ WHERE report_id = :report_id
+   AND artifact_type = 'TRIGGER_LITERAL_OBJECT_PATH_DETAIL'
+ ORDER BY file_path, line_no;
+
+------------------------------------------------------------
+L. DDL 清理/改写明细（SQL-89）
+------------------------------------------------------------
+
+-- SQL-89 DDL 清理/改写明细
+-- 说明：
+-- 1) STATUS=APPLIED 代表程序实际做了清理/改写
+-- 2) STATUS=PRESERVED 代表该子句已改为默认保留，只提醒不自动删除
+-- 3) CATEGORY 可区分 format_only / syntax_compat / environment_detach / semantic_rewrite
+-- 4) 遇到 semantic_rewrite，建议同时核对 fixup SQL 头部的 DDL_REWRITE 注释
+SELECT file_path, line_no, DBMS_LOB.SUBSTR(line_text, 4000, 1) AS line_text
+  FROM DIFF_REPORT_ARTIFACT_LINE
+ WHERE report_id = :report_id
+   AND artifact_type = 'DDL_CLEANUP_DETAIL'
+ ORDER BY file_path, line_no;
+
 ============================================================
 建议排查顺序（实战）
 1) SQL-01/02/08/10 先建立全局认知。
@@ -1328,4 +1359,6 @@ SELECT file_path, line_no, DBMS_LOB.SUBSTR(line_text, 4000, 1) AS line_text
 8) SQL-78~81 单独处理“源有数据/目标空表”风险清单。
 9) SQL-82~86 复核单对象根因（对客户反馈点做一锤定音）。
 10) SQL-87 排查触发器中的视图引用（确认是否需要人工改造）。
+11) SQL-88 排查触发器中的三段式对象路径字符串（确认是否需要人工改造）。
+12) SQL-89 复核 DDL 清理/改写明细，重点看 semantic_rewrite 与 preserved 项。
 ============================================================
