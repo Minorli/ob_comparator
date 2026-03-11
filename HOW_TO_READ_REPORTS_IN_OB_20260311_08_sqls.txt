@@ -1,7 +1,8 @@
 ============================================================
 OceanBase 报告库排查手册（report_to_db）
-文件: HOW_TO_READ_REPORTS_IN_OB_20260304_10_sqls.txt
-说明: 兼容旧文件名的入口文件；本文件名已过期，请优先使用 HOW_TO_READ_REPORTS_IN_OB_latest.txt 或 HOW_TO_READ_REPORTS_IN_OB_20260311_08_sqls.txt
+文件: HOW_TO_READ_REPORTS_IN_OB_20260311_08_sqls.txt
+来源: HOW_TO_READ_REPORTS_IN_OB_latest.txt
+说明: 这是 2026-03-11 08 点同步出的版本化快照，供交付包与人工查阅使用
 ============================================================
 
 使用说明
@@ -403,12 +404,12 @@ SELECT status, line_no, object_type, schema_name, object_name, detail
  WHERE report_id = :report_id
  ORDER BY line_no, status, object_type, schema_name, object_name;
 
--- SQL-35C 创建时间截断过滤对象（object_created_before）
-SELECT object_type, schema_name, object_name, detail
+-- SQL-35C 创建时间范围过滤对象（object_created_before）
+SELECT status, object_type, schema_name, object_name, detail
   FROM DIFF_REPORT_EXCLUDED_OBJECT
  WHERE report_id = :report_id
-   AND status = 'FILTERED_BY_CREATED_AFTER_CUTOFF'
- ORDER BY object_type, schema_name, object_name;
+   AND status IN ('FILTERED_BY_CREATED_AFTER_CUTOFF', 'FILTERED_BY_MISSING_CREATED')
+ ORDER BY status, object_type, schema_name, object_name;
 
 ------------------------------------------------------------
 D. 不一致（MISMATCHED）深挖（SQL-36 ~ SQL-46）
