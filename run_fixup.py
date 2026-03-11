@@ -91,6 +91,18 @@ class RuntimeNotice(NamedTuple):
     message: str
 
 
+class ManualActionNoticeRow(NamedTuple):
+    priority: str
+    stage: str
+    category: str
+    count: int
+    default_behavior: str
+    primary_artifact: str
+    related_fixup_dir: str
+    why: str
+    recommended_action: str
+
+
 def resolve_notice_state_path(config_dir: Optional[Union[str, Path]]) -> Path:
     base_dir = Path(config_dir).expanduser() if config_dir else Path.cwd()
     try:
@@ -161,6 +173,115 @@ def persist_seen_notices(
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def find_latest_manual_actions_report(report_dir: Optional[Union[str, Path]]) -> Optional[Path]:
+    if not report_dir:
+        return None
+    base_dir = Path(report_dir)
+    if not base_dir.exists():
+        return None
+    candidates = sorted(base_dir.glob("run_*/manual_actions_required_*.txt"))
+    return candidates[-1] if candidates else None
+
+
+def load_manual_actions_report(path: Optional[Path]) -> List[ManualActionNoticeRow]:
+    if not path or not path.exists():
+        return []
+    rows: List[ManualActionNoticeRow] = []
+    try:
+        header_seen = False
+        for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not header_seen:
+                header_seen = True
+                if line.upper().startswith("PRIORITY|STAGE|CATEGORY|COUNT|"):
+                    continue
+            parts = [part.strip() for part in line.split("|")]
+            if len(parts) < 9:
+                continue
+            try:
+                count = int(parts[3] or 0)
+            except Exception:
+                count = 0
+            rows.append(
+                ManualActionNoticeRow(
+                    priority=parts[0],
+                    stage=parts[1],
+                    category=parts[2],
+                    count=count,
+                    default_behavior=parts[4],
+                    primary_artifact=parts[5],
+                    related_fixup_dir=parts[6],
+                    why=parts[7],
+                    recommended_action=parts[8],
+                )
+            )
+    except OSError:
+        return []
+    return rows
+
+
+def _normalize_manual_action_related_dirs(value: str) -> Set[str]:
+    result: Set[str] = set()
+    for token in re.split(r"[|,]", str(value or "")):
+        text = str(token or "").strip().strip("/")
+        if text:
+            result.add(text.lower())
+    return result
+
+
+def select_relevant_manual_actions(
+    rows: Sequence[ManualActionNoticeRow],
+    only_dirs: Sequence[str]
+) -> List[ManualActionNoticeRow]:
+    selected_dirs = {str(item).strip().lower() for item in (only_dirs or []) if str(item).strip()}
+    if not selected_dirs:
+        return list(rows)
+
+    always_show_categories = {
+        "DATA_RISK",
+        "UNSUPPORTED_OBJECT",
+        "DDL_SEMANTIC_REWRITE",
+        "CASE_SENSITIVE_REVIEW",
+        "FIXUP_NOT_GENERATED",
+    }
+    always_show_priorities = {"BLOCKER"}
+    result: List[ManualActionNoticeRow] = []
+    for row in rows:
+        if (row.priority or "").upper() in always_show_priorities:
+            result.append(row)
+            continue
+        if (row.category or "").upper() in always_show_categories:
+            result.append(row)
+            continue
+        related_dirs = _normalize_manual_action_related_dirs(row.related_fixup_dir)
+        if related_dirs and (related_dirs & selected_dirs):
+            result.append(row)
+    return result
+
+
+def log_manual_action_preflight(path: Optional[Path], rows: Sequence[ManualActionNoticeRow]) -> None:
+    if not path or not rows:
+        return
+    log_section("执行前人工处理提醒")
+    log.warning("统一清单: %s", path)
+    for idx, row in enumerate(rows[:6], start=1):
+        target = row.primary_artifact or row.related_fixup_dir or "-"
+        log.warning(
+            "%d. [%s/%s] %s x%d | %s | %s",
+            idx,
+            row.priority or "-",
+            row.stage or "-",
+            row.category or "-",
+            int(row.count or 0),
+            target,
+            row.recommended_action or row.why or "-",
+        )
+    if len(rows) > 6:
+        log.warning("其余 %d 类人工项请继续查看统一清单。", len(rows) - 6)
 
 CONFIG_HOT_RELOAD_MODE_VALUES = {"off", "phase", "round"}
 CONFIG_HOT_RELOAD_FAIL_POLICY_VALUES = {"keep_last_good", "abort"}
@@ -4916,11 +5037,19 @@ def main() -> None:
     notice_state_path: Optional[Path] = None
     notice_state: Optional[Dict[str, object]] = None
     notices_to_mark_seen: List[RuntimeNotice] = []
+    manual_actions_report_path: Optional[Path] = None
+    manual_actions_for_run: List[ManualActionNoticeRow] = []
     try:
         notice_state_path, notice_state = load_notice_state(config_arg.resolve().parent)
         runtime_notices = build_run_fixup_change_notices(args, fixup_dir, only_dirs)
         notices_to_mark_seen = select_unseen_notices(notice_state, runtime_notices)
         log_change_notices_block(notices_to_mark_seen)
+        manual_actions_report_path = find_latest_manual_actions_report(report_dir)
+        manual_actions_for_run = select_relevant_manual_actions(
+            load_manual_actions_report(manual_actions_report_path),
+            only_dirs,
+        )
+        log_manual_action_preflight(manual_actions_report_path, manual_actions_for_run)
     except Exception as exc:
         log.debug("加载运行时提醒状态失败，已跳过: %s", exc)
     

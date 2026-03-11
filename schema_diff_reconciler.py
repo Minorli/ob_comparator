@@ -332,6 +332,7 @@ class RunSummary(NamedTuple):
     actions_skipped: List[str]
     findings: List[str]
     attention: List[str]
+    manual_actions: List[str]
     change_notices: List[str]
     next_steps: List[str]
 
@@ -1122,6 +1123,18 @@ class UnsupportedGrantDetailRow(NamedTuple):
     reason: str
     root_cause: str
     action: str
+
+
+class OperatorActionRow(NamedTuple):
+    priority: str
+    stage: str
+    category: str
+    count: int
+    default_behavior: str
+    primary_artifact: str
+    related_fixup_dir: str
+    why: str
+    recommended_action: str
 
 
 class GrantPlan(NamedTuple):
@@ -26224,6 +26237,32 @@ def clean_long_types_in_table_ddl(ddl: str) -> str:
     return rewrite_unsupported_table_oracle_types(ddl)
 
 
+TYPE_NOT_PERSISTABLE_TOKEN = "__CODX_TYPE_NOT_PERSISTABLE__"
+TYPE_NOT_PERSISTABLE_PATTERN = re.compile(r"\bNOT\s+PERSISTABLE\b", re.IGNORECASE)
+
+
+def protect_type_not_persistable_clause(ddl: str, obj_type: str) -> str:
+    """
+    对 TYPE / TYPE BODY DDL 中的 NOT PERSISTABLE 做保护性占位，避免后续通用清洗误删。
+    注意：该保护不生成额外 cleanup action，避免为默认 TYPE 存在性校验引入新噪声。
+    """
+    if not ddl:
+        return ddl
+    obj_type_u = (obj_type or "").upper()
+    if obj_type_u not in {"TYPE", "TYPE BODY"}:
+        return ddl
+    return TYPE_NOT_PERSISTABLE_PATTERN.sub(TYPE_NOT_PERSISTABLE_TOKEN, ddl)
+
+
+def restore_type_not_persistable_clause(ddl: str, obj_type: str) -> str:
+    if not ddl:
+        return ddl
+    obj_type_u = (obj_type or "").upper()
+    if obj_type_u not in {"TYPE", "TYPE BODY"}:
+        return ddl
+    return ddl.replace(TYPE_NOT_PERSISTABLE_TOKEN, "NOT PERSISTABLE")
+
+
 # DDL清理规则配置（更新为包含生产环境规则）
 DDL_CLEANUP_RULES = {
     # PL/SQL对象需要特殊的结尾处理和PRAGMA清理
@@ -26327,6 +26366,7 @@ def apply_ddl_cleanup_rules_with_audit(
         return ddl, []
     
     obj_type_upper = obj_type.upper()
+    protected_ddl = protect_type_not_persistable_clause(ddl, obj_type_upper)
     
     # 确定使用哪套规则（先快照，避免并发修改字典导致迭代异常）
     rules_to_apply: List[Callable[[str], str]] = []
@@ -26340,7 +26380,7 @@ def apply_ddl_cleanup_rules_with_audit(
             rules_to_apply = list(DDL_CLEANUP_RULES['GENERAL_OBJECTS']['rules'])
     
     # 依次应用所有规则
-    cleaned_ddl = ddl
+    cleaned_ddl = protected_ddl
     actions: List[DdlCleanupAction] = []
     for rule_func in rules_to_apply:
         previous = cleaned_ddl
@@ -26353,6 +26393,7 @@ def apply_ddl_cleanup_rules_with_audit(
             cleaned_ddl = previous
             log.warning("DDL清理规则 %s 执行失败: %s", rule_func.__name__, exc)
 
+    cleaned_ddl = restore_type_not_persistable_clause(cleaned_ddl, obj_type_upper)
     actions.extend(_scan_preserved_cleanup_actions(cleaned_ddl, obj_type_upper))
     return cleaned_ddl, actions
 
@@ -27151,7 +27192,10 @@ def write_fixup_root_readme(
     base_dir: Path,
     report_dir: Optional[Path],
     report_timestamp: Optional[str],
-    generated_dirs: Optional[Sequence[str]] = None
+    generated_dirs: Optional[Sequence[str]] = None,
+    manual_actions_path: Optional[Path] = None,
+    unsupported_grant_count: int = 0,
+    deferred_grant_count: int = 0,
 ) -> Optional[Path]:
     if generated_dirs is None:
         try:
@@ -27180,16 +27224,19 @@ def write_fixup_root_readme(
         "# Fixup 使用导航",
         "# 运行初期建议先看",
     ]
-    intro_steps: List[str] = [
-        f"先看 {report_hint} 里的“执行结论”和“本次建议处理顺序”。"
-    ]
+    intro_steps: List[str] = []
+    if manual_actions_path:
+        intro_steps.append(f"先看 {manual_actions_path}，这是本次仍需人工处理/确认的统一清单。")
+    intro_steps.append(f"再看 {report_hint} 里的“执行结论”和“本次建议处理顺序”。")
     if "tables_unsupported" in existing_dirs or "unsupported" in existing_dirs:
         intro_steps.append("先确认 tables_unsupported/ 与 unsupported/ 里的对象，这些目录默认不建议直接执行。")
+    if unsupported_grant_count:
+        intro_steps.append("grants_miss/ 不是完整授权闭环；还有一部分不支持授权只会落到 unsupported_grant_detail。")
     if "table" in existing_dirs:
         intro_steps.append("table/ 是缺表 CREATE 脚本，默认不要直接执行；run_fixup 需显式 --allow-table-create。")
     if "grants_revoke" in existing_dirs:
         intro_steps.append("grants_revoke/ 是目标端多余 PUBLIC 授权回收建议，先核对源端声明后再执行。")
-    elif "grants_deferred" in existing_dirs:
+    elif "grants_deferred" in existing_dirs or deferred_grant_count:
         intro_steps.append("grants_deferred/ 需要在对象补齐后再执行，不要作为首次 fixup 的默认目录。")
     else:
         intro_steps.append("确认以上风险项后，再按默认顺序执行 run_fixup.py。")
@@ -29937,6 +29984,46 @@ def generate_fixup_scripts(
                                 merged_count += 1
         return raw_count, merged_count, dict(object_grant_lookup_local), dict(grants_by_owner_local)
 
+    grant_file_object_types: Dict[str, str] = build_ob_object_type_map(ob_meta)
+    grant_file_object_types.update({
+        (key or "").upper(): normalize_privilege_object_type(value)
+        for key, value in ((grant_plan.object_target_types or {}) if grant_plan else {}).items()
+        if key
+    })
+
+    def extract_object_full_from_grant_stmt(stmt: str) -> str:
+        match = re.search(r"(?is)\bON\s+([^\s]+)\s+TO\b", stmt or "")
+        if not match:
+            return ""
+        return (match.group(1) or "").strip().upper()
+
+    def sort_object_type_for_grant_file(obj_type: str) -> Tuple[int, str]:
+        obj_type_u = normalize_privilege_object_type(obj_type) or "UNKNOWN"
+        try:
+            rank = PRIVILEGE_TYPE_PRIORITY.index(obj_type_u)
+        except ValueError:
+            rank = len(PRIVILEGE_TYPE_PRIORITY)
+        return rank, obj_type_u
+
+    def render_grouped_object_grant_content(stmts: Set[str]) -> str:
+        if not stmts:
+            return ""
+        grouped: Dict[str, List[str]] = defaultdict(list)
+        for stmt in sorted(stmts):
+            object_full = extract_object_full_from_grant_stmt(stmt)
+            obj_type = grant_file_object_types.get(object_full, "UNKNOWN") if object_full else "UNKNOWN"
+            grouped[normalize_privilege_object_type(obj_type) or "UNKNOWN"].append(stmt)
+
+        lines: List[str] = []
+        first_section = True
+        for obj_type_u in sorted(grouped.keys(), key=sort_object_type_for_grant_file):
+            if not first_section:
+                lines.append("")
+            first_section = False
+            lines.append(f"-- OBJECT_TYPE: {obj_type_u} ({len(grouped[obj_type_u])})")
+            lines.extend(sorted(grouped[obj_type_u]))
+        return "\n".join(lines).strip()
+
     def pre_add_cross_schema_grants(
         constraint_tasks: List[Tuple[ConstraintMismatch, str, str, str, str]],
         trigger_tasks: List[Tuple[str, str, str, str, str, str, str]]
@@ -32407,7 +32494,7 @@ def generate_fixup_scripts(
             for owner, stmts in sorted(prereq_by_owner.items()):
                 if not stmts:
                     continue
-                content = "\n".join(sorted(stmts))
+                content = render_grouped_object_grant_content(stmts)
                 header = f"{owner} VIEW 前置授权 (依赖对象)"
                 write_fixup_file(
                     base_dir,
@@ -32424,7 +32511,7 @@ def generate_fixup_scripts(
             for owner, stmts in sorted(post_by_owner.items()):
                 if not stmts:
                     continue
-                content = "\n".join(sorted(stmts))
+                content = render_grouped_object_grant_content(stmts)
                 header = f"{owner} VIEW 创建后授权"
                 write_fixup_file(
                     base_dir,
@@ -32441,7 +32528,7 @@ def generate_fixup_scripts(
                 for owner, stmts in sorted(grants_by_owner.items()):
                     if not stmts:
                         continue
-                    content = "\n".join(sorted(stmts))
+                    content = render_grouped_object_grant_content(stmts)
                     header = f"{owner} 对象权限授权"
                     write_fixup_file(
                         base_dir,
@@ -32483,7 +32570,7 @@ def generate_fixup_scripts(
                 for owner, stmts in sorted(miss_grants_by_owner.items()):
                     if not stmts:
                         continue
-                    content = "\n".join(sorted(stmts))
+                    content = render_grouped_object_grant_content(stmts)
                     header = f"{owner} 对象权限授权"
                     write_fixup_file(
                         base_dir,
@@ -32502,7 +32589,7 @@ def generate_fixup_scripts(
                 for owner, stmts in sorted(deferred_grants_by_owner.items()):
                     if not stmts:
                         continue
-                    content = "\n".join(sorted(stmts))
+                    content = render_grouped_object_grant_content(stmts)
                     header = f"{owner} 延后执行授权 (目标对象当前不存在且本轮不会创建)"
                     write_fixup_file(
                         base_dir,
@@ -32965,6 +33052,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "不支持授权明细"
     if name.startswith("target_extra_grants_detail_"):
         return "DETAIL", "目标端额外授权明细"
+    if name.startswith("manual_actions_required_"):
+        return "DETAIL", "人工处理/确认统一清单"
     if name.startswith("fixup_skip_summary_"):
         return "AUX", "Fixup 跳过汇总"
     if name.startswith("ddl_format_report_"):
@@ -33058,6 +33147,8 @@ def build_operator_handling_order(
     report_file: Optional[Union[str, Path]],
     report_ts: Optional[str],
     fixup_dir: Optional[Union[str, Path]],
+    manual_actions_path: Optional[Union[str, Path]] = None,
+    manual_action_count: int = 0,
     fixup_root_readme_path: Optional[Union[str, Path]] = None,
     actionable_cnt: int,
     blocked_total: int,
@@ -33074,6 +33165,18 @@ def build_operator_handling_order(
     report_ts_text = (report_ts or "").strip()
     fixup_dir_text = str(fixup_dir or "fixup_scripts").strip() or "fixup_scripts"
     steps: List[str] = []
+
+    if manual_action_count:
+        if manual_actions_path:
+            _append_unique_guide_step(
+                steps,
+                f"先看 {manual_actions_path}，这是本次仍需人工处理/确认的统一清单。"
+            )
+        else:
+            _append_unique_guide_step(
+                steps,
+                "先看 manual_actions_required_*.txt，先确认本次仍需人工处理/确认的事项。"
+            )
 
     if table_presence_risk_cnt:
         if report_parent:
@@ -33164,6 +33267,7 @@ def build_operator_handling_order(
 def build_report_index_guide_entries(
     *,
     report_path: Path,
+    manual_actions_path: Optional[Path],
     fixup_root_readme_path: Optional[Union[str, Path]],
     migration_focus_path: Optional[Path],
     unsupported_detail_path: Optional[Path],
@@ -33186,6 +33290,8 @@ def build_report_index_guide_entries(
         if rel_path:
             entries.append(ReportIndexEntry("GUIDE", rel_path, "-", description))
 
+    if manual_actions_path:
+        _add(manual_actions_path, "先看这份人工处理清单，再展开 fixup 和 detail。")
     _add(report_path, "先看主报告里的“执行结论”和“本次建议处理顺序”")
     if table_presence_risk_cnt > 0:
         _add(table_presence_detail_path, "若存在数据风险，优先处理源有数据目标空表")
@@ -35353,6 +35459,361 @@ def export_deferred_grant_detail(
     return write_pipe_report("延后授权明细", header_fields, data_rows, output_path)
 
 
+OPERATOR_ACTION_PRIORITY_ORDER = {
+    "BLOCKER": 0,
+    "PREREQ": 1,
+    "REVIEW": 2,
+    "INFO": 3,
+}
+OPERATOR_ACTION_STAGE_ORDER = {
+    "BEFORE_FIXUP": 0,
+    "BEFORE_DIR_EXECUTE": 1,
+    "AFTER_OBJECT_READY": 2,
+    "POST_DATA_CLEANUP": 3,
+    "POST_COMPARE_REVIEW": 4,
+}
+OPERATOR_ACTION_CATEGORY_LABELS = {
+    "DATA_RISK": "数据风险",
+    "UNSUPPORTED_OBJECT": "不支持/阻断对象",
+    "UNSUPPORTED_GRANT": "不支持授权",
+    "GRANT_CAPABILITY_MANUAL": "授权能力人工复核",
+    "DEFERRED_GRANT": "延后授权",
+    "PUBLIC_REVOKE_REVIEW": "PUBLIC 扩权回收复核",
+    "TRIGGER_TEMP_UNSUPPORTED": "临时表触发器",
+    "TRIGGER_VIEW_REVIEW": "触发器视图引用",
+    "TRIGGER_LITERAL_REVIEW": "触发器对象路径字符串",
+    "SYS_C_FORCE_REVIEW": "SYS_C FORCE 候选",
+    "CASE_SENSITIVE_REVIEW": "大小写敏感对象",
+    "CONSTRAINT_VALIDATE_LATER": "约束后置 VALIDATE",
+    "DDL_SEMANTIC_REWRITE": "DDL 语义改写",
+    "FIXUP_NOT_GENERATED": "Fixup 未生成/需人工补位",
+    "JOB_SCHEDULE_MANUAL": "JOB/SCHEDULE 人工处理",
+}
+
+
+def _derive_run_artifact_path(
+    report_dir: Optional[Path],
+    report_timestamp: Optional[str],
+    stem: str
+) -> str:
+    if not report_dir or not report_timestamp:
+        return f"{stem}_*.txt"
+    return str(Path(report_dir) / f"{stem}_{report_timestamp}.txt")
+
+
+def _normalize_generated_fixup_dirs(
+    generated_dirs: Optional[Sequence[str]]
+) -> Set[str]:
+    result: Set[str] = set()
+    for item in (generated_dirs or []):
+        text = str(item or "").strip()
+        if not text:
+            continue
+        result.add(Path(text).parts[0].lower() if Path(text).parts else text.lower())
+    return result
+
+
+def build_operator_action_rows(
+    *,
+    report_dir: Optional[Path],
+    report_timestamp: Optional[str],
+    fixup_dir: Optional[Union[str, Path]],
+    blocked_total: int = 0,
+    table_presence_risk_cnt: int = 0,
+    unsupported_grant_count: int = 0,
+    deferred_grant_count: int = 0,
+    grant_capability_manual_count: int = 0,
+    extra_public_grant_count: int = 0,
+    trigger_temp_unsupported_count: int = 0,
+    trigger_view_reference_count: int = 0,
+    trigger_literal_alert_count: int = 0,
+    sys_c_force_candidate_count: int = 0,
+    case_sensitive_findings_count: int = 0,
+    deferred_validate_count: int = 0,
+    ddl_cleanup_semantic_rows: int = 0,
+    fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None,
+    generated_fixup_dirs: Optional[Sequence[str]] = None,
+    job_missing_count: int = 0,
+    schedule_missing_count: int = 0,
+) -> List[OperatorActionRow]:
+    report_dir = Path(report_dir) if report_dir else None
+    fixup_dir_text = str(fixup_dir or "fixup_scripts").strip() or "fixup_scripts"
+    generated_fixup_dir_set = _normalize_generated_fixup_dirs(generated_fixup_dirs)
+    rows: List[OperatorActionRow] = []
+
+    def _add(
+        *,
+        priority: str,
+        stage: str,
+        category: str,
+        count: int,
+        default_behavior: str,
+        primary_artifact: str,
+        related_fixup_dir: str,
+        why: str,
+        recommended_action: str,
+    ) -> None:
+        if int(count or 0) <= 0:
+            return
+        rows.append(
+            OperatorActionRow(
+                priority=priority,
+                stage=stage,
+                category=category,
+                count=int(count or 0),
+                default_behavior=default_behavior,
+                primary_artifact=primary_artifact,
+                related_fixup_dir=related_fixup_dir,
+                why=why,
+                recommended_action=recommended_action,
+            )
+        )
+
+    _add(
+        priority="BLOCKER",
+        stage="BEFORE_FIXUP",
+        category="DATA_RISK",
+        count=table_presence_risk_cnt,
+        default_behavior="REPORT_ONLY",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "table_data_presence_detail"),
+        related_fixup_dir="",
+        why="源端有数据而目标端空表，直接执行 fixup 不能替代补数。",
+        recommended_action="先处理数据补齐风险，再决定是否执行 fixup。",
+    )
+    _add(
+        priority="BLOCKER",
+        stage="BEFORE_FIXUP",
+        category="UNSUPPORTED_OBJECT",
+        count=blocked_total,
+        default_behavior="GENERATED_BUT_DO_NOT_RUN",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "unsupported_objects_detail"),
+        related_fixup_dir="unsupported/",
+        why="目标对象不支持、被阻断，或需改造后才能迁移。",
+        recommended_action="先核对 unsupported 明细与对应 fixup 目录，默认不要直接执行这些对象脚本。",
+    )
+    _add(
+        priority="REVIEW",
+        stage="BEFORE_DIR_EXECUTE",
+        category="UNSUPPORTED_GRANT",
+        count=unsupported_grant_count,
+        default_behavior="NOT_GENERATED",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "unsupported_grant_detail"),
+        related_fixup_dir="grants_miss/",
+        why="这部分授权已被程序故意过滤，不会出现在可执行的 grants_miss 闭环里。",
+        recommended_action="先看 unsupported_grant_detail，人工确认接受缺口、改造权限或后续补授权。",
+    )
+    _add(
+        priority="REVIEW",
+        stage="POST_COMPARE_REVIEW",
+        category="GRANT_CAPABILITY_MANUAL",
+        count=grant_capability_manual_count,
+        default_behavior="REPORT_ONLY",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "grant_capability_detail"),
+        related_fixup_dir="",
+        why="部分权限能力未被当前运行完整证明，程序已降级为人工复核。",
+        recommended_action="查看 grant_capability_detail 中的 MANUAL_REVIEW 决策后再决定如何处理授权。",
+    )
+    _add(
+        priority="PREREQ",
+        stage="AFTER_OBJECT_READY",
+        category="DEFERRED_GRANT",
+        count=deferred_grant_count,
+        default_behavior="GENERATED_AFTER_PREREQ",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "deferred_grants_detail"),
+        related_fixup_dir="grants_deferred/",
+        why="授权对象当前不存在或本轮不会创建，提前执行会失败。",
+        recommended_action="先补齐对象，再执行 grants_deferred/，不要把它当首次 fixup 默认目录。",
+    )
+    _add(
+        priority="REVIEW",
+        stage="BEFORE_DIR_EXECUTE",
+        category="PUBLIC_REVOKE_REVIEW",
+        count=extra_public_grant_count,
+        default_behavior="REVIEW_BEFORE_EXECUTE",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "target_extra_grants_detail"),
+        related_fixup_dir="grants_revoke/",
+        why="目标端存在源端未声明的 PUBLIC 授权，回收前必须核对业务预期。",
+        recommended_action="先核对 target_extra_grants_detail，再决定是否执行 grants_revoke/。",
+    )
+    _add(
+        priority="BLOCKER",
+        stage="BEFORE_FIXUP",
+        category="TRIGGER_TEMP_UNSUPPORTED",
+        count=trigger_temp_unsupported_count,
+        default_behavior="REPORT_ONLY",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "triggers_temp_table_unsupported_detail"),
+        related_fixup_dir="trigger/",
+        why="临时表触发器存在目标端兼容性限制，不应视为普通缺失触发器。",
+        recommended_action="先看临时表触发器不支持明细，确认改造策略。",
+    )
+    _add(
+        priority="REVIEW",
+        stage="BEFORE_DIR_EXECUTE",
+        category="TRIGGER_VIEW_REVIEW",
+        count=trigger_view_reference_count,
+        default_behavior="REPORT_ONLY",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "triggers_view_reference_detail"),
+        related_fixup_dir="trigger/",
+        why="触发器依赖视图时通常需要确认生成语义与跨 schema 访问路径。",
+        recommended_action="先核对触发器视图引用明细，再决定是否直接执行 trigger/。",
+    )
+    _add(
+        priority="REVIEW",
+        stage="BEFORE_DIR_EXECUTE",
+        category="TRIGGER_LITERAL_REVIEW",
+        count=trigger_literal_alert_count,
+        default_behavior="REPORT_ONLY",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "triggers_literal_object_path_detail"),
+        related_fixup_dir="trigger/",
+        why="触发器中存在对象路径字符串，程序已保守保留原文，可能仍需人工改造。",
+        recommended_action="先核对触发器对象路径字符串明细，再决定是否直接执行 trigger/。",
+    )
+    _add(
+        priority="REVIEW",
+        stage="BEFORE_DIR_EXECUTE",
+        category="SYS_C_FORCE_REVIEW",
+        count=sys_c_force_candidate_count,
+        default_behavior="REPORT_ONLY",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "sys_c_force_candidates_detail"),
+        related_fixup_dir="table_alter/",
+        why="该类表通常需要评估 FORCE 范围，不能仅凭列差异脚本直接处理。",
+        recommended_action="先看 SYS_C FORCE 候选明细，再决定是否启用相关修复。",
+    )
+    _add(
+        priority="REVIEW",
+        stage="POST_COMPARE_REVIEW",
+        category="CASE_SENSITIVE_REVIEW",
+        count=case_sensitive_findings_count,
+        default_behavior="REPORT_ONLY",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "case_sensitive_identifiers_detail"),
+        related_fixup_dir="",
+        why="双引号大小写对象可能影响自动修复和跨端定位，不宜静默忽略。",
+        recommended_action="查看大小写敏感对象明细，确认是否需要保守处理或人工修复。",
+    )
+    _add(
+        priority="PREREQ",
+        stage="POST_DATA_CLEANUP",
+        category="CONSTRAINT_VALIDATE_LATER",
+        count=deferred_validate_count,
+        default_behavior="GENERATED_AFTER_PREREQ",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "constraint_validate_deferred_detail"),
+        related_fixup_dir="constraint_validate_later/",
+        why="这些约束被故意后置到数据清理后再 VALIDATE。",
+        recommended_action="先完成脏数据清理，再执行 constraint_validate_later/。",
+    )
+    _add(
+        priority="REVIEW",
+        stage="POST_COMPARE_REVIEW",
+        category="DDL_SEMANTIC_REWRITE",
+        count=ddl_cleanup_semantic_rows,
+        default_behavior="REPORT_ONLY",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "ddl_cleanup_detail"),
+        related_fixup_dir="",
+        why="本次 fixup 中存在改变语义的兼容改写，不应当成普通格式清洗。",
+        recommended_action="查看 ddl_cleanup_detail 中的 semantic_rewrite 明细，并复核对应脚本头注释。",
+    )
+    skip_total = 0
+    for item in (fixup_skip_summary or {}).values():
+        skipped_map = item.get("skipped", {}) if isinstance(item, dict) else {}
+        if isinstance(skipped_map, dict):
+            for count in skipped_map.values():
+                try:
+                    skip_total += int(count or 0)
+                except Exception:
+                    continue
+    _add(
+        priority="INFO",
+        stage="POST_COMPARE_REVIEW",
+        category="FIXUP_NOT_GENERATED",
+        count=skip_total,
+        default_behavior="REPORT_ONLY",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "fixup_skip_summary"),
+        related_fixup_dir="",
+        why="部分缺失对象不是“已经修完”，而是被策略跳过或未自动生成。",
+        recommended_action="查看 fixup_skip_summary，确认哪些对象需要人工补位或单独处理。",
+    )
+    job_schedule_count = 0
+    if "job" in generated_fixup_dir_set:
+        job_schedule_count += max(int(job_missing_count or 0), 1)
+    if "schedule" in generated_fixup_dir_set:
+        job_schedule_count += max(int(schedule_missing_count or 0), 1)
+    _add(
+        priority="REVIEW",
+        stage="BEFORE_DIR_EXECUTE",
+        category="JOB_SCHEDULE_MANUAL",
+        count=job_schedule_count,
+        default_behavior="REVIEW_BEFORE_EXECUTE",
+        primary_artifact="fixup_scripts/job|schedule/",
+        related_fixup_dir="job|schedule/",
+        why="JOB/SCHEDULE 仍属于半自动或人工补录范畴，不能按普通对象脚本理解。",
+        recommended_action="先核对 job/schedule 草案与源端定义，再决定如何补录或执行。",
+    )
+
+    rows.sort(
+        key=lambda row: (
+            OPERATOR_ACTION_PRIORITY_ORDER.get((row.priority or "").upper(), 99),
+            OPERATOR_ACTION_STAGE_ORDER.get((row.stage or "").upper(), 99),
+            (row.category or "").upper(),
+            -(row.count or 0),
+        )
+    )
+    return rows
+
+
+def summarize_operator_action_rows(
+    rows: List[OperatorActionRow],
+    manual_actions_path: Optional[Path]
+) -> List[str]:
+    if not rows:
+        return []
+    top_rows = rows[:4]
+    summary = "、".join(
+        f"{OPERATOR_ACTION_CATEGORY_LABELS.get((row.category or '').upper(), row.category)} {row.count}"
+        for row in top_rows
+    )
+    lines = [f"存在 {len(rows)} 类人工项：{summary}。"]
+    if manual_actions_path:
+        lines.append(f"统一入口：{manual_actions_path}")
+    lines.append("这些事项不会自动变成可直接执行的闭环脚本，不要只看 grants_miss/ 或 fixup_scripts/。")
+    return lines
+
+
+def export_manual_actions_required(
+    rows: List[OperatorActionRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not report_timestamp or not rows:
+        return None
+    output_path = Path(report_dir) / f"manual_actions_required_{report_timestamp}.txt"
+    header_fields = [
+        "PRIORITY",
+        "STAGE",
+        "CATEGORY",
+        "COUNT",
+        "DEFAULT_BEHAVIOR",
+        "PRIMARY_ARTIFACT",
+        "RELATED_FIXUP_DIR",
+        "WHY",
+        "RECOMMENDED_ACTION",
+    ]
+    data_rows = [
+        [
+            row.priority,
+            row.stage,
+            row.category,
+            str(int(row.count or 0)),
+            row.default_behavior,
+            row.primary_artifact,
+            row.related_fixup_dir,
+            row.why,
+            row.recommended_action,
+        ]
+        for row in rows
+    ]
+    return write_pipe_report("本次必须人工处理/确认", header_fields, data_rows, output_path)
+
+
 def export_fixup_skip_summary(
     summary: Dict[str, Dict[str, object]],
     report_dir: Path,
@@ -37211,6 +37672,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "TARGET_EXTRA_GRANT_DETAIL"
     if name.startswith("grant_capability_detail_"):
         return "GRANT_CAPABILITY_DETAIL"
+    if name.startswith("manual_actions_required_"):
+        return "MANUAL_ACTION_REQUIRED"
     if name.startswith("ddl_cleanup_detail_"):
         return "DDL_CLEANUP_DETAIL"
     if name.startswith("triggers_temp_table_unsupported_detail_"):
@@ -37266,6 +37729,7 @@ def _infer_artifact_status(
         "DEFERRED_GRANT_DETAIL",
         "TARGET_EXTRA_GRANT_DETAIL",
         "GRANT_CAPABILITY_DETAIL",
+        "MANUAL_ACTION_REQUIRED",
         "DDL_CLEANUP_DETAIL",
     }:
         return ("IN_DB", "") if store_scope in {"core", "full"} else ("TXT_ONLY", "")
@@ -39073,9 +39537,9 @@ def ensure_report_db_views_exist(
     return artifacts
 
 
-REPORT_SQL_PLAYBOOK_TEMPLATE_VERSION = "20260311_12"
+REPORT_SQL_PLAYBOOK_TEMPLATE_VERSION = "20260311_17"
 REPORT_SQL_PLAYBOOK_LATEST_FILENAME = "HOW_TO_READ_REPORTS_IN_OB_latest.txt"
-REPORT_SQL_PLAYBOOK_SNAPSHOT_FILENAME = "HOW_TO_READ_REPORTS_IN_OB_20260311_12_sqls.txt"
+REPORT_SQL_PLAYBOOK_SNAPSHOT_FILENAME = "HOW_TO_READ_REPORTS_IN_OB_20260311_17_sqls.txt"
 REPORT_SQL_PLAYBOOK_TEMPLATE = """# 说明: 本文件仅提供 report_id 与 HOW TO 入口，不内嵌 HOW TO 正文。
 当前 report_id: :report_id_value
 建议阅读:
@@ -39984,6 +40448,8 @@ def build_run_summary(
     trigger_literal_alert_count: int = 0,
     ddl_cleanup_summary: Optional[Dict[str, object]] = None,
     ddl_cleanup_report_path: Optional[Path] = None,
+    manual_action_rows: Optional[List[OperatorActionRow]] = None,
+    manual_actions_path: Optional[Path] = None,
 ) -> RunSummary:
     end_time = datetime.now()
     total_seconds = time.perf_counter() - ctx.start_perf
@@ -40135,6 +40601,7 @@ def build_run_summary(
     ddl_cleanup_applied_rows = int(ddl_cleanup_summary.get("applied_rows", 0) or 0)
     ddl_cleanup_preserved_rows = int(ddl_cleanup_summary.get("preserved_rows", 0) or 0)
     ddl_cleanup_semantic_rows = int(ddl_cleanup_summary.get("semantic_rewrite_rows", 0) or 0)
+    manual_action_rows = list(manual_action_rows or [])
     findings: List[str] = [
         f"主对象: 缺失 {missing_count}, 不匹配 {mismatched_count}, 多余 {extra_target_cnt}, 仅打印 {skipped_count}"
     ]
@@ -40277,12 +40744,15 @@ def build_run_summary(
         attention.append("部分 Oracle 子句已改为默认保留策略，需结合目标环境确认是否仍需人工精简。")
     if config_diagnostics:
         attention.append(f"配置诊断提示 {len(config_diagnostics)} 项（详见报告）。")
+    manual_actions = summarize_operator_action_rows(manual_action_rows, manual_actions_path)
 
     next_steps = build_operator_handling_order(
         settings={"generate_fixup": ctx.fixup_enabled},
         report_file=report_file,
         report_ts=(Path(report_file).stem.split("_", 1)[1] if report_file and "_" in Path(report_file).stem else None),
         fixup_dir=ctx.fixup_dir,
+        manual_actions_path=manual_actions_path,
+        manual_action_count=len(manual_action_rows),
         fixup_root_readme_path=fixup_root_readme_path,
         actionable_cnt=(missing_count + mismatched_count + idx_mis_cnt + cons_mis_cnt + seq_mis_cnt + trg_mis_cnt + table_presence_risk_cnt),
         blocked_total=unsupported_total,
@@ -40349,6 +40819,7 @@ def build_run_summary(
         actions_skipped=actions_skipped,
         findings=findings,
         attention=attention,
+        manual_actions=manual_actions,
         change_notices=[],
         next_steps=next_steps
     )
@@ -40381,10 +40852,11 @@ def render_run_summary_panel(summary: RunSummary, width: int) -> Panel:
     skipped = render_section("本次未执行", summary.actions_skipped, empty_text="无")
     findings = render_section("关键发现", summary.findings, empty_text="无")
     attention = render_section("需要注意", summary.attention, empty_text="无")
+    manual_actions = render_section("本次必须人工处理/确认", summary.manual_actions, empty_text="无")
     notices = render_section("本次相关变化提醒", summary.change_notices, empty_text="无")
     next_steps = render_section("本次建议处理顺序", summary.next_steps, empty_text="无")
 
-    text = "\n\n".join([overview, phases, actions, skipped, findings, attention, notices, next_steps])
+    text = "\n\n".join([overview, phases, actions, skipped, findings, attention, manual_actions, notices, next_steps])
     return Panel.fit(text, title="[info]运行总结", border_style="info", width=width)
 
 
@@ -40414,6 +40886,13 @@ def log_run_summary(summary: RunSummary) -> None:
     log_subsection("需要注意")
     if summary.attention:
         for item in summary.attention:
+            log.info("%s", item)
+    else:
+        log.info("无")
+
+    log_subsection("本次必须人工处理/确认")
+    if summary.manual_actions:
+        for item in summary.manual_actions:
             log.info("%s", item)
     else:
         log.info("无")
@@ -40686,6 +41165,63 @@ def print_final_report(
         1 for row in unsupported_rows
         if (row.obj_type or "").upper() == "VIEW"
     )
+    unsupported_total = 0
+    if support_counts:
+        for data in support_counts.values():
+            unsupported_total += int(data.get("unsupported", 0) or 0)
+            unsupported_total += int(data.get("blocked", 0) or 0)
+            unsupported_total += int(data.get("risky", 0) or 0)
+    idx_blocked_cnt = extra_blocked_counts.get("INDEX", 0)
+    cons_blocked_cnt = extra_blocked_counts.get("CONSTRAINT", 0)
+    trg_blocked_cnt = extra_blocked_counts.get("TRIGGER", 0)
+    cons_unsupported_cnt = len(extra_results.get("constraint_unsupported", []) or [])
+    blocked_total = (
+        unsupported_total
+        + idx_blocked_cnt
+        + idx_unsupported_cnt
+        + cons_blocked_cnt
+        + cons_unsupported_cnt
+        + trg_blocked_cnt
+    )
+    unsupported_grant_count = sum(
+        1 for item in (filtered_grants or [])
+        if not (item.reason or "").upper().startswith("DEFERRED_")
+    )
+    deferred_grant_count = sum(
+        1 for item in (filtered_grants or [])
+        if (item.reason or "").upper().startswith("DEFERRED_")
+    )
+    grant_capability_manual_count = int((grant_capability_summary or {}).get("manual_rows", 0) or 0)
+    deferred_validate_count = int((settings or {}).get("_constraint_validate_deferred_count", 0) or 0)
+    generated_fixup_dirs = list((settings or {}).get("_generated_fixup_dirs") or [])
+    report_parent_path = Path(report_file).parent if report_file else None
+    manual_actions_preview_path = (
+        Path(report_parent_path) / f"manual_actions_required_{report_ts}.txt"
+        if report_parent_path is not None and report_ts
+        else None
+    )
+    manual_action_rows = build_operator_action_rows(
+        report_dir=report_parent_path,
+        report_timestamp=report_ts,
+        fixup_dir=(settings.get("fixup_dir", "fixup_scripts") if settings else "fixup_scripts"),
+        blocked_total=blocked_total,
+        table_presence_risk_cnt=table_presence_risk_cnt,
+        unsupported_grant_count=unsupported_grant_count,
+        deferred_grant_count=deferred_grant_count,
+        grant_capability_manual_count=grant_capability_manual_count,
+        extra_public_grant_count=extra_public_grant_count,
+        trigger_temp_unsupported_count=len(temp_trigger_unsupported_rows),
+        trigger_view_reference_count=trigger_view_reference_count,
+        trigger_literal_alert_count=trigger_literal_alert_count,
+        sys_c_force_candidate_count=sys_c_force_candidate_count,
+        case_sensitive_findings_count=case_sensitive_findings_count,
+        deferred_validate_count=deferred_validate_count,
+        ddl_cleanup_semantic_rows=int(ddl_cleanup_summary.get("semantic_rewrite_rows", 0) or 0),
+        fixup_skip_summary=fixup_skip_summary,
+        generated_fixup_dirs=generated_fixup_dirs,
+        job_missing_count=int(extra_missing_counts.get("JOB", 0) or 0),
+        schedule_missing_count=int(extra_missing_counts.get("SCHEDULE", 0) or 0),
+    )
 
     console.print(Panel.fit(f"[bold]数据库对象迁移校验报告 (V{__version__} - Rich)[/bold]", style="title"))
     console.print(f"[info]项目主页: {REPO_URL} | 问题反馈: {REPO_ISSUES_URL}[/info]")
@@ -40747,28 +41283,9 @@ def print_final_report(
         console.print(env_table)
         console.print("")
 
-    unsupported_total = 0
-    if support_counts:
-        for data in support_counts.values():
-            unsupported_total += int(data.get("unsupported", 0) or 0)
-            unsupported_total += int(data.get("blocked", 0) or 0)
-            unsupported_total += int(data.get("risky", 0) or 0)
-    idx_blocked_cnt = extra_blocked_counts.get("INDEX", 0)
-    cons_blocked_cnt = extra_blocked_counts.get("CONSTRAINT", 0)
-    trg_blocked_cnt = extra_blocked_counts.get("TRIGGER", 0)
-    cons_unsupported_cnt = len(extra_results.get("constraint_unsupported", []) or [])
-
     def build_execution_conclusion() -> Panel:
         ext_mismatch_cnt = idx_missing_cnt + cons_missing_cnt + seq_missing_cnt + trg_missing_cnt
         actionable_cnt = missing_count + mismatched_count + ext_mismatch_cnt + table_presence_risk_cnt
-        blocked_total = (
-            unsupported_total
-            + idx_blocked_cnt
-            + idx_unsupported_cnt
-            + cons_blocked_cnt
-            + cons_unsupported_cnt
-            + trg_blocked_cnt
-        )
         status = "通过" if actionable_cnt == 0 and blocked_total == 0 else "需处理"
         lines: List[str] = [
             f"状态: {status} | 总校验对象: {total_checked}",
@@ -40816,6 +41333,8 @@ def print_final_report(
             report_file=report_file,
             report_ts=report_ts,
             fixup_dir=(settings.get("fixup_dir", "fixup_scripts") if settings else "fixup_scripts"),
+            manual_actions_path=manual_actions_preview_path,
+            manual_action_count=len(manual_action_rows),
             fixup_root_readme_path=(settings.get("_fixup_root_readme_path", "") if settings else ""),
             actionable_cnt=actionable_cnt,
             blocked_total=blocked_total,
@@ -40830,6 +41349,8 @@ def print_final_report(
         )
         if next_steps:
             lines.append("本次建议处理顺序: " + "；".join(next_steps))
+        if manual_action_rows and manual_actions_preview_path:
+            lines.append(f"人工处理统一入口: {manual_actions_preview_path}")
         return Panel.fit("\n".join(lines), title="[header]执行结论", border_style="info")
 
     console.print(build_execution_conclusion())
@@ -41823,6 +42344,8 @@ def print_final_report(
                 if settings and settings.get("_ddl_cleanup_report_path")
                 else None
             ),
+            manual_action_rows=manual_action_rows,
+            manual_actions_path=manual_actions_preview_path,
         )
         notice_state_path, notice_state = load_notice_state(settings.get("config_dir") if settings else None)
         runtime_notices = build_runtime_change_notices(
@@ -41953,6 +42476,17 @@ def print_final_report(
             grant_capability_detail_path,
             int((grant_capability_summary or {}).get("total_rows", 0) or 0) if grant_capability_detail_path else None,
             "动态授权能力明细"
+        )
+        manual_actions_path = export_manual_actions_required(
+            manual_action_rows,
+            report_path.parent,
+            report_ts
+        )
+        _add_index_entry(
+            "DETAIL",
+            manual_actions_path,
+            len(manual_action_rows) if manual_actions_path else None,
+            "人工处理/确认统一清单"
         )
         fixup_skip_path = export_fixup_skip_summary(
             fixup_skip_summary or {},
@@ -42388,6 +42922,8 @@ def print_final_report(
                 log.info("目标端额外授权明细已输出到: %s", target_extra_grant_detail_path)
             if grant_capability_detail_path:
                 log.info("动态授权能力明细已输出到: %s", grant_capability_detail_path)
+            if manual_actions_path:
+                log.info("人工处理/确认统一清单已输出到: %s", manual_actions_path)
             if fixup_skip_path:
                 log.info("Fixup 跳过汇总已输出到: %s", fixup_skip_path)
             if missing_detail_path:
@@ -42450,16 +42986,28 @@ def print_final_report(
                 category, description = _infer_report_index_meta(item)
                 index_entries.append(ReportIndexEntry(category, rel_path, "-", description))
                 existing_paths.add(rel_path)
-            blocked_total_for_guide = (
-                unsupported_total
-                + idx_blocked_cnt
-                + idx_unsupported_cnt
-                + cons_blocked_cnt
-                + cons_unsupported_cnt
-                + trg_blocked_cnt
+            fixup_root_base = None
+            if settings and settings.get("_fixup_root_readme_path"):
+                fixup_root_base = Path(str(settings.get("_fixup_root_readme_path"))).parent
+            elif settings and settings.get("config_dir"):
+                fixup_root_base = Path(str(settings.get("config_dir"))) / str(settings.get("fixup_dir", "fixup_scripts"))
+            else:
+                fixup_root_base = Path(str(settings.get("fixup_dir", "fixup_scripts")) if settings else "fixup_scripts")
+            refreshed_fixup_root_readme_path = write_fixup_root_readme(
+                fixup_root_base,
+                report_path.parent,
+                report_ts,
+                generated_dirs=list((settings.get("_generated_fixup_dirs") or []) if settings else []),
+                manual_actions_path=manual_actions_path,
+                unsupported_grant_count=unsupported_grant_count,
+                deferred_grant_count=deferred_grant_count,
             )
+            if refreshed_fixup_root_readme_path:
+                settings["_fixup_root_readme_path"] = str(refreshed_fixup_root_readme_path)
+            blocked_total_for_guide = blocked_total
             guide_entries = build_report_index_guide_entries(
                 report_path=report_path,
+                manual_actions_path=manual_actions_path,
                 fixup_root_readme_path=(settings.get("_fixup_root_readme_path", "") if settings else ""),
                 migration_focus_path=migration_focus_path,
                 unsupported_detail_path=unsupported_detail_path,

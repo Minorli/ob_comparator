@@ -123,9 +123,13 @@ python3 run_fixup.py --smart-order --recompile
 ```
 
 主程序跑完后，优先看两处：
+- `main_reports/run_<ts>/manual_actions_required_<ts>.txt`
+  说明：这是本次仍需人工处理/确认的统一清单，先看它，再展开其他 detail/fixup。
 - `report_<ts>.txt` 里的 `执行结论` 和 `本次建议处理顺序`
 - `fixup_scripts/README_FIRST.txt`
   说明：这个文件会按本次实际生成的目录解释哪些可以先看、哪些默认不要直接执行。
+
+说明：`run_fixup.py` 启动时也会读取最新的 `manual_actions_required_<ts>.txt`，并按本次执行目录提示相关人工项。
 
 说明：若本次运行命中了你还没见过的新行为，运行总结里会额外出现 `本次相关变化提醒`，且同一提醒默认只展示一次。
 
@@ -203,6 +207,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/VIEWs_chain_<ts>.txt`：VIEW 依赖链报告
 - `main_reports/run_<ts>/blacklist_tables.txt`：黑名单表清单
 - `main_reports/run_<ts>/filtered_grants.txt`：过滤授权清单
+- `main_reports/run_<ts>/manual_actions_required_<ts>.txt`：本次必须人工处理/确认的统一清单（聚合 unsupported/deferred/review-first 项）
 - `main_reports/run_<ts>/grant_capability_detail_<ts>.txt`：本次授权动态规则库明细（含目标端目录权限别名，如 `DEBUG -> OTHERS`）
 - `main_reports/run_<ts>/target_extra_grants_detail_<ts>.txt`：目标端额外对象授权明细（含 PUBLIC 扩权风险）
 - `main_reports/run_<ts>/ddl_cleanup_detail_<ts>.txt`：DDL 清理/改写明细（区分 `format_only / syntax_compat / environment_detach / semantic_rewrite`，并标记 `evidence_level`）
@@ -221,9 +226,10 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `*_detail_*.txt` 明细文件采用 `|` 分隔，并包含 `# total/# 字段说明` 头，格式与 `package_compare` 一致，便于 Excel 直接分隔导入。
 - `main_reports/run_<ts>/missed_tables_views_for_OMS/`：OMS 缺失 TABLE/VIEW 规则
 - `fixup_scripts/`：修补脚本输出（执行前需人工审核）
-- `fixup_scripts/README_FIRST.txt`：fixup 根目录导航，说明本次生成目录的用途与默认执行边界
+- `fixup_scripts/README_FIRST.txt`：fixup 根目录导航，说明本次生成目录的用途与默认执行边界；若存在人工项，会先指向 `manual_actions_required_<ts>.txt`
 - `fixup_scripts/grants_miss/`：缺失授权脚本
 - `fixup_scripts/grants_revoke/`：目标端额外 PUBLIC 授权回收建议（默认仅 PUBLIC 自动给出 REVOKE）
+- `fixup_scripts/grants_all/*.grants.sql` / `fixup_scripts/grants_miss/*.grants.sql`：对象授权文件在同一 owner 文件内按 `OBJECT_TYPE` 分段，便于人工审核
 - `fixup_scripts/tables_unsupported/`：不支持 TABLE 的 DDL（默认不执行）
 - `fixup_scripts/unsupported/`：不支持/阻断对象 DDL（默认不执行）
 - `fixup_scripts/view_chain_plans/`：VIEW 链路修复计划
@@ -239,6 +245,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `ddl_cleanup_detail_<ts>.txt` 会把每条清理/保留动作拆成 `STATUS/RULE/CATEGORY/EVIDENCE_LEVEL/CHANGE_COUNT`，便于区分“格式整理”和“真实兼容性改写”。
 - `PRAGMA AUTONOMOUS_TRANSACTION`、`PRAGMA SERIALLY_REUSABLE`、`STORAGE(...)` 现在默认保留；`TABLESPACE` 不再按“语法不支持”自动删除。
 - `LONG -> CLOB`、`LONG RAW/BFILE -> BLOB`、`INTERVAL` 分区处理属于语义改写，会在 fixup SQL 头部追加 `DDL_REWRITE: ...` 注释，并同步进入 `ddl_cleanup_detail_<ts>.txt`。
+- `TYPE ... NOT PERSISTABLE` 当前按源端语义保留，不会被默认清洗成普通 TYPE，也不会因为该子句差异额外制造 TYPE mismatch 噪声。
 
 ## 黑名单规则
 - 默认启用 `blacklist_rules.json` 规则并尝试读取 `OMS_USER.TMP_BLACK_TABLE`（`blacklist_mode=auto`）。
