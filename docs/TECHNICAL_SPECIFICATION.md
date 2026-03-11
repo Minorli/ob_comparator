@@ -2,7 +2,7 @@
 ## 技术规格说明 (Technical Specification)
 
 **版本**：0.9.8.7  
-**日期**：2026-03-01  
+**日期**：2026-03-11  
 **适用场景**：Oracle → OceanBase（Oracle 模式）迁移后的结构一致性校验、对象补全、DDL 兼容性修复。
 
 ---
@@ -140,7 +140,10 @@
 ### 7.2 DDL 清洗与兼容
 - Hint 策略过滤
 - PL/SQL 结尾修正
-- Oracle 特有语法清理
+- 仅对已实证不兼容的 Oracle 语法做自动清洗
+- `PRAGMA AUTONOMOUS_TRANSACTION` / `PRAGMA SERIALLY_REUSABLE` 默认保留
+- `STORAGE(...)` / `TABLESPACE ...` 默认保留，并在 `ddl_cleanup_detail_<ts>.txt` 中记录为 preserved
+- `LONG/LONG RAW/BFILE` 等类型改写标记为 `semantic_rewrite`
 - VIEW 行内注释修复
 - VIEW FORCE 关键字清理（CREATE OR REPLACE FORCE VIEW -> CREATE OR REPLACE VIEW）
 
@@ -182,6 +185,8 @@
 
 ## 9. 报告体系
 - `run_<ts>/report_<ts>.txt`：主报告
+- `run_<ts>/report_sql_<ts>.txt`：轻量入口文件，仅包含 `report_id` 与 HOW TO 手册入口
+- `HOW_TO_READ_REPORTS_IN_OB_latest.txt` / 当前快照文件：数据库侧排障手册，供人工查阅
 - `run_<ts>/package_compare_<ts>.txt`：包对比明细
 - `run_<ts>/remap_conflicts_<ts>.txt`：推导冲突
 - `run_<ts>/VIEWs_chain_<ts>.txt`：VIEW 链路
@@ -216,4 +221,4 @@
 - 语法检查：`python3 -m py_compile $(git ls-files '*.py')`
 - 单元测试：`.venv/bin/python -m unittest discover -v`
 - 可选联调：在测试库执行 `schema_diff_reconciler.py` 与 `run_fixup.py --glob "__NO_MATCH__"` 验证整体链路。
-- 当前基线（2026-02-09）：`unittest` 290 项通过，2 项联调测试默认跳过（需真实 Oracle/OB 环境）。
+- 当前版本不再在文档中硬编码测试条数；交付时应记录本次实际执行命令、通过/失败结果与是否完成实库验证。

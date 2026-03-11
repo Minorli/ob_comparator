@@ -292,10 +292,11 @@ grant_merge_grantees = true
 
 ## 更多文档
 1) `readme_config.txt`：配置项与默认值
-2) `docs/ADVANCED_USAGE.md`：Remap 推导与 run_fixup 高级说明
-3) `docs/ARCHITECTURE.md`：架构设计与实现细节
-4) `docs/DEPLOYMENT.md`：离线部署与跨平台运行
-5) `docs/TECHNICAL_SPECIFICATION.md`：技术规格说明
+2) `docs/README.md`：docs 目录入口与阅读顺序
+3) `docs/ADVANCED_USAGE.md`：Remap 推导与 run_fixup 高级说明
+4) `docs/ARCHITECTURE.md`：架构设计与实现细节
+5) `docs/DEPLOYMENT.md`：离线部署与跨平台运行
+6) `docs/TECHNICAL_SPECIFICATION.md`：技术规格说明
 
 ---
 © 2025 Minor Li.

@@ -34,6 +34,8 @@ deployment_package/
 ├── remap_rules.txt
 ├── blacklist_rules.json
 ├── readme_config.txt
+├── HOW_TO_READ_REPORTS_IN_OB_latest.txt
+├── HOW_TO_READ_REPORTS_IN_OB_20260311_08_sqls.txt
 ├── docs/
 ├── wheelhouse/
 ├── dbcat-2.5.0-SNAPSHOT/
@@ -72,6 +74,8 @@ python run_fixup.py --smart-order --recompile
 如需执行建表脚本，显式添加：`--allow-table-create`。
 
 提示：默认报告输出为 `main_reports/run_<timestamp>/`，如需兼容旧流程可设置 `report_dir_layout=flat`。
+
+提示：`report_sql_<timestamp>.txt` 现在只提供 `report_id` 与 HOW TO 文档入口；如果交付包缺少 HOW TO 文件，客户无法按数据库侧剧本排查。
 
 ## 5. 常见问题检查清单
 - `LD_LIBRARY_PATH` 是否包含 instantclient。

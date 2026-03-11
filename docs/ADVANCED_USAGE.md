@@ -1,6 +1,6 @@
 # 高级使用指南
 
-本手册聚焦六类高级能力：Remap 推导、授权生成、DDL 清洗、报告入库、run_fixup 高级执行、表数据风险校验。
+本手册聚焦当前版本最常用的高级能力：Remap 推导、授权生成、DDL 清洗、报告入库、run_fixup 高级执行、表数据风险校验，以及运行期导航入口。
 
 ---
 
@@ -93,7 +93,10 @@
 
 ### 4.2 PL/SQL 语法修复
 - 清理冗余分号/斜杠结尾
-- 清理 Oracle 特有语法、PRAGMA
+- 仅对已实证不兼容的 Oracle 语法做自动清洗
+- `PRAGMA AUTONOMOUS_TRANSACTION` / `PRAGMA SERIALLY_REUSABLE` 默认保留，不再按“未知即删除”处理
+- `STORAGE(...)` / `TABLESPACE ...` 默认保留，只在 `ddl_cleanup_detail_<timestamp>.txt` 中给出提醒
+- `LONG/LONG RAW/BFILE` 这类类型改写会单独标记为 `semantic_rewrite`，不再伪装成普通 cleanup
 - 全角标点转半角（`ddl_punct_sanitize=true`）
 
 ### 4.3 VIEW DDL 修复
@@ -124,7 +127,8 @@
 ### 5.3 报告存库（默认开启，obclient）
 - `report_to_db=true` 后，会将报告写入 OceanBase（仅 obclient；不影响本地报告文件）。
 - `DIFF_REPORT_SUMMARY.WRITE_STATUS='READY'` 才表示该 report_id 已完整写入并通过口径复核；`WRITING/FAILED` 不用于结论判断。
-- 运行后会在 run 目录输出 `report_sql_<timestamp>.txt`（预填 report_id 的 SQL 模板）。
+- 运行后会在 run 目录输出 `report_sql_<timestamp>.txt`（仅写入 `report_id` 与 HOW TO 入口，不再内嵌 HOW TO 正文）。
+- `HOW_TO_READ_REPORTS_IN_OB_latest.txt` 与当前快照文件是给客户/DBA 查库排障用的外部手册，主程序不会在运行时读取其正文。
 - 当 `report_db_store_scope=core/full` 时，会尝试创建只读分析视图：
   `DIFF_REPORT_ACTIONS_V` / `DIFF_REPORT_OBJECT_PROFILE_V` / `DIFF_REPORT_TRENDS_V`
   `DIFF_REPORT_PENDING_ACTIONS_V` / `DIFF_REPORT_GRANT_CLASS_V` / `DIFF_REPORT_USABILITY_CLASS_V`。
@@ -162,6 +166,11 @@
   - `DIFF_REPORT_WRITE_ERRORS`（写库失败追踪）
   - `DIFF_REPORT_RESOLUTION`（整改闭环标记）
 - 缺失/不支持明细无需额外表，使用 `DIFF_REPORT_DETAIL` 按 `report_type/object_type` 查询。
+
+### 5.4 运行期导航
+- `report_index_<timestamp>.txt`：本次 run 的报告索引入口。
+- `fixup_scripts/README_FIRST.txt`：fixup 根目录导航，说明哪些目录默认不要直接执行。
+- 主报告里的“本次建议处理顺序”与“本次相关变化提醒”只负责引导操作，不替代 HOW TO 细节手册。
 
 示例查询：
 ```sql

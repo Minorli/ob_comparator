@@ -2,7 +2,7 @@
 
 本文件记录 OceanBase Comparator Toolkit 的重要变更。
 
-## [0.9.8.7] - 2026-03-01
+## [0.9.8.7] - 2026-03-11
 
 ### 新增
 - `run_fixup.py` 新增并发执行防护：同一 `fixup_dir` 下使用 `.run_fixup.lock` 防止重复并发执行。
@@ -16,14 +16,21 @@
 - `SqlPunctuationMasker` 补齐 Q-quote 掩码路径，标点清洗不再误伤 Q-quote 字面量。
 - `mask_sql_for_scan` 不再掩码双引号标识符，降低列清单与别名解析偏差。
 - `blacklist_rules.json` 在关键路径采用严格解析（fail-fast），解析失败会终止流程，防止规则失效后静默放行。
+- `report_sql_<ts>.txt` 改为轻量入口文件，仅写入 `report_id` 与 HOW TO 手册入口，不再内嵌 HOW TO 正文。
+- HOW TO 手册与主程序运行期解耦：主程序只提示客户去读 HOW TO，不再把 HOW TO 内容编进主流程输出。
+- 运行期导航增强：主报告增加“本次建议处理顺序”，`fixup_scripts/README_FIRST.txt` 作为 fixup 根目录导航。
+- 触发器字符串字面量 remap 收紧：仅自动改写完整匹配 `SCHEMA.OBJECT` 的单引号字面量；`SCHEMA.OBJECT.COLUMN` 保守保留并输出提醒明细。
+- DDL 清洗治理改为证据门禁：`AUTONOMOUS_TRANSACTION`、`SERIALLY_REUSABLE`、`STORAGE`、`TABLESPACE` 默认保留，类型改写单独标记为 `semantic_rewrite`。
 
 ### 修复
 - `run_fixup.py` 备份失败后的文件移动行为收敛，避免覆盖既有 `done/` 脚本引发审计信息丢失。
 - `run_fixup.py` 重编译成功判定增强：不再仅依赖进程返回码，改为编译后再次校验 INVALID 状态。
 - `clean_storage_clauses` 对引号 TABLESPACE 名称的处理增强，降低清洗漏网。
+- `run_fixup.py` 错误识别补齐 `OBE-* / PLS-* / SP2-*`，`fixup_errors_*.txt` 更容易命中首错。
+- `PUBLIC` 额外授权回收审计修复：源端已声明但因兼容性过滤的授权，不再误生成 `REVOKE_PUBLIC`。
 
 ### 文档
-- README / readme_lite / readme_config / ARCHITECTURE / ADVANCED_USAGE / TECHNICAL_SPECIFICATION / DEPLOYMENT 同步到 `0.9.8.7`。
+- README / readme_lite / readme_config / docs 主文档统一同步到当前实现；旧版 release note / version diff / 规划草稿从 `docs/` 目录清理。
 
 ## [0.9.8.6] - 2026-02-27
 

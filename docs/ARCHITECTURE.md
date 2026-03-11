@@ -1,12 +1,14 @@
 # 数据库对象对比工具设计文档
 
-> 当前版本：V0.9.8.7（Dump-Once, Compare-Locally + 依赖分析 + 修补脚本生成）
+> 当前版本：V0.9.8.7（截至 2026-03-11）
+> 核心模式：Dump-Once, Compare-Locally + 依赖分析 + 修补脚本生成
 
 ## 1. 设计原则
 - **一次转储、本地对比**：最大限度减少数据库往返，性能可控。
 - **配置驱动**：所有行为由 `config.ini` 控制，可复用和审计。
 - **脚本优先、人工审核**：主程序仅生成 SQL，不自动执行。
 - **可回滚、可追踪**：报告与脚本输出具备完整审计线索。
+- **运行期文档分离**：HOW TO 手册属于交付文档，主程序只输出入口，不在运行时内嵌或读取其正文。
 
 ## 2. 组件划分
 - **`schema_diff_reconciler.py`**：主流程，负责元数据采集、差异对比、修补脚本生成、报告输出。
@@ -59,12 +61,14 @@
 - **清洗策略**：
   - Hint 过滤与白名单
   - PL/SQL 标点清洗
-  - Oracle 特有语法清理
+  - 证据门禁下的兼容性清洗（不再默认删除未证实不支持的 PRAGMA / STORAGE / TABLESPACE）
   - VIEW 注释吞行修复
 
 ## 9. 输出与执行
 - 报告输出到 `main_reports/`（默认 `run_<timestamp>` 分目录），脚本输出到 `fixup_scripts/`。
 - 报告索引 `report_index_<timestamp>.txt` 用于快速定位细节文件。
+- `report_sql_<timestamp>.txt` 只提供 `report_id` 与 HOW TO 入口。
+- `fixup_scripts/README_FIRST.txt` 作为 fixup 根目录导航，明确默认执行边界。
 - `run_fixup.py` 支持：
   - 依赖感知排序（smart-order）
   - 迭代重试（iterative）
