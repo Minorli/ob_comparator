@@ -55,7 +55,7 @@
 - report_to_db：是否将报告存储到 OceanBase（obclient 方式）。默认：true。
   说明：开启后仍会保留本地文本报告，写库失败时是否中断由 report_db_fail_abort 控制。
   说明：写库采用发布门禁；DIFF_REPORT_SUMMARY.WRITE_STATUS=READY 才表示可用于正式排查（WRITING/FAILED 为未完成或失败）。
-  说明：开启后会在 run 目录输出 report_sql_<timestamp>.txt（预填 report_id 的 SQL 模板），并尝试创建只读分析视图（actions/profile/trends/pending/grant/usability）。
+  说明：开启后会在 run 目录输出 report_sql_<timestamp>.txt（仅写入 report_id 与 HOW TO 入口，不再内嵌 HOW TO 正文），并尝试创建只读分析视图（actions/profile/trends/pending/grant/usability）。
   说明：当 report_db_store_scope=full 时，会将 run 目录下所有 txt 逐行写入 DIFF_REPORT_ARTIFACT_LINE，实现 txt 内容 100% 可查询覆盖。
 - report_db_schema：报告存库 schema。默认：空（使用 OCEANBASE_TARGET 连接用户）。
   说明：非空时必须是 Oracle 普通标识符（示例：DIFF_REPORT），不支持点号/引号/分号；非法值会在启动阶段直接阻断。
