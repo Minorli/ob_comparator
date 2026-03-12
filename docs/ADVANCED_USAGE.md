@@ -56,6 +56,8 @@
 ### 2.3 触发器清单
 - `trigger_list`：仅生成清单内 TRIGGER
 - 缺失/非法条目会输出到 `main_reports/trigger_status_report.txt`
+- 若清单命中的是非表触发器（如 `BEFORE DROP ON DATABASE`），程序不会生成普通 trigger DDL，
+  会输出到 `triggers_non_table_detail_<ts>.txt` 并进入人工处理清单。
 
 ---
 
@@ -76,6 +78,7 @@
 - `grant_include_oracle_maintained_roles`：是否保留 Oracle 维护角色
 - 过滤结果输出到 `main_reports/filtered_grants.txt`
 - 动态规则库输出到 `main_reports/grant_capability_detail_<ts>.txt`
+- 若本次探针不完整，`manual_actions_required_<ts>.txt` 会额外提示先看 `grant_capability_detail_<ts>.txt`
 
 ### 3.4 VIEW 与同义词下探
 - VIEW 被授予非 owner 时，会补齐 owner 对依赖对象的 `WITH GRANT OPTION`

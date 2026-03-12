@@ -43,6 +43,7 @@ import fnmatch
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -164,15 +165,57 @@ def persist_seen_notices(
         seen_notices = {}
     for notice in notices:
         seen_notices[notice.notice_id] = current_version
+    latest_seen: Dict[str, str] = {}
+    if state_path.exists():
+        try:
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and isinstance(payload.get("seen_notices"), dict):
+                latest_seen = {
+                    str(key): str(value)
+                    for key, value in payload.get("seen_notices", {}).items()
+                    if str(key).strip()
+                }
+        except Exception:
+            latest_seen = {}
+    latest_seen.update({str(key): str(value) for key, value in seen_notices.items() if str(key).strip()})
     payload = {
         "schema_version": NOTICE_STATE_SCHEMA_VERSION,
         "last_seen_tool_version": current_version,
-        "seen_notices": seen_notices,
+        "seen_notices": latest_seen,
     }
-    state_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_path.with_name(f"{state_path.name}.lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_fp:
+        if fcntl is not None:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        try:
+            if state_path.exists():
+                try:
+                    current_payload = json.loads(state_path.read_text(encoding="utf-8"))
+                    if isinstance(current_payload, dict) and isinstance(current_payload.get("seen_notices"), dict):
+                        merged = {
+                            str(key): str(value)
+                            for key, value in current_payload.get("seen_notices", {}).items()
+                            if str(key).strip()
+                        }
+                        merged.update(payload["seen_notices"])
+                        payload["seen_notices"] = merged
+                except Exception:
+                    pass
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=str(state_path.parent),
+                prefix=f"{state_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp_fp:
+                tmp_fp.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+                tmp_name = tmp_fp.name
+            os.replace(tmp_name, state_path)
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
 
 
 def find_latest_manual_actions_report(report_dir: Optional[Union[str, Path]]) -> Optional[Path]:
@@ -244,6 +287,9 @@ def select_relevant_manual_actions(
     always_show_categories = {
         "DATA_RISK",
         "UNSUPPORTED_OBJECT",
+        "UNSUPPORTED_GRANT",
+        "GRANT_CAPABILITY_MANUAL",
+        "GRANT_CAPABILITY_PROBE_INCOMPLETE",
         "DDL_SEMANTIC_REWRITE",
         "CASE_SENSITIVE_REVIEW",
         "FIXUP_NOT_GENERATED",
@@ -258,7 +304,13 @@ def select_relevant_manual_actions(
             result.append(row)
             continue
         related_dirs = _normalize_manual_action_related_dirs(row.related_fixup_dir)
-        if related_dirs and (related_dirs & selected_dirs):
+        if related_dirs and any(
+            rel == sel
+            or rel.startswith(f"{sel}/")
+            or sel.startswith(f"{rel}/")
+            for rel in related_dirs
+            for sel in selected_dirs
+        ):
             result.append(row)
     return result
 
@@ -801,6 +853,15 @@ SYS_PRIV_IMPLICATIONS = {
     "REFERENCES": {
         "REFERENCES ANY TABLE",
     },
+    "INSERT": {
+        "INSERT ANY TABLE",
+    },
+    "UPDATE": {
+        "UPDATE ANY TABLE",
+    },
+    "DELETE": {
+        "DELETE ANY TABLE",
+    },
 }
 
 DICTIONARY_OWNER_SCHEMAS = {"SYS", "SYSTEM"}
@@ -838,6 +899,8 @@ def resolve_implied_sys_privileges(
             implied = set()
     elif required_u == "REFERENCES":
         implied = {"REFERENCES ANY TABLE"} if target_type_u == "TABLE" else set()
+    elif required_u in {"INSERT", "UPDATE", "DELETE"}:
+        implied = {f"{required_u} ANY TABLE"} if target_type_u in {"TABLE", "VIEW", "MATERIALIZED VIEW"} else set()
     else:
         implied = set(SYS_PRIV_IMPLICATIONS.get(required_u, set()))
 

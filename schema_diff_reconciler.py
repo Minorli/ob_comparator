@@ -69,6 +69,10 @@ import json
 import logging
 import math
 import os
+try:
+    import fcntl
+except Exception:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 import random
 import re
 import shutil
@@ -166,15 +170,57 @@ def persist_seen_notices(
         seen_notices = {}
     for notice in notices:
         seen_notices[notice.notice_id] = current_version
+    latest_seen: Dict[str, str] = {}
+    if state_path.exists():
+        try:
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and isinstance(payload.get("seen_notices"), dict):
+                latest_seen = {
+                    str(key): str(value)
+                    for key, value in payload.get("seen_notices", {}).items()
+                    if str(key).strip()
+                }
+        except Exception:
+            latest_seen = {}
+    latest_seen.update({str(key): str(value) for key, value in seen_notices.items() if str(key).strip()})
     payload = {
         "schema_version": NOTICE_STATE_SCHEMA_VERSION,
         "last_seen_tool_version": current_version,
-        "seen_notices": seen_notices,
+        "seen_notices": latest_seen,
     }
-    state_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_path.with_name(f"{state_path.name}.lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_fp:
+        if fcntl is not None:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        try:
+            if state_path.exists():
+                try:
+                    current_payload = json.loads(state_path.read_text(encoding="utf-8"))
+                    if isinstance(current_payload, dict) and isinstance(current_payload.get("seen_notices"), dict):
+                        merged = {
+                            str(key): str(value)
+                            for key, value in current_payload.get("seen_notices", {}).items()
+                            if str(key).strip()
+                        }
+                        merged.update(payload["seen_notices"])
+                        payload["seen_notices"] = merged
+                except Exception:
+                    pass
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=str(state_path.parent),
+                prefix=f"{state_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp_fp:
+                tmp_fp.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+                tmp_name = tmp_fp.name
+            os.replace(tmp_name, state_path)
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
 
 # 尝试导入 oracledb，如果失败则提示安装
 try:
@@ -1016,6 +1062,7 @@ class OracleMetadata(NamedTuple):
     package_errors_complete: bool                            # 源端错误信息是否完整
     partition_key_columns: Dict[Tuple[str, str], List[str]]   # (OWNER, TABLE_NAME) -> [PARTITION_COLS...]
     interval_partitions: Dict[Tuple[str, str], IntervalPartitionInfo]  # (OWNER, TABLE) -> interval info
+    non_table_triggers: Tuple["NonTableTriggerInfo", ...] = ()
 
 
 class DependencyRecord(NamedTuple):
@@ -3956,6 +4003,31 @@ class TriggerStatusReportRow(NamedTuple):
     detail: str
 
 
+class NonTableTriggerInfo(NamedTuple):
+    owner: str
+    trigger_name: str
+    trigger_type: str
+    triggering_event: str
+    base_object_type: str
+    table_owner: str
+    table_name: str
+    status: str
+
+
+class NonTableTriggerDetailRow(NamedTuple):
+    source_trigger: str
+    target_trigger: str
+    trigger_type: str
+    triggering_event: str
+    base_object_type: str
+    table_owner: str
+    table_name: str
+    status: str
+    reason_code: str
+    reason: str
+    action: str
+
+
 class TriggerViewReferenceRow(NamedTuple):
     trigger_full: str
     location: str
@@ -4431,6 +4503,15 @@ SYS_PRIV_IMPLICATIONS: Dict[str, Set[str]] = {
     # REFERENCES ANY TABLE 可覆盖跨 schema REFERENCES
     'REFERENCES': {
         'REFERENCES ANY TABLE',
+    },
+    'INSERT': {
+        'INSERT ANY TABLE',
+    },
+    'UPDATE': {
+        'UPDATE ANY TABLE',
+    },
+    'DELETE': {
+        'DELETE ANY TABLE',
     },
 }
 
@@ -6759,6 +6840,19 @@ def build_trigger_full_map(
     return full_map
 
 
+def build_non_table_trigger_map(
+    rows: Sequence[NonTableTriggerInfo]
+) -> Dict[str, NonTableTriggerInfo]:
+    result: Dict[str, NonTableTriggerInfo] = {}
+    for row in rows or ():
+        owner_u = (row.owner or "").upper()
+        name_u = (row.trigger_name or "").upper()
+        if not owner_u or not name_u:
+            continue
+        result[f"{owner_u}.{name_u}"] = row
+    return result
+
+
 def collect_missing_trigger_mappings(
     extra_results: ExtraCheckResults
 ) -> Tuple[Dict[str, str], Set[str], int]:
@@ -6783,6 +6877,58 @@ def collect_missing_trigger_mappings(
                 src_to_tgt[src_u] = tgt_u
                 missing_targets.add(tgt_u)
     return src_to_tgt, missing_targets, total_missing
+
+
+def build_non_table_trigger_detail_rows(
+    oracle_meta: OracleMetadata,
+    full_object_mapping: FullObjectMapping
+) -> List[NonTableTriggerDetailRow]:
+    rows: List[NonTableTriggerDetailRow] = []
+    for item in sorted(
+        oracle_meta.non_table_triggers or (),
+        key=lambda x: (
+            (x.owner or "").upper(),
+            (x.trigger_name or "").upper(),
+            (x.base_object_type or "").upper(),
+            (x.triggering_event or "").upper(),
+        )
+    ):
+        src_full = f"{(item.owner or '').upper()}.{(item.trigger_name or '').upper()}".strip(".")
+        if not src_full:
+            continue
+        tgt_full = (get_mapped_target(full_object_mapping, src_full, 'TRIGGER') or src_full).upper()
+        base_type_u = str(item.base_object_type or "").strip().upper()
+        event_u = str(item.triggering_event or "").strip().upper()
+        if base_type_u == "DATABASE":
+            reason_code = "DATABASE_EVENT_TRIGGER_UNSUPPORTED"
+            reason = "源端为 DATABASE 级事件触发器，当前 OB 环境不支持按普通触发器自动生成。"
+            action = "MANUAL_REVIEW"
+        elif base_type_u == "TABLE":
+            reason_code = "TABLE_TRIGGER_OUT_OF_SCOPE"
+            reason = "源端触发器依附的表未进入当前 TABLE 触发器比较范围，程序不会按普通缺失触发器生成。"
+            action = "MANUAL_REVIEW"
+        else:
+            reason_code = "NON_TABLE_TRIGGER_OUT_OF_SCOPE"
+            reason = "源端触发器不属于普通 TABLE 触发器校验/生成范围。"
+            action = "MANUAL_REVIEW"
+        if "DROP" in event_u and base_type_u == "DATABASE":
+            reason = "源端为 DATABASE 级 DROP 事件触发器；当前 OB 实测不支持 BEFORE/AFTER DROP ON DATABASE 语法。"
+        rows.append(
+            NonTableTriggerDetailRow(
+                source_trigger=src_full,
+                target_trigger=tgt_full,
+                trigger_type=item.trigger_type or "-",
+                triggering_event=item.triggering_event or "-",
+                base_object_type=item.base_object_type or "-",
+                table_owner=item.table_owner or "-",
+                table_name=item.table_name or "-",
+                status=item.status or "-",
+                reason_code=reason_code,
+                reason=reason,
+                action=action,
+            )
+        )
+    return rows
 
 
 def build_trigger_list_report(
@@ -6812,6 +6958,7 @@ def build_trigger_list_report(
         "missing_not_listed": 0,
         "not_found": 0,
         "not_missing": 0,
+        "non_table": 0,
         "check_disabled": False,
         "error": read_error or "",
         "fallback_full": False,
@@ -6870,11 +7017,14 @@ def build_trigger_list_report(
     missing_src_set = set(src_to_tgt.keys())
     missing_by_tgt = {tgt: src for src, tgt in src_to_tgt.items()}
     source_triggers = build_trigger_full_set(oracle_meta.triggers or {})
+    source_non_table_triggers = build_non_table_trigger_map(oracle_meta.non_table_triggers or ())
+    source_trigger_all = set(source_triggers) | set(source_non_table_triggers)
     target_triggers = build_trigger_full_set(ob_meta.triggers or {})
 
     selected_missing_targets: Set[str] = set()
     not_found = 0
     not_missing = 0
+    non_table = 0
 
     for entry in sorted(entries):
         entry_u = entry.upper()
@@ -6897,7 +7047,19 @@ def build_trigger_list_report(
                 detail=f"源触发器: {src_full}" if src_full else "目标缺失"
             ))
             continue
-        if entry_u not in source_triggers:
+        if entry_u in source_non_table_triggers:
+            detail_row = source_non_table_triggers[entry_u]
+            non_table += 1
+            rows.append(TriggerListReportRow(
+                entry=entry_u,
+                status="NON_TABLE_SOURCE_TRIGGER",
+                detail=(
+                    f"源端为非表触发器(base_object_type={detail_row.base_object_type or '-'}, "
+                    f"event={detail_row.triggering_event or '-'})，不在普通 TABLE 触发器生成范围"
+                )
+            ))
+            continue
+        if entry_u not in source_trigger_all:
             if entry_u in target_triggers:
                 not_missing += 1
                 rows.append(TriggerListReportRow(
@@ -6934,6 +7096,7 @@ def build_trigger_list_report(
     summary["missing_not_listed"] = max(0, total_missing - len(selected_missing_targets))
     summary["not_found"] = not_found
     summary["not_missing"] = not_missing
+    summary["non_table"] = non_table
     return rows, summary
 
 
@@ -12861,9 +13024,32 @@ def build_grant_capability_library(
                     sample_sql=sample_sql,
                 )
     finally:
+        cleanup_failures: List[str] = []
         for sql in reversed(cleanup_sqls):
-            _drop_ob_probe_sql(ob_cfg, sql)
-        _drop_ob_probe_sql(ob_cfg, f"DROP ROLE {quote_identifier(role_name)}")
+            ok_cleanup, err_cleanup = _drop_ob_probe_sql(ob_cfg, sql)
+            if not ok_cleanup:
+                cleanup_failures.append(f"{sql} :: {normalize_error_text(err_cleanup)}")
+        ok_role_drop, err_role_drop = _drop_ob_probe_sql(ob_cfg, f"DROP ROLE {quote_identifier(role_name)}")
+        if not ok_role_drop:
+            cleanup_failures.append(
+                f"DROP ROLE {quote_identifier(role_name)} :: {normalize_error_text(err_role_drop)}"
+            )
+        if cleanup_failures:
+            probe_complete = False
+            detail_rows.append(
+                GrantCapabilityDetailRow(
+                    category="HOUSEKEEPING",
+                    source_privilege="-",
+                    object_type="-",
+                    target_catalog_privilege="-",
+                    support_status=GRANT_CAPABILITY_SUPPORT_UNKNOWN,
+                    decision=GRANT_CAPABILITY_DECISION_MANUAL,
+                    reason_code=GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE,
+                    error_code="-",
+                    error_message=_sanitize_probe_message("; ".join(cleanup_failures[:3])),
+                    sample_sql="probe_cleanup",
+                )
+            )
 
     return GrantCapabilityLibrary(
         system_decisions=system_decisions,
@@ -13487,7 +13673,8 @@ def dump_oracle_metadata(
             package_errors={},
             package_errors_complete=False,
             partition_key_columns={},
-            interval_partitions={}
+            interval_partitions={},
+            non_table_triggers=()
         )
 
     log.info("正在批量加载 Oracle 元数据 (DBA_TAB_COLUMNS/DBA_INDEXES/DBA_CONSTRAINTS/DBA_TRIGGERS/DBA_SEQUENCES)...")
@@ -13495,6 +13682,7 @@ def dump_oracle_metadata(
     indexes: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     constraints: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     triggers: Dict[Tuple[str, str], Dict[str, Dict]] = {}
+    non_table_triggers: List[NonTableTriggerInfo] = []
     sequences: Dict[str, Set[str]] = {}
     sequence_attrs: Dict[str, Dict[str, Dict]] = {}
     roles: Set[str] = set()
@@ -14159,9 +14347,9 @@ def dump_oracle_metadata(
                 # 触发器
                 if include_triggers:
                     sql_trg_tpl = """
-                        SELECT OWNER, TABLE_OWNER, TABLE_NAME, TRIGGER_NAME, TRIGGERING_EVENT, STATUS
+                        SELECT OWNER, TABLE_OWNER, TABLE_NAME, TRIGGER_NAME, TRIGGER_TYPE, TRIGGERING_EVENT, BASE_OBJECT_TYPE, STATUS
                         FROM DBA_TRIGGERS
-                        WHERE TABLE_OWNER IN ({owners_clause})
+                        WHERE OWNER IN ({owners_clause})
                     """
                     with ora_conn.cursor() as cursor:
                         for owner_chunk in owner_chunks:
@@ -14169,25 +14357,53 @@ def dump_oracle_metadata(
                             sql_trg = sql_trg_tpl.format(owners_clause=owners_clause)
                             cursor.execute(sql_trg, owner_chunk)
                             for row in cursor:
-                                trg_owner = _safe_upper(row[0])
-                                owner = _safe_upper(row[1])
-                                table = _safe_upper(row[2])
-                                if not owner or not table:
-                                    continue
-                                key = (owner, table)
-                                if key not in table_pairs:
-                                    continue
-                                trg_name = _safe_upper(row[3])
+                                trg_owner = _safe_upper((row[0] or "").strip())
+                                owner = _safe_upper((row[1] or "").strip())
+                                table = _safe_upper((row[2] or "").strip())
+                                trg_name = _safe_upper((row[3] or "").strip())
+                                trigger_type = (row[4] or "").strip()
+                                event = (row[5] or "").strip()
+                                base_object_type = _safe_upper((row[6] or "").strip()) or ""
+                                status = (row[7] or "").strip()
                                 if not trg_name:
                                     continue
-                                trg_owner_u = trg_owner or owner
-                                trg_key = f"{trg_owner_u}.{trg_name}" if trg_owner_u and trg_name else trg_name
-                                triggers.setdefault(key, {})[trg_key] = {
-                                    "event": row[4],
-                                    "status": row[5],
-                                    "owner": trg_owner_u,
-                                    "name": trg_name
-                                }
+                                trg_owner_u = trg_owner or owner or ""
+                                if base_object_type == "TABLE" and owner and table:
+                                    key = (owner, table)
+                                    if key in table_pairs:
+                                        trg_key = f"{trg_owner_u}.{trg_name}" if trg_owner_u and trg_name else trg_name
+                                        triggers.setdefault(key, {})[trg_key] = {
+                                            "event": event,
+                                            "status": status,
+                                            "owner": trg_owner_u,
+                                            "name": trg_name
+                                        }
+                                    else:
+                                        non_table_triggers.append(
+                                            NonTableTriggerInfo(
+                                                owner=trg_owner_u,
+                                                trigger_name=trg_name,
+                                                trigger_type=trigger_type,
+                                                triggering_event=event,
+                                                base_object_type=base_object_type or "-",
+                                                table_owner=owner or "-",
+                                                table_name=table or "-",
+                                                status=(status or "").strip() or "-",
+                                            )
+                                        )
+                                else:
+                                    non_table_triggers.append(
+                                        NonTableTriggerInfo(
+                                            owner=trg_owner_u,
+                                            trigger_name=trg_name,
+                                            trigger_type=trigger_type,
+                                            triggering_event=event,
+                                            base_object_type=base_object_type or "-",
+                                            table_owner=owner or "-",
+                                            table_name=table or "-",
+                                            status=(status or "").strip() or "-",
+                                        )
+                                    )
 
                 status_types: Set[str] = set()
                 if include_triggers:
@@ -14548,11 +14764,12 @@ def dump_oracle_metadata(
         abort_run()
 
     log.info(
-        "Oracle 元数据加载完成：列=%d, 索引表=%d, 约束表=%d, 触发器表=%d, 序列schema=%d, 注释表=%d, 黑名单表=%d",
+        "Oracle 元数据加载完成：列=%d, 索引表=%d, 约束表=%d, 触发器表=%d, 非表触发器=%d, 序列schema=%d, 注释表=%d, 黑名单表=%d",
         len(table_columns),
         len(indexes),
         len(constraints),
         len(triggers),
+        len(non_table_triggers),
         len(sequences),
         len(table_comments),
         len(blacklist_tables)
@@ -14583,6 +14800,8 @@ def dump_oracle_metadata(
         ora_constraint_count,
         ora_trigger_count
     )
+    if non_table_triggers:
+        log.warning("Oracle 源端检测到 %d 个非表触发器，这些触发器不会进入普通 TABLE 触发器校验。", len(non_table_triggers))
 
     return OracleMetadata(
         table_columns=table_columns,
@@ -14608,7 +14827,8 @@ def dump_oracle_metadata(
         package_errors=package_errors,
         package_errors_complete=package_errors_complete,
         partition_key_columns=partition_key_columns,
-        interval_partitions=interval_partitions
+        interval_partitions=interval_partitions,
+        non_table_triggers=tuple(non_table_triggers)
     )
 
 
@@ -15948,11 +16168,12 @@ def _run_ob_probe_sql(
     return obclient_run_sql(ob_cfg, sql, timeout=timeout, quiet_error=True)
 
 
-def _drop_ob_probe_sql(ob_cfg: ObConfig, sql: str) -> None:
+def _drop_ob_probe_sql(ob_cfg: ObConfig, sql: str) -> Tuple[bool, str]:
     try:
-        _run_ob_probe_sql(ob_cfg, sql)
-    except Exception:
-        pass
+        ok, _out, err = _run_ob_probe_sql(ob_cfg, sql)
+        return bool(ok), err or ""
+    except Exception as exc:
+        return False, str(exc)
 
 
 def _build_object_probe_sql(
@@ -16075,11 +16296,13 @@ def _ensure_object_probe_fixture(
     create_sqls, local_cleanup = _build_object_probe_sql(obj_type_u, owner_u, names)
     if not create_sqls:
         return False, "unsupported_probe_object_type"
+    for stmt in local_cleanup:
+        if stmt not in cleanup_sqls:
+            cleanup_sqls.append(stmt)
     for stmt in create_sqls:
         ok, _out, err = _run_ob_probe_sql(ob_cfg, stmt)
         if not ok:
             return False, err
-    cleanup_sqls.extend(local_cleanup)
     created_types.add(obj_type_u)
     return True, ""
 
@@ -22435,12 +22658,14 @@ def _build_cleanup_action_from_rule(
     )
     change_count = 1
     samples: List[str] = []
+    note = meta.note
     if meta.sample_builder:
         try:
             change_count, samples = meta.sample_builder(before, after)
         except Exception as exc:
             log.warning("DDL 清理规则样本提取失败 %s: %s", meta.rule_name, exc)
             change_count, samples = 1, []
+            note = f"{meta.note} [SAMPLE_EXTRACTION_DEGRADED: {normalize_error_text(str(exc))}]"
     if change_count <= 0:
         change_count = 1
     return DdlCleanupAction(
@@ -22449,7 +22674,7 @@ def _build_cleanup_action_from_rule(
         category=meta.category,
         evidence_level=meta.evidence_level,
         change_count=change_count,
-        note=meta.note,
+        note=note,
         samples=samples,
     )
 
@@ -34136,6 +34361,56 @@ def export_trigger_literal_alert_detail(
     return write_pipe_report("触发器对象路径字符串提醒明细", header_fields, data_rows, output_path)
 
 
+def export_non_table_trigger_detail(
+    rows: List[NonTableTriggerDetailRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    """
+    输出源端非表触发器明细，避免数据库/模式级触发器被静默漏掉。
+    """
+    if not report_dir or not report_timestamp or not rows:
+        return None
+    output_path = Path(report_dir) / f"triggers_non_table_detail_{report_timestamp}.txt"
+    rows_sorted = sorted(
+        rows,
+        key=lambda r: (
+            r.source_trigger or "-",
+            r.base_object_type or "-",
+            r.triggering_event or "-",
+        )
+    )
+    header_fields = [
+        "SOURCE_TRIGGER",
+        "TARGET_TRIGGER",
+        "TRIGGER_TYPE",
+        "TRIGGERING_EVENT",
+        "BASE_OBJECT_TYPE",
+        "TABLE_OWNER",
+        "TABLE_NAME",
+        "STATUS",
+        "REASON_CODE",
+        "REASON",
+        "ACTION",
+    ]
+    data_rows: List[List[str]] = []
+    for row in rows_sorted:
+        data_rows.append([
+            row.source_trigger or "-",
+            row.target_trigger or "-",
+            row.trigger_type or "-",
+            row.triggering_event or "-",
+            row.base_object_type or "-",
+            row.table_owner or "-",
+            row.table_name or "-",
+            row.status or "-",
+            row.reason_code or "-",
+            row.reason or "-",
+            row.action or "-",
+        ])
+    return write_pipe_report("非表触发器明细", header_fields, data_rows, output_path)
+
+
 def export_migration_focus_report(
     missing_rows: List[ObjectSupportReportRow],
     unsupported_rows: List[ObjectSupportReportRow],
@@ -35042,10 +35317,10 @@ def export_trigger_status_report(
             (
                 "汇总: total_lines={total_lines}, valid={valid_entries}, invalid={invalid_entries}, "
                 "duplicate={duplicate_entries}, selected_missing={selected_missing}, "
-                "missing_not_listed={missing_not_listed}, not_found={not_found}, not_missing={not_missing}"
+                "missing_not_listed={missing_not_listed}, not_found={not_found}, not_missing={not_missing}, non_table={non_table}"
             ).format(**{k: summary.get(k, 0) for k in [
                 "total_lines", "valid_entries", "invalid_entries", "duplicate_entries",
-                "selected_missing", "missing_not_listed", "not_found", "not_missing"
+                "selected_missing", "missing_not_listed", "not_found", "not_missing", "non_table"
             ]})
         ]
         if summary.get("error"):
@@ -35477,8 +35752,10 @@ OPERATOR_ACTION_CATEGORY_LABELS = {
     "UNSUPPORTED_OBJECT": "不支持/阻断对象",
     "UNSUPPORTED_GRANT": "不支持授权",
     "GRANT_CAPABILITY_MANUAL": "授权能力人工复核",
+    "GRANT_CAPABILITY_PROBE_INCOMPLETE": "授权能力探针不完整",
     "DEFERRED_GRANT": "延后授权",
     "PUBLIC_REVOKE_REVIEW": "PUBLIC 扩权回收复核",
+    "TRIGGER_NON_TABLE_UNSUPPORTED": "非表触发器",
     "TRIGGER_TEMP_UNSUPPORTED": "临时表触发器",
     "TRIGGER_VIEW_REVIEW": "触发器视图引用",
     "TRIGGER_LITERAL_REVIEW": "触发器对象路径字符串",
@@ -35523,7 +35800,9 @@ def build_operator_action_rows(
     unsupported_grant_count: int = 0,
     deferred_grant_count: int = 0,
     grant_capability_manual_count: int = 0,
+    grant_capability_probe_incomplete: bool = False,
     extra_public_grant_count: int = 0,
+    trigger_non_table_count: int = 0,
     trigger_temp_unsupported_count: int = 0,
     trigger_view_reference_count: int = 0,
     trigger_literal_alert_count: int = 0,
@@ -35614,6 +35893,17 @@ def build_operator_action_rows(
         recommended_action="查看 grant_capability_detail 中的 MANUAL_REVIEW 决策后再决定如何处理授权。",
     )
     _add(
+        priority="REVIEW",
+        stage="POST_COMPARE_REVIEW",
+        category="GRANT_CAPABILITY_PROBE_INCOMPLETE",
+        count=1 if grant_capability_probe_incomplete else 0,
+        default_behavior="REPORT_ONLY",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "grant_capability_detail"),
+        related_fixup_dir="",
+        why="本次授权能力探针未完全闭环，部分结论属于降级判断。",
+        recommended_action="先看 grant_capability_detail 中的 PROBE_INCOMPLETE/MANUAL_REVIEW 行，再决定是否补授权或回收权限。",
+    )
+    _add(
         priority="PREREQ",
         stage="AFTER_OBJECT_READY",
         category="DEFERRED_GRANT",
@@ -35634,6 +35924,17 @@ def build_operator_action_rows(
         related_fixup_dir="grants_revoke/",
         why="目标端存在源端未声明的 PUBLIC 授权，回收前必须核对业务预期。",
         recommended_action="先核对 target_extra_grants_detail，再决定是否执行 grants_revoke/。",
+    )
+    _add(
+        priority="BLOCKER",
+        stage="BEFORE_FIXUP",
+        category="TRIGGER_NON_TABLE_UNSUPPORTED",
+        count=trigger_non_table_count,
+        default_behavior="REPORT_ONLY",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "triggers_non_table_detail"),
+        related_fixup_dir="trigger/",
+        why="源端存在非表触发器（如 DATABASE 级事件触发器），当前不会按普通 trigger/ 脚本自动生成。",
+        recommended_action="先看非表触发器明细，确认是否需要人工改造、保留空缺或另行迁移。",
     )
     _add(
         priority="BLOCKER",
@@ -37682,6 +37983,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "TRIGGER_VIEW_REFERENCE_DETAIL"
     if name.startswith("triggers_literal_object_path_detail_"):
         return "TRIGGER_LITERAL_OBJECT_PATH_DETAIL"
+    if name.startswith("triggers_non_table_detail_"):
+        return "TRIGGER_NON_TABLE_DETAIL"
     if "missed_tables_views_for_OMS" in rel_path:
         return "OMS_MISSING_RULES"
     return "OTHER"
@@ -37719,6 +38022,7 @@ def _infer_artifact_status(
         "TRIGGER_STATUS",
         "TRIGGER_TEMP_UNSUPPORTED_DETAIL",
         "TRIGGER_VIEW_REFERENCE_DETAIL",
+        "TRIGGER_NON_TABLE_DETAIL",
         "OBJECTS_AFTER_CUTOFF_DETAIL",
         "CASE_SENSITIVE_IDENTIFIER_DETAIL",
         "SYS_C_FORCE_CANDIDATES_DETAIL",
@@ -39537,9 +39841,9 @@ def ensure_report_db_views_exist(
     return artifacts
 
 
-REPORT_SQL_PLAYBOOK_TEMPLATE_VERSION = "20260311_17"
+REPORT_SQL_PLAYBOOK_TEMPLATE_VERSION = "20260312_10"
 REPORT_SQL_PLAYBOOK_LATEST_FILENAME = "HOW_TO_READ_REPORTS_IN_OB_latest.txt"
-REPORT_SQL_PLAYBOOK_SNAPSHOT_FILENAME = "HOW_TO_READ_REPORTS_IN_OB_20260311_17_sqls.txt"
+REPORT_SQL_PLAYBOOK_SNAPSHOT_FILENAME = "HOW_TO_READ_REPORTS_IN_OB_20260312_10_sqls.txt"
 REPORT_SQL_PLAYBOOK_TEMPLATE = """# 说明: 本文件仅提供 report_id 与 HOW TO 入口，不内嵌 HOW TO 正文。
 当前 report_id: :report_id_value
 建议阅读:
@@ -41072,6 +41376,8 @@ def print_final_report(
     trigger_view_reference_count = len(trigger_view_reference_rows)
     trigger_literal_alert_rows = list((settings or {}).get("_trigger_literal_alert_rows") or [])
     trigger_literal_alert_count = len(trigger_literal_alert_rows)
+    non_table_trigger_rows = list((settings or {}).get("_non_table_trigger_rows") or [])
+    non_table_trigger_count = len(non_table_trigger_rows)
     if usability_summary:
         usability_checked_cnt = usability_summary.total_checked
         usability_usable_cnt = usability_summary.total_usable
@@ -41191,6 +41497,7 @@ def print_final_report(
         1 for item in (filtered_grants or [])
         if (item.reason or "").upper().startswith("DEFERRED_")
     )
+    grant_capability_library = (settings or {}).get("_grant_capability_library")
     grant_capability_manual_count = int((grant_capability_summary or {}).get("manual_rows", 0) or 0)
     deferred_validate_count = int((settings or {}).get("_constraint_validate_deferred_count", 0) or 0)
     generated_fixup_dirs = list((settings or {}).get("_generated_fixup_dirs") or [])
@@ -41209,7 +41516,9 @@ def print_final_report(
         unsupported_grant_count=unsupported_grant_count,
         deferred_grant_count=deferred_grant_count,
         grant_capability_manual_count=grant_capability_manual_count,
+        grant_capability_probe_incomplete=bool(grant_capability_library and not grant_capability_library.probe_complete),
         extra_public_grant_count=extra_public_grant_count,
+        trigger_non_table_count=non_table_trigger_count,
         trigger_temp_unsupported_count=len(temp_trigger_unsupported_rows),
         trigger_view_reference_count=trigger_view_reference_count,
         trigger_literal_alert_count=trigger_literal_alert_count,
@@ -41638,6 +41947,9 @@ def print_final_report(
             invalid_cnt = trigger_list_summary.get("invalid_entries", 0) or 0
             not_found_cnt = trigger_list_summary.get("not_found", 0) or 0
             not_missing_cnt = trigger_list_summary.get("not_missing", 0) or 0
+            if non_table_trigger_count:
+                filter_text.append("  非表触发器: ", style="mismatch")
+                filter_text.append(str(non_table_trigger_count), style="mismatch")
             if invalid_cnt:
                 filter_text.append("  无效: ", style="mismatch")
                 filter_text.append(str(invalid_cnt), style="mismatch")
@@ -41649,15 +41961,26 @@ def print_final_report(
                 filter_text.append(str(not_missing_cnt), style="info")
         summary_table.add_row("[bold]触发器筛选[/bold]", filter_text)
 
-    if trigger_status_rows or constraint_status_rows:
+    if trigger_status_rows or constraint_status_rows or non_table_trigger_count:
         status_text = Text()
         status_text.append("TRIGGER 差异: ", style="mismatch")
         status_text.append(str(trg_status_drift_cnt), style="mismatch")
+        if non_table_trigger_count:
+            status_text.append("\n非表触发器: ", style="mismatch")
+            status_text.append(str(non_table_trigger_count), style="mismatch")
         status_text.append("\nCONSTRAINT 差异: ", style="mismatch")
         status_text.append(str(cons_status_drift_cnt), style="mismatch")
         if report_file:
-            status_text.append("\n详见: trigger_status_report.txt / ", style="info")
-            status_text.append(f"status_drift_detail_{report_ts or '*'}.txt", style="info")
+            status_refs: List[str] = []
+            if trigger_list_summary or trigger_status_rows:
+                status_refs.append("trigger_status_report.txt")
+            if trigger_status_rows or constraint_status_rows:
+                status_refs.append(f"status_drift_detail_{report_ts or '*'}.txt")
+            if non_table_trigger_count:
+                status_refs.append(f"triggers_non_table_detail_{report_ts or '*'}.txt")
+            if status_refs:
+                status_text.append("\n详见: ", style="info")
+                status_text.append(" / ".join(status_refs), style="info")
         summary_table.add_row("[bold]状态漂移[/bold]", status_text)
 
     dep_text = Text()
@@ -42410,6 +42733,17 @@ def print_final_report(
             )
         trigger_row_count = (len(trigger_list_rows or []) + len(trigger_status_rows or [])) if trigger_report_path else None
         _add_index_entry("AUX", trigger_report_path, trigger_row_count, "触发器状态/清单报告")
+        non_table_trigger_detail_path = export_non_table_trigger_detail(
+            non_table_trigger_rows,
+            report_path.parent,
+            report_ts
+        )
+        _add_index_entry(
+            "DETAIL",
+            non_table_trigger_detail_path,
+            len(non_table_trigger_rows) if non_table_trigger_detail_path else None,
+            "非表触发器明细"
+        )
         status_drift_path = export_status_drift_detail(
             trigger_status_rows or [],
             constraint_status_rows or [],
@@ -44297,6 +44631,7 @@ def main():
                 trigger_list_summary.get("selected_missing", 0),
                 trigger_list_summary.get("missing_not_listed", 0)
             )
+    settings["_non_table_trigger_rows"] = build_non_table_trigger_detail_rows(oracle_meta, full_object_mapping)
 
     if enable_dependencies_check:
         apply_config_hot_reload_at_phase(hot_reload_runtime, "依赖/授权校验", settings, ora_cfg, ob_cfg)
