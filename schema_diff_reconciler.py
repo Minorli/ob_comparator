@@ -13975,18 +13975,18 @@ def dump_oracle_metadata(
                                     col = _safe_upper(row[2])
                                     if not owner or not table or not col:
                                         continue
-                                key = (owner, table)
-                                if key not in table_pairs:
-                                    continue
-                                table_columns.setdefault(key, {})[col] = _parse_tab_column_row(
-                                    row,
-                                    False,
-                                    False,
-                                    False,
-                                    False,
-                                    False,
-                                    False
-                                )
+                                    key = (owner, table)
+                                    if key not in table_pairs:
+                                        continue
+                                    table_columns.setdefault(key, {})[col] = _parse_tab_column_row(
+                                        row,
+                                        False,
+                                        False,
+                                        False,
+                                        False,
+                                        False,
+                                        False
+                                    )
                     else:
                         raise
 
