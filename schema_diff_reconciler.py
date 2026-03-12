@@ -1047,6 +1047,7 @@ class ObMetadata(NamedTuple):
     partition_key_columns: Dict[Tuple[str, str], List[str]]  # (OWNER, TABLE_NAME) -> [PARTITION_COLS...]
     case_sensitive_findings: Tuple[CaseSensitiveIdentifierFinding, ...] = ()  # case-sensitive 标识符发现
     constraint_deferrable_supported: bool = False         # 是否支持读取 DEFERRABLE/DEFERRED 元数据
+    temporary_tables: Set[Tuple[str, str]] = set()        # (OWNER, TABLE_NAME) -> target GTT / temporary tables
 
 
 class OracleMetadata(NamedTuple):
@@ -9852,31 +9853,6 @@ def resolve_remap_target(
                     mapped_schema = schema_mapping.get(parent_schema.upper())
                     if mapped_schema:
                         parent_target = f"{mapped_schema.upper()}.{parent_obj}"
-                if not parent_target and obj_type_u == 'SYNONYM' and source_objects:
-                    parent_types = {t.upper() for t in source_objects.get(parent_table.upper(), set())}
-                    preferred_types = (
-                        'TABLE', 'VIEW', 'MATERIALIZED VIEW', 'SEQUENCE',
-                        'SYNONYM', 'FUNCTION', 'PROCEDURE', 'PACKAGE',
-                        'TYPE', 'TRIGGER'
-                    )
-                    for parent_type in preferred_types:
-                        if parent_type not in parent_types:
-                            continue
-                        parent_target = resolve_remap_target(
-                            parent_table.upper(),
-                            parent_type,
-                            remap_rules,
-                            source_objects=source_objects,
-                            schema_mapping=schema_mapping,
-                            object_parent_map=object_parent_map,
-                            dependency_graph=dependency_graph,
-                            transitive_table_cache=transitive_table_cache,
-                            source_dependencies=source_dependencies,
-                            sequence_remap_policy=sequence_policy,
-                            _path=path
-                        )
-                        if parent_target:
-                            break
                 if parent_target:
                     tgt_schema = parent_target.split('.', 1)[0].upper()
                     src_obj = src_name.split('.', 1)[1]
@@ -11507,7 +11483,8 @@ def dump_ob_metadata(
             package_errors_complete=False,
             partition_key_columns={},
             case_sensitive_findings=(),
-            constraint_deferrable_supported=False
+            constraint_deferrable_supported=False,
+            temporary_tables=set()
         )
 
     synonym_scope = normalize_synonym_check_scope(synonym_check_scope)
@@ -11908,6 +11885,7 @@ def dump_ob_metadata(
     table_comments: Dict[Tuple[str, str], Optional[str]] = {}
     column_comments: Dict[Tuple[str, str], Dict[str, Optional[str]]] = {}
     comments_complete = False
+    temporary_tables: Set[Tuple[str, str]] = set()
     if include_comments:
         target_pairs = target_table_pairs or set()
         if not target_pairs:
@@ -11966,6 +11944,26 @@ def dump_ob_metadata(
             if comments_complete and target_pairs and not table_comments and not column_comments:
                 log.warning("OB 端注释查询未返回任何记录，可能缺少权限，注释比对将跳过。")
                 comments_complete = False
+
+    # --- 2.c Temporary table metadata (for GTT index normalization gate) ---
+    sql_temp_tpl = """
+        SELECT OWNER, TABLE_NAME
+        FROM DBA_TABLES
+        WHERE OWNER IN ({owners_in})
+          AND TEMPORARY = 'Y'
+    """
+    ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_temp_tpl, owners_in_list)
+    if not ok:
+        log.warning("读取 OB DBA_TABLES.TEMPORARY 失败，GTT 索引归一化将保守关闭: %s", err)
+    elif lines:
+        for line in lines:
+            parts = line.split('\t')
+            if len(parts) < 2:
+                continue
+            owner = parts[0].strip().upper()
+            table = parts[1].strip().upper()
+            if owner and table:
+                temporary_tables.add((owner, table))
 
     # --- 3. DBA_INDEXES ---
     indexes: Dict[Tuple[str, str], Dict[str, Dict]] = {}
@@ -12481,7 +12479,8 @@ def dump_ob_metadata(
         package_errors_complete=package_errors_complete,
         partition_key_columns=partition_key_columns,
         case_sensitive_findings=case_sensitive_findings,
-        constraint_deferrable_supported=constraint_deferrable_supported
+        constraint_deferrable_supported=constraint_deferrable_supported,
+        temporary_tables=temporary_tables
     )
     ob_table_count = len(ob_meta.tab_columns)
     ob_column_count = sum(len(cols) for cols in ob_meta.tab_columns.values())
@@ -17873,6 +17872,8 @@ def is_ob_gtt_internal_index_name(index_name: Optional[str]) -> bool:
 
 
 def should_normalize_ob_gtt_indexes(
+    target_table_key: Optional[Tuple[str, str]],
+    temporary_tables: Optional[Set[Tuple[str, str]]],
     entries: Optional[Dict[str, Dict]],
     constraints: Optional[Dict[str, Dict]] = None
 ) -> bool:
@@ -17880,9 +17881,21 @@ def should_normalize_ob_gtt_indexes(
     判定是否启用 OB GTT 索引归一化（剥离 SYS_SESSION_ID 前缀列）。
 
     规则：
+    0) 目标表必须先被确认是 temporary/GTT；
     1) 命中 IDX_FOR_HEAP_GTT_* 内部索引名；
     2) 或者 P/U 约束背靠索引首列为 SYS_SESSION_ID（部分版本无内部索引名也会出现）。
     """
+    table_key_u = (
+        (str(target_table_key[0]).upper(), str(target_table_key[1]).upper())
+        if target_table_key and len(target_table_key) == 2
+        else None
+    )
+    temporary_table_set = {
+        (str(owner).upper(), str(table).upper())
+        for owner, table in (temporary_tables or set())
+    }
+    if not table_key_u or table_key_u not in temporary_table_set:
+        return False
     idx_entries = entries or {}
     if any(is_ob_gtt_internal_index_name(name) for name in idx_entries.keys()):
         return True
@@ -18088,7 +18101,12 @@ def build_index_cache_for_table(
         src_idx = {}
     tgt_idx = ob_meta.indexes.get(tgt_key, {})
     tgt_constraints = ob_meta.constraints.get(tgt_key, {})
-    normalize_ob_gtt = should_normalize_ob_gtt_indexes(tgt_idx, tgt_constraints)
+    normalize_ob_gtt = should_normalize_ob_gtt_indexes(
+        tgt_key,
+        getattr(ob_meta, "temporary_tables", set()),
+        tgt_idx,
+        tgt_constraints,
+    )
     src_map = build_index_map(src_idx)
     tgt_map = build_index_map(tgt_idx, normalize_ob_gtt=normalize_ob_gtt)
     src_sig = build_index_signature(src_map)
@@ -18369,7 +18387,12 @@ def compare_indexes_for_table(
         src_idx = {}
     tgt_idx = ob_meta.indexes.get(tgt_key, {})
     tgt_constraints = ob_meta.constraints.get(tgt_key, {})
-    normalize_ob_gtt = should_normalize_ob_gtt_indexes(tgt_idx, tgt_constraints)
+    normalize_ob_gtt = should_normalize_ob_gtt_indexes(
+        tgt_key,
+        getattr(ob_meta, "temporary_tables", set()),
+        tgt_idx,
+        tgt_constraints,
+    )
     constraint_index_cols = build_constraint_index_cols(
         tgt_constraints,
         tgt_idx,

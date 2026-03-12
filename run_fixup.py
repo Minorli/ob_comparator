@@ -2217,13 +2217,7 @@ def parse_object_from_filename(path: Path) -> Tuple[Optional[str], Optional[str]
 
 
 def parse_object_identity_from_path(path: Path) -> Tuple[Optional[str], Optional[str]]:
-    stem = path.stem
-    if "." not in stem:
-        return None, None
-    parts = stem.split(".")
-    if len(parts) < 2:
-        return None, None
-    return normalize_identifier(parts[0]), normalize_identifier(parts[1])
+    return parse_object_from_filename(path)
 
 
 def normalize_object_type(raw: str) -> str:
@@ -2942,9 +2936,21 @@ def reset_auto_grant_round_cache(ctx: Optional[AutoGrantContext], round_num: int
     if not ctx:
         return 0
     cleared = len(ctx.blocked_objects)
+    cache_entries = (
+        len(ctx.roles_cache)
+        + len(ctx.tab_privs_cache)
+        + len(ctx.tab_privs_grantable_cache)
+        + len(ctx.sys_privs_cache)
+    )
     if cleared:
         ctx.blocked_objects.clear()
         log.info("[AUTO-GRANT] 第 %d 轮开始，已清理上一轮阻断缓存 %d 项。", round_num, cleared)
+    if cache_entries:
+        ctx.roles_cache.clear()
+        ctx.tab_privs_cache.clear()
+        ctx.tab_privs_grantable_cache.clear()
+        ctx.sys_privs_cache.clear()
+        log.info("[AUTO-GRANT] 第 %d 轮开始，已清理权限查询缓存 %d 项。", round_num, cache_entries)
     return cleared
 
 
