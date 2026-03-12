@@ -100,6 +100,8 @@ REPO_URL = "https://github.com/Minorli/ob_comparator"
 REPO_ISSUES_URL = f"{REPO_URL}/issues"
 NOTICE_STATE_FILENAME = ".comparator_notice_state.json"
 NOTICE_STATE_SCHEMA_VERSION = 1
+MANUAL_ACTION_REPORT_KIND = "MANUAL_ACTION_REQUIRED"
+MANUAL_ACTION_REPORT_SCHEMA_VERSION = 1
 
 
 class RuntimeNotice(NamedTuple):
@@ -141,7 +143,20 @@ def load_notice_state(config_dir: Optional[Union[str, Path]]) -> Tuple[Path, Dic
             last_seen = payload.get("last_seen_tool_version")
             if isinstance(last_seen, str):
                 state["last_seen_tool_version"] = last_seen
-    except Exception:
+    except Exception as exc:
+        backup_path = state_path.with_name(
+            f"{state_path.name}.corrupted.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+        try:
+            shutil.copy2(state_path, backup_path)
+        except Exception:
+            backup_path = None
+        logging.getLogger(__name__).warning(
+            "notice 状态文件损坏，已按空状态继续: %s%s%s",
+            state_path,
+            f" (备份: {backup_path})" if backup_path else "",
+            f" ({exc})" if exc else "",
+        )
         return state_path, state
     return state_path, state
 
@@ -35646,7 +35661,10 @@ def export_unsupported_grant_detail(
 def export_grant_capability_detail(
     capability_rows: List[GrantCapabilityDetailRow],
     report_dir: Path,
-    report_timestamp: Optional[str]
+    report_timestamp: Optional[str],
+    *,
+    probe_complete: Optional[bool] = None,
+    summary: Optional[Dict[str, int]] = None,
 ) -> Optional[Path]:
     if not report_dir or not report_timestamp or not capability_rows:
         return None
@@ -35688,7 +35706,36 @@ def export_grant_capability_detail(
         ]
         for row in rows
     ]
-    return write_pipe_report("动态授权能力明细", header_fields, data_rows, output_path)
+    lines: List[str] = [
+        "# 动态授权能力明细",
+        f"# total={len(rows)}",
+        "# 分隔符: |",
+        f"# 字段说明: {'|'.join(header_fields)}",
+    ]
+    if probe_complete is not None:
+        lines.append(f"# probe_complete={'true' if probe_complete else 'false'}")
+    if summary:
+        lines.append(
+            "# summary: allow={allow} filter={filter} manual={manual} alias={alias}".format(
+                allow=int(summary.get("allow_rows", 0) or 0),
+                filter=int(summary.get("filter_rows", 0) or 0),
+                manual=int(summary.get("manual_rows", 0) or 0),
+                alias=int(summary.get("supported_alias_rows", 0) or 0),
+            )
+        )
+    if probe_complete is False:
+        lines.append("# note: probe_complete=false 表示本次仅部分完成运行期验证；ALLOW/FILTER 中已验证结果仍有效，MANUAL_REVIEW 表示需人工复核。")
+    header = "|".join(header_fields)
+    lines.append(header)
+    for row in data_rows:
+        lines.append("|".join(sanitize_pipe_field(item) for item in row))
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        return output_path
+    except OSError as exc:
+        log.warning("写入报告失败 %s: %s", output_path, exc)
+        return None
 
 
 def export_deferred_grant_detail(
@@ -36112,7 +36159,25 @@ def export_manual_actions_required(
         ]
         for row in rows
     ]
-    return write_pipe_report("本次必须人工处理/确认", header_fields, data_rows, output_path)
+    header = "|".join(header_fields)
+    lines: List[str] = [
+        "# 本次必须人工处理/确认",
+        f"# total={len(rows)}",
+        "# 分隔符: |",
+        f"# report_kind={MANUAL_ACTION_REPORT_KIND}",
+        f"# schema_version={MANUAL_ACTION_REPORT_SCHEMA_VERSION}",
+        f"# 字段说明: {header}",
+        header,
+    ]
+    for row in data_rows:
+        lines.append("|".join(sanitize_pipe_field(item) for item in row))
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        return output_path
+    except OSError as exc:
+        log.warning("写入报告失败 %s: %s", output_path, exc)
+        return None
 
 
 def export_fixup_skip_summary(
@@ -42803,7 +42868,13 @@ def print_final_report(
         grant_capability_detail_path = export_grant_capability_detail(
             list((settings or {}).get("_grant_capability_detail_rows") or []),
             report_path.parent,
-            report_ts
+            report_ts,
+            probe_complete=(
+                None
+                if not (settings or {}).get("_grant_capability_library")
+                else bool((settings or {}).get("_grant_capability_library").probe_complete)
+            ),
+            summary=grant_capability_summary,
         )
         _add_index_entry(
             "DETAIL",

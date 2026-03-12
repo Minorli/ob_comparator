@@ -84,6 +84,8 @@ REPO_ISSUES_URL = f"{REPO_URL}/issues"
 OBCLIENT_SECURE_OPT = "--defaults-extra-file"
 NOTICE_STATE_FILENAME = ".comparator_notice_state.json"
 NOTICE_STATE_SCHEMA_VERSION = 1
+MANUAL_ACTION_REPORT_KIND = "MANUAL_ACTION_REQUIRED"
+MANUAL_ACTION_REPORT_SCHEMA_VERSION = 1
 
 class RuntimeNotice(NamedTuple):
     notice_id: str
@@ -136,7 +138,20 @@ def load_notice_state(config_dir: Optional[Union[str, Path]]) -> Tuple[Path, Dic
             last_seen = payload.get("last_seen_tool_version")
             if isinstance(last_seen, str):
                 state["last_seen_tool_version"] = last_seen
-    except Exception:
+    except Exception as exc:
+        backup_path = state_path.with_name(
+            f"{state_path.name}.corrupted.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+        try:
+            shutil.copy2(state_path, backup_path)
+        except Exception:
+            backup_path = None
+        logging.getLogger(__name__).warning(
+            "notice 状态文件损坏，已按空状态继续: %s%s%s",
+            state_path,
+            f" (备份: {backup_path})" if backup_path else "",
+            f" ({exc})" if exc else "",
+        )
         return state_path, state
     return state_path, state
 
@@ -234,16 +249,39 @@ def load_manual_actions_report(path: Optional[Path]) -> List[ManualActionNoticeR
     rows: List[ManualActionNoticeRow] = []
     try:
         header_seen = False
+        report_kind = ""
+        schema_version = ""
+        expected_header = "PRIORITY|STAGE|CATEGORY|COUNT|DEFAULT_BEHAVIOR|PRIMARY_ARTIFACT|RELATED_FIXUP_DIR|WHY|RECOMMENDED_ACTION"
         for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
             line = raw.strip()
             if not line or line.startswith("#"):
+                if line.startswith("# report_kind="):
+                    report_kind = line.split("=", 1)[-1].strip()
+                elif line.startswith("# schema_version="):
+                    schema_version = line.split("=", 1)[-1].strip()
+                elif line.startswith("# 字段说明:"):
+                    declared = line.split(":", 1)[-1].strip()
+                    if declared and declared != expected_header:
+                        log.warning("manual_actions 报告字段说明不匹配，已拒绝加载: %s", path)
+                        return []
                 continue
             if not header_seen:
                 header_seen = True
+                if report_kind and report_kind != MANUAL_ACTION_REPORT_KIND:
+                    log.warning("manual_actions 报告类型不匹配，已拒绝加载: %s", path)
+                    return []
+                if schema_version and schema_version != str(MANUAL_ACTION_REPORT_SCHEMA_VERSION):
+                    log.warning("manual_actions 报告 schema_version=%s 不兼容，已拒绝加载: %s", schema_version, path)
+                    return []
+                if line == expected_header:
+                    continue
                 if line.upper().startswith("PRIORITY|STAGE|CATEGORY|COUNT|"):
                     continue
+                log.warning("manual_actions 报告缺少标准表头，已拒绝加载: %s", path)
+                return []
             parts = [part.strip() for part in line.split("|")]
             if len(parts) < 9:
+                log.warning("manual_actions 报告字段数不足，已跳过该行: %s | %s", path, line)
                 continue
             try:
                 count = int(parts[3] or 0)
