@@ -2,6 +2,15 @@
 
 本文件记录 OceanBase Comparator Toolkit 的重要变更。
 
+## [0.9.8.8] - 2026-03-13
+
+### 变更
+- owner 级授权文件渲染增强：当 `OBJECT_TYPE=TABLE` 时，继续细分 `TABLE_OBJECT_GRANTS` 与 `TABLE_COLUMN_GRANTS`，提升列级授权审核可读性。
+- 上述细分为输出层增强，不改变授权语句集合、merge/dedupe 规则、`grants_*` 目录布局与 `run_fixup` 执行语义。
+
+### 文档
+- README / `readme_config.txt` / 技术文档当前版本号同步到 `0.9.8.8`。
+
 ## [0.9.8.7] - 2026-03-11
 
 ### 新增

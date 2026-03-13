@@ -1,19 +1,13 @@
 # OceanBase Comparator Toolkit
 
-> 当前版本：V0.9.8.7  
+> 当前版本：V0.9.8.8  
 > 面向 Oracle → OceanBase (Oracle 模式) 的结构一致性校验与修补脚本生成工具  
 > 核心理念：一次转储、本地对比、脚本审计优先
 
-## 近期更新（0.9.8.7）
-- `run_fixup` 稳定性增强：新增并发运行锁（`.run_fixup.lock`）与执行状态账本（`.fixup_state_ledger.json`），避免并发重入与 move 失败后的重复执行。
-- `run_fixup` 迭代授权链路增强：每轮自动清理阻断缓存，防止前一轮临时阻断导致后续轮次长期跳过。
-- SQL/DDL 清洗增强：补齐 Q-quote 掩码、修复双引号扫描误伤、注释剥离后再判定 `WITH CHECK OPTION` / `WITH READ ONLY`。
-- 视图 DDL 清洗增强：`CREATE ... VIEW` 前缀改为 token 扫描，降低注释/字符串命中导致的误改风险。
-- 表数据存在性校验增强：`auto` 模式下对 `NUM_ROWS=0` 做源端/目标端二次探针，新增 `table_data_presence_zero_probe_workers` 并限制最大并发为 32。
-- 黑名单规则增强：`blacklist_rules.json` 解析失败可致命中止（fail-fast），避免规则失效后“静默全量放行”。
-- 配置热加载增强：新增 `config_hot_reload_mode/config_hot_reload_interval_sec/config_hot_reload_fail_policy`，
-  支持主程序 phase 边界应用与 `run_fixup --iterative` round 边界应用（默认关闭）。
-- 近期能力与文档总览统一补齐（README / readme_config / docs/* / release notes / version diff）。
+## 近期更新（0.9.8.8）
+- 授权文件可读性增强：owner 级 `*.grants.sql` 在 `OBJECT_TYPE: TABLE` 段内继续细分 `TABLE_OBJECT_GRANTS` 与 `TABLE_COLUMN_GRANTS`，便于快速区分整表授权和列级授权。
+- 该细分仅影响授权文件渲染，不改变 grant 采集、过滤、合并、fixup 执行目录和执行语义。
+- README / `readme_config.txt` / OpenSpec release 元数据已同步到 `0.9.8.8`。
 
 ## 核心能力
 - **对象覆盖完整**：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。

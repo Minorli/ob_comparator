@@ -1,5 +1,5 @@
 OceanBase 对比工具极简手册（现场版）
-当前版本：V0.9.8.7
+当前版本：V0.9.8.8
 
 0. 先更新版本
 - 项目地址：https://github.com/Minorli/ob_comparator
