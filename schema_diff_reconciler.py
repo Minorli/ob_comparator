@@ -31619,6 +31619,9 @@ def generate_fixup_scripts(
             rank = len(PRIVILEGE_TYPE_PRIORITY)
         return rank, obj_type_u
 
+    def is_column_grant_statement(stmt: str) -> bool:
+        return bool(re.search(r"(?is)^\s*GRANT\s+.+\([^)]*\)\s+ON\s+", stmt or ""))
+
     def render_grouped_object_grant_content(stmts: Set[str]) -> str:
         if not stmts:
             return ""
@@ -31634,8 +31637,21 @@ def generate_fixup_scripts(
             if not first_section:
                 lines.append("")
             first_section = False
-            lines.append(f"-- OBJECT_TYPE: {obj_type_u} ({len(grouped[obj_type_u])})")
-            lines.extend(sorted(grouped[obj_type_u]))
+            section_stmts = sorted(grouped[obj_type_u])
+            lines.append(f"-- OBJECT_TYPE: {obj_type_u} ({len(section_stmts)})")
+            if obj_type_u == "TABLE":
+                table_object_stmts = [stmt for stmt in section_stmts if not is_column_grant_statement(stmt)]
+                table_column_stmts = [stmt for stmt in section_stmts if is_column_grant_statement(stmt)]
+                if table_object_stmts:
+                    lines.append(f"-- TABLE_OBJECT_GRANTS ({len(table_object_stmts)})")
+                    lines.extend(table_object_stmts)
+                if table_object_stmts and table_column_stmts:
+                    lines.append("")
+                if table_column_stmts:
+                    lines.append(f"-- TABLE_COLUMN_GRANTS ({len(table_column_stmts)})")
+                    lines.extend(table_column_stmts)
+                continue
+            lines.extend(section_stmts)
         return "\n".join(lines).strip()
 
     def pre_add_cross_schema_grants(

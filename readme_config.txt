@@ -249,7 +249,8 @@
   说明：程序还会额外生成 `oracle_privilege_family_detail_<ts>.txt`，说明当前 run 覆盖到哪些 Oracle 权限族；
   因此 `grants_miss/` 不是“全部 Oracle 权限闭环”，而是“当前 runnable grants 闭环”。
   说明：所有“未自动闭环”的授权与其他人工项，还会统一聚合到 `manual_actions_required_<ts>.txt`，避免只看 `grants_miss/` 后遗漏 unsupported/deferred/review-first 场景。
-  说明：对象/列授权文件（如 `grants_all/<OWNER>.grants.sql`、`grants_miss/<OWNER>.grants.sql`）会在同一文件内按 `OBJECT_TYPE` 分段，便于识别 `TYPE/PROCEDURE/PACKAGE/...`。
+  说明：对象/列授权文件（如 `grants_all/<OWNER>.grants.sql`、`grants_miss/<OWNER>.grants.sql`）会在同一文件内按 `OBJECT_TYPE` 分段；
+  其中 `OBJECT_TYPE=TABLE` 时，还会继续拆成 `TABLE_OBJECT_GRANTS` 与 `TABLE_COLUMN_GRANTS`，便于区分整表授权和列级授权。
 - grant_tab_privs_scope：DBA_TAB_PRIVS 抽取范围。默认：owner。
   可选值：owner（仅源 schema 所拥有对象）、owner_or_grantee（兼容旧逻辑）。
 - grant_merge_privileges：合并同一对象的多权限授权。默认：true。
