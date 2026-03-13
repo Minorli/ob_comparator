@@ -125,6 +125,8 @@ python3 run_fixup.py --smart-order --recompile
 主程序跑完后，优先看两处：
 - `main_reports/run_<ts>/manual_actions_required_<ts>.txt`
   说明：这是本次仍需人工处理/确认的统一清单，先看它，再展开其他 detail/fixup。
+- `main_reports/run_<ts>/oracle_privilege_family_detail_<ts>.txt`
+  说明：这是 Oracle 权限族覆盖清单。`grants_miss/` 只代表当前 runnable grants，不等于全部 Oracle 权限已经闭环。
 - `report_<ts>.txt` 里的 `执行结论` 和 `本次建议处理顺序`
 - `fixup_scripts/README_FIRST.txt`
   说明：这个文件会按本次实际生成的目录解释哪些可以先看、哪些默认不要直接执行。
@@ -209,6 +211,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/filtered_grants.txt`：过滤授权清单
 - `main_reports/run_<ts>/manual_actions_required_<ts>.txt`：本次必须人工处理/确认的统一清单（聚合 unsupported/deferred/review-first 项）
 - `main_reports/run_<ts>/grant_capability_detail_<ts>.txt`：本次授权动态规则库明细（含目标端目录权限别名，如 `DEBUG -> OTHERS`）
+- `main_reports/run_<ts>/oracle_privilege_family_detail_<ts>.txt`：Oracle 权限族覆盖明细（区分 `RUNNABLE / MANUAL_ONLY`，当前 `DBA_COL_PRIVS` 已纳入 runnable grants，ACL/AQ/XS/Resource Manager 等仍先做盘点）
 - `main_reports/run_<ts>/target_extra_grants_detail_<ts>.txt`：目标端额外对象授权明细（含 PUBLIC 扩权风险）
 - `main_reports/run_<ts>/ddl_cleanup_detail_<ts>.txt`：DDL 清理/改写明细（区分 `format_only / syntax_compat / environment_detach / semantic_rewrite`，并标记 `evidence_level`）
 - `main_reports/run_<ts>/trigger_status_report.txt`：触发器清单/状态差异报告
@@ -229,8 +232,9 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `fixup_scripts/`：修补脚本输出（执行前需人工审核）
 - `fixup_scripts/README_FIRST.txt`：fixup 根目录导航，说明本次生成目录的用途与默认执行边界；若存在人工项，会先指向 `manual_actions_required_<ts>.txt`
 - `fixup_scripts/grants_miss/`：缺失授权脚本
+- `fixup_scripts/grants_all/*.grants.sql` / `fixup_scripts/grants_miss/*.grants.sql`：现在既可能包含普通对象授权，也可能包含列级授权，如 `GRANT UPDATE (COL) ON OWNER.TABLE TO USER`
 - `fixup_scripts/grants_revoke/`：目标端额外 PUBLIC 授权回收建议（默认仅 PUBLIC 自动给出 REVOKE）
-- `fixup_scripts/grants_all/*.grants.sql` / `fixup_scripts/grants_miss/*.grants.sql`：对象授权文件在同一 owner 文件内按 `OBJECT_TYPE` 分段，便于人工审核
+- `fixup_scripts/grants_all/*.grants.sql` / `fixup_scripts/grants_miss/*.grants.sql`：对象/列授权文件在同一 owner 文件内按 `OBJECT_TYPE` 分段，便于人工审核
 - `fixup_scripts/tables_unsupported/`：不支持 TABLE 的 DDL（默认不执行）
 - `fixup_scripts/unsupported/`：不支持/阻断对象 DDL（默认不执行）
 - `fixup_scripts/view_chain_plans/`：VIEW 链路修复计划

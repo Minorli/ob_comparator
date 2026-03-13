@@ -1,7 +1,7 @@
 ============================================================
 OceanBase 报告库排查手册（report_to_db）
 文件: HOW_TO_READ_REPORTS_IN_OB_latest.txt
-说明: 当前最新版；本次同步快照文件为 HOW_TO_READ_REPORTS_IN_OB_20260312_10_sqls.txt
+说明: 当前最新版；本次同步快照文件为 HOW_TO_READ_REPORTS_IN_OB_20260313_12_sqls.txt
 ============================================================
 
 使用说明
@@ -643,6 +643,13 @@ F. 授权 / 可用性 / 包 / 触发器 / 写库异常（SQL-60 ~ SQL-73）
 说明：
 - 若主报告/`grant_capability_detail_<ts>.txt` 显示对象权限存在目录别名（例如 `DEBUG -> OTHERS`），
   以下 SQL-60/61 的字典直查结果需要结合 `grant_capability_detail_<ts>.txt` 一起看，不能只按 `DBA_TAB_PRIVS.PRIVILEGE` 字面值下结论。
+- 若主报告出现 `oracle_privilege_family_detail_<ts>.txt`，
+  含义是：本次 run 发现了超出 `DBA_TAB_PRIVS/DBA_SYS_PRIVS/DBA_ROLE_PRIVS` 普通闭环之外的 Oracle 权限族。
+  其中 `COLUMN_PRIV` 表示列级授权（`DBA_COL_PRIVS`），当前已纳入 runnable grants；
+  其他 `MANUAL_ONLY` family 表示程序已盘点但不会自动生成 fixup。
+- 若 `unsupported_grant_detail_<ts>.txt` 出现 `VIEW_DML_GRANT_PREREQ_UNVERIFIED`，
+  含义不是“源端不存在该授权”，而是“源端当前可见元数据无法证明这条跨 schema VIEW DML 授权仍可重放”。
+  这类授权默认不会进入 `grants_miss/`，应优先检查 view owner 对底层跨 schema 对象是否具备对应 DML `WITH GRANT OPTION`。
 
 -- SQL-60 GRANT 三分类汇总（缺失 / 缺选项 / 不支持）
 WITH g AS (

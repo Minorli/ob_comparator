@@ -4613,7 +4613,7 @@ def execute_grant_file_with_prune(
     for statement in statements:
         if is_comment_only_statement(statement):
             continue
-        stripped = statement.strip()
+        stripped = strip_leading_sql_comments(statement).strip()
         is_grant = stripped.upper().startswith("GRANT ")
         # grants_* 文件仅保留 GRANT 的重试语义，避免非 GRANT 语句反复执行。
         if not is_grant:

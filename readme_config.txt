@@ -244,8 +244,12 @@
   其中 PUBLIC 额外授权会生成 `fixup_scripts/grants_revoke/revoke_public_object_grants.sql` 回收建议。
   说明：程序会为每次运行生成 `grant_capability_detail_<ts>.txt`，记录本次授权动态规则库：
   源端权限、目标端目录权限、是否支持、是否存在目录别名（如 `DEBUG -> OTHERS`）、以及最终决策。
+  说明：若源端存在 `DBA_COL_PRIVS`，列级授权会进入普通 grants 闭环，生成如
+  `GRANT UPDATE (COL) ON OWNER.TABLE TO USER` 的脚本。
+  说明：程序还会额外生成 `oracle_privilege_family_detail_<ts>.txt`，说明当前 run 覆盖到哪些 Oracle 权限族；
+  因此 `grants_miss/` 不是“全部 Oracle 权限闭环”，而是“当前 runnable grants 闭环”。
   说明：所有“未自动闭环”的授权与其他人工项，还会统一聚合到 `manual_actions_required_<ts>.txt`，避免只看 `grants_miss/` 后遗漏 unsupported/deferred/review-first 场景。
-  说明：对象授权文件（如 `grants_all/<OWNER>.grants.sql`、`grants_miss/<OWNER>.grants.sql`）会在同一文件内按 `OBJECT_TYPE` 分段，便于识别 `TYPE/PROCEDURE/PACKAGE/...`。
+  说明：对象/列授权文件（如 `grants_all/<OWNER>.grants.sql`、`grants_miss/<OWNER>.grants.sql`）会在同一文件内按 `OBJECT_TYPE` 分段，便于识别 `TYPE/PROCEDURE/PACKAGE/...`。
 - grant_tab_privs_scope：DBA_TAB_PRIVS 抽取范围。默认：owner。
   可选值：owner（仅源 schema 所拥有对象）、owner_or_grantee（兼容旧逻辑）。
 - grant_merge_privileges：合并同一对象的多权限授权。默认：true。
