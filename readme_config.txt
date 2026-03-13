@@ -51,7 +51,8 @@
   可选值：full（主报告包含全部明细）、split（主报告仅概要，细节拆分为 *_detail_*.txt）、summary（仅概要，不生成细节文件）。
   说明：split 模式下的明细文件采用 `|` 分隔并包含 `# total/# 字段说明` 头，格式与 package_compare 相同，便于 Excel 直接分隔导入。
   说明：若存在不支持的约束（如 DEFERRABLE / CHECK SYS_CONTEXT / 自引用外键），会额外输出 constraints_unsupported_detail_<timestamp>.txt（不受 report_detail_mode 影响）。
-  说明：若存在“触发器挂在临时表”场景，会额外输出 triggers_temp_table_unsupported_detail_<timestamp>.txt（不受 report_detail_mode 影响）。
+  说明：若存在“触发器挂在临时表”场景，会额外输出 triggers_temp_table_unsupported_detail_<timestamp>.txt（不受 report_detail_mode 影响）；
+  对应 DDL 仅输出到 `fixup_scripts/unsupported/trigger/`，用于人工改造参考，不进入普通 `trigger/`。
 - report_to_db：是否将报告存储到 OceanBase（obclient 方式）。默认：true。
   说明：开启后仍会保留本地文本报告，写库失败时是否中断由 report_db_fail_abort 控制。
   说明：写库采用发布门禁；DIFF_REPORT_SUMMARY.WRITE_STATUS=READY 才表示可用于正式排查（WRITING/FAILED 为未完成或失败）。

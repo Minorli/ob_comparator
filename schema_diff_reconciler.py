@@ -1081,6 +1081,7 @@ class OracleMetadata(NamedTuple):
     interval_partitions: Dict[Tuple[str, str], IntervalPartitionInfo]  # (OWNER, TABLE) -> interval info
     privilege_family_counts: Tuple["OraclePrivilegeFamilyCount", ...] = ()
     non_table_triggers: Tuple["NonTableTriggerInfo", ...] = ()
+    temporary_tables: Set[Tuple[str, str]] = set()          # (OWNER, TABLE_NAME) -> source GTT / temporary tables
 
 
 class DependencyRecord(NamedTuple):
@@ -7926,6 +7927,14 @@ def classify_missing_objects(
 
     unsupported_nodes: Set[DependencyNode] = set()
     unsupported_table_map: Dict[str, Tuple[str, str, str]] = {}
+    source_temporary_table_keys: Set[Tuple[str, str]] = {
+        (str(owner).upper(), str(table).upper())
+        for owner, table in (getattr(oracle_meta, "temporary_tables", set()) or set())
+    }
+    target_temporary_table_fulls: Set[str] = {
+        f"{str(owner).upper()}.{str(table).upper()}"
+        for owner, table in (getattr(ob_meta, "temporary_tables", set()) or set())
+    }
     for (schema, table), entries in (oracle_meta.blacklist_tables or {}).items():
         schema_u = (schema or "").upper()
         table_u = (table or "").upper()
@@ -8213,7 +8222,9 @@ def classify_missing_objects(
         if (
             obj_type.upper() == "TRIGGER"
             and (
-                table_black_type in TEMP_TABLE_BLACKLIST_TYPES
+                src_key in source_temporary_table_keys
+                or table_full_u in target_temporary_table_fulls
+                or table_black_type in TEMP_TABLE_BLACKLIST_TYPES
                 or is_temp_table_blacklist_reason_code(table_reason_code)
             )
         ):
@@ -8260,6 +8271,15 @@ def classify_missing_objects(
             )
         return None
 
+    def _record_extra_blocked_row(row: ObjectSupportReportRow) -> None:
+        support_state_map[(row.obj_type.upper(), row.src_full.upper())] = row
+        unsupported_rows.append(row)
+        extra_blocked_counts[row.obj_type.upper()] += 1
+
+    def _extra_row_is_blocked(obj_type: str, src_full: str) -> bool:
+        row = support_state_map.get(((obj_type or "").upper(), (src_full or "").upper()))
+        return bool(row and row.support_state != SUPPORT_STATE_SUPPORTED)
+
     for item in extra_results.get('index_mismatched', []):
         table_str = item.table.split()[0]
         if '.' not in table_str:
@@ -8280,8 +8300,7 @@ def classify_missing_objects(
             )
             if not row:
                 continue
-            unsupported_rows.append(row)
-            extra_blocked_counts["INDEX"] += 1
+            _record_extra_blocked_row(row)
 
     for item in extra_results.get('constraint_mismatched', []):
         table_str = item.table.split()[0]
@@ -8303,8 +8322,7 @@ def classify_missing_objects(
             )
             if not row:
                 continue
-            unsupported_rows.append(row)
-            extra_blocked_counts["CONSTRAINT"] += 1
+            _record_extra_blocked_row(row)
 
     def _iter_missing_trigger_full_pairs(
         item: TriggerMismatch,
@@ -8358,8 +8376,7 @@ def classify_missing_objects(
             )
             if not row:
                 continue
-            unsupported_rows.append(row)
-            extra_blocked_counts["TRIGGER"] += 1
+            _record_extra_blocked_row(row)
 
     extra_missing_rows: List[ObjectSupportReportRow] = []
 
@@ -8398,9 +8415,12 @@ def classify_missing_objects(
             continue
         tgt_schema, _ = table_str.split('.', 1)
         for idx_name in sorted(item.missing_indexes):
+            src_full = f"{src_schema.upper()}.{idx_name.upper()}"
+            if _extra_row_is_blocked("INDEX", src_full):
+                continue
             _add_extra_missing_row(
                 "INDEX",
-                f"{src_schema.upper()}.{idx_name.upper()}",
+                src_full,
                 f"{tgt_schema.upper()}.{idx_name.upper()}",
                 table_str.upper(),
                 "INDEX"
@@ -8419,9 +8439,12 @@ def classify_missing_objects(
             continue
         tgt_schema, _ = table_str.split('.', 1)
         for cons_name in sorted(item.missing_constraints):
+            src_full = f"{src_schema.upper()}.{cons_name.upper()}"
+            if _extra_row_is_blocked("CONSTRAINT", src_full):
+                continue
             _add_extra_missing_row(
                 "CONSTRAINT",
-                f"{src_schema.upper()}.{cons_name.upper()}",
+                src_full,
                 f"{tgt_schema.upper()}.{cons_name.upper()}",
                 table_str.upper(),
                 "CONSTRAINT"
@@ -8440,6 +8463,8 @@ def classify_missing_objects(
             continue
         tgt_schema, _ = table_str.split('.', 1)
         for src_full, tgt_full in _iter_missing_trigger_full_pairs(item, src_schema, tgt_schema):
+            if _extra_row_is_blocked("TRIGGER", src_full):
+                continue
             _add_extra_missing_row(
                 "TRIGGER",
                 src_full,
@@ -14482,7 +14507,8 @@ def dump_oracle_metadata(
             partition_key_columns={},
             interval_partitions={},
             privilege_family_counts=(),
-            non_table_triggers=()
+            non_table_triggers=(),
+            temporary_tables=set(),
         )
 
     log.info("正在批量加载 Oracle 元数据 (DBA_TAB_COLUMNS/DBA_INDEXES/DBA_CONSTRAINTS/DBA_TRIGGERS/DBA_SEQUENCES)...")
@@ -14511,6 +14537,7 @@ def dump_oracle_metadata(
     package_errors_complete = True
     partition_key_columns: Dict[Tuple[str, str], List[str]] = {}
     interval_partitions: Dict[Tuple[str, str], IntervalPartitionInfo] = {}
+    temporary_tables: Set[Tuple[str, str]] = set()
     invisible_column_supported = False
     identity_column_supported = False
     default_on_null_supported = False
@@ -15504,6 +15531,29 @@ def dump_oracle_metadata(
                         if not table_loaded and not rules_loaded:
                             log.warning("黑名单未加载（mode=%s），缺失表过滤将跳过。", blacklist_mode)
 
+            sql_temp_tpl = """
+                SELECT OWNER, TABLE_NAME
+                FROM DBA_TABLES
+                WHERE OWNER IN ({owners_clause})
+                  AND TEMPORARY = 'Y'
+            """
+            try:
+                with ora_conn.cursor() as cursor:
+                    for owner_chunk in owner_chunks:
+                        owners_clause = build_bind_placeholders(len(owner_chunk))
+                        sql_temp = sql_temp_tpl.format(owners_clause=owners_clause)
+                        cursor.execute(sql_temp, owner_chunk)
+                        for row in cursor:
+                            owner = _safe_upper(row[0])
+                            table = _safe_upper(row[1])
+                            if not owner or not table:
+                                continue
+                            if table_pairs and (owner, table) not in table_pairs:
+                                continue
+                            temporary_tables.add((owner, table))
+            except oracledb.Error as e:
+                log.warning("读取 Oracle DBA_TABLES.TEMPORARY 失败，临时表触发器兼容性分类将保守退化: %s", e)
+
             if include_privileges:
                 try:
                     base_grantees = set(source_schema_set)
@@ -15656,7 +15706,8 @@ def dump_oracle_metadata(
         partition_key_columns=partition_key_columns,
         interval_partitions=interval_partitions,
         privilege_family_counts=privilege_family_counts,
-        non_table_triggers=tuple(non_table_triggers)
+        non_table_triggers=tuple(non_table_triggers),
+        temporary_tables=temporary_tables,
     )
 
 
@@ -31942,6 +31993,7 @@ def generate_fixup_scripts(
             )
 
     trigger_tasks: List[Tuple[str, str, str, str, str, str, str]] = []
+    unsupported_trigger_tasks: List[Tuple[str, str, str, str, str, str, str, ObjectSupportReportRow]] = []
     for item in extra_results.get('trigger_mismatched', []):
         table_str = item.table.split()[0]
         if '.' not in table_str:
@@ -31952,8 +32004,6 @@ def generate_fixup_scripts(
         src_schema, src_table = src_name.split('.', 1)
         tgt_schema, tgt_table = table_str.split('.', 1)
         src_table_key = (src_schema.upper(), src_table.upper())
-        if src_table_key in unsupported_table_keys or src_table_key in missing_target_table_keys:
-            continue
         # 优先使用缺失映射对（源->目标），确保 dbcat 按源名导出
         if item.missing_mappings:
             for src_full, tgt_full in item.missing_mappings:
@@ -31961,9 +32011,19 @@ def generate_fixup_scripts(
                     continue
                 src_schema_u, src_trg = src_full.split('.', 1)
                 tgt_schema_final, tgt_obj = tgt_full.split('.', 1)
+                support_row = support_state_map.get(("TRIGGER", src_full.upper()))
                 if not _trigger_allowed(src_full, tgt_full):
                     continue
                 if not allow_fixup('TRIGGER', tgt_schema_final, src_schema_u):
+                    continue
+                if support_row and support_row.support_state != SUPPORT_STATE_SUPPORTED:
+                    if support_row.reason_code == TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON_CODE:
+                        queue_request(src_schema_u, 'TRIGGER', src_trg)
+                        unsupported_trigger_tasks.append(
+                            (src_schema_u, src_trg, tgt_schema_final, tgt_obj, src_table, tgt_schema, tgt_table, support_row)
+                        )
+                    continue
+                if src_table_key in unsupported_table_keys or src_table_key in missing_target_table_keys:
                     continue
                 queue_request(src_schema_u, 'TRIGGER', src_trg)
                 trigger_tasks.append((src_schema_u, src_trg, tgt_schema_final, tgt_obj, src_table, tgt_schema, tgt_table))
@@ -31981,9 +32041,19 @@ def generate_fixup_scripts(
                     tgt_schema_final = src_owner_u
                     tgt_obj = src_trg_u
                 tgt_full = f"{tgt_schema_final}.{tgt_obj}"
+                support_row = support_state_map.get(("TRIGGER", src_full.upper()))
                 if not _trigger_allowed(src_full, tgt_full):
                     continue
                 if not allow_fixup('TRIGGER', tgt_schema_final, src_owner_u):
+                    continue
+                if support_row and support_row.support_state != SUPPORT_STATE_SUPPORTED:
+                    if support_row.reason_code == TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON_CODE:
+                        queue_request(src_owner_u, 'TRIGGER', src_trg_u)
+                        unsupported_trigger_tasks.append(
+                            (src_owner_u, src_trg_u, tgt_schema_final, tgt_obj, src_table, tgt_schema, tgt_table, support_row)
+                        )
+                    continue
+                if src_table_key in unsupported_table_keys or src_table_key in missing_target_table_keys:
                     continue
                 queue_request(src_owner_u, 'TRIGGER', src_trg_u)
                 trigger_tasks.append((src_owner_u, src_trg_u, tgt_schema_final, tgt_obj, src_table, tgt_schema, tgt_table))
@@ -31997,6 +32067,14 @@ def generate_fixup_scripts(
         skipped = before_count - len(trigger_tasks)
         if skipped:
             log.info("[FIXUP] 跳过源端 INVALID 的 TRIGGER %d 个。", skipped)
+        before_unsupported_count = len(unsupported_trigger_tasks)
+        unsupported_trigger_tasks = [
+            task for task in unsupported_trigger_tasks
+            if (task[0].upper(), task[1].upper()) not in invalid_trigger_keys
+        ]
+        skipped_unsupported = before_unsupported_count - len(unsupported_trigger_tasks)
+        if skipped_unsupported:
+            log.info("[FIXUP] 跳过源端 INVALID 的不支持 TRIGGER %d 个。", skipped_unsupported)
 
     other_missing_summary: Dict[str, int] = defaultdict(int)
     for ot, _, _, _, _ in other_missing_supported:
@@ -33798,12 +33876,27 @@ def generate_fixup_scripts(
 
     log.info("[FIXUP] (7/9) 正在生成 TRIGGER 脚本...")
     trigger_progress = build_progress_tracker(len(trigger_tasks), "[FIXUP] (7/9) TRIGGER")
+    unsupported_trigger_progress = build_progress_tracker(
+        len(unsupported_trigger_tasks),
+        "[FIXUP] (7b/9) TRIGGER_UNSUPPORTED"
+    )
     trigger_view_reference_rows: List[TriggerViewReferenceRow] = []
     trigger_view_reference_lock = threading.Lock()
     trigger_literal_alert_rows: List[TriggerLiteralPathAlertRow] = []
     trigger_literal_alert_lock = threading.Lock()
-    trigger_jobs: List[Callable[[], None]] = []
-    for src_schema, trg_name, tgt_schema, tgt_obj, src_table, tgt_table_schema, tgt_table in trigger_tasks:
+    if unsupported_trigger_tasks:
+        log.info("[FIXUP] (7b/9) 正在生成不支持 TRIGGER 的 DDL（仅输出，默认不执行）...")
+
+    def _build_trigger_job(
+        src_schema: str,
+        trg_name: str,
+        tgt_schema: str,
+        tgt_obj: str,
+        src_table: str,
+        tgt_table_schema: str,
+        tgt_table: str,
+        support_row: Optional[ObjectSupportReportRow] = None,
+    ) -> Callable[[], None]:
         def _job(
             ss=src_schema,
             tn=trg_name,
@@ -33811,11 +33904,15 @@ def generate_fixup_scripts(
             to=tgt_obj,
             st=src_table,
             tts=tgt_table_schema,
-            tt=tgt_table
+            tt=tgt_table,
+            sr=support_row,
         ):
             try:
                 if (ss.upper(), tn.upper()) in invalid_trigger_keys:
-                    log.info("[FIXUP] 跳过源端 INVALID 的 TRIGGER %s.%s。", ss, tn)
+                    if sr:
+                        log.info("[FIXUP] 跳过源端 INVALID 的不支持 TRIGGER %s.%s。", ss, tn)
+                    else:
+                        log.info("[FIXUP] 跳过源端 INVALID 的 TRIGGER %s.%s。", ss, tn)
                     mark_source('TRIGGER', 'invalid')
                     return
                 fetch_result = fetch_ddl_with_timing(ss, 'TRIGGER', tn)
@@ -33845,7 +33942,6 @@ def generate_fixup_scripts(
                     extra_identifiers=extra_ids,
                     obj_type='TRIGGER'
                 )
-                # 重映射触发器中的对象引用并补全 schema
                 trigger_qualify_schema = bool(settings.get('trigger_qualify_schema', True))
                 local_view_refs: List[TriggerViewReferenceRow] = []
                 local_literal_alerts: List[TriggerLiteralPathAlertRow] = []
@@ -33907,45 +34003,94 @@ def generate_fixup_scripts(
                 )
                 ddl_adj = strip_constraint_enable(ddl_adj)
                 ddl_adj = enforce_schema_for_ddl(ddl_adj, ts, 'TRIGGER')
-                ddl_adj = apply_fixup_idempotency(
-                    ddl_adj,
-                    'TRIGGER',
-                    ts,
-                    to,
-                    settings,
-                    idempotent_stats
-                )
+                if not sr:
+                    ddl_adj = apply_fixup_idempotency(
+                        ddl_adj,
+                        'TRIGGER',
+                        ts,
+                        to,
+                        settings,
+                        idempotent_stats
+                    )
                 grants_for_trigger: Set[str] = set()
-                if tts and tt and ts and tts.upper() != ts.upper():
-                    table_full = f"{tts}.{tt}"
-                    required_priv = GRANT_PRIVILEGE_BY_TYPE.get('TABLE', 'SELECT')
-                    add_object_grant(ts, required_priv, table_full)
-                    if grant_enabled:
-                        grants_for_trigger.add(format_object_grant(
-                            ts,
-                            ObjectGrantEntry(required_priv.upper(), table_full.upper(), False)
-                        ))
-                if grant_enabled and ts and tts and tt:
-                    table_full_u = f"{tts}.{tt}".upper()
-                    for entry in object_grants_by_grantee.get(ts.upper(), set()):
-                        if entry.object_full.upper() == table_full_u:
-                            grants_for_trigger.add(format_object_grant(ts, entry))
+                if not sr:
+                    if tts and tt and ts and tts.upper() != ts.upper():
+                        table_full = f"{tts}.{tt}"
+                        required_priv = GRANT_PRIVILEGE_BY_TYPE.get('TABLE', 'SELECT')
+                        add_object_grant(ts, required_priv, table_full)
+                        if grant_enabled:
+                            grants_for_trigger.add(format_object_grant(
+                                ts,
+                                ObjectGrantEntry(required_priv.upper(), table_full.upper(), False)
+                            ))
+                    if grant_enabled and ts and tts and tt:
+                        table_full_u = f"{tts}.{tt}".upper()
+                        for entry in object_grants_by_grantee.get(ts.upper(), set()):
+                            if entry.object_full.upper() == table_full_u:
+                                grants_for_trigger.add(format_object_grant(ts, entry))
                 filename = f"{ts}.{to}.sql"
-                header = f"修补缺失的触发器 {to} (源: {ss}.{tn})"
-                log.info("[FIXUP]%s 写入 TRIGGER 脚本: %s", source_tag(ddl_source_label), filename)
-                write_fixup_file(
-                    base_dir,
-                    'trigger',
-                    filename,
-                    ddl_adj,
-                    header,
-                    grants_to_add=sorted(grants_for_trigger) if grants_for_trigger else None,
-                    extra_comments=cleanup_comments
-                )
+                if sr:
+                    header = f"不支持 TRIGGER DDL {ts}.{to} (源: {ss}.{tn})"
+                    extra_comments = build_support_comments(sr)
+                    if cleanup_comments:
+                        extra_comments.extend(cleanup_comments)
+                    log.info("[FIXUP]%s 写入不支持 TRIGGER 脚本: %s", source_tag(ddl_source_label), filename)
+                    write_fixup_file(
+                        base_dir,
+                        'unsupported/trigger',
+                        filename,
+                        ddl_adj,
+                        header,
+                        extra_comments=extra_comments
+                    )
+                else:
+                    header = f"修补缺失的触发器 {to} (源: {ss}.{tn})"
+                    log.info("[FIXUP]%s 写入 TRIGGER 脚本: %s", source_tag(ddl_source_label), filename)
+                    write_fixup_file(
+                        base_dir,
+                        'trigger',
+                        filename,
+                        ddl_adj,
+                        header,
+                        grants_to_add=sorted(grants_for_trigger) if grants_for_trigger else None,
+                        extra_comments=cleanup_comments
+                    )
             finally:
-                trigger_progress()
-        trigger_jobs.append(_job)
+                if sr:
+                    unsupported_trigger_progress()
+                else:
+                    trigger_progress()
+        return _job
+
+    trigger_jobs: List[Callable[[], None]] = []
+    for src_schema, trg_name, tgt_schema, tgt_obj, src_table, tgt_table_schema, tgt_table in trigger_tasks:
+        trigger_jobs.append(
+            _build_trigger_job(
+                src_schema,
+                trg_name,
+                tgt_schema,
+                tgt_obj,
+                src_table,
+                tgt_table_schema,
+                tgt_table,
+            )
+        )
     run_tasks(trigger_jobs, "TRIGGER")
+    unsupported_trigger_jobs: List[Callable[[], None]] = []
+    for src_schema, trg_name, tgt_schema, tgt_obj, src_table, tgt_table_schema, tgt_table, support_row in unsupported_trigger_tasks:
+        unsupported_trigger_jobs.append(
+            _build_trigger_job(
+                src_schema,
+                trg_name,
+                tgt_schema,
+                tgt_obj,
+                src_table,
+                tgt_table_schema,
+                tgt_table,
+                support_row=support_row,
+            )
+        )
+    run_tasks(unsupported_trigger_jobs, "TRIGGER_UNSUPPORTED")
     if trigger_view_reference_rows:
         dedup_rows = sorted(
             set(trigger_view_reference_rows),
