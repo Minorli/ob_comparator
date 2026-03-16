@@ -2532,6 +2532,44 @@ def normalize_deferred_flag(value: Optional[object]) -> str:
     return "IMMEDIATE"
 
 
+def normalize_nullable_flag(value: Optional[object]) -> str:
+    text = str(value).strip().upper() if value is not None else ""
+    if text in ("N", "NO", "NOT NULL"):
+        return "N"
+    if text in ("Y", "YES", "NULLABLE", "NULL"):
+        return "Y"
+    return ""
+
+
+def describe_nullable_flag(value: Optional[object]) -> str:
+    normalized = normalize_nullable_flag(value)
+    if normalized == "N":
+        return "NOT NULL"
+    if normalized == "Y":
+        return "NULLABLE"
+    return "UNKNOWN"
+
+
+def normalize_column_default_expression(expr: Optional[object]) -> str:
+    if expr is None:
+        return ""
+    text = normalize_sql_expression_casefold(str(expr))
+    while text.startswith("(") and text.endswith(")"):
+        stripped = strip_wrapping_parentheses(text)
+        if stripped == text:
+            break
+        text = stripped.strip()
+    text = normalize_space_before_parentheses(text)
+    if text.upper() == "NULL":
+        return ""
+    return text
+
+
+def describe_column_default_expression(expr: Optional[object]) -> str:
+    normalized = normalize_column_default_expression(expr)
+    return normalized if normalized else "NO DEFAULT"
+
+
 def normalize_check_constraint_expression(
     expr: Optional[str],
     cons_name: Optional[str]
@@ -18817,9 +18855,10 @@ def check_primary_objects(
                         return False
                     return str(value).strip().upper() in ("YES", "Y", "TRUE", "1")
 
+                src_identity = _is_true_flag(src_info.get("identity"))
+                tgt_identity = _is_true_flag(tgt_info.get("identity"))
+
                 if identity_enabled:
-                    src_identity = _is_true_flag(src_info.get("identity"))
-                    tgt_identity = _is_true_flag(tgt_info.get("identity"))
                     if src_identity and not tgt_identity:
                         type_mismatches.append(
                             ColumnTypeIssue(
@@ -18845,6 +18884,32 @@ def check_primary_objects(
                             )
                         )
 
+                if not src_identity and not tgt_identity:
+                    src_default_expr = normalize_column_default_expression(src_info.get("data_default"))
+                    tgt_default_expr = normalize_column_default_expression(tgt_info.get("data_default"))
+                    if src_default_expr != tgt_default_expr:
+                        if src_default_expr:
+                            issue_type = "default_missing" if not tgt_default_expr else "default_mismatch"
+                            type_mismatches.append(
+                                ColumnTypeIssue(
+                                    col_name,
+                                    describe_column_default_expression(src_info.get("data_default")),
+                                    describe_column_default_expression(tgt_info.get("data_default")),
+                                    src_default_expr,
+                                    issue_type
+                                )
+                            )
+                        else:
+                            type_mismatches.append(
+                                ColumnTypeIssue(
+                                    col_name,
+                                    describe_column_default_expression(src_info.get("data_default")),
+                                    describe_column_default_expression(tgt_info.get("data_default")),
+                                    "NO DEFAULT",
+                                    "default_extra"
+                                )
+                            )
+
                 if visibility_enabled:
                     src_invisible = src_info.get("invisible")
                     tgt_invisible = tgt_info.get("invisible")
@@ -18866,6 +18931,30 @@ def check_primary_objects(
                                 "INVISIBLE",
                                 "VISIBLE",
                                 "visibility_mismatch"
+                            )
+                        )
+
+                src_nullable = normalize_nullable_flag(src_info.get("nullable"))
+                tgt_nullable = normalize_nullable_flag(tgt_info.get("nullable"))
+                if src_nullable and tgt_nullable and src_nullable != tgt_nullable:
+                    if src_nullable == "N":
+                        type_mismatches.append(
+                            ColumnTypeIssue(
+                                col_name,
+                                describe_nullable_flag(src_nullable),
+                                describe_nullable_flag(tgt_nullable),
+                                "NOT NULL",
+                                "nullability_tighten"
+                            )
+                        )
+                    else:
+                        type_mismatches.append(
+                            ColumnTypeIssue(
+                                col_name,
+                                describe_nullable_flag(src_nullable),
+                                describe_nullable_flag(tgt_nullable),
+                                "NULLABLE",
+                                "nullability_relax"
                             )
                         )
 
@@ -29532,6 +29621,46 @@ def generate_alter_for_table_columns(
                 lines.append(
                     f"-- WARNING: {col_name.upper()} 缺失 {expected_type} 特性，请人工处理。"
                 )
+            elif issue_type == "nullability_tighten":
+                review_type = format_oracle_column_type(
+                    info,
+                    prefer_ob_varchar=True
+                )
+                lines.append(
+                    f"-- REVIEW-FIRST: {col_name.upper()} 源端为 NOT NULL，目标端仍为可空。"
+                )
+                lines.append(
+                    f"-- 建议先确认目标端是否存在 NULL 数据，再决定是否执行："
+                )
+                lines.append(
+                    f"-- ALTER TABLE {table_full} "
+                    f"MODIFY ({col_name.upper()} {review_type} NOT NULL);"
+                )
+            elif issue_type == "nullability_relax":
+                lines.append(
+                    f"-- REVIEW-FIRST: {col_name.upper()} 源端允许 NULL，目标端当前为 NOT NULL。"
+                )
+                lines.append(
+                    f"-- 请先确认业务是否允许放宽非空约束，再人工处理对应 ALTER TABLE。"
+                )
+            elif issue_type in ("default_missing", "default_mismatch"):
+                lines.append(
+                    f"-- REVIEW-FIRST: {col_name.upper()} 默认值与源端不一致。"
+                )
+                lines.append(
+                    f"-- 建议先确认业务写入路径，再决定是否执行："
+                )
+                lines.append(
+                    f"-- ALTER TABLE {table_full} "
+                    f"MODIFY ({col_name.upper()} DEFAULT {expected_type});"
+                )
+            elif issue_type == "default_extra":
+                lines.append(
+                    f"-- REVIEW-FIRST: {col_name.upper()} 目标端存在额外默认值，源端无默认值。"
+                )
+                lines.append(
+                    f"-- 请先确认业务是否允许移除目标端默认值，再人工处理该列。"
+                )
             elif issue_type == "visibility_mismatch":
                 if expected_type.upper() == "INVISIBLE":
                     lines.append(
@@ -34938,6 +35067,10 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "仅打印未校验对象明细"
     if name.startswith("mismatched_tables_detail_"):
         return "DETAIL", "表列不匹配明细"
+    if name.startswith("column_nullability_detail_"):
+        return "DETAIL", "列空值语义差异明细"
+    if name.startswith("column_default_detail_"):
+        return "DETAIL", "列默认值差异明细"
     if name.startswith("column_order_mismatch_detail_"):
         return "DETAIL", "列顺序差异明细"
     if name.startswith("comment_mismatch_detail_"):
@@ -36148,6 +36281,58 @@ def export_mismatched_tables_detail(
             ";".join(type_parts) if type_parts else "-"
         ])
     return write_pipe_report("表列不匹配明细", header_fields, rows, output_path)
+
+
+def export_column_nullability_detail(
+    mismatched_items: List[Tuple[str, str, Set[str], Set[str], List[Tuple[str, int, int, int, str]], List[Tuple[str, str, str, str]]]],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not mismatched_items or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"column_nullability_detail_{report_timestamp}.txt"
+    header_fields = ["TABLE", "COLUMN", "SRC_NULLABILITY", "TGT_NULLABILITY", "EXPECTED", "ACTION"]
+    rows: List[List[str]] = []
+    for obj_type, tgt_name, _missing, _extra, _length_mismatches, type_mismatches in mismatched_items:
+        if (obj_type or "").upper() != "TABLE":
+            continue
+        if "获取失败" in tgt_name:
+            continue
+        for col, src_type, tgt_type, expected_type, issue_type in type_mismatches:
+            if issue_type == "nullability_tighten":
+                rows.append([tgt_name, col, src_type, tgt_type, expected_type, "REVIEW_NOT_NULL"])
+            elif issue_type == "nullability_relax":
+                rows.append([tgt_name, col, src_type, tgt_type, expected_type, "REVIEW_NULLABLE"])
+    if not rows:
+        return None
+    return write_pipe_report("列空值语义差异明细", header_fields, rows, output_path)
+
+
+def export_column_default_detail(
+    mismatched_items: List[Tuple[str, str, Set[str], Set[str], List[Tuple[str, int, int, int, str]], List[Tuple[str, str, str, str]]]],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not mismatched_items or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"column_default_detail_{report_timestamp}.txt"
+    header_fields = ["TABLE", "COLUMN", "SRC_DEFAULT", "TGT_DEFAULT", "EXPECTED", "ACTION"]
+    rows: List[List[str]] = []
+    for obj_type, tgt_name, _missing, _extra, _length_mismatches, type_mismatches in mismatched_items:
+        if (obj_type or "").upper() != "TABLE":
+            continue
+        if "获取失败" in tgt_name:
+            continue
+        for col, src_type, tgt_type, expected_type, issue_type in type_mismatches:
+            if issue_type == "default_missing":
+                rows.append([tgt_name, col, src_type, tgt_type, expected_type, "REVIEW_SET_DEFAULT"])
+            elif issue_type == "default_mismatch":
+                rows.append([tgt_name, col, src_type, tgt_type, expected_type, "REVIEW_CHANGE_DEFAULT"])
+            elif issue_type == "default_extra":
+                rows.append([tgt_name, col, src_type, tgt_type, expected_type, "REVIEW_DROP_DEFAULT"])
+    if not rows:
+        return None
+    return write_pipe_report("列默认值差异明细", header_fields, rows, output_path)
 
 
 def export_column_order_mismatch_detail(
@@ -39744,6 +39929,10 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "USABILITY_DETAIL"
     if name.startswith("table_data_presence_detail_"):
         return "TABLE_PRESENCE_DETAIL"
+    if name.startswith("column_nullability_detail_"):
+        return "COLUMN_NULLABILITY_DETAIL"
+    if name.startswith("column_default_detail_"):
+        return "COLUMN_DEFAULT_DETAIL"
     if name.startswith("dependency_chains_"):
         return "DEPENDENCY_CHAINS"
     if name.startswith("VIEWs_chain_"):
@@ -39826,6 +40015,8 @@ def _infer_artifact_status(
         "TRIGGER_TEMP_UNSUPPORTED_DETAIL",
         "TRIGGER_VIEW_REFERENCE_DETAIL",
         "TRIGGER_NON_TABLE_DETAIL",
+        "COLUMN_NULLABILITY_DETAIL",
+        "COLUMN_DEFAULT_DETAIL",
         "OBJECTS_AFTER_CUTOFF_DETAIL",
         "CASE_SENSITIVE_IDENTIFIER_DETAIL",
         "SYS_C_FORCE_CANDIDATES_DETAIL",
@@ -43125,6 +43316,22 @@ def print_final_report(
     ok_count = len(tv_results['ok'])
     missing_count = len(tv_results['missing'])
     mismatched_count = len(tv_results['mismatched'])
+    column_nullability_issue_cnt = sum(
+        1
+        for obj_type, _tgt_name, _missing, _extra, _length_mismatches, type_mismatches
+        in (tv_results.get("mismatched", []) or [])
+        if (obj_type or "").upper() == "TABLE"
+        for _col, _src_type, _tgt_type, _expected_type, issue_type in (type_mismatches or [])
+        if issue_type in {"nullability_tighten", "nullability_relax"}
+    )
+    column_default_issue_cnt = sum(
+        1
+        for obj_type, _tgt_name, _missing, _extra, _length_mismatches, type_mismatches
+        in (tv_results.get("mismatched", []) or [])
+        if (obj_type or "").upper() == "TABLE"
+        for _col, _src_type, _tgt_type, _expected_type, issue_type in (type_mismatches or [])
+        if issue_type in {"default_missing", "default_mismatch", "default_extra"}
+    )
     skipped_count = len(tv_results.get('skipped', []))
     remap_conflicts = tv_results.get('remap_conflicts', [])
     remap_conflict_cnt = len(remap_conflicts)
@@ -43891,6 +44098,10 @@ def print_final_report(
                 detail_hint_lines.append(
                     "按类型明细: missing_<type>_detail / unsupported_<type>_detail (含 ROOT_CAUSE，详见 report_index)"
                 )
+                if column_nullability_issue_cnt:
+                    detail_hint_lines.append(f"列空值语义差异明细: column_nullability_detail_{report_ts}.txt")
+                if column_default_issue_cnt:
+                    detail_hint_lines.append(f"列默认值差异明细: column_default_detail_{report_ts}.txt")
             if column_order_mismatch_cnt and report_ts:
                 detail_hint_lines.append(f"列顺序差异明细: column_order_mismatch_detail_{report_ts}.txt")
             if noise_suppressed_count and report_ts:
@@ -44218,9 +44429,18 @@ def print_final_report(
                     details.append("* 类型不匹配:\n", style="mismatch")
                     for issue in type_mismatches:
                         col, src_type, tgt_type, expected_type, issue_type = issue
-                        details.append(
-                            f"    - {col}: 源={src_type}, 目标={tgt_type}, 期望={expected_type} ({issue_type})\n"
-                        )
+                        if issue_type in ("nullability_tighten", "nullability_relax"):
+                            details.append(
+                                f"    - {col}: 源={src_type}, 目标={tgt_type}, 期望={expected_type} ({issue_type}, review-first)\n"
+                            )
+                        elif issue_type in ("default_missing", "default_mismatch", "default_extra"):
+                            details.append(
+                                f"    - {col}: 源={src_type}, 目标={tgt_type}, 期望={expected_type} ({issue_type}, review-first)\n"
+                            )
+                        else:
+                            details.append(
+                                f"    - {col}: 源={src_type}, 目标={tgt_type}, 期望={expected_type} ({issue_type})\n"
+                            )
                 if length_mismatches:
                     details.append("* 长度不匹配 (VARCHAR/2):\n", style="mismatch")
                     for issue in length_mismatches:
@@ -44914,6 +45134,8 @@ def print_final_report(
         extra_targets_path = None
         skipped_detail_path = None
         mismatched_tables_path = None
+        column_nullability_detail_path = None
+        column_default_detail_path = None
         column_order_mismatch_path = None
         comment_mismatch_path = None
         usability_detail_path = None
@@ -44945,6 +45167,16 @@ def print_final_report(
                 report_ts
             )
             mismatched_tables_path = export_mismatched_tables_detail(
+                tv_results.get("mismatched", []),
+                report_path.parent,
+                report_ts
+            )
+            column_nullability_detail_path = export_column_nullability_detail(
+                tv_results.get("mismatched", []),
+                report_path.parent,
+                report_ts
+            )
+            column_default_detail_path = export_column_default_detail(
                 tv_results.get("mismatched", []),
                 report_path.parent,
                 report_ts
@@ -44991,6 +45223,18 @@ def print_final_report(
             mismatched_tables_path,
             len(tv_results.get("mismatched", []) or []),
             "表列不匹配明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            column_nullability_detail_path,
+            column_nullability_issue_cnt or None,
+            "列空值语义差异明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            column_default_detail_path,
+            column_default_issue_cnt or None,
+            "列默认值差异明细"
         )
         _add_index_entry(
             "DETAIL",
@@ -45135,6 +45379,10 @@ def print_final_report(
                 log.info("仅打印未校验对象明细已输出到: %s", skipped_detail_path)
             if mismatched_tables_path:
                 log.info("表列不匹配明细已输出到: %s", mismatched_tables_path)
+            if column_nullability_detail_path:
+                log.info("列空值语义差异明细已输出到: %s", column_nullability_detail_path)
+            if column_default_detail_path:
+                log.info("列默认值差异明细已输出到: %s", column_default_detail_path)
             if column_order_mismatch_path:
                 log.info("列顺序差异明细已输出到: %s", column_order_mismatch_path)
             if comment_mismatch_path:
