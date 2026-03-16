@@ -1,24 +1,14 @@
-.gemini
-main_reports
-fixup_scripts
-dbcat_output
-venv
-test_scenarios
-history
-__pycache__
-remap_rules_invalid.txt
-remap_rules_table_only.txt
-schema_diff_reconciler.py.bkp
-schema_diff_reconciler_review_report.md
-schema_diff_reconciler_audit_report_20251212.md
-schema_diff_reconciler_backup_20251212_pre_patch.py
-schema_diff_reconciler_v0.8.8.py
-logs
-audit/table_check_validation/
+# Generated outputs
+main_reports/
+fixup_scripts/
+dbcat_output/
+logs/
+
+# Local environments and runtime files
+.venv/
+venv/
+__pycache__/
 config.ini
-AGENTS.md
-CLAUDE.md
-.venv
 
 # Only track these docs; ignore the rest under docs/
 docs/*
@@ -28,25 +18,3 @@ docs/*
 !docs/TECHNICAL_SPECIFICATION.md
 !docs/DEPLOYMENT.md
 !docs/CHANGELOG.md
-
-.gemini/
-gha-creds-*.json
-.github/
-compatibility_suite/
-.claude
-
-# Agent team and swarm files
-expert_swarm.py
-test_expert_swarm.py
-audit/swarm/
-
-# Internal engineering assets not shipped to customer
-openspec/
-audit/
-scripts/
-test_*.py
-collect_source_object_stats.py
-init_test.py
-tmp_fixup_public_grant/
-tmp_reports_public_grant/
-.comparator_notice_state.json
