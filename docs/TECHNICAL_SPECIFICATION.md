@@ -82,6 +82,7 @@
 - 列集合对比（忽略 OMS_* 和隐藏列）
 - VARCHAR/VARCHAR2 长度窗口校验
 - 现有列 `NULLABLE` / `NOT NULL` 语义漂移校验（按列语义处理，不依赖系统命名 `SYS_C... IS NOT NULL` 约束名）
+- 覆盖系统命名 `SYS_C... IS NOT NULL` 且 `ENABLED + NOT VALIDATED` 的 `NOT NULL ENABLE NOVALIDATE` 语义补位；该类仅进入 `TABLE mismatch` 与 review-first `table_alter`
 - 现有列 `DATA_DEFAULT` 语义漂移校验（按列语义处理；`NULL` 与无默认值按等价处理）
 - OB 侧 CHAR_USED 缺失时，按 NLS_LENGTH_SEMANTICS（默认 BYTE）回退，并结合 DATA_LENGTH/CHAR_LENGTH 推断 CHAR 语义
 - LONG/LONG RAW 自动映射为 CLOB/BLOB

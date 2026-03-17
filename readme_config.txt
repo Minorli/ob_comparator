@@ -208,8 +208,9 @@
   source（FK/CHECK 跟随源端 VALIDATED 状态；源端状态未知时回退 NOVALIDATE）、
   force_validate（FK/CHECK 统一生成 ENABLE VALIDATE，可能因目标脏数据失败）。
   说明：PK/UK 在 OB 侧固定生成 plain ADD CONSTRAINT，不追加 ENABLE/VALIDATE 关键字。
-  说明：当 FK/CHECK 采用 NOVALIDATE 时，程序会额外输出 `fixup_scripts/constraint_validate_later/` 与
-  `constraint_validate_deferred_detail_<ts>.txt`，用于数据清理后执行二次 VALIDATE。
+  说明：当 FK/CHECK 采用 NOVALIDATE 且源端最终语义需要 `VALIDATED` 时，程序才会额外输出
+  `fixup_scripts/constraint_validate_later/` 与 `constraint_validate_deferred_detail_<ts>.txt`，
+  用于数据清理后执行二次 VALIDATE；若源端本来就是 `NOT VALIDATED`，则不会额外生成后置 VALIDATE。
 - trigger_validity_sync_mode：触发器有效性同步模式。默认：compile。
   可选值：off（不处理 VALID/INVALID）、compile（当源 VALID 且目标 INVALID 时生成 COMPILE）。
 - fixup_drop_sys_c_columns：是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE。默认：false。

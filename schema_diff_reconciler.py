@@ -2493,6 +2493,77 @@ def is_system_notnull_check(cons_name: Optional[str], search_condition: Optional
     return is_notnull_check_condition(search_condition)
 
 
+def build_system_notnull_novalidate_column_map(constraints: Optional[Dict[str, Dict]]) -> Dict[str, Dict[str, str]]:
+    """
+    提取源端系统命名的 NOT NULL ENABLE NOVALIDATE 语义，按列聚合。
+
+    仅用于补位当前列语义 compare：
+    - 约束必须是 CHECK
+    - 名称必须是系统命名 SYS_*
+    - 条件必须是单列 IS NOT NULL
+    - 状态必须是 ENABLED + NOT VALIDATED
+    """
+    result: Dict[str, Dict[str, str]] = {}
+    for cons_name, cons in sorted((constraints or {}).items(), key=lambda item: extract_constraint_name(item[0]).upper()):
+        ctype = (cons.get("type") or "").upper()
+        if ctype != "C":
+            continue
+        search_condition = cons.get("search_condition")
+        if not is_system_notnull_check(cons_name, search_condition):
+            continue
+        if normalize_constraint_enabled_status(cons.get("status")) != "ENABLED":
+            continue
+        if normalize_constraint_validated_status(cons.get("validated")) != "NOT VALIDATED":
+            continue
+        col = _extract_notnull_column(search_condition)
+        if not col:
+            continue
+        col_u = col.upper()
+        if col_u in result:
+            continue
+        result[col_u] = {
+            "constraint_name": extract_constraint_name(cons_name).upper(),
+            "search_condition": normalize_sql_expression(search_condition),
+            "status": normalize_constraint_enabled_status(cons.get("status")),
+            "validated": normalize_constraint_validated_status(cons.get("validated")),
+        }
+    return result
+
+
+def build_enabled_notnull_check_column_map(constraints: Optional[Dict[str, Dict]]) -> Dict[str, Dict[str, str]]:
+    """
+    提取目标端已启用的单列 IS NOT NULL 约束语义，按列聚合。
+
+    用于判断目标端是否已经具备等价约束语义：
+    - 接受 OB 内部命名 / SYS_* / 用户命名
+    - 仅要求 ENABLED
+    - VALIDATED / NOT VALIDATED 都视为已存在“拒绝后续 NULL”语义
+    """
+    result: Dict[str, Dict[str, str]] = {}
+    for cons_name, cons in sorted((constraints or {}).items(), key=lambda item: extract_constraint_name(item[0]).upper()):
+        ctype = (cons.get("type") or "").upper()
+        if ctype != "C":
+            continue
+        search_condition = cons.get("search_condition")
+        if not is_notnull_check_condition(search_condition):
+            continue
+        if normalize_constraint_enabled_status(cons.get("status")) != "ENABLED":
+            continue
+        col = _extract_notnull_column(search_condition)
+        if not col:
+            continue
+        col_u = col.upper()
+        if col_u in result:
+            continue
+        result[col_u] = {
+            "constraint_name": extract_constraint_name(cons_name).upper(),
+            "search_condition": normalize_sql_expression(search_condition),
+            "status": normalize_constraint_enabled_status(cons.get("status")),
+            "validated": normalize_constraint_validated_status(cons.get("validated")),
+        }
+    return result
+
+
 CHECK_SYS_CONTEXT_USERENV_RE = re.compile(r"SYS_CONTEXT\s*\(\s*['\"]USERENV['\"]", flags=re.IGNORECASE)
 CHECK_LIKE_ESCAPE_REWRITE_RE = re.compile(
     r"([A-Z0-9_#$]+\s+LIKE)\s+REPLACE\('((?:''|[^'])*)','\\\\','\\\\\\\\'\)\s+ESCAPE\s+'\\\\'",
@@ -18777,6 +18848,12 @@ def check_primary_objects(
                 ))
                 continue
 
+            src_notnull_novalidate_cols = build_system_notnull_novalidate_column_map(
+                oracle_meta.constraints.get((src_schema_u, src_obj_u), {})
+            )
+            tgt_enabled_notnull_cols = build_enabled_notnull_check_column_map(
+                ob_meta.constraints.get((tgt_schema_u, tgt_obj_u), {})
+            )
             hidden_src_cols = {col for col, meta in src_cols_details.items() if meta.get("hidden")}
             invisible_src_cols = {col for col, meta in src_cols_details.items() if meta.get("invisible") is True}
             src_col_names = {
@@ -18957,6 +19034,24 @@ def check_primary_objects(
                                 "nullability_relax"
                             )
                         )
+
+                source_novalidate_meta = src_notnull_novalidate_cols.get(col_name.upper())
+                target_has_notnull_check = col_name.upper() in tgt_enabled_notnull_cols
+                if (
+                    source_novalidate_meta
+                    and src_nullable != "N"
+                    and tgt_nullable == "Y"
+                    and not target_has_notnull_check
+                ):
+                    type_mismatches.append(
+                        ColumnTypeIssue(
+                            col_name,
+                            "NOT NULL ENABLE NOVALIDATE",
+                            "NULLABLE",
+                            "NOT NULL ENABLE NOVALIDATE",
+                            "nullability_novalidate_tighten"
+                        )
+                    )
 
                 if is_long_type(src_dtype):
                     expected_type = map_long_type_to_ob(src_dtype)
@@ -28212,6 +28307,27 @@ def apply_constraint_missing_validate_mode_to_ddl(
     return stmt, keyword, reason
 
 
+def should_generate_constraint_validate_later(
+    applied_keyword: Optional[str],
+    src_validated: Optional[str]
+) -> bool:
+    """
+    仅当缺失约束当前以 NOVALIDATE 落地、且源端最终语义需要 VALIDATED 时，
+    才生成 constraint_validate_later。
+
+    规则：
+    - applied_keyword != NOVALIDATE: 不生成
+    - 源端明确为 NOT VALIDATED: 不生成
+    - 源端 VALIDATED 或 UNKNOWN: 生成（保持现有保守行为）
+    """
+    if (applied_keyword or "").strip().upper() != "NOVALIDATE":
+        return False
+    src_valid_n = normalize_constraint_validated_status(src_validated)
+    if src_valid_n == "NOT VALIDATED":
+        return False
+    return True
+
+
 def split_ddl_statements(ddl: str) -> List[str]:
     """
     以较稳健的方式按顶层分号切分 DDL：
@@ -29487,6 +29603,9 @@ def generate_alter_for_table_columns(
     tgt_schema_u = tgt_schema.upper()
     tgt_table_u = tgt_table.upper()
     table_full = quote_qualified_parts(tgt_schema_u, tgt_table_u)
+    src_notnull_novalidate_cols = build_system_notnull_novalidate_column_map(
+        oracle_meta.constraints.get((src_schema.upper(), src_table.upper()), {})
+    )
 
     # 缺失列：ADD
     if missing_cols:
@@ -29631,6 +29750,43 @@ def generate_alter_for_table_columns(
                 )
                 lines.append(
                     f"-- 建议先确认目标端是否存在 NULL 数据，再决定是否执行："
+                )
+                lines.append(
+                    f"-- ALTER TABLE {table_full} "
+                    f"MODIFY ({col_name.upper()} {review_type} NOT NULL);"
+                )
+            elif issue_type == "nullability_novalidate_tighten":
+                review_type = format_oracle_column_type(
+                    info,
+                    prefer_ob_varchar=True
+                )
+                novalidate_meta = src_notnull_novalidate_cols.get(col_name.upper(), {})
+                source_cons = novalidate_meta.get("constraint_name") or ""
+                search_condition = novalidate_meta.get("search_condition") or f"{quote_identifier(col_name.upper())} IS NOT NULL"
+                suggested_name = _build_collision_preferred_name(
+                    "CONSTRAINT",
+                    tgt_table_u,
+                    "C",
+                    [col_name.upper()],
+                    [],
+                    search_condition
+                )
+                lines.append(
+                    f"-- REVIEW-FIRST: {col_name.upper()} 源端为 NOT NULL ENABLE NOVALIDATE，目标端仍为可空。"
+                )
+                if source_cons:
+                    lines.append(
+                        f"-- 源端约束: {source_cons} CHECK ({search_condition}) ENABLE NOVALIDATE"
+                    )
+                lines.append(
+                    "-- Oracle 该语义不会使 DBA_TAB_COLUMNS.NULLABLE 变为 N。"
+                )
+                lines.append(
+                    "-- 建议先检查目标端是否已有 NULL 数据，再决定保留 NOVALIDATE 语义还是升级为严格 NOT NULL："
+                )
+                lines.append(
+                    f"-- ALTER TABLE {table_full} "
+                    f"ADD CONSTRAINT {quote_identifier(suggested_name)} CHECK ({search_condition}) ENABLE NOVALIDATE;"
                 )
                 lines.append(
                     f"-- ALTER TABLE {table_full} "
@@ -33906,8 +34062,8 @@ def generate_fixup_scripts(
                             ctype
                         )
                         if (
-                            applied_keyword == "NOVALIDATE"
-                            and not deferred_recorded
+                            not deferred_recorded
+                            and should_generate_constraint_validate_later(applied_keyword, src_validated)
                         ):
                             validate_sql = (
                                 f"ALTER TABLE {table_full} ENABLE VALIDATE CONSTRAINT "
@@ -36301,6 +36457,8 @@ def export_column_nullability_detail(
         for col, src_type, tgt_type, expected_type, issue_type in type_mismatches:
             if issue_type == "nullability_tighten":
                 rows.append([tgt_name, col, src_type, tgt_type, expected_type, "REVIEW_NOT_NULL"])
+            elif issue_type == "nullability_novalidate_tighten":
+                rows.append([tgt_name, col, src_type, tgt_type, expected_type, "REVIEW_NOT_NULL_NOVALIDATE"])
             elif issue_type == "nullability_relax":
                 rows.append([tgt_name, col, src_type, tgt_type, expected_type, "REVIEW_NULLABLE"])
     if not rows:
@@ -43322,7 +43480,7 @@ def print_final_report(
         in (tv_results.get("mismatched", []) or [])
         if (obj_type or "").upper() == "TABLE"
         for _col, _src_type, _tgt_type, _expected_type, issue_type in (type_mismatches or [])
-        if issue_type in {"nullability_tighten", "nullability_relax"}
+        if issue_type in {"nullability_tighten", "nullability_novalidate_tighten", "nullability_relax"}
     )
     column_default_issue_cnt = sum(
         1
@@ -44429,7 +44587,7 @@ def print_final_report(
                     details.append("* 类型不匹配:\n", style="mismatch")
                     for issue in type_mismatches:
                         col, src_type, tgt_type, expected_type, issue_type = issue
-                        if issue_type in ("nullability_tighten", "nullability_relax"):
+                        if issue_type in ("nullability_tighten", "nullability_novalidate_tighten", "nullability_relax"):
                             details.append(
                                 f"    - {col}: 源={src_type}, 目标={tgt_type}, 期望={expected_type} ({issue_type}, review-first)\n"
                             )
