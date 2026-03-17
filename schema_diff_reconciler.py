@@ -20369,6 +20369,7 @@ def compare_constraints_for_table(
     grouped_tgt_fk = bucket_fk(tgt_cons, is_source=False)
     grouped_src_ck = bucket_check(src_cons, include_deferrable=include_deferrable)
     grouped_tgt_ck = bucket_check(tgt_cons, include_deferrable=include_deferrable)
+    src_system_notnull_novalidate_cols = build_system_notnull_novalidate_column_map(src_cons)
 
     src_pk_list = grouped_src_pkuk.get('P', [])
     src_uk_list = grouped_src_pkuk.get('U', [])
@@ -20572,6 +20573,12 @@ def compare_constraints_for_table(
             if expr_key in src_expr_keys and expr_key not in expr_keys_with_name_match:
                 check_suppressed_target_dup_count += 1
                 continue
+            extra_notnull_col = _extract_notnull_column(raw_expr)
+            if extra_notnull_col and extra_notnull_col in src_system_notnull_novalidate_cols:
+                tgt_meta = tgt_cons.get(name) or {}
+                if normalize_constraint_enabled_status(tgt_meta.get("status")) == "ENABLED":
+                    check_suppressed_target_dup_count += 1
+                    continue
             extra.add(name)
             detail_mismatch.append(
                 f"CHECK: 目标端存在额外约束 {name} (条件 {raw_expr})。"
@@ -29785,7 +29792,7 @@ def generate_alter_for_table_columns(
                     "-- 建议先检查目标端是否已有 NULL 数据，再决定保留 NOVALIDATE 语义还是升级为严格 NOT NULL："
                 )
                 lines.append(
-                    f"-- ALTER TABLE {table_full} "
+                    f"ALTER TABLE {table_full} "
                     f"ADD CONSTRAINT {quote_identifier(suggested_name)} CHECK ({search_condition}) ENABLE NOVALIDATE;"
                 )
                 lines.append(
