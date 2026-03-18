@@ -849,6 +849,16 @@ class SysCForceCandidateRow(NamedTuple):
     sys_c_columns: Tuple[str, ...]
 
 
+class ColumnVisibilitySkippedRow(NamedTuple):
+    source_table: str
+    target_table: str
+    policy: str
+    source_metadata: str
+    target_metadata: str
+    reason: str
+    action: str
+
+
 class SupportClassificationResult(NamedTuple):
     support_state_map: Dict[Tuple[str, str], ObjectSupportReportRow]
     missing_detail_rows: List[ObjectSupportReportRow]
@@ -1050,6 +1060,8 @@ class ObMetadata(NamedTuple):
     constraint_deferrable_supported: bool = False         # 是否支持读取 DEFERRABLE/DEFERRED 元数据
     temporary_tables: frozenset[Tuple[str, str]] = frozenset()        # (OWNER, TABLE_NAME) -> target GTT / temporary tables
     identity_modes: Dict[Tuple[str, str], Dict[str, str]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: IDENTITY_MODE}
+    default_on_null_columns: Dict[Tuple[str, str], Tuple[str, ...]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> (COLUMN_NAME, ...)
+    identity_options: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: {OPTION: VALUE}}
 
 
 class OracleMetadata(NamedTuple):
@@ -1085,6 +1097,8 @@ class OracleMetadata(NamedTuple):
     non_table_triggers: Tuple["NonTableTriggerInfo", ...] = ()
     temporary_tables: Set[Tuple[str, str]] = set()          # (OWNER, TABLE_NAME) -> source GTT / temporary tables
     identity_modes: Dict[Tuple[str, str], Dict[str, str]] = {}  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: IDENTITY_MODE}
+    default_on_null_columns: Dict[Tuple[str, str], Tuple[str, ...]] = {}  # (OWNER, TABLE_NAME) -> (COLUMN_NAME, ...)
+    identity_options: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = {}  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: {OPTION: VALUE}}
 
 
 class DependencyRecord(NamedTuple):
@@ -1458,6 +1472,15 @@ SUPPORT_STATE_SUPPORTED = "SUPPORTED"
 SUPPORT_STATE_UNSUPPORTED = "UNSUPPORTED"
 SUPPORT_STATE_BLOCKED = "BLOCKED"
 SUPPORT_STATE_RISKY = "RISKY"
+
+
+def support_state_to_report_type(support_state: str) -> str:
+    state = (support_state or "").upper()
+    if state == SUPPORT_STATE_SUPPORTED:
+        return "MISSING"
+    if state == SUPPORT_STATE_RISKY:
+        return "RISKY"
+    return "UNSUPPORTED"
 
 UNSUPPORTED_GRANT_TARGET_REASON_PREFIX = "UNSUPPORTED_TARGET_"
 DEFERRED_GRANT_REASON_TARGET_MISSING_NOT_PLANNED = "DEFERRED_TARGET_MISSING_NOT_PLANNED"
@@ -2650,6 +2673,14 @@ def describe_column_default_expression(expr: Optional[object]) -> str:
 IDENTITY_MODE_ALWAYS = "ALWAYS"
 IDENTITY_MODE_BY_DEFAULT = "BY DEFAULT"
 IDENTITY_MODE_BY_DEFAULT_ON_NULL = "BY DEFAULT ON NULL"
+IDENTITY_OPTION_START_WITH = "START WITH"
+IDENTITY_OPTION_INCREMENT_BY = "INCREMENT BY"
+IDENTITY_OPTION_CACHE = "CACHE"
+IDENTITY_OPTION_KEYS = (
+    IDENTITY_OPTION_START_WITH,
+    IDENTITY_OPTION_INCREMENT_BY,
+    IDENTITY_OPTION_CACHE,
+)
 IDENTITY_MODE_VALUES = {
     IDENTITY_MODE_ALWAYS,
     IDENTITY_MODE_BY_DEFAULT,
@@ -2660,6 +2691,14 @@ IDENTITY_MODE_LINE_RE = re.compile(
     r'(?P<mode>ALWAYS|BY\s+DEFAULT(?:\s+ON\s+NULL)?)\s+AS\s+IDENTITY\b',
     flags=re.IGNORECASE,
 )
+DEFAULT_ON_NULL_LINE_RE = re.compile(
+    r'^[\s,(]*"?(?P<col>[A-Z0-9_#$]+)"?\s+.+?\bDEFAULT\s+ON\s+NULL\b',
+    flags=re.IGNORECASE,
+)
+IDENTITY_START_WITH_RE = re.compile(r"\bSTART\s+WITH\s+(-?\d+)\b", flags=re.IGNORECASE)
+IDENTITY_INCREMENT_BY_RE = re.compile(r"\bINCREMENT\s+BY\s+(-?\d+)\b", flags=re.IGNORECASE)
+IDENTITY_CACHE_RE = re.compile(r"\bCACHE\s+(\d+)\b", flags=re.IGNORECASE)
+IDENTITY_NOCACHE_RE = re.compile(r"\bNOCACHE\b", flags=re.IGNORECASE)
 
 
 def normalize_identity_mode(mode: Optional[object]) -> str:
@@ -2676,6 +2715,37 @@ def normalize_identity_mode(mode: Optional[object]) -> str:
 def describe_identity_mode(mode: Optional[object]) -> str:
     normalized = normalize_identity_mode(mode)
     return f"IDENTITY {normalized}" if normalized else "NO IDENTITY"
+
+
+def format_identity_option_subset(options: Optional[Dict[str, str]]) -> str:
+    if not options:
+        return "-"
+    parts: List[str] = []
+    for key in IDENTITY_OPTION_KEYS:
+        value = (options or {}).get(key)
+        if value in (None, ""):
+            continue
+        parts.append(f"{key}={value}")
+    return ", ".join(parts) if parts else "-"
+
+
+def normalize_identity_option_subset(options: Optional[Dict[str, object]]) -> Dict[str, str]:
+    normalized: Dict[str, str] = {}
+    for key in IDENTITY_OPTION_KEYS:
+        raw_value = (options or {}).get(key)
+        if raw_value in (None, ""):
+            continue
+        text = str(raw_value).strip().upper()
+        if not text:
+            continue
+        if key == IDENTITY_OPTION_CACHE and text == "NOCACHE":
+            normalized[key] = "NOCACHE"
+            continue
+        try:
+            normalized[key] = str(int(text))
+        except (TypeError, ValueError):
+            normalized[key] = text
+    return normalized
 
 
 def looks_like_identity_default_expression(expr: Optional[object]) -> bool:
@@ -2719,6 +2789,70 @@ def extract_identity_modes_from_table_ddl(
             continue
         result[col] = mode
     return result
+
+
+def extract_identity_options_from_table_ddl(
+    ddl: Optional[str],
+    known_columns: Optional[Iterable[str]] = None
+) -> Dict[str, Dict[str, str]]:
+    if not ddl:
+        return {}
+    ddl_text = str(ddl).replace("\\r", "\r").replace("\\n", "\n").replace("\\t", "\t")
+    known = {str(col).strip().upper() for col in (known_columns or []) if str(col).strip()}
+    result: Dict[str, Dict[str, str]] = {}
+    for raw_line in ddl_text.splitlines():
+        if "AS IDENTITY" not in (raw_line or "").upper():
+            continue
+        line = " ".join((raw_line or "").strip().split())
+        match = IDENTITY_MODE_LINE_RE.search(line.upper())
+        if not match:
+            continue
+        col = normalize_identifier_name(match.group("col"))
+        if not col:
+            continue
+        if known and col not in known:
+            continue
+        options: Dict[str, str] = {}
+        start_match = IDENTITY_START_WITH_RE.search(line)
+        if start_match:
+            options[IDENTITY_OPTION_START_WITH] = start_match.group(1)
+        increment_match = IDENTITY_INCREMENT_BY_RE.search(line)
+        if increment_match:
+            options[IDENTITY_OPTION_INCREMENT_BY] = increment_match.group(1)
+        if IDENTITY_NOCACHE_RE.search(line):
+            options[IDENTITY_OPTION_CACHE] = "NOCACHE"
+        else:
+            cache_match = IDENTITY_CACHE_RE.search(line)
+            if cache_match:
+                options[IDENTITY_OPTION_CACHE] = cache_match.group(1)
+        if options:
+            result[col] = options
+    return result
+
+
+def extract_default_on_null_columns_from_table_ddl(
+    ddl: Optional[str],
+    known_columns: Optional[Iterable[str]] = None
+) -> Tuple[str, ...]:
+    if not ddl:
+        return ()
+    ddl_text = str(ddl).replace("\\r", "\r").replace("\\n", "\n").replace("\\t", "\t")
+    known = {str(col).strip().upper() for col in (known_columns or []) if str(col).strip()}
+    result: Set[str] = set()
+    for raw_line in ddl_text.splitlines():
+        if "DEFAULT ON NULL" not in (raw_line or "").upper():
+            continue
+        line = " ".join((raw_line or "").strip().split())
+        match = DEFAULT_ON_NULL_LINE_RE.search(line.upper())
+        if not match:
+            continue
+        col = normalize_identifier_name(match.group("col"))
+        if not col:
+            continue
+        if known and col not in known:
+            continue
+        result.add(col)
+    return tuple(sorted(result))
 
 
 def normalize_check_constraint_expression(
@@ -2952,7 +3086,10 @@ def normalize_ob_metadata_public_owner(meta: ObMetadata) -> ObMetadata:
         column_comments=column_comments,
         object_statuses=object_statuses,
         package_errors=package_errors,
-        partition_key_columns=partition_key_columns
+        partition_key_columns=partition_key_columns,
+        identity_modes=_remap_owner_table_simple(meta.identity_modes or {}),
+        default_on_null_columns=_remap_owner_table_simple(meta.default_on_null_columns or {}),
+        identity_options=_remap_owner_table_simple(meta.identity_options or {}),
     )
 
 def is_index_expression_token(token: Optional[str]) -> bool:
@@ -8428,7 +8565,7 @@ def classify_missing_objects(
                     or f"{dep_full}(DEPENDENCY)"
                 )
         elif support_state == SUPPORT_STATE_RISKY:
-            root_cause = f"{src_full}(VIEW_FIXUP_RISK)"
+            root_cause = f"{src_full}({reason_code or SUPPORT_STATE_RISKY})"
 
         row = ObjectSupportReportRow(
             obj_type=obj_type_u,
@@ -11805,6 +11942,21 @@ def _collect_identity_candidate_tables(
     return candidates
 
 
+def _collect_default_on_null_candidate_tables(
+    table_columns: Dict[Tuple[str, str], Dict[str, Dict]]
+) -> Dict[Tuple[str, str], Set[str]]:
+    candidates: Dict[Tuple[str, str], Set[str]] = {}
+    for key, columns in (table_columns or {}).items():
+        matched = {
+            normalize_identifier_name(col)
+            for col, meta in (columns or {}).items()
+            if str(meta.get("default_on_null") or "").strip().upper() in {"YES", "Y", "TRUE", "1"}
+        }
+        if matched:
+            candidates[key] = matched
+    return candidates
+
+
 def _fetch_oracle_identity_mode_map(
     ora_conn,
     candidate_tables: Dict[Tuple[str, str], Set[str]]
@@ -11849,6 +12001,100 @@ def _fetch_ob_identity_mode_map(
         mode_map = extract_identity_modes_from_table_ddl(out, cols)
         if mode_map:
             result[(owner_u, table_u)] = mode_map
+    return result
+
+
+def _fetch_oracle_identity_option_map(
+    ora_conn,
+    candidate_tables: Dict[Tuple[str, str], Set[str]]
+) -> Dict[Tuple[str, str], Dict[str, Dict[str, str]]]:
+    if not candidate_tables:
+        return {}
+    result: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = {}
+    sql = "SELECT DBMS_METADATA.GET_DDL('TABLE', :1, :2) FROM DUAL"
+    with ora_conn.cursor() as cursor:
+        for (owner_u, table_u), cols in sorted(candidate_tables.items()):
+            try:
+                cursor.execute(sql, [table_u, owner_u])
+                row = cursor.fetchone()
+            except Exception as exc:  # noqa: BLE001
+                log.info("[CHECK] 读取 Oracle TABLE DDL 失败 %s.%s: %s", owner_u, table_u, exc)
+                continue
+            ddl_text = str(row[0]) if row and row[0] is not None else ""
+            option_map = extract_identity_options_from_table_ddl(ddl_text, cols)
+            if option_map:
+                result[(owner_u, table_u)] = option_map
+    return result
+
+
+def _fetch_ob_identity_option_map(
+    ob_cfg: ObConfig,
+    candidate_tables: Dict[Tuple[str, str], Set[str]]
+) -> Dict[Tuple[str, str], Dict[str, Dict[str, str]]]:
+    if not candidate_tables:
+        return {}
+    result: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = {}
+    for (owner_u, table_u), cols in sorted(candidate_tables.items()):
+        sql = (
+            "SELECT DBMS_METADATA.GET_DDL('TABLE', {table_name}, {owner_name}) FROM DUAL"
+        ).format(
+            table_name=sql_quote_literal(table_u),
+            owner_name=sql_quote_literal(owner_u),
+        )
+        ok, out, err = obclient_run_sql(ob_cfg, sql, quiet_error=True)
+        if not ok:
+            log.info("[CHECK] 读取 OceanBase TABLE DDL 失败 %s.%s: %s", owner_u, table_u, err)
+            continue
+        option_map = extract_identity_options_from_table_ddl(out, cols)
+        if option_map:
+            result[(owner_u, table_u)] = option_map
+    return result
+
+
+def _fetch_oracle_default_on_null_map(
+    ora_conn,
+    candidate_tables: Dict[Tuple[str, str], Set[str]]
+) -> Dict[Tuple[str, str], Tuple[str, ...]]:
+    if not candidate_tables:
+        return {}
+    result: Dict[Tuple[str, str], Tuple[str, ...]] = {}
+    sql = "SELECT DBMS_METADATA.GET_DDL('TABLE', :1, :2) FROM DUAL"
+    with ora_conn.cursor() as cursor:
+        for (owner_u, table_u), cols in sorted(candidate_tables.items()):
+            try:
+                cursor.execute(sql, [table_u, owner_u])
+                row = cursor.fetchone()
+            except Exception as exc:  # noqa: BLE001
+                log.info("[CHECK] 读取 Oracle TABLE DDL 失败 %s.%s: %s", owner_u, table_u, exc)
+                continue
+            ddl_text = str(row[0]) if row and row[0] is not None else ""
+            matched_cols = extract_default_on_null_columns_from_table_ddl(ddl_text, cols)
+            if matched_cols:
+                result[(owner_u, table_u)] = matched_cols
+    return result
+
+
+def _fetch_ob_default_on_null_map(
+    ob_cfg: ObConfig,
+    candidate_tables: Dict[Tuple[str, str], Set[str]]
+) -> Dict[Tuple[str, str], Tuple[str, ...]]:
+    if not candidate_tables:
+        return {}
+    result: Dict[Tuple[str, str], Tuple[str, ...]] = {}
+    for (owner_u, table_u), cols in sorted(candidate_tables.items()):
+        sql = (
+            "SELECT DBMS_METADATA.GET_DDL('TABLE', {table_name}, {owner_name}) FROM DUAL"
+        ).format(
+            table_name=sql_quote_literal(table_u),
+            owner_name=sql_quote_literal(owner_u),
+        )
+        ok, out, err = obclient_run_sql(ob_cfg, sql, quiet_error=True)
+        if not ok:
+            log.info("[CHECK] 读取 OceanBase TABLE DDL 失败 %s.%s: %s", owner_u, table_u, err)
+            continue
+        matched_cols = extract_default_on_null_columns_from_table_ddl(out, cols)
+        if matched_cols:
+            result[(owner_u, table_u)] = matched_cols
     return result
 
 
@@ -12965,10 +13211,16 @@ def dump_ob_metadata(
         _load_ob_part_keys("DBA_SUBPART_KEY_COLUMNS")
 
     identity_modes: Dict[Tuple[str, str], Dict[str, str]] = {}
+    identity_options: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = {}
+    default_on_null_columns: Dict[Tuple[str, str], Tuple[str, ...]] = {}
     if include_tab_columns and tab_columns:
         identity_candidate_tables = _collect_identity_candidate_tables(tab_columns)
         if identity_candidate_tables:
             identity_modes = _fetch_ob_identity_mode_map(ob_cfg, identity_candidate_tables)
+            identity_options = _fetch_ob_identity_option_map(ob_cfg, identity_candidate_tables)
+        default_on_null_candidate_tables = _collect_default_on_null_candidate_tables(tab_columns)
+        if default_on_null_candidate_tables:
+            default_on_null_columns = _fetch_ob_default_on_null_map(ob_cfg, default_on_null_candidate_tables)
 
     roles: Set[str] = set()
     # --- 9. DBA_ROLES ---
@@ -13007,6 +13259,8 @@ def dump_ob_metadata(
         constraint_deferrable_supported=constraint_deferrable_supported,
         temporary_tables=temporary_tables,
         identity_modes=identity_modes,
+        default_on_null_columns=default_on_null_columns,
+        identity_options=identity_options,
     )
     ob_table_count = len(ob_meta.tab_columns)
     ob_column_count = sum(len(cols) for cols in ob_meta.tab_columns.values())
@@ -16134,6 +16388,8 @@ def dump_oracle_metadata(
         log.warning("Oracle 源端检测到 %d 个非表触发器，这些触发器不会进入普通 TABLE 触发器校验。", len(non_table_triggers))
 
     identity_modes: Dict[Tuple[str, str], Dict[str, str]] = {}
+    identity_options: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = {}
+    default_on_null_columns: Dict[Tuple[str, str], Tuple[str, ...]] = {}
     if table_columns:
         try:
             with oracledb.connect(
@@ -16144,8 +16400,12 @@ def dump_oracle_metadata(
                 identity_candidate_tables = _collect_identity_candidate_tables(table_columns)
                 if identity_candidate_tables:
                     identity_modes = _fetch_oracle_identity_mode_map(ora_conn, identity_candidate_tables)
+                    identity_options = _fetch_oracle_identity_option_map(ora_conn, identity_candidate_tables)
+                default_on_null_candidate_tables = _collect_default_on_null_candidate_tables(table_columns)
+                if default_on_null_candidate_tables:
+                    default_on_null_columns = _fetch_oracle_default_on_null_map(ora_conn, default_on_null_candidate_tables)
         except oracledb.Error as e:
-            log.warning("读取 Oracle TABLE DDL 以提取 identity mode 失败，将跳过 identity mode compare: %s", e)
+            log.warning("读取 Oracle TABLE DDL 以提取 identity/default-on-null 语义失败，将跳过对应 DDL 兜底 compare: %s", e)
 
     return OracleMetadata(
         table_columns=table_columns,
@@ -16177,6 +16437,8 @@ def dump_oracle_metadata(
         non_table_triggers=tuple(non_table_triggers),
         temporary_tables=temporary_tables,
         identity_modes=identity_modes,
+        default_on_null_columns=default_on_null_columns,
+        identity_options=identity_options,
     )
 
 
@@ -19094,6 +19356,7 @@ def check_primary_objects(
         "mismatched": [],
         "ok": [],
         "skipped": [],
+        "visibility_skipped": [],
         "column_order_mismatched": [],
         "column_order_skipped": [],
         "extraneous": extraneous_rules,
@@ -19129,11 +19392,15 @@ def check_primary_objects(
     if not identity_mode_compare_enabled:
         log.info("[CHECK] IDENTITY 列校验已跳过 (IDENTITY 元数据与 DDL mode 均不完整)。")
 
-    default_on_null_enabled = bool(getattr(oracle_meta, "default_on_null_supported", False)) and bool(
+    default_on_null_compare_enabled = bool(getattr(oracle_meta, "default_on_null_supported", False)) and bool(
         getattr(ob_meta, "default_on_null_supported", False)
     )
-    if not default_on_null_enabled:
-        log.info("[CHECK] DEFAULT ON NULL 校验已跳过 (DEFAULT_ON_NULL 元数据不完整)。")
+    if not default_on_null_compare_enabled:
+        default_on_null_compare_enabled = bool(getattr(oracle_meta, "default_on_null_columns", {}) or {}) or bool(
+            getattr(ob_meta, "default_on_null_columns", {}) or {}
+        )
+    if not default_on_null_compare_enabled:
+        log.info("[CHECK] DEFAULT ON NULL 校验已跳过 (DEFAULT_ON_NULL 元数据与 DDL 语义均不完整)。")
 
     column_order_enabled = bool((settings or {}).get("enable_column_order_check", False))
 
@@ -19221,8 +19488,28 @@ def check_primary_objects(
             )
             src_identity_modes = (getattr(oracle_meta, "identity_modes", {}) or {}).get((src_schema_u, src_obj_u), {})
             tgt_identity_modes = (getattr(ob_meta, "identity_modes", {}) or {}).get((tgt_schema_u, tgt_obj_u), {})
+            src_identity_options = (getattr(oracle_meta, "identity_options", {}) or {}).get((src_schema_u, src_obj_u), {})
+            tgt_identity_options = (getattr(ob_meta, "identity_options", {}) or {}).get((tgt_schema_u, tgt_obj_u), {})
+            src_default_on_null_cols = set(
+                (getattr(oracle_meta, "default_on_null_columns", {}) or {}).get((src_schema_u, src_obj_u), ())
+            )
+            tgt_default_on_null_cols = set(
+                (getattr(ob_meta, "default_on_null_columns", {}) or {}).get((tgt_schema_u, tgt_obj_u), ())
+            )
             hidden_src_cols = {col for col, meta in src_cols_details.items() if meta.get("hidden")}
             invisible_src_cols = {col for col, meta in src_cols_details.items() if meta.get("invisible") is True}
+            if visibility_policy == "auto" and not visibility_enabled:
+                results["visibility_skipped"].append(
+                    ColumnVisibilitySkippedRow(
+                        source_table=src_name,
+                        target_table=full_tgt,
+                        policy="auto",
+                        source_metadata="READY" if oracle_meta.invisible_column_supported else "MISSING",
+                        target_metadata="READY" if ob_meta.invisible_column_supported else "MISSING",
+                        reason="INVISIBLE_COLUMN 元数据不完整，已跳过 INVISIBLE compare/fixup。",
+                        action="补齐两端 INVISIBLE_COLUMN 元数据能力后重跑；或在确认风险后改用 column_visibility_policy=enforce 复核。"
+                    )
+                )
             src_col_names = {
                 col for col, meta in src_cols_details.items()
                 if not is_ignored_source_column(col, meta)
@@ -19303,6 +19590,8 @@ def check_primary_objects(
                 tgt_identity = _is_true_flag(tgt_info.get("identity"))
                 src_identity_mode = normalize_identity_mode(src_identity_modes.get(col_name.upper()))
                 tgt_identity_mode = normalize_identity_mode(tgt_identity_modes.get(col_name.upper()))
+                src_identity_option_subset = normalize_identity_option_subset(src_identity_options.get(col_name.upper()))
+                tgt_identity_option_subset = normalize_identity_option_subset(tgt_identity_options.get(col_name.upper()))
                 src_identity_present = src_identity or bool(src_identity_mode)
                 tgt_identity_present = tgt_identity or bool(tgt_identity_mode)
 
@@ -19339,18 +19628,45 @@ def check_primary_objects(
                                 "identity_mode_mismatch"
                             )
                         )
+                    elif (
+                        src_identity_present
+                        and tgt_identity_present
+                        and src_identity_mode
+                        and tgt_identity_mode
+                        and src_identity_mode == tgt_identity_mode
+                        and src_identity_option_subset != tgt_identity_option_subset
+                    ):
+                        type_mismatches.append(
+                            ColumnTypeIssue(
+                                col_name,
+                                format_identity_option_subset(src_identity_option_subset),
+                                format_identity_option_subset(tgt_identity_option_subset),
+                                format_identity_option_subset(src_identity_option_subset),
+                                "identity_option_mismatch"
+                            )
+                        )
 
-                if default_on_null_enabled:
-                    src_default_on_null = _is_true_flag(src_info.get("default_on_null"))
-                    tgt_default_on_null = _is_true_flag(tgt_info.get("default_on_null"))
+                if default_on_null_compare_enabled:
+                    src_default_on_null = _is_true_flag(src_info.get("default_on_null")) or col_name.upper() in src_default_on_null_cols
+                    tgt_default_on_null = _is_true_flag(tgt_info.get("default_on_null")) or col_name.upper() in tgt_default_on_null_cols
                     if src_default_on_null and not tgt_default_on_null:
                         type_mismatches.append(
                             ColumnTypeIssue(
                                 col_name,
-                                format_oracle_column_type(src_info, prefer_ob_varchar=True),
-                                format_oracle_column_type(tgt_info, prefer_ob_varchar=True),
+                                "DEFAULT ON NULL",
+                                "NO DEFAULT ON NULL",
                                 "DEFAULT ON NULL",
                                 "default_on_null_missing"
+                            )
+                        )
+                    elif not src_default_on_null and tgt_default_on_null:
+                        type_mismatches.append(
+                            ColumnTypeIssue(
+                                col_name,
+                                "NO DEFAULT ON NULL",
+                                "DEFAULT ON NULL",
+                                "NO DEFAULT ON NULL",
+                                "default_on_null_unexpected"
                             )
                         )
 
@@ -23581,6 +23897,7 @@ def load_from_flat_cache(
     if not flat_cache.exists():
         return 0
     
+    cache_index_path_exists = get_flat_cache_index_path(base_output).exists()
     index_start = time.time()
     cache_index = load_flat_cache_index(base_output)
     index_elapsed = time.time() - index_start
@@ -23589,6 +23906,7 @@ def load_from_flat_cache(
     
     # 收集所有需要加载的文件
     load_tasks: List[Tuple[str, str, str, Path]] = []
+    repair_candidates: Set[Tuple[str, str, str]] = set()
     for schema in list(schema_requests.keys()):
         schema_u = schema.upper()
         type_map = schema_requests.get(schema) or {}
@@ -23601,17 +23919,19 @@ def load_from_flat_cache(
             
             for name in names:
                 name_u = name.upper()
-                if cached_names and name_u not in cached_names:
-                    continue
                 file_path = get_flat_cache_path(base_output, schema, obj_type, name)
-                if file_path.exists():
-                    load_tasks.append((schema, obj_type, name, file_path))
+                if not file_path.exists():
+                    continue
+                load_tasks.append((schema, obj_type, name, file_path))
+                if cache_index_path_exists and name_u not in cached_names:
+                    repair_candidates.add((schema_u, obj_type_u, name_u))
     
     if not load_tasks:
         return 0
     
     loaded_count = 0
     loaded_keys: List[Tuple[str, str, str]] = []
+    repaired_index_entries: Set[Tuple[str, str, str]] = set()
     total_read_time = 0.0
     slow_files = []
     results_lock = threading.Lock()
@@ -23637,26 +23957,34 @@ def load_from_flat_cache(
                     schema, obj_type, name, ddl_text, elapsed = result
                     with results_lock:
                         accumulator.setdefault(schema.upper(), {}).setdefault(obj_type.upper(), {})[name.upper()] = ddl_text
-                        if source_meta:
-                            source_meta[(schema.upper(), obj_type.upper(), name.upper())] = ("flat_cache", elapsed)
+                        if source_meta is not None:
+                            source_meta[(schema.upper(), obj_type.upper(), name.upper())] = ("cache", elapsed)
                         total_read_time += elapsed
                         if elapsed > 0.5:
                             slow_files.append((f"{schema}.{name}", elapsed))
                         loaded_count += 1
                         loaded_keys.append((schema, obj_type, name))
+                        key = (schema.upper(), obj_type.upper(), name.upper())
+                        if key in repair_candidates:
+                            update_flat_cache_index(base_output, schema, obj_type, name, cache_index)
+                            repaired_index_entries.add(key)
     else:
         for task in load_tasks:
             result = _load_file(task)
             if result:
                 schema, obj_type, name, ddl_text, elapsed = result
                 accumulator.setdefault(schema.upper(), {}).setdefault(obj_type.upper(), {})[name.upper()] = ddl_text
-                if source_meta:
-                    source_meta[(schema.upper(), obj_type.upper(), name.upper())] = ("flat_cache", elapsed)
+                if source_meta is not None:
+                    source_meta[(schema.upper(), obj_type.upper(), name.upper())] = ("cache", elapsed)
                 total_read_time += elapsed
                 if elapsed > 0.5:
                     slow_files.append((f"{schema}.{name}", elapsed))
                 loaded_count += 1
                 loaded_keys.append((schema, obj_type, name))
+                key = (schema.upper(), obj_type.upper(), name.upper())
+                if key in repair_candidates:
+                    update_flat_cache_index(base_output, schema, obj_type, name, cache_index)
+                    repaired_index_entries.add(key)
 
     # 更新schema_requests
     for schema, obj_type, name in loaded_keys:
@@ -23667,6 +23995,12 @@ def load_from_flat_cache(
                 del type_map[obj_type]
         if not type_map and schema in schema_requests:
             del schema_requests[schema]
+
+    if repaired_index_entries:
+        if save_flat_cache_index(base_output, cache_index):
+            log.info("[dbcat] 已自修复扁平缓存索引漏项 %d 个。", len(repaired_index_entries))
+        else:
+            log.warning("[dbcat] 扁平缓存索引漏项已命中文件，但回写 index.json 失败。")
     
     # 性能诊断
     if loaded_count > 0:
@@ -26391,6 +26725,13 @@ QUALIFIED_NAME_PATTERN = re.compile(
     r'^\s*(?:"([^"]+)"|([A-Z0-9_\$#]+))\s*\.\s*(?:"([^"]+)"|([A-Z0-9_\$#]+))\s*$',
     re.IGNORECASE
 )
+PLSQL_QUALIFIED_REF_PATTERN = re.compile(
+    r'(?<![A-Z0-9_\$#"])'
+    r'(?P<schema>"[^"]+"|[A-Z_][A-Z0-9_\$#]*)'
+    r'\s*\.\s*'
+    r'(?P<object>"[^"]+"|[A-Z_][A-Z0-9_\$#]*)',
+    re.IGNORECASE,
+)
 
 
 def quote_identifier(name: str) -> str:
@@ -26426,6 +26767,22 @@ def normalize_qualified_name(name: str) -> Optional[str]:
 
 def ensure_quoted_qualified(name: str) -> str:
     return normalize_qualified_name(name) or name
+
+
+def format_plsql_qualified_target(
+    target_full: str,
+    *,
+    quoted_like_source: bool = False,
+) -> str:
+    if not target_full:
+        return target_full
+    target_u = str(target_full).strip().upper()
+    if '.' not in target_u:
+        return quote_identifier(target_u) if quoted_like_source else target_u
+    schema_u, obj_u = target_u.split('.', 1)
+    if quoted_like_source:
+        return quote_qualified_parts(schema_u, obj_u)
+    return f"{schema_u}.{obj_u}"
 
 
 def build_view_ddl_from_text(
@@ -27251,8 +27608,13 @@ TRIGGER_DML_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(r'(\bFROM\s+)(?P<name>"?[A-Z0-9_\$#]+"?)', re.IGNORECASE),
     re.compile(r'(\bJOIN\s+)(?P<name>"?[A-Z0-9_\$#]+"?)', re.IGNORECASE),
 )
+TRIGGER_CREATE_PREFIX_RE = (
+    r'CREATE\s+(?:OR\s+REPLACE\s+)?'
+    r'(?:EDITIONABLE\s+|NONEDITIONABLE\s+)?'
+    r'TRIGGER'
+)
 TRIGGER_EVENT_HEADER_PATTERN = re.compile(
-    r'\bCREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\b.*?\bON\s+(?:"?[A-Z0-9_\$#]+"?(?:\s*\.\s*"?[A-Z0-9_\$#]+"?)?)',
+    rf'\b{TRIGGER_CREATE_PREFIX_RE}\b.*?\bON\s+(?:"?[A-Z0-9_\$#]+"?(?:\s*\.\s*"?[A-Z0-9_\$#]+"?)?)',
     re.IGNORECASE | re.DOTALL
 )
 TRIGGER_LITERAL_REMAP_PREFERRED_TYPES: Tuple[str, ...] = (
@@ -27529,7 +27891,7 @@ def remap_trigger_object_references(
     # CREATE TRIGGER 主对象名强制补 schema
     if tgt_schema_u and tgt_trigger_u:
         name_pattern = re.compile(
-            r'(CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+)(?P<name>"?[A-Z0-9_\$#]+"?(?:\s*\.\s*"?[A-Z0-9_\$#]+"?)?)',
+            rf'({TRIGGER_CREATE_PREFIX_RE}\s+)(?P<name>"?[A-Z0-9_\$#]+"?(?:\s*\.\s*"?[A-Z0-9_\$#]+"?)?)',
             re.IGNORECASE
         )
         working_sql = name_pattern.sub(
@@ -27541,7 +27903,7 @@ def remap_trigger_object_references(
     # ON 子句（仅匹配 CREATE TRIGGER 段落）
     if on_schema_u and on_table_u:
         on_pattern = re.compile(
-            r'(CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\b.*?\bON\s+)(?P<name>"?[A-Z0-9_\$#]+"?(?:\s*\.\s*"?[A-Z0-9_\$#]+"?)?)',
+            rf'({TRIGGER_CREATE_PREFIX_RE}\b.*?\bON\s+)(?P<name>"?[A-Z0-9_\$#]+"?(?:\s*\.\s*"?[A-Z0-9_\$#]+"?)?)',
             re.IGNORECASE | re.DOTALL
         )
         working_sql = on_pattern.sub(
@@ -27797,8 +28159,6 @@ def remap_plsql_object_references(
     masker = SqlMasker(ddl)
     working_sql = masker.masked_sql
     
-    # 收集需要替换的引用
-    replacements_qualified: Dict[str, str] = {}
     replacements_unqualified: Dict[str, str] = {}
     preferred_types = (
         "TABLE", "VIEW", "MATERIALIZED VIEW", "SEQUENCE",
@@ -27806,19 +28166,32 @@ def remap_plsql_object_references(
         "PROCEDURE", "TYPE", "TYPE BODY", "TRIGGER"
     )
 
-    # 1. 查找 SCHEMA.OBJECT 格式的引用
-    ref_pattern = r'\b([A-Z_][A-Z0-9_]*\.[A-Z_][A-Z0-9_]*)\b'
-    matches = re.findall(ref_pattern, working_sql, re.IGNORECASE)
-    for match in matches:
-        ref_name = match.strip().strip('"').upper()
-        if '.' in ref_name:
-            tgt_name = find_mapped_target_any_type(
-                full_object_mapping,
-                ref_name,
-                preferred_types=preferred_types
-            )
-            if tgt_name and tgt_name.upper() != ref_name:
-                replacements_qualified[ref_name] = tgt_name.upper()
+    # 1. 查找 SCHEMA.OBJECT 格式的引用（支持双引号与 $/#）
+    def _replace_qualified_ref(match: re.Match) -> str:
+        schema_raw = match.group("schema")
+        object_raw = match.group("object")
+        ref_name = f"{normalize_identifier_name(schema_raw)}.{normalize_identifier_name(object_raw)}"
+        if "." not in ref_name:
+            return match.group(0)
+        tgt_name = find_mapped_target_any_type(
+            full_object_mapping,
+            ref_name,
+            preferred_types=preferred_types
+        )
+        if not tgt_name or tgt_name.upper() == ref_name:
+            return match.group(0)
+        quoted_like_source = (
+            str(schema_raw).strip().startswith('"')
+            or str(object_raw).strip().startswith('"')
+        )
+        rendered = format_plsql_qualified_target(
+            tgt_name,
+            quoted_like_source=quoted_like_source,
+        )
+        log.debug("[%s] 重映射对象引用(限定): %s -> %s", obj_type_upper, ref_name, rendered)
+        return rendered
+
+    working_sql = PLSQL_QUALIFIED_REF_PATTERN.sub(_replace_qualified_ref, working_sql)
 
     # 2. 查找未限定引用 (如果提供了 source_schema)
     if source_schema:
@@ -27848,14 +28221,6 @@ def remap_plsql_object_references(
                 tgt_u = tgt_name.upper()
                 if tgt_u != cand_u:
                     replacements_unqualified[cand_u] = tgt_u
-
-    # 执行替换
-    if replacements_qualified:
-        for src_ref in sorted(replacements_qualified.keys(), key=len, reverse=True):
-            tgt_ref = replacements_qualified[src_ref]
-            pattern = r'\b' + re.escape(src_ref) + r'\b'
-            working_sql = re.sub(pattern, tgt_ref, working_sql, flags=re.IGNORECASE)
-            log.debug("[%s] 重映射对象引用(限定): %s -> %s", obj_type_upper, src_ref, tgt_ref)
 
     rewritten = masker.unmask(working_sql)
     # 未限定名称仅在 DML 对象位置替换，避免误替换局部变量/参数名。
@@ -30165,6 +30530,13 @@ def generate_alter_for_table_columns(
                 lines.append(
                     "-- 请结合源/目标 DDL 与写入路径人工处理，当前不生成自动修复 SQL。"
                 )
+            elif issue_type == "identity_option_mismatch":
+                lines.append(
+                    f"-- REVIEW-FIRST: {col_name.upper()} identity 细项与源端不一致 (源={src_type}, 目标={tgt_type})。"
+                )
+                lines.append(
+                    "-- 当前仅覆盖 START WITH / INCREMENT BY / CACHE，且只做 review-first 提示。"
+                )
             elif issue_type == "identity_unexpected":
                 lines.append(
                     f"-- REVIEW-FIRST: {col_name.upper()} 目标端额外存在 {tgt_type} 特性，源端无 identity。"
@@ -30174,7 +30546,17 @@ def generate_alter_for_table_columns(
                 )
             elif issue_type == "default_on_null_missing":
                 lines.append(
-                    f"-- WARNING: {col_name.upper()} 缺失 {expected_type} 特性，请人工处理。"
+                    f"-- REVIEW-FIRST: {col_name.upper()} 源端含 {expected_type} 语义，目标端缺失。"
+                )
+                lines.append(
+                    "-- 请结合源/目标 DDL 与写入路径人工处理，当前不生成自动修复 SQL。"
+                )
+            elif issue_type == "default_on_null_unexpected":
+                lines.append(
+                    f"-- REVIEW-FIRST: {col_name.upper()} 目标端额外存在 DEFAULT ON NULL 语义，源端无该语义。"
+                )
+                lines.append(
+                    "-- 请人工确认是否需要去除 DEFAULT ON NULL；当前不生成自动修复 SQL。"
                 )
             elif issue_type == "nullability_tighten":
                 review_type = format_oracle_column_type(
@@ -34777,7 +35159,7 @@ def generate_fixup_scripts(
                     # 保持旧逻辑：仅补全 CREATE TRIGGER 与 ON 子句
                     def _rewrite_trigger_name_and_on(text: str) -> str:
                         name_pattern = re.compile(
-                            rf'(CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+)"?{re.escape(ss)}"?\s*\.\s*"?{re.escape(tn)}"?',
+                            rf'({TRIGGER_CREATE_PREFIX_RE}\s+)"?{re.escape(ss)}"?\s*\.\s*"?{re.escape(tn)}"?',
                             re.IGNORECASE
                         )
                         text = name_pattern.sub(
@@ -35746,10 +36128,16 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "表列不匹配明细"
     if name.startswith("column_nullability_detail_"):
         return "DETAIL", "列空值语义差异明细"
+    if name.startswith("column_visibility_skipped_detail_"):
+        return "DETAIL", "列可见性(INVISIBLE)跳过明细"
     if name.startswith("column_default_detail_"):
         return "DETAIL", "列默认值差异明细"
+    if name.startswith("column_default_on_null_detail_"):
+        return "DETAIL", "列 DEFAULT ON NULL 差异明细"
     if name.startswith("column_identity_detail_"):
         return "DETAIL", "列 identity 差异明细"
+    if name.startswith("column_identity_option_detail_"):
+        return "DETAIL", "列 identity 细项差异明细"
     if name.startswith("column_order_mismatch_detail_"):
         return "DETAIL", "列顺序差异明细"
     if name.startswith("comment_mismatch_detail_"):
@@ -37016,6 +37404,63 @@ def export_column_default_detail(
     return write_pipe_report("列默认值差异明细", header_fields, rows, output_path)
 
 
+def export_column_default_on_null_detail(
+    mismatched_items: List[Tuple[str, str, Set[str], Set[str], List[Tuple[str, int, int, int, str]], List[Tuple[str, str, str, str]]]],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not mismatched_items or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"column_default_on_null_detail_{report_timestamp}.txt"
+    header_fields = ["TABLE", "COLUMN", "SRC_DEFAULT_ON_NULL", "TGT_DEFAULT_ON_NULL", "EXPECTED", "ACTION"]
+    rows: List[List[str]] = []
+    for obj_type, tgt_name, _missing, _extra, _length_mismatches, type_mismatches in mismatched_items:
+        if (obj_type or "").upper() != "TABLE":
+            continue
+        if "获取失败" in tgt_name:
+            continue
+        for col, src_type, tgt_type, expected_type, issue_type in type_mismatches:
+            if issue_type == "default_on_null_missing":
+                rows.append([tgt_name, col, src_type, tgt_type, expected_type, "REVIEW_ADD_DEFAULT_ON_NULL"])
+            elif issue_type == "default_on_null_unexpected":
+                rows.append([tgt_name, col, src_type, tgt_type, expected_type, "REVIEW_DROP_DEFAULT_ON_NULL"])
+    if not rows:
+        return None
+    return write_pipe_report("列 DEFAULT ON NULL 差异明细", header_fields, rows, output_path)
+
+
+def export_column_visibility_skipped_detail(
+    skipped_items: List[ColumnVisibilitySkippedRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not skipped_items or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"column_visibility_skipped_detail_{report_timestamp}.txt"
+    header_fields = [
+        "SOURCE_TABLE",
+        "TARGET_TABLE",
+        "POLICY",
+        "SOURCE_METADATA",
+        "TARGET_METADATA",
+        "REASON",
+        "ACTION"
+    ]
+    rows = [
+        [
+            item.source_table,
+            item.target_table,
+            item.policy,
+            item.source_metadata,
+            item.target_metadata,
+            item.reason,
+            item.action,
+        ]
+        for item in skipped_items
+    ]
+    return write_pipe_report("列可见性(INVISIBLE)跳过明细", header_fields, rows, output_path)
+
+
 def export_column_identity_detail(
     mismatched_items: List[Tuple[str, str, Set[str], Set[str], List[Tuple[str, int, int, int, str]], List[Tuple[str, str, str, str]]]],
     report_dir: Path,
@@ -37041,6 +37486,29 @@ def export_column_identity_detail(
     if not rows:
         return None
     return write_pipe_report("列 identity 差异明细", header_fields, rows, output_path)
+
+
+def export_column_identity_option_detail(
+    mismatched_items: List[Tuple[str, str, Set[str], Set[str], List[Tuple[str, int, int, int, str]], List[Tuple[str, str, str, str]]]],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not mismatched_items or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"column_identity_option_detail_{report_timestamp}.txt"
+    header_fields = ["TABLE", "COLUMN", "SRC_OPTIONS", "TGT_OPTIONS", "EXPECTED", "ACTION"]
+    rows: List[List[str]] = []
+    for obj_type, tgt_name, _missing, _extra, _length_mismatches, type_mismatches in mismatched_items:
+        if (obj_type or "").upper() != "TABLE":
+            continue
+        if "获取失败" in tgt_name:
+            continue
+        for col, src_type, tgt_type, expected_type, issue_type in type_mismatches:
+            if issue_type == "identity_option_mismatch":
+                rows.append([tgt_name, col, src_type, tgt_type, expected_type, "REVIEW_IDENTITY_OPTIONS"])
+    if not rows:
+        return None
+    return write_pipe_report("列 identity 细项差异明细", header_fields, rows, output_path)
 
 
 def export_column_order_mismatch_detail(
@@ -39789,8 +40257,9 @@ def _build_report_detail_rows(
         for row in unsupported_rows:
             src_schema, src_name = parse_full_object_name(row.src_full) or ("", "")
             tgt_schema, tgt_name = parse_full_object_name(row.tgt_full) or ("", "")
+            report_type = support_state_to_report_type(row.support_state)
             _push({
-                "report_type": "UNSUPPORTED",
+                "report_type": report_type,
                 "object_type": row.obj_type,
                 "source_schema": src_schema,
                 "source_name": src_name,
@@ -40124,7 +40593,7 @@ def _build_report_detail_item_rows(
             + (support_summary.extra_missing_rows or [])
             + (support_summary.unsupported_rows or [])
         ):
-            report_type = "MISSING" if row.support_state == SUPPORT_STATE_SUPPORTED else "UNSUPPORTED"
+            report_type = support_state_to_report_type(row.support_state)
             src_schema, src_name = _split_full(row.src_full)
             tgt_schema, tgt_name = _split_full(row.tgt_full)
             base = {
@@ -40639,10 +41108,16 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "TABLE_PRESENCE_DETAIL"
     if name.startswith("column_nullability_detail_"):
         return "COLUMN_NULLABILITY_DETAIL"
+    if name.startswith("column_visibility_skipped_detail_"):
+        return "COLUMN_VISIBILITY_SKIPPED_DETAIL"
     if name.startswith("column_default_detail_"):
         return "COLUMN_DEFAULT_DETAIL"
+    if name.startswith("column_default_on_null_detail_"):
+        return "COLUMN_DEFAULT_ON_NULL_DETAIL"
     if name.startswith("column_identity_detail_"):
         return "COLUMN_IDENTITY_DETAIL"
+    if name.startswith("column_identity_option_detail_"):
+        return "COLUMN_IDENTITY_OPTION_DETAIL"
     if name.startswith("dependency_chains_"):
         return "DEPENDENCY_CHAINS"
     if name.startswith("VIEWs_chain_"):
@@ -40726,7 +41201,10 @@ def _infer_artifact_status(
         "TRIGGER_VIEW_REFERENCE_DETAIL",
         "TRIGGER_NON_TABLE_DETAIL",
         "COLUMN_NULLABILITY_DETAIL",
+        "COLUMN_VISIBILITY_SKIPPED_DETAIL",
         "COLUMN_IDENTITY_DETAIL",
+        "COLUMN_IDENTITY_OPTION_DETAIL",
+        "COLUMN_DEFAULT_ON_NULL_DETAIL",
         "COLUMN_DEFAULT_DETAIL",
         "OBJECTS_AFTER_CUTOFF_DETAIL",
         "CASE_SENSITIVE_IDENTIFIER_DETAIL",
@@ -42307,7 +42785,7 @@ SELECT d.report_id,
        d.status,
        d.reason
   FROM {detail} d
- WHERE d.report_type = 'UNSUPPORTED'
+ WHERE d.report_type = 'RISKY'
    AND d.status = 'RISKY'
    AND EXISTS (
        SELECT 1 FROM {summary} s
@@ -44043,6 +44521,22 @@ def print_final_report(
         for _col, _src_type, _tgt_type, _expected_type, issue_type in (type_mismatches or [])
         if issue_type in {"identity_missing", "identity_mode_mismatch", "identity_unexpected"}
     )
+    column_identity_option_issue_cnt = sum(
+        1
+        for obj_type, _tgt_name, _missing, _extra, _length_mismatches, type_mismatches
+        in (tv_results.get("mismatched", []) or [])
+        if (obj_type or "").upper() == "TABLE"
+        for _col, _src_type, _tgt_type, _expected_type, issue_type in (type_mismatches or [])
+        if issue_type in {"identity_option_mismatch"}
+    )
+    column_default_on_null_issue_cnt = sum(
+        1
+        for obj_type, _tgt_name, _missing, _extra, _length_mismatches, type_mismatches
+        in (tv_results.get("mismatched", []) or [])
+        if (obj_type or "").upper() == "TABLE"
+        for _col, _src_type, _tgt_type, _expected_type, issue_type in (type_mismatches or [])
+        if issue_type in {"default_on_null_missing", "default_on_null_unexpected"}
+    )
     column_default_issue_cnt = sum(
         1
         for obj_type, _tgt_name, _missing, _extra, _length_mismatches, type_mismatches
@@ -44052,6 +44546,7 @@ def print_final_report(
         if issue_type in {"default_missing", "default_mismatch", "default_extra"}
     )
     skipped_count = len(tv_results.get('skipped', []))
+    visibility_skipped_cnt = len(tv_results.get("visibility_skipped", []) or [])
     remap_conflicts = tv_results.get('remap_conflicts', [])
     remap_conflict_cnt = len(remap_conflicts)
     extraneous_count = len(tv_results['extraneous'])
@@ -44819,8 +45314,14 @@ def print_final_report(
                 )
                 if column_nullability_issue_cnt:
                     detail_hint_lines.append(f"列空值语义差异明细: column_nullability_detail_{report_ts}.txt")
+                if visibility_skipped_cnt:
+                    detail_hint_lines.append(f"列可见性(INVISIBLE)跳过明细: column_visibility_skipped_detail_{report_ts}.txt")
                 if column_identity_issue_cnt:
                     detail_hint_lines.append(f"列 identity 差异明细: column_identity_detail_{report_ts}.txt")
+                if column_identity_option_issue_cnt:
+                    detail_hint_lines.append(f"列 identity 细项差异明细: column_identity_option_detail_{report_ts}.txt")
+                if column_default_on_null_issue_cnt:
+                    detail_hint_lines.append(f"列 DEFAULT ON NULL 差异明细: column_default_on_null_detail_{report_ts}.txt")
                 if column_default_issue_cnt:
                     detail_hint_lines.append(f"列默认值差异明细: column_default_detail_{report_ts}.txt")
             if column_order_mismatch_cnt and report_ts:
@@ -45154,7 +45655,7 @@ def print_final_report(
                             details.append(
                                 f"    - {col}: 源={src_type}, 目标={tgt_type}, 期望={expected_type} ({issue_type}, review-first)\n"
                             )
-                        elif issue_type in ("identity_missing", "identity_mode_mismatch", "identity_unexpected"):
+                        elif issue_type in ("identity_missing", "identity_mode_mismatch", "identity_option_mismatch", "identity_unexpected"):
                             details.append(
                                 f"    - {col}: 源={src_type}, 目标={tgt_type}, 期望={expected_type} ({issue_type}, review-first)\n"
                             )
@@ -45860,7 +46361,10 @@ def print_final_report(
         skipped_detail_path = None
         mismatched_tables_path = None
         column_nullability_detail_path = None
+        column_visibility_skipped_detail_path = None
         column_identity_detail_path = None
+        column_identity_option_detail_path = None
+        column_default_on_null_detail_path = None
         column_default_detail_path = None
         column_order_mismatch_path = None
         comment_mismatch_path = None
@@ -45902,7 +46406,22 @@ def print_final_report(
                 report_path.parent,
                 report_ts
             )
+            column_visibility_skipped_detail_path = export_column_visibility_skipped_detail(
+                tv_results.get("visibility_skipped", []) or [],
+                report_path.parent,
+                report_ts
+            )
             column_identity_detail_path = export_column_identity_detail(
+                tv_results.get("mismatched", []),
+                report_path.parent,
+                report_ts
+            )
+            column_identity_option_detail_path = export_column_identity_option_detail(
+                tv_results.get("mismatched", []),
+                report_path.parent,
+                report_ts
+            )
+            column_default_on_null_detail_path = export_column_default_on_null_detail(
                 tv_results.get("mismatched", []),
                 report_path.parent,
                 report_ts
@@ -45963,9 +46482,27 @@ def print_final_report(
         )
         _add_index_entry(
             "DETAIL",
+            column_visibility_skipped_detail_path,
+            visibility_skipped_cnt or None,
+            "列可见性(INVISIBLE)跳过明细"
+        )
+        _add_index_entry(
+            "DETAIL",
             column_identity_detail_path,
             column_identity_issue_cnt or None,
             "列 identity 差异明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            column_identity_option_detail_path,
+            column_identity_option_issue_cnt or None,
+            "列 identity 细项差异明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            column_default_on_null_detail_path,
+            column_default_on_null_issue_cnt or None,
+            "列 DEFAULT ON NULL 差异明细"
         )
         _add_index_entry(
             "DETAIL",
@@ -46118,8 +46655,14 @@ def print_final_report(
                 log.info("表列不匹配明细已输出到: %s", mismatched_tables_path)
             if column_nullability_detail_path:
                 log.info("列空值语义差异明细已输出到: %s", column_nullability_detail_path)
+            if column_visibility_skipped_detail_path:
+                log.info("列可见性(INVISIBLE)跳过明细已输出到: %s", column_visibility_skipped_detail_path)
             if column_identity_detail_path:
                 log.info("列 identity 差异明细已输出到: %s", column_identity_detail_path)
+            if column_identity_option_detail_path:
+                log.info("列 identity 细项差异明细已输出到: %s", column_identity_option_detail_path)
+            if column_default_on_null_detail_path:
+                log.info("列 DEFAULT ON NULL 差异明细已输出到: %s", column_default_on_null_detail_path)
             if column_default_detail_path:
                 log.info("列默认值差异明细已输出到: %s", column_default_detail_path)
             if column_order_mismatch_path:
@@ -46793,6 +47336,7 @@ def main():
             "mismatched": [],
             "ok": [],
             "skipped": [],
+            "visibility_skipped": [],
             "column_order_mismatched": [],
             "column_order_skipped": [],
             "remap_conflicts": remap_conflict_items,

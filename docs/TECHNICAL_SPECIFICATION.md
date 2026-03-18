@@ -84,7 +84,10 @@
 - 现有列 `NULLABLE` / `NOT NULL` 语义漂移校验（按列语义处理，不依赖系统命名 `SYS_C... IS NOT NULL` 约束名）
 - 覆盖系统命名 `SYS_C... IS NOT NULL` 且 `ENABLED + NOT VALIDATED` 的 `NOT NULL ENABLE NOVALIDATE` 语义补位；该类进入 `TABLE mismatch`，并在 `table_alter` 中默认输出可执行 `ADD CONSTRAINT ... ENABLE NOVALIDATE`，同时保留严格 `NOT NULL` 的 review-first 注释
 - 普通 `NOT NULL` 收紧默认采用 `plain_not_null_fixup_mode=runnable_if_no_nulls`；会先探测目标端是否存在 `NULL`，仅无 `NULL` 时输出可执行 `MODIFY ... NOT NULL`，否则继续保留注释
+- 当 `column_visibility_policy=auto` 且两端 `INVISIBLE_COLUMN` 元数据不完整时，不改变 compare/fixup 结论，但会输出独立 `column_visibility_skipped_detail` 说明本轮跳过范围
 - identity 列模式差异校验（`GENERATED ALWAYS` / `BY DEFAULT` / `BY DEFAULT ON NULL`），以 TABLE DDL 提取为主，不只依赖 `IDENTITY_COLUMN`
+- 当 identity 模式一致时，还会比较稳定细项子集 `START WITH / INCREMENT BY / CACHE`，并输出独立 `column_identity_option_detail`；首版仅 review-first，不生成 runnable identity SQL
+- `DEFAULT ON NULL` 语义漂移校验采用字典 + TABLE DDL 兜底提取；支持双向 compare，并输出独立 `column_default_on_null_detail`
 - 现有列 `DATA_DEFAULT` 语义漂移校验（按列语义处理；`NULL` 与无默认值按等价处理）
 - OB 侧 CHAR_USED 缺失时，按 NLS_LENGTH_SEMANTICS（默认 BYTE）回退，并结合 DATA_LENGTH/CHAR_LENGTH 推断 CHAR 语义
 - LONG/LONG RAW 自动映射为 CLOB/BLOB
@@ -94,6 +97,14 @@
 - VIEW 兼容性分析：SYS.OBJ$ / X$ 系统对象视为不支持（用户自建 X$ 对象除外）
 - PUBLIC 同义词按 Oracle 语义处理（OB `__public` 归一化为 `PUBLIC`）
 - 若 SYNONYM 的终点对象不在本次迁移范围（含同义词链最终落到范围外对象），该 SYNONYM 会被分类为 `BLOCKED`，写入 unsupported/detail 报告，且不生成 normal synonym fixup DDL
+
+### 5.2.1 Report DB 语义
+- `DIFF_REPORT_DETAIL` / `DIFF_REPORT_DETAIL_ITEM` 对支持性分类采用：
+  - `SUPPORTED -> report_type='MISSING'`
+  - `UNSUPPORTED/BLOCKED -> report_type='UNSUPPORTED'`
+  - `RISKY -> report_type='RISKY'`
+- `DIFF_REPORT_ACTIONS_V` 会把 `report_type='RISKY'` 归类到 `REVIEW`
+- 文本主报告与 `unsupported_objects_detail_*.txt` 仍保持“缺失(不支持/阻断/待确认)”聚合口径，不单独拆出主报告 `RISKY` 计数列
 
 ### 5.3 PACKAGE / PACKAGE BODY
 - 有效性校验（`DBA_ERRORS` 摘要）
@@ -113,8 +124,18 @@
 
 ### 5.7 TRIGGER
 - 目标存在性 + 触发事件与状态
+- 触发器头部 remap 兼容 `CREATE OR REPLACE [NON]EDITIONABLE TRIGGER`
+- `trigger_qualify_schema=false` 的 legacy 最小 remap 分支同样兼容该头部，至少保证 `ON <table>` remap 不受影响
+- `ON <table>` 目标表 remap 与事件头保护解耦，避免将关键字 `ON/OR` 误当对象名补 schema
 
-### 5.8 对象可用性（可选）
+### 5.8 PROCEDURE/FUNCTION/PACKAGE/TYPE
+- 非 TRIGGER 的 PL/SQL 对象继续使用 `remap_plsql_object_references()`
+- 已限定 `SCHEMA.OBJECT` 引用支持：
+  - 双引号形式 `"SCHEMA"."OBJECT"`
+  - 对象名带 `$` / `#`
+- 注释与字符串字面量仍通过 `SqlMasker` 保护，不参与该类 remap
+
+### 5.9 对象可用性（可选）
 - VIEW/SYNONYM 可用性校验：`SELECT * FROM <obj> WHERE 1=2`
 - 支持源端对照（判断预期不可用）、超时保护与并发执行
 - 明细输出根因与建议（依赖缺失/权限不足/不支持阻断），与依赖链/不支持分类联动
@@ -141,7 +162,8 @@
 
 ### 7.1 DDL 获取
 - dbcat（批量导出）
-- DBMS_METADATA（VIEW 兜底）
+- DBMS_METADATA（VIEW 兜底；TRIGGER 缺失 dbcat 时亦可回退）
+- `dbcat_output/cache/` 扁平缓存优先按实际对象文件命中；若 `cache/index.json` 漏项但文件存在，运行时会自动修复索引并继续使用 cache
 
 ### 7.2 DDL 清洗与兼容
 - Hint 策略过滤
@@ -207,6 +229,7 @@
 - 大部分逻辑在内存执行，避免高频 DB 访问。
 - 可配置超时与并发线程数。
 - dbcat 输出缓存复用，减少重复扫描。
+- 扁平 cache 索引漏项不会再直接导致 metadata fallback；对象文件存在时会自修复 `cache/index.json`。
 - `table_data_presence_check=auto` 对 `NUM_ROWS=0` 会做二次探针确认，降低统计信息滞后造成的误判。
 - `table_data_presence_zero_probe_workers` 控制 Oracle 零行探针并发（默认 1，最大 32）。
 

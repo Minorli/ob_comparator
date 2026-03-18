@@ -23,6 +23,7 @@
 
 ## 新增能力总览（按模块）
 - **报告入库**：`report_to_db` 支持 `summary/core/full` 多级落库与行化明细，支持数据库侧直接排查（含 HOW TO SQL 手册）。
+  `DIFF_REPORT_DETAIL` / `DIFF_REPORT_DETAIL_ITEM` 现在会保留 `RISKY` 作为独立 `report_type`；但主报告与 `unsupported_objects_detail_<ts>.txt` 仍继续按“缺失(不支持/阻断/待确认)”汇总展示。
 - **迁移聚焦报告**：按“可修补缺失 vs 不支持/阻断”拆分，保留全量明细并可在主报告快速定位。
 - **可用性校验**：支持 VIEW/SYNONYM 查询可用性检查（`WHERE 1=2`）与根因输出。
 - **表数据风险校验**：`table_data_presence_check` 识别“源端有数据、目标空表”风险；`auto` 为统计口径，`on` 为严格回表。
@@ -103,6 +104,8 @@ java_home = /usr/lib/jvm/java-11
 ```
 完整配置说明见 `readme_config.txt`。
 
+`dbcat_output/cache/` 扁平缓存以实际对象文件为准；如果 `cache/index.json` 漏项，但对应 `SCHEMA/TYPE/OBJ.sql` 存在，主程序会继续命中该缓存并自动修复索引。
+
 ### 3) 运行对比
 ```bash
 python3 schema_diff_reconciler.py
@@ -146,6 +149,8 @@ python3 -m py_compile $(git ls-files '*.py')
 - **显式规则优先级最高**，未写规则的对象按默认推导。
 - **TABLE 必须显式**：表的 remap 建议只写表规则。
 - **VIEW/MVIEW/TRIGGER/PACKAGE** 默认保持原 schema，需显式 remap 才改。
+- **TRIGGER 头兼容**：即使源端 DDL 来自 `DBMS_METADATA`，带 `EDITIONABLE/NONEDITIONABLE TRIGGER` 头，也会正确 remap `ON <table>`，不会把关键字 `ON` 误改成对象名；`trigger_qualify_schema=false` 的 legacy 最小 remap 模式也兼容该头部。
+- **非 TRIGGER 的 PL/SQL qualified ref**：`PROCEDURE/FUNCTION/PACKAGE/TYPE` 中已写成 `SCHEMA.OBJECT` 的引用，若对象名带双引号或带 `$` / `#`，也会按 remap 正常改写。
 - **INDEX/CONSTRAINT/SEQUENCE** 默认跟随父表。
 - **PROCEDURE/FUNCTION/TYPE/SYNONYM** 可通过依赖推导目标 schema。
 
@@ -221,8 +226,11 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/unsupported_objects_detail_<ts>.txt`：不支持/阻断对象明细（report_detail_mode=split）
 - `main_reports/run_<ts>/extra_mismatch_detail_<ts>.txt`：扩展对象差异明细（report_detail_mode=split）
 - `main_reports/run_<ts>/column_nullability_detail_<ts>.txt`：现有列空值语义差异明细（含 `NOT NULL`、`NOT NULL ENABLE NOVALIDATE` 与反向漂移；其中 `ENABLE NOVALIDATE` 补位会在 `table_alter` 中默认输出可执行约束 SQL）
+- `main_reports/run_<ts>/column_visibility_skipped_detail_<ts>.txt`：`column_visibility_policy=auto` 且 `INVISIBLE_COLUMN` 元数据不完整时的跳过明细，说明哪些表本轮未做 INVISIBLE compare/fixup
 - 普通 `NOT NULL` 收紧默认改为 `plain_not_null_fixup_mode=runnable_if_no_nulls`：先探测目标端是否存在 `NULL`，仅无 `NULL` 时输出可执行 `MODIFY ... NOT NULL`；如需恢复纯 review-first，可改回 `review_only`
 - `main_reports/run_<ts>/column_identity_detail_<ts>.txt`：现有列 identity 差异明细（含 `ALWAYS / BY DEFAULT / BY DEFAULT ON NULL` 模式差异；首版为 review-first）
+- `main_reports/run_<ts>/column_identity_option_detail_<ts>.txt`：现有列 identity 细项差异明细（首批覆盖 `START WITH / INCREMENT BY / CACHE`；仅在 identity 模式一致时比较，首版为 review-first）
+- `main_reports/run_<ts>/column_default_on_null_detail_<ts>.txt`：现有列 `DEFAULT ON NULL` 语义差异明细（双向 compare；首版为 review-first）
 - `main_reports/run_<ts>/column_default_detail_<ts>.txt`：现有列默认值差异明细（仅列级语义，不等同 `DEFAULT ON NULL`）
 - `main_reports/run_<ts>/dependency_detail_<ts>.txt`：依赖差异明细（report_detail_mode=split）
 - `*_detail_*.txt` 明细文件采用 `|` 分隔，并包含 `# total/# 字段说明` 头，格式与 `package_compare` 一致，便于 Excel 直接分隔导入。
