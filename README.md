@@ -221,6 +221,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/unsupported_objects_detail_<ts>.txt`：不支持/阻断对象明细（report_detail_mode=split）
 - `main_reports/run_<ts>/extra_mismatch_detail_<ts>.txt`：扩展对象差异明细（report_detail_mode=split）
 - `main_reports/run_<ts>/column_nullability_detail_<ts>.txt`：现有列空值语义差异明细（含 `NOT NULL`、`NOT NULL ENABLE NOVALIDATE` 与反向漂移；其中 `ENABLE NOVALIDATE` 补位会在 `table_alter` 中默认输出可执行约束 SQL）
+- 普通 `NOT NULL` 收紧默认改为 `plain_not_null_fixup_mode=runnable_if_no_nulls`：先探测目标端是否存在 `NULL`，仅无 `NULL` 时输出可执行 `MODIFY ... NOT NULL`；如需恢复纯 review-first，可改回 `review_only`
 - `main_reports/run_<ts>/column_identity_detail_<ts>.txt`：现有列 identity 差异明细（含 `ALWAYS / BY DEFAULT / BY DEFAULT ON NULL` 模式差异；首版为 review-first）
 - `main_reports/run_<ts>/column_default_detail_<ts>.txt`：现有列默认值差异明细（仅列级语义，不等同 `DEFAULT ON NULL`）
 - `main_reports/run_<ts>/dependency_detail_<ts>.txt`：依赖差异明细（report_detail_mode=split）

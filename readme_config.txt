@@ -229,6 +229,13 @@
 - job_schedule_fixup_mode：JOB/SCHEDULE 修补模式。默认：manual。
   可选值：manual（保持人工处理，不生成缺失脚本）、semi_auto（当源端 DDL 缺失时输出草案模板到 `fixup_scripts/unsupported/job|schedule/`）。
   说明：semi_auto 仅提供人工补录模板，不改变 JOB/SCHEDULE 的“不支持自动修补”统计口径。
+- plain_not_null_fixup_mode：普通 `NULLABLE -> NOT NULL` 收紧输出模式。默认：runnable_if_no_nulls。
+  可选值：
+  review_only（保持 `table_alter` 中的 review-first 注释）、
+  runnable_if_no_nulls（先探测目标端该列是否存在 NULL；仅无 NULL 时输出可执行 `MODIFY ... NOT NULL`；默认）、
+  force_runnable（直接输出可执行 `MODIFY ... NOT NULL`，跳过目标端 NULL 门禁，高风险）。
+  说明：该开关仅影响普通 `NOT NULL` 收紧，不影响 `NOT NULL ENABLE NOVALIDATE`、`DEFAULT` 或 `DROP COLUMN`。
+  说明：`runnable_if_no_nulls` 使用目标端实时探测；若探测失败或发现 NULL，DDL 会继续保留注释并在脚本中写出门禁说明。
 - fixup_idempotent_mode：修补脚本幂等模式。默认：replace。
   可选值：off（不处理）、replace（CREATE OR REPLACE）、guard（存在则跳过创建）、drop_create（存在则 DROP 再创建）。
 - fixup_idempotent_types：幂等模式作用对象类型（逗号分隔）。默认：空（使用安全默认集）。

@@ -207,6 +207,11 @@ fixup_types             =
 #   manual    -> 仅标记不支持，不生成脚本（默认）
 #   semi_auto -> 当源端 DDL 缺失时，生成草案模板到 fixup_scripts/unsupported/job|schedule/
 job_schedule_fixup_mode = manual
+# 普通 NOT NULL 收紧输出模式：
+#   review_only         -> 保持 review-first 注释
+#   runnable_if_no_nulls-> 先探测目标端该列是否存在 NULL；仅无 NULL 时输出可执行 MODIFY ... NOT NULL（默认）
+#   force_runnable      -> 直接输出可执行 MODIFY ... NOT NULL（高风险）
+plain_not_null_fixup_mode = runnable_if_no_nulls
 # 修补脚本幂等模式（避免重复执行失败）
 #   off         -> 不处理（默认）
 #   replace     -> 对支持的对象类型使用 CREATE OR REPLACE

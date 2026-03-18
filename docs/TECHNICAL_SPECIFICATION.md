@@ -83,6 +83,7 @@
 - VARCHAR/VARCHAR2 长度窗口校验
 - 现有列 `NULLABLE` / `NOT NULL` 语义漂移校验（按列语义处理，不依赖系统命名 `SYS_C... IS NOT NULL` 约束名）
 - 覆盖系统命名 `SYS_C... IS NOT NULL` 且 `ENABLED + NOT VALIDATED` 的 `NOT NULL ENABLE NOVALIDATE` 语义补位；该类进入 `TABLE mismatch`，并在 `table_alter` 中默认输出可执行 `ADD CONSTRAINT ... ENABLE NOVALIDATE`，同时保留严格 `NOT NULL` 的 review-first 注释
+- 普通 `NOT NULL` 收紧默认采用 `plain_not_null_fixup_mode=runnable_if_no_nulls`；会先探测目标端是否存在 `NULL`，仅无 `NULL` 时输出可执行 `MODIFY ... NOT NULL`，否则继续保留注释
 - identity 列模式差异校验（`GENERATED ALWAYS` / `BY DEFAULT` / `BY DEFAULT ON NULL`），以 TABLE DDL 提取为主，不只依赖 `IDENTITY_COLUMN`
 - 现有列 `DATA_DEFAULT` 语义漂移校验（按列语义处理；`NULL` 与无默认值按等价处理）
 - OB 侧 CHAR_USED 缺失时，按 NLS_LENGTH_SEMANTICS（默认 BYTE）回退，并结合 DATA_LENGTH/CHAR_LENGTH 推断 CHAR 语义

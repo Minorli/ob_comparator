@@ -3774,6 +3774,23 @@ JOB_SCHEDULE_FIXUP_MODE_ALIASES = {
     "semi-auto": "semi_auto",
     "semiauto": "semi_auto",
 }
+PLAIN_NOT_NULL_FIXUP_MODE_VALUES = {"review_only", "runnable_if_no_nulls", "force_runnable"}
+PLAIN_NOT_NULL_FIXUP_MODE_ALIASES = {
+    "off": "review_only",
+    "false": "review_only",
+    "0": "review_only",
+    "review": "review_only",
+    "comment": "review_only",
+    "on": "runnable_if_no_nulls",
+    "true": "runnable_if_no_nulls",
+    "1": "runnable_if_no_nulls",
+    "safe": "runnable_if_no_nulls",
+    "guarded": "runnable_if_no_nulls",
+    "probe": "runnable_if_no_nulls",
+    "force": "force_runnable",
+    "runnable": "force_runnable",
+    "uncomment": "force_runnable",
+}
 FIXUP_EXEC_MODE_VALUES = {"auto", "file", "statement"}
 FIXUP_EXEC_MODE_ALIASES = {
     "single": "file",
@@ -3865,6 +3882,17 @@ def normalize_job_schedule_fixup_mode(raw_value: Optional[str]) -> str:
     if value not in JOB_SCHEDULE_FIXUP_MODE_VALUES:
         log.warning("job_schedule_fixup_mode=%s 不在支持范围内，将回退为 manual。", raw_value)
         return "manual"
+    return value
+
+
+def normalize_plain_not_null_fixup_mode(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "runnable_if_no_nulls"
+    value = str(raw_value).strip().lower()
+    value = PLAIN_NOT_NULL_FIXUP_MODE_ALIASES.get(value, value)
+    if value not in PLAIN_NOT_NULL_FIXUP_MODE_VALUES:
+        log.warning("plain_not_null_fixup_mode=%s 不在支持范围内，将回退为 runnable_if_no_nulls。", raw_value)
+        return "runnable_if_no_nulls"
     return value
 
 
@@ -5074,6 +5102,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('fixup_schemas', '')
         settings.setdefault('fixup_types', '')
         settings.setdefault('job_schedule_fixup_mode', 'manual')
+        settings.setdefault('plain_not_null_fixup_mode', 'runnable_if_no_nulls')
         settings.setdefault('fixup_idempotent_mode', 'replace')
         settings.setdefault('fixup_idempotent_types', '')
         settings.setdefault('fixup_auto_grant', 'true')
@@ -5495,6 +5524,13 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings['job_schedule_fixup_mode'] = normalize_job_schedule_fixup_mode(
             settings.get('job_schedule_fixup_mode', 'manual')
         )
+        settings['plain_not_null_fixup_mode'] = normalize_plain_not_null_fixup_mode(
+            settings.get('plain_not_null_fixup_mode', 'runnable_if_no_nulls')
+        )
+        if settings['plain_not_null_fixup_mode'] == "force_runnable":
+            log.warning(
+                "plain_not_null_fixup_mode=force_runnable：普通 NOT NULL 修补将跳过目标端 NULL 门禁，请确认执行风险。"
+            )
         settings['fixup_idempotent_mode'] = normalize_fixup_idempotent_mode(
             settings.get('fixup_idempotent_mode', 'replace')
         )
@@ -5988,6 +6024,14 @@ def run_config_wizard(config_path: Path) -> None:
         if normalized in JOB_SCHEDULE_FIXUP_MODE_VALUES:
             return True, ""
         return False, "仅支持 manual/semi_auto"
+
+    def _validate_plain_not_null_fixup_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = PLAIN_NOT_NULL_FIXUP_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in PLAIN_NOT_NULL_FIXUP_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 review_only/runnable_if_no_nulls/force_runnable"
 
     def _validate_config_hot_reload_mode(val: str) -> Tuple[bool, str]:
         if not val.strip():
@@ -6640,6 +6684,14 @@ def run_config_wizard(config_path: Path) -> None:
         default=cfg.get("SETTINGS", "job_schedule_fixup_mode", fallback="manual"),
         validator=_validate_job_schedule_fixup_mode,
         transform=normalize_job_schedule_fixup_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "plain_not_null_fixup_mode",
+        "普通 NOT NULL 收紧输出模式 (review_only/runnable_if_no_nulls/force_runnable)",
+        default=cfg.get("SETTINGS", "plain_not_null_fixup_mode", fallback="runnable_if_no_nulls"),
+        validator=_validate_plain_not_null_fixup_mode,
+        transform=normalize_plain_not_null_fixup_mode,
     )
     _prompt_field(
         "SETTINGS",
@@ -11567,6 +11619,73 @@ def obclient_run_sql(
     except Exception as e:
         log.error(f"严重错误: 执行 subprocess 时发生未知错误: {e}")
         return False, "", str(e)
+
+
+def probe_target_plain_not_null_columns(
+    ob_cfg: ObConfig,
+    tgt_schema: str,
+    tgt_table: str,
+    columns: List[str],
+    timeout: Optional[int] = None,
+) -> Dict[str, Tuple[Optional[bool], str]]:
+    """
+    探测目标端指定列是否存在 NULL 数据。
+
+    返回:
+      {COLUMN: (has_null, reason)}
+      - has_null=True  : 目标端存在 NULL
+      - has_null=False : 未探测到 NULL
+      - has_null=None  : 探测失败或结果不完整，reason 记录原因
+    """
+    ordered_columns: List[str] = []
+    seen: Set[str] = set()
+    for col in columns or []:
+        col_u = normalize_identifier_name(col)
+        if not col_u or col_u in seen:
+            continue
+        seen.add(col_u)
+        ordered_columns.append(col_u)
+    if not ordered_columns:
+        return {}
+
+    table_full = quote_qualified_parts(tgt_schema.upper(), tgt_table.upper())
+    union_parts: List[str] = []
+    for col_u in ordered_columns:
+        literal = col_u.replace("'", "''")
+        col_ident = quote_identifier(col_u)
+        union_parts.append(
+            "SELECT '{col}' AS COLUMN_NAME, "
+            "CASE WHEN EXISTS (SELECT 1 FROM {table_full} WHERE {col_ident} IS NULL AND ROWNUM = 1) "
+            "THEN 'Y' ELSE 'N' END AS HAS_NULL FROM DUAL".format(
+                col=literal,
+                table_full=table_full,
+                col_ident=col_ident,
+            )
+        )
+    sql = "\nUNION ALL\n".join(union_parts)
+    ok, out, err = obclient_run_sql(ob_cfg, sql, timeout=timeout, quiet_error=True)
+    if not ok:
+        reason = normalize_error_text(err) or "probe_failed"
+        return {col_u: (None, reason) for col_u in ordered_columns}
+
+    results: Dict[str, Tuple[Optional[bool], str]] = {}
+    for raw in (out or "").splitlines():
+        parts = raw.split("\t")
+        if len(parts) < 2:
+            continue
+        col_u = normalize_identifier_name(parts[0])
+        marker = (parts[1] or "").strip().upper()
+        if not col_u:
+            continue
+        if marker == "Y":
+            results[col_u] = (True, "")
+        elif marker == "N":
+            results[col_u] = (False, "")
+
+    for col_u in ordered_columns:
+        if col_u not in results:
+            results[col_u] = (None, "probe_incomplete")
+    return results
 
 
 def _collect_identity_candidate_tables(
@@ -29761,7 +29880,9 @@ def generate_alter_for_table_columns(
     extra_cols: Set[str],
     length_mismatches: List[ColumnLengthIssue],
     type_mismatches: List[ColumnTypeIssue],
-    drop_sys_c_columns: bool = False
+    drop_sys_c_columns: bool = False,
+    plain_not_null_fixup_mode: str = "runnable_if_no_nulls",
+    plain_not_null_probe_results: Optional[Dict[str, Tuple[Optional[bool], str]]] = None,
 ) -> Optional[str]:
     """
     为一个具体的表生成 ALTER TABLE 脚本：
@@ -29782,6 +29903,12 @@ def generate_alter_for_table_columns(
     tgt_schema_u = tgt_schema.upper()
     tgt_table_u = tgt_table.upper()
     table_full = quote_qualified_parts(tgt_schema_u, tgt_table_u)
+    plain_not_null_mode = normalize_plain_not_null_fixup_mode(plain_not_null_fixup_mode)
+    plain_not_null_probe_results = {
+        normalize_identifier_name(col): value
+        for col, value in (plain_not_null_probe_results or {}).items()
+        if normalize_identifier_name(col)
+    }
     src_notnull_novalidate_cols = build_system_notnull_novalidate_column_map(
         oracle_meta.constraints.get((src_schema.upper(), src_table.upper()), {})
     )
@@ -29942,16 +30069,47 @@ def generate_alter_for_table_columns(
                     info,
                     prefer_ob_varchar=True
                 )
-                lines.append(
-                    f"-- REVIEW-FIRST: {col_name.upper()} 源端为 NOT NULL，目标端仍为可空。"
-                )
-                lines.append(
-                    f"-- 建议先确认目标端是否存在 NULL 数据，再决定是否执行："
-                )
-                lines.append(
-                    f"-- ALTER TABLE {table_full} "
+                alter_stmt = (
+                    f"ALTER TABLE {table_full} "
                     f"MODIFY ({col_name.upper()} {review_type} NOT NULL);"
                 )
+                probe_has_null: Optional[bool] = None
+                probe_reason = ""
+                if col_name.upper() in plain_not_null_probe_results:
+                    probe_has_null, probe_reason = plain_not_null_probe_results.get(col_name.upper(), (None, ""))
+                if plain_not_null_mode == "force_runnable":
+                    lines.append(
+                        f"-- WARNING: {col_name.upper()} 源端为 NOT NULL，plain_not_null_fixup_mode=force_runnable，未执行目标端 NULL 门禁。"
+                    )
+                    lines.append(alter_stmt)
+                elif plain_not_null_mode == "runnable_if_no_nulls":
+                    if probe_has_null is False:
+                        lines.append(
+                            f"-- AUTO-GUARD: {col_name.upper()} 目标端未探测到 NULL，已输出可执行 NOT NULL 收紧 SQL。"
+                        )
+                        lines.append(alter_stmt)
+                    else:
+                        lines.append(
+                            f"-- REVIEW-FIRST: {col_name.upper()} 源端为 NOT NULL，目标端仍为可空。"
+                        )
+                        if probe_has_null is True:
+                            lines.append(
+                                f"-- AUTO-GUARD: {col_name.upper()} 目标端已探测到 NULL 数据，保持注释。"
+                            )
+                        else:
+                            reason_text = probe_reason or "probe_failed"
+                            lines.append(
+                                f"-- AUTO-GUARD: {col_name.upper()} 目标端 NULL 门禁探测失败 ({reason_text})，保持注释。"
+                            )
+                        lines.append(f"-- {alter_stmt}")
+                else:
+                    lines.append(
+                        f"-- REVIEW-FIRST: {col_name.upper()} 源端为 NOT NULL，目标端仍为可空。"
+                    )
+                    lines.append(
+                        "-- 建议先确认目标端是否存在 NULL 数据，再决定是否执行："
+                    )
+                    lines.append(f"-- {alter_stmt}")
             elif issue_type == "nullability_novalidate_tighten":
                 review_type = format_oracle_column_type(
                     info,
@@ -31177,9 +31335,16 @@ def generate_fixup_scripts(
     job_schedule_fixup_mode = normalize_job_schedule_fixup_mode(
         settings.get("job_schedule_fixup_mode", "manual")
     )
+    plain_not_null_fixup_mode = normalize_plain_not_null_fixup_mode(
+        settings.get("plain_not_null_fixup_mode", "runnable_if_no_nulls")
+    )
     job_schedule_semi_auto_enabled = (job_schedule_fixup_mode == "semi_auto")
     if job_schedule_semi_auto_enabled:
         log.info("[FIXUP] job_schedule_fixup_mode=semi_auto，JOB/SCHEDULE 缺失对象将生成半自动草案模板。")
+    if plain_not_null_fixup_mode == "runnable_if_no_nulls":
+        log.info("[FIXUP] plain_not_null_fixup_mode=runnable_if_no_nulls，普通 NOT NULL 收紧将先做目标端 NULL 门禁探测。")
+    elif plain_not_null_fixup_mode == "force_runnable":
+        log.warning("[FIXUP] plain_not_null_fixup_mode=force_runnable，普通 NOT NULL 收紧将直接输出可执行 SQL。")
     deferred_validation_rows: List[ConstraintValidateDeferredRow] = []
     deferred_validation_lock = threading.Lock()
     invalid_view_keys: Set[Tuple[str, str]] = set()
@@ -33343,6 +33508,42 @@ def generate_fixup_scripts(
                     )
                 )
                 sys_c_force_candidate_seen.add(candidate_key)
+        plain_not_null_probe_results: Dict[str, Tuple[Optional[bool], str]] = {}
+        if plain_not_null_fixup_mode == "runnable_if_no_nulls":
+            guarded_columns = sorted({
+                normalize_identifier_name(issue.column)
+                for issue in type_mismatches
+                if getattr(issue, "issue", "") == "nullability_tighten"
+            })
+            if guarded_columns:
+                plain_not_null_probe_results = probe_target_plain_not_null_columns(
+                    ob_cfg,
+                    tgt_schema,
+                    tgt_table,
+                    guarded_columns,
+                )
+                guarded_has_null = sorted(
+                    col for col, result in plain_not_null_probe_results.items()
+                    if result and result[0] is True
+                )
+                guarded_probe_failed = sorted(
+                    col for col, result in plain_not_null_probe_results.items()
+                    if not result or result[0] is None
+                )
+                if guarded_has_null:
+                    log.info(
+                        "[FIXUP] %s.%s 普通 NOT NULL 门禁探测到目标端存在 NULL 列: %s",
+                        tgt_schema,
+                        tgt_table,
+                        ",".join(guarded_has_null),
+                    )
+                if guarded_probe_failed:
+                    log.warning(
+                        "[FIXUP] %s.%s 普通 NOT NULL 门禁探测不完整，相关列将保持注释: %s",
+                        tgt_schema,
+                        tgt_table,
+                        ",".join(guarded_probe_failed),
+                    )
         alter_sql = generate_alter_for_table_columns(
             oracle_meta,
             src_schema,
@@ -33354,6 +33555,8 @@ def generate_fixup_scripts(
             length_mismatches,
             type_mismatches,
             drop_sys_c_columns=bool(settings.get("fixup_drop_sys_c_columns", False)),
+            plain_not_null_fixup_mode=plain_not_null_fixup_mode,
+            plain_not_null_probe_results=plain_not_null_probe_results,
         )
         if alter_sql:
             alter_sql = prepend_set_schema(alter_sql, tgt_schema)
@@ -45914,6 +46117,7 @@ def parse_cli_args() -> argparse.Namespace:
             fixup_schemas           仅对指定目标 schema 生成订正 SQL（逗号分隔，留空为全部）
             fixup_types             仅生成指定对象类型的订正 SQL（留空为全部，例如 TABLE,TRIGGER）
             job_schedule_fixup_mode JOB/SCHEDULE 修补模式 (manual/semi_auto)
+            plain_not_null_fixup_mode 普通 NOT NULL 收紧输出模式 (review_only/runnable_if_no_nulls/force_runnable)
             fixup_idempotent_mode   修补脚本幂等模式 (off/guard/replace/drop_create)
             fixup_idempotent_types  幂等模式作用对象类型（逗号分隔，留空用默认）
             fixup_drop_sys_c_columns 是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE (true/false)
