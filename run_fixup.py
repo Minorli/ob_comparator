@@ -1070,6 +1070,17 @@ RE_BLOCK_START = re.compile(
     re.IGNORECASE
 )
 RE_ANON_BLOCK_START = re.compile(r"^\s*(DECLARE|BEGIN)\b", re.IGNORECASE)
+RE_BLOCK_HEADER_NAME = re.compile(
+    r'^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:NON)?EDITIONABLE\s+)?'
+    r'(?:PROCEDURE|FUNCTION|PACKAGE(?:\s+BODY)?|TYPE(?:\s+BODY)?|TRIGGER)\s+'
+    r'(?P<name>(?:"[^"]+"|[A-Z0-9_$#]+)(?:\s*\.\s*(?:"[^"]+"|[A-Z0-9_$#]+))?)',
+    re.IGNORECASE
+)
+RE_BLOCK_END = re.compile(
+    r'^\s*END(?:\s+(?:"(?P<quoted>[^"]+)"|(?P<name>[A-Z0-9_$#]+)))?\s*;\s*(?:--.*)?$',
+    re.IGNORECASE
+)
+PLSQL_INNER_END_KEYWORDS = {"IF", "LOOP", "CASE", "WHILE", "FOR", "REPEAT"}
 RE_CREATE_VIEW = re.compile(
     r"^\s*CREATE\s+(OR\s+REPLACE\s+)?(FORCE\s+)?(MATERIALIZED\s+)?VIEW\b",
     re.IGNORECASE
@@ -3542,6 +3553,36 @@ def split_sql_statements(sql_text: str) -> List[str]:
     in_q_quote = False
     q_quote_end = ""
     slash_block = False
+    slash_block_end_name = ""
+
+    def _normalize_block_name(token: str) -> str:
+        text = (token or "").strip()
+        if not text:
+            return ""
+        if "." in text:
+            text = text.rsplit(".", 1)[-1].strip()
+        if text.startswith('"') and text.endswith('"') and len(text) >= 2:
+            text = text[1:-1]
+        return text.strip().upper()
+
+    def _extract_block_header_end_name(line: str) -> str:
+        match = RE_BLOCK_HEADER_NAME.match(line or "")
+        if not match:
+            return ""
+        return _normalize_block_name(match.group("name") or "")
+
+    def _is_outer_block_end(line: str, expected_name: str) -> bool:
+        match = RE_BLOCK_END.match(line or "")
+        if not match:
+            return False
+        end_name = _normalize_block_name(match.group("quoted") or match.group("name") or "")
+        if end_name and end_name in PLSQL_INNER_END_KEYWORDS:
+            return False
+        if not end_name:
+            return True
+        if expected_name:
+            return end_name == expected_name
+        return False
 
     def flush_buffer() -> None:
         statement = "".join(buffer).strip()
@@ -3552,11 +3593,13 @@ def split_sql_statements(sql_text: str) -> List[str]:
     for line in sql_text.splitlines(keepends=True):
         if not slash_block and (RE_BLOCK_START.match(line) or RE_ANON_BLOCK_START.match(line)):
             slash_block = True
+            slash_block_end_name = _extract_block_header_end_name(line)
         stripped = line.strip()
         if not in_single and not in_double and block_comment_depth == 0 and stripped == "/":
             buffer.append(line)
             flush_buffer()
             slash_block = False
+            slash_block_end_name = ""
             continue
 
         idx = 0
@@ -3632,6 +3675,18 @@ def split_sql_statements(sql_text: str) -> List[str]:
 
             buffer.append(ch)
             idx += 1
+
+        if (
+            slash_block
+            and not in_single
+            and not in_double
+            and not in_q_quote
+            and block_comment_depth == 0
+            and _is_outer_block_end(line, slash_block_end_name)
+        ):
+            slash_block = False
+            slash_block_end_name = ""
+            flush_buffer()
 
     if buffer:
         flush_buffer()
@@ -4574,6 +4629,19 @@ def write_error_report(
         )
     report_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return report_path
+
+
+def normalize_failed_path(path: Path, repo_root: Path) -> Path:
+    raw = Path(path)
+    if raw.is_absolute():
+        try:
+            return raw.resolve()
+        except Exception:
+            return raw
+    try:
+        return (repo_root / raw).resolve()
+    except Exception:
+        return repo_root / raw
 
 
 def execute_grant_file_with_prune(
@@ -6176,10 +6244,11 @@ def run_iterative_fixup(
         
         cumulative_success += round_success
         for item in round_results:
+            failed_path = normalize_failed_path(item.path, repo_root)
             if item.status in ("FAILED", "ERROR"):
-                active_failed_paths.add(item.path)
+                active_failed_paths.add(failed_path)
             else:
-                active_failed_paths.discard(item.path)
+                active_failed_paths.discard(failed_path)
         cumulative_failed = len(active_failed_paths)
         
         log_subsection(f"第 {round_num} 轮结果")

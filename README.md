@@ -237,6 +237,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `fixup_scripts/unsupported/`：不支持/阻断对象 DDL（默认不执行）
 - `fixup_scripts/view_chain_plans/`：VIEW 链路修复计划
 - `fixup_scripts/errors/`：run_fixup 错误报告
+- 若 SYNONYM 的终点对象不在本次迁移范围（含同义词链最终落到范围外对象），程序会把该 SYNONYM 标记为阻断，并写入 `unsupported_objects_detail_<ts>.txt` / `unsupported_synonym_detail_<ts>.txt`；同时不会再生成 `fixup_scripts/synonym/` DDL
 
 ## 触发器专项说明
 - 触发器中的真实对象引用会继续按现有规则做 schema 补全和 remap。

@@ -84,6 +84,7 @@ import textwrap
 import threading
 import time
 import uuid
+from types import MappingProxyType
 from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
@@ -1047,8 +1048,8 @@ class ObMetadata(NamedTuple):
     partition_key_columns: Dict[Tuple[str, str], List[str]]  # (OWNER, TABLE_NAME) -> [PARTITION_COLS...]
     case_sensitive_findings: Tuple[CaseSensitiveIdentifierFinding, ...] = ()  # case-sensitive 标识符发现
     constraint_deferrable_supported: bool = False         # 是否支持读取 DEFERRABLE/DEFERRED 元数据
-    temporary_tables: Set[Tuple[str, str]] = set()        # (OWNER, TABLE_NAME) -> target GTT / temporary tables
-    identity_modes: Dict[Tuple[str, str], Dict[str, str]] = {}  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: IDENTITY_MODE}
+    temporary_tables: frozenset[Tuple[str, str]] = frozenset()        # (OWNER, TABLE_NAME) -> target GTT / temporary tables
+    identity_modes: Dict[Tuple[str, str], Dict[str, str]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: IDENTITY_MODE}
 
 
 class OracleMetadata(NamedTuple):
@@ -1361,6 +1362,9 @@ MANUAL_FIXUP_REASON_TEXT = "当前版本不自动导出该对象类型"
 MANUAL_FIXUP_ACTION_TEXT = "人工导出并执行"
 MANUAL_FIXUP_SEMI_AUTO_ACTION_TEXT = "生成半自动草案并人工完善"
 MANUAL_FIXUP_SEMI_AUTO_DETAIL_TEXT = "若无法获取源端DDL，将输出草案模板供人工补录"
+SYNONYM_TARGET_OUT_OF_SCOPE_REASON_CODE = "SYNONYM_TARGET_OUT_OF_SCOPE"
+SYNONYM_TARGET_OUT_OF_SCOPE_REASON_TEXT = "同义词终点对象不在本次迁移范围"
+SYNONYM_TARGET_OUT_OF_SCOPE_ACTION_TEXT = "先纳入终点对象或跳过同义词"
 
 OB_FEATURE_GATE_VERSION = "4.4.2"
 INTERVAL_PARTITION_FIXUP_MODE_VALUES: Set[str] = {"auto", "true", "false"}
@@ -8245,6 +8249,8 @@ def classify_missing_objects(
         if not blocked_refs:
             root_cause_cache[node] = ""
             return ""
+        # 递归前先写入哨兵，避免 A->B->A 这类环依赖导致无限递归。
+        root_cause_cache[node] = ""
         # Prefer stable ordering for deterministic output
         for ref in sorted(blocked_refs, key=lambda n: (n[0], n[1])):
             if ref in block_source_nodes:
@@ -8363,15 +8369,31 @@ def classify_missing_objects(
                         action = "人工复核DDL"
         elif obj_type_u == "SYNONYM":
             syn_meta = synonym_meta_map.get((src_schema, src_obj))
+            terminal_target, scope_state, scope_detail = resolve_synonym_scope_status(
+                src_schema,
+                src_obj,
+                synonym_meta_map,
+                source_objects,
+                remap_rules=remap_rules,
+            )
+            if scope_state == "out_of_scope":
+                support_state = SUPPORT_STATE_BLOCKED
+                reason_code = SYNONYM_TARGET_OUT_OF_SCOPE_REASON_CODE
+                reason = SYNONYM_TARGET_OUT_OF_SCOPE_REASON_TEXT
+                dependency = terminal_target or "-"
+                action = SYNONYM_TARGET_OUT_OF_SCOPE_ACTION_TEXT
+                detail = scope_detail or "terminal_target_not_in_source_scope"
             if syn_meta and syn_meta.table_owner and syn_meta.table_name:
-                ref_full = f"{syn_meta.table_owner.upper()}.{syn_meta.table_name.upper()}"
-                if ref_full in unsupported_table_map or (ref_full, "VIEW") in unsupported_nodes:
+                ref_full = (terminal_target or f"{syn_meta.table_owner.upper()}.{syn_meta.table_name.upper()}").upper()
+                if support_state == SUPPORT_STATE_SUPPORTED and (
+                    ref_full in unsupported_table_map or (ref_full, "VIEW") in unsupported_nodes
+                ):
                     support_state = SUPPORT_STATE_BLOCKED
                     reason_code = "DEPENDENCY_UNSUPPORTED"
                     reason = "同义词指向不支持对象"
                     dependency = ref_full
                     action = "先改造依赖对象"
-                elif ref_full in invalid_full_types:
+                elif support_state == SUPPORT_STATE_SUPPORTED and ref_full in invalid_full_types:
                     support_state = SUPPORT_STATE_BLOCKED
                     reason_code = "DEPENDENCY_INVALID"
                     reason = "同义词指向无效对象"
@@ -9081,47 +9103,75 @@ def get_source_objects(
                 else:
                     synonym_owners = sorted(set(s.upper() for s in schemas_list) | {"PUBLIC"})
                 target_owners = sorted({s.upper() for s in schemas_list})
-                if target_owners:
-                    synonym_chunks = chunk_list(synonym_owners, ORACLE_IN_BATCH_SIZE)
-                    target_chunks = chunk_list(target_owners, ORACLE_IN_BATCH_SIZE)
-                    sql_tpl = """
-                        SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME
-                        FROM DBA_SYNONYMS
-                        WHERE OWNER IN ({owner_ph})
-                          AND TABLE_OWNER IN ({target_ph})
-                          AND TABLE_NAME IS NOT NULL
-                    """
-                    with connection.cursor() as cursor:
-                        for owner_chunk in synonym_chunks:
+                private_synonym_owners = [owner for owner in synonym_owners if owner != "PUBLIC"]
+                with connection.cursor() as cursor:
+                    if private_synonym_owners:
+                        private_chunks = chunk_list(private_synonym_owners, ORACLE_IN_BATCH_SIZE)
+                        private_sql_tpl = """
+                            SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME
+                            FROM DBA_SYNONYMS
+                            WHERE OWNER IN ({owner_ph})
+                              AND TABLE_NAME IS NOT NULL
+                        """
+                        for owner_chunk in private_chunks:
                             owner_ph = build_bind_placeholders(len(owner_chunk))
-                            for target_chunk in target_chunks:
-                                target_ph = build_bind_placeholders(len(target_chunk), offset=len(owner_chunk))
-                                sql = sql_tpl.format(owner_ph=owner_ph, target_ph=target_ph)
-                                cursor.execute(sql, owner_chunk + target_chunk)
-                                for row in cursor:
-                                    owner_raw = (row[0] or '').strip()
-                                    syn_name_raw = (row[1] or '').strip()
-                                    table_owner_raw = (row[2] or '').strip()
-                                    table_name_raw = (row[3] or '').strip()
-                                    if (
-                                        is_case_sensitive_identifier(owner_raw)
-                                        or is_case_sensitive_identifier(syn_name_raw)
-                                        or is_case_sensitive_identifier(table_owner_raw)
-                                        or is_case_sensitive_identifier(table_name_raw)
-                                    ):
-                                        case_sensitive_issues.add((owner_raw, syn_name_raw, "SYNONYM"))
-                                    owner = owner_raw.upper()
-                                    syn_name = syn_name_raw.upper()
-                                    table_owner = table_owner_raw.upper()
-                                    table_name = table_name_raw.upper()
-                                    if not owner or not syn_name or not table_owner or not table_name:
-                                        continue
-                                    full_name = f"{owner}.{syn_name}"
-                                    source_objects[full_name].add('SYNONYM')
-                                    if owner == 'PUBLIC':
-                                        added_public_synonyms += 1
-                                    else:
-                                        added_synonyms += 1
+                            sql = private_sql_tpl.format(owner_ph=owner_ph)
+                            cursor.execute(sql, owner_chunk)
+                            for row in cursor:
+                                owner_raw = (row[0] or '').strip()
+                                syn_name_raw = (row[1] or '').strip()
+                                table_owner_raw = (row[2] or '').strip()
+                                table_name_raw = (row[3] or '').strip()
+                                if (
+                                    is_case_sensitive_identifier(owner_raw)
+                                    or is_case_sensitive_identifier(syn_name_raw)
+                                    or is_case_sensitive_identifier(table_owner_raw)
+                                    or is_case_sensitive_identifier(table_name_raw)
+                                ):
+                                    case_sensitive_issues.add((owner_raw, syn_name_raw, "SYNONYM"))
+                                owner = owner_raw.upper()
+                                syn_name = syn_name_raw.upper()
+                                table_owner = table_owner_raw.upper()
+                                table_name = table_name_raw.upper()
+                                if not owner or not syn_name or not table_owner or not table_name:
+                                    continue
+                                full_name = f"{owner}.{syn_name}"
+                                source_objects[full_name].add('SYNONYM')
+                                added_synonyms += 1
+                    if target_owners and "PUBLIC" in synonym_owners:
+                        target_chunks = chunk_list(target_owners, ORACLE_IN_BATCH_SIZE)
+                        public_sql_tpl = """
+                            SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME
+                            FROM DBA_SYNONYMS
+                            WHERE OWNER = 'PUBLIC'
+                              AND TABLE_OWNER IN ({target_ph})
+                              AND TABLE_NAME IS NOT NULL
+                        """
+                        for target_chunk in target_chunks:
+                            target_ph = build_bind_placeholders(len(target_chunk))
+                            sql = public_sql_tpl.format(target_ph=target_ph)
+                            cursor.execute(sql, target_chunk)
+                            for row in cursor:
+                                owner_raw = (row[0] or '').strip()
+                                syn_name_raw = (row[1] or '').strip()
+                                table_owner_raw = (row[2] or '').strip()
+                                table_name_raw = (row[3] or '').strip()
+                                if (
+                                    is_case_sensitive_identifier(owner_raw)
+                                    or is_case_sensitive_identifier(syn_name_raw)
+                                    or is_case_sensitive_identifier(table_owner_raw)
+                                    or is_case_sensitive_identifier(table_name_raw)
+                                ):
+                                    case_sensitive_issues.add((owner_raw, syn_name_raw, "SYNONYM"))
+                                owner = owner_raw.upper()
+                                syn_name = syn_name_raw.upper()
+                                table_owner = table_owner_raw.upper()
+                                table_name = table_name_raw.upper()
+                                if not owner or not syn_name or not table_owner or not table_name:
+                                    continue
+                                full_name = f"{owner}.{syn_name}"
+                                source_objects[full_name].add('SYNONYM')
+                                added_public_synonyms += 1
             # 精确认定物化视图集合，避免误删真实表
             with connection.cursor() as cursor:
                 for placeholders, chunk in iter_in_chunks(schemas_list):
@@ -9341,6 +9391,7 @@ def load_synonym_metadata(
 
     allowed_targets = {s.upper() for s in (allowed_target_schemas or [])}
     owners = sorted(set(s.upper() for s in schemas_list) | {"PUBLIC"})
+    private_owners = [owner for owner in owners if owner != "PUBLIC"]
     sql_tpl = """
         SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME, DB_LINK
         FROM DBA_SYNONYMS
@@ -9359,13 +9410,47 @@ def load_synonym_metadata(
             dsn=ora_cfg['dsn']
         ) as connection:
             with connection.cursor() as cursor:
-                owner_chunks = chunk_list(owners, ORACLE_IN_BATCH_SIZE)
-                target_chunks = chunk_list(sorted(allowed_targets), ORACLE_IN_BATCH_SIZE) if allowed_targets else []
-                if not allowed_targets:
-                    for owner_chunk in owner_chunks:
-                        owner_ph = build_bind_placeholders(len(owner_chunk))
-                        sql = sql_tpl.format(owner_ph=owner_ph, target_filter="")
-                        cursor.execute(sql, owner_chunk)
+                private_chunks = chunk_list(private_owners, ORACLE_IN_BATCH_SIZE)
+                for owner_chunk in private_chunks:
+                    owner_ph = build_bind_placeholders(len(owner_chunk))
+                    sql = sql_tpl.format(owner_ph=owner_ph, target_filter="")
+                    cursor.execute(sql, owner_chunk)
+                    for row in cursor:
+                        owner = (row[0] or '').strip().upper()
+                        name = (row[1] or '').strip().upper()
+                        table_owner = (row[2] or '').strip().upper()
+                        table_name = (row[3] or '').strip().upper()
+                        db_link = (row[4] or '').strip().upper() if row[4] else None
+                        if not owner or not name or not table_name:
+                            continue
+                        key = (owner, name)
+                        result[key] = SynonymMeta(
+                            owner=owner,
+                            name=name,
+                            table_owner=table_owner,
+                            table_name=table_name,
+                            db_link=db_link
+                        )
+
+                if "PUBLIC" in owners:
+                    target_chunks = chunk_list(sorted(allowed_targets), ORACLE_IN_BATCH_SIZE) if allowed_targets else [[]]
+                    public_sql_tpl = """
+                        SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME, DB_LINK
+                        FROM DBA_SYNONYMS
+                        WHERE OWNER = 'PUBLIC'
+                          AND TABLE_OWNER IS NOT NULL
+                          AND TABLE_NAME IS NOT NULL
+                          {target_filter}
+                    """
+                    for target_chunk in target_chunks:
+                        if allowed_targets:
+                            target_ph = build_bind_placeholders(len(target_chunk))
+                            target_filter = f"AND TABLE_OWNER IN ({target_ph})"
+                            sql = public_sql_tpl.format(target_filter=target_filter)
+                            cursor.execute(sql, target_chunk)
+                        else:
+                            sql = public_sql_tpl.format(target_filter="")
+                            cursor.execute(sql)
                         for row in cursor:
                             owner = (row[0] or '').strip().upper()
                             name = (row[1] or '').strip().upper()
@@ -9373,6 +9458,9 @@ def load_synonym_metadata(
                             table_name = (row[3] or '').strip().upper()
                             db_link = (row[4] or '').strip().upper() if row[4] else None
                             if not owner or not name or not table_name:
+                                continue
+                            if allowed_targets and table_owner and table_owner.upper() not in allowed_targets:
+                                skipped_public += 1
                                 continue
                             key = (owner, name)
                             result[key] = SynonymMeta(
@@ -9382,33 +9470,6 @@ def load_synonym_metadata(
                                 table_name=table_name,
                                 db_link=db_link
                             )
-                else:
-                    for owner_chunk in owner_chunks:
-                        owner_ph = build_bind_placeholders(len(owner_chunk))
-                        for target_chunk in target_chunks:
-                            target_ph = build_bind_placeholders(len(target_chunk), offset=len(owner_chunk))
-                            target_filter = f"AND TABLE_OWNER IN ({target_ph})"
-                            sql = sql_tpl.format(owner_ph=owner_ph, target_filter=target_filter)
-                            cursor.execute(sql, owner_chunk + target_chunk)
-                            for row in cursor:
-                                owner = (row[0] or '').strip().upper()
-                                name = (row[1] or '').strip().upper()
-                                table_owner = (row[2] or '').strip().upper()
-                                table_name = (row[3] or '').strip().upper()
-                                db_link = (row[4] or '').strip().upper() if row[4] else None
-                                if not owner or not name or not table_name:
-                                    continue
-                                if owner == 'PUBLIC' and table_owner and table_owner.upper() not in allowed_targets:
-                                    skipped_public += 1
-                                    continue
-                                key = (owner, name)
-                                result[key] = SynonymMeta(
-                                    owner=owner,
-                                    name=name,
-                                    table_owner=table_owner,
-                                    table_name=table_name,
-                                    db_link=db_link
-                                )
     except oracledb.Error as exc:
         log.warning("读取同义词元数据失败，将回退 DBMS_METADATA：%s", exc)
 
@@ -9462,6 +9523,47 @@ def resolve_synonym_terminal_source(
         owner_u, name_u = next_owner, next_name
 
     return None
+
+
+def resolve_synonym_scope_status(
+    synonym_owner: str,
+    synonym_name: str,
+    synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]],
+    source_objects: Optional[SourceObjectMap],
+    remap_rules: Optional[RemapRules] = None,
+) -> Tuple[Optional[str], str, Optional[str]]:
+    """
+    返回:
+      - terminal_source: 解析到的终点源对象（OWNER.OBJECT）或 immediate target
+      - state:
+          in_scope / out_of_scope / unknown
+      - detail: 额外说明
+    """
+    source_objects = source_objects or {}
+    remap_rules = remap_rules or {}
+    owner_u = (synonym_owner or "").upper()
+    name_u = (synonym_name or "").upper()
+    if not owner_u or not name_u:
+        return None, "unknown", "synonym_owner_or_name_missing"
+
+    src_full = f"{owner_u}.{name_u}"
+    meta = synonym_meta.get((owner_u, name_u)) if synonym_meta else None
+    immediate_target = None
+    if meta and meta.table_owner and meta.table_name:
+        immediate_target = f"{meta.table_owner.upper()}.{meta.table_name.upper()}"
+
+    terminal_source = resolve_synonym_terminal_source(owner_u, name_u, synonym_meta)
+    target_full = (terminal_source or immediate_target or "").upper() or None
+    if not target_full:
+        return None, "unknown", "terminal_target_unresolved"
+
+    if src_full in remap_rules:
+        return target_full, "in_scope", "synonym_explicit_remap"
+
+    target_types = {t.upper() for t in (source_objects.get(target_full) or set()) if t}
+    if target_types:
+        return target_full, "in_scope", ",".join(sorted(target_types))
+    return target_full, "out_of_scope", "terminal_target_not_in_source_scope"
 
 
 def load_oracle_view_like_object_keys(
@@ -28028,7 +28130,7 @@ def clean_oracle_hints(ddl: str) -> str:
     """移除Oracle特有的Hint语法"""
     if not ddl:
         return ddl
-    return re.sub(r'/\*\+[^*]*\*/', '', ddl, flags=re.DOTALL)
+    return re.sub(r'/\*\+.*?\*/', '', ddl, flags=re.DOTALL)
 
 
 def clean_storage_clauses(ddl: str) -> str:
@@ -28134,8 +28236,18 @@ def clean_xmltype_xmlschema_clause(ddl: str) -> str:
     """移除 XMLTYPE COLUMN ... XMLSCHEMA 子句。"""
     if not ddl:
         return ddl
-
-    cleaned = re.sub(r'\s+XMLTYPE\s+COLUMN\s+\w+\s+XMLSCHEMA[^;]*', '', ddl, flags=re.IGNORECASE)
+    masked = mask_sql_for_scan(ddl)
+    masked_upper = masked.upper()
+    pattern = re.compile(
+        r'\s+XMLTYPE\s+COLUMN\s+[A-Z0-9_$#]+\s+XMLSCHEMA[^;]*',
+        flags=re.IGNORECASE
+    )
+    spans = [(match.start(), match.end()) for match in pattern.finditer(masked_upper)]
+    if not spans:
+        return ddl
+    cleaned = ddl
+    for start, end in reversed(spans):
+        cleaned = cleaned[:start] + cleaned[end:]
     return cleaned
 
 
@@ -32446,6 +32558,15 @@ def generate_fixup_scripts(
             src_obj_u = src_obj.upper()
             src_key = (src_schema_u, src_obj_u)
             src_full = f"{src_schema_u}.{src_obj_u}"
+            support_row = support_state_map.get((obj_type_u, src_full))
+            if support_row and (support_row.reason_code or "").upper() == SYNONYM_TARGET_OUT_OF_SCOPE_REASON_CODE:
+                log.info(
+                    "[FIXUP] 跳过同义词 %s.%s（终点对象 %s 不在本次迁移范围）。",
+                    src_schema,
+                    src_obj,
+                    support_row.dependency or "-"
+                )
+                continue
             syn_meta = synonym_meta_map.get(src_key)
             if syn_meta and allowed_synonym_targets and syn_meta.table_owner:
                 table_owner_u = syn_meta.table_owner.upper()
