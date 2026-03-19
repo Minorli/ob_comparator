@@ -199,8 +199,8 @@
   说明：仅处理已存在对象的状态差异，不负责对象创建；输出目录为 fixup_scripts/status/。
 - status_fixup_types：状态漂移修补脚本类型。默认：trigger,constraint。
   可选值：TRIGGER, CONSTRAINT。
-- constraint_status_sync_mode：约束状态同步模式。默认：enabled_only。
-  可选值：enabled_only（仅同步 ENABLED/DISABLED）、full（额外同步 VALIDATED/NOT VALIDATED）。
+- constraint_status_sync_mode：约束状态同步模式。默认：full。
+  可选值：enabled_only（仅同步 ENABLED/DISABLED）、full（额外同步 VALIDATED/NOT VALIDATED，默认）。
   说明：OB 4.2.5.x 对 PK/UK 不支持 ENABLE/DISABLE/VALIDATE 状态语法，程序会仅报告状态漂移，不为 PK/UK 生成状态修复 SQL。
 - constraint_missing_fixup_validate_mode：缺失约束修补时的 VALIDATE 策略。默认：safe_novalidate。
   可选值：

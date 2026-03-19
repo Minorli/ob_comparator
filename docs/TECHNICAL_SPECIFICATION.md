@@ -97,6 +97,7 @@
 - VIEW 兼容性分析：SYS.OBJ$ / X$ 系统对象视为不支持（用户自建 X$ 对象除外）
 - PUBLIC 同义词按 Oracle 语义处理（OB `__public` 归一化为 `PUBLIC`）
 - 若 SYNONYM 的终点对象不在本次迁移范围（含同义词链最终落到范围外对象），该 SYNONYM 会被分类为 `BLOCKED`，写入 unsupported/detail 报告，且不生成 normal synonym fixup DDL
+- `constraint_status_sync_mode` 默认值为 `full`；现有 `FK/CHECK` 的 `VALIDATED / NOT VALIDATED` 状态漂移会默认进入状态修复逻辑，`PK/UK` 继续仅报告不生成 `ENABLE/[NO]VALIDATE` SQL
 
 ### 5.2.1 Report DB 语义
 - `DIFF_REPORT_DETAIL` / `DIFF_REPORT_DETAIL_ITEM` 对支持性分类采用：

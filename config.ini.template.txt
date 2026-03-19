@@ -258,8 +258,8 @@ trigger_qualify_schema  = true
 # status_fixup_types 可选值：
 #   TRIGGER, CONSTRAINT（状态修复脚本生成范围）
 # constraint_status_sync_mode：
-#   enabled_only（仅同步 ENABLED/DISABLED，默认）
-#   full（同时同步 VALIDATED / NOT VALIDATED）
+#   enabled_only（仅同步 ENABLED/DISABLED）
+#   full（同时同步 VALIDATED / NOT VALIDATED，默认）
 #   注意：OB 4.2.5.x 对 PK/UK 不支持 ENABLE/DISABLE/VALIDATE 状态语法，
 #         程序会仅报告 PK/UK 状态漂移，不生成状态修复 SQL。
 # constraint_missing_fixup_validate_mode：
@@ -280,7 +280,7 @@ check_extra_types       = index,constraint,sequence,trigger
 check_status_drift_types = trigger,constraint
 generate_status_fixup   = true
 status_fixup_types      = trigger,constraint
-constraint_status_sync_mode = enabled_only
+constraint_status_sync_mode = full
 constraint_missing_fixup_validate_mode = safe_novalidate
 trigger_validity_sync_mode = compile
 # 是否进行依赖关系校验

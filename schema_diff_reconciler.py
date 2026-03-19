@@ -4221,15 +4221,15 @@ def normalize_view_constraint_cleanup(raw_value: Optional[str]) -> str:
 
 def normalize_constraint_status_sync_mode(raw_value: Optional[str]) -> str:
     if not raw_value or not str(raw_value).strip():
-        return "enabled_only"
+        return "full"
     value = str(raw_value).strip().lower()
     value = CONSTRAINT_STATUS_SYNC_MODE_ALIASES.get(value, value)
     if value not in CONSTRAINT_STATUS_SYNC_MODE_VALUES:
         log.warning(
-            "constraint_status_sync_mode=%s 不在支持范围内，将回退为 enabled_only。",
+            "constraint_status_sync_mode=%s 不在支持范围内，将回退为 full。",
             raw_value
         )
-        return "enabled_only"
+        return "full"
     return value
 
 
@@ -5266,7 +5266,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('check_status_drift_types', 'trigger,constraint')
         settings.setdefault('generate_status_fixup', 'true')
         settings.setdefault('status_fixup_types', 'trigger,constraint')
-        settings.setdefault('constraint_status_sync_mode', 'enabled_only')
+        settings.setdefault('constraint_status_sync_mode', 'full')
         settings.setdefault('constraint_missing_fixup_validate_mode', 'safe_novalidate')
         settings.setdefault('trigger_validity_sync_mode', 'compile')
         settings.setdefault('sequence_remap_policy', 'source_only')
@@ -5751,7 +5751,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             'status_fixup_types'
         )
         settings['constraint_status_sync_mode'] = normalize_constraint_status_sync_mode(
-            settings.get('constraint_status_sync_mode', 'enabled_only')
+            settings.get('constraint_status_sync_mode', 'full')
         )
         settings['constraint_missing_fixup_validate_mode'] = normalize_constraint_missing_fixup_validate_mode(
             settings.get('constraint_missing_fixup_validate_mode', 'safe_novalidate')
@@ -6878,7 +6878,7 @@ def run_config_wizard(config_path: Path) -> None:
         "SETTINGS",
         "constraint_status_sync_mode",
         "约束状态同步模式 (enabled_only/full)",
-        default=cfg.get("SETTINGS", "constraint_status_sync_mode", fallback="enabled_only"),
+        default=cfg.get("SETTINGS", "constraint_status_sync_mode", fallback="full"),
         validator=_validate_constraint_status_sync_mode,
         transform=normalize_constraint_status_sync_mode,
     )
@@ -7725,7 +7725,7 @@ def collect_constraint_status_drift_rows(
     ob_meta: ObMetadata,
     master_list: MasterCheckList,
     full_object_mapping: FullObjectMapping,
-    sync_mode: str = "enabled_only",
+    sync_mode: str = "full",
     unsupported_table_keys: Optional[Set[Tuple[str, str]]] = None
 ) -> List[ConstraintStatusDriftRow]:
     rows: List[ConstraintStatusDriftRow] = []
@@ -31821,7 +31821,7 @@ def generate_fixup_scripts(
     status_fixup_types = set(settings.get("status_fixup_type_set", set()) or set())
     generate_status_fixup = parse_bool_flag(settings.get("generate_status_fixup", "true"), True)
     generate_extra_cleanup = parse_bool_flag(settings.get("generate_extra_cleanup", "false"), False)
-    constraint_status_sync_mode = settings.get("constraint_status_sync_mode", "enabled_only")
+    constraint_status_sync_mode = settings.get("constraint_status_sync_mode", "full")
     constraint_missing_validate_mode = normalize_constraint_missing_fixup_validate_mode(
         settings.get("constraint_missing_fixup_validate_mode", "safe_novalidate")
     )
@@ -47956,7 +47956,7 @@ def main():
             ob_meta,
             master_list,
             full_object_mapping,
-            sync_mode=settings.get("constraint_status_sync_mode", "enabled_only"),
+            sync_mode=settings.get("constraint_status_sync_mode", "full"),
             unsupported_table_keys=(support_summary.unsupported_table_keys if support_summary else None)
         )
     extra_results["trigger_status_drift"] = trigger_status_rows
