@@ -1941,6 +1941,95 @@ def select_tab_columns_view(
     return primary_view, primary_support, []
 
 
+def normalize_ob_metadata_flag(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    text = str(value).strip().upper()
+    if not text or text == "NULL":
+        return None
+    if text in ("YES", "Y", "TRUE", "1"):
+        return True
+    if text in ("NO", "N", "FALSE", "0"):
+        return False
+    return None
+
+
+def metadata_value_missing(value: Optional[object]) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    return False
+
+
+def merge_metadata_flag(primary: Optional[bool], secondary: Optional[bool]) -> Optional[bool]:
+    if primary is True or secondary is True:
+        return True
+    if primary is False or secondary is False:
+        return False
+    return None
+
+
+def merge_ob_column_metadata_entry(primary: Dict, secondary: Dict) -> Dict:
+    if not primary:
+        return dict(secondary or {})
+    if not secondary:
+        return dict(primary)
+
+    merged = dict(primary)
+    scalar_fields = (
+        "data_type",
+        "char_length",
+        "data_length",
+        "data_precision",
+        "data_scale",
+        "char_used",
+        "nullable",
+        "data_default",
+        "column_id",
+    )
+    for field_name in scalar_fields:
+        if metadata_value_missing(merged.get(field_name)) and not metadata_value_missing(secondary.get(field_name)):
+            merged[field_name] = secondary.get(field_name)
+
+    merged["hidden"] = bool(merged.get("hidden")) or bool(secondary.get("hidden"))
+    merged["virtual"] = bool(merged.get("virtual")) or bool(secondary.get("virtual"))
+    merged["identity"] = merge_metadata_flag(merged.get("identity"), secondary.get("identity"))
+    merged["default_on_null"] = merge_metadata_flag(
+        merged.get("default_on_null"),
+        secondary.get("default_on_null")
+    )
+    merged["invisible"] = merge_metadata_flag(merged.get("invisible"), secondary.get("invisible"))
+
+    if metadata_value_missing(merged.get("virtual_expr")):
+        secondary_virtual_expr = secondary.get("virtual_expr")
+        if not metadata_value_missing(secondary_virtual_expr):
+            merged["virtual_expr"] = secondary_virtual_expr
+        elif merged.get("virtual") and not metadata_value_missing(secondary.get("data_default")):
+            merged["virtual_expr"] = secondary.get("data_default")
+    if merged.get("virtual") and metadata_value_missing(merged.get("virtual_expr")):
+        merged["virtual_expr"] = merged.get("data_default")
+
+    return merged
+
+
+def merge_ob_tab_column_metadata(
+    primary_map: Dict[Tuple[str, str], Dict[str, Dict]],
+    secondary_map: Dict[Tuple[str, str], Dict[str, Dict]]
+) -> Dict[Tuple[str, str], Dict[str, Dict]]:
+    merged: Dict[Tuple[str, str], Dict[str, Dict]] = {}
+    for key, cols in (primary_map or {}).items():
+        merged[key] = {col_name: dict(meta) for col_name, meta in cols.items()}
+    for key, cols in (secondary_map or {}).items():
+        target_cols = merged.setdefault(key, {})
+        for col_name, meta in cols.items():
+            if col_name in target_cols:
+                target_cols[col_name] = merge_ob_column_metadata_entry(target_cols[col_name], meta)
+            else:
+                target_cols[col_name] = dict(meta)
+    return merged
+
+
 VARCHAR_LEN_MIN_MULTIPLIER = 1.5  # 目标端 VARCHAR/2 长度需 >= ceil(src * 1.5)
 VARCHAR_LEN_OVERSIZE_MULTIPLIER = 2.5  # 超过该倍数认为“过大”，需要提示
 NUMBER_STAR_PRECISION = 38  # NUMBER(*) 等价精度
@@ -12145,6 +12234,65 @@ def obclient_query_by_owner_chunks(
     return True, lines, ""
 
 
+def obclient_query_by_owner_chunks_best_effort(
+    ob_cfg: ObConfig,
+    mode_sql_tpls: Sequence[Tuple[str, str]],
+    owners: List[str],
+    *,
+    chunk_size: int = ORACLE_IN_BATCH_SIZE
+) -> Tuple[bool, List[Tuple[str, str]], str]:
+    """
+    以“富信息优先”的方式按 owner 分块查询。
+    - 优先尝试高保真 SQL
+    - chunk 失败时先递归拆分 chunk，尽量保留其他 owner 的高保真结果
+    - 仅在最小 chunk 仍失败时才降级到下一档 SQL
+    返回 (ok, [(mode_name, line), ...], err)。
+    """
+    if not owners:
+        return True, [], ""
+
+    modes = [(name, tpl) for name, tpl in (mode_sql_tpls or []) if tpl]
+    if not modes:
+        return True, [], ""
+
+    def _quote_owner(value: str) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def _run_chunk(chunk_owners: List[str], mode_idx: int = 0) -> Tuple[bool, List[Tuple[str, str]], str]:
+        if not chunk_owners:
+            return True, [], ""
+        if mode_idx >= len(modes):
+            return False, [], "all modes failed"
+
+        mode_name, sql_tpl = modes[mode_idx]
+        owners_in = ",".join(_quote_owner(s) for s in chunk_owners)
+        sql = sql_tpl.format(owners_in=owners_in)
+        ok, out, err = obclient_run_sql(ob_cfg, sql)
+        if ok:
+            tagged_lines: List[Tuple[str, str]] = []
+            if out:
+                tagged_lines.extend((mode_name, line) for line in out.splitlines())
+            return True, tagged_lines, ""
+
+        if len(chunk_owners) > 1:
+            mid = len(chunk_owners) // 2
+            ok_left, left_lines, left_err = _run_chunk(chunk_owners[:mid], mode_idx)
+            ok_right, right_lines, right_err = _run_chunk(chunk_owners[mid:], mode_idx)
+            if ok_left and ok_right:
+                return True, left_lines + right_lines, ""
+            return False, [], left_err or right_err or err
+
+        return _run_chunk(chunk_owners, mode_idx + 1)
+
+    tagged_lines: List[Tuple[str, str]] = []
+    for chunk in chunk_list(owners, chunk_size):
+        ok, chunk_lines, err = _run_chunk(list(chunk), 0)
+        if not ok:
+            return False, [], err
+        tagged_lines.extend(chunk_lines)
+    return True, tagged_lines, ""
+
+
 def ob_has_dba_column(
     ob_cfg: ObConfig,
     table_name: str,
@@ -12204,6 +12352,240 @@ def obclient_query_by_owner_pairs(
             if out:
                 lines.extend(out.splitlines())
     return True, lines, ""
+
+
+def load_ob_tab_columns_from_view(
+    ob_cfg: ObConfig,
+    owners_in_list: List[str],
+    view_name: str,
+    support_map: Dict[str, bool],
+    ob_default_char_used: str
+) -> Tuple[bool, Dict[Tuple[str, str], Dict[str, Dict]], str]:
+    support_hidden_col = bool((support_map or {}).get("HIDDEN_COLUMN"))
+    support_virtual_col = bool((support_map or {}).get("VIRTUAL_COLUMN"))
+    support_identity_col = bool((support_map or {}).get("IDENTITY_COLUMN"))
+    support_default_on_null = bool((support_map or {}).get("DEFAULT_ON_NULL"))
+    support_invisible_col = bool((support_map or {}).get("INVISIBLE_COLUMN"))
+    support_column_id = bool((support_map or {}).get("COLUMN_ID"))
+
+    hidden_col = ", HIDDEN_COLUMN" if support_hidden_col else ""
+    virtual_col = ", VIRTUAL_COLUMN" if support_virtual_col else ""
+    identity_col = ", IDENTITY_COLUMN" if support_identity_col else ""
+    default_on_null_col = ", DEFAULT_ON_NULL" if support_default_on_null else ""
+    invisible_col = ", INVISIBLE_COLUMN" if support_invisible_col else ""
+    column_id_col = ", COLUMN_ID" if support_column_id else ""
+
+    sql_cols_ext_tpl = f"""
+        SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
+               CHAR_LENGTH, DATA_LENGTH, DATA_PRECISION, DATA_SCALE, CHAR_USED, NULLABLE,
+               REPLACE(REPLACE(REPLACE(DATA_DEFAULT, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS DATA_DEFAULT
+               {column_id_col}
+               {hidden_col}{virtual_col}{identity_col}{default_on_null_col}{invisible_col}
+        FROM {view_name}
+        WHERE OWNER IN ({{owners_in}})
+    """
+    sql_cols_mid_tpl = f"""
+        SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
+               CHAR_LENGTH, DATA_LENGTH, DATA_PRECISION, DATA_SCALE, NULLABLE, DATA_DEFAULT
+               {column_id_col}
+               {hidden_col}{virtual_col}{identity_col}{default_on_null_col}{invisible_col}
+        FROM {view_name}
+        WHERE OWNER IN ({{owners_in}})
+    """
+    sql_cols_basic_tpl = f"""
+        SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHAR_LENGTH, NULLABLE, DATA_DEFAULT
+               {column_id_col}
+               {hidden_col}{virtual_col}{identity_col}{default_on_null_col}{invisible_col}
+        FROM {view_name}
+        WHERE OWNER IN ({{owners_in}})
+    """
+
+    ok, tagged_lines, err = obclient_query_by_owner_chunks_best_effort(
+        ob_cfg,
+        [("ext", sql_cols_ext_tpl), ("mid", sql_cols_mid_tpl), ("basic", sql_cols_basic_tpl)],
+        owners_in_list
+    )
+    if not ok:
+        return False, {}, err
+
+    tab_columns: Dict[Tuple[str, str], Dict[str, Dict]] = {}
+    for mode_name, line in tagged_lines:
+        parts = line.split('\t')
+        if len(parts) < 7:
+            continue
+        owner = parts[0].strip().upper()
+        table = parts[1].strip().upper()
+        col = parts[2].strip().upper()
+        dtype = parts[3].strip().upper()
+        char_len = parts[4].strip()
+        data_length = None
+        data_precision = None
+        data_scale = None
+        char_used = None
+        nullable = ""
+        default = ""
+        idx = 0
+        column_id = None
+        if mode_name == "ext":
+            data_length = parts[5].strip()
+            data_precision = parts[6].strip()
+            data_scale = parts[7].strip()
+            char_used = parts[8].strip()
+            nullable = parts[9].strip()
+            default = parts[10].strip() if len(parts) > 10 else ""
+            idx = 11
+        elif mode_name == "mid":
+            data_length = parts[5].strip()
+            data_precision = parts[6].strip()
+            data_scale = parts[7].strip()
+            nullable = parts[8].strip()
+            default = parts[9].strip() if len(parts) > 9 else ""
+            idx = 10
+        else:
+            nullable = parts[5].strip()
+            default = parts[6].strip() if len(parts) > 6 else ""
+            idx = 7
+
+        if support_column_id and len(parts) > idx:
+            column_id = parse_column_id(parts[idx])
+            idx += 1
+
+        hidden_flag = None
+        virtual_flag = None
+        identity_flag = None
+        default_on_null_flag = None
+        invisible_flag = None
+        if support_hidden_col and len(parts) > idx:
+            hidden_flag = normalize_ob_metadata_flag(parts[idx])
+            idx += 1
+        if support_virtual_col and len(parts) > idx:
+            virtual_flag = normalize_ob_metadata_flag(parts[idx])
+            idx += 1
+        if support_identity_col and len(parts) > idx:
+            identity_flag = normalize_ob_metadata_flag(parts[idx])
+            idx += 1
+        if support_default_on_null and len(parts) > idx:
+            default_on_null_flag = normalize_ob_metadata_flag(parts[idx])
+            idx += 1
+        if support_invisible_col and len(parts) > idx:
+            invisible_flag = normalize_ob_metadata_flag(parts[idx])
+
+        key = (owner, table)
+        char_used_clean = char_used.strip().upper() if char_used else ""
+        if char_used_clean in ("", "NULL"):
+            char_used_clean = ""
+        if not char_used_clean:
+            if dtype in ("VARCHAR2", "VARCHAR", "CHAR"):
+                try:
+                    if (
+                        (data_length or "").isdigit()
+                        and (char_len or "").isdigit()
+                        and int(data_length) > int(char_len)
+                    ):
+                        char_used_clean = "C"
+                except ValueError:
+                    char_used_clean = ""
+            if not char_used_clean:
+                char_used_clean = ob_default_char_used
+        is_virtual = bool(virtual_flag)
+        tab_columns.setdefault(key, {})[col] = {
+            "data_type": dtype,
+            "char_length": int(char_len) if char_len.isdigit() else None,
+            "data_length": int(data_length) if (data_length or "").isdigit() else None,
+            "data_precision": int(data_precision) if (data_precision or "").isdigit() else None,
+            "data_scale": int(data_scale) if (data_scale or "").isdigit() else None,
+            "char_used": char_used_clean or None,
+            "nullable": nullable,
+            "data_default": default,
+            "column_id": column_id,
+            "hidden": bool(hidden_flag) if support_hidden_col else False,
+            "virtual": is_virtual,
+            "virtual_expr": default if is_virtual else None,
+            "identity": identity_flag,
+            "default_on_null": default_on_null_flag,
+            "invisible": invisible_flag if support_invisible_col else None
+        }
+
+    return True, tab_columns, ""
+
+
+def backfill_ob_check_search_conditions(
+    ob_cfg: ObConfig,
+    check_targets: Set[Tuple[str, str, str]],
+    use_search_condition_vc: bool
+) -> Tuple[Dict[Tuple[str, str, str], str], List[Tuple[str, str, str]]]:
+    recovered: Dict[Tuple[str, str, str], str] = {}
+    unresolved: List[Tuple[str, str, str]] = []
+    if not check_targets:
+        return recovered, unresolved
+
+    condition_col = "SEARCH_CONDITION_VC" if use_search_condition_vc else "SEARCH_CONDITION"
+
+    def _quote_literal(value: str) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    grouped: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+    for owner, table, cons_name in sorted(check_targets):
+        grouped[(owner, table)].append(cons_name)
+
+    for (owner, table), cons_names in grouped.items():
+        sql = f"""
+            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME,
+                   REPLACE(REPLACE(REPLACE({condition_col}, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS SEARCH_CONDITION
+            FROM DBA_CONSTRAINTS
+            WHERE OWNER={_quote_literal(owner)}
+              AND TABLE_NAME={_quote_literal(table)}
+              AND CONSTRAINT_TYPE='C'
+        """
+        ok, out, err = obclient_run_sql(ob_cfg, sql)
+        if ok and out:
+            for line in out.splitlines():
+                parts = line.split('\t')
+                if len(parts) < 4:
+                    continue
+                key = (
+                    parts[0].strip().upper(),
+                    parts[1].strip().upper(),
+                    parts[2].strip().upper()
+                )
+                search_condition = parts[3].strip() if len(parts) > 3 else ""
+                if key in check_targets and search_condition:
+                    recovered[key] = search_condition
+        elif err:
+            log.info(
+                "OB CHECK 条件按表回填失败，将尝试逐约束回填: %s.%s (%s)",
+                owner,
+                table,
+                err
+            )
+
+        for cons_name in cons_names:
+            key = (owner, table, cons_name)
+            if key in recovered:
+                continue
+            sql = f"""
+                SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME,
+                       REPLACE(REPLACE(REPLACE({condition_col}, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS SEARCH_CONDITION
+                FROM DBA_CONSTRAINTS
+                WHERE OWNER={_quote_literal(owner)}
+                  AND TABLE_NAME={_quote_literal(table)}
+                  AND CONSTRAINT_NAME={_quote_literal(cons_name)}
+                  AND CONSTRAINT_TYPE='C'
+            """
+            ok, out, err = obclient_run_sql(ob_cfg, sql)
+            if ok and out:
+                for line in out.splitlines():
+                    parts = line.split('\t')
+                    if len(parts) < 4:
+                        continue
+                    search_condition = parts[3].strip() if len(parts) > 3 else ""
+                    if search_condition:
+                        recovered[key] = search_condition
+                        break
+            if key not in recovered:
+                unresolved.append(key)
+
+    return recovered, unresolved
 
 
 def dump_ob_metadata(
@@ -12416,13 +12798,16 @@ def dump_ob_metadata(
                 )
 
     # --- 2. DBA_TAB_COLUMNS ---
-    tab_cols_view = "DBA_TAB_COLUMNS"
     support_hidden_col = False
     support_virtual_col = False
     support_identity_col = False
     support_default_on_null = False
     support_invisible_col = False
     support_column_id = False
+    support_by_view: Dict[str, Dict[str, bool]] = {
+        "DBA_TAB_COLUMNS": {},
+        "DBA_TAB_COLS": {}
+    }
     if include_tab_columns:
         def _probe_ob_dict_col(col_name: str, view_name: str) -> bool:
             sql = (
@@ -12448,189 +12833,73 @@ def dump_ob_metadata(
         )
         if include_column_order:
             optional_cols = optional_cols + ("COLUMN_ID",)
-        support_by_view: Dict[str, Dict[str, bool]] = {
+        support_by_view = {
             "DBA_TAB_COLUMNS": {col: False for col in optional_cols},
             "DBA_TAB_COLS": {col: False for col in optional_cols}
         }
         for view_name in ("DBA_TAB_COLUMNS", "DBA_TAB_COLS"):
             for col_name in optional_cols:
                 support_by_view[view_name][col_name] = _probe_ob_dict_col(col_name, view_name)
-        tab_cols_view, support_cols, missing_cols = select_tab_columns_view(
+        _, _, missing_cols = select_tab_columns_view(
             "DBA_TAB_COLUMNS",
             support_by_view["DBA_TAB_COLUMNS"],
             "DBA_TAB_COLS",
             support_by_view["DBA_TAB_COLS"]
         )
-        support_hidden_col = bool(support_cols.get("HIDDEN_COLUMN"))
-        support_virtual_col = bool(support_cols.get("VIRTUAL_COLUMN"))
-        support_identity_col = bool(support_cols.get("IDENTITY_COLUMN"))
-        support_default_on_null = bool(support_cols.get("DEFAULT_ON_NULL"))
-        support_invisible_col = bool(support_cols.get("INVISIBLE_COLUMN"))
+        support_hidden_col = bool(support_by_view["DBA_TAB_COLUMNS"].get("HIDDEN_COLUMN")) or bool(
+            support_by_view["DBA_TAB_COLS"].get("HIDDEN_COLUMN")
+        )
+        support_virtual_col = bool(support_by_view["DBA_TAB_COLUMNS"].get("VIRTUAL_COLUMN")) or bool(
+            support_by_view["DBA_TAB_COLS"].get("VIRTUAL_COLUMN")
+        )
+        support_identity_col = bool(support_by_view["DBA_TAB_COLUMNS"].get("IDENTITY_COLUMN")) or bool(
+            support_by_view["DBA_TAB_COLS"].get("IDENTITY_COLUMN")
+        )
+        support_default_on_null = bool(support_by_view["DBA_TAB_COLUMNS"].get("DEFAULT_ON_NULL")) or bool(
+            support_by_view["DBA_TAB_COLS"].get("DEFAULT_ON_NULL")
+        )
+        support_invisible_col = bool(support_by_view["DBA_TAB_COLUMNS"].get("INVISIBLE_COLUMN")) or bool(
+            support_by_view["DBA_TAB_COLS"].get("INVISIBLE_COLUMN")
+        )
         if include_column_order:
-            support_column_id = bool(support_cols.get("COLUMN_ID"))
-        if tab_cols_view != "DBA_TAB_COLUMNS" and missing_cols:
-            log.info(
-                "OB DBA_TAB_COLUMNS 缺少列元数据(%s)，切换为 %s 读取列信息。",
-                ",".join(missing_cols),
-                tab_cols_view
+            support_column_id = bool(support_by_view["DBA_TAB_COLUMNS"].get("COLUMN_ID")) or bool(
+                support_by_view["DBA_TAB_COLS"].get("COLUMN_ID")
             )
-
-    hidden_col = ", HIDDEN_COLUMN" if support_hidden_col else ""
-    virtual_col = ", VIRTUAL_COLUMN" if support_virtual_col else ""
-    identity_col = ", IDENTITY_COLUMN" if support_identity_col else ""
-    default_on_null_col = ", DEFAULT_ON_NULL" if support_default_on_null else ""
-    invisible_col = ", INVISIBLE_COLUMN" if support_invisible_col else ""
-    column_id_col = ", COLUMN_ID" if support_column_id else ""
-    sql_cols_ext_tpl = f"""
-        SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
-               CHAR_LENGTH, DATA_LENGTH, DATA_PRECISION, DATA_SCALE, CHAR_USED, NULLABLE,
-               REPLACE(REPLACE(REPLACE(DATA_DEFAULT, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS DATA_DEFAULT
-               {column_id_col}
-               {hidden_col}{virtual_col}{identity_col}{default_on_null_col}{invisible_col}
-        FROM {tab_cols_view}
-        WHERE OWNER IN ({{owners_in}})
-    """
-    sql_cols_mid_tpl = f"""
-        SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
-               CHAR_LENGTH, DATA_LENGTH, DATA_PRECISION, DATA_SCALE, NULLABLE, DATA_DEFAULT
-               {column_id_col}
-               {hidden_col}{virtual_col}{identity_col}{default_on_null_col}{invisible_col}
-        FROM {tab_cols_view}
-        WHERE OWNER IN ({{owners_in}})
-    """
-    sql_cols_basic_tpl = f"""
-        SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHAR_LENGTH, NULLABLE, DATA_DEFAULT
-               {column_id_col}
-               {hidden_col}{virtual_col}{identity_col}{default_on_null_col}{invisible_col}
-        FROM {tab_cols_view}
-        WHERE OWNER IN ({{owners_in}})
-    """
+        if missing_cols:
+            log.info(
+                "OB DBA_TAB_COLUMNS 缺少列元数据(%s)，将联合 DBA_TAB_COLS 补齐列信息。",
+                ",".join(missing_cols),
+            )
 
     tab_columns: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     if include_tab_columns:
-        parse_mode = "ext"
-        ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_cols_ext_tpl, owners_in_list)
+        ok, primary_tab_columns, err = load_ob_tab_columns_from_view(
+            ob_cfg,
+            owners_in_list,
+            "DBA_TAB_COLUMNS",
+            support_by_view["DBA_TAB_COLUMNS"],
+            ob_default_char_used
+        )
         if not ok:
-            parse_mode = "mid"
-            log.warning("读取 OB DBA_TAB_COLUMNS(含CHAR_USED)失败，将回退中间查询：%s", err)
-            ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_cols_mid_tpl, owners_in_list)
+            log.warning("读取 OB DBA_TAB_COLUMNS 失败，将尝试仅使用 DBA_TAB_COLS: %s", err)
+            primary_tab_columns = {}
+
+        ok, secondary_tab_columns, secondary_err = load_ob_tab_columns_from_view(
+            ob_cfg,
+            owners_in_list,
+            "DBA_TAB_COLS",
+            support_by_view["DBA_TAB_COLS"],
+            ob_default_char_used
+        )
         if not ok:
-            parse_mode = "basic"
-            log.warning("读取 OB DBA_TAB_COLUMNS(中间查询)失败，将回退基础查询：%s", err)
-            ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_cols_basic_tpl, owners_in_list)
-        if not ok:
-            log.error("无法从 OB 读取 DBA_TAB_COLUMNS，程序退出。")
+            log.warning("读取 OB DBA_TAB_COLS 失败，将仅使用 DBA_TAB_COLUMNS 已获取信息: %s", secondary_err)
+            secondary_tab_columns = {}
+
+        if not primary_tab_columns and not secondary_tab_columns:
+            log.error("无法从 OB 读取列元数据（DBA_TAB_COLUMNS / DBA_TAB_COLS），程序退出。")
             abort_run()
 
-        def _normalize_flag(value: str) -> Optional[bool]:
-            if value is None:
-                return None
-            text = str(value).strip().upper()
-            if not text or text == "NULL":
-                return None
-            if text in ("YES", "Y", "TRUE", "1"):
-                return True
-            if text in ("NO", "N", "FALSE", "0"):
-                return False
-            return None
-
-        if lines:
-            for line in lines:
-                parts = line.split('\t')
-                if len(parts) < 7:
-                    continue
-                owner = parts[0].strip().upper()
-                table = parts[1].strip().upper()
-                col = parts[2].strip().upper()
-                dtype = parts[3].strip().upper()
-                char_len = parts[4].strip()
-                data_length = None
-                data_precision = None
-                data_scale = None
-                char_used = None
-                nullable = ""
-                default = ""
-                idx = 0
-                column_id = None
-                if parse_mode == "ext":
-                    data_length = parts[5].strip()
-                    data_precision = parts[6].strip()
-                    data_scale = parts[7].strip()
-                    char_used = parts[8].strip()
-                    nullable = parts[9].strip()
-                    default = parts[10].strip() if len(parts) > 10 else ""
-                    idx = 11
-                elif parse_mode == "mid":
-                    data_length = parts[5].strip()
-                    data_precision = parts[6].strip()
-                    data_scale = parts[7].strip()
-                    nullable = parts[8].strip()
-                    default = parts[9].strip() if len(parts) > 9 else ""
-                    idx = 10
-                else:
-                    nullable = parts[5].strip()
-                    default = parts[6].strip() if len(parts) > 6 else ""
-                    idx = 7
-
-                if support_column_id and len(parts) > idx:
-                    column_id = parse_column_id(parts[idx])
-                    idx += 1
-
-                hidden_flag = None
-                virtual_flag = None
-                identity_flag = None
-                default_on_null_flag = None
-                invisible_flag = None
-                if support_hidden_col and len(parts) > idx:
-                    hidden_flag = _normalize_flag(parts[idx])
-                    idx += 1
-                if support_virtual_col and len(parts) > idx:
-                    virtual_flag = _normalize_flag(parts[idx])
-                    idx += 1
-                if support_identity_col and len(parts) > idx:
-                    identity_flag = _normalize_flag(parts[idx])
-                    idx += 1
-                if support_default_on_null and len(parts) > idx:
-                    default_on_null_flag = _normalize_flag(parts[idx])
-                    idx += 1
-                if support_invisible_col and len(parts) > idx:
-                    invisible_flag = _normalize_flag(parts[idx])
-
-                key = (owner, table)
-                char_used_clean = char_used.strip().upper() if char_used else ""
-                if char_used_clean in ("", "NULL"):
-                    char_used_clean = ""
-                if not char_used_clean:
-                    if dtype in ("VARCHAR2", "VARCHAR", "CHAR"):
-                        try:
-                            if (
-                                (data_length or "").isdigit()
-                                and (char_len or "").isdigit()
-                                and int(data_length) > int(char_len)
-                            ):
-                                char_used_clean = "C"
-                        except ValueError:
-                            char_used_clean = ""
-                    if not char_used_clean:
-                        char_used_clean = ob_default_char_used
-                is_virtual = bool(virtual_flag)
-                tab_columns.setdefault(key, {})[col] = {
-                    "data_type": dtype,
-                    "char_length": int(char_len) if char_len.isdigit() else None,
-                    "data_length": int(data_length) if (data_length or "").isdigit() else None,
-                    "data_precision": int(data_precision) if (data_precision or "").isdigit() else None,
-                    "data_scale": int(data_scale) if (data_scale or "").isdigit() else None,
-                    "char_used": char_used_clean or None,
-                    "nullable": nullable,
-                    "data_default": default,
-                    "column_id": column_id,
-                    "hidden": bool(hidden_flag) if support_hidden_col else False,
-                    "virtual": is_virtual,
-                    "virtual_expr": default if is_virtual else None,
-                    "identity": identity_flag,
-                    "default_on_null": default_on_null_flag,
-                    "invisible": invisible_flag if support_invisible_col else None
-                }
+        tab_columns = merge_ob_tab_column_metadata(primary_tab_columns, secondary_tab_columns)
 
     identity_column_supported = False
     default_on_null_supported = False
@@ -12878,55 +13147,47 @@ def dump_ob_metadata(
             WHERE OWNER IN ({{owners_in}})
               AND CONSTRAINT_TYPE IN ('P','U','R','C')
         """
-        ok = False
-        lines: List[str] = []
-        err = ""
+        sql_mid_tpl = f"""
+            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, STATUS{validated_select}{index_name_select}, R_OWNER, R_CONSTRAINT_NAME, DELETE_RULE{update_rule_select}
+                   {deferrable_select}
+            FROM DBA_CONSTRAINTS
+            WHERE OWNER IN ({{owners_in}})
+              AND CONSTRAINT_TYPE IN ('P','U','R','C')
+        """
+        sql_tpl = f"""
+            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, STATUS{validated_select}{index_name_select}
+                   {deferrable_select}
+            FROM DBA_CONSTRAINTS
+            WHERE OWNER IN ({{owners_in}})
+              AND CONSTRAINT_TYPE IN ('P','U','R','C')
+        """
+        constraint_mode_sqls: List[Tuple[str, str]] = []
         if use_search_condition_vc:
-            ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_ext_tpl_vc, owners_in_list)
-        support_fk_ref = False
-        support_search_condition = False
-        if ok:
-            support_fk_ref = True
-            support_search_condition = True
+            constraint_mode_sqls.append(("ext_vc", sql_ext_tpl_vc))
+        constraint_mode_sqls.extend([
+            ("ext", sql_ext_tpl),
+            ("mid", sql_mid_tpl),
+            ("basic", sql_tpl),
+        ])
+        ok, constraint_rows, err = obclient_query_by_owner_chunks_best_effort(
+            ob_cfg,
+            constraint_mode_sqls,
+            owners_in_list
+        )
         if not ok:
-            if err:
-                log.warning("读取 OB DBA_CONSTRAINTS(含 SEARCH_CONDITION_VC)失败，将尝试 SEARCH_CONDITION: %s", err)
-            ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_ext_tpl, owners_in_list)
-            if ok:
-                support_fk_ref = True
-                support_search_condition = True
-        if not ok:
-            log.warning("读取 OB DBA_CONSTRAINTS(含条件)失败，将回退为中间字段：%s", err)
-            sql_mid_tpl = f"""
-                SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, STATUS{validated_select}{index_name_select}, R_OWNER, R_CONSTRAINT_NAME, DELETE_RULE{update_rule_select}
-                       {deferrable_select}
-                FROM DBA_CONSTRAINTS
-                WHERE OWNER IN ({{owners_in}})
-                  AND CONSTRAINT_TYPE IN ('P','U','R','C')
-            """
-            ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_mid_tpl, owners_in_list)
-            if ok:
-                support_fk_ref = True
-                support_search_condition = False
-        if not ok:
-            log.warning("读取 OB DBA_CONSTRAINTS(含引用信息)失败，将回退为基础字段：%s", err)
-            sql_tpl = f"""
-                SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, STATUS{validated_select}{index_name_select}
-                       {deferrable_select}
-                FROM DBA_CONSTRAINTS
-                WHERE OWNER IN ({{owners_in}})
-                  AND CONSTRAINT_TYPE IN ('P','U','R','C')
-            """
-            ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners_in_list)
-            if not ok:
-                log.error("无法从 OB 读取 DBA_CONSTRAINTS，程序退出。")
-                abort_run()
+            log.error("无法从 OB 读取 DBA_CONSTRAINTS，程序退出。")
+            abort_run()
 
-        if lines:
-            for line in lines:
+        degraded_check_targets: Set[Tuple[str, str, str]] = set()
+        constraint_mode_counts: Dict[str, int] = defaultdict(int)
+        if constraint_rows:
+            for mode_name, line in constraint_rows:
+                constraint_mode_counts[mode_name] += 1
                 parts = line.split('\t')
                 if len(parts) < 4:
                     continue
+                mode_support_fk_ref = mode_name in ("ext_vc", "ext", "mid")
+                mode_support_search_condition = mode_name in ("ext_vc", "ext")
                 idx = 0
                 owner = parts[idx].strip().upper()
                 idx += 1
@@ -12947,7 +13208,7 @@ def dump_ob_metadata(
                     index_name = parts[idx].strip().upper()
                     idx += 1
                 r_owner = r_cons = delete_rule = update_rule = None
-                if support_fk_ref:
+                if mode_support_fk_ref:
                     r_owner = parts[idx].strip().upper() if len(parts) > idx else None
                     idx += 1
                     r_cons = parts[idx].strip().upper() if len(parts) > idx else None
@@ -12958,7 +13219,7 @@ def dump_ob_metadata(
                         update_rule = parts[idx].strip().upper() if len(parts) > idx else None
                         idx += 1
                 search_condition = None
-                if support_search_condition and len(parts) > idx:
+                if mode_support_search_condition and len(parts) > idx:
                     search_condition = parts[idx].strip()
                     idx += 1
                 deferrable = deferred = None
@@ -12982,6 +13243,17 @@ def dump_ob_metadata(
                     "deferrable": deferrable,
                     "deferred": deferred,
                 }
+                if ctype == "C" and not search_condition:
+                    degraded_check_targets.add((owner, table, cons_name))
+
+        if constraint_mode_counts.get("mid") or constraint_mode_counts.get("basic"):
+            log.info(
+                "OB DBA_CONSTRAINTS 分层读取完成：ext_vc=%d ext=%d mid=%d basic=%d",
+                constraint_mode_counts.get("ext_vc", 0),
+                constraint_mode_counts.get("ext", 0),
+                constraint_mode_counts.get("mid", 0),
+                constraint_mode_counts.get("basic", 0),
+            )
 
         # --- 6. DBA_CONS_COLUMNS ---
         sql_tpl = """
@@ -13026,8 +13298,32 @@ def dump_ob_metadata(
                     }
                 constraints[key][cons_name]["columns"].append(col_name)
 
+        if degraded_check_targets:
+            recovered_conditions, unresolved_conditions = backfill_ob_check_search_conditions(
+                ob_cfg,
+                degraded_check_targets,
+                use_search_condition_vc
+            )
+            for (owner, table, cons_name), search_condition in recovered_conditions.items():
+                if (
+                    (owner, table) in constraints
+                    and cons_name in constraints[(owner, table)]
+                    and constraints[(owner, table)][cons_name].get("type") == "C"
+                ):
+                    constraints[(owner, table)][cons_name]["search_condition"] = search_condition
+            if recovered_conditions:
+                log.info(
+                    "OB CHECK 条件回填完成：恢复 SEARCH_CONDITION %d 条。",
+                    len(recovered_conditions)
+                )
+            if unresolved_conditions:
+                log.warning(
+                    "仍有 %d 条 OB CHECK 约束无法回填 SEARCH_CONDITION，相关等价语义 suppress 可能受限。",
+                    len(unresolved_conditions)
+                )
+
         # 为外键补齐被引用表信息（若 OB 提供 R_OWNER/R_CONSTRAINT_NAME）
-        if support_fk_ref:
+        if any(info.get("r_owner") for cons_map in constraints.values() for info in cons_map.values()):
             cons_table_lookup: Dict[Tuple[str, str], Tuple[str, str]] = {}
             for (owner, table), cons_map in constraints.items():
                 for cons_name, info in cons_map.items():
