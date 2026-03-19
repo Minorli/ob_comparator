@@ -83,7 +83,7 @@ report_detail_mode      = split
 # report_db_save_full_json: 是否保存完整 JSON（可能很大）
 report_to_db            = true
 report_db_schema        =
-report_retention_days   = 90
+report_retention_days   = 30
 report_db_fail_abort    = false
 report_db_store_scope   = full
 report_db_detail_mode   = missing,mismatched,unsupported

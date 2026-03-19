@@ -60,7 +60,7 @@
   说明：当 report_db_store_scope=full 时，会将 run 目录下所有 txt 逐行写入 DIFF_REPORT_ARTIFACT_LINE，实现 txt 内容 100% 可查询覆盖。
 - report_db_schema：报告存库 schema。默认：空（使用 OCEANBASE_TARGET 连接用户）。
   说明：非空时必须是 Oracle 普通标识符（示例：DIFF_REPORT），不支持点号/引号/分号；非法值会在启动阶段直接阻断。
-- report_retention_days：报告保留天数。默认：90；设为 0 表示不自动清理。
+- report_retention_days：报告保留天数。默认：30；设为 0 表示不自动清理。
 - report_db_fail_abort：报告写库失败是否中止主流程。默认：false。
 - report_db_store_scope：写库范围（summary/core/full）。默认：full。
   - summary：仅写入汇总与计数。

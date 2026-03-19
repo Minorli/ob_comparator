@@ -5308,7 +5308,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('report_detail_mode', 'split')
         settings.setdefault('report_to_db', 'true')
         settings.setdefault('report_db_schema', '')
-        settings.setdefault('report_retention_days', '90')
+        settings.setdefault('report_retention_days', '30')
         settings.setdefault('report_db_fail_abort', 'false')
         settings.setdefault('report_db_store_scope', 'full')
         settings.setdefault('report_db_detail_mode', 'missing,mismatched,unsupported')
@@ -5695,9 +5695,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             settings.get('report_db_schema', '')
         )
         try:
-            settings['report_retention_days'] = int(settings.get('report_retention_days', '90'))
+            settings['report_retention_days'] = int(settings.get('report_retention_days', '30'))
         except (TypeError, ValueError):
-            settings['report_retention_days'] = 90
+            settings['report_retention_days'] = 30
         if settings['report_retention_days'] < 0:
             settings['report_retention_days'] = 0
         settings['report_db_fail_abort'] = parse_bool_flag(
@@ -7036,7 +7036,7 @@ def run_config_wizard(config_path: Path) -> None:
         "SETTINGS",
         "report_retention_days",
         "报告保留天数（0 表示不清理）",
-        default=cfg.get("SETTINGS", "report_retention_days", fallback="90"),
+        default=cfg.get("SETTINGS", "report_retention_days", fallback="30"),
         validator=_validate_non_negative_int,
     )
     _prompt_field(
