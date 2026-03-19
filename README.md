@@ -33,6 +33,7 @@
 - **状态漂移修复**：支持 TRIGGER/CONSTRAINT 的状态差异检测与状态修补脚本生成。
 - **约束策略增强**：支持缺失约束的 `safe_novalidate/source/force_validate` 策略；仅当源端最终语义需要 `VALIDATED` 时，才生成后置 `validate_later` 脚本。
 - **约束状态修复默认更严格**：`constraint_status_sync_mode` 默认改为 `full`，现有 `FK/CHECK` 的 `VALIDATED / NOT VALIDATED` 漂移会默认进入状态校验与状态修复脚本；`PK/UK` 仍只报告、不生成 `ENABLE/[NO]VALIDATE` SQL。
+- **OB FK 元数据增强**：当 OceanBase `DBA_CONSTRAINTS` 退化到 basic/degraded 模式时，会对受影响 FK 定向回填 `R_OWNER/R_CONSTRAINT_NAME`，避免仅按本地列集合误判 FK 已匹配。
 - **视图兼容治理**：支持 VIEW 兼容规则、DBLINK 策略、列清单约束清洗与依赖链修复。
 - **DDL 清洗与格式化**：支持 `ddl_cleanup_detail_<ts>.txt` 审计明细、全角标点清洗、hint 策略清洗、SQLcl 格式化（可按类型/体积/超时控制）；语义改写会在脚本头写 `DDL_REWRITE` 注释。
 - **黑名单与排除机制**：支持规则引擎、名称模式、显式排除清单（`exclude_objects_file`）与依赖联动过滤。

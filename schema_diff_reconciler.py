@@ -1096,10 +1096,10 @@ class OracleMetadata(NamedTuple):
     interval_partitions: Dict[Tuple[str, str], IntervalPartitionInfo]  # (OWNER, TABLE) -> interval info
     privilege_family_counts: Tuple["OraclePrivilegeFamilyCount", ...] = ()
     non_table_triggers: Tuple["NonTableTriggerInfo", ...] = ()
-    temporary_tables: Set[Tuple[str, str]] = set()          # (OWNER, TABLE_NAME) -> source GTT / temporary tables
-    identity_modes: Dict[Tuple[str, str], Dict[str, str]] = {}  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: IDENTITY_MODE}
-    default_on_null_columns: Dict[Tuple[str, str], Tuple[str, ...]] = {}  # (OWNER, TABLE_NAME) -> (COLUMN_NAME, ...)
-    identity_options: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = {}  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: {OPTION: VALUE}}
+    temporary_tables: FrozenSet[Tuple[str, str]] = frozenset()          # (OWNER, TABLE_NAME) -> source GTT / temporary tables
+    identity_modes: Dict[Tuple[str, str], Dict[str, str]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: IDENTITY_MODE}
+    default_on_null_columns: Dict[Tuple[str, str], Tuple[str, ...]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> (COLUMN_NAME, ...)
+    identity_options: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: {OPTION: VALUE}}
 
 
 class DependencyRecord(NamedTuple):
@@ -12590,6 +12590,82 @@ def backfill_ob_check_search_conditions(
     return recovered, unresolved
 
 
+def backfill_ob_fk_reference_metadata(
+    ob_cfg: ObConfig,
+    fk_targets: Set[Tuple[str, str, str]]
+) -> Tuple[Dict[Tuple[str, str, str], Tuple[str, str]], List[Tuple[str, str, str]]]:
+    recovered: Dict[Tuple[str, str, str], Tuple[str, str]] = {}
+    unresolved: List[Tuple[str, str, str]] = []
+    if not fk_targets:
+        return recovered, unresolved
+
+    def _quote_literal(value: str) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    grouped: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+    for owner, table, cons_name in sorted(fk_targets):
+        grouped[(owner, table)].append(cons_name)
+
+    for (owner, table), cons_names in grouped.items():
+        sql = f"""
+            SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, R_OWNER, R_CONSTRAINT_NAME
+            FROM DBA_CONSTRAINTS
+            WHERE OWNER={_quote_literal(owner)}
+              AND TABLE_NAME={_quote_literal(table)}
+              AND CONSTRAINT_TYPE='R'
+        """
+        ok, out, err = obclient_run_sql(ob_cfg, sql)
+        if ok and out:
+            for line in out.splitlines():
+                parts = line.split('\t')
+                if len(parts) < 5:
+                    continue
+                key = (
+                    parts[0].strip().upper(),
+                    parts[1].strip().upper(),
+                    parts[2].strip().upper(),
+                )
+                r_owner = parts[3].strip().upper() if len(parts) > 3 else ""
+                r_cons = parts[4].strip().upper() if len(parts) > 4 else ""
+                if key in fk_targets and r_owner and r_cons:
+                    recovered[key] = (r_owner, r_cons)
+        elif err:
+            log.info(
+                "OB FK 引用元数据按表回填失败，将尝试逐约束回填: %s.%s (%s)",
+                owner,
+                table,
+                err
+            )
+
+        for cons_name in cons_names:
+            key = (owner, table, cons_name)
+            if key in recovered:
+                continue
+            sql = f"""
+                SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME, R_OWNER, R_CONSTRAINT_NAME
+                FROM DBA_CONSTRAINTS
+                WHERE OWNER={_quote_literal(owner)}
+                  AND TABLE_NAME={_quote_literal(table)}
+                  AND CONSTRAINT_NAME={_quote_literal(cons_name)}
+                  AND CONSTRAINT_TYPE='R'
+            """
+            ok, out, err = obclient_run_sql(ob_cfg, sql)
+            if ok and out:
+                for line in out.splitlines():
+                    parts = line.split('\t')
+                    if len(parts) < 5:
+                        continue
+                    r_owner = parts[3].strip().upper() if len(parts) > 3 else ""
+                    r_cons = parts[4].strip().upper() if len(parts) > 4 else ""
+                    if r_owner and r_cons:
+                        recovered[key] = (r_owner, r_cons)
+                        break
+            if key not in recovered:
+                unresolved.append(key)
+
+    return recovered, unresolved
+
+
 def dump_ob_metadata(
     ob_cfg: ObConfig,
     target_schemas: Set[str],
@@ -13182,6 +13258,7 @@ def dump_ob_metadata(
             abort_run()
 
         degraded_check_targets: Set[Tuple[str, str, str]] = set()
+        degraded_fk_targets: Set[Tuple[str, str, str]] = set()
         constraint_mode_counts: Dict[str, int] = defaultdict(int)
         if constraint_rows:
             for mode_name, line in constraint_rows:
@@ -13232,6 +13309,10 @@ def dump_ob_metadata(
                     deferred = parts[idx].strip() if len(parts) > idx else None
                     idx += 1
                 key = (owner, table)
+                ref_metadata_complete = True
+                if ctype == "R" and not (r_owner and r_cons):
+                    ref_metadata_complete = False
+                    degraded_fk_targets.add((owner, table, cons_name))
                 constraints.setdefault(key, {})[cons_name] = {
                     "type": ctype,
                     "status": cons_status,
@@ -13245,6 +13326,7 @@ def dump_ob_metadata(
                     "search_condition": search_condition if ctype == "C" else None,
                     "deferrable": deferrable,
                     "deferred": deferred,
+                    "ref_metadata_complete": ref_metadata_complete if ctype == "R" else None,
                 }
                 if ctype == "C" and not search_condition:
                     degraded_check_targets.add((owner, table, cons_name))
@@ -13325,6 +13407,31 @@ def dump_ob_metadata(
                     len(unresolved_conditions)
                 )
 
+        if degraded_fk_targets:
+            recovered_fk_refs, unresolved_fk_refs = backfill_ob_fk_reference_metadata(
+                ob_cfg,
+                degraded_fk_targets
+            )
+            for (owner, table, cons_name), (r_owner, r_cons) in recovered_fk_refs.items():
+                if (
+                    (owner, table) in constraints
+                    and cons_name in constraints[(owner, table)]
+                    and constraints[(owner, table)][cons_name].get("type") == "R"
+                ):
+                    constraints[(owner, table)][cons_name]["r_owner"] = r_owner
+                    constraints[(owner, table)][cons_name]["r_constraint"] = r_cons
+                    constraints[(owner, table)][cons_name]["ref_metadata_complete"] = True
+            if recovered_fk_refs:
+                log.info(
+                    "OB FK 引用元数据回填完成：恢复 R_OWNER/R_CONSTRAINT_NAME %d 条。",
+                    len(recovered_fk_refs)
+                )
+            if unresolved_fk_refs:
+                log.warning(
+                    "仍有 %d 条 OB FK 无法恢复引用约束元数据，相关 FK compare 将保守处理。",
+                    len(unresolved_fk_refs)
+                )
+
         # 为外键补齐被引用表信息（若 OB 提供 R_OWNER/R_CONSTRAINT_NAME）
         if any(info.get("r_owner") for cons_map in constraints.values() for info in cons_map.values()):
             cons_table_lookup: Dict[Tuple[str, str], Tuple[str, str]] = {}
@@ -13345,6 +13452,13 @@ def dump_ob_metadata(
                     ref_table = cons_table_lookup.get((r_owner_u, r_cons_u))
                     if ref_table:
                         info["ref_table_owner"], info["ref_table_name"] = ref_table
+        for (_owner, _table), cons_map in constraints.items():
+            for _cons_name, info in cons_map.items():
+                ctype = (info.get("type") or "").upper()
+                if ctype != "R":
+                    continue
+                if not (info.get("ref_table_owner") and info.get("ref_table_name")):
+                    info["ref_metadata_complete"] = False
 
         for key, cons_map in constraints.items():
             nn_map = build_enabled_notnull_check_column_map(cons_map)
@@ -21329,8 +21443,8 @@ def compare_constraints_for_table(
         cons_dict: Dict[str, Dict],
         *,
         is_source: bool
-    ) -> List[Tuple[Tuple[str, ...], str, Optional[str], str, str]]:
-        entries: List[Tuple[Tuple[str, ...], str, Optional[str], str, str]] = []
+    ) -> List[Tuple[Tuple[str, ...], str, Optional[str], str, str, bool]]:
+        entries: List[Tuple[Tuple[str, ...], str, Optional[str], str, str, bool]] = []
         for name, cons in cons_dict.items():
             ctype = (cons.get("type") or "").upper()
             if ctype != 'R':
@@ -21341,6 +21455,13 @@ def compare_constraints_for_table(
             ref_name = cons.get("ref_table_name")
             delete_rule = normalize_delete_rule(cons.get("delete_rule"))
             update_rule = normalize_update_rule(cons.get("update_rule"))
+            ref_meta_complete = bool(
+                cons.get("ref_metadata_complete")
+                if cons.get("ref_metadata_complete") is not None
+                else (True if is_source else bool(ref_owner and ref_name))
+            )
+            if (not is_source) and not (ref_owner and ref_name):
+                ref_meta_complete = False
             if ref_owner and ref_name:
                 ref_full_raw = f"{str(ref_owner).upper()}.{str(ref_name).upper()}"
                 if is_source:
@@ -21350,7 +21471,7 @@ def compare_constraints_for_table(
                 else:
                     # 目标端FK引用：使用原始名称（目标端已经是remapped之后的名称）
                     ref_full = ref_full_raw.upper()
-            entries.append((cols, name, ref_full, delete_rule, update_rule))
+            entries.append((cols, name, ref_full, delete_rule, update_rule, ref_meta_complete))
         return entries
 
     def bucket_check(
@@ -21454,23 +21575,30 @@ def compare_constraints_for_table(
             )
 
     def match_foreign_keys(
-        src_list: List[Tuple[Tuple[str, ...], str, Optional[str], str, str]],
-        tgt_list: List[Tuple[Tuple[str, ...], str, Optional[str], str, str]]
+        src_list: List[Tuple[Tuple[str, ...], str, Optional[str], str, str, bool]],
+        tgt_list: List[Tuple[Tuple[str, ...], str, Optional[str], str, str, bool]]
     ) -> None:
         tgt_used = [False] * len(tgt_list)
         tgt_by_cols: Dict[Tuple[str, ...], Set[Optional[str]]] = defaultdict(set)
-        for cols, _name, ref, _rule, _update_rule in tgt_list:
-            tgt_by_cols[cols].add(ref)
+        tgt_unknown_ref_cols: Set[Tuple[str, ...]] = set()
+        for cols, _name, ref, _rule, _update_rule, ref_complete in tgt_list:
+            if ref:
+                tgt_by_cols[cols].add(ref)
+            elif not ref_complete:
+                tgt_unknown_ref_cols.add(cols)
 
-        for cols, name, src_ref, src_rule, src_update_rule in src_list:
+        for cols, name, src_ref, src_rule, src_update_rule, _src_ref_complete in src_list:
             found_idx = None
-            for idx, (t_cols, _t_name, t_ref, t_rule, t_update_rule) in enumerate(tgt_list):
+            for idx, (t_cols, _t_name, t_ref, t_rule, t_update_rule, t_ref_complete) in enumerate(tgt_list):
                 if tgt_used[idx]:
                     continue
                 if cols != t_cols:
                     continue
-                if src_ref and t_ref and src_ref != t_ref:
-                    continue
+                if src_ref:
+                    if not t_ref:
+                        continue
+                    if src_ref != t_ref:
+                        continue
                 found_idx = idx
                 tgt_used[idx] = True
                 break
@@ -21479,6 +21607,11 @@ def compare_constraints_for_table(
                 if src_ref and cols in tgt_by_cols and (src_ref not in tgt_by_cols[cols]):
                     detail_mismatch.append(
                         f"FOREIGN KEY: 源约束 {name} (列 {list(cols)}) 引用 {src_ref}，但目标端同列集引用 {sorted(tgt_by_cols[cols])}。"
+                    )
+                elif src_ref and cols in tgt_unknown_ref_cols:
+                    detail_mismatch.append(
+                        f"FOREIGN KEY: 源约束 {name} (列 {list(cols)}) 引用 {src_ref}，"
+                        "但目标端同列集约束无法恢复引用表元数据。"
                     )
                 else:
                     detail_mismatch.append(
@@ -21504,13 +21637,15 @@ def compare_constraints_for_table(
 
         for idx, used in enumerate(tgt_used):
             if not used:
-                extra_name, extra_cols, extra_ref, extra_rule, extra_update_rule = tgt_list[idx]
+                extra_cols, extra_name, extra_ref, extra_rule, extra_update_rule, extra_ref_complete = tgt_list[idx]
                 if extra_cols in source_all_cols:
                     continue
                 if "_OMS_ROWID" in (extra_name or ""):
                     continue
                 extra.add(extra_name)
                 ref_note = f" 引用 {extra_ref}" if extra_ref else ""
+                if (not extra_ref) and (not extra_ref_complete):
+                    ref_note = " 引用元数据未恢复"
                 rule_note = f" DELETE_RULE={normalize_delete_rule(extra_rule) or 'NO ACTION'}"
                 update_note = f" UPDATE_RULE={normalize_update_rule(extra_update_rule) or 'NO ACTION'}"
                 detail_mismatch.append(

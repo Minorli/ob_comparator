@@ -122,7 +122,8 @@
 - PK/UK/FK 按列序列匹配
 - 忽略 `_OBNOTNULL_` 约束
 - FK 额外比对 `DELETE_RULE` / `UPDATE_RULE`
-- 自引用外键（FK 引用自身表）视为不支持，输出到约束不支持明细
+- OB `DBA_CONSTRAINTS` 若退化到 basic/degraded 模式，FK 会定向回填 `R_OWNER/R_CONSTRAINT_NAME` 后再解析被引用表，避免仅按本地列集合接受语义不等价的目标 FK
+- 自引用外键已按普通 FK compare/fixup 路径处理，不再一刀切视为不支持
 
 ### 5.6 SEQUENCE
 - 按 schema 映射比较集合
