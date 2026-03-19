@@ -92,7 +92,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Iterator, List, NamedTuple, NoReturn, Optional, Sequence, Set, Tuple, Union
+from typing import Callable, Dict, FrozenSet, Iterable, Iterator, List, NamedTuple, NoReturn, Optional, Sequence, Set, Tuple, Union
 
 __version__ = "0.9.8.8"
 
@@ -1058,7 +1058,7 @@ class ObMetadata(NamedTuple):
     partition_key_columns: Dict[Tuple[str, str], List[str]]  # (OWNER, TABLE_NAME) -> [PARTITION_COLS...]
     case_sensitive_findings: Tuple[CaseSensitiveIdentifierFinding, ...] = ()  # case-sensitive 标识符发现
     constraint_deferrable_supported: bool = False         # 是否支持读取 DEFERRABLE/DEFERRED 元数据
-    temporary_tables: frozenset[Tuple[str, str]] = frozenset()        # (OWNER, TABLE_NAME) -> target GTT / temporary tables
+    temporary_tables: FrozenSet[Tuple[str, str]] = frozenset()        # (OWNER, TABLE_NAME) -> target GTT / temporary tables
     identity_modes: Dict[Tuple[str, str], Dict[str, str]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: IDENTITY_MODE}
     default_on_null_columns: Dict[Tuple[str, str], Tuple[str, ...]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> (COLUMN_NAME, ...)
     identity_options: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: {OPTION: VALUE}}

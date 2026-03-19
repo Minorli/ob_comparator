@@ -45,6 +45,7 @@
 
 ## 环境与依赖
 - Python 3.7+
+- 运行时兼容基线按 Python 3.7 控制；项目代码中的泛型注解统一使用 `typing` 别名，不引入 `list[...]` / `frozenset[...]` 这类 3.9+ 运行时写法
 - Oracle Instant Client 19c+（oracledb Thick Mode）
 - obclient（目标 OceanBase 可连接）
 - JDK + dbcat（DDL 批量提取）

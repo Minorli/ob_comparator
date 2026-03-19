@@ -25,6 +25,7 @@
 - OceanBase `obclient`
 - JDK + `dbcat`
 - SQLcl（可选，用于 DDL 格式化）
+- Python 运行时兼容基线保持 3.7，项目代码中的泛型注解使用 `typing` 兼容别名，不引入 3.9+ 内建泛型下标运行时语法
 
 ### 2.3 可配置开关（核心）
 - `check_primary_types` / `check_extra_types`
