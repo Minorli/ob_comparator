@@ -31,9 +31,12 @@
 核心与映射
 - source_schemas：源端 schema 列表（必填）。默认：无；为空将直接退出。
   说明：逗号分隔，大小写不敏感；只扫描这些 schema 的对象与依赖。
+  说明：它只定义“源端扫描范围”，不等于目标端受管 schema。
+  说明：目标端实际受管范围会按 remap/full mapping 自动推导；即使 remap 到 config.ini 中未出现的新目标 schema，也会继续进入 compare/fixup/report。
 - remap_file：Remap 规则文件路径。默认：空（按 1:1 映射）。
   说明：规则格式为 `SRC_SCHEMA.OBJECT = TGT_SCHEMA.OBJECT`，支持注释与空行。
   注意：文件不存在会报警但继续。
+  说明：每轮运行会额外输出 `managed_target_scope_detail_<ts>.txt`，用于审计本轮派生出的目标 schema 范围。
 - case_sensitive_identifier_mode：大小写敏感(双引号)标识符处理模式。默认：warn。
   可选值：abort / warn / strict_fixup。
   说明：`abort` 发现即终止；`warn` 继续运行并输出专项明细；
@@ -201,7 +204,7 @@
   可选值：TRIGGER, CONSTRAINT。
 - constraint_status_sync_mode：约束状态同步模式。默认：full。
   可选值：enabled_only（仅同步 ENABLED/DISABLED）、full（额外同步 VALIDATED/NOT VALIDATED，默认）。
-  说明：OB 4.2.5.x 对 PK/UK 不支持 ENABLE/DISABLE/VALIDATE 状态语法，程序会仅报告状态漂移，不为 PK/UK 生成状态修复 SQL。
+  说明：OB 4.2.5.x 对 PK/UK 不支持 ENABLE/DISABLE/VALIDATE 状态语法；full 模式下，程序会把 PK/UK 的 VALIDATED/NOT VALIDATED 漂移纳入状态漂移报告，但不会为 PK/UK 生成状态修复 SQL。
 - constraint_missing_fixup_validate_mode：缺失约束修补时的 VALIDATE 策略。默认：safe_novalidate。
   可选值：
   safe_novalidate（默认，FK/CHECK 生成 ENABLE NOVALIDATE，降低 ORA-02298 风险）、

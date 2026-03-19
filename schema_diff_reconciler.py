@@ -1127,6 +1127,16 @@ class SynonymMeta(NamedTuple):
     db_link: Optional[str]
 
 
+class ManagedTargetScope(NamedTuple):
+    configured_source_schemas: FrozenSet[str]
+    managed_source_schemas: FrozenSet[str]
+    target_schemas: FrozenSet[str]
+    target_only_schemas: FrozenSet[str]
+    source_to_target_schemas: Dict[str, Tuple[str, ...]]
+    target_to_source_schemas: Dict[str, Tuple[str, ...]]
+    target_object_counts: Dict[str, int]
+
+
 DependencyReport = Dict[str, List[DependencyIssue]]
 
 
@@ -7824,6 +7834,117 @@ def collect_constraint_status_drift_rows(
     unsupported_keys = {(s.upper(), t.upper()) for s, t in (unsupported_table_keys or set())}
     sync_mode = normalize_constraint_status_sync_mode(sync_mode)
 
+    def _build_status_entry(
+        cons_name: str,
+        cons_meta: Dict[str, object],
+        *,
+        is_source: bool
+    ) -> Optional[Dict[str, object]]:
+        cons_name_u = (cons_name or "").upper()
+        if not cons_name_u:
+            return None
+        key = _build_constraint_semantic_key(
+            cons_name_u,
+            cons_meta or {},
+            is_source=is_source,
+            full_object_mapping=full_object_mapping
+        )
+        if key is None:
+            return None
+        ctype = (cons_meta.get("type") or "").upper()
+        entry: Dict[str, object] = {
+            "name": cons_name_u,
+            "type": ctype,
+            "key": key,
+            "status": normalize_constraint_enabled_status(cons_meta.get("status")),
+            "validated": normalize_constraint_validated_status(cons_meta.get("validated")),
+        }
+        if ctype in {"P", "U"}:
+            entry["cols"] = tuple(col.upper() for col in (cons_meta.get("columns") or []) if col)
+        elif ctype == "C":
+            entry["expr_key"] = key[1] if len(key) > 1 else ""
+        elif ctype == "R":
+            ref_owner = (cons_meta.get("ref_table_owner") or cons_meta.get("r_owner") or "").upper()
+            ref_name = (cons_meta.get("ref_table_name") or "").upper()
+            ref_complete = bool(
+                cons_meta.get("ref_metadata_complete")
+                if cons_meta.get("ref_metadata_complete") is not None
+                else (True if is_source else bool(ref_owner and ref_name))
+            )
+            if (not is_source) and not (ref_owner and ref_name):
+                ref_complete = False
+            entry["cols"] = tuple(col.upper() for col in (cons_meta.get("columns") or []) if col)
+            entry["ref_target"] = key[2] if len(key) > 2 else ""
+            entry["delete_rule"] = normalize_delete_rule(cons_meta.get("delete_rule"))
+            entry["update_rule"] = normalize_update_rule(cons_meta.get("update_rule"))
+            entry["ref_metadata_complete"] = ref_complete
+        return entry
+
+    def _match_status_entries(
+        src_entries: List[Dict[str, object]],
+        tgt_entries: List[Dict[str, object]]
+    ) -> List[Tuple[Dict[str, object], Dict[str, object]]]:
+        matches: List[Tuple[Dict[str, object], Dict[str, object]]] = []
+        used_tgt_names: Set[str] = set()
+        direct_tgt_by_name: Dict[str, Dict[str, object]] = {
+            str(entry.get("name") or ""): entry for entry in tgt_entries
+        }
+        remaining_src: List[Dict[str, object]] = []
+        remaining_tgt_by_type: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+
+        for src_entry in sorted(src_entries, key=lambda e: str(e.get("name") or "")):
+            src_name_u = str(src_entry.get("name") or "")
+            direct = direct_tgt_by_name.get(src_name_u)
+            if direct and str(direct.get("name") or "") not in used_tgt_names:
+                matches.append((src_entry, direct))
+                used_tgt_names.add(str(direct.get("name") or ""))
+            else:
+                remaining_src.append(src_entry)
+
+        for tgt_entry in tgt_entries:
+            tgt_name_u = str(tgt_entry.get("name") or "")
+            if not tgt_name_u or tgt_name_u in used_tgt_names:
+                continue
+            remaining_tgt_by_type[str(tgt_entry.get("type") or "")].append(tgt_entry)
+
+        def _consume_candidate(
+            candidate_list: List[Dict[str, object]],
+            predicate: Callable[[Dict[str, object]], bool]
+        ) -> Optional[Dict[str, object]]:
+            for idx, candidate in enumerate(candidate_list):
+                if predicate(candidate):
+                    return candidate_list.pop(idx)
+            return None
+
+        for src_entry in sorted(remaining_src, key=lambda e: (str(e.get("type") or ""), str(e.get("name") or ""))):
+            ctype = str(src_entry.get("type") or "")
+            candidates = remaining_tgt_by_type.get(ctype, [])
+            if not candidates:
+                continue
+            matched: Optional[Dict[str, object]] = None
+            if ctype in {"P", "U", "C"}:
+                src_key = src_entry.get("key")
+                matched = _consume_candidate(candidates, lambda item: item.get("key") == src_key)
+            elif ctype == "R":
+                src_cols = tuple(src_entry.get("cols") or ())
+                src_ref = str(src_entry.get("ref_target") or "")
+                matched = _consume_candidate(
+                    candidates,
+                    lambda item: (
+                        tuple(item.get("cols") or ()) == src_cols
+                        and (
+                            not src_ref
+                            or (
+                                str(item.get("ref_target") or "")
+                                and str(item.get("ref_target") or "") == src_ref
+                            )
+                        )
+                    )
+                )
+            if matched:
+                matches.append((src_entry, matched))
+        return matches
+
     for src_full, tgt_full, obj_type in master_list:
         if (obj_type or "").upper() != "TABLE":
             continue
@@ -7847,79 +7968,24 @@ def collect_constraint_status_drift_rows(
 
         src_entries: List[Dict[str, object]] = []
         for src_name, src_meta in src_map.items():
-            src_name_u = (src_name or "").upper()
-            if not src_name_u:
-                continue
-            key = _build_constraint_semantic_key(
-                src_name_u,
-                src_meta or {},
-                is_source=True,
-                full_object_mapping=full_object_mapping
-            )
-            if key is None:
-                continue
-            src_entries.append({
-                "name": src_name_u,
-                "type": (src_meta.get("type") or "").upper(),
-                "key": key,
-                "status": normalize_constraint_enabled_status(src_meta.get("status")),
-                "validated": normalize_constraint_validated_status(src_meta.get("validated")),
-            })
+            entry = _build_status_entry(src_name, src_meta or {}, is_source=True)
+            if entry:
+                src_entries.append(entry)
 
         tgt_entries: List[Dict[str, object]] = []
         for tgt_name, tgt_meta in tgt_map.items():
-            tgt_name_u = (tgt_name or "").upper()
-            if not tgt_name_u:
-                continue
-            key = _build_constraint_semantic_key(
-                tgt_name_u,
-                tgt_meta or {},
-                is_source=False,
-                full_object_mapping=full_object_mapping
-            )
-            if key is None:
-                continue
-            tgt_entries.append({
-                "name": tgt_name_u,
-                "type": (tgt_meta.get("type") or "").upper(),
-                "key": key,
-                "status": normalize_constraint_enabled_status(tgt_meta.get("status")),
-                "validated": normalize_constraint_validated_status(tgt_meta.get("validated")),
-            })
+            entry = _build_status_entry(tgt_name, tgt_meta or {}, is_source=False)
+            if entry:
+                tgt_entries.append(entry)
 
         if not src_entries or not tgt_entries:
             continue
 
-        tgt_by_name: Dict[str, Dict[str, object]] = {entry["name"]: entry for entry in tgt_entries}
-        tgt_by_key: Dict[Tuple, List[Dict[str, object]]] = defaultdict(list)
-        for entry in tgt_entries:
-            tgt_by_key[entry["key"]].append(entry)
-        for candidate_list in tgt_by_key.values():
-            candidate_list.sort(key=lambda e: str(e.get("name") or ""))
-
-        used_tgt_names: Set[str] = set()
-        for src_entry in sorted(src_entries, key=lambda e: str(e.get("name") or "")):
+        for src_entry, matched in _match_status_entries(src_entries, tgt_entries):
             src_name_u = str(src_entry.get("name") or "")
-            if not src_name_u:
-                continue
-            matched: Optional[Dict[str, object]] = None
-            direct = tgt_by_name.get(src_name_u)
-            if direct and direct.get("name") not in used_tgt_names:
-                matched = direct
-            if matched is None:
-                candidates = [
-                    item for item in tgt_by_key.get(src_entry.get("key"), [])
-                    if item.get("name") not in used_tgt_names
-                ]
-                if candidates:
-                    matched = candidates[0]
-            if not matched:
-                continue
-
             tgt_name_u = str(matched.get("name") or "")
             if not tgt_name_u:
                 continue
-            used_tgt_names.add(tgt_name_u)
 
             src_status = str(src_entry.get("status") or "UNKNOWN")
             tgt_status = str(matched.get("status") or "UNKNOWN")
@@ -7931,7 +7997,7 @@ def collect_constraint_status_drift_rows(
             status_diff = src_status_n != tgt_status_n
             validated_diff = (
                 sync_mode == "full"
-                and ctype in {"R", "C"}
+                and ctype in {"P", "U", "R", "C"}
                 and src_status_n == "ENABLED"
                 and tgt_status_n == "ENABLED"
                 and normalize_constraint_validated_status(src_validated)
@@ -9607,17 +9673,22 @@ def get_object_parent_tables(
 def load_synonym_metadata(
     ora_cfg: OraConfig,
     schemas_list: List[str],
-    allowed_target_schemas: Optional[List[str]] = None
+    allowed_terminal_source_schemas: Optional[Sequence[str]] = None
 ) -> Dict[Tuple[str, str], SynonymMeta]:
     """
     快速读取同义词定义，避免逐个 DBMS_METADATA 调用。
     返回 {(OWNER, SYNONYM_NAME): SynonymMeta}
-    allowed_target_schemas: 仅保留指向这些 schema 的同义词（用于过滤系统 PUBLIC 同义词等无关对象）。
+    allowed_terminal_source_schemas: 仅保留终点落在这些源 schema 的 PUBLIC 同义词，
+    用于过滤系统 PUBLIC 同义词等无关对象。
     """
     if not schemas_list:
         return {}
 
-    allowed_targets = {s.upper() for s in (allowed_target_schemas or [])}
+    allowed_targets = {
+        (item or "").strip().upper()
+        for item in (allowed_terminal_source_schemas or [])
+        if (item or "").strip()
+    }
     owners = sorted(set(s.upper() for s in schemas_list) | {"PUBLIC"})
     private_owners = [owner for owner in owners if owner != "PUBLIC"]
     sql_tpl = """
@@ -11567,10 +11638,118 @@ def build_schema_mapping(master_list: MasterCheckList) -> Dict[str, str]:
     return final_mapping
 
 
+def derive_managed_target_scope(
+    configured_source_schemas: Sequence[str],
+    full_object_mapping: FullObjectMapping
+) -> ManagedTargetScope:
+    """
+    从 remap/full_object_mapping 推导本轮受管的目标 schema 范围。
+    这是所有 target-side 元数据/依赖/fixup/report 的唯一权威来源。
+    """
+    configured_source_set = {
+        (item or "").strip().upper()
+        for item in (configured_source_schemas or [])
+        if (item or "").strip()
+    }
+    managed_source_schemas: Set[str] = set()
+    target_schemas: Set[str] = set()
+    source_to_target: Dict[str, Set[str]] = defaultdict(set)
+    target_to_source: Dict[str, Set[str]] = defaultdict(set)
+    target_object_counts: Dict[str, int] = defaultdict(int)
+
+    for src_full, type_map in (full_object_mapping or {}).items():
+        if "." not in src_full:
+            continue
+        src_schema, _src_obj = src_full.split(".", 1)
+        src_schema_u = src_schema.upper()
+        if not src_schema_u:
+            continue
+        managed_source_schemas.add(src_schema_u)
+        for tgt_full in (type_map or {}).values():
+            if "." not in tgt_full:
+                continue
+            tgt_schema, _tgt_obj = tgt_full.split(".", 1)
+            tgt_schema_u = tgt_schema.upper()
+            if not tgt_schema_u:
+                continue
+            target_schemas.add(tgt_schema_u)
+            source_to_target[src_schema_u].add(tgt_schema_u)
+            target_to_source[tgt_schema_u].add(src_schema_u)
+            target_object_counts[tgt_schema_u] += 1
+
+    target_only_schemas = target_schemas - configured_source_set
+    return ManagedTargetScope(
+        configured_source_schemas=frozenset(sorted(configured_source_set)),
+        managed_source_schemas=frozenset(sorted(managed_source_schemas)),
+        target_schemas=frozenset(sorted(target_schemas)),
+        target_only_schemas=frozenset(sorted(target_only_schemas)),
+        source_to_target_schemas=MappingProxyType({
+            schema: tuple(sorted(targets))
+            for schema, targets in source_to_target.items()
+        }),
+        target_to_source_schemas=MappingProxyType({
+            schema: tuple(sorted(sources))
+            for schema, sources in target_to_source.items()
+        }),
+        target_object_counts=MappingProxyType({
+            schema: int(target_object_counts.get(schema, 0) or 0)
+            for schema in sorted(target_object_counts.keys())
+        })
+    )
+
+
+def build_managed_target_scope_diagnostics(scope: ManagedTargetScope) -> List[str]:
+    diagnostics: List[str] = []
+    target_schemas_text = ", ".join(sorted(scope.target_schemas)) or "-"
+    diagnostics.append("本轮受管目标 schema: {value}".format(value=target_schemas_text))
+    if scope.target_only_schemas:
+        diagnostics.append(
+            "以下目标 schema 不在 source_schemas 中，但因 remap/映射纳入本轮范围: {value}".format(
+                value=", ".join(sorted(scope.target_only_schemas))
+            )
+        )
+    return diagnostics
+
+
+def export_managed_target_scope_detail(
+    scope: ManagedTargetScope,
+    report_dir: Optional[Path],
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"managed_target_scope_detail_{report_timestamp}.txt"
+    header_fields = [
+        "TARGET_SCHEMA",
+        "IN_SOURCE_CONFIG",
+        "SOURCE_SCHEMAS",
+        "TARGET_OBJECT_COUNT",
+        "SCOPE_KIND",
+    ]
+    rows: List[List[str]] = []
+    for target_schema in sorted(scope.target_schemas):
+        source_schemas = tuple(scope.target_to_source_schemas.get(target_schema) or ())
+        in_source_config = "Y" if target_schema in scope.configured_source_schemas else "N"
+        if target_schema not in scope.configured_source_schemas:
+            scope_kind = "REMAPPED_ONLY"
+        elif source_schemas == (target_schema,):
+            scope_kind = "SELF"
+        else:
+            scope_kind = "REMAPPED_IN_CONFIG"
+        rows.append([
+            target_schema,
+            in_source_config,
+            ",".join(source_schemas) or "-",
+            str(int(scope.target_object_counts.get(target_schema, 0) or 0)),
+            scope_kind,
+        ])
+    return write_pipe_report("受管目标 Schema 明细", header_fields, rows, output_path)
+
+
 def compute_schema_coverage(
     configured_source_schemas: List[str],
     source_objects: SourceObjectMap,
-    expected_target_schemas: Set[str],
+    managed_target_scope: ManagedTargetScope,
     ob_meta: ObMetadata
 ) -> Dict[str, List[str]]:
     """
@@ -11582,7 +11761,7 @@ def compute_schema_coverage(
     src_seen = {name.split('.', 1)[0].upper() for name in source_objects.keys() if '.' in name}
     source_missing = sorted(cfg_src_set - src_seen)
 
-    expected_tgt_set = {s.upper() for s in expected_target_schemas}
+    expected_tgt_set = {s.upper() for s in managed_target_scope.target_schemas}
     tgt_seen: Set[str] = set()
     for type_set in ob_meta.objects_by_type.values():
         for full_name in type_set:
@@ -11601,7 +11780,9 @@ def compute_schema_coverage(
         "source_missing": source_missing,
         "target_missing": target_missing,
         "target_extra": target_extra,
-        "target_missing_schema_hint": hints
+        "target_missing_schema_hint": hints,
+        "managed_target_schemas": sorted(managed_target_scope.target_schemas),
+        "target_only_schemas": sorted(managed_target_scope.target_only_schemas),
     }
 
 
@@ -32179,6 +32360,7 @@ def generate_fixup_scripts(
     fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None,
     support_state_map: Optional[Dict[Tuple[str, str], ObjectSupportReportRow]] = None,
     unsupported_table_keys: Optional[Set[Tuple[str, str]]] = None,
+    managed_target_scope: Optional[ManagedTargetScope] = None,
     view_compat_map: Optional[Dict[Tuple[str, str], ViewCompatResult]] = None,
     view_dependency_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
     trigger_status_rows: Optional[List[TriggerStatusReportRow]] = None,
@@ -32238,6 +32420,11 @@ def generate_fixup_scripts(
     settings["_trigger_literal_alert_rows"] = []
     settings["_generated_fixup_dirs"] = []
     settings["_fixup_root_readme_path"] = ""
+    if managed_target_scope is None:
+        managed_target_scope = derive_managed_target_scope(
+            settings.get("source_schemas_list", []) or [],
+            full_object_mapping
+        )
     trigger_filter_set = {t.upper() for t in (trigger_filter_entries or set())}
     support_state_map = support_state_map or {}
     table_target_map = build_table_target_map(master_list)
@@ -32322,7 +32509,6 @@ def generate_fixup_scripts(
         if not trigger_filter_set:
             log.warning("[FIXUP] trigger_list 为空，已回退全量 TRIGGER 生成。")
             trigger_filter_enabled = False
-    allowed_synonym_targets = {s.upper() for s in settings.get('source_schemas_list', [])}
 
     config_dir_raw = str(settings.get("config_dir", "") or "").strip()
     config_base_dir = Path(config_dir_raw).expanduser() if config_dir_raw else Path.cwd().resolve()
@@ -32942,14 +33128,7 @@ def generate_fixup_scripts(
     merge_privileges = parse_bool_flag(settings.get('grant_merge_privileges', 'true'), True)
     merge_grantees = parse_bool_flag(settings.get('grant_merge_grantees', 'true'), True)
     source_schema_set = {s.upper() for s in settings.get('source_schemas_list', []) if s}
-    target_schema_set: Set[str] = set()
-    for type_map in full_object_mapping.values():
-        for tgt_name in type_map.values():
-            if '.' in tgt_name:
-                target_schema_set.add(tgt_name.split('.', 1)[0].upper())
-    for tgt_full in remap_rules.values():
-        if '.' in tgt_full:
-            target_schema_set.add(tgt_full.split('.', 1)[0].upper())
+    target_schema_set: Set[str] = set(managed_target_scope.target_schemas)
     grant_owner_allowlist: Set[str] = set(source_schema_set) | target_schema_set
     grant_owner_denylist: Set[str] = {"SYS", "PUBLIC"}
 
@@ -33393,17 +33572,9 @@ def generate_fixup_scripts(
                 )
                 continue
             syn_meta = synonym_meta_map.get(src_key)
-            if syn_meta and allowed_synonym_targets and syn_meta.table_owner:
-                table_owner_u = syn_meta.table_owner.upper()
-                if table_owner_u not in allowed_synonym_targets and src_full not in remap_rules:
-                    log.info(
-                        "[FIXUP] 跳过同义词 %s.%s（table_owner=%s 不在 source_schemas 范围内）。",
-                        src_schema, src_obj, table_owner_u
-                    )
-                    continue
             if src_schema_u == 'PUBLIC' and not syn_meta and src_full not in remap_rules:
                 log.info(
-                    "[FIXUP] 跳过 PUBLIC 同义词 %s.%s（table_owner 不在 source_schemas 范围内）。",
+                    "[FIXUP] 跳过 PUBLIC 同义词 %s.%s（终点对象不在源端受管范围或元数据缺失）。",
                     src_schema, src_obj
                 )
                 continue
@@ -36539,6 +36710,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "不支持/阻断对象明细"
     if name.startswith("objects_after_cutoff_detail_"):
         return "DETAIL", "截止时间后对象过滤明细"
+    if name.startswith("managed_target_scope_detail_"):
+        return "DETAIL", "受管目标 Schema 明细"
     if name.startswith("view_constraint_cleaned_detail_"):
         return "DETAIL", "VIEW 列清单约束清洗明细"
     if name.startswith("view_constraint_uncleanable_detail_"):
@@ -41575,6 +41748,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "EXCLUDED_OBJECTS_DETAIL"
     if name.startswith("objects_after_cutoff_detail_"):
         return "OBJECTS_AFTER_CUTOFF_DETAIL"
+    if name.startswith("managed_target_scope_detail_"):
+        return "MANAGED_TARGET_SCOPE_DETAIL"
     if name.startswith("case_sensitive_identifiers_detail_"):
         return "CASE_SENSITIVE_IDENTIFIER_DETAIL"
     if name.startswith("sys_c_force_candidates_detail_"):
@@ -41649,6 +41824,7 @@ def _infer_artifact_status(
         "COLUMN_IDENTITY_OPTION_DETAIL",
         "COLUMN_DEFAULT_ON_NULL_DETAIL",
         "COLUMN_DEFAULT_DETAIL",
+        "MANAGED_TARGET_SCOPE_DETAIL",
         "OBJECTS_AFTER_CUTOFF_DETAIL",
         "CASE_SENSITIVE_IDENTIFIER_DETAIL",
         "SYS_C_FORCE_CANDIDATES_DETAIL",
@@ -44940,7 +45116,9 @@ def print_final_report(
         schema_summary = {
             "source_missing": [],
             "target_missing": [],
-            "target_extra": []
+            "target_extra": [],
+            "managed_target_schemas": [],
+            "target_only_schemas": [],
         }
 
     log.info("所有校验已完成。正在生成最终报告...")
@@ -45063,6 +45241,7 @@ def print_final_report(
         table_presence_checked_cnt = int(table_presence_summary.total_checked or 0)
         table_presence_mode = table_presence_summary.mode or "-"
     source_missing_schema_cnt = len(schema_summary.get("source_missing", []))
+    target_only_schema_cnt = len(schema_summary.get("target_only_schemas", []))
     package_rows: List[PackageCompareRow] = []
     package_diff_rows: List[PackageCompareRow] = []
     package_summary: Dict[str, int] = {}
@@ -45353,6 +45532,9 @@ def print_final_report(
     schema_text = Text()
     schema_text.append("源 schema 未获取到对象: ", style="mismatch")
     schema_text.append(f"{source_missing_schema_cnt}")
+    if target_only_schema_cnt:
+        schema_text.append("\n仅由 remap 导出的目标 schema: ", style="info")
+        schema_text.append(str(target_only_schema_cnt), style="info")
     summary_table.add_row("[bold]Schema 覆盖[/bold]", schema_text)
 
     if case_sensitive_findings_count:
@@ -45915,6 +46097,18 @@ def print_final_report(
             schema_table.add_row(
                 "源端未获取到对象",
                 ", ".join(schema_summary["source_missing"])
+            )
+            has_row = True
+        if schema_summary.get("managed_target_schemas"):
+            schema_table.add_row(
+                "本轮受管目标 schema",
+                ", ".join(schema_summary["managed_target_schemas"])
+            )
+            has_row = True
+        if schema_summary.get("target_only_schemas"):
+            schema_table.add_row(
+                "仅由 remap 导出的目标 schema",
+                ", ".join(schema_summary["target_only_schemas"])
             )
             has_row = True
         if has_row:
@@ -47433,6 +47627,15 @@ def main():
             )
 
     generate_fixup_enabled = settings.get('generate_fixup', 'true').strip().lower() in ('true', '1', 'yes')
+    managed_target_scope = ManagedTargetScope(
+        configured_source_schemas=frozenset(),
+        managed_source_schemas=frozenset(),
+        target_schemas=frozenset(),
+        target_only_schemas=frozenset(),
+        source_to_target_schemas=MappingProxyType({}),
+        target_to_source_schemas=MappingProxyType({}),
+        target_object_counts=MappingProxyType({}),
+    )
     if not enabled_extra_types:
         phase_skip_reasons["扩展对象校验"] = "check_extra_types 为空"
     if not enable_usability_check:
@@ -47631,13 +47834,6 @@ def main():
                 object_parent_map=object_parent_map
             )
             log.info("递归依赖表缓存完成，共 %d 个节点。", len(transitive_table_cache))
-        # 4.3) 缓存同义词元数据，供 PUBLIC 等大规模同义词快速生成 DDL
-        synonym_meta = load_synonym_metadata(
-            ora_cfg,
-            settings['source_schemas_list'],
-            allowed_target_schemas=settings['source_schemas_list']
-        )
-
         sequence_policy = settings.get("sequence_remap_policy", "source_only")
         # 5) 先不推导 schema，生成基础映射/清单，用于推导 TABLE 唯一映射
         remap_conflicts: RemapConflictMap = {}
@@ -47705,14 +47901,23 @@ def main():
                 oracle_dependencies_internal,
                 full_object_mapping
             )
-        target_schemas: Set[str] = set()
-        for type_map in full_object_mapping.values():
-            for tgt_name in type_map.values():
-                try:
-                    schema, _ = tgt_name.split('.', 1)
-                    target_schemas.add(schema.upper())
-                except ValueError:
-                    continue
+        managed_target_scope = derive_managed_target_scope(
+            settings['source_schemas_list'],
+            full_object_mapping
+        )
+        target_schemas: Set[str] = set(managed_target_scope.target_schemas)
+        managed_source_terminal_schemas = sorted({
+            full_name.split('.', 1)[0].upper()
+            for full_name in source_objects.keys()
+            if '.' in full_name
+        })
+        # 4.3) 缓存同义词元数据，供 PUBLIC 等大规模同义词快速生成 DDL。
+        # 这里按“源端实际受管范围”过滤 PUBLIC 终点，不再把 source_schemas 直接混作 target 口径。
+        synonym_meta = load_synonym_metadata(
+            ora_cfg,
+            settings['source_schemas_list'],
+            allowed_terminal_source_schemas=managed_source_terminal_schemas
+        )
         target_table_pairs = collect_table_pairs(master_list, use_target=True)
 
     report_dir_setting = settings.get('report_dir', 'main_reports').strip() or 'main_reports'
@@ -47723,6 +47928,18 @@ def main():
     settings['report_dir_effective'] = str(report_dir)
     report_path = report_dir / f"report_{timestamp}.txt"
     log.info(f"本次报告将输出到: {report_path}")
+    managed_target_scope_detail_path = export_managed_target_scope_detail(
+        managed_target_scope,
+        report_dir,
+        timestamp
+    )
+    if managed_target_scope_detail_path:
+        log.info("受管目标 Schema 明细已输出: %s", managed_target_scope_detail_path)
+    scope_diagnostics = build_managed_target_scope_diagnostics(managed_target_scope)
+    if scope_diagnostics:
+        if config_diagnostics is None:
+            config_diagnostics = []
+        config_diagnostics.extend(scope_diagnostics)
 
     # 输出全量 remap 推导结果，便于人工审核
     mapping_path = report_dir / f"object_mapping_{timestamp}.txt"
@@ -47903,7 +48120,7 @@ def main():
                 endpoint_info,
                 None,
                 None,
-                set(),
+                set(managed_target_scope.target_schemas),
                 grant_plan=None,
                 usability_summary=None,
                 table_presence_summary=None,
@@ -47979,7 +48196,7 @@ def main():
         schema_summary = compute_schema_coverage(
             settings['source_schemas_list'],
             source_objects,
-            target_schemas,
+            managed_target_scope,
             ob_meta
         )
 
@@ -48660,6 +48877,7 @@ def main():
                 constraint_status_rows=constraint_status_rows,
                 support_state_map=support_summary.support_state_map,
                 unsupported_table_keys=support_summary.unsupported_table_keys,
+                managed_target_scope=managed_target_scope,
                 view_compat_map=support_summary.view_compat_map,
                 view_dependency_map=view_dependency_map
             )

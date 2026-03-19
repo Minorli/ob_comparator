@@ -13,6 +13,7 @@
 - **对象覆盖完整**：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。
 - **Dump-Once 架构**：Oracle Thick Mode + 少量 obclient 调用，元数据一次性落本地内存。
 - **Remap 推导**：支持显式规则、依附对象跟随、依赖推导、schema 回退策略。
+- **Target Scope 一等公民**：目标端受管 schema 不再等同于 `source_schemas`；会按 remap/full mapping 自动推导，哪怕 remap 到全新的目标 schema，也会继续进入 compare/fixup/report。
 - **依赖与授权**：基于 DBA_DEPENDENCIES/DBA_*_PRIVS 生成缺失依赖与授权脚本。
 - **DDL 清洗与兼容**：VIEW DDL 走 DBMS_METADATA，PL/SQL 语法清洗与 Hint 过滤。
 - **DDL 输出格式化**：可选 SQLcl 格式化 fixup DDL（不影响校验与修补逻辑）。
@@ -32,7 +33,7 @@
 - **run_fixup 安全门禁**：默认跳过 `fixup_scripts/table/`，需显式 `--allow-table-create` 才执行建表脚本。
 - **状态漂移修复**：支持 TRIGGER/CONSTRAINT 的状态差异检测与状态修补脚本生成。
 - **约束策略增强**：支持缺失约束的 `safe_novalidate/source/force_validate` 策略；仅当源端最终语义需要 `VALIDATED` 时，才生成后置 `validate_later` 脚本。
-- **约束状态修复默认更严格**：`constraint_status_sync_mode` 默认改为 `full`，现有 `FK/CHECK` 的 `VALIDATED / NOT VALIDATED` 漂移会默认进入状态校验与状态修复脚本；`PK/UK` 仍只报告、不生成 `ENABLE/[NO]VALIDATE` SQL。
+- **约束状态修复默认更严格**：`constraint_status_sync_mode` 默认改为 `full`，现有 `FK/CHECK` 的 `VALIDATED / NOT VALIDATED` 漂移会默认进入状态校验与状态修复脚本；`PK/UK` 的 `VALIDATED / NOT VALIDATED` 漂移也会进入状态漂移报告，但仍不生成 `ENABLE/[NO]VALIDATE` SQL。
 - **OB FK 元数据增强**：当 OceanBase `DBA_CONSTRAINTS` 退化到 basic/degraded 模式时，会对受影响 FK 定向回填 `R_OWNER/R_CONSTRAINT_NAME`，避免仅按本地列集合误判 FK 已匹配。
 - **视图兼容治理**：支持 VIEW 兼容规则、DBLINK 策略、列清单约束清洗与依赖链修复。
 - **DDL 清洗与格式化**：支持 `ddl_cleanup_detail_<ts>.txt` 审计明细、全角标点清洗、hint 策略清洗、SQLcl 格式化（可按类型/体积/超时控制）；语义改写会在脚本头写 `DDL_REWRITE` 注释。
@@ -108,6 +109,7 @@ java_home = /usr/lib/jvm/java-11
 完整配置说明见 `readme_config.txt`。
 
 `dbcat_output/cache/` 扁平缓存以实际对象文件为准；如果 `cache/index.json` 漏项，但对应 `SCHEMA/TYPE/OBJ.sql` 存在，主程序会继续命中该缓存并自动修复索引。
+`main_reports/run_<ts>/managed_target_scope_detail_<ts>.txt` 会列出本轮实际受管的目标 schema，明确哪些 schema 是仅由 remap 导出的新目标范围。
 
 ### 3) 运行对比
 ```bash
@@ -156,6 +158,7 @@ python3 -m py_compile $(git ls-files '*.py')
 - **非 TRIGGER 的 PL/SQL qualified ref**：`PROCEDURE/FUNCTION/PACKAGE/TYPE` 中已写成 `SCHEMA.OBJECT` 的引用，若对象名带双引号或带 `$` / `#`，也会按 remap 正常改写。
 - **INDEX/CONSTRAINT/SEQUENCE** 默认跟随父表。
 - **PROCEDURE/FUNCTION/TYPE/SYNONYM** 可通过依赖推导目标 schema。
+- **目标范围说明**：`source_schemas` 只定义源端扫描范围；目标端实际受管 schema 由 remap/full mapping 自动推导，不要求预先写进 `config.ini`。
 
 示例：
 ```

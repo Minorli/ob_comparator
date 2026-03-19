@@ -75,6 +75,16 @@
 - PROCEDURE / FUNCTION / TYPE / SYNONYM
 - 基于依赖目标 schema 频次统计推导
 
+### 4.5 受管目标 Scope
+- `source_schemas` 只定义源端扫描范围，不直接等于目标端受管 schema。
+- 主流程会基于 `full_object_mapping` 统一推导 `managed target scope`，作为目标端元数据、依赖、fixup、授权审计、report_db 的共同输入。
+- remap 到“配置中不存在的新目标 schema”时，这些 schema 仍属于本轮受管范围。
+- 会输出 `managed_target_scope_detail_<ts>.txt`，列出：
+  - 本轮受管目标 schema
+  - 是否也出现在 `source_schemas`
+  - 由哪些源 schema 推导而来
+  - 该目标 schema 下的受管对象数
+
 ---
 
 ## 5. 对比规则
@@ -101,7 +111,8 @@
 - VIEW 兼容性分析：SYS.OBJ$ / X$ 系统对象视为不支持（用户自建 X$ 对象除外）
 - PUBLIC 同义词按 Oracle 语义处理（OB `__public` 归一化为 `PUBLIC`）
 - 若 SYNONYM 的终点对象不在本次迁移范围（含同义词链最终落到范围外对象），该 SYNONYM 会被分类为 `BLOCKED`，写入 unsupported/detail 报告，且不生成 normal synonym fixup DDL
-- `constraint_status_sync_mode` 默认值为 `full`；现有 `FK/CHECK` 的 `VALIDATED / NOT VALIDATED` 状态漂移会默认进入状态修复逻辑，`PK/UK` 继续仅报告不生成 `ENABLE/[NO]VALIDATE` SQL
+- 同义词的“源端终点对象是否受管”与“目标端 schema 是否受管”分开处理；不会再把 `source_schemas` 误当 target allowlist 使用
+- `constraint_status_sync_mode` 默认值为 `full`；现有 `FK/CHECK` 的 `VALIDATED / NOT VALIDATED` 状态漂移会默认进入状态修复逻辑，`PK/UK` 的 `VALIDATED / NOT VALIDATED` 漂移也会进入状态漂移报告，但仍不生成 `ENABLE/[NO]VALIDATE` SQL
 
 ### 5.2.1 Report DB 语义
 - `DIFF_REPORT_DETAIL` / `DIFF_REPORT_DETAIL_ITEM` 对支持性分类采用：
