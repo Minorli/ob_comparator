@@ -253,6 +253,7 @@
   同时写入 `deferred_grants_detail_<ts>.txt`，避免误执行失败。
   说明：若延后授权因 owner 策略无法自动输出 SQL，`fixup_scripts/grants_deferred/README.txt` 仍会保留完整提醒。
   说明：程序会额外审计目标端“源端未声明”的对象授权，输出 `target_extra_grants_detail_<ts>.txt`；
+  extra grant 审计按“本轮受管 target object 集合”收敛，不会因为某个旧 schema 仍有其他受管对象就把该 schema 下未受管对象的授权误判进来；
   其中 PUBLIC 额外授权会生成 `fixup_scripts/grants_revoke/revoke_public_object_grants.sql` 回收建议。
   说明：程序会为每次运行生成 `grant_capability_detail_<ts>.txt`，记录本次授权动态规则库：
   源端权限、目标端目录权限、是否支持、是否存在目录别名（如 `DEBUG -> OTHERS`）、以及最终决策。

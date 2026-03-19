@@ -9702,6 +9702,15 @@ def load_synonym_metadata(
 
     result: Dict[Tuple[str, str], SynonymMeta] = {}
     skipped_public = 0
+
+    def _should_keep_public_synonym_meta(table_owner: str) -> bool:
+        table_owner_u = (table_owner or "").strip().upper()
+        if not allowed_targets:
+            return True
+        if table_owner_u == "PUBLIC":
+            return True
+        return table_owner_u in allowed_targets
+
     try:
         with oracledb.connect(
             user=ora_cfg['user'],
@@ -9744,7 +9753,7 @@ def load_synonym_metadata(
                     for target_chunk in target_chunks:
                         if allowed_targets:
                             target_ph = build_bind_placeholders(len(target_chunk))
-                            target_filter = f"AND TABLE_OWNER IN ({target_ph})"
+                            target_filter = f"AND (TABLE_OWNER IN ({target_ph}) OR TABLE_OWNER = 'PUBLIC')"
                             sql = public_sql_tpl.format(target_filter=target_filter)
                             cursor.execute(sql, target_chunk)
                         else:
@@ -9758,7 +9767,7 @@ def load_synonym_metadata(
                             db_link = (row[4] or '').strip().upper() if row[4] else None
                             if not owner or not name or not table_name:
                                 continue
-                            if allowed_targets and table_owner and table_owner.upper() not in allowed_targets:
+                            if not _should_keep_public_synonym_meta(table_owner):
                                 skipped_public += 1
                                 continue
                             key = (owner, name)
@@ -9786,6 +9795,7 @@ def resolve_synonym_terminal_source(
     synonym_owner: str,
     synonym_name: str,
     synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]],
+    known_source_types: Optional[Dict[str, object]] = None,
     max_depth: int = 16
 ) -> Optional[str]:
     """
@@ -9793,6 +9803,18 @@ def resolve_synonym_terminal_source(
     返回格式: OWNER.OBJECT
     - 若遇到 DBLINK、循环依赖或元数据不足，则返回 None。
     """
+    def _known_types_for(full_name: str) -> Set[str]:
+        if not known_source_types:
+            return set()
+        entry = known_source_types.get((full_name or "").upper())
+        if not entry:
+            return set()
+        if isinstance(entry, dict):
+            iterable = entry.keys()
+        else:
+            iterable = entry
+        return {str(item).upper() for item in iterable if item}
+
     if not synonym_meta:
         return None
     owner_u = (synonym_owner or "").upper()
@@ -9817,9 +9839,19 @@ def resolve_synonym_terminal_source(
         next_name = (meta.table_name or "").upper()
         if not next_owner or not next_name:
             return None
-        if (next_owner, next_name) not in synonym_meta:
-            return f"{next_owner}.{next_name}"
-        owner_u, name_u = next_owner, next_name
+        next_key = (next_owner, next_name)
+        if next_key in synonym_meta:
+            owner_u, name_u = next_key
+            continue
+
+        public_key = ("PUBLIC", next_name)
+        if public_key in synonym_meta:
+            exact_types = _known_types_for(f"{next_owner}.{next_name}")
+            if not exact_types or exact_types == {"SYNONYM"}:
+                owner_u, name_u = public_key
+                continue
+
+        return f"{next_owner}.{next_name}"
 
     return None
 
@@ -9851,18 +9883,71 @@ def resolve_synonym_scope_status(
     if meta and meta.table_owner and meta.table_name:
         immediate_target = f"{meta.table_owner.upper()}.{meta.table_name.upper()}"
 
-    terminal_source = resolve_synonym_terminal_source(owner_u, name_u, synonym_meta)
+    terminal_source = resolve_synonym_terminal_source(owner_u, name_u, synonym_meta, source_objects)
     target_full = (terminal_source or immediate_target or "").upper() or None
     if not target_full:
         return None, "unknown", "terminal_target_unresolved"
 
-    if src_full in remap_rules:
-        return target_full, "in_scope", "synonym_explicit_remap"
-
     target_types = {t.upper() for t in (source_objects.get(target_full) or set()) if t}
     if target_types:
-        return target_full, "in_scope", ",".join(sorted(target_types))
+        detail_parts: List[str] = []
+        if src_full in remap_rules:
+            detail_parts.append("synonym_explicit_remap")
+        detail_parts.append(",".join(sorted(target_types)))
+        return target_full, "in_scope", ";".join(part for part in detail_parts if part)
+    if src_full in remap_rules:
+        return target_full, "out_of_scope", "synonym_explicit_remap_but_terminal_target_not_in_source_scope"
     return target_full, "out_of_scope", "terminal_target_not_in_source_scope"
+
+
+def resolve_synonym_fixup_target(
+    synonym_owner: str,
+    synonym_name: str,
+    synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]],
+    full_object_mapping: FullObjectMapping,
+    remap_rules: Optional[RemapRules] = None,
+) -> Optional[str]:
+    remap_rules = remap_rules or {}
+    if not synonym_meta:
+        return None
+    owner_u = (synonym_owner or "").upper()
+    name_u = (synonym_name or "").upper()
+    if not owner_u or not name_u:
+        return None
+    meta = synonym_meta.get((owner_u, name_u))
+    if not meta or not meta.table_name:
+        return None
+
+    terminal_source = None
+    if not meta.db_link:
+        terminal_source = resolve_synonym_terminal_source(
+            owner_u,
+            name_u,
+            synonym_meta,
+            full_object_mapping,
+        )
+    if terminal_source:
+        terminal_u = terminal_source.upper()
+        mapped = find_mapped_target_any_type(
+            full_object_mapping,
+            terminal_u,
+            preferred_types=("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM", "FUNCTION", "PROCEDURE", "PACKAGE", "TYPE"),
+        )
+        explicit = remap_rules.get(terminal_u)
+        if explicit:
+            return explicit.upper()
+        if mapped:
+            return mapped.upper()
+        return terminal_u
+
+    target = (meta.table_owner or "").upper()
+    if target:
+        target = "{0}.{1}".format(target, (meta.table_name or "").upper())
+    else:
+        target = (meta.table_name or "").upper()
+    if meta.db_link:
+        target = "{0}@{1}".format(target, meta.db_link)
+    return target or None
 
 
 def load_oracle_view_like_object_keys(
@@ -15052,6 +15137,7 @@ def build_target_extra_object_grant_rows(
     declared_filtered_grants: Optional[List[FilteredGrantEntry]] = None,
     capability_library: Optional[GrantCapabilityLibrary] = None,
     object_target_types: Optional[Dict[str, str]] = None,
+    managed_target_objects: Optional[Set[str]] = None,
 ) -> List[ExtraObjectGrantDriftRow]:
     """
     识别“目标端存在但源端期望中不存在”的对象授权。
@@ -15061,6 +15147,11 @@ def build_target_extra_object_grant_rows(
     """
     expected_basic: Set[Tuple[str, str, str]] = set()
     expected_grantable: Set[Tuple[str, str, str]] = set()
+    managed_target_object_set = {
+        (item or "").upper()
+        for item in (managed_target_objects or set())
+        if (item or "").strip()
+    }
     object_target_types = {
         (key or "").upper(): normalize_privilege_object_type(value)
         for key, value in (object_target_types or {}).items()
@@ -15104,6 +15195,8 @@ def build_target_extra_object_grant_rows(
         target_object_grants or set(),
         key=lambda item: (item[0], item[1], item[2], "1" if item[3] else "0")
     ):
+        if managed_target_object_set and object_u.upper() not in managed_target_object_set:
+            continue
         object_type_u = object_target_types.get((object_u or "").upper(), "")
         logical_privilege_u, resolved = normalize_target_object_privilege(
             target_privilege_u,
@@ -15177,9 +15270,15 @@ def build_target_extra_column_grant_rows(
     declared_filtered_grants: Optional[List[FilteredGrantEntry]] = None,
     capability_library: Optional[GrantCapabilityLibrary] = None,
     object_target_types: Optional[Dict[str, str]] = None,
+    managed_target_objects: Optional[Set[str]] = None,
 ) -> List[ExtraObjectGrantDriftRow]:
     expected_basic: Set[Tuple[str, str, str, str]] = set()
     expected_grantable: Set[Tuple[str, str, str, str]] = set()
+    managed_target_object_set = {
+        (item or "").upper()
+        for item in (managed_target_objects or set())
+        if (item or "").strip()
+    }
     object_target_types = {
         (key or "").upper(): normalize_privilege_object_type(value)
         for key, value in (object_target_types or {}).items()
@@ -15222,6 +15321,8 @@ def build_target_extra_column_grant_rows(
         target_column_grants or set(),
         key=lambda item: (item[0], item[1], item[2], item[3], "1" if item[4] else "0")
     ):
+        if managed_target_object_set and object_u.upper() not in managed_target_object_set:
+            continue
         object_type_u = object_target_types.get((object_u or "").upper(), "")
         logical_privilege_u, resolved = normalize_target_column_privilege(
             target_privilege_u,
@@ -17410,7 +17511,7 @@ def resolve_synonym_chain_target(
     if '.' not in src_full:
         return None, None
     owner, name = src_full.split('.', 1)
-    target_source = resolve_synonym_terminal_source(owner, name, synonym_meta)
+    target_source = resolve_synonym_terminal_source(owner, name, synonym_meta, full_object_mapping)
     if not target_source:
         return None, None
     mapped_auto = find_mapped_target_any_type(
@@ -18198,6 +18299,18 @@ def build_existing_target_object_set(ob_meta: Optional[ObMetadata]) -> Set[str]:
             if full_u and "." in full_u:
                 existing.add(full_u)
     return existing
+
+
+def build_managed_target_object_set(
+    full_object_mapping: Optional[FullObjectMapping]
+) -> Set[str]:
+    managed: Set[str] = set()
+    for type_map in (full_object_mapping or {}).values():
+        for target_full in (type_map or {}).values():
+            target_u = (target_full or "").upper()
+            if target_u and "." in target_u:
+                managed.add(target_u)
+    return managed
 
 
 def build_planned_grant_target_set(
@@ -27050,7 +27163,7 @@ def remap_view_dependencies(
     preferred_types = ("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM", "FUNCTION")
 
     def _resolve_synonym(owner: str, dep_obj: str) -> Optional[str]:
-        terminal_source = resolve_synonym_terminal_source(owner, dep_obj, synonym_meta)
+        terminal_source = resolve_synonym_terminal_source(owner, dep_obj, synonym_meta, full_object_mapping)
         if not terminal_source:
             return None
         mapped = find_mapped_target_any_type(
@@ -28435,7 +28548,7 @@ def remap_trigger_object_references(
 
         allow_synonym_resolution = (not explicit_src) and (source_type in {"", "SYNONYM"})
         if synonym_meta and allow_synonym_resolution:
-            terminal_source = resolve_synonym_terminal_source(schema_u, obj_u, synonym_meta)
+            terminal_source = resolve_synonym_terminal_source(schema_u, obj_u, synonym_meta, full_object_mapping)
             if terminal_source:
                 source_full = terminal_source.upper()
                 explicit = remap_rules_u.get(source_full)
@@ -28444,7 +28557,7 @@ def remap_trigger_object_references(
                     source_type = "VIEW"
                 resolved_by_synonym = True
             elif allow_public_fallback and schema_u != "PUBLIC":
-                terminal_source = resolve_synonym_terminal_source("PUBLIC", obj_u, synonym_meta)
+                terminal_source = resolve_synonym_terminal_source("PUBLIC", obj_u, synonym_meta, full_object_mapping)
                 if terminal_source:
                     source_full = terminal_source.upper()
                     explicit = remap_rules_u.get(source_full)
@@ -28651,9 +28764,9 @@ def remap_trigger_object_references(
             tgt_full = explicit.upper()
 
         if not tgt_full and synonym_meta:
-            terminal_source = resolve_synonym_terminal_source(src_schema_u, name_clean, synonym_meta)
+            terminal_source = resolve_synonym_terminal_source(src_schema_u, name_clean, synonym_meta, full_object_mapping)
             if not terminal_source:
-                terminal_source = resolve_synonym_terminal_source("PUBLIC", name_clean, synonym_meta)
+                terminal_source = resolve_synonym_terminal_source("PUBLIC", name_clean, synonym_meta, full_object_mapping)
             if terminal_source:
                 terminal_u = terminal_source.upper()
                 tgt_full = get_mapped_target(full_object_mapping, terminal_u, "SEQUENCE")
@@ -32942,20 +33055,35 @@ def generate_fixup_scripts(
             syn_meta = synonym_meta_map.get((schema.upper(), obj_name.upper()))
             if syn_meta and syn_meta.table_name:
                 syn_name = syn_meta.name.split('.', 1)[-1]
-                target = syn_meta.table_owner
-                if target:
-                    target = f"{target}.{syn_meta.table_name}"
-                else:
-                    target = syn_meta.table_name
+                target = resolve_synonym_fixup_target(
+                    schema.upper(),
+                    obj_name.upper(),
+                    synonym_meta_map,
+                    full_object_mapping,
+                    remap_rules,
+                )
+                if not target:
+                    target = syn_meta.table_owner
+                    if target:
+                        target = "{0}.{1}".format(target, syn_meta.table_name)
+                    else:
+                        target = syn_meta.table_name
+                    if syn_meta.db_link:
+                        target = "{0}@{1}".format(target, syn_meta.db_link)
                 if syn_meta.db_link:
-                    target = f"{target}@{syn_meta.db_link}"
+                    target_sql = target
+                elif "." in target:
+                    target_owner, target_name = target.split(".", 1)
+                    target_sql = quote_qualified_parts(target_owner, target_name)
+                else:
+                    target_sql = quote_identifier(target)
                 if syn_meta.owner == 'PUBLIC':
                     syn_name_quoted = quote_identifier(syn_name)
-                    ddl = f"CREATE OR REPLACE PUBLIC SYNONYM {syn_name_quoted} FOR {target};"
+                    ddl = f"CREATE OR REPLACE PUBLIC SYNONYM {syn_name_quoted} FOR {target_sql};"
                 else:
                     syn_owner = (syn_meta.owner or "").upper()
                     syn_full = quote_qualified_parts(syn_owner, syn_name)
-                    ddl = f"CREATE OR REPLACE SYNONYM {syn_full} FOR {target};"
+                    ddl = f"CREATE OR REPLACE SYNONYM {syn_full} FOR {target_sql};"
                 elapsed = time.time() - start_time
                 log.info(
                     "[DDL_FETCH] %s.%s (%s) 来源=META_SYN 耗时=%.3fs",
@@ -33127,9 +33255,9 @@ def generate_fixup_scripts(
     grants_by_owner: Dict[str, Set[str]] = {}
     merge_privileges = parse_bool_flag(settings.get('grant_merge_privileges', 'true'), True)
     merge_grantees = parse_bool_flag(settings.get('grant_merge_grantees', 'true'), True)
-    source_schema_set = {s.upper() for s in settings.get('source_schemas_list', []) if s}
     target_schema_set: Set[str] = set(managed_target_scope.target_schemas)
-    grant_owner_allowlist: Set[str] = set(source_schema_set) | target_schema_set
+    managed_target_object_set: Set[str] = build_managed_target_object_set(full_object_mapping)
+    grant_owner_allowlist: Set[str] = set(target_schema_set)
     grant_owner_denylist: Set[str] = {"SYS", "PUBLIC"}
 
     def is_allowed_grant_owner(owner: str) -> bool:
@@ -33960,6 +34088,7 @@ def generate_fixup_scripts(
                     **build_ob_object_type_map(ob_meta),
                     **((grant_plan.object_target_types or {}) if grant_plan else {}),
                 },
+                managed_target_objects=managed_target_object_set,
             )
             if target_column_grants is not None:
                 extra_object_grant_rows.extend(
@@ -33972,6 +34101,7 @@ def generate_fixup_scripts(
                             **build_ob_object_type_map(ob_meta),
                             **((grant_plan.object_target_types or {}) if grant_plan else {}),
                         },
+                        managed_target_objects=managed_target_object_set,
                     )
                 )
             else:
@@ -48415,6 +48545,36 @@ def main():
                 log.info("已按排除规则更新对象映射清单: %s", mapping_written)
 
             after_mapping_cnt = sum(len(v) for v in full_object_mapping.values())
+            managed_target_scope = derive_managed_target_scope(
+                settings['source_schemas_list'],
+                full_object_mapping
+            )
+            target_schemas = set(managed_target_scope.target_schemas)
+            schema_summary = compute_schema_coverage(
+                settings['source_schemas_list'],
+                source_objects,
+                managed_target_scope,
+                ob_meta
+            )
+            updated_scope_detail_path = export_managed_target_scope_detail(
+                managed_target_scope,
+                report_dir,
+                timestamp
+            )
+            if updated_scope_detail_path:
+                managed_target_scope_detail_path = updated_scope_detail_path
+                log.info("已按排除规则更新受管目标 Schema 明细: %s", updated_scope_detail_path)
+            refreshed_scope_diagnostics = build_managed_target_scope_diagnostics(managed_target_scope)
+            if config_diagnostics is None:
+                config_diagnostics = []
+            config_diagnostics = [
+                item for item in config_diagnostics
+                if not (
+                    item.startswith("本轮受管目标 schema:")
+                    or item.startswith("以下目标 schema 不在 source_schemas 中，但因 remap/映射纳入本轮范围:")
+                )
+            ]
+            config_diagnostics.extend(refreshed_scope_diagnostics)
             cascaded_count = max(len(excluded_nodes) - len(excluded_seed_nodes), 0)
             if explicit_seed_nodes or explicit_skipped_rules:
                 log.info(

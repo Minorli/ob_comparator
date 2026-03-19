@@ -112,6 +112,9 @@
 - PUBLIC 同义词按 Oracle 语义处理（OB `__public` 归一化为 `PUBLIC`）
 - 若 SYNONYM 的终点对象不在本次迁移范围（含同义词链最终落到范围外对象），该 SYNONYM 会被分类为 `BLOCKED`，写入 unsupported/detail 报告，且不生成 normal synonym fixup DDL
 - 同义词的“源端终点对象是否受管”与“目标端 schema 是否受管”分开处理；不会再把 `source_schemas` 误当 target allowlist 使用
+- SYNONYM 对象自身的显式 remap 只影响目标对象命名，不会豁免终点对象受管性校验；若 terminal source target 不在源端受管范围，仍会判为 `SYNONYM_TARGET_OUT_OF_SCOPE`
+- PUBLIC 同义词元数据预加载会保留 `TABLE_OWNER='PUBLIC'` 的中间节点，用于解析 `PUBLIC -> PUBLIC -> ...` 链式同义词
+- target extra grant audit 以 `managed target scope` 派生的“受管 target object 集合”为准；owner 只用于目录取数，不再把同 schema 下未受管对象的授权误判为 extra grant
 - `constraint_status_sync_mode` 默认值为 `full`；现有 `FK/CHECK` 的 `VALIDATED / NOT VALIDATED` 状态漂移会默认进入状态修复逻辑，`PK/UK` 的 `VALIDATED / NOT VALIDATED` 漂移也会进入状态漂移报告，但仍不生成 `ENABLE/[NO]VALIDATE` SQL
 
 ### 5.2.1 Report DB 语义

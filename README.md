@@ -255,6 +255,9 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `fixup_scripts/view_chain_plans/`：VIEW 链路修复计划
 - `fixup_scripts/errors/`：run_fixup 错误报告
 - 若 SYNONYM 的终点对象不在本次迁移范围（含同义词链最终落到范围外对象），程序会把该 SYNONYM 标记为阻断，并写入 `unsupported_objects_detail_<ts>.txt` / `unsupported_synonym_detail_<ts>.txt`；同时不会再生成 `fixup_scripts/synonym/` DDL
+- 即使 SYNONYM 对象本身存在显式 remap，程序仍会继续校验同义词链最终落点是否受管；显式 remap 不会绕过 terminal target scope 校验
+- PUBLIC 同义词元数据会保留 `PUBLIC -> PUBLIC -> terminal object` 链路所需的中间节点，避免链式 PUBLIC 同义词被过早过滤
+- 目标端额外授权审计现在按“本轮受管 target object 集合”收敛；即使某个旧 schema 仍因其他对象留在 `managed target scope` 内，也不会再把该 schema 下未受管对象的授权误判成 extra grant
 
 ## 触发器专项说明
 - 触发器中的真实对象引用会继续按现有规则做 schema 补全和 remap。
