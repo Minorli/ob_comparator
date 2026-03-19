@@ -85,6 +85,7 @@
 - 现有列 `NULLABLE` / `NOT NULL` 语义漂移校验（按列语义处理，不依赖系统命名 `SYS_C... IS NOT NULL` 约束名）
 - 覆盖系统命名 `SYS_C... IS NOT NULL` 且 `ENABLED + NOT VALIDATED` 的 `NOT NULL ENABLE NOVALIDATE` 语义补位；该类进入 `TABLE mismatch`，并在 `table_alter` 中默认输出可执行 `ADD CONSTRAINT ... ENABLE NOVALIDATE`，同时保留严格 `NOT NULL` 的 review-first 注释
 - OB 侧等价 `CHECK (<col> IS NOT NULL)` suppress 依赖 `DBA_CONSTRAINTS.SEARCH_CONDITION[_VC]`；元数据加载采用按 chunk 保留成功结果 + 退化 owner/table/constraint 定向回填，避免个别 chunk 失败导致整批 `SEARCH_CONDITION` 丢失
+- OceanBase 自动 `*_OBCHECK_*` / `*_OBNOTNULL_*` 约束在普通约束 compare 中继续降噪，但其单列 `IS NOT NULL` 语义必须保留给 `TABLE` compare 使用
 - 普通 `NOT NULL` 收紧默认采用 `plain_not_null_fixup_mode=runnable_if_no_nulls`；会先探测目标端是否存在 `NULL`，仅无 `NULL` 时输出可执行 `MODIFY ... NOT NULL`，否则继续保留注释
 - 当 `column_visibility_policy=auto` 且两端 `INVISIBLE_COLUMN` 元数据不完整时，不改变 compare/fixup 结论，但会输出独立 `column_visibility_skipped_detail` 说明本轮跳过范围
 - identity 列模式差异校验（`GENERATED ALWAYS` / `BY DEFAULT` / `BY DEFAULT ON NULL`），以 TABLE DDL 提取为主，不只依赖 `IDENTITY_COLUMN`

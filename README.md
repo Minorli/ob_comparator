@@ -229,6 +229,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/extra_mismatch_detail_<ts>.txt`：扩展对象差异明细（report_detail_mode=split）
 - `main_reports/run_<ts>/column_nullability_detail_<ts>.txt`：现有列空值语义差异明细（含 `NOT NULL`、`NOT NULL ENABLE NOVALIDATE` 与反向漂移；其中 `ENABLE NOVALIDATE` 补位会在 `table_alter` 中默认输出可执行约束 SQL）
 - OceanBase 侧等价 `CHECK (<col> IS NOT NULL)` 识别依赖 `DBA_CONSTRAINTS` 条件文本；当前版本已改为按 chunk 保留成功的 `SEARCH_CONDITION`，并在退化时按表/约束回填，避免因个别 owner 查询失败而误生 `NOT NULL ENABLE NOVALIDATE` DDL
+- OceanBase 自动生成的 `*_OBCHECK_*` / `*_OBNOTNULL_*` 约束会继续从普通约束噪声中抑制，但其 `IS NOT NULL` 语义仍会保留给 `TABLE` compare 使用，避免目标端已存在等价约束时重复生成 `table_alter` DDL
 - `main_reports/run_<ts>/column_visibility_skipped_detail_<ts>.txt`：`column_visibility_policy=auto` 且 `INVISIBLE_COLUMN` 元数据不完整时的跳过明细，说明哪些表本轮未做 INVISIBLE compare/fixup
 - OceanBase 列元数据现在联合 `DBA_TAB_COLUMNS` 与 `DBA_TAB_COLS` 取长补短；标准字段优先保留 `DBA_TAB_COLUMNS`，可选标记/缺失值由 `DBA_TAB_COLS` 补齐，降低单视图元数据不一致带来的漏检
 - 普通 `NOT NULL` 收紧默认改为 `plain_not_null_fixup_mode=runnable_if_no_nulls`：先探测目标端是否存在 `NULL`，仅无 `NULL` 时输出可执行 `MODIFY ... NOT NULL`；如需恢复纯 review-first，可改回 `review_only`

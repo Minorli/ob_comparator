@@ -1062,6 +1062,7 @@ class ObMetadata(NamedTuple):
     identity_modes: Dict[Tuple[str, str], Dict[str, str]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: IDENTITY_MODE}
     default_on_null_columns: Dict[Tuple[str, str], Tuple[str, ...]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> (COLUMN_NAME, ...)
     identity_options: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: {OPTION: VALUE}}
+    enabled_notnull_check_columns: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: enabled single-column IS NOT NULL check meta}
 
 
 class OracleMetadata(NamedTuple):
@@ -3179,6 +3180,7 @@ def normalize_ob_metadata_public_owner(meta: ObMetadata) -> ObMetadata:
         identity_modes=_remap_owner_table_simple(meta.identity_modes or {}),
         default_on_null_columns=_remap_owner_table_simple(meta.default_on_null_columns or {}),
         identity_options=_remap_owner_table_simple(meta.identity_options or {}),
+        enabled_notnull_check_columns=_remap_owner_table_dict(meta.enabled_notnull_check_columns or {}),
     )
 
 def is_index_expression_token(token: Optional[str]) -> bool:
@@ -13114,6 +13116,7 @@ def dump_ob_metadata(
 
     # --- 5. DBA_CONSTRAINTS (P/U/R/C) ---
     constraints: Dict[Tuple[str, str], Dict[str, Dict]] = {}
+    enabled_notnull_check_columns: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = {}
     if include_constraints:
         use_search_condition_vc = ob_has_dba_column(ob_cfg, "DBA_CONSTRAINTS", "SEARCH_CONDITION_VC")
         deferrable_supported = (
@@ -13343,6 +13346,11 @@ def dump_ob_metadata(
                     if ref_table:
                         info["ref_table_owner"], info["ref_table_name"] = ref_table
 
+        for key, cons_map in constraints.items():
+            nn_map = build_enabled_notnull_check_column_map(cons_map)
+            if nn_map:
+                enabled_notnull_check_columns[key] = nn_map
+
         # 过滤 OceanBase 自动生成的 *_OBNOTNULL_* CHECK 约束
         if constraints:
             pruned_constraints: Dict[Tuple[str, str], Dict[str, Dict]] = {}
@@ -13557,6 +13565,7 @@ def dump_ob_metadata(
         identity_modes=identity_modes,
         default_on_null_columns=default_on_null_columns,
         identity_options=identity_options,
+        enabled_notnull_check_columns=enabled_notnull_check_columns,
     )
     ob_table_count = len(ob_meta.tab_columns)
     ob_column_count = sum(len(cols) for cols in ob_meta.tab_columns.values())
@@ -19779,8 +19788,11 @@ def check_primary_objects(
             src_notnull_novalidate_cols = build_system_notnull_novalidate_column_map(
                 oracle_meta.constraints.get((src_schema_u, src_obj_u), {})
             )
-            tgt_enabled_notnull_cols = build_enabled_notnull_check_column_map(
-                ob_meta.constraints.get((tgt_schema_u, tgt_obj_u), {})
+            tgt_enabled_notnull_cols = (
+                (getattr(ob_meta, "enabled_notnull_check_columns", {}) or {}).get((tgt_schema_u, tgt_obj_u), {})
+                or build_enabled_notnull_check_column_map(
+                    ob_meta.constraints.get((tgt_schema_u, tgt_obj_u), {})
+                )
             )
             src_identity_modes = (getattr(oracle_meta, "identity_modes", {}) or {}).get((src_schema_u, src_obj_u), {})
             tgt_identity_modes = (getattr(ob_meta, "identity_modes", {}) or {}).get((tgt_schema_u, tgt_obj_u), {})
