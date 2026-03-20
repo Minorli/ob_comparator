@@ -294,7 +294,7 @@
 同义词与触发器
 - synonym_check_scope：同义词校验范围。默认：public_only。
   可选值：public_only（仅 PUBLIC 参与 missing/extra/汇总统计）、all（PUBLIC+私有全量校验）。
-  说明：该开关影响“校验与统计口径”；不影响同义词 fixup 输出范围。
+  说明：该开关影响“校验与统计口径”；不影响同义词 fixup 输出范围。PUBLIC 同义词仅在终点对象落入受管源范围时才会被纳入，Oracle 自带系统 PUBLIC 链路会自动过滤。
 - synonym_fixup_scope：同义词修补范围。默认：public_only。
   可选值：all（PUBLIC+私有）、public_only（仅 PUBLIC）。
 - name_collision_mode：约束/索引重名处理模式。默认：fixup。

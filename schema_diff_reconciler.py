@@ -4513,6 +4513,7 @@ class TriggerListReportRow(NamedTuple):
 
 class TriggerStatusReportRow(NamedTuple):
     trigger_full: str
+    src_trigger_full: str
     src_event: str
     tgt_event: str
     src_enabled: str
@@ -4568,6 +4569,7 @@ class TriggerLiteralPathAlertRow(NamedTuple):
 
 class ConstraintStatusDriftRow(NamedTuple):
     table_full: str
+    src_table_full: str
     constraint_type: str
     src_constraint: str
     tgt_constraint: str
@@ -7701,6 +7703,7 @@ def collect_trigger_status_rows(
             diffs.append("VALID")
         rows.append(TriggerStatusReportRow(
             trigger_full=mapped_u,
+            src_trigger_full=src_full.upper(),
             src_event=s_event,
             tgt_event=t_event,
             src_enabled=s_enabled,
@@ -8029,6 +8032,7 @@ def collect_constraint_status_drift_rows(
             rows.append(
                 ConstraintStatusDriftRow(
                     table_full=f"{tgt_schema}.{tgt_table}",
+                    src_table_full=f"{src_schema}.{src_table}",
                     constraint_type=ctype,
                     src_constraint=src_name_u,
                     tgt_constraint=tgt_name_u,
@@ -9352,6 +9356,9 @@ def get_source_objects(
     skipped_iot = 0
     added_synonyms = 0
     added_public_synonyms = 0
+    skipped_public_synonyms = 0
+    private_synonym_meta: Dict[Tuple[str, str], SynonymMeta] = {}
+    public_synonym_meta: Dict[Tuple[str, str], SynonymMeta] = {}
 
     try:
         with oracledb.connect(
@@ -9431,6 +9438,13 @@ def get_source_objects(
                                     continue
                                 full_name = f"{owner}.{syn_name}"
                                 source_objects[full_name].add('SYNONYM')
+                                private_synonym_meta[(owner, syn_name)] = SynonymMeta(
+                                    owner=owner,
+                                    name=syn_name,
+                                    table_owner=table_owner,
+                                    table_name=table_name,
+                                    db_link=None,
+                                )
                                 added_synonyms += 1
                     if target_owners and "PUBLIC" in synonym_owners:
                         target_chunks = chunk_list(target_owners, ORACLE_IN_BATCH_SIZE)
@@ -9438,7 +9452,7 @@ def get_source_objects(
                             SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME
                             FROM DBA_SYNONYMS
                             WHERE OWNER = 'PUBLIC'
-                              AND TABLE_OWNER IN ({target_ph})
+                              AND (TABLE_OWNER IN ({target_ph}) OR TABLE_OWNER = 'PUBLIC')
                               AND TABLE_NAME IS NOT NULL
                         """
                         for target_chunk in target_chunks:
@@ -9463,9 +9477,13 @@ def get_source_objects(
                                 table_name = table_name_raw.upper()
                                 if not owner or not syn_name or not table_owner or not table_name:
                                     continue
-                                full_name = f"{owner}.{syn_name}"
-                                source_objects[full_name].add('SYNONYM')
-                                added_public_synonyms += 1
+                                public_synonym_meta[(owner, syn_name)] = SynonymMeta(
+                                    owner=owner,
+                                    name=syn_name,
+                                    table_owner=table_owner,
+                                    table_name=table_name,
+                                    db_link=None,
+                                )
             # 精确认定物化视图集合，避免误删真实表
             with connection.cursor() as cursor:
                 for placeholders, chunk in iter_in_chunks(schemas_list):
@@ -9529,6 +9547,19 @@ def get_source_objects(
             mview_dedup
         )
 
+    if include_synonyms and public_synonym_meta:
+        combined_synonym_meta = dict(private_synonym_meta)
+        combined_synonym_meta.update(public_synonym_meta)
+        relevant_public_keys, _closure_public_keys = classify_public_synonym_scope(
+            combined_synonym_meta,
+            known_source_types=source_objects,
+            allowed_terminal_source_schemas=schemas_list,
+        )
+        for owner_u, name_u in sorted(relevant_public_keys):
+            source_objects["%s.%s" % (owner_u, name_u)].add('SYNONYM')
+        added_public_synonyms = len(relevant_public_keys)
+        skipped_public_synonyms = max(0, len(public_synonym_meta) - added_public_synonyms)
+
     total_objects = sum(len(types) for types in source_objects.values())
     log.info(
         "从 Oracle 成功获取 %d 个受管对象 (包含主对象与扩展对象)。",
@@ -9536,9 +9567,10 @@ def get_source_objects(
     )
     if include_synonyms:
         log.info(
-            "已纳入同义词 %d 个（含 PUBLIC %d 个），仅保留指向 source_schemas 的同义词。",
+            "已纳入同义词 %d 个（含 PUBLIC %d 个，过滤无关 PUBLIC %d 个）；PUBLIC 同义词仅保留终点落在受管源范围内的链路。",
             added_synonyms + added_public_synonyms,
-            added_public_synonyms
+            added_public_synonyms,
+            skipped_public_synonyms
         )
     if skipped_iot:
         log.info("已跳过 %d 个 SYS_IOT_OVER_* IOT 表，不参与对比或修补脚本生成。", skipped_iot)
@@ -9703,14 +9735,6 @@ def load_synonym_metadata(
     result: Dict[Tuple[str, str], SynonymMeta] = {}
     skipped_public = 0
 
-    def _should_keep_public_synonym_meta(table_owner: str) -> bool:
-        table_owner_u = (table_owner or "").strip().upper()
-        if not allowed_targets:
-            return True
-        if table_owner_u == "PUBLIC":
-            return True
-        return table_owner_u in allowed_targets
-
     try:
         with oracledb.connect(
             user=ora_cfg['user'],
@@ -9767,9 +9791,6 @@ def load_synonym_metadata(
                             db_link = (row[4] or '').strip().upper() if row[4] else None
                             if not owner or not name or not table_name:
                                 continue
-                            if not _should_keep_public_synonym_meta(table_owner):
-                                skipped_public += 1
-                                continue
                             key = (owner, name)
                             result[key] = SynonymMeta(
                                 owner=owner,
@@ -9778,15 +9799,31 @@ def load_synonym_metadata(
                                 table_name=table_name,
                                 db_link=db_link
                             )
+        if allowed_targets:
+            relevant_public_keys, closure_public_keys = classify_public_synonym_scope(
+                result,
+                allowed_terminal_source_schemas=sorted(allowed_targets),
+            )
+            filtered_result: Dict[Tuple[str, str], SynonymMeta] = {}
+            for key, meta in result.items():
+                if (key[0] or "").upper() != "PUBLIC":
+                    filtered_result[key] = meta
+                    continue
+                if key in closure_public_keys or key in relevant_public_keys:
+                    filtered_result[key] = meta
+                    continue
+                skipped_public += 1
+            result = filtered_result
     except oracledb.Error as exc:
         log.warning("读取同义词元数据失败，将回退 DBMS_METADATA：%s", exc)
 
     target_hint = ",".join(sorted(allowed_targets)) if allowed_targets else "<ALL>"
     log.info(
-        "已缓存 %d 个同义词元数据（OWNER IN %s，TABLE_OWNER IN %s）。",
+        "已缓存 %d 个同义词元数据（OWNER IN %s，TABLE_OWNER IN %s，过滤无关 PUBLIC %d 个）。",
         len(result),
         ",".join(owners),
-        target_hint
+        target_hint,
+        skipped_public
     )
     return result
 
@@ -9803,6 +9840,27 @@ def resolve_synonym_terminal_source(
     返回格式: OWNER.OBJECT
     - 若遇到 DBLINK、循环依赖或元数据不足，则返回 None。
     """
+    terminal_full, _chain = resolve_synonym_terminal_source_with_chain(
+        synonym_owner,
+        synonym_name,
+        synonym_meta,
+        known_source_types=known_source_types,
+        max_depth=max_depth,
+    )
+    return terminal_full
+
+
+def resolve_synonym_terminal_source_with_chain(
+    synonym_owner: str,
+    synonym_name: str,
+    synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]],
+    known_source_types: Optional[Dict[str, object]] = None,
+    max_depth: int = 16
+) -> Tuple[Optional[str], Tuple[Tuple[str, str], ...]]:
+    """
+    解析同义词终点对象，并返回遍历到的同义词链 key 列表。
+    chain 仅包含实际访问过的 synonym key，便于后续保留最小 PUBLIC 链闭包。
+    """
     def _known_types_for(full_name: str) -> Set[str]:
         if not known_source_types:
             return set()
@@ -9816,29 +9874,31 @@ def resolve_synonym_terminal_source(
         return {str(item).upper() for item in iterable if item}
 
     if not synonym_meta:
-        return None
+        return None, ()
     owner_u = (synonym_owner or "").upper()
     name_u = (synonym_name or "").upper()
     if not owner_u or not name_u:
-        return None
+        return None, ()
     if (owner_u, name_u) not in synonym_meta:
-        return None
+        return None, ()
 
     visited: Set[Tuple[str, str]] = set()
+    chain: List[Tuple[str, str]] = []
     for _ in range(max_depth):
         key = (owner_u, name_u)
         if key in visited:
-            return None
+            return None, tuple(chain)
         visited.add(key)
+        chain.append(key)
         meta = synonym_meta.get(key)
         if not meta:
-            return f"{owner_u}.{name_u}"
+            return f"{owner_u}.{name_u}", tuple(chain)
         if meta.db_link:
-            return None
+            return None, tuple(chain)
         next_owner = (meta.table_owner or "").upper()
         next_name = (meta.table_name or "").upper()
         if not next_owner or not next_name:
-            return None
+            return None, tuple(chain)
         next_key = (next_owner, next_name)
         if next_key in synonym_meta:
             owner_u, name_u = next_key
@@ -9851,9 +9911,69 @@ def resolve_synonym_terminal_source(
                 owner_u, name_u = public_key
                 continue
 
-        return f"{next_owner}.{next_name}"
+        return f"{next_owner}.{next_name}", tuple(chain)
 
-    return None
+    return None, tuple(chain)
+
+
+def classify_public_synonym_scope(
+    synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]],
+    *,
+    known_source_types: Optional[Dict[str, object]] = None,
+    allowed_terminal_source_schemas: Optional[Sequence[str]] = None,
+    max_depth: int = 16,
+) -> Tuple[Set[Tuple[str, str]], Set[Tuple[str, str]]]:
+    """
+    返回:
+      - relevant_public_keys: 终点落在受管源范围内、应进入 source_objects 的 PUBLIC 同义词
+      - closure_public_keys: 解析这些 PUBLIC 同义词所需保留的最小 PUBLIC 链闭包
+    """
+    if not synonym_meta:
+        return set(), set()
+
+    allowed_schemas = {
+        (item or "").strip().upper()
+        for item in (allowed_terminal_source_schemas or [])
+        if (item or "").strip()
+    }
+
+    def _is_terminal_in_scope(terminal_full: Optional[str]) -> bool:
+        terminal_u = (terminal_full or "").upper().strip()
+        if not terminal_u or "." not in terminal_u:
+            return False
+        if known_source_types:
+            entry = known_source_types.get(terminal_u)
+            if entry:
+                if isinstance(entry, dict):
+                    return bool(entry)
+                return bool(set(entry))
+        term_schema = terminal_u.split(".", 1)[0]
+        if allowed_schemas:
+            return term_schema in allowed_schemas
+        return False
+
+    relevant_public_keys: Set[Tuple[str, str]] = set()
+    closure_public_keys: Set[Tuple[str, str]] = set()
+    public_keys = sorted(
+        key for key in synonym_meta.keys()
+        if key and len(key) == 2 and (key[0] or "").upper() == "PUBLIC"
+    )
+    for owner_u, name_u in public_keys:
+        terminal_full, chain = resolve_synonym_terminal_source_with_chain(
+            owner_u,
+            name_u,
+            synonym_meta,
+            known_source_types=known_source_types,
+            max_depth=max_depth,
+        )
+        if not _is_terminal_in_scope(terminal_full):
+            continue
+        relevant_public_keys.add((owner_u, name_u))
+        closure_public_keys.update(
+            key for key in chain
+            if key and len(key) == 2 and (key[0] or "").upper() == "PUBLIC"
+        )
+    return relevant_public_keys, closure_public_keys
 
 
 def resolve_synonym_scope_status(
@@ -36088,7 +36208,9 @@ def generate_fixup_scripts(
                     if not parsed:
                         return
                     schema_u, trigger_u = parsed
-                    if not allow_fixup("TRIGGER", schema_u, schema_u):
+                    src_parsed = parse_full_object_name(_row.src_trigger_full or "")
+                    src_schema_u = src_parsed[0] if src_parsed else schema_u
+                    if not allow_fixup("TRIGGER", schema_u, src_schema_u):
                         return
                     content = prepend_set_schema("\n".join(_sqls), schema_u)
                     filename = f"{schema_u}.{trigger_u}.status.sql"
@@ -36119,12 +36241,16 @@ def generate_fixup_scripts(
                     if not table_parsed:
                         return
                     schema_u, table_u = table_parsed
-                    if not allow_fixup("CONSTRAINT", schema_u, schema_u):
+                    src_table_parsed = parse_full_object_name(_row.src_table_full or "")
+                    src_schema_u = src_table_parsed[0] if src_table_parsed else schema_u
+                    if not allow_fixup("CONSTRAINT", schema_u, src_schema_u):
                         return
                     content = prepend_set_schema(_row.action_sql, schema_u)
                     filename = f"{schema_u}.{_row.tgt_constraint}.status.sql"
                     header = f"状态修复 CONSTRAINT {_row.tgt_constraint} (表: {schema_u}.{table_u})"
                     extra_comments = [
+                        f"src_table={_row.src_table_full}",
+                        f"tgt_table={_row.table_full}",
                         f"src_constraint={_row.src_constraint}",
                         f"tgt_constraint={_row.tgt_constraint}",
                         f"constraint_type={_row.constraint_type}",
