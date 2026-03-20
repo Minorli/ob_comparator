@@ -3006,7 +3006,8 @@ def invalidate_exists_cache(
 ) -> int:
     removed = 0
     for full_name, obj_type in planned_objects:
-        key = (normalize_identifier(full_name), normalize_object_type(obj_type))
+        # Use the same key format as check_object_exists: (full_name.upper(), obj_type.upper())
+        key = (full_name.upper(), obj_type.upper())
         if key in exists_cache:
             exists_cache.pop(key, None)
             removed += 1
@@ -3591,7 +3592,14 @@ def split_sql_statements(sql_text: str) -> List[str]:
         buffer.clear()
 
     for line in sql_text.splitlines(keepends=True):
-        if not slash_block and (RE_BLOCK_START.match(line) or RE_ANON_BLOCK_START.match(line)):
+        if (
+            not slash_block
+            and not in_single
+            and not in_double
+            and not in_q_quote
+            and block_comment_depth == 0
+            and (RE_BLOCK_START.match(line) or RE_ANON_BLOCK_START.match(line))
+        ):
             slash_block = True
             slash_block_end_name = _extract_block_header_end_name(line)
         stripped = line.strip()
@@ -4875,7 +4883,15 @@ def query_invalid_objects(
         for line in result.stdout.strip().splitlines():
             parts = line.split('\t')
             if len(parts) >= 3:
-                invalid_objects.append((parts[0].strip(), parts[1].strip(), parts[2].strip()))
+                owner = parts[0].strip()
+                obj_name = parts[1].strip()
+                obj_type = parts[2].strip()
+                # Skip header row emitted by obclient
+                if owner.upper() == "OWNER" and obj_name.upper() == "OBJECT_NAME" and obj_type.upper() == "OBJECT_TYPE":
+                    continue
+                if not owner or not obj_name or not obj_type:
+                    continue
+                invalid_objects.append((owner, obj_name, obj_type))
         
         return invalid_objects
     except Exception as exc:
