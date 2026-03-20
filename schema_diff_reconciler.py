@@ -1094,6 +1094,7 @@ class OracleMetadata(NamedTuple):
     package_errors_complete: bool                            # 源端错误信息是否完整
     partition_key_columns: Dict[Tuple[str, str], List[str]]   # (OWNER, TABLE_NAME) -> [PARTITION_COLS...]
     interval_partitions: Dict[Tuple[str, str], IntervalPartitionInfo]  # (OWNER, TABLE) -> interval info
+    loaded_schemas: FrozenSet[str] = frozenset()               # 已加载到任一 Oracle 元数据片段中的 schema
     privilege_family_counts: Tuple["OraclePrivilegeFamilyCount", ...] = ()
     non_table_triggers: Tuple["NonTableTriggerInfo", ...] = ()
     temporary_tables: FrozenSet[Tuple[str, str]] = frozenset()          # (OWNER, TABLE_NAME) -> source GTT / temporary tables
@@ -16035,6 +16036,7 @@ def dump_oracle_metadata(
             package_errors_complete=False,
             partition_key_columns={},
             interval_partitions={},
+            loaded_schemas=frozenset(),
             privilege_family_counts=(),
             non_table_triggers=(),
             temporary_tables=set(),
@@ -17228,6 +17230,18 @@ def dump_oracle_metadata(
         except oracledb.Error as e:
             log.warning("读取 Oracle TABLE DDL 以提取 identity/default-on-null 语义失败，将跳过对应 DDL 兜底 compare: %s", e)
 
+    loaded_schema_set: Set[str] = set(seq_owners)
+    loaded_schema_set.update(owner for owner, _table in table_columns.keys())
+    loaded_schema_set.update(owner for owner, _table in indexes.keys())
+    loaded_schema_set.update(owner for owner, _table in constraints.keys())
+    loaded_schema_set.update(owner for owner, _table in triggers.keys())
+    loaded_schema_set.update(owner for owner, _table in table_comments.keys())
+    loaded_schema_set.update(owner for owner, _table in column_comments.keys())
+    loaded_schema_set.update(owner for owner, _name, _obj_type in object_statuses.keys())
+    loaded_schema_set.update(owner for owner, _name, _err_type in package_errors.keys())
+    loaded_schema_set.update(owner for owner, _table in partition_key_columns.keys())
+    loaded_schema_set.update(owner for owner, _table in interval_partitions.keys())
+
     return OracleMetadata(
         table_columns=table_columns,
         invisible_column_supported=invisible_column_supported,
@@ -17254,6 +17268,7 @@ def dump_oracle_metadata(
         package_errors_complete=package_errors_complete,
         partition_key_columns=partition_key_columns,
         interval_partitions=interval_partitions,
+        loaded_schemas=frozenset(sorted(loaded_schema_set)),
         privilege_family_counts=privilege_family_counts,
         non_table_triggers=tuple(non_table_triggers),
         temporary_tables=temporary_tables,
@@ -22218,38 +22233,9 @@ def compare_sequences_for_schema(
         log.warning(f"[序列检查] 未找到 {src_schema} 的 Oracle 序列元数据。")
         tgt_seqs_snapshot = ob_meta.sequences.get(tgt_schema.upper(), set())
         
-        # 改进：区分元数据加载失败 vs schema确实没有序列
-        # 检查该schema是否在已加载的对象元数据中出现（说明schema存在）
         schema_u = src_schema.upper()
-        schema_has_objects = any(
-            owner == schema_u
-            for owner, _ in oracle_meta.table_columns.keys()
-        )
-        if not schema_has_objects:
-            for owner, _ in oracle_meta.indexes.keys():
-                if owner == schema_u:
-                    schema_has_objects = True
-                    break
-        if not schema_has_objects:
-            for owner, _ in oracle_meta.constraints.keys():
-                if owner == schema_u:
-                    schema_has_objects = True
-                    break
-        if not schema_has_objects:
-            for owner, _ in oracle_meta.triggers.keys():
-                if owner == schema_u:
-                    schema_has_objects = True
-                    break
-        if not schema_has_objects:
-            for owner, _ in oracle_meta.table_comments.keys():
-                if owner == schema_u:
-                    schema_has_objects = True
-                    break
-        if not schema_has_objects:
-            for owner, _ in oracle_meta.column_comments.keys():
-                if owner == schema_u:
-                    schema_has_objects = True
-                    break
+        loaded_schemas = set(getattr(oracle_meta, "loaded_schemas", ()) or ())
+        schema_has_objects = schema_u in loaded_schemas
 
         if not schema_has_objects:
             # Schema不存在于元数据中，可能是配置错误或权限问题，跳过比较
@@ -26567,9 +26553,17 @@ def mask_sql_for_scan(sql: str) -> str:
     i = 0
     in_single = False
     in_double = False
+    in_q_quote = False
+    q_quote_end = ""
     in_line_comment = False
     in_block_comment = False
     length = len(chars)
+    q_quote_pairs = {
+        "[": "]",
+        "{": "}",
+        "(": ")",
+        "<": ">",
+    }
     while i < length:
         ch = chars[i]
         nxt = chars[i + 1] if i + 1 < length else ""
@@ -26609,6 +26603,15 @@ def mask_sql_for_scan(sql: str) -> str:
                 in_double = False
             i += 1
             continue
+        if in_q_quote:
+            chars[i] = " "
+            if ch == q_quote_end and nxt == "'":
+                chars[i + 1] = " "
+                i += 2
+                in_q_quote = False
+                continue
+            i += 1
+            continue
         if ch == "-" and nxt == "-":
             chars[i] = " "
             chars[i + 1] = " "
@@ -26626,6 +26629,16 @@ def mask_sql_for_scan(sql: str) -> str:
             in_single = True
             i += 1
             continue
+        if ch in ("q", "Q") and nxt == "'" and i + 2 < length:
+            delimiter = chars[i + 2]
+            if not delimiter.isspace():
+                chars[i] = " "
+                chars[i + 1] = " "
+                chars[i + 2] = " "
+                q_quote_end = q_quote_pairs.get(delimiter, delimiter)
+                in_q_quote = True
+                i += 3
+                continue
         if ch == '"':
             chars[i] = " "
             in_double = True
@@ -26681,8 +26694,16 @@ def split_sql_list_items(segment: str) -> List[str]:
     depth = 0
     in_single = False
     in_double = False
+    in_q_quote = False
+    q_quote_end = ""
     i = 0
     length = len(segment)
+    q_quote_pairs = {
+        "[": "]",
+        "{": "}",
+        "(": ")",
+        "<": ">",
+    }
     while i < length:
         ch = segment[i]
         nxt = segment[i + 1] if i + 1 < length else ""
@@ -26706,6 +26727,25 @@ def split_sql_list_items(segment: str) -> List[str]:
                 in_double = False
             i += 1
             continue
+        if in_q_quote:
+            buf.append(ch)
+            if ch == q_quote_end and nxt == "'":
+                buf.append(nxt)
+                i += 2
+                in_q_quote = False
+                continue
+            i += 1
+            continue
+        if ch in ("q", "Q") and nxt == "'" and i + 2 < length:
+            delimiter = segment[i + 2]
+            if not delimiter.isspace():
+                q_quote_end = q_quote_pairs.get(delimiter, delimiter)
+                in_q_quote = True
+                buf.append(ch)
+                buf.append(nxt)
+                buf.append(delimiter)
+                i += 3
+                continue
         if ch == "'":
             in_single = True
             buf.append(ch)

@@ -1452,6 +1452,8 @@ def move_sql_to_done(sql_path: Path, done_dir: Path) -> str:
             except Exception as exc:
                 log.warning("已存在文件备份失败: %s (%s)", target_path, str(exc)[:200])
                 return f"(移动失败: 目标已存在且备份失败: {exc})"
+            if target_path.exists():
+                return f"(移动失败: 目标文件在备份后被重新创建: {target_path.name})"
         shutil.move(str(sql_path), target_path)
         return f"(已移至 done/{sql_path.parent.name}/){backup_note}"
     except Exception as exc:
@@ -3710,6 +3712,8 @@ def run_sql(obclient_cmd: List[str], sql_text: str, timeout: Optional[int]) -> s
             input=sql_text,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="ignore",
             check=False,
             timeout=timeout,
         )
@@ -4711,8 +4715,7 @@ def execute_grant_file_with_prune(
 
         error_msg = extract_execution_error(result)
         if not error_msg:
-            if is_grant:
-                removed_count += 1
+            removed_count += 1
             continue
 
         message = error_msg
@@ -4880,7 +4883,13 @@ def query_invalid_objects(
             return []
         
         invalid_objects = []
-        for line in result.stdout.strip().splitlines():
+        for raw_line in (result.stdout or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            upper = line.upper()
+            if upper.startswith("WARNING:") or upper.startswith("SP2-"):
+                continue
             parts = line.split('\t')
             if len(parts) >= 3:
                 owner = parts[0].strip()
@@ -4888,6 +4897,8 @@ def query_invalid_objects(
                 obj_type = parts[2].strip()
                 # Skip header row emitted by obclient
                 if owner.upper() == "OWNER" and obj_name.upper() == "OBJECT_NAME" and obj_type.upper() == "OBJECT_TYPE":
+                    continue
+                if not re.fullmatch(r"[A-Z0-9_$#]+", owner.upper()):
                     continue
                 if not owner or not obj_name or not obj_type:
                     continue
@@ -4933,24 +4944,33 @@ def build_compile_statement(owner: str, obj_name: str, obj_type: str) -> Optiona
     return None
 
 
+class RecompileSummary(NamedTuple):
+    total_recompiled: int
+    remaining_invalid: int
+    recompile_failed: int
+    unsupported_types: int
+
+
 def recompile_invalid_objects(
     obclient_cmd: List[str],
     timeout: Optional[int],
     max_retries: int = MAX_RECOMPILE_RETRIES,
     allowed_owners: Optional[Set[str]] = None
-) -> Tuple[int, int]:
+) -> RecompileSummary:
     """
     Recompile INVALID objects multiple times until all are VALID or max retries reached.
     
     Returns:
-        (total_recompiled, remaining_invalid)
+        RecompileSummary(total_recompiled, remaining_invalid, recompile_failed, unsupported_types)
     """
     total_recompiled = 0
+    recompile_failed = 0
+    unsupported_types = 0
     
     for retry in range(max_retries):
         invalid_objects = query_invalid_objects(obclient_cmd, timeout, allowed_owners=allowed_owners)
         if not invalid_objects:
-            return total_recompiled, 0
+            return RecompileSummary(total_recompiled, 0, recompile_failed, unsupported_types)
         
         log.info(
             "重编译轮次 %d/%d, INVALID=%d",
@@ -4963,6 +4983,7 @@ def recompile_invalid_objects(
         for owner, obj_name, obj_type in invalid_objects:
             compile_sql = build_compile_statement(owner, obj_name, obj_type)
             if not compile_sql:
+                unsupported_types += 1
                 log.info("  SKIP %s.%s (%s): unsupported compile type", owner, obj_name, obj_type)
                 continue
             try:
@@ -4974,10 +4995,12 @@ def recompile_invalid_objects(
                         recompiled_this_round += 1
                         log.info("  OK %s.%s (%s)", owner, obj_name, obj_type)
                     elif still_invalid is True:
+                        recompile_failed += 1
                         log.warning("  FAIL %s.%s (%s): still INVALID after COMPILE", owner, obj_name, obj_type)
                     else:
                         log.warning("  WARN %s.%s (%s): 无法确认编译后状态，未计入成功", owner, obj_name, obj_type)
                 else:
+                    recompile_failed += 1
                     log.warning(
                         "  FAIL %s.%s (%s): %s",
                         owner,
@@ -4986,6 +5009,7 @@ def recompile_invalid_objects(
                         str(error_msg)[:100]
                     )
             except Exception as e:
+                recompile_failed += 1
                 log.warning(
                     "  FAIL %s.%s (%s): %s",
                     owner,
@@ -5002,7 +5026,7 @@ def recompile_invalid_objects(
     
     # Final check
     final_invalid = query_invalid_objects(obclient_cmd, timeout, allowed_owners=allowed_owners)
-    return total_recompiled, len(final_invalid)
+    return RecompileSummary(total_recompiled, len(final_invalid), recompile_failed, unsupported_types)
 
 
 def parse_args() -> argparse.Namespace:
@@ -5510,11 +5534,17 @@ def run_single_fixup(
     # Recompilation phase
     total_recompiled = 0
     remaining_invalid = 0
+    recompile_failed = 0
+    unsupported_recompile_types = 0
     if args.recompile:
         log_subsection("重编译阶段")
-        total_recompiled, remaining_invalid = recompile_invalid_objects(
+        recomp_summary = recompile_invalid_objects(
             obclient_cmd, ob_timeout, args.max_retries, allowed_owners=recompile_owners
         )
+        total_recompiled = recomp_summary.total_recompiled
+        remaining_invalid = recomp_summary.remaining_invalid
+        recompile_failed = recomp_summary.recompile_failed
+        unsupported_recompile_types = recomp_summary.unsupported_types
 
     if auto_grant_ctx:
         log_subsection("自动补权限统计")
@@ -5541,6 +5571,8 @@ def run_single_fixup(
     if args.recompile:
         log_subsection("重编译统计")
         log.info("重编译成功 : %d", total_recompiled)
+        log.info("重编译失败 : %d", recompile_failed)
+        log.info("不支持重编译类型 : %d", unsupported_recompile_types)
         log.info("仍为INVALID: %d", remaining_invalid)
         if remaining_invalid > 0:
             log.info("提示: 运行 'SELECT * FROM DBA_OBJECTS WHERE STATUS=\\'INVALID\\';' 查看详情")
@@ -6293,27 +6325,44 @@ def run_iterative_fixup(
             
             break
         
-        if round_success < min_progress:
-            log.warning(f"本轮成功数 ({round_success}) 低于最小进展阈值 ({min_progress})，停止迭代。")
+        effective_min_progress = max(1, min_progress)
+        if round_success < effective_min_progress:
+            if round_success == 0:
+                log.warning("本轮无新成功脚本，停止迭代。")
+                failures_by_type = analyze_failure_patterns(round_results)
+                if failures_by_type:
+                    log_failure_analysis(failures_by_type)
+            else:
+                log.warning(
+                    "本轮成功数 (%d) 低于最小进展阈值 (%d)，停止迭代。",
+                    round_success,
+                    effective_min_progress,
+                )
             break
         
         # Recompile after each round if enabled
         if args.recompile:
             log_subsection("轮次重编译")
-            recomp, invalid = recompile_invalid_objects(
+            recomp_summary = recompile_invalid_objects(
                 obclient_cmd, ob_timeout, 2, allowed_owners=recompile_owners  # Fewer retries per round
             )
-            if recomp > 0:
-                log.info("重编译成功 %d 个对象", recomp)
+            if recomp_summary.total_recompiled > 0:
+                log.info("重编译成功 %d 个对象", recomp_summary.total_recompiled)
     
     # Final recompilation
     total_recompiled = 0
     remaining_invalid = 0
+    recompile_failed = 0
+    unsupported_recompile_types = 0
     if args.recompile:
         log_section("最终重编译")
-        total_recompiled, remaining_invalid = recompile_invalid_objects(
+        recomp_summary = recompile_invalid_objects(
             obclient_cmd, ob_timeout, args.max_retries, allowed_owners=recompile_owners
         )
+        total_recompiled = recomp_summary.total_recompiled
+        remaining_invalid = recomp_summary.remaining_invalid
+        recompile_failed = recomp_summary.recompile_failed
+        unsupported_recompile_types = recomp_summary.unsupported_types
 
     if auto_grant_ctx:
         log_subsection("自动补权限统计")
@@ -6337,6 +6386,8 @@ def run_iterative_fixup(
     if args.recompile:
         log_subsection("最终重编译统计")
         log.info("重编译成功: %d", total_recompiled)
+        log.info("重编译失败: %d", recompile_failed)
+        log.info("不支持重编译类型: %d", unsupported_recompile_types)
         log.info("仍为INVALID: %d", remaining_invalid)
     
     # Final failure analysis
