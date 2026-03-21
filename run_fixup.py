@@ -308,17 +308,61 @@ def load_manual_actions_report(path: Optional[Path]) -> List[ManualActionNoticeR
 def _normalize_manual_action_related_dirs(value: str) -> Set[str]:
     result: Set[str] = set()
     for token in re.split(r"[|,]", str(value or "")):
-        text = str(token or "").strip().strip("/")
+        text = normalize_dir_filter(token)
         if text:
-            result.add(text.lower())
+            result.add(text)
     return result
+
+
+def normalize_dir_filter(value: str) -> str:
+    return str(value or "").strip().replace("\\", "/").strip("/").lower()
+
+
+def dir_filter_overlaps(path_a: str, path_b: str) -> bool:
+    a = normalize_dir_filter(path_a)
+    b = normalize_dir_filter(path_b)
+    if not a or not b:
+        return False
+    return a == b or a.startswith(f"{b}/") or b.startswith(f"{a}/")
+
+
+def dir_path_matches_filter(path_value: str, filter_value: str) -> bool:
+    path_norm = normalize_dir_filter(path_value)
+    filter_norm = normalize_dir_filter(filter_value)
+    if not path_norm or not filter_norm:
+        return False
+    return path_norm == filter_norm or path_norm.startswith(f"{filter_norm}/")
+
+
+def should_scan_top_dir(dir_name: str, include_dirs: Optional[Set[str]]) -> bool:
+    include_set = {normalize_dir_filter(item) for item in (include_dirs or set()) if normalize_dir_filter(item)}
+    if not include_set:
+        return True
+    dir_norm = normalize_dir_filter(dir_name)
+    return any(dir_filter_overlaps(dir_norm, item) for item in include_set)
+
+
+def path_selected_by_filters(path_value: str, include_dirs: Optional[Set[str]]) -> bool:
+    include_set = {normalize_dir_filter(item) for item in (include_dirs or set()) if normalize_dir_filter(item)}
+    if not include_set:
+        return True
+    path_norm = normalize_dir_filter(path_value)
+    return any(dir_path_matches_filter(path_norm, item) for item in include_set)
+
+
+def path_excluded_by_filters(path_value: str, exclude_dirs: Optional[Set[str]]) -> bool:
+    exclude_set = {normalize_dir_filter(item) for item in (exclude_dirs or set()) if normalize_dir_filter(item)}
+    if not exclude_set:
+        return False
+    path_norm = normalize_dir_filter(path_value)
+    return any(dir_path_matches_filter(path_norm, item) for item in exclude_set)
 
 
 def select_relevant_manual_actions(
     rows: Sequence[ManualActionNoticeRow],
     only_dirs: Sequence[str]
 ) -> List[ManualActionNoticeRow]:
-    selected_dirs = {str(item).strip().lower() for item in (only_dirs or []) if str(item).strip()}
+    selected_dirs = {normalize_dir_filter(item) for item in (only_dirs or []) if normalize_dir_filter(item)}
     if not selected_dirs:
         return list(rows)
 
@@ -343,9 +387,7 @@ def select_relevant_manual_actions(
             continue
         related_dirs = _normalize_manual_action_related_dirs(row.related_fixup_dir)
         if related_dirs and any(
-            rel == sel
-            or rel.startswith(f"{sel}/")
-            or sel.startswith(f"{rel}/")
+            dir_filter_overlaps(rel, sel)
             for rel in related_dirs
             for sel in selected_dirs
         ):
@@ -964,32 +1006,38 @@ def resolve_grant_dirs(
     exclude_dirs: Set[str]
 ) -> List[str]:
     available = set(subdirs.keys())
-    include_set = {d.lower() for d in include_dirs or set()}
-    exclude_set = {d.lower() for d in exclude_dirs or set()}
+    include_set = {normalize_dir_filter(d) for d in include_dirs or set() if normalize_dir_filter(d)}
+    exclude_set = {normalize_dir_filter(d) for d in exclude_dirs or set() if normalize_dir_filter(d)}
+
+    def _included(name: str) -> bool:
+        return not include_set or any(dir_filter_overlaps(name, item) for item in include_set)
+
+    def _excluded(name: str) -> bool:
+        return any(dir_path_matches_filter(name, item) for item in exclude_set)
 
     grant_dirs: List[str] = []
     if include_set:
-        if "grants_all" in include_set and "grants_all" in available and "grants_all" not in exclude_set:
+        if _included("grants_all") and "grants_all" in available and not _excluded("grants_all"):
             grant_dirs.append("grants_all")
-        if "grants_miss" in include_set and "grants_miss" in available and "grants_miss" not in exclude_set:
+        if _included("grants_miss") and "grants_miss" in available and not _excluded("grants_miss"):
             grant_dirs.append("grants_miss")
-        if "grants" in include_set:
-            if "grants_miss" in available and "grants_miss" not in exclude_set:
+        if _included("grants"):
+            if "grants_miss" in available and not _excluded("grants_miss"):
                 grant_dirs.append("grants_miss")
-            elif "grants" in available and "grants" not in exclude_set:
+            elif "grants" in available and not _excluded("grants"):
                 grant_dirs.append("grants")
-        if "view_prereq_grants" in include_set and "view_prereq_grants" in available and "view_prereq_grants" not in exclude_set:
+        if _included("view_prereq_grants") and "view_prereq_grants" in available and not _excluded("view_prereq_grants"):
             grant_dirs.append("view_prereq_grants")
-        if "view_post_grants" in include_set and "view_post_grants" in available and "view_post_grants" not in exclude_set:
+        if _included("view_post_grants") and "view_post_grants" in available and not _excluded("view_post_grants"):
             grant_dirs.append("view_post_grants")
     else:
-        if "grants_miss" in available and "grants_miss" not in exclude_set:
+        if "grants_miss" in available and not _excluded("grants_miss"):
             grant_dirs.append("grants_miss")
-        elif "grants" in available and "grants" not in exclude_set:
+        elif "grants" in available and not _excluded("grants"):
             grant_dirs.append("grants")
-        if "view_prereq_grants" in available and "view_prereq_grants" not in exclude_set:
+        if "view_prereq_grants" in available and not _excluded("view_prereq_grants"):
             grant_dirs.append("view_prereq_grants")
-        if "view_post_grants" in available and "view_post_grants" not in exclude_set:
+        if "view_post_grants" in available and not _excluded("view_post_grants"):
             grant_dirs.append("view_post_grants")
 
     # preserve order, remove duplicates
@@ -1002,10 +1050,14 @@ def build_run_fixup_change_notices(
     only_dirs: List[str]
 ) -> List[RuntimeNotice]:
     notices: List[RuntimeNotice] = []
-    selected_dirs = {str(item).lower() for item in (only_dirs or []) if str(item).strip()}
+    selected_dirs = {normalize_dir_filter(item) for item in (only_dirs or []) if normalize_dir_filter(item)}
     selected_all = not selected_dirs
+    selected_table = any(dir_filter_overlaps("table", item) for item in selected_dirs)
+    selected_view = any(dir_filter_overlaps("view", item) for item in selected_dirs)
+    selected_grants_revoke = any(dir_filter_overlaps("grants_revoke", item) for item in selected_dirs)
+    selected_cleanup_safe = any(dir_filter_overlaps("cleanup_safe", item) for item in selected_dirs)
     if not getattr(args, "allow_table_create", False) and (
-        "table" in selected_dirs or (selected_all and (fixup_dir / "table").exists())
+        selected_table or (selected_all and (fixup_dir / "table").exists())
     ):
         notices.append(RuntimeNotice(
             "fixup_table_safe_gate",
@@ -1013,7 +1065,7 @@ def build_run_fixup_change_notices(
             "建表脚本默认不执行",
             "run_fixup 默认跳过 table/；确需建表请显式加 --allow-table-create。",
         ))
-    if (selected_all or "grants_revoke" in selected_dirs) and (fixup_dir / "grants_revoke").exists():
+    if (selected_all or selected_grants_revoke) and (fixup_dir / "grants_revoke").exists():
         notices.append(RuntimeNotice(
             "public_grants_revoke_audit",
             "0.9.8.7",
@@ -1021,7 +1073,7 @@ def build_run_fixup_change_notices(
             "若出现 grants_revoke，请先核对源端是否声明，再决定是否回收。",
         ))
     if (
-        (selected_all or "view" in selected_dirs)
+        (selected_all or selected_view)
         and (fixup_dir / "view").exists()
         and not getattr(args, "view_chain_autofix", False)
     ):
@@ -1030,6 +1082,13 @@ def build_run_fixup_change_notices(
             "0.9.8.6",
             "视图链可自动修复",
             "缺失 VIEW 或依赖复杂时，可尝试 python3 run_fixup.py config.ini --view-chain-autofix。",
+        ))
+    if selected_cleanup_safe and (fixup_dir / "cleanup_safe").exists():
+        notices.append(RuntimeNotice(
+            "cleanup_safe_review",
+            "0.9.8.8",
+            "安全清理目录需要显式确认",
+            "cleanup_safe/ 下是 destructive SQL；请先审 extra_cleanup_candidates.txt，再显式按目录执行。",
         ))
     return notices
 
@@ -2079,7 +2138,7 @@ def collect_sql_files_by_layer(
     subdirs = {
         p.name.lower(): p
         for p in fixup_dir.iterdir()
-        if p.is_dir() and p.name != DONE_DIR_NAME and p.name.lower() not in exclude_dirs
+        if p.is_dir() and p.name != DONE_DIR_NAME and not path_excluded_by_filters(p.name, exclude_dirs)
     }
     grant_dirs = resolve_grant_dirs(subdirs, include_dirs, exclude_dirs)
     core_grant_dirs = [d for d in grant_dirs if d in CORE_GRANT_DIRS_ORDER]
@@ -2103,7 +2162,7 @@ def collect_sql_files_by_layer(
                                 continue
                             files_with_layer.append((layer_idx, sql_file))
                     continue
-                if include_dirs and dir_name not in include_dirs:
+                if not should_scan_top_dir(dir_name, include_dirs):
                     continue
                 if dir_name not in subdirs:
                     continue
@@ -2112,6 +2171,11 @@ def collect_sql_files_by_layer(
                     if not sql_file.is_file():
                         continue
                     rel_str = str(sql_file.relative_to(fixup_dir))
+                    rel_parent = normalize_dir_filter(sql_file.parent.relative_to(fixup_dir))
+                    if path_excluded_by_filters(rel_parent, exclude_dirs):
+                        continue
+                    if not path_selected_by_filters(rel_parent, include_dirs):
+                        continue
                     if not any(fnmatch.fnmatch(rel_str, p) or fnmatch.fnmatch(sql_file.name, p)
                               for p in glob_patterns):
                         continue
@@ -2125,13 +2189,18 @@ def collect_sql_files_by_layer(
                 continue
             if is_grant_dir(dir_name) and dir_name not in grant_dirs:
                 continue
-            if include_dirs and dir_name not in include_dirs:
+            if not should_scan_top_dir(dir_name, include_dirs):
                 continue
                 
             for sql_file in iter_sql_files_recursive(subdirs[dir_name]):
                 if not sql_file.is_file():
                     continue
                 rel_str = str(sql_file.relative_to(fixup_dir))
+                rel_parent = normalize_dir_filter(sql_file.parent.relative_to(fixup_dir))
+                if path_excluded_by_filters(rel_parent, exclude_dirs):
+                    continue
+                if not path_selected_by_filters(rel_parent, include_dirs):
+                    continue
                 if not any(fnmatch.fnmatch(rel_str, p) or fnmatch.fnmatch(sql_file.name, p) 
                           for p in glob_patterns):
                     continue
@@ -2162,13 +2231,18 @@ def collect_sql_files_by_layer(
                         files_with_layer.append((idx, sql_file))
                     seen.add(grant_dir)
                 continue
-            if include_dirs and name not in include_dirs:
+            if not should_scan_top_dir(name, include_dirs):
                 continue
             if name in subdirs:
                 for sql_file in iter_sql_files_recursive(subdirs[name]):
                     if not sql_file.is_file():
                         continue
                     rel_str = str(sql_file.relative_to(fixup_dir))
+                    rel_parent = normalize_dir_filter(sql_file.parent.relative_to(fixup_dir))
+                    if path_excluded_by_filters(rel_parent, exclude_dirs):
+                        continue
+                    if not path_selected_by_filters(rel_parent, include_dirs):
+                        continue
                     if not any(fnmatch.fnmatch(rel_str, p) or fnmatch.fnmatch(sql_file.name, p)
                               for p in glob_patterns):
                         continue
@@ -2181,12 +2255,17 @@ def collect_sql_files_by_layer(
                 continue
             if is_grant_dir(name) and name not in grant_dirs:
                 continue
-            if include_dirs and name not in include_dirs:
+            if not should_scan_top_dir(name, include_dirs):
                 continue
             for sql_file in iter_sql_files_recursive(subdirs[name]):
                 if not sql_file.is_file():
                     continue
                 rel_str = str(sql_file.relative_to(fixup_dir))
+                rel_parent = normalize_dir_filter(sql_file.parent.relative_to(fixup_dir))
+                if path_excluded_by_filters(rel_parent, exclude_dirs):
+                    continue
+                if not path_selected_by_filters(rel_parent, include_dirs):
+                    continue
                 if not any(fnmatch.fnmatch(rel_str, p) or fnmatch.fnmatch(sql_file.name, p) 
                           for p in glob_patterns):
                     continue
@@ -4265,12 +4344,17 @@ def collect_sql_files_from_root(
     for subdir in sorted(root_dir.iterdir()):
         if not subdir.is_dir():
             continue
-        if subdir.name.lower() in exclude_set:
+        if path_excluded_by_filters(subdir.name, exclude_set):
             continue
-        if include_set and subdir.name.lower() not in include_set:
+        if not should_scan_top_dir(subdir.name, include_set):
             continue
         for sql_file in iter_sql_files_recursive(subdir):
             if sql_file.is_file():
+                rel_parent = normalize_dir_filter(sql_file.parent.relative_to(root_dir))
+                if path_excluded_by_filters(rel_parent, exclude_set):
+                    continue
+                if not path_selected_by_filters(rel_parent, include_set):
+                    continue
                 files.append(sql_file)
     return files
 
@@ -5158,7 +5242,7 @@ def parse_csv_args(arg_list: List[str]) -> List[str]:
     for item in arg_list:
         if not item:
             continue
-        values.extend([p.strip() for p in item.split(",") if p.strip()])
+        values.extend([normalize_dir_filter(p) for p in item.split(",") if normalize_dir_filter(p)])
     return values
 
 
@@ -5196,36 +5280,41 @@ def main() -> None:
     
     if mapped_dirs:
         if only_dirs:
-            merged = set(d.lower() for d in only_dirs) | set(d.lower() for d in mapped_dirs)
+            merged = set(normalize_dir_filter(d) for d in only_dirs) | set(normalize_dir_filter(d) for d in mapped_dirs)
             only_dirs = sorted(merged)
         else:
-            only_dirs = [d.lower() for d in mapped_dirs]
+            only_dirs = [normalize_dir_filter(d) for d in mapped_dirs]
     else:
-        only_dirs = [d.lower() for d in only_dirs] if only_dirs else []
+        only_dirs = [normalize_dir_filter(d) for d in only_dirs] if only_dirs else []
     
-    exclude_dirs = [d.lower() for d in exclude_dirs]
-    default_excludes = {"tables_unsupported", "unsupported", "constraint_validate_later", "grants_deferred"}
+    exclude_dirs = [normalize_dir_filter(d) for d in exclude_dirs]
+    default_excludes = {"tables_unsupported", "unsupported", "constraint_validate_later", "grants_deferred", "cleanup_safe"}
     if not getattr(args, "allow_table_create", False):
         # Safety first: table create scripts are risky in migration workflows
         # because they can create empty target tables if OMS data load is skipped.
         default_excludes.add("table")
     exclude_set = set(exclude_dirs) | default_excludes
     if only_dirs:
-        exclude_set -= set(only_dirs)
+        exclude_set = {
+            item for item in exclude_set
+            if not any(dir_filter_overlaps(item, include_item) for include_item in only_dirs)
+        }
     if not getattr(args, "allow_table_create", False):
         # Keep table excluded unless explicit opt-in, even with --only-dirs table.
         exclude_set.add("table")
     exclude_dirs = sorted(exclude_set)
 
-    if "table" in only_dirs and not getattr(args, "allow_table_create", False):
+    if any(dir_filter_overlaps("table", item) for item in only_dirs) and not getattr(args, "allow_table_create", False):
         log.warning(
             "检测到 --only-dirs/--only-types 包含 table，但默认安全策略已禁用 table 执行。"
             "如需执行建表脚本，请显式添加 --allow-table-create。"
         )
     if not getattr(args, "allow_table_create", False):
         log.warning("安全模式: 默认跳过 fixup_scripts/table/（防止误建空表）。")
-    if "grants_deferred" not in only_dirs:
+    if not any(dir_filter_overlaps("grants_deferred", item) for item in only_dirs):
         log.warning("安全模式: 默认跳过 fixup_scripts/grants_deferred/（需对象补齐后再执行）。")
+    if not any(dir_filter_overlaps("cleanup_safe", item) for item in only_dirs):
+        log.warning("安全模式: 默认跳过 fixup_scripts/cleanup_safe/（显式审核后再执行 destructive 清理 SQL）。")
     
     # Load configuration
     try:
@@ -5687,9 +5776,13 @@ def run_view_chain_autofix(
         )
 
     # 根据用户 --only-dirs 决定使用哪些 grant 目录
-    only_dirs_set = set(only_dirs) if only_dirs else set()
-    use_grants_miss = not only_dirs_set or "grants_miss" in only_dirs_set or "grants" in only_dirs_set
-    use_grants_all = not only_dirs_set or "grants_all" in only_dirs_set
+    only_dirs_set = {normalize_dir_filter(item) for item in (only_dirs or []) if normalize_dir_filter(item)}
+    use_grants_miss = (
+        not only_dirs_set
+        or any(dir_filter_overlaps("grants_miss", item) for item in only_dirs_set)
+        or any(dir_filter_overlaps("grants", item) for item in only_dirs_set)
+    )
+    use_grants_all = not only_dirs_set or any(dir_filter_overlaps("grants_all", item) for item in only_dirs_set)
     
     grant_index_miss = build_grant_index(
         fixup_dir,
@@ -6315,16 +6408,6 @@ def run_iterative_fixup(
         })
         
         # Convergence check
-        if round_success == 0:
-            log.warning("本轮无新成功脚本，停止迭代。")
-            
-            # Analyze remaining failures
-            failures_by_type = analyze_failure_patterns(round_results)
-            if failures_by_type:
-                log_failure_analysis(failures_by_type)
-            
-            break
-        
         effective_min_progress = max(1, min_progress)
         if round_success < effective_min_progress:
             if round_success == 0:

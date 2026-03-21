@@ -96,6 +96,7 @@
 - 覆盖系统命名 `SYS_C... IS NOT NULL` 且 `ENABLED + NOT VALIDATED` 的 `NOT NULL ENABLE NOVALIDATE` 语义补位；该类进入 `TABLE mismatch`，并在 `table_alter` 中默认输出可执行 `ADD CONSTRAINT ... ENABLE NOVALIDATE`，同时保留严格 `NOT NULL` 的 review-first 注释
 - OB 侧等价 `CHECK (<col> IS NOT NULL)` suppress 依赖 `DBA_CONSTRAINTS.SEARCH_CONDITION[_VC]`；元数据加载采用按 chunk 保留成功结果 + 退化 owner/table/constraint 定向回填，避免个别 chunk 失败导致整批 `SEARCH_CONDITION` 丢失
 - OceanBase 自动 `*_OBCHECK_*` / `*_OBNOTNULL_*` 约束在普通约束 compare 中继续降噪，但其单列 `IS NOT NULL` 语义必须保留给 `TABLE` compare 使用
+- 当目标端同一列存在多份 enabled 的等价单列 `IS NOT NULL` CHECK、且源端仅保留一份等价语义时，约束 compare 会把多余约束识别为 `extra mismatch`；`generate_extra_cleanup=true` 时会在 `cleanup_candidates/extra_cleanup_candidates.txt` 中输出 `SAFE_DUPLICATE_NOTNULL_DROP_SQL` 原始清理语句，并额外生成 `cleanup_safe/constraint/*.sql`；`cleanup_safe/` 默认不进入 `run_fixup` 自动执行，需显式按目录执行
 - 普通 `NOT NULL` 收紧默认采用 `plain_not_null_fixup_mode=runnable_if_no_nulls`；会先探测目标端是否存在 `NULL`，仅无 `NULL` 时输出可执行 `MODIFY ... NOT NULL`，否则继续保留注释
 - 当 `column_visibility_policy=auto` 且两端 `INVISIBLE_COLUMN` 元数据不完整时，不改变 compare/fixup 结论，但会输出独立 `column_visibility_skipped_detail` 说明本轮跳过范围
 - identity 列模式差异校验（`GENERATED ALWAYS` / `BY DEFAULT` / `BY DEFAULT ON NULL`），以 TABLE DDL 提取为主，不只依赖 `IDENTITY_COLUMN`
@@ -117,6 +118,7 @@
 - PUBLIC 同义词进入 compare/fixup 前，会额外按 terminal source scope 过滤；只有终点落在受管源范围内的 `PUBLIC` 链路会被纳入，Oracle 系统 `PUBLIC` 链路不会再批量进入校验
 - target extra grant audit 以 `managed target scope` 派生的“受管 target object 集合”为准；owner 只用于目录取数，不再把同 schema 下未受管对象的授权误判为 extra grant
 - `constraint_status_sync_mode` 默认值为 `full`；现有 `FK/CHECK` 的 `VALIDATED / NOT VALIDATED` 状态漂移会默认进入状态修复逻辑，`PK/UK` 的 `VALIDATED / NOT VALIDATED` 漂移也会进入状态漂移报告，但仍不生成 `ENABLE/[NO]VALIDATE` SQL
+- 对“缺失 TABLE 首次创建”场景，若源端 `FK/CHECK` 为 `ENABLED + NOT VALIDATED`，fixup 会额外输出 `status/constraint/*.status.sql` 的后置 `ENABLE NOVALIDATE`，避免 `CREATE TABLE` 兼容清洗后把目标端默认建成 `VALIDATED`
 
 ### 5.2.1 Report DB 语义
 - `DIFF_REPORT_DETAIL` / `DIFF_REPORT_DETAIL_ITEM` 对支持性分类采用：

@@ -197,7 +197,8 @@
   可选值：auto（OB>=4.4.2 开启校验+修补；低版本仅打印）、on（强制开启校验+修补）、off（强制仅打印）。
   说明：当 mode=auto 且 OB 版本无法识别时，为兼容旧行为会回退为“仅打印”并在日志提示。
 - generate_extra_cleanup：是否生成“目标端多余对象”的清理候选。默认：false。
-  说明：仅输出注释候选文件 `fixup_scripts/cleanup_candidates/extra_cleanup_candidates.txt`，不会被 run_fixup 自动执行；用于人工审核后再处理。
+  说明：普通候选会以注释形式输出到 `fixup_scripts/cleanup_candidates/extra_cleanup_candidates.txt`，不会被 run_fixup 自动执行；用于人工审核后再处理。
+  说明：当目标端存在“重复的单列 `IS NOT NULL` 语义 CHECK”且源端仅保留一份等价语义时，`SAFE_DUPLICATE_NOTNULL_DROP_SQL` 区域会额外输出未注释的 `ALTER TABLE ... DROP CONSTRAINT ...;`，同时生成 `fixup_scripts/cleanup_safe/constraint/*.sql`；该目录默认会被 run_fixup 跳过，需显式 `--only-dirs cleanup_safe/constraint`。
 - generate_status_fixup：是否生成“状态漂移”修补脚本。默认：true。
   说明：仅处理已存在对象的状态差异，不负责对象创建；输出目录为 fixup_scripts/status/。
 - status_fixup_types：状态漂移修补脚本类型。默认：trigger,constraint。
@@ -214,6 +215,8 @@
   说明：当 FK/CHECK 采用 NOVALIDATE 且源端最终语义需要 `VALIDATED` 时，程序才会额外输出
   `fixup_scripts/constraint_validate_later/` 与 `constraint_validate_deferred_detail_<ts>.txt`，
   用于数据清理后执行二次 VALIDATE；若源端本来就是 `NOT VALIDATED`，则不会额外生成后置 VALIDATE。
+  说明：若对象是“缺失 TABLE 首次创建”，且源端 `FK/CHECK` 为 `ENABLED + NOT VALIDATED`，
+  程序会同步输出 `fixup_scripts/status/constraint/*.status.sql`，用于在建表后恢复 `ENABLE NOVALIDATE` 语义。
 - trigger_validity_sync_mode：触发器有效性同步模式。默认：compile。
   可选值：off（不处理 VALID/INVALID）、compile（当源 VALID 且目标 INVALID 时生成 COMPILE）。
 - fixup_drop_sys_c_columns：是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE。默认：false。

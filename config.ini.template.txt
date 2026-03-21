@@ -137,7 +137,12 @@ generate_fixup          = true
 # on  : 强制开启校验+修补
 # off : 强制仅打印不校验
 mview_check_fixup_mode  = auto
-# 是否生成目标端“多余对象”清理候选（仅输出注释候选，不自动执行）
+# 是否生成目标端“多余对象”清理候选
+# 普通候选仍以注释形式输出；若识别到“目标端重复的单列 IS NOT NULL 语义 CHECK”，
+# 会在 cleanup_candidates 文本中额外输出原始 DROP CONSTRAINT SQL，
+# 并额外生成 cleanup_safe/constraint/*.sql，便于人工审核后显式执行。
+# cleanup_candidates 文本本身不会被 run_fixup 执行；cleanup_safe/ 默认也会被 run_fixup 跳过，
+# 需显式 --only-dirs cleanup_safe/constraint。
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 generate_extra_cleanup  = false
 # interval 分区补齐脚本（版本门控）

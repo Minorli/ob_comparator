@@ -1063,6 +1063,7 @@ class ObMetadata(NamedTuple):
     default_on_null_columns: Dict[Tuple[str, str], Tuple[str, ...]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> (COLUMN_NAME, ...)
     identity_options: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: {OPTION: VALUE}}
     enabled_notnull_check_columns: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: enabled single-column IS NOT NULL check meta}
+    enabled_notnull_check_groups: Dict[Tuple[str, str], Dict[str, Tuple["NotnullCheckEntry", ...]]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: (enabled single-column IS NOT NULL checks...)}
 
 
 class OracleMetadata(NamedTuple):
@@ -1101,6 +1102,15 @@ class OracleMetadata(NamedTuple):
     identity_modes: Dict[Tuple[str, str], Dict[str, str]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: IDENTITY_MODE}
     default_on_null_columns: Dict[Tuple[str, str], Tuple[str, ...]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> (COLUMN_NAME, ...)
     identity_options: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: {OPTION: VALUE}}
+
+
+class NotnullCheckEntry(NamedTuple):
+    constraint_name: str
+    search_condition: str
+    status: str
+    validated: str
+    is_ob_auto: bool
+    is_system_named: bool
 
 
 class DependencyRecord(NamedTuple):
@@ -2660,16 +2670,10 @@ def build_system_notnull_novalidate_column_map(constraints: Optional[Dict[str, D
     return result
 
 
-def build_enabled_notnull_check_column_map(constraints: Optional[Dict[str, Dict]]) -> Dict[str, Dict[str, str]]:
-    """
-    提取目标端已启用的单列 IS NOT NULL 约束语义，按列聚合。
-
-    用于判断目标端是否已经具备等价约束语义：
-    - 接受 OB 内部命名 / SYS_* / 用户命名
-    - 仅要求 ENABLED
-    - VALIDATED / NOT VALIDATED 都视为已存在“拒绝后续 NULL”语义
-    """
-    result: Dict[str, Dict[str, str]] = {}
+def build_enabled_notnull_check_group_map(
+    constraints: Optional[Dict[str, Dict]]
+) -> Dict[str, Tuple[NotnullCheckEntry, ...]]:
+    result: Dict[str, List[NotnullCheckEntry]] = {}
     for cons_name, cons in sorted((constraints or {}).items(), key=lambda item: extract_constraint_name(item[0]).upper()):
         ctype = (cons.get("type") or "").upper()
         if ctype != "C":
@@ -2683,15 +2687,129 @@ def build_enabled_notnull_check_column_map(constraints: Optional[Dict[str, Dict]
         if not col:
             continue
         col_u = col.upper()
-        if col_u in result:
+        result.setdefault(col_u, []).append(NotnullCheckEntry(
+            constraint_name=extract_constraint_name(cons_name).upper(),
+            search_condition=normalize_sql_expression(search_condition),
+            status=normalize_constraint_enabled_status(cons.get("status")),
+            validated=normalize_constraint_validated_status(cons.get("validated")),
+            is_ob_auto=is_ob_notnull_constraint(cons_name, search_condition),
+            is_system_named=is_system_notnull_check(extract_constraint_name(cons_name), search_condition),
+        ))
+    return {
+        col_u: tuple(entries)
+        for col_u, entries in result.items()
+    }
+
+
+def build_enabled_notnull_check_column_map(constraints: Optional[Dict[str, Dict]]) -> Dict[str, Dict[str, str]]:
+    """
+    提取目标端已启用的单列 IS NOT NULL 约束语义，按列聚合。
+
+    用于判断目标端是否已经具备等价约束语义：
+    - 接受 OB 内部命名 / SYS_* / 用户命名
+    - 仅要求 ENABLED
+    - VALIDATED / NOT VALIDATED 都视为已存在“拒绝后续 NULL”语义
+    """
+    result: Dict[str, Dict[str, str]] = {}
+    for col_u, entries in build_enabled_notnull_check_group_map(constraints).items():
+        if not entries:
             continue
+        first = entries[0]
         result[col_u] = {
-            "constraint_name": extract_constraint_name(cons_name).upper(),
-            "search_condition": normalize_sql_expression(search_condition),
-            "status": normalize_constraint_enabled_status(cons.get("status")),
-            "validated": normalize_constraint_validated_status(cons.get("validated")),
+            "constraint_name": first.constraint_name,
+            "search_condition": first.search_condition,
+            "status": first.status,
+            "validated": first.validated,
         }
     return result
+
+
+def _notnull_check_keep_priority(
+    entry: NotnullCheckEntry,
+    source_names: Set[str],
+    source_validated_values: Set[str]
+) -> Tuple[int, int, int, int, str]:
+    name_u = (entry.constraint_name or "").upper()
+    if name_u in source_names:
+        family_rank = 0
+    elif not entry.is_ob_auto and not entry.is_system_named:
+        family_rank = 1
+    elif entry.is_system_named and not entry.is_ob_auto:
+        family_rank = 2
+    else:
+        family_rank = 3
+    validated_u = normalize_constraint_validated_status(entry.validated)
+    validated_rank = 0 if not source_validated_values or validated_u in source_validated_values else 1
+    return (
+        0 if name_u in source_names else 1,
+        family_rank,
+        validated_rank,
+        0 if validated_u == "VALIDATED" else 1,
+        name_u,
+    )
+
+
+def select_safe_duplicate_notnull_target_extras(
+    source_groups: Dict[str, Tuple[NotnullCheckEntry, ...]],
+    target_groups: Dict[str, Tuple[NotnullCheckEntry, ...]]
+) -> Dict[str, Tuple[NotnullCheckEntry, ...]]:
+    extras_by_column: Dict[str, Tuple[NotnullCheckEntry, ...]] = {}
+    for col_u, target_entries in sorted((target_groups or {}).items()):
+        if not target_entries:
+            continue
+        source_entries = tuple(source_groups.get(col_u, ()) or ())
+        if not source_entries:
+            continue
+        if len(target_entries) <= len(source_entries):
+            continue
+        source_names = {
+            (entry.constraint_name or "").upper()
+            for entry in source_entries
+            if entry.constraint_name
+        }
+        source_validated_values = {
+            normalize_constraint_validated_status(entry.validated)
+            for entry in source_entries
+            if normalize_constraint_validated_status(entry.validated)
+        }
+        ranked_targets = sorted(
+            target_entries,
+            key=lambda entry: _notnull_check_keep_priority(entry, source_names, source_validated_values)
+        )
+        keep_names = {
+            (entry.constraint_name or "").upper()
+            for entry in ranked_targets[:len(source_entries)]
+            if entry.constraint_name
+        }
+        extra_entries = tuple(
+            entry for entry in target_entries
+            if (entry.constraint_name or "").upper() not in keep_names
+        )
+        if extra_entries:
+            extras_by_column[col_u] = extra_entries
+    return extras_by_column
+
+
+def select_preferred_notnull_semantic_entry(
+    source_constraint_name: Optional[str],
+    source_validated: Optional[str],
+    target_entries: Sequence[NotnullCheckEntry]
+) -> Optional[NotnullCheckEntry]:
+    if not target_entries:
+        return None
+    source_names: Set[str] = set()
+    source_name_u = normalize_identifier_name(source_constraint_name)
+    if source_name_u:
+        source_names.add(source_name_u)
+    source_validated_values: Set[str] = set()
+    source_validated_u = normalize_constraint_validated_status(source_validated)
+    if source_validated_u:
+        source_validated_values.add(source_validated_u)
+    ranked_targets = sorted(
+        target_entries,
+        key=lambda entry: _notnull_check_keep_priority(entry, source_names, source_validated_values)
+    )
+    return ranked_targets[0] if ranked_targets else None
 
 
 CHECK_SYS_CONTEXT_USERENV_RE = re.compile(r"SYS_CONTEXT\s*\(\s*['\"]USERENV['\"]", flags=re.IGNORECASE)
@@ -3192,6 +3310,7 @@ def normalize_ob_metadata_public_owner(meta: ObMetadata) -> ObMetadata:
         default_on_null_columns=_remap_owner_table_simple(meta.default_on_null_columns or {}),
         identity_options=_remap_owner_table_simple(meta.identity_options or {}),
         enabled_notnull_check_columns=_remap_owner_table_dict(meta.enabled_notnull_check_columns or {}),
+        enabled_notnull_check_groups=_remap_owner_table_dict(meta.enabled_notnull_check_groups or {}),
     )
 
 def is_index_expression_token(token: Optional[str]) -> bool:
@@ -4486,6 +4605,7 @@ class ConstraintMismatch(NamedTuple):
     downgraded_pk_constraints: Set[str]
     check_suppressed_source_dup_count: int = 0
     check_suppressed_target_dup_count: int = 0
+    duplicate_notnull_extra_constraints: FrozenSet[str] = frozenset()
 
 
 class SequenceMismatch(NamedTuple):
@@ -4578,6 +4698,17 @@ class ConstraintStatusDriftRow(NamedTuple):
     tgt_status: str
     src_validated: str
     tgt_validated: str
+    detail: str
+    action_sql: str
+
+
+class MissingTableConstraintStatusRow(NamedTuple):
+    table_full: str
+    src_table_full: str
+    constraint_type: str
+    constraint_name: str
+    src_status: str
+    src_validated: str
     detail: str
     action_sql: str
 
@@ -7867,6 +7998,7 @@ def collect_constraint_status_drift_rows(
             entry["cols"] = tuple(col.upper() for col in (cons_meta.get("columns") or []) if col)
         elif ctype == "C":
             entry["expr_key"] = key[1] if len(key) > 1 else ""
+            entry["notnull_col"] = normalize_identifier_name(_extract_notnull_column(cons_meta.get("search_condition")))
         elif ctype == "R":
             ref_owner = (cons_meta.get("ref_table_owner") or cons_meta.get("r_owner") or "").upper()
             ref_name = (cons_meta.get("ref_table_name") or "").upper()
@@ -7886,7 +8018,8 @@ def collect_constraint_status_drift_rows(
 
     def _match_status_entries(
         src_entries: List[Dict[str, object]],
-        tgt_entries: List[Dict[str, object]]
+        tgt_entries: List[Dict[str, object]],
+        tgt_notnull_groups: Optional[Dict[str, Tuple[NotnullCheckEntry, ...]]] = None
     ) -> List[Tuple[Dict[str, object], Dict[str, object]]]:
         matches: List[Tuple[Dict[str, object], Dict[str, object]]] = []
         used_tgt_names: Set[str] = set()
@@ -7920,10 +8053,12 @@ def collect_constraint_status_drift_rows(
                     return candidate_list.pop(idx)
             return None
 
+        unmatched_src: List[Dict[str, object]] = []
         for src_entry in sorted(remaining_src, key=lambda e: (str(e.get("type") or ""), str(e.get("name") or ""))):
             ctype = str(src_entry.get("type") or "")
             candidates = remaining_tgt_by_type.get(ctype, [])
             if not candidates:
+                unmatched_src.append(src_entry)
                 continue
             matched: Optional[Dict[str, object]] = None
             if ctype in {"P", "U", "C"}:
@@ -7947,6 +8082,59 @@ def collect_constraint_status_drift_rows(
                 )
             if matched:
                 matches.append((src_entry, matched))
+                matched_name = str(matched.get("name") or "")
+                if matched_name:
+                    used_tgt_names.add(matched_name)
+            else:
+                unmatched_src.append(src_entry)
+
+        if not tgt_notnull_groups:
+            return matches
+
+        remaining_notnull_groups: Dict[str, List[NotnullCheckEntry]] = {}
+        for col_u, entries in (tgt_notnull_groups or {}).items():
+            available_entries = [
+                entry
+                for entry in (entries or ())
+                if normalize_identifier_name(entry.constraint_name) not in used_tgt_names
+            ]
+            if available_entries:
+                remaining_notnull_groups[col_u.upper()] = available_entries
+
+        for src_entry in sorted(unmatched_src, key=lambda e: (str(e.get("type") or ""), str(e.get("name") or ""))):
+            if str(src_entry.get("type") or "").upper() != "C":
+                continue
+            notnull_col = normalize_identifier_name(src_entry.get("notnull_col"))
+            if not notnull_col:
+                continue
+            target_entries = remaining_notnull_groups.get(notnull_col)
+            if not target_entries:
+                continue
+            preferred = select_preferred_notnull_semantic_entry(
+                str(src_entry.get("name") or ""),
+                str(src_entry.get("validated") or ""),
+                target_entries,
+            )
+            if preferred is None:
+                continue
+            matched_name = normalize_identifier_name(preferred.constraint_name)
+            if matched_name:
+                used_tgt_names.add(matched_name)
+                remaining_notnull_groups[notnull_col] = [
+                    entry
+                    for entry in target_entries
+                    if normalize_identifier_name(entry.constraint_name) != matched_name
+                ]
+            synthetic_target = {
+                "name": matched_name,
+                "type": "C",
+                "key": src_entry.get("key"),
+                "status": normalize_constraint_enabled_status(preferred.status),
+                "validated": normalize_constraint_validated_status(preferred.validated),
+                "expr_key": src_entry.get("expr_key") or normalize_check_constraint_expression(preferred.search_condition, matched_name),
+                "notnull_col": notnull_col,
+            }
+            matches.append((src_entry, synthetic_target))
         return matches
 
     for src_full, tgt_full, obj_type in master_list:
@@ -7967,7 +8155,13 @@ def collect_constraint_status_drift_rows(
 
         src_map = oracle_meta.constraints.get((src_schema.upper(), src_table.upper()), {}) or {}
         tgt_map = ob_meta.constraints.get((tgt_schema.upper(), tgt_table.upper()), {}) or {}
-        if not src_map or not tgt_map:
+        tgt_notnull_groups = (
+            (getattr(ob_meta, "enabled_notnull_check_groups", {}) or {}).get((tgt_schema.upper(), tgt_table.upper()), {})
+            or {}
+        )
+        if not src_map:
+            continue
+        if not tgt_map and not tgt_notnull_groups:
             continue
 
         src_entries: List[Dict[str, object]] = []
@@ -7982,10 +8176,10 @@ def collect_constraint_status_drift_rows(
             if entry:
                 tgt_entries.append(entry)
 
-        if not src_entries or not tgt_entries:
+        if not src_entries or (not tgt_entries and not tgt_notnull_groups):
             continue
 
-        for src_entry, matched in _match_status_entries(src_entries, tgt_entries):
+        for src_entry, matched in _match_status_entries(src_entries, tgt_entries, tgt_notnull_groups):
             src_name_u = str(src_entry.get("name") or "")
             tgt_name_u = str(matched.get("name") or "")
             if not tgt_name_u:
@@ -8043,6 +8237,79 @@ def collect_constraint_status_drift_rows(
                     tgt_validated=tgt_validated,
                     detail="; ".join(part for part in detail_parts if part),
                     action_sql=action_sql or "-"
+                )
+            )
+    return rows
+
+
+def collect_missing_table_constraint_status_rows(
+    oracle_meta: OracleMetadata,
+    missing_tables: List[Tuple[str, str, str, str]],
+    name_collision_planned_map: Optional[Dict[Tuple[str, str, str, str], str]] = None,
+    unsupported_table_keys: Optional[Set[Tuple[str, str]]] = None,
+) -> List[MissingTableConstraintStatusRow]:
+    rows: List[MissingTableConstraintStatusRow] = []
+    seen_rows: Set[Tuple[str, str, str]] = set()
+    unsupported_keys = {(s.upper(), t.upper()) for s, t in (unsupported_table_keys or set())}
+    collision_map = name_collision_planned_map or {}
+
+    for src_schema, src_table, tgt_schema, tgt_table in (missing_tables or []):
+        src_schema_u = (src_schema or "").upper()
+        src_table_u = (src_table or "").upper()
+        tgt_schema_u = (tgt_schema or "").upper()
+        tgt_table_u = (tgt_table or "").upper()
+        if not src_schema_u or not src_table_u or not tgt_schema_u or not tgt_table_u:
+            continue
+        if unsupported_keys and (src_schema_u, src_table_u) in unsupported_keys:
+            continue
+        cons_map = oracle_meta.constraints.get((src_schema_u, src_table_u), {}) or {}
+        if not cons_map:
+            continue
+        for cons_name, cons_meta in sorted(
+            cons_map.items(),
+            key=lambda item: extract_constraint_name(item[0]).upper()
+        ):
+            cons_name_u = extract_constraint_name(cons_name).upper()
+            if not cons_name_u:
+                continue
+            cons_type = (cons_meta.get("type") or "").upper()
+            if cons_type not in {"R", "C"}:
+                continue
+            src_status_n = normalize_constraint_enabled_status(cons_meta.get("status"))
+            src_validated_n = normalize_constraint_validated_status(cons_meta.get("validated"))
+            if src_status_n != "ENABLED" or src_validated_n != "NOT VALIDATED":
+                continue
+            final_cons_name = collision_map.get(
+                (tgt_schema_u, "CONSTRAINT", tgt_table_u, cons_name_u),
+                cons_name_u
+            )
+            action_sql = _build_constraint_status_drift_action_sql(
+                tgt_schema_u,
+                tgt_table_u,
+                final_cons_name,
+                cons_type,
+                src_status_n,
+                "ENABLED",
+                src_validated_n,
+                "VALIDATED",
+                "full"
+            )
+            if not action_sql:
+                continue
+            seen_key = (tgt_schema_u, tgt_table_u, final_cons_name)
+            if seen_key in seen_rows:
+                continue
+            seen_rows.add(seen_key)
+            rows.append(
+                MissingTableConstraintStatusRow(
+                    table_full=f"{tgt_schema_u}.{tgt_table_u}",
+                    src_table_full=f"{src_schema_u}.{src_table_u}",
+                    constraint_type=cons_type,
+                    constraint_name=final_cons_name,
+                    src_status=src_status_n,
+                    src_validated=src_validated_n,
+                    detail="POST_CREATE_NOT_VALIDATED",
+                    action_sql=action_sql,
                 )
             )
     return rows
@@ -9400,15 +9667,17 @@ def get_source_objects(
                             full_name = f"{owner}.{obj_name}"
                             source_objects[full_name].add(obj_type)
             if include_synonyms:
+                source_schema_owners = sorted({s.upper() for s in schemas_list})
                 if synonym_scope == "public_only":
                     synonym_owners = ["PUBLIC"]
                 else:
-                    synonym_owners = sorted(set(s.upper() for s in schemas_list) | {"PUBLIC"})
-                target_owners = sorted({s.upper() for s in schemas_list})
-                private_synonym_owners = [owner for owner in synonym_owners if owner != "PUBLIC"]
+                    synonym_owners = sorted(set(source_schema_owners) | {"PUBLIC"})
+                target_owners = list(source_schema_owners)
+                private_synonym_meta_owners = list(source_schema_owners)
+                private_synonym_output_owners = {owner for owner in synonym_owners if owner != "PUBLIC"}
                 with connection.cursor() as cursor:
-                    if private_synonym_owners:
-                        private_chunks = chunk_list(private_synonym_owners, ORACLE_IN_BATCH_SIZE)
+                    if private_synonym_meta_owners:
+                        private_chunks = chunk_list(private_synonym_meta_owners, ORACLE_IN_BATCH_SIZE)
                         private_sql_tpl = """
                             SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME
                             FROM DBA_SYNONYMS
@@ -9437,8 +9706,6 @@ def get_source_objects(
                                 table_name = table_name_raw.upper()
                                 if not owner or not syn_name or not table_owner or not table_name:
                                     continue
-                                full_name = f"{owner}.{syn_name}"
-                                source_objects[full_name].add('SYNONYM')
                                 private_synonym_meta[(owner, syn_name)] = SynonymMeta(
                                     owner=owner,
                                     name=syn_name,
@@ -9446,7 +9713,10 @@ def get_source_objects(
                                     table_name=table_name,
                                     db_link=None,
                                 )
-                                added_synonyms += 1
+                                if owner in private_synonym_output_owners:
+                                    full_name = f"{owner}.{syn_name}"
+                                    source_objects[full_name].add('SYNONYM')
+                                    added_synonyms += 1
                     if target_owners and "PUBLIC" in synonym_owners:
                         target_chunks = chunk_list(target_owners, ORACLE_IN_BATCH_SIZE)
                         public_sql_tpl = """
@@ -11435,8 +11705,17 @@ def apply_noise_suppression(
     constraint_mismatched = list(filtered_extra.get("constraint_mismatched", []) or [])
     filtered_constraint_mismatched: List[ConstraintMismatch] = []
     for item in constraint_mismatched:
+        protected_duplicate_extras = {
+            normalize_identifier_name(name)
+            for name in (getattr(item, "duplicate_notnull_extra_constraints", frozenset()) or frozenset())
+            if normalize_identifier_name(name)
+        }
         missing_suppressed = {name for name in item.missing_constraints if is_ob_notnull_constraint(name)}
-        extra_suppressed = {name for name in item.extra_constraints if is_ob_notnull_constraint(name)}
+        extra_suppressed = {
+            name for name in item.extra_constraints
+            if is_ob_notnull_constraint(name)
+            and normalize_identifier_name(name) not in protected_duplicate_extras
+        }
         if missing_suppressed:
             _record_noise_details(
                 "CONSTRAINT",
@@ -11471,7 +11750,14 @@ def apply_noise_suppression(
             detail_mismatch=new_detail,
             downgraded_pk_constraints=item.downgraded_pk_constraints,
             check_suppressed_source_dup_count=int(getattr(item, "check_suppressed_source_dup_count", 0) or 0),
-            check_suppressed_target_dup_count=int(getattr(item, "check_suppressed_target_dup_count", 0) or 0)
+            check_suppressed_target_dup_count=int(getattr(item, "check_suppressed_target_dup_count", 0) or 0),
+            duplicate_notnull_extra_constraints=frozenset(
+                normalize_identifier_name(name)
+                for name in (getattr(item, "duplicate_notnull_extra_constraints", frozenset()) or frozenset())
+                if normalize_identifier_name(name) in {
+                    normalize_identifier_name(v) for v in new_extra
+                }
+            ),
         ))
     filtered_extra["constraint_ok"] = constraint_ok
     filtered_extra["constraint_mismatched"] = filtered_constraint_mismatched
@@ -11573,7 +11859,10 @@ def normalize_extra_results_names(extra_results: ExtraCheckResults) -> ExtraChec
         constraint_items.append(item._replace(
             missing_constraints=_norm_set(item.missing_constraints),
             extra_constraints=_norm_set(item.extra_constraints),
-            downgraded_pk_constraints=_norm_set(item.downgraded_pk_constraints)
+            downgraded_pk_constraints=_norm_set(item.downgraded_pk_constraints),
+            duplicate_notnull_extra_constraints=frozenset(
+                _norm_set(getattr(item, "duplicate_notnull_extra_constraints", frozenset()))
+            ),
         ))
     normalized["constraint_mismatched"] = constraint_items
 
@@ -11684,7 +11973,14 @@ def classify_unsupported_check_constraints(
             detail_mismatch=new_detail,
             downgraded_pk_constraints=item.downgraded_pk_constraints,
             check_suppressed_source_dup_count=int(getattr(item, "check_suppressed_source_dup_count", 0) or 0),
-            check_suppressed_target_dup_count=int(getattr(item, "check_suppressed_target_dup_count", 0) or 0)
+            check_suppressed_target_dup_count=int(getattr(item, "check_suppressed_target_dup_count", 0) or 0),
+            duplicate_notnull_extra_constraints=frozenset(
+                normalize_identifier_name(name)
+                for name in (getattr(item, "duplicate_notnull_extra_constraints", frozenset()) or frozenset())
+                if normalize_identifier_name(name) in {
+                    normalize_identifier_name(v) for v in new_extra
+                }
+            ),
         ))
 
     extra_results["constraint_mismatched"] = updated_mismatches
@@ -13096,7 +13392,8 @@ def dump_ob_metadata(
             partition_key_columns={},
             case_sensitive_findings=(),
             constraint_deferrable_supported=False,
-            temporary_tables=set()
+            temporary_tables=frozenset(),
+            enabled_notnull_check_groups=MappingProxyType({})
         )
 
     synonym_scope = normalize_synonym_check_scope(synonym_check_scope)
@@ -13580,6 +13877,7 @@ def dump_ob_metadata(
     # --- 5. DBA_CONSTRAINTS (P/U/R/C) ---
     constraints: Dict[Tuple[str, str], Dict[str, Dict]] = {}
     enabled_notnull_check_columns: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = {}
+    enabled_notnull_check_groups: Dict[Tuple[str, str], Dict[str, Tuple[NotnullCheckEntry, ...]]] = {}
     if include_constraints:
         use_search_condition_vc = ob_has_dba_column(ob_cfg, "DBA_CONSTRAINTS", "SEARCH_CONDITION_VC")
         deferrable_supported = (
@@ -13851,6 +14149,9 @@ def dump_ob_metadata(
             nn_map = build_enabled_notnull_check_column_map(cons_map)
             if nn_map:
                 enabled_notnull_check_columns[key] = nn_map
+            nn_groups = build_enabled_notnull_check_group_map(cons_map)
+            if nn_groups:
+                enabled_notnull_check_groups[key] = nn_groups
 
         # 过滤 OceanBase 自动生成的 *_OBNOTNULL_* CHECK 约束
         if constraints:
@@ -14067,6 +14368,7 @@ def dump_ob_metadata(
         default_on_null_columns=default_on_null_columns,
         identity_options=identity_options,
         enabled_notnull_check_columns=enabled_notnull_check_columns,
+        enabled_notnull_check_groups=enabled_notnull_check_groups,
     )
     ob_table_count = len(ob_meta.tab_columns)
     ob_column_count = sum(len(cols) for cols in ob_meta.tab_columns.values())
@@ -21806,6 +22108,7 @@ def compare_constraints_for_table(
     cache: Optional[ConstraintCompareCache] = None
 ) -> Tuple[bool, Optional[ConstraintMismatch]]:
     include_deferrable = bool(getattr(ob_meta, "constraint_deferrable_supported", False))
+    tgt_key = (tgt_schema.upper(), tgt_table.upper())
     if cache:
         src_cons = cache.src_cons
         tgt_cons = cache.tgt_cons
@@ -21850,6 +22153,7 @@ def compare_constraints_for_table(
     missing: Set[str] = set()
     extra: Set[str] = set()
     downgraded_missing: Set[str] = set()
+    duplicate_notnull_extra_constraints: Set[str] = set()
     check_suppressed_source_dup_count = 0
     check_suppressed_target_dup_count = 0
 
@@ -21937,6 +22241,10 @@ def compare_constraints_for_table(
     grouped_src_ck = bucket_check(src_cons, include_deferrable=include_deferrable)
     grouped_tgt_ck = bucket_check(tgt_cons, include_deferrable=include_deferrable)
     src_system_notnull_novalidate_cols = build_system_notnull_novalidate_column_map(src_cons)
+    src_enabled_notnull_groups = build_enabled_notnull_check_group_map(src_cons)
+    tgt_enabled_notnull_groups = (
+        getattr(ob_meta, "enabled_notnull_check_groups", {}) or {}
+    ).get(tgt_key, {})
 
     src_pk_list = grouped_src_pkuk.get('P', [])
     src_uk_list = grouped_src_pkuk.get('U', [])
@@ -22136,6 +22444,9 @@ def compare_constraints_for_table(
                 matched_expr_keys_any.add(expr_key)
                 used.add(matched_name)
                 continue
+            src_notnull_col = normalize_identifier_name(_extract_notnull_column(raw_expr))
+            if src_notnull_col and src_notnull_col in tgt_enabled_notnull_groups:
+                continue
             # 源端同语义重复 CHECK：目标端已有同语义命中时，不再继续标记 missing。
             if expr_key in matched_expr_keys_any:
                 check_suppressed_source_dup_count += 1
@@ -22197,6 +22508,36 @@ def compare_constraints_for_table(
     mark_extra_constraints("UNIQUE KEY", tgt_uk_list, tgt_uk_used)
     match_foreign_keys(grouped_src_fk, grouped_tgt_fk)
     match_check_constraints(grouped_src_ck, grouped_tgt_ck)
+    duplicate_notnull_extras = select_safe_duplicate_notnull_target_extras(
+        src_enabled_notnull_groups,
+        tgt_enabled_notnull_groups,
+    )
+    for col_u, extra_entries in sorted(duplicate_notnull_extras.items()):
+        source_entries = tuple(src_enabled_notnull_groups.get(col_u, ()) or ())
+        target_entries = tuple(tgt_enabled_notnull_groups.get(col_u, ()) or ())
+        source_names = {
+            entry.constraint_name for entry in source_entries if entry.constraint_name
+        }
+        source_validated_values = {
+            normalize_constraint_validated_status(entry.validated)
+            for entry in source_entries
+            if normalize_constraint_validated_status(entry.validated)
+        }
+        keep_entries = sorted(
+            target_entries,
+            key=lambda entry: _notnull_check_keep_priority(entry, source_names, source_validated_values)
+        )[:len(source_entries)]
+        keep_names = ",".join(entry.constraint_name for entry in keep_entries if entry.constraint_name) or "-"
+        drop_names = ",".join(entry.constraint_name for entry in extra_entries if entry.constraint_name) or "-"
+        detail_mismatch.append(
+            "CHECK_DUPLICATE_NOTNULL: 列 %s 源端同语义数=%d，目标端同语义数=%d；保留=%s；额外=%s。"
+            % (col_u, len(source_entries), len(target_entries), keep_names, drop_names)
+        )
+        for entry in extra_entries:
+            if not entry.constraint_name:
+                continue
+            duplicate_notnull_extra_constraints.add(entry.constraint_name)
+            extra.add(entry.constraint_name)
     if detail_mismatch:
         if check_suppressed_source_dup_count > 0:
             detail_mismatch.append(
@@ -22218,7 +22559,8 @@ def compare_constraints_for_table(
             detail_mismatch=detail_mismatch,
             downgraded_pk_constraints=downgraded_missing,
             check_suppressed_source_dup_count=check_suppressed_source_dup_count,
-            check_suppressed_target_dup_count=check_suppressed_target_dup_count
+            check_suppressed_target_dup_count=check_suppressed_target_dup_count,
+            duplicate_notnull_extra_constraints=frozenset(duplicate_notnull_extra_constraints),
         )
 
 
@@ -22232,7 +22574,6 @@ def compare_sequences_for_schema(
     if src_seqs is None:
         log.warning(f"[序列检查] 未找到 {src_schema} 的 Oracle 序列元数据。")
         tgt_seqs_snapshot = ob_meta.sequences.get(tgt_schema.upper(), set())
-        
         schema_u = src_schema.upper()
         loaded_schemas = set(getattr(oracle_meta, "loaded_schemas", ()) or ())
         schema_has_objects = schema_u in loaded_schemas
@@ -30357,8 +30698,15 @@ def collect_extra_cleanup_candidates(
             if not parsed:
                 continue
             schema_u, table_u = parsed
+            safe_duplicate_names = {
+                normalize_identifier_name(name)
+                for name in (getattr(item, "duplicate_notnull_extra_constraints", frozenset()) or frozenset())
+                if normalize_identifier_name(name)
+            }
             for cons_name in sorted(item.extra_constraints or set()):
                 cons_u = (cons_name or "").upper()
+                if cons_u in safe_duplicate_names:
+                    continue
                 stmt = _build_extra_cleanup_drop_statement(
                     "CONSTRAINT",
                     schema_u,
@@ -30388,22 +30736,56 @@ def collect_extra_cleanup_candidates(
     return [candidates[key] for key in sorted(candidates.keys())]
 
 
+def collect_safe_duplicate_notnull_cleanup_candidates(
+    extra_results: Optional[ExtraCheckResults]
+) -> List[Tuple[str, str, str, str]]:
+    candidates: Dict[Tuple[str, str], Tuple[str, str, str, str]] = {}
+    if not extra_results:
+        return []
+    for item in (extra_results.get("constraint_mismatched", []) or []):
+        parsed = parse_full_object_name(item.table)
+        if not parsed:
+            continue
+        schema_u, table_u = parsed
+        for cons_name in sorted(getattr(item, "duplicate_notnull_extra_constraints", frozenset()) or frozenset()):
+            cons_u = normalize_identifier_name(cons_name)
+            if not cons_u:
+                continue
+            stmt = _build_extra_cleanup_drop_statement(
+                "CONSTRAINT",
+                schema_u,
+                cons_u,
+                parent_table=table_u
+            )
+            if not stmt:
+                continue
+            key = ("CONSTRAINT", f"{schema_u}.{cons_u}")
+            if key in candidates:
+                continue
+            candidates[key] = ("CONSTRAINT", f"{schema_u}.{cons_u}", "SAFE_DUPLICATE_NOTNULL", stmt.rstrip(";") + ";")
+    return [candidates[key] for key in sorted(candidates.keys())]
+
+
 def export_extra_cleanup_candidates(
     base_dir: Path,
-    candidates: List[Tuple[str, str, str, str]]
+    candidates: List[Tuple[str, str, str, str]],
+    safe_duplicate_notnull_candidates: Optional[List[Tuple[str, str, str, str]]] = None
 ) -> Optional[Path]:
-    if not base_dir or not candidates:
+    if not base_dir or (not candidates and not safe_duplicate_notnull_candidates):
         return None
     output_dir = Path(base_dir) / "cleanup_candidates"
     ensure_dir(output_dir)
     output_path = output_dir / "extra_cleanup_candidates.txt"
+    safe_duplicate_notnull_candidates = safe_duplicate_notnull_candidates or []
     lines: List[str] = [
         "# EXTRA 清理候选脚本（仅供人工审核）",
-        "# 说明：以下 SQL 默认以注释形式输出，不会被 run_fixup 自动执行。",
+        "# 说明：GENERAL_CANDIDATES 区域默认以注释形式输出，不会被 run_fixup 自动执行。",
+        "# 说明：SAFE_DUPLICATE_NOTNULL_DROP_SQL 区域仅包含“目标端重复的单列 IS NOT NULL 语义 CHECK”清理 SQL。",
+        "#      同时会额外生成 cleanup_safe/constraint/*.sql，供显式 --only-dirs cleanup_safe/constraint 执行。",
         "# 字段分隔符: |",
         "# OBJECT_TYPE|TARGET_FULL|SOURCE|CANDIDATE_SQL",
         "",
-        "DETAIL"
+        "GENERAL_CANDIDATES"
     ]
     for obj_type_u, target_u, source, sql_stmt in candidates:
         lines.append(
@@ -30415,14 +30797,74 @@ def export_extra_cleanup_candidates(
             ])
         )
 
-    lines.append("")
-    lines.append("CANDIDATE_SQL_COMMENTS")
-    for _obj_type_u, target_u, _source, sql_stmt in candidates:
-        lines.append(f"-- {target_u}")
-        lines.append(f"-- {sql_stmt}")
+    if candidates:
+        lines.append("")
+        lines.append("CANDIDATE_SQL_COMMENTS")
+        for _obj_type_u, target_u, _source, sql_stmt in candidates:
+            lines.append(f"-- {target_u}")
+            lines.append(f"-- {sql_stmt}")
+
+    if safe_duplicate_notnull_candidates:
+        lines.append("")
+        lines.append("SAFE_DUPLICATE_NOTNULL_DETAIL")
+        for obj_type_u, target_u, source, sql_stmt in safe_duplicate_notnull_candidates:
+            lines.append(
+                "|".join([
+                    sanitize_pipe_field(obj_type_u),
+                    sanitize_pipe_field(target_u),
+                    sanitize_pipe_field(source),
+                    sanitize_pipe_field(sql_stmt),
+                ])
+            )
+        lines.append("")
+        lines.append("SAFE_DUPLICATE_NOTNULL_DROP_SQL")
+        for _obj_type_u, target_u, _source, sql_stmt in safe_duplicate_notnull_candidates:
+            lines.append(f"-- {target_u}")
+            lines.append(sql_stmt)
 
     output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return output_path
+
+
+def export_safe_duplicate_notnull_cleanup_fixup_scripts(
+    base_dir: Path,
+    candidates: List[Tuple[str, str, str, str]]
+) -> List[Path]:
+    output_paths: List[Path] = []
+    if not base_dir or not candidates:
+        return output_paths
+    for obj_type_u, target_u, _source, sql_stmt in candidates:
+        if (obj_type_u or "").upper() != "CONSTRAINT":
+            continue
+        parsed = parse_full_object_name(target_u)
+        if not parsed:
+            continue
+        schema_u, cons_u = parsed
+        match = re.search(
+            r'ALTER\s+TABLE\s+"([^"]+)"\."([^"]+)"\s+DROP\s+CONSTRAINT\s+("([^"]+)"|([A-Z0-9_$#]+))\s*;?\s*$',
+            sql_stmt.strip(),
+            flags=re.IGNORECASE
+        )
+        if not match:
+            continue
+        table_schema_u = (match.group(1) or "").upper()
+        table_name_u = (match.group(2) or "").upper()
+        if table_schema_u != schema_u:
+            continue
+        content = prepend_set_schema(sql_stmt.strip(), schema_u)
+        file_path = write_fixup_file(
+            base_dir,
+            "cleanup_safe/constraint",
+            f"{schema_u}.{cons_u}.drop.sql",
+            content,
+            "安全清理目标端重复单列 IS NOT NULL 约束",
+            extra_comments=[
+                f"TARGET_TABLE: {schema_u}.{table_name_u}",
+                "仅当报告已明确标记为 SAFE_DUPLICATE_NOTNULL 时才生成；执行前仍建议复核。"
+            ]
+        )
+        output_paths.append(file_path)
+    return output_paths
 
 
 def _build_guard_block(obj_type: str, schema: str, name: str, ddl: str) -> str:
@@ -30613,6 +31055,7 @@ def write_fixup_file(
                 f.write(f"{grant_stmt}\n")
 
     log.info(f"[FIXUP] 生成目标端订正 SQL: {file_path}")
+    return file_path
 
 
 def write_fixup_root_readme(
@@ -30705,7 +31148,8 @@ def write_fixup_root_readme(
         "status": "状态漂移修补脚本（trigger/constraint）。",
         "job": "JOB 草案或修补脚本，通常需人工确认。",
         "schedule": "SCHEDULE 草案或修补脚本，通常需人工确认。",
-        "cleanup_candidates": "目标端多余对象清理候选，默认不自动执行。",
+        "cleanup_candidates": "目标端多余对象清理候选总览，默认不自动执行。",
+        "cleanup_safe": "安全清理 SQL（默认跳过；需显式按目录执行 destructive DROP）。",
     }
 
     for dir_name in existing_dirs:
@@ -32663,6 +33107,7 @@ def generate_fixup_scripts(
     view_dependency_map = view_dependency_map or {}
     trigger_status_rows = trigger_status_rows or []
     constraint_status_rows = constraint_status_rows or []
+    missing_table_constraint_status_rows: List[MissingTableConstraintStatusRow] = []
     name_collision_mode = normalize_name_collision_mode(
         settings.get("name_collision_mode", "fixup")
     )
@@ -34171,6 +34616,18 @@ def generate_fixup_scripts(
         )
 
     missing_tables = list(missing_tables_supported)
+    missing_table_constraint_status_rows = collect_missing_table_constraint_status_rows(
+        oracle_meta,
+        missing_tables,
+        name_collision_planned_map=name_collision_planned_map,
+        unsupported_table_keys=unsupported_table_keys,
+    )
+    settings["_missing_table_constraint_status_count"] = len(missing_table_constraint_status_rows)
+    if missing_table_constraint_status_rows:
+        log.info(
+            "[FIXUP] 缺失 TABLE 的 FK/CHECK 源端为 ENABLED + NOT VALIDATED，已追加后置状态脚本 %d 条。",
+            len(missing_table_constraint_status_rows)
+        )
 
     ob_grant_catalog: Optional[ObGrantCatalog] = None
     object_grants_missing_by_grantee: Dict[str, Set[ObjectGrantEntry]] = {}
@@ -36226,6 +36683,7 @@ def generate_fixup_scripts(
         status_jobs: List[Callable[[], None]] = []
         trigger_status_jobs: List[Tuple[TriggerStatusReportRow, List[str]]] = []
         constraint_status_jobs: List[ConstraintStatusDriftRow] = []
+        seen_constraint_status_jobs: Set[Tuple[str, str, str]] = set()
         if "TRIGGER" in status_fixup_types and "TRIGGER" in check_status_drift_types:
             for row in trigger_status_rows:
                 sqls = build_trigger_status_fixup_sqls(row, trigger_validity_sync_mode)
@@ -36234,8 +36692,32 @@ def generate_fixup_scripts(
         if "CONSTRAINT" in status_fixup_types and "CONSTRAINT" in check_status_drift_types:
             for row in constraint_status_rows:
                 action_sql = (row.action_sql or "").strip()
-                if action_sql and action_sql != "-":
+                dedup_key = ((row.table_full or "").upper(), (row.tgt_constraint or "").upper(), action_sql)
+                if action_sql and action_sql != "-" and dedup_key not in seen_constraint_status_jobs:
+                    seen_constraint_status_jobs.add(dedup_key)
                     constraint_status_jobs.append(row)
+            for row in missing_table_constraint_status_rows:
+                action_sql = (row.action_sql or "").strip()
+                if not action_sql or action_sql == "-":
+                    continue
+                drift_row = ConstraintStatusDriftRow(
+                    table_full=row.table_full,
+                    src_table_full=row.src_table_full,
+                    constraint_type=row.constraint_type,
+                    src_constraint=row.constraint_name,
+                    tgt_constraint=row.constraint_name,
+                    src_status=row.src_status,
+                    tgt_status="ENABLED",
+                    src_validated=row.src_validated,
+                    tgt_validated="VALIDATED",
+                    detail=row.detail,
+                    action_sql=row.action_sql,
+                )
+                dedup_key = ((drift_row.table_full or "").upper(), (drift_row.tgt_constraint or "").upper(), action_sql)
+                if dedup_key in seen_constraint_status_jobs:
+                    continue
+                seen_constraint_status_jobs.add(dedup_key)
+                constraint_status_jobs.append(drift_row)
 
         total_status_jobs = len(trigger_status_jobs) + len(constraint_status_jobs)
         log.info("[FIXUP] (7.5/9) 正在生成状态修复脚本...")
@@ -36680,13 +37162,28 @@ def generate_fixup_scripts(
 
     if generate_extra_cleanup:
         cleanup_candidates = collect_extra_cleanup_candidates(tv_results, extra_results)
-        cleanup_path = export_extra_cleanup_candidates(base_dir, cleanup_candidates)
+        safe_duplicate_notnull_cleanup_candidates = collect_safe_duplicate_notnull_cleanup_candidates(extra_results)
+        cleanup_path = export_extra_cleanup_candidates(
+            base_dir,
+            cleanup_candidates,
+            safe_duplicate_notnull_candidates=safe_duplicate_notnull_cleanup_candidates
+        )
+        cleanup_safe_paths = export_safe_duplicate_notnull_cleanup_fixup_scripts(
+            base_dir,
+            safe_duplicate_notnull_cleanup_candidates
+        )
         if cleanup_path:
             log.info(
-                "[FIXUP] 额外对象清理候选已输出: %s (count=%d, 注释候选不自动执行)",
+                "[FIXUP] 额外对象清理候选已输出: %s (count=%d, duplicate_notnull_drop=%d, cleanup_safe_sql=%d)",
                 cleanup_path,
-                len(cleanup_candidates)
+                len(cleanup_candidates),
+                len(safe_duplicate_notnull_cleanup_candidates),
+                len(cleanup_safe_paths)
             )
+            if cleanup_safe_paths:
+                log.warning(
+                    "[FIXUP] 已生成 cleanup_safe/constraint/ 安全清理 SQL（默认不会被 run_fixup 执行，需显式 --only-dirs cleanup_safe/constraint）。"
+                )
         else:
             log.info("[FIXUP] 未发现可输出的额外对象清理候选。")
 
@@ -41314,6 +41811,9 @@ def _build_report_detail_rows(
                     "check_suppressed_target_dup_count": int(
                         getattr(row, "check_suppressed_target_dup_count", 0) or 0
                     ),
+                    "duplicate_notnull_extra_constraints": sorted(list(
+                        getattr(row, "duplicate_notnull_extra_constraints", frozenset()) or frozenset()
+                    )),
                 }, ensure_ascii=False)
             })
         for row in extra_sequence_mismatched:
@@ -44171,15 +44671,35 @@ def save_report_to_db(
     trigger_missing_total = int(extra_missing_counts.get("TRIGGER", 0) or 0)
     sequence_missing_total = int(extra_missing_counts.get("SEQUENCE", 0) or 0)
 
-    if missing_count == 0 and mismatched_count == 0:
+    extra_mismatch_total = (
+        index_mismatch_total
+        + constraint_mismatch_total
+        + len(extra_results.get("sequence_mismatched", []) or [])
+        + len(extra_results.get("trigger_mismatched", []) or [])
+        + len(trigger_status_rows or [])
+        + len(constraint_status_rows or [])
+    )
+    extra_missing_total = (
+        index_missing_total
+        + constraint_missing_total
+        + trigger_missing_total
+        + sequence_missing_total
+    )
+    actionable_missing_total = missing_count + extra_missing_total
+    actionable_mismatch_total = mismatched_count + extra_mismatch_total
+
+    if actionable_missing_total == 0 and actionable_mismatch_total == 0 and unsupported_count == 0:
         conclusion = "PASS"
         conclusion_detail = "所有校验对象均已通过"
-    elif missing_count > 0:
+    elif actionable_missing_total > 0:
         conclusion = "FAIL"
-        conclusion_detail = f"存在 {missing_count} 个缺失对象"
+        conclusion_detail = f"存在 {actionable_missing_total} 个缺失对象"
+    elif unsupported_count > 0:
+        conclusion = "FAIL"
+        conclusion_detail = f"存在 {unsupported_count} 个不支持/阻断对象"
     else:
         conclusion = "WARN"
-        conclusion_detail = f"存在 {mismatched_count} 个不匹配对象"
+        conclusion_detail = f"存在 {actionable_mismatch_total} 个不匹配对象"
 
     if store_scope in {"core", "full"}:
         detail_rows, detail_truncated, detail_truncated_count = _build_report_detail_rows(

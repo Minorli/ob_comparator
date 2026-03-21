@@ -32,7 +32,7 @@
 - **run_fixup 增强**：支持 `--iterative`、`--view-chain-autofix`、语句级继续执行、授权修剪与错误报告。
 - **run_fixup 安全门禁**：默认跳过 `fixup_scripts/table/`，需显式 `--allow-table-create` 才执行建表脚本。
 - **状态漂移修复**：支持 TRIGGER/CONSTRAINT 的状态差异检测与状态修补脚本生成。
-- **约束策略增强**：支持缺失约束的 `safe_novalidate/source/force_validate` 策略；仅当源端最终语义需要 `VALIDATED` 时，才生成后置 `validate_later` 脚本。
+- **约束策略增强**：支持缺失约束的 `safe_novalidate/source/force_validate` 策略；仅当源端最终语义需要 `VALIDATED` 时，才生成后置 `validate_later` 脚本。对“缺失 TABLE 首次创建”场景，若源端 `FK/CHECK` 为 `ENABLED + NOT VALIDATED`，会同轮追加 `fixup/status/constraint/*.status.sql` 恢复 `ENABLE NOVALIDATE` 语义。
 - **约束状态修复默认更严格**：`constraint_status_sync_mode` 默认改为 `full`，现有 `FK/CHECK` 的 `VALIDATED / NOT VALIDATED` 漂移会默认进入状态校验与状态修复脚本；`PK/UK` 的 `VALIDATED / NOT VALIDATED` 漂移也会进入状态漂移报告，但仍不生成 `ENABLE/[NO]VALIDATE` SQL。
 - **OB FK 元数据增强**：当 OceanBase `DBA_CONSTRAINTS` 退化到 basic/degraded 模式时，会对受影响 FK 定向回填 `R_OWNER/R_CONSTRAINT_NAME`，避免仅按本地列集合误判 FK 已匹配。
 - **视图兼容治理**：支持 VIEW 兼容规则、DBLINK 策略、列清单约束清洗与依赖链修复。
@@ -234,6 +234,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/column_nullability_detail_<ts>.txt`：现有列空值语义差异明细（含 `NOT NULL`、`NOT NULL ENABLE NOVALIDATE` 与反向漂移；其中 `ENABLE NOVALIDATE` 补位会在 `table_alter` 中默认输出可执行约束 SQL）
 - OceanBase 侧等价 `CHECK (<col> IS NOT NULL)` 识别依赖 `DBA_CONSTRAINTS` 条件文本；当前版本已改为按 chunk 保留成功的 `SEARCH_CONDITION`，并在退化时按表/约束回填，避免因个别 owner 查询失败而误生 `NOT NULL ENABLE NOVALIDATE` DDL
 - OceanBase 自动生成的 `*_OBCHECK_*` / `*_OBNOTNULL_*` 约束会继续从普通约束噪声中抑制，但其 `IS NOT NULL` 语义仍会保留给 `TABLE` compare 使用，避免目标端已存在等价约束时重复生成 `table_alter` DDL
+- 当目标端同一列存在多份等价单列 `IS NOT NULL` CHECK、而源端仅保留一份语义时，扩展约束 compare 会把多余约束列为 `extra mismatch`，并在 `fixup/cleanup_candidates/extra_cleanup_candidates.txt` 的 `SAFE_DUPLICATE_NOTNULL_DROP_SQL` 区域输出未注释的 `DROP CONSTRAINT` 候选，同时生成 `fixup/cleanup_safe/constraint/*.sql`；`cleanup_safe/` 默认不会被 `run_fixup` 执行，需显式 `--only-dirs cleanup_safe/constraint`
 - `main_reports/run_<ts>/column_visibility_skipped_detail_<ts>.txt`：`column_visibility_policy=auto` 且 `INVISIBLE_COLUMN` 元数据不完整时的跳过明细，说明哪些表本轮未做 INVISIBLE compare/fixup
 - OceanBase 列元数据现在联合 `DBA_TAB_COLUMNS` 与 `DBA_TAB_COLS` 取长补短；标准字段优先保留 `DBA_TAB_COLUMNS`，可选标记/缺失值由 `DBA_TAB_COLS` 补齐，降低单视图元数据不一致带来的漏检
 - 普通 `NOT NULL` 收紧默认改为 `plain_not_null_fixup_mode=runnable_if_no_nulls`：先探测目标端是否存在 `NULL`，仅无 `NULL` 时输出可执行 `MODIFY ... NOT NULL`；如需恢复纯 review-first，可改回 `review_only`
