@@ -92,7 +92,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Callable, Dict, FrozenSet, Iterable, Iterator, List, NamedTuple, NoReturn, Optional, Sequence, Set, Tuple, Union
+from typing import Callable, Dict, FrozenSet, Iterable, Iterator, List, NamedTuple, NoReturn, Optional, Pattern, Sequence, Set, Tuple, Union
 
 __version__ = "0.9.8.8"
 
@@ -27542,7 +27542,7 @@ def analyze_view_compatibility(
 def extract_view_dependencies(
     ddl: str,
     default_schema: Optional[str] = None,
-    max_depth: int = 1
+    max_depth: int = 5
 ) -> Set[str]:
     """
     从 VIEW DDL 中提取依赖的对象名（表/视图/同义词等）。
@@ -27554,88 +27554,176 @@ def extract_view_dependencies(
     if not ddl:
         return dependencies
 
-    masker = SqlMasker(ddl)
-    clean_sql = masker.masked_sql
+    masked = mask_sql_for_scan(ddl)
+    masked_upper = masked.upper()
+    length = len(masked_upper)
+    start_single = ("FROM", "JOIN", "UPDATE", "INTO")
+    stopper_keywords = (
+        "WHERE", "GROUP", "HAVING", "ORDER", "UNION", "INTERSECT", "MINUS", "EXCEPT",
+        "START", "CONNECT", "MODEL", "WINDOW", "FETCH", "OFFSET", "FOR",
+        "ON", "USING", "LEFT", "RIGHT", "FULL", "INNER", "CROSS", "NATURAL",
+        "SELECT", "SET", "VALUES", "RETURNING", "AS",
+    )
+    qualified_token_re = re.compile(
+        r'^\s*((?:"[^"]+"|[A-Z0-9_$#]+)(?:\s*\.\s*(?:"[^"]+"|[A-Z0-9_$#]+))?(?:\s*@\s*[A-Z0-9_$#]+)?)',
+        re.IGNORECASE,
+    )
 
-    # 归一化空白
-    clean_sql = re.sub(r'\s+', ' ', clean_sql)
+    def _is_word_char(ch: str) -> bool:
+        return ch.isalnum() or ch in "_$#"
 
-    # 关键词正则
-    start_keywords = r'(?:FROM|JOIN|UPDATE|INTO|MERGE\s+INTO)'
-    stopper_keywords = [
-        'WHERE', 'GROUP', 'HAVING', 'ORDER', 'UNION', 'INTERSECT', 'MINUS', 'EXCEPT',
-        'START', 'CONNECT', 'MODEL', 'WINDOW', 'FETCH', 'OFFSET', 'FOR',
-        'ON', 'USING', 'LEFT', 'RIGHT', 'FULL', 'INNER', 'CROSS', 'NATURAL',
-        'SELECT', 'SET', 'VALUES', 'RETURNING', 'AS'
-    ]
-    stopper_pattern = r'\b(?:' + '|'.join(stopper_keywords) + r')\b'
+    def _match_word_at(pos: int, word: str) -> Optional[int]:
+        end = pos + len(word)
+        if end > length:
+            return None
+        if masked_upper[pos:end] != word:
+            return None
+        if pos > 0 and _is_word_char(masked_upper[pos - 1]):
+            return None
+        if end < length and _is_word_char(masked_upper[end]):
+            return None
+        return end
 
-    combined_pattern = re.compile(rf'\b{start_keywords}\b', re.IGNORECASE)
-    stopper_regex = re.compile(stopper_pattern + r'|' + rf'\b{start_keywords}\b', re.IGNORECASE)
+    def _match_merge_into_at(pos: int) -> Optional[int]:
+        merge_end = _match_word_at(pos, "MERGE")
+        if merge_end is None:
+            return None
+        idx = merge_end
+        while idx < length and masked_upper[idx].isspace():
+            idx += 1
+        return _match_word_at(idx, "INTO")
 
-    current_pos = 0
-    while True:
-        match = combined_pattern.search(clean_sql, current_pos)
-        if not match:
-            break
-        
-        content_start = match.end()
-        stop_match = stopper_regex.search(clean_sql, content_start)
-        
-        if stop_match:
-            content_end = stop_match.start()
-            next_scan_pos = stop_match.start()
-        else:
-            content_end = len(clean_sql)
-            next_scan_pos = len(clean_sql)
+    def _previous_word(pos: int) -> str:
+        idx = pos - 1
+        while idx >= 0 and masked_upper[idx].isspace():
+            idx -= 1
+        if idx < 0 or not _is_word_char(masked_upper[idx]):
+            return ""
+        end = idx + 1
+        while idx >= 0 and _is_word_char(masked_upper[idx]):
+            idx -= 1
+        return masked_upper[idx + 1:end]
 
-        segment = clean_sql[content_start:content_end]
-        
-        # 处理逗号分隔的表列表
-        parts = segment.split(',')
-        for part in parts:
-            part = part.strip()
-            # 简单过滤：忽略括号开头的子查询
-            if not part:
+    def _match_start_at(pos: int) -> Optional[Tuple[str, int]]:
+        merge_into_end = _match_merge_into_at(pos)
+        if merge_into_end is not None:
+            return "MERGE INTO", merge_into_end
+        for keyword in start_single:
+            keyword_end = _match_word_at(pos, keyword)
+            if keyword_end is None:
                 continue
-            if part.startswith('('):
-                if max_depth <= 0:
+            if keyword == "INTO":
+                prev = _previous_word(pos)
+                if prev not in {"INSERT", "MERGE"}:
                     continue
-                inner = part
-                if ')' in inner:
-                    inner = inner[1:inner.rfind(')')]
-                else:
-                    inner = inner[1:]
-                if re.search(r'\bSELECT\b', inner, re.IGNORECASE):
-                    dependencies.update(
-                        extract_view_dependencies(inner, default_schema=default_schema, max_depth=max_depth - 1)
-                    )
-                continue
-                
-            # 取第一个 token (忽略别名)
-            first_token = part.split()[0]
-            candidate = first_token.replace('"', '').upper()
-            candidate = re.sub(r'[^A-Z0-9_\$#\.]+$', '', candidate)
-            
-            if '@' in candidate:
-                candidate = candidate.split('@')[0]
-            
-            if not candidate or candidate == 'DUAL':
-                continue
-            
-            # 简单的合法性检查
-            if not re.match(r'^[A-Z0-9_\$#\.]+$', candidate):
-                continue
-                
-            if '.' in candidate:
-                dependencies.add(candidate)
-            elif default_schema:
-                dependencies.add(f"{default_schema.upper()}.{candidate}")
+            return keyword, keyword_end
+        return None
 
-        current_pos = next_scan_pos
-        # 防止死循环
-        if current_pos <= match.start():
-            current_pos = match.end()
+    def _normalize_dep_candidate(raw_token: str) -> Optional[str]:
+        if not raw_token:
+            return None
+        token = re.sub(r'\s*@\s*[A-Z0-9_$#]+$', '', raw_token.strip(), flags=re.IGNORECASE)
+        token = token.replace(" ", "")
+        if not token:
+            return None
+        parts = [part.strip().strip('"').upper() for part in token.split(".") if part.strip()]
+        if not parts:
+            return None
+        if len(parts) == 1:
+            if parts[0] == "DUAL" or not default_schema:
+                return None
+            return "%s.%s" % (default_schema.upper(), parts[0])
+        if len(parts) == 2:
+            if parts[1] == "DUAL":
+                return None
+            return "%s.%s" % (parts[0], parts[1])
+        return None
+
+    def _extract_inner_subquery(part_text: str) -> Optional[str]:
+        if not part_text:
+            return None
+        stripped = part_text.lstrip()
+        if not stripped or stripped[0] != "(":
+            return None
+        masked_part = mask_sql_for_scan(stripped)
+        depth = 0
+        for idx, ch in enumerate(masked_part):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return stripped[1:idx]
+        return stripped[1:] if len(stripped) > 1 else None
+
+    def _process_part(part_start: int, part_end: int, segment_offset: int, recurse_depth: int) -> None:
+        part_text = ddl[segment_offset + part_start:segment_offset + part_end]
+        if not part_text or not part_text.strip():
+            return
+        inner = _extract_inner_subquery(part_text)
+        if inner is not None:
+            if recurse_depth <= 0:
+                return
+            if re.search(r'\bSELECT\b', mask_sql_for_scan(inner), re.IGNORECASE):
+                dependencies.update(
+                    extract_view_dependencies(inner, default_schema=default_schema, max_depth=recurse_depth - 1)
+                )
+            return
+        match = qualified_token_re.match(part_text)
+        if not match:
+            return
+        candidate = _normalize_dep_candidate(match.group(1))
+        if candidate:
+            dependencies.add(candidate)
+
+    depth_map: List[int] = [0] * length
+    current_depth = 0
+    for idx, ch in enumerate(masked_upper):
+        depth_map[idx] = current_depth
+        if ch == "(":
+            current_depth += 1
+        elif ch == ")":
+            current_depth = max(0, current_depth - 1)
+
+    i = 0
+    while i < length:
+        start_hit = _match_start_at(i)
+        if not start_hit:
+            i += 1
+            continue
+        _start_kw, content_start = start_hit
+        clause_depth = depth_map[i]
+        j = content_start
+        while j < length:
+            depth_j = depth_map[j]
+            if depth_j < clause_depth:
+                break
+            if depth_j == clause_depth:
+                if _match_start_at(j):
+                    break
+                should_stop = False
+                for keyword in stopper_keywords:
+                    if _match_word_at(j, keyword):
+                        should_stop = True
+                        break
+                if should_stop:
+                    break
+            j += 1
+
+        segment = masked[content_start:j]
+        seg_depth = 0
+        part_start = 0
+        for idx, seg_ch in enumerate(segment):
+            if seg_ch == "(":
+                seg_depth += 1
+            elif seg_ch == ")":
+                if seg_depth > 0:
+                    seg_depth -= 1
+            elif seg_ch == "," and seg_depth == 0:
+                _process_part(part_start, idx, content_start, max_depth)
+                part_start = idx + 1
+        _process_part(part_start, len(segment), content_start, max_depth)
+        i += 1
 
     return dependencies
 
@@ -27821,7 +27909,7 @@ def remap_view_dependencies(
         return ddl
     
     # 提取依赖对象（无 schema 的引用按 view_schema 兜底）
-    dependencies = extract_view_dependencies(ddl, default_schema=view_schema)
+    dependencies = extract_view_dependencies(ddl, default_schema=view_schema, max_depth=5)
     if view_dependency_map:
         dep_key = ((view_schema or "").upper(), (view_name or "").upper())
         fallback_deps = view_dependency_map.get(dep_key)
@@ -27832,8 +27920,19 @@ def remap_view_dependencies(
     replacements_qualified: Dict[str, str] = {}
     replacements_unqualified: Dict[str, str] = {}
     view_schema_u = (view_schema or "").upper()
+    view_name_u = (view_name or "").upper()
     synonym_meta = synonym_meta or {}
     preferred_types = ("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM", "FUNCTION")
+    unresolved_dependencies: List[str] = []
+    synonym_object_fallbacks: List[str] = []
+
+    def _resolve_managed_synonym_object(owner: str, dep_obj: str) -> Optional[str]:
+        owner_u = (owner or "").upper()
+        dep_obj_u = (dep_obj or "").upper()
+        if not owner_u or not dep_obj_u:
+            return None
+        mapped = get_mapped_target(full_object_mapping, f"{owner_u}.{dep_obj_u}", "SYNONYM")
+        return mapped.upper() if mapped else None
 
     def _resolve_synonym(owner: str, dep_obj: str) -> Optional[str]:
         terminal_source = resolve_synonym_terminal_source(owner, dep_obj, synonym_meta, full_object_mapping)
@@ -27849,6 +27948,44 @@ def remap_view_dependencies(
         if explicit:
             mapped = explicit
         return (mapped or terminal_source).upper()
+
+    def _build_qualified_rewrite_specs(src_ref: str, tgt_ref: str) -> List[Tuple[Pattern[str], str]]:
+        src_u = (src_ref or "").upper()
+        tgt_u = (tgt_ref or "").upper()
+        if "." not in src_u or "." not in tgt_u:
+            return []
+        src_schema_u, src_obj_u = src_u.split(".", 1)
+        tgt_schema_u, tgt_obj_u = tgt_u.split(".", 1)
+        specs: List[Tuple[Pattern[str], str]] = []
+        variants = [
+            (
+                rf'(?<![A-Z0-9_\$#"])'
+                rf'"{re.escape(src_schema_u)}"\s*\.\s*"{re.escape(src_obj_u)}"'
+                rf'(?![A-Z0-9_\$#"])',
+                f'{quote_identifier(tgt_schema_u)}.{quote_identifier(tgt_obj_u)}',
+            ),
+            (
+                rf'(?<![A-Z0-9_\$#"])'
+                rf'"{re.escape(src_schema_u)}"\s*\.\s*{re.escape(src_obj_u)}'
+                rf'(?![A-Z0-9_\$#"])',
+                f'{quote_identifier(tgt_schema_u)}.{tgt_obj_u}',
+            ),
+            (
+                rf'(?<![A-Z0-9_\$#"])'
+                rf'{re.escape(src_schema_u)}\s*\.\s*"{re.escape(src_obj_u)}"'
+                rf'(?![A-Z0-9_\$#"])',
+                f'{tgt_schema_u}.{quote_identifier(tgt_obj_u)}',
+            ),
+            (
+                rf'(?<![A-Z0-9_\$#"])'
+                rf'{re.escape(src_schema_u)}\s*\.\s*{re.escape(src_obj_u)}'
+                rf'(?![A-Z0-9_\$#"])',
+                f'{tgt_schema_u}.{tgt_obj_u}',
+            ),
+        ]
+        for pattern_text, replacement in variants:
+            specs.append((re.compile(pattern_text, re.IGNORECASE), replacement))
+        return specs
 
     for dep in dependencies:
         dep_u = dep.upper()
@@ -27884,15 +28021,30 @@ def remap_view_dependencies(
                 mapped_target = _resolve_synonym("PUBLIC", dep_obj)
                 if mapped_target:
                     resolved_by_synonym = True
+                else:
+                    mapped_target = _resolve_managed_synonym_object("PUBLIC", dep_obj)
+                    if mapped_target:
+                        resolved_by_synonym = True
+                        synonym_object_fallbacks.append(f"PUBLIC.{dep_obj}->{mapped_target}")
             else:
                 # 同义词依赖优先解析为终点对象，再做 remap，避免停留在目标同义词名。
                 mapped_target = _resolve_synonym(dep_schema, dep_obj)
                 if mapped_target:
                     resolved_by_synonym = True
+                else:
+                    mapped_target = _resolve_managed_synonym_object(dep_schema, dep_obj)
+                    if mapped_target:
+                        resolved_by_synonym = True
+                        synonym_object_fallbacks.append(f"{dep_schema}.{dep_obj}->{mapped_target}")
                 if not mapped_target and dep_schema == view_schema_u:
                     mapped_target = _resolve_synonym("PUBLIC", dep_obj)
                     if mapped_target:
                         resolved_by_synonym = True
+                    else:
+                        mapped_target = _resolve_managed_synonym_object("PUBLIC", dep_obj)
+                        if mapped_target:
+                            resolved_by_synonym = True
+                            synonym_object_fallbacks.append(f"PUBLIC.{dep_obj}->{mapped_target}")
 
             if not mapped_target:
                 mapped_target = find_mapped_target_any_type(
@@ -27911,6 +28063,7 @@ def remap_view_dependencies(
                     if mapped_public:
                         mapped_target = mapped_public
         if not mapped_target:
+            unresolved_dependencies.append(dep_u)
             continue
         # 保护规则：
         # 若未显式配置该依赖对象的重命名 remap，且不是同义词终点解析得到的结果，
@@ -27929,6 +28082,27 @@ def remap_view_dependencies(
             # 无前缀引用也替换为全名(或目标名)，避免跨 schema 迁移后失效
             replacements_unqualified.setdefault(dep_obj.upper(), tgt_u)
 
+    if synonym_object_fallbacks:
+        preview = ", ".join(sorted(dict.fromkeys(synonym_object_fallbacks))[:10])
+        log.info(
+            "[VIEW] %s.%s 使用目标同义词对象 fallback 重写 %d 条依赖: %s",
+            view_schema_u,
+            view_name_u,
+            len(synonym_object_fallbacks),
+            preview,
+        )
+    if unresolved_dependencies:
+        unresolved_sorted = sorted(dict.fromkeys(unresolved_dependencies))
+        preview = ", ".join(unresolved_sorted[:10])
+        suffix = " ..." if len(unresolved_sorted) > 10 else ""
+        log.warning(
+            "[VIEW] %s.%s 有 %d 条依赖无法安全 remap，保留原引用: %s%s",
+            view_schema_u,
+            view_name_u,
+            len(unresolved_sorted),
+            preview,
+            suffix,
+        )
     if not replacements_qualified and not replacements_unqualified:
         return ddl
 
@@ -27938,11 +28112,8 @@ def remap_view_dependencies(
 
     for src_ref in sorted(replacements_qualified.keys(), key=len, reverse=True):
         tgt_ref = replacements_qualified[src_ref]
-        pattern = re.compile(
-            rf'(?<![A-Z0-9_\$#"]){re.escape(src_ref)}(?![A-Z0-9_\$#"])',
-            re.IGNORECASE
-        )
-        working_sql = pattern.sub(tgt_ref, working_sql)
+        for pattern, replacement in _build_qualified_rewrite_specs(src_ref, tgt_ref):
+            working_sql = pattern.sub(replacement, working_sql)
 
     rewritten = masker.unmask(working_sql)
     if replacements_unqualified:
