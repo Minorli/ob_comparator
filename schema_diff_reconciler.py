@@ -1011,6 +1011,15 @@ class TablePresenceSummary(NamedTuple):
     rows: List[TablePresenceResult]
 
 
+class ScopedSourceScopeResult(NamedTuple):
+    mode: str
+    root_seed_nodes: FrozenSet[DependencyNode]
+    explicit_trigger_nodes: FrozenSet[DependencyNode]
+    included_nodes: FrozenSet[DependencyNode]
+    excluded_nodes: FrozenSet[DependencyNode]
+    detail_rows: Tuple[Tuple[str, str, str, str], ...]  # (STATUS, TYPE, SOURCE_FULL, DETAIL)
+
+
 @dataclass
 class DdlFormatItem:
     path: Path
@@ -3992,6 +4001,15 @@ def collect_fixup_config_diagnostics(
     trigger_list_path = settings.get("trigger_list", "").strip()
     if trigger_list_path and "TRIGGER" not in enabled_extra_types:
         diagnostics.append("trigger_list 已配置，但 check_extra_types 未启用 TRIGGER，仅进行清单格式校验。")
+    source_scope_mode = normalize_source_object_scope_mode(
+        settings.get("source_object_scope_mode", "full_source")
+    )
+    if source_scope_mode == "remap_root_closure":
+        remap_file = (settings.get("remap_file") or "").strip()
+        if not remap_file:
+            diagnostics.append("source_object_scope_mode=remap_root_closure 但 remap_file 为空，运行时会 fail-fast。")
+        if trigger_list_path and "TRIGGER" not in enabled_extra_types:
+            diagnostics.append("source_object_scope_mode=remap_root_closure 且配置了 trigger_list，但 check_extra_types 未启用 TRIGGER，运行时会 fail-fast。")
 
     name_collision_mode = normalize_name_collision_mode(settings.get("name_collision_mode", "fixup"))
     rename_existing = parse_bool_flag(settings.get("name_collision_rename_existing", "true"), True)
@@ -4178,6 +4196,16 @@ REPORT_DIR_LAYOUT_ALIASES = {
     "single": "flat",
 }
 
+SOURCE_OBJECT_SCOPE_MODE_VALUES = {"full_source", "remap_root_closure"}
+SOURCE_OBJECT_SCOPE_MODE_ALIASES = {
+    "full": "full_source",
+    "fullsource": "full_source",
+    "closure": "remap_root_closure",
+    "remap_closure": "remap_root_closure",
+    "remap-root-closure": "remap_root_closure",
+    "remaprootclosure": "remap_root_closure",
+}
+
 
 def normalize_report_dir_layout(raw_value: Optional[str]) -> str:
     if not raw_value or not str(raw_value).strip():
@@ -4187,6 +4215,17 @@ def normalize_report_dir_layout(raw_value: Optional[str]) -> str:
     if value not in REPORT_DIR_LAYOUT_VALUES:
         log.warning("report_dir_layout=%s 不在支持范围内，将回退为 per_run。", raw_value)
         return "per_run"
+    return value
+
+
+def normalize_source_object_scope_mode(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "full_source"
+    value = str(raw_value).strip().lower()
+    value = SOURCE_OBJECT_SCOPE_MODE_ALIASES.get(value, value)
+    if value not in SOURCE_OBJECT_SCOPE_MODE_VALUES:
+        log.warning("source_object_scope_mode=%s 不在支持范围内，将回退为 full_source。", raw_value)
+        return "full_source"
     return value
 
 
@@ -5616,6 +5655,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('name_collision_rename_existing', 'true')
         settings.setdefault('trigger_list', '')
         settings.setdefault('trigger_qualify_schema', 'true')
+        settings.setdefault('source_object_scope_mode', 'full_source')
         settings.setdefault('check_status_drift_types', 'trigger,constraint')
         settings.setdefault('generate_status_fixup', 'true')
         settings.setdefault('status_fixup_types', 'trigger,constraint')
@@ -5947,6 +5987,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings['name_collision_rename_existing'] = parse_bool_flag(
             settings.get('name_collision_rename_existing', 'true'),
             True
+        )
+        settings['source_object_scope_mode'] = normalize_source_object_scope_mode(
+            settings.get('source_object_scope_mode', 'full_source')
         )
         settings['report_dir_layout'] = normalize_report_dir_layout(
             settings.get('report_dir_layout', 'per_run')
@@ -6561,6 +6604,14 @@ def run_config_wizard(config_path: Path) -> None:
         if normalized in REPORT_DIR_LAYOUT_VALUES:
             return True, ""
         return False, "仅支持 flat/per_run"
+
+    def _validate_source_object_scope_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = SOURCE_OBJECT_SCOPE_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in SOURCE_OBJECT_SCOPE_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 full_source/remap_root_closure"
 
     def _validate_report_detail_mode(val: str) -> Tuple[bool, str]:
         if not val.strip():
@@ -7238,6 +7289,14 @@ def run_config_wizard(config_path: Path) -> None:
     )
     _prompt_field(
         "SETTINGS",
+        "source_object_scope_mode",
+        "源对象范围模式 (full_source/remap_root_closure)",
+        default=cfg.get("SETTINGS", "source_object_scope_mode", fallback="full_source"),
+        validator=_validate_source_object_scope_mode,
+        transform=normalize_source_object_scope_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
         "generate_status_fixup",
         "是否生成状态漂移修复脚本 (true/false，默认 true)",
         default=cfg.get("SETTINGS", "generate_status_fixup", fallback="true"),
@@ -7698,9 +7757,15 @@ def collect_missing_trigger_mappings(
 
 def build_non_table_trigger_detail_rows(
     oracle_meta: OracleMetadata,
-    full_object_mapping: FullObjectMapping
+    full_object_mapping: FullObjectMapping,
+    source_objects: Optional[SourceObjectMap] = None,
 ) -> List[NonTableTriggerDetailRow]:
     rows: List[NonTableTriggerDetailRow] = []
+    scoped_source_objects = {
+        (full_name or "").upper(): {t.upper() for t in (types or set()) if t}
+        for full_name, types in (source_objects or {}).items()
+        if full_name
+    }
     for item in sorted(
         oracle_meta.non_table_triggers or (),
         key=lambda x: (
@@ -7712,6 +7777,8 @@ def build_non_table_trigger_detail_rows(
     ):
         src_full = f"{(item.owner or '').upper()}.{(item.trigger_name or '').upper()}".strip(".")
         if not src_full:
+            continue
+        if scoped_source_objects and "TRIGGER" not in scoped_source_objects.get(src_full, set()):
             continue
         tgt_full = (get_mapped_target(full_object_mapping, src_full, 'TRIGGER') or src_full).upper()
         base_type_u = str(item.base_object_type or "").strip().upper()
@@ -8702,6 +8769,218 @@ def filter_remap_conflicts_by_nodes(
             continue
         filtered[(src_full, obj_type)] = reason
     return filtered
+
+
+def collect_source_object_nodes(
+    source_objects: Optional[SourceObjectMap]
+) -> Set[DependencyNode]:
+    nodes: Set[DependencyNode] = set()
+    for full_name, obj_types in (source_objects or {}).items():
+        full_u = (full_name or "").upper()
+        if not full_u:
+            continue
+        for obj_type in (obj_types or set()):
+            type_u = (obj_type or "").upper()
+            if type_u:
+                nodes.add((full_u, type_u))
+    return nodes
+
+
+def build_attached_object_reverse_map(
+    source_objects: Optional[SourceObjectMap],
+    object_parent_map: Optional["ObjectParentMap"]
+) -> Dict[str, Set[DependencyNode]]:
+    reverse_map: Dict[str, Set[DependencyNode]] = defaultdict(set)
+    if not object_parent_map:
+        return {}
+    source_objects = source_objects or {}
+    for dep_full, parent_full in object_parent_map.items():
+        dep_full_u = (dep_full or "").upper()
+        parent_full_u = (parent_full or "").upper()
+        if not dep_full_u or not parent_full_u:
+            continue
+        dep_types = {
+            (obj_type or "").upper()
+            for obj_type in source_objects.get(dep_full_u, set())
+            if obj_type
+        }
+        if not dep_types:
+            continue
+        for dep_type in dep_types:
+            reverse_map[parent_full_u].add((dep_full_u, dep_type))
+    return {key: set(value) for key, value in reverse_map.items()}
+
+
+def build_remap_root_seed_nodes(
+    source_objects: Optional[SourceObjectMap],
+    remap_rules: RemapRules
+) -> Tuple[Set[DependencyNode], List[Tuple[str, str, str]], List[str]]:
+    """
+    返回:
+      - root_seed_nodes: 来自 remap_file 显式 TABLE/VIEW 条目的根种子
+      - skipped_entries: [(SRC_FULL, SOURCE_TYPES, REASON)]
+      - explicit_root_keys: 按 remap 文件出现的显式 TABLE/VIEW 源对象全名
+    """
+    source_objects = source_objects or {}
+    root_seed_nodes: Set[DependencyNode] = set()
+    skipped_entries: List[Tuple[str, str, str]] = []
+    explicit_root_keys: List[str] = []
+    for src_full in sorted((remap_rules or {}).keys()):
+        src_full_u = (src_full or "").upper()
+        types = {
+            (obj_type or "").upper()
+            for obj_type in source_objects.get(src_full_u, set())
+            if obj_type
+        }
+        if not types:
+            skipped_entries.append((src_full_u, "-", "SOURCE_OBJECT_NOT_FOUND"))
+            continue
+        root_types = sorted(t for t in types if t in {"TABLE", "VIEW"})
+        if not root_types:
+            skipped_entries.append((src_full_u, ",".join(sorted(types)), "NON_ROOT_OBJECT_TYPE"))
+            continue
+        explicit_root_keys.append(src_full_u)
+        for obj_type in root_types:
+            root_seed_nodes.add((src_full_u, obj_type))
+    return root_seed_nodes, skipped_entries, explicit_root_keys
+
+
+def build_scoped_trigger_keep_nodes(
+    trigger_entries: Optional[Set[str]],
+    source_objects: Optional[SourceObjectMap],
+    object_parent_map: Optional["ObjectParentMap"]
+) -> Tuple[Set[DependencyNode], List[Tuple[str, str, str, str]], List[str]]:
+    """
+    返回:
+      - keep_nodes: 显式 trigger 及其父 TABLE/VIEW
+      - detail_rows: (STATUS, TYPE, SOURCE_FULL, DETAIL)
+      - missing_entries: trigger_list 中无法在 source_objects 中解析的条目
+    """
+    keep_nodes: Set[DependencyNode] = set()
+    detail_rows: List[Tuple[str, str, str, str]] = []
+    missing_entries: List[str] = []
+    source_objects = source_objects or {}
+    object_parent_map = object_parent_map or {}
+    for full_name in sorted(trigger_entries or set()):
+        full_u = (full_name or "").upper()
+        trigger_types = {
+            (obj_type or "").upper()
+            for obj_type in source_objects.get(full_u, set())
+            if (obj_type or "").upper() == "TRIGGER"
+        }
+        if not trigger_types:
+            missing_entries.append(full_u)
+            continue
+        keep_nodes.add((full_u, "TRIGGER"))
+        detail_rows.append(("TRIGGER_KEEP", "TRIGGER", full_u, "EXPLICIT_TRIGGER_LIST"))
+        parent_full = (object_parent_map.get(full_u) or "").upper()
+        if not parent_full:
+            continue
+        parent_types = {
+            (obj_type or "").upper()
+            for obj_type in source_objects.get(parent_full, set())
+            if (obj_type or "").upper() in {"TABLE", "VIEW"}
+        }
+        for parent_type in sorted(parent_types):
+            keep_nodes.add((parent_full, parent_type))
+            detail_rows.append(("TRIGGER_PARENT", parent_type, parent_full, f"EXPLICIT_TRIGGER_LIST:{full_u}"))
+    return keep_nodes, detail_rows, missing_entries
+
+
+def paired_object_types_for(obj_type: str) -> Tuple[str, ...]:
+    obj_type_u = (obj_type or "").upper()
+    if obj_type_u == "PACKAGE":
+        return ("PACKAGE BODY",)
+    if obj_type_u == "PACKAGE BODY":
+        return ("PACKAGE",)
+    if obj_type_u == "TYPE":
+        return ("TYPE BODY",)
+    if obj_type_u == "TYPE BODY":
+        return ("TYPE",)
+    return ()
+
+
+def build_source_scope_closure(
+    source_objects: SourceObjectMap,
+    dependency_graph: Optional[DependencyGraph],
+    object_parent_map: Optional["ObjectParentMap"],
+    root_seed_nodes: Set[DependencyNode],
+    explicit_trigger_keep_nodes: Optional[Set[DependencyNode]] = None,
+    explicit_trigger_detail_rows: Optional[List[Tuple[str, str, str, str]]] = None,
+    mode: str = "full_source",
+) -> ScopedSourceScopeResult:
+    if mode == "full_source":
+        return ScopedSourceScopeResult(
+            mode=mode,
+            root_seed_nodes=frozenset(),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset(),
+            excluded_nodes=frozenset(),
+            detail_rows=(),
+        )
+
+    all_nodes = collect_source_object_nodes(source_objects)
+    reverse_attached = build_attached_object_reverse_map(source_objects, object_parent_map)
+    included_nodes: Set[DependencyNode] = set()
+    enqueued: Set[DependencyNode] = set()
+    queue: deque = deque()
+    detail_rows: List[Tuple[str, str, str, str]] = []
+    source_objects = source_objects or {}
+
+    def _queue(node: DependencyNode, status: str, detail: str) -> None:
+        full_u = (node[0] or "").upper()
+        type_u = (node[1] or "").upper()
+        if not full_u or not type_u:
+            return
+        if type_u not in source_objects.get(full_u, set()):
+            return
+        key = (full_u, type_u)
+        if key in enqueued:
+            return
+        enqueued.add(key)
+        queue.append((key, status, detail))
+
+    for node in sorted(root_seed_nodes, key=lambda item: (item[1], item[0])):
+        _queue(node, "ROOT_REMAP", "EXPLICIT_REMAP_ROOT")
+    for node in sorted(explicit_trigger_keep_nodes or set(), key=lambda item: (item[1], item[0])):
+        _queue(node, "TRIGGER_KEEP", "EXPLICIT_TRIGGER_KEEP")
+
+    explicit_trigger_detail_map = {
+        ((full or "").upper(), (obj_type or "").upper()): (status, detail)
+        for status, obj_type, full, detail in (explicit_trigger_detail_rows or [])
+    }
+
+    while queue:
+        (full_u, type_u), status, detail = queue.popleft()
+        if (full_u, type_u) in included_nodes:
+            continue
+        included_nodes.add((full_u, type_u))
+        status_final, detail_final = explicit_trigger_detail_map.get((full_u, type_u), (status, detail))
+        detail_rows.append((status_final, type_u, full_u, detail_final))
+
+        for paired_type in paired_object_types_for(type_u):
+            if paired_type in source_objects.get(full_u, set()):
+                _queue((full_u, paired_type), "PAIRED_OBJECT", "%s:%s" % (type_u, full_u))
+
+        if type_u in {"TABLE", "VIEW"}:
+            for child_node in sorted(reverse_attached.get(full_u, set()), key=lambda item: (item[1], item[0])):
+                _queue(child_node, "ATTACHED_OBJECT", "%s:%s" % (type_u, full_u))
+
+        for ref_full, ref_type in sorted(dependency_graph.get((full_u, type_u), set()) if dependency_graph else set(), key=lambda item: (item[1], item[0])):
+            _queue((ref_full.upper(), ref_type.upper()), "DEPENDENCY", "%s:%s" % (type_u, full_u))
+
+    excluded_nodes = all_nodes - included_nodes
+    for full_u, type_u in sorted(excluded_nodes, key=lambda item: (item[1], item[0])):
+        detail_rows.append(("FILTERED_OUT", type_u, full_u, "OUTSIDE_REMAP_ROOT_CLOSURE"))
+
+    return ScopedSourceScopeResult(
+        mode=mode,
+        root_seed_nodes=frozenset(root_seed_nodes),
+        explicit_trigger_nodes=frozenset(explicit_trigger_keep_nodes or set()),
+        included_nodes=frozenset(included_nodes),
+        excluded_nodes=frozenset(excluded_nodes),
+        detail_rows=tuple(detail_rows),
+    )
 
 
 def classify_missing_objects(
@@ -12364,6 +12643,48 @@ def build_managed_target_scope_diagnostics(scope: ManagedTargetScope) -> List[st
     return diagnostics
 
 
+def build_source_scope_diagnostics(scope_result: ScopedSourceScopeResult) -> List[str]:
+    if not scope_result:
+        return []
+    if (scope_result.mode or "").lower() == "full_source":
+        return []
+    diagnostics: List[str] = []
+    diagnostics.append("source_object_scope_mode={mode}".format(mode=scope_result.mode))
+    diagnostics.append(
+        "scoped roots={roots}, explicit_trigger_keeps={triggers}, included={included}, filtered_out={excluded}".format(
+            roots=len(scope_result.root_seed_nodes or []),
+            triggers=len(scope_result.explicit_trigger_nodes or []),
+            included=len(scope_result.included_nodes or []),
+            excluded=len(scope_result.excluded_nodes or []),
+        )
+    )
+    return diagnostics
+
+
+def export_source_scope_detail(
+    scope_result: Optional[ScopedSourceScopeResult],
+    report_dir: Optional[Path],
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not report_timestamp or not scope_result:
+        return None
+    if scope_result.mode == "full_source" and not scope_result.excluded_nodes:
+        return None
+    output_path = Path(report_dir) / f"source_scope_detail_{report_timestamp}.txt"
+    header_fields = ["STATUS", "OBJECT_TYPE", "SOURCE_FULL", "DETAIL"]
+    rows: List[List[str]] = []
+    for status, obj_type, full_name, detail in (scope_result.detail_rows or ()):
+        rows.append([
+            sanitize_pipe_field(status),
+            sanitize_pipe_field(obj_type),
+            sanitize_pipe_field(full_name),
+            sanitize_pipe_field(detail),
+        ])
+    if not rows:
+        return None
+    return write_pipe_report("源对象范围明细", header_fields, rows, output_path)
+
+
 def export_managed_target_scope_detail(
     scope: ManagedTargetScope,
     report_dir: Optional[Path],
@@ -12443,7 +12764,8 @@ def compute_object_counts(
     full_object_mapping: FullObjectMapping,
     ob_meta: ObMetadata,
     oracle_meta: OracleMetadata,
-    monitored_types: Tuple[str, ...] = OBJECT_COUNT_TYPES
+    monitored_types: Tuple[str, ...] = OBJECT_COUNT_TYPES,
+    suppress_unmanaged_target_extras: bool = False,
 ) -> ObjectCountSummary:
     """
     基于“期望对象集合”统计各类型的：源端数量、目标端命中数量、缺失数量、额外数量。
@@ -12476,6 +12798,7 @@ def compute_object_counts(
         t.upper(): {name.upper() for name in ob_meta.objects_by_type.get(t.upper(), set())}
         for t in monitored_types if t != 'CONSTRAINT'
     }
+    managed_target_object_set = build_managed_target_object_set(full_object_mapping) if suppress_unmanaged_target_extras else set()
 
     summary: ObjectCountSummary = {
         "oracle": {},
@@ -12541,6 +12864,8 @@ def compute_object_counts(
         matched = expected_set & actual_set
         missing_set = expected_set - actual_set
         extra_set = actual_set - expected_set
+        if managed_target_object_set:
+            extra_set = {name for name in extra_set if name in managed_target_object_set}
 
         summary["oracle"][obj_type_u] = len(expected_set)
         summary["oceanbase"][obj_type_u] = len(matched)
@@ -18336,7 +18661,8 @@ def check_dependencies_against_ob(
     actual_pairs: Set[Tuple[str, str, str, str]],
     skipped: List[DependencyIssue],
     ob_meta: ObMetadata,
-    ob_grant_catalog: Optional[ObGrantCatalog] = None
+    ob_grant_catalog: Optional[ObGrantCatalog] = None,
+    managed_target_objects: Optional[Set[str]] = None,
 ) -> DependencyReport:
     """
     对比目标端依赖关系，返回缺失/多余/跳过的依赖项。
@@ -18345,6 +18671,11 @@ def check_dependencies_against_ob(
         "missing": [],
         "unexpected": [],
         "skipped": skipped
+    }
+    managed_target_object_set = {
+        (item or "").upper()
+        for item in (managed_target_objects or set())
+        if item
     }
 
     def object_exists(full_name: str, obj_type: str) -> bool:
@@ -18436,6 +18767,12 @@ def check_dependencies_against_ob(
 
     missing_pairs = expected_pairs - actual_pairs
     extra_pairs = actual_pairs - expected_pairs
+    if managed_target_object_set:
+        extra_pairs = {
+            (dep_name, dep_type, ref_name, ref_type)
+            for dep_name, dep_type, ref_name, ref_type in extra_pairs
+            if dep_name in managed_target_object_set or ref_name in managed_target_object_set
+        }
 
     for dep_name, dep_type, ref_name, ref_type in sorted(missing_pairs):
         dep_obj = f"{dep_name} ({dep_type})"
@@ -20642,7 +20979,9 @@ def check_primary_objects(
     enabled_primary_types: Optional[Set[str]] = None,
     print_only_types: Optional[Set[str]] = None,
     print_only_reasons: Optional[Dict[str, str]] = None,
-    settings: Optional[Dict] = None
+    settings: Optional[Dict] = None,
+    suppress_unmanaged_target_extras: bool = False,
+    managed_target_objects: Optional[Set[str]] = None,
 ) -> ReportResults:
     """
     核心主对象校验：
@@ -20717,6 +21056,11 @@ def check_primary_objects(
         str(k).upper(): str(v)
         for k, v in (print_only_reasons or PRINT_ONLY_PRIMARY_REASONS).items()
     }
+    managed_target_object_set = {
+        (item or "").upper()
+        for item in (managed_target_objects or set())
+        if item
+    } if suppress_unmanaged_target_extras else set()
     package_types_u = {t.upper() for t in PACKAGE_OBJECT_TYPES}
     primary_existence_only_types = {
         t.upper()
@@ -21196,6 +21540,8 @@ def check_primary_objects(
         actual = ob_meta.objects_by_type.get(obj_type, set())
         expected = expected_targets.get(obj_type, set())
         extras = sorted(actual - expected)
+        if managed_target_object_set:
+            extras = [tgt for tgt in extras if tgt in managed_target_object_set]
         for tgt in extras:
             results['extra_targets'].append((obj_type, tgt))
 
@@ -38002,6 +38348,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "截止时间后对象过滤明细"
     if name.startswith("managed_target_scope_detail_"):
         return "DETAIL", "受管目标 Schema 明细"
+    if name.startswith("source_scope_detail_"):
+        return "DETAIL", "源对象范围明细"
     if name.startswith("view_constraint_cleaned_detail_"):
         return "DETAIL", "VIEW 列清单约束清洗明细"
     if name.startswith("view_constraint_uncleanable_detail_"):
@@ -48964,6 +49312,8 @@ def main():
 
     object_created_after_cutoff_rows: List[Dict[str, object]] = []
     object_created_after_cutoff_nodes: Set[DependencyNode] = set()
+    source_scope_result: Optional[ScopedSourceScopeResult] = None
+    source_scope_detail_path: Optional[Path] = None
 
     log_section("对象映射准备")
     apply_config_hot_reload_at_phase(hot_reload_runtime, "对象映射准备", settings, ora_cfg, ob_cfg)
@@ -49068,6 +49418,7 @@ def main():
         # 4) 验证 Remap 规则
         extraneous_rules = validate_remap_rules(remap_rules, source_objects_full_scope, settings.get("remap_file"))
         schema_mapping_from_tables: Optional[Dict[str, str]] = None
+        remap_conflicts: RemapConflictMap = {}
         
         # 4.1) 获取依附对象（如 TRIGGER）的父表映射，用于 one-to-many schema 拆分场景
         object_parent_map = get_object_parent_tables(
@@ -49081,6 +49432,9 @@ def main():
         oracle_dependencies_for_grants: List[DependencyRecord] = []
         source_dependencies_set: Optional[SourceDependencySet] = None
         source_schema_set = {s.upper() for s in settings.get("source_schemas_list", []) if s}
+        source_scope_mode_setting = normalize_source_object_scope_mode(
+            settings.get("source_object_scope_mode", "full_source")
+        )
         # 依赖既用于缺失依赖校验，也用于 one-to-many remap 推导；grant 生成亦依赖依赖链
         infer_candidate_types = enabled_object_types - NO_INFER_SCHEMA_TYPES - {'TABLE', 'INDEX', 'CONSTRAINT'}
         need_dependency_infer = enable_dependencies_check or (
@@ -49089,7 +49443,9 @@ def main():
         need_grant_dependencies = enable_grant_generation and generate_fixup_enabled
         need_dependency_load = need_dependency_infer or enable_dependencies_check or need_grant_dependencies
         if need_dependency_load:
-            include_external_refs = bool(need_grant_dependencies)
+            include_external_refs = bool(
+                need_grant_dependencies or source_scope_mode_setting == "remap_root_closure"
+            )
             oracle_dependencies_for_grants = load_oracle_dependencies(
                 ora_cfg,
                 settings['source_schemas_list'],
@@ -49138,6 +49494,147 @@ def main():
                 "[CUTOFF] 已同步更新依赖/父对象图，移除截止后对象节点=%d。",
                 len(object_created_after_cutoff_nodes)
             )
+
+        source_scope_mode = normalize_source_object_scope_mode(
+            settings.get("source_object_scope_mode", "full_source")
+        )
+        if source_scope_mode == "remap_root_closure":
+            trigger_list_path_scoped = settings.get("trigger_list", "").strip()
+            trigger_entries_scoped: Set[str] = set()
+            if trigger_list_path_scoped:
+                if "TRIGGER" not in enabled_extra_types:
+                    log.error(
+                        "严重错误: source_object_scope_mode=remap_root_closure 且已配置 trigger_list，但 check_extra_types 未启用 TRIGGER。"
+                    )
+                    abort_run()
+                entries, invalid_entries, duplicate_entries, _total_lines, read_error = parse_trigger_list_file(
+                    trigger_list_path_scoped
+                )
+                if read_error:
+                    log.error(
+                        "严重错误: source_object_scope_mode=remap_root_closure 且 trigger_list 读取失败: %s",
+                        read_error,
+                    )
+                    abort_run()
+                if invalid_entries:
+                    sample_text = ", ".join(
+                        "{line}:{entry}".format(line=line_no, entry=entry)
+                        for line_no, entry, _reason in invalid_entries[:10]
+                    )
+                    log.error(
+                        "严重错误: source_object_scope_mode=remap_root_closure 下 trigger_list 存在 %d 条非法条目: %s",
+                        len(invalid_entries),
+                        sample_text,
+                    )
+                    abort_run()
+                if duplicate_entries:
+                    log.warning(
+                        "trigger_list 在 remap_root_closure 模式下存在 %d 条重复条目，已按去重结果继续。",
+                        len(duplicate_entries),
+                    )
+                trigger_entries_scoped = set(entries or set())
+
+            root_seed_nodes, skipped_root_entries, _explicit_root_keys = build_remap_root_seed_nodes(
+                source_objects,
+                remap_rules,
+            )
+            if not root_seed_nodes:
+                log.error(
+                    "严重错误: source_object_scope_mode=remap_root_closure 但 remap_file 中没有可用的显式 TABLE/VIEW roots。"
+                )
+                abort_run()
+
+            explicit_trigger_keep_nodes, explicit_trigger_detail_rows, missing_trigger_entries = build_scoped_trigger_keep_nodes(
+                trigger_entries_scoped,
+                source_objects,
+                object_parent_map,
+            )
+            if missing_trigger_entries:
+                log.error(
+                    "严重错误: source_object_scope_mode=remap_root_closure 下 trigger_list 中有 %d 个触发器未在源端对象范围内解析到: %s",
+                    len(missing_trigger_entries),
+                    ", ".join(sorted(missing_trigger_entries[:10])),
+                )
+                abort_run()
+
+            source_scope_result = build_source_scope_closure(
+                source_objects,
+                dependency_graph,
+                object_parent_map,
+                root_seed_nodes,
+                explicit_trigger_keep_nodes=explicit_trigger_keep_nodes,
+                explicit_trigger_detail_rows=explicit_trigger_detail_rows,
+                mode=source_scope_mode,
+            )
+            detail_rows = list(source_scope_result.detail_rows or ())
+            for src_full_u, source_types_text, reason in skipped_root_entries:
+                detail_rows.append(("ROOT_SKIPPED", source_types_text, src_full_u, reason))
+            source_scope_result = source_scope_result._replace(detail_rows=tuple(detail_rows))
+
+            before_scope_cnt = sum(len(v) for v in source_objects.values())
+            before_dep_cnt = len(source_dependencies_set or set())
+            before_parent_cnt = len(object_parent_map or {})
+            before_conflict_cnt = len(remap_conflicts or {})
+
+            source_objects = filter_source_objects_by_nodes(
+                source_objects,
+                source_scope_result.excluded_nodes,
+            )
+            source_dependencies_set = filter_source_dependencies_by_nodes(
+                source_dependencies_set,
+                source_scope_result.excluded_nodes,
+            )
+            oracle_dependencies_internal = filter_dependency_records_by_nodes(
+                oracle_dependencies_internal,
+                source_scope_result.excluded_nodes,
+            ) or []
+            oracle_dependencies_for_grants = filter_dependency_records_by_nodes(
+                oracle_dependencies_for_grants,
+                source_scope_result.excluded_nodes,
+            ) or []
+            object_parent_map = filter_object_parent_map_by_nodes(
+                object_parent_map,
+                source_objects,
+                source_scope_result.excluded_nodes,
+            ) or {}
+            remap_conflicts = filter_remap_conflicts_by_nodes(
+                remap_conflicts,
+                source_scope_result.excluded_nodes,
+            )
+            remap_rules = {
+                (src_full or "").upper(): tgt_full
+                for src_full, tgt_full in (remap_rules or {}).items()
+                if (src_full or "").upper() in source_objects
+            }
+            dependency_graph = build_dependency_graph(source_dependencies_set) if source_dependencies_set else {}
+            view_dependency_map = build_view_dependency_map(source_dependencies_set) if source_dependencies_set else {}
+
+            log.info(
+                "[SOURCE_SCOPE] remap_root_closure 生效: roots=%d, explicit_triggers=%d, included_nodes=%d, filtered_nodes=%d, source_objects=%d->%d, deps=%d->%d, parent_links=%d->%d, remap_conflicts=%d->%d, remap_rules=%d。",
+                len(source_scope_result.root_seed_nodes),
+                len(source_scope_result.explicit_trigger_nodes),
+                len(source_scope_result.included_nodes),
+                len(source_scope_result.excluded_nodes),
+                before_scope_cnt,
+                sum(len(v) for v in source_objects.values()),
+                before_dep_cnt,
+                len(source_dependencies_set or set()),
+                before_parent_cnt,
+                len(object_parent_map or {}),
+                before_conflict_cnt,
+                len(remap_conflicts or {}),
+                len(remap_rules or {}),
+            )
+        else:
+            source_scope_result = build_source_scope_closure(
+                source_objects,
+                dependency_graph,
+                object_parent_map,
+                set(),
+                explicit_trigger_keep_nodes=set(),
+                explicit_trigger_detail_rows=[],
+                mode=source_scope_mode,
+            )
         # 4.2.b) 预计算递归依赖表集合（性能优化：避免每对象 DFS）
         transitive_table_cache: Optional[TransitiveTableCache] = None
         if settings.get("enable_schema_mapping_infer") and dependency_graph:
@@ -49149,7 +49646,6 @@ def main():
             log.info("递归依赖表缓存完成，共 %d 个节点。", len(transitive_table_cache))
         sequence_policy = settings.get("sequence_remap_policy", "source_only")
         # 5) 先不推导 schema，生成基础映射/清单，用于推导 TABLE 唯一映射
-        remap_conflicts: RemapConflictMap = {}
         base_full_mapping = build_full_object_mapping(
             source_objects,
             remap_rules,
@@ -49253,6 +49749,18 @@ def main():
         if config_diagnostics is None:
             config_diagnostics = []
         config_diagnostics.extend(scope_diagnostics)
+    source_scope_detail_path = export_source_scope_detail(
+        source_scope_result,
+        report_dir,
+        timestamp,
+    )
+    if source_scope_detail_path:
+        log.info("源对象范围明细已输出: %s", source_scope_detail_path)
+    source_scope_diagnostics = build_source_scope_diagnostics(source_scope_result)
+    if source_scope_diagnostics:
+        if config_diagnostics is None:
+            config_diagnostics = []
+        config_diagnostics.extend(source_scope_diagnostics)
 
     # 输出全量 remap 推导结果，便于人工审核
     mapping_path = report_dir / f"object_mapping_{timestamp}.txt"
@@ -49822,7 +50330,13 @@ def main():
 
     apply_config_hot_reload_at_phase(hot_reload_runtime, "主对象校验", settings, ora_cfg, ob_cfg)
     with phase_timer("主对象校验", phase_durations):
-        object_counts_summary = compute_object_counts(full_object_mapping, ob_meta, oracle_meta, monitored_types)
+        object_counts_summary = compute_object_counts(
+            full_object_mapping,
+            ob_meta,
+            oracle_meta,
+            monitored_types,
+            suppress_unmanaged_target_extras=(settings.get("source_object_scope_mode") == "remap_root_closure"),
+        )
         tv_results = check_primary_objects(
             master_list,
             extraneous_rules,
@@ -49831,7 +50345,9 @@ def main():
             enabled_primary_types,
             print_only_types,
             settings.get("effective_print_only_primary_reasons"),
-            settings=settings
+            settings=settings,
+            suppress_unmanaged_target_extras=(settings.get("source_object_scope_mode") == "remap_root_closure"),
+            managed_target_objects=build_managed_target_object_set(full_object_mapping),
         )
         supplement_missing_views_from_mapping(
             tv_results,
@@ -50003,7 +50519,11 @@ def main():
                 trigger_list_summary.get("selected_missing", 0),
                 trigger_list_summary.get("missing_not_listed", 0)
             )
-    settings["_non_table_trigger_rows"] = build_non_table_trigger_detail_rows(oracle_meta, full_object_mapping)
+    settings["_non_table_trigger_rows"] = build_non_table_trigger_detail_rows(
+        oracle_meta,
+        full_object_mapping,
+        source_objects=source_objects,
+    )
 
     if enable_dependencies_check:
         apply_config_hot_reload_at_phase(hot_reload_runtime, "依赖/授权校验", settings, ora_cfg, ob_cfg)
@@ -50030,7 +50550,8 @@ def main():
                 ob_dependencies,
                 skipped_dependency_pairs,
                 ob_meta,
-                ob_grant_catalog=dependency_grant_catalog
+                ob_grant_catalog=dependency_grant_catalog,
+                managed_target_objects=build_managed_target_object_set(full_object_mapping) if settings.get("source_object_scope_mode") == "remap_root_closure" else None,
             )
             if settings.get("print_dependency_chains", True):
                 dep_chain_path = report_dir / f"dependency_chains_{timestamp}.txt"

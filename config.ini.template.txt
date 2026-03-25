@@ -21,6 +21,11 @@ source_schemas          = ORA_APP,ORA_FIN,ORA_BI
 # Remap 规则文件路径（迁移时需要改变 schema 的对象映射）
 # 留空表示按 1:1 映射处理
 remap_file              = remap_rules.txt
+# 源对象范围模式：
+#   full_source        -> 当前默认行为：基于 source_schemas 全量扫描
+#   remap_root_closure -> 仅以 remap_file 中显式 TABLE/VIEW 为根种子，按依赖/附属关系扩展闭包
+#                         trigger_list 中显式列出的触发器会作为额外 keep set 保留
+source_object_scope_mode = full_source
 # 大小写敏感(双引号)标识符处理模式：
 #   abort        -> 发现即中止（最严格）
 #   warn         -> 继续运行并输出专项明细（默认）

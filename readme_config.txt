@@ -34,6 +34,10 @@
   说明：它只定义“源端扫描范围”，不等于目标端受管 schema。
   说明：目标端实际受管范围会按 remap/full mapping 自动推导；即使 remap 到 config.ini 中未出现的新目标 schema，也会继续进入 compare/fixup/report。
 - remap_file：Remap 规则文件路径。默认：空（按 1:1 映射）。
+- source_object_scope_mode：源对象范围模式。默认：full_source。
+  可选值：full_source、remap_root_closure。
+  说明：`full_source` 保持当前行为，按 `source_schemas` 全量扫描；`remap_root_closure` 仅以 `remap_file` 中显式 TABLE/VIEW 为 root seeds，再按依赖/附属关系扩展闭包，不在闭包中的对象（及其相关 INDEX/CONSTRAINT/SYNONYM/SEQUENCE 等）整体忽略。
+  说明：当设置为 `remap_root_closure` 且配置了 `trigger_list` 时，`trigger_list` 中的触发器会作为显式 keep set 保留；若 `trigger_list` 非法或未启用 `TRIGGER` 检查，程序会 fail-fast。
   说明：规则格式为 `SRC_SCHEMA.OBJECT = TGT_SCHEMA.OBJECT`，支持注释与空行。
   注意：文件不存在会报警但继续。
   说明：每轮运行会额外输出 `managed_target_scope_detail_<ts>.txt`，用于审计本轮派生出的目标 schema 范围。
