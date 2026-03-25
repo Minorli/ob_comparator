@@ -2963,8 +2963,23 @@ def normalize_column_default_expression(expr: Optional[object]) -> str:
     return text
 
 
+def normalize_column_default_display_expression(expr: Optional[object]) -> str:
+    if expr is None:
+        return ""
+    text = normalize_sql_expression(str(expr))
+    while text.startswith("(") and text.endswith(")"):
+        stripped = strip_wrapping_parentheses(text)
+        if stripped == text:
+            break
+        text = stripped.strip()
+    text = normalize_space_before_parentheses(text)
+    if text.upper() == "NULL":
+        return ""
+    return text
+
+
 def describe_column_default_expression(expr: Optional[object]) -> str:
-    normalized = normalize_column_default_expression(expr)
+    normalized = normalize_column_default_display_expression(expr)
     return normalized if normalized else "NO DEFAULT"
 
 
@@ -20962,6 +20977,7 @@ def check_primary_objects(
                 if not src_identity_present and not tgt_identity_present:
                     src_default_expr = normalize_column_default_expression(src_info.get("data_default"))
                     tgt_default_expr = normalize_column_default_expression(tgt_info.get("data_default"))
+                    src_default_display = normalize_column_default_display_expression(src_info.get("data_default"))
                     if src_default_expr != tgt_default_expr:
                         if src_default_expr:
                             issue_type = "default_missing" if not tgt_default_expr else "default_mismatch"
@@ -20970,7 +20986,7 @@ def check_primary_objects(
                                     col_name,
                                     describe_column_default_expression(src_info.get("data_default")),
                                     describe_column_default_expression(tgt_info.get("data_default")),
-                                    src_default_expr,
+                                    src_default_display or src_default_expr,
                                     issue_type
                                 )
                             )

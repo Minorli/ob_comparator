@@ -238,6 +238,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - 当目标端同一列存在多份等价单列 `IS NOT NULL` CHECK、而源端仅保留一份语义时，扩展约束 compare 会把多余约束列为 `extra mismatch`，并在 `fixup/cleanup_candidates/extra_cleanup_candidates.txt` 的 `SAFE_DUPLICATE_NOTNULL_DROP_SQL` 区域输出未注释的 `DROP CONSTRAINT` 候选，同时生成 `fixup/cleanup_safe/constraint/*.sql`；`generate_extra_cleanup` 默认开启，但 `cleanup_safe/` 默认不会被 `run_fixup` 执行，需显式 `--only-dirs cleanup_safe/constraint`
 - 当 `extra_constraint_cleanup_mode=semantic_fk_check` 时，compare 后仍判定为 target-only 的 `FK/CHECK` 会额外生成到 `fixup/cleanup_semantic/constraint/*.sql`；这类 SQL 同样属于 destructive cleanup，默认不会被 `run_fixup` 自动执行，需显式 `--only-dirs cleanup_semantic/constraint`
 - VIEW 依赖 remap 现在会处理 `FROM/JOIN` 中的带引号 qualified 引用（如 `"SRC"."T1"`），并对同义词终点无法安全解析的场景输出诊断日志；若仅能确认目标同义词对象自身映射，则优先 fallback 到目标同义词，不做盲目的 schema-only 改写
+- 列默认值 compare 继续按大小写不敏感语义比较（字符串字面量除外）；但报告和 review-first fixup SQL 现在会保留源端默认值表达式的原始显示形式，避免把 `rowtohex(sys_guid())` 这类函数默认值仅为显示目的改写成全大写
 - `main_reports/run_<ts>/column_visibility_skipped_detail_<ts>.txt`：`column_visibility_policy=auto` 且 `INVISIBLE_COLUMN` 元数据不完整时的跳过明细，说明哪些表本轮未做 INVISIBLE compare/fixup
 - OceanBase 列元数据现在联合 `DBA_TAB_COLUMNS` 与 `DBA_TAB_COLS` 取长补短；标准字段优先保留 `DBA_TAB_COLUMNS`，可选标记/缺失值由 `DBA_TAB_COLS` 补齐，降低单视图元数据不一致带来的漏检
 - 普通 `NOT NULL` 收紧默认改为 `plain_not_null_fixup_mode=runnable_if_no_nulls`：先探测目标端是否存在 `NULL`，仅无 `NULL` 时输出可执行 `MODIFY ... NOT NULL`；如需恢复纯 review-first，可改回 `review_only`
