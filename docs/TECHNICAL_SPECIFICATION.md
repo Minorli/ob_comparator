@@ -96,7 +96,9 @@
 - 覆盖系统命名 `SYS_C... IS NOT NULL` 且 `ENABLED + NOT VALIDATED` 的 `NOT NULL ENABLE NOVALIDATE` 语义补位；该类进入 `TABLE mismatch`，并在 `table_alter` 中默认输出可执行 `ADD CONSTRAINT ... ENABLE NOVALIDATE`，同时保留严格 `NOT NULL` 的 review-first 注释
 - OB 侧等价 `CHECK (<col> IS NOT NULL)` suppress 依赖 `DBA_CONSTRAINTS.SEARCH_CONDITION[_VC]`；元数据加载采用按 chunk 保留成功结果 + 退化 owner/table/constraint 定向回填，避免个别 chunk 失败导致整批 `SEARCH_CONDITION` 丢失
 - OceanBase 自动 `*_OBCHECK_*` / `*_OBNOTNULL_*` 约束在普通约束 compare 中继续降噪，但其单列 `IS NOT NULL` 语义必须保留给 `TABLE` compare 使用
-- 当目标端同一列存在多份 enabled 的等价单列 `IS NOT NULL` CHECK、且源端仅保留一份等价语义时，约束 compare 会把多余约束识别为 `extra mismatch`；`generate_extra_cleanup=true` 时会在 `cleanup_candidates/extra_cleanup_candidates.txt` 中输出 `SAFE_DUPLICATE_NOTNULL_DROP_SQL` 原始清理语句，并额外生成 `cleanup_safe/constraint/*.sql`；`cleanup_safe/` 默认不进入 `run_fixup` 自动执行，需显式按目录执行
+- 当目标端同一列存在多份 enabled 的等价单列 `IS NOT NULL` CHECK、且源端仅保留一份等价语义时，约束 compare 会把多余约束识别为 `extra mismatch`；`generate_extra_cleanup` 默认开启，会在 `cleanup_candidates/extra_cleanup_candidates.txt` 中输出 `SAFE_DUPLICATE_NOTNULL_DROP_SQL` 原始清理语句，并额外生成 `cleanup_safe/constraint/*.sql`；`cleanup_safe/` 默认不进入 `run_fixup` 自动执行，需显式按目录执行
+- 当 `extra_constraint_cleanup_mode=semantic_fk_check` 时，compare 后仍判定为 target-only 的 `FK/CHECK` 会额外输出到 `cleanup_candidates/extra_cleanup_candidates.txt` 的 `SEMANTIC_EXTRA_CONSTRAINT_DROP_SQL` 区域，并生成 `cleanup_semantic/constraint/*.sql`；该目录默认不进入 `run_fixup` 自动执行，需显式按目录执行
+- 源端系统命名的单列 `IS NOT NULL` CHECK 仅在 `ENABLED` 时按列语义降噪；若该类约束为 `DISABLED`，则按普通 CHECK 参与缺失 compare、unsupported 过滤与 metadata fallback fixup，生成的缺失约束脚本会保留 `DISABLE` 状态
 - 普通 `NOT NULL` 收紧默认采用 `plain_not_null_fixup_mode=runnable_if_no_nulls`；会先探测目标端是否存在 `NULL`，仅无 `NULL` 时输出可执行 `MODIFY ... NOT NULL`，否则继续保留注释
 - 当 `column_visibility_policy=auto` 且两端 `INVISIBLE_COLUMN` 元数据不完整时，不改变 compare/fixup 结论，但会输出独立 `column_visibility_skipped_detail` 说明本轮跳过范围
 - identity 列模式差异校验（`GENERATED ALWAYS` / `BY DEFAULT` / `BY DEFAULT ON NULL`），以 TABLE DDL 提取为主，不只依赖 `IDENTITY_COLUMN`

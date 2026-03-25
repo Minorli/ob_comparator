@@ -144,7 +144,13 @@ mview_check_fixup_mode  = auto
 # cleanup_candidates 文本本身不会被 run_fixup 执行；cleanup_safe/ 默认也会被 run_fixup 跳过，
 # 需显式 --only-dirs cleanup_safe/constraint。
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
-generate_extra_cleanup  = false
+generate_extra_cleanup  = true
+# 额外约束可执行清理模式
+# safe_only         : 仅为 SAFE_DUPLICATE_NOTNULL 生成 cleanup_safe/constraint/*.sql
+# semantic_fk_check : 在 safe_only 基础上，额外为 compare 后仍判定为 target-only 的 FK/CHECK
+#                     生成 cleanup_semantic/constraint/*.sql
+# off               : 不生成任何可执行 extra constraint cleanup SQL
+extra_constraint_cleanup_mode = safe_only
 # interval 分区补齐脚本（版本门控）
 # generate_interval_partition_fixup:
 #   auto  -> OB>=4.4.2 默认关闭；低版本默认开启

@@ -5288,7 +5288,7 @@ def main() -> None:
         only_dirs = [normalize_dir_filter(d) for d in only_dirs] if only_dirs else []
     
     exclude_dirs = [normalize_dir_filter(d) for d in exclude_dirs]
-    default_excludes = {"tables_unsupported", "unsupported", "constraint_validate_later", "grants_deferred", "cleanup_safe"}
+    default_excludes = {"tables_unsupported", "unsupported", "constraint_validate_later", "grants_deferred", "cleanup_safe", "cleanup_semantic"}
     if not getattr(args, "allow_table_create", False):
         # Safety first: table create scripts are risky in migration workflows
         # because they can create empty target tables if OMS data load is skipped.
@@ -5315,6 +5315,8 @@ def main() -> None:
         log.warning("安全模式: 默认跳过 fixup_scripts/grants_deferred/（需对象补齐后再执行）。")
     if not any(dir_filter_overlaps("cleanup_safe", item) for item in only_dirs):
         log.warning("安全模式: 默认跳过 fixup_scripts/cleanup_safe/（显式审核后再执行 destructive 清理 SQL）。")
+    if not any(dir_filter_overlaps("cleanup_semantic", item) for item in only_dirs):
+        log.warning("安全模式: 默认跳过 fixup_scripts/cleanup_semantic/（语义级 destructive 约束清理需显式审核后执行）。")
     
     # Load configuration
     try:

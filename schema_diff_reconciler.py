@@ -2633,6 +2633,23 @@ def is_system_notnull_check(cons_name: Optional[str], search_condition: Optional
     return is_notnull_check_condition(search_condition)
 
 
+def should_skip_system_notnull_from_constraint_compare(
+    cons_name: Optional[str],
+    search_condition: Optional[str],
+    status: Optional[str],
+) -> bool:
+    """
+    仅对“已启用”的系统命名单列 IS NOT NULL 约束走列语义建模，
+    避免其干扰普通 CHECK compare/fixup。
+
+    对于 DISABLED 的系统命名 NOT NULL CHECK，不再视为列语义噪声，
+    需要按普通缺失/额外 CHECK 参与 compare 和 fixup。
+    """
+    if not is_system_notnull_check(cons_name, search_condition):
+        return False
+    return normalize_constraint_enabled_status(status) != "DISABLED"
+
+
 def build_system_notnull_novalidate_column_map(constraints: Optional[Dict[str, Dict]]) -> Dict[str, Dict[str, str]]:
     """
     提取源端系统命名的 NOT NULL ENABLE NOVALIDATE 语义，按列聚合。
@@ -2724,20 +2741,63 @@ def build_enabled_notnull_check_column_map(constraints: Optional[Dict[str, Dict]
     return result
 
 
+def is_comparator_generated_notnull_constraint_name(
+    constraint_name: Optional[str],
+    table_name: Optional[str],
+    column_name: Optional[str]
+) -> bool:
+    cons_u = normalize_identifier_name(constraint_name)
+    table_u = normalize_identifier_name(table_name)
+    col_u = normalize_identifier_name(column_name)
+    if not cons_u or not table_u or not col_u:
+        return False
+    preferred = _build_collision_preferred_name(
+        "CONSTRAINT",
+        table_u,
+        "C",
+        [col_u],
+        [],
+        "%s IS NOT NULL" % quote_identifier(col_u),
+    )
+    preferred_u = normalize_identifier_name(preferred)
+    if not preferred_u:
+        return False
+    if cons_u == preferred_u:
+        return True
+    if cons_u.startswith(preferred_u + "_"):
+        suffix = cons_u[len(preferred_u) + 1:]
+        return suffix.isdigit()
+    return False
+
+
 def _notnull_check_keep_priority(
     entry: NotnullCheckEntry,
     source_names: Set[str],
-    source_validated_values: Set[str]
+    source_validated_values: Set[str],
+    table_name: Optional[str] = None,
+    column_name: Optional[str] = None,
+    prefer_ob_auto: bool = False,
 ) -> Tuple[int, int, int, int, str]:
     name_u = (entry.constraint_name or "").upper()
+    is_comparator_generated = is_comparator_generated_notnull_constraint_name(
+        name_u,
+        table_name,
+        column_name,
+    )
     if name_u in source_names:
         family_rank = 0
-    elif not entry.is_ob_auto and not entry.is_system_named:
+    elif prefer_ob_auto and entry.is_ob_auto:
         family_rank = 1
-    elif entry.is_system_named and not entry.is_ob_auto:
+    elif not entry.is_ob_auto and not entry.is_system_named and not is_comparator_generated:
         family_rank = 2
-    else:
+    elif entry.is_system_named and not entry.is_ob_auto:
         family_rank = 3
+    elif entry.is_ob_auto:
+        family_rank = 4
+    elif is_comparator_generated:
+        family_rank = 5
+    else:
+        family_rank = 6
     validated_u = normalize_constraint_validated_status(entry.validated)
     validated_rank = 0 if not source_validated_values or validated_u in source_validated_values else 1
     return (
@@ -2751,7 +2811,8 @@ def _notnull_check_keep_priority(
 
 def select_safe_duplicate_notnull_target_extras(
     source_groups: Dict[str, Tuple[NotnullCheckEntry, ...]],
-    target_groups: Dict[str, Tuple[NotnullCheckEntry, ...]]
+    target_groups: Dict[str, Tuple[NotnullCheckEntry, ...]],
+    table_name: Optional[str] = None,
 ) -> Dict[str, Tuple[NotnullCheckEntry, ...]]:
     extras_by_column: Dict[str, Tuple[NotnullCheckEntry, ...]] = {}
     for col_u, target_entries in sorted((target_groups or {}).items()):
@@ -2772,9 +2833,17 @@ def select_safe_duplicate_notnull_target_extras(
             for entry in source_entries
             if normalize_constraint_validated_status(entry.validated)
         }
+        prefer_ob_auto = bool(source_entries) and all(entry.is_system_named for entry in source_entries)
         ranked_targets = sorted(
             target_entries,
-            key=lambda entry: _notnull_check_keep_priority(entry, source_names, source_validated_values)
+            key=lambda entry: _notnull_check_keep_priority(
+                entry,
+                source_names,
+                source_validated_values,
+                table_name=table_name,
+                column_name=col_u,
+                prefer_ob_auto=prefer_ob_auto,
+            )
         )
         keep_names = {
             (entry.constraint_name or "").upper()
@@ -2793,7 +2862,10 @@ def select_safe_duplicate_notnull_target_extras(
 def select_preferred_notnull_semantic_entry(
     source_constraint_name: Optional[str],
     source_validated: Optional[str],
-    target_entries: Sequence[NotnullCheckEntry]
+    target_entries: Sequence[NotnullCheckEntry],
+    table_name: Optional[str] = None,
+    column_name: Optional[str] = None,
+    source_is_system_named: bool = False,
 ) -> Optional[NotnullCheckEntry]:
     if not target_entries:
         return None
@@ -2807,7 +2879,14 @@ def select_preferred_notnull_semantic_entry(
         source_validated_values.add(source_validated_u)
     ranked_targets = sorted(
         target_entries,
-        key=lambda entry: _notnull_check_keep_priority(entry, source_names, source_validated_values)
+        key=lambda entry: _notnull_check_keep_priority(
+            entry,
+            source_names,
+            source_validated_values,
+            table_name=table_name,
+            column_name=column_name,
+            prefer_ob_auto=source_is_system_named,
+        )
     )
     return ranked_targets[0] if ranked_targets else None
 
@@ -4027,6 +4106,29 @@ def normalize_name_collision_mode(raw_value: Optional[str]) -> str:
     if value not in NAME_COLLISION_MODE_VALUES:
         log.warning("name_collision_mode=%s 不在支持范围内，将回退为 fixup。", raw_value)
         return "fixup"
+    return value
+
+
+EXTRA_CONSTRAINT_CLEANUP_MODE_VALUES = {"off", "safe_only", "semantic_fk_check"}
+EXTRA_CONSTRAINT_CLEANUP_MODE_ALIASES = {
+    "safe": "safe_only",
+    "semantic": "semantic_fk_check",
+    "fk_check": "semantic_fk_check",
+    "semantic_check_fk": "semantic_fk_check",
+}
+
+
+def normalize_extra_constraint_cleanup_mode(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "safe_only"
+    value = str(raw_value).strip().lower()
+    value = EXTRA_CONSTRAINT_CLEANUP_MODE_ALIASES.get(value, value)
+    if value not in EXTRA_CONSTRAINT_CLEANUP_MODE_VALUES:
+        log.warning(
+            "extra_constraint_cleanup_mode=%s 不在支持范围内，将回退为 safe_only。",
+            raw_value,
+        )
+        return "safe_only"
     return value
 
 
@@ -5445,7 +5547,8 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('fixup_force_clean', 'false')
         settings.setdefault('fixup_clean_outside_repo', 'false')
         settings.setdefault('fixup_drop_sys_c_columns', 'false')
-        settings.setdefault('generate_extra_cleanup', 'false')
+        settings.setdefault('generate_extra_cleanup', 'true')
+        settings.setdefault('extra_constraint_cleanup_mode', 'safe_only')
         # obclient 超时时间 (秒)
         settings.setdefault('obclient_timeout', '60')
         # 报告输出目录
@@ -5612,8 +5715,11 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             True
         )
         settings['generate_extra_cleanup'] = parse_bool_flag(
-            settings.get('generate_extra_cleanup', 'false'),
-            False
+            settings.get('generate_extra_cleanup', 'true'),
+            True
+        )
+        settings['extra_constraint_cleanup_mode'] = normalize_extra_constraint_cleanup_mode(
+            settings.get('extra_constraint_cleanup_mode', 'safe_only')
         )
         settings['check_object_usability'] = parse_bool_flag(
             settings.get('check_object_usability', 'false'),
@@ -6514,6 +6620,17 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "仅支持 safe_novalidate/source/force_validate"
 
+    def _validate_extra_constraint_cleanup_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = EXTRA_CONSTRAINT_CLEANUP_MODE_ALIASES.get(
+            val.strip().lower(),
+            val.strip().lower()
+        )
+        if normalized in EXTRA_CONSTRAINT_CLEANUP_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 off/safe_only/semantic_fk_check"
+
     def _validate_trigger_validity_sync_mode(val: str) -> Tuple[bool, str]:
         if not val.strip():
             return True, ""
@@ -6622,9 +6739,17 @@ def run_config_wizard(config_path: Path) -> None:
     _prompt_field(
         "SETTINGS",
         "generate_extra_cleanup",
-        "是否生成目标端多余对象清理候选（仅注释，不自动执行）(true/false)",
-        default=cfg.get("SETTINGS", "generate_extra_cleanup", fallback="false"),
+        "是否生成目标端多余对象清理候选与安全 cleanup SQL（需显式执行）(true/false)",
+        default=cfg.get("SETTINGS", "generate_extra_cleanup", fallback="true"),
         transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "extra_constraint_cleanup_mode",
+        "额外约束可执行清理模式 (off/safe_only/semantic_fk_check)",
+        default=cfg.get("SETTINGS", "extra_constraint_cleanup_mode", fallback="safe_only"),
+        validator=_validate_extra_constraint_cleanup_mode,
+        transform=normalize_extra_constraint_cleanup_mode,
     )
     _prompt_field(
         "SETTINGS",
@@ -7999,6 +8124,10 @@ def collect_constraint_status_drift_rows(
         elif ctype == "C":
             entry["expr_key"] = key[1] if len(key) > 1 else ""
             entry["notnull_col"] = normalize_identifier_name(_extract_notnull_column(cons_meta.get("search_condition")))
+            entry["is_system_named"] = is_system_notnull_check(
+                cons_name_u,
+                cons_meta.get("search_condition"),
+            )
         elif ctype == "R":
             ref_owner = (cons_meta.get("ref_table_owner") or cons_meta.get("r_owner") or "").upper()
             ref_name = (cons_meta.get("ref_table_name") or "").upper()
@@ -8114,6 +8243,9 @@ def collect_constraint_status_drift_rows(
                 str(src_entry.get("name") or ""),
                 str(src_entry.get("validated") or ""),
                 target_entries,
+                table_name=tgt_table,
+                column_name=notnull_col,
+                source_is_system_named=bool(src_entry.get("is_system_named")),
             )
             if preferred is None:
                 continue
@@ -11939,7 +12071,11 @@ def classify_unsupported_check_constraints(
             if not cons_meta:
                 continue
             ctype = (cons_meta.get("type") or "").upper()
-            if ctype == "C" and is_system_notnull_check(cons_name, cons_meta.get("search_condition")):
+            if ctype == "C" and should_skip_system_notnull_from_constraint_compare(
+                cons_name,
+                cons_meta.get("search_condition"),
+                cons_meta.get("status"),
+            ):
                 continue
             reason = classify_unsupported_constraint(cons_meta)
             if not reason:
@@ -21405,7 +21541,11 @@ def build_constraint_signature(
         elif ctype == "C":
             if is_ob_notnull_constraint(name, cons.get("search_condition")):
                 continue
-            if is_system_notnull_check(name, cons.get("search_condition")):
+            if should_skip_system_notnull_from_constraint_compare(
+                name,
+                cons.get("search_condition"),
+                cons.get("status"),
+            ):
                 continue
             expr_norm = normalize_check_constraint_expression(cons.get("search_condition"), name)
             if include_deferrable:
@@ -22109,6 +22249,25 @@ def compare_constraints_for_table(
 ) -> Tuple[bool, Optional[ConstraintMismatch]]:
     include_deferrable = bool(getattr(ob_meta, "constraint_deferrable_supported", False))
     tgt_key = (tgt_schema.upper(), tgt_table.upper())
+
+    def _has_duplicate_notnull_cleanup_candidates(
+        src_constraints: Dict[str, Dict]
+    ) -> bool:
+        tgt_enabled_notnull_groups_local = (
+            getattr(ob_meta, "enabled_notnull_check_groups", {}) or {}
+        ).get(tgt_key, {})
+        if not tgt_enabled_notnull_groups_local:
+            return False
+        src_enabled_notnull_groups_local = build_enabled_notnull_check_group_map(src_constraints)
+        if not src_enabled_notnull_groups_local:
+            return False
+        duplicate_notnull_extras_local = select_safe_duplicate_notnull_target_extras(
+            src_enabled_notnull_groups_local,
+            tgt_enabled_notnull_groups_local,
+            table_name=tgt_table,
+        )
+        return bool(duplicate_notnull_extras_local)
+
     if cache:
         src_cons = cache.src_cons
         tgt_cons = cache.tgt_cons
@@ -22116,7 +22275,7 @@ def compare_constraints_for_table(
         tgt_norm_cols = cache.tgt_norm_cols
         source_all_cols = cache.source_all_cols
         partition_key_set = cache.partition_key_set
-        if cache.src_sig == cache.tgt_sig:
+        if cache.src_sig == cache.tgt_sig and not _has_duplicate_notnull_cleanup_candidates(src_cons):
             return True, None
     else:
         src_key = (src_schema.upper(), src_table.upper())
@@ -22220,7 +22379,11 @@ def compare_constraints_for_table(
             raw_expr = cons.get("search_condition")
             if is_ob_notnull_constraint(name, raw_expr):
                 continue
-            if is_system_notnull_check(name, raw_expr):
+            if should_skip_system_notnull_from_constraint_compare(
+                name,
+                raw_expr,
+                cons.get("status"),
+            ):
                 continue
             expr_norm = normalize_check_constraint_expression(raw_expr, name)
             if include_deferrable:
@@ -22511,6 +22674,7 @@ def compare_constraints_for_table(
     duplicate_notnull_extras = select_safe_duplicate_notnull_target_extras(
         src_enabled_notnull_groups,
         tgt_enabled_notnull_groups,
+        table_name=tgt_table,
     )
     for col_u, extra_entries in sorted(duplicate_notnull_extras.items()):
         source_entries = tuple(src_enabled_notnull_groups.get(col_u, ()) or ())
@@ -22523,9 +22687,17 @@ def compare_constraints_for_table(
             for entry in source_entries
             if normalize_constraint_validated_status(entry.validated)
         }
+        prefer_ob_auto = bool(source_entries) and all(entry.is_system_named for entry in source_entries)
         keep_entries = sorted(
             target_entries,
-            key=lambda entry: _notnull_check_keep_priority(entry, source_names, source_validated_values)
+            key=lambda entry: _notnull_check_keep_priority(
+                entry,
+                source_names,
+                source_validated_values,
+                table_name=tgt_table,
+                column_name=col_u,
+                prefer_ob_auto=prefer_ob_auto,
+            )
         )[:len(source_entries)]
         keep_names = ",".join(entry.constraint_name for entry in keep_entries if entry.constraint_name) or "-"
         drop_names = ",".join(entry.constraint_name for entry in extra_entries if entry.constraint_name) or "-"
@@ -30766,22 +30938,71 @@ def collect_safe_duplicate_notnull_cleanup_candidates(
     return [candidates[key] for key in sorted(candidates.keys())]
 
 
+def collect_semantic_extra_constraint_cleanup_candidates(
+    extra_results: Optional[ExtraCheckResults],
+    ob_meta: Optional[ObMetadata],
+    mode: str,
+) -> List[Tuple[str, str, str, str]]:
+    mode_u = normalize_extra_constraint_cleanup_mode(mode)
+    if mode_u != "semantic_fk_check" or not extra_results or not ob_meta:
+        return []
+    candidates: Dict[Tuple[str, str], Tuple[str, str, str, str]] = {}
+    constraint_meta = getattr(ob_meta, "constraints", {}) or {}
+    for item in (extra_results.get("constraint_mismatched", []) or []):
+        parsed = parse_full_object_name(item.table)
+        if not parsed:
+            continue
+        schema_u, table_u = parsed
+        cons_map = constraint_meta.get((schema_u, table_u), {}) or {}
+        safe_duplicate_names = {
+            normalize_identifier_name(name)
+            for name in (getattr(item, "duplicate_notnull_extra_constraints", frozenset()) or frozenset())
+            if normalize_identifier_name(name)
+        }
+        for cons_name in sorted(item.extra_constraints or set()):
+            cons_u = normalize_identifier_name(cons_name)
+            if not cons_u or cons_u in safe_duplicate_names:
+                continue
+            cons_meta = cons_map.get(cons_u) or cons_map.get(cons_name) or {}
+            ctype = normalize_identifier_name((cons_meta or {}).get("type"))
+            if ctype not in {"C", "R"}:
+                continue
+            stmt = _build_extra_cleanup_drop_statement(
+                "CONSTRAINT",
+                schema_u,
+                cons_u,
+                parent_table=table_u,
+            )
+            if not stmt:
+                continue
+            source = "SEMANTIC_EXTRA_CHECK" if ctype == "C" else "SEMANTIC_EXTRA_FK"
+            key = ("CONSTRAINT", f"{schema_u}.{cons_u}")
+            if key in candidates:
+                continue
+            candidates[key] = ("CONSTRAINT", f"{schema_u}.{cons_u}", source, stmt.rstrip(";") + ";")
+    return [candidates[key] for key in sorted(candidates.keys())]
+
+
 def export_extra_cleanup_candidates(
     base_dir: Path,
     candidates: List[Tuple[str, str, str, str]],
-    safe_duplicate_notnull_candidates: Optional[List[Tuple[str, str, str, str]]] = None
+    safe_duplicate_notnull_candidates: Optional[List[Tuple[str, str, str, str]]] = None,
+    semantic_constraint_candidates: Optional[List[Tuple[str, str, str, str]]] = None,
 ) -> Optional[Path]:
-    if not base_dir or (not candidates and not safe_duplicate_notnull_candidates):
+    if not base_dir or (not candidates and not safe_duplicate_notnull_candidates and not semantic_constraint_candidates):
         return None
     output_dir = Path(base_dir) / "cleanup_candidates"
     ensure_dir(output_dir)
     output_path = output_dir / "extra_cleanup_candidates.txt"
     safe_duplicate_notnull_candidates = safe_duplicate_notnull_candidates or []
+    semantic_constraint_candidates = semantic_constraint_candidates or []
     lines: List[str] = [
         "# EXTRA 清理候选脚本（仅供人工审核）",
         "# 说明：GENERAL_CANDIDATES 区域默认以注释形式输出，不会被 run_fixup 自动执行。",
         "# 说明：SAFE_DUPLICATE_NOTNULL_DROP_SQL 区域仅包含“目标端重复的单列 IS NOT NULL 语义 CHECK”清理 SQL。",
         "#      同时会额外生成 cleanup_safe/constraint/*.sql，供显式 --only-dirs cleanup_safe/constraint 执行。",
+        "# 说明：SEMANTIC_EXTRA_CONSTRAINT_DROP_SQL 区域仅包含 compare 后仍判定为 target-only 的 FK/CHECK 清理 SQL。",
+        "#      同时会额外生成 cleanup_semantic/constraint/*.sql，供显式 --only-dirs cleanup_semantic/constraint 执行。",
         "# 字段分隔符: |",
         "# OBJECT_TYPE|TARGET_FULL|SOURCE|CANDIDATE_SQL",
         "",
@@ -30819,6 +31040,24 @@ def export_extra_cleanup_candidates(
         lines.append("")
         lines.append("SAFE_DUPLICATE_NOTNULL_DROP_SQL")
         for _obj_type_u, target_u, _source, sql_stmt in safe_duplicate_notnull_candidates:
+            lines.append(f"-- {target_u}")
+            lines.append(sql_stmt)
+
+    if semantic_constraint_candidates:
+        lines.append("")
+        lines.append("SEMANTIC_EXTRA_CONSTRAINT_DETAIL")
+        for obj_type_u, target_u, source, sql_stmt in semantic_constraint_candidates:
+            lines.append(
+                "|".join([
+                    sanitize_pipe_field(obj_type_u),
+                    sanitize_pipe_field(target_u),
+                    sanitize_pipe_field(source),
+                    sanitize_pipe_field(sql_stmt),
+                ])
+            )
+        lines.append("")
+        lines.append("SEMANTIC_EXTRA_CONSTRAINT_DROP_SQL")
+        for _obj_type_u, target_u, _source, sql_stmt in semantic_constraint_candidates:
             lines.append(f"-- {target_u}")
             lines.append(sql_stmt)
 
@@ -30861,6 +31100,48 @@ def export_safe_duplicate_notnull_cleanup_fixup_scripts(
             extra_comments=[
                 f"TARGET_TABLE: {schema_u}.{table_name_u}",
                 "仅当报告已明确标记为 SAFE_DUPLICATE_NOTNULL 时才生成；执行前仍建议复核。"
+            ]
+        )
+        output_paths.append(file_path)
+    return output_paths
+
+
+def export_semantic_extra_constraint_cleanup_fixup_scripts(
+    base_dir: Path,
+    candidates: List[Tuple[str, str, str, str]]
+) -> List[Path]:
+    output_paths: List[Path] = []
+    if not base_dir or not candidates:
+        return output_paths
+    for obj_type_u, target_u, source, sql_stmt in candidates:
+        if (obj_type_u or "").upper() != "CONSTRAINT":
+            continue
+        parsed = parse_full_object_name(target_u)
+        if not parsed:
+            continue
+        schema_u, cons_u = parsed
+        match = re.search(
+            r'ALTER\s+TABLE\s+"([^"]+)"\."([^"]+)"\s+DROP\s+CONSTRAINT\s+("([^"]+)"|([A-Z0-9_$#]+))\s*;?\s*$',
+            sql_stmt.strip(),
+            flags=re.IGNORECASE
+        )
+        if not match:
+            continue
+        table_schema_u = (match.group(1) or "").upper()
+        table_name_u = (match.group(2) or "").upper()
+        if table_schema_u != schema_u:
+            continue
+        content = prepend_set_schema(sql_stmt.strip(), schema_u)
+        file_path = write_fixup_file(
+            base_dir,
+            "cleanup_semantic/constraint",
+            f"{schema_u}.{cons_u}.drop.sql",
+            content,
+            "语义确认的目标端额外约束清理 SQL",
+            extra_comments=[
+                f"TARGET_TABLE: {schema_u}.{table_name_u}",
+                f"SOURCE_KIND: {source}",
+                "仅当 compare 已明确判定为 target-only FK/CHECK 时才生成；执行前仍建议复核。"
             ]
         )
         output_paths.append(file_path)
@@ -31106,6 +31387,8 @@ def write_fixup_root_readme(
         intro_steps.append("table/ 是缺表 CREATE 脚本，默认不要直接执行；run_fixup 需显式 --allow-table-create。")
     if "grants_revoke" in existing_dirs:
         intro_steps.append("grants_revoke/ 是目标端多余 PUBLIC 授权回收建议，先核对源端声明后再执行。")
+    if "cleanup_semantic" in existing_dirs:
+        intro_steps.append("cleanup_semantic/ 是语义确认的 destructive 约束清理 SQL，仅在显式按目录执行时生效。")
     elif "grants_deferred" in existing_dirs or deferred_grant_count:
         intro_steps.append("grants_deferred/ 需要在对象补齐后再执行，不要作为首次 fixup 的默认目录。")
     else:
@@ -31150,6 +31433,7 @@ def write_fixup_root_readme(
         "schedule": "SCHEDULE 草案或修补脚本，通常需人工确认。",
         "cleanup_candidates": "目标端多余对象清理候选总览，默认不自动执行。",
         "cleanup_safe": "安全清理 SQL（默认跳过；需显式按目录执行 destructive DROP）。",
+        "cleanup_semantic": "语义确认的 FK/CHECK 清理 SQL（默认跳过；需显式按目录执行 destructive DROP）。",
     }
 
     for dir_name in existing_dirs:
@@ -33168,7 +33452,10 @@ def generate_fixup_scripts(
     check_status_drift_types = set(settings.get("check_status_drift_type_set", set()) or set())
     status_fixup_types = set(settings.get("status_fixup_type_set", set()) or set())
     generate_status_fixup = parse_bool_flag(settings.get("generate_status_fixup", "true"), True)
-    generate_extra_cleanup = parse_bool_flag(settings.get("generate_extra_cleanup", "false"), False)
+    generate_extra_cleanup = parse_bool_flag(settings.get("generate_extra_cleanup", "true"), True)
+    extra_constraint_cleanup_mode = normalize_extra_constraint_cleanup_mode(
+        settings.get("extra_constraint_cleanup_mode", "safe_only")
+    )
     constraint_status_sync_mode = settings.get("constraint_status_sync_mode", "full")
     constraint_missing_validate_mode = normalize_constraint_missing_fixup_validate_mode(
         settings.get("constraint_missing_fixup_validate_mode", "safe_novalidate")
@@ -36266,7 +36553,11 @@ def generate_fixup_scripts(
                                         ))
                         elif cons_meta and ctype == 'C':
                             search_condition = cons_meta.get("search_condition")
-                            if search_condition and not is_system_notnull_check(cons_name_u, search_condition):
+                            if search_condition and not should_skip_system_notnull_from_constraint_compare(
+                                cons_name_u,
+                                search_condition,
+                                cons_meta.get("status"),
+                            ):
                                 stmt = (
                                     f"ALTER TABLE {table_full} "
                                     f"ADD CONSTRAINT {final_cons_name} CHECK ({search_condition})"
@@ -37162,27 +37453,46 @@ def generate_fixup_scripts(
 
     if generate_extra_cleanup:
         cleanup_candidates = collect_extra_cleanup_candidates(tv_results, extra_results)
-        safe_duplicate_notnull_cleanup_candidates = collect_safe_duplicate_notnull_cleanup_candidates(extra_results)
+        if extra_constraint_cleanup_mode == "off":
+            safe_duplicate_notnull_cleanup_candidates = []
+        else:
+            safe_duplicate_notnull_cleanup_candidates = collect_safe_duplicate_notnull_cleanup_candidates(extra_results)
+        semantic_constraint_cleanup_candidates = collect_semantic_extra_constraint_cleanup_candidates(
+            extra_results,
+            ob_meta,
+            extra_constraint_cleanup_mode,
+        )
         cleanup_path = export_extra_cleanup_candidates(
             base_dir,
             cleanup_candidates,
-            safe_duplicate_notnull_candidates=safe_duplicate_notnull_cleanup_candidates
+            safe_duplicate_notnull_candidates=safe_duplicate_notnull_cleanup_candidates,
+            semantic_constraint_candidates=semantic_constraint_cleanup_candidates,
         )
         cleanup_safe_paths = export_safe_duplicate_notnull_cleanup_fixup_scripts(
             base_dir,
             safe_duplicate_notnull_cleanup_candidates
         )
+        cleanup_semantic_paths = export_semantic_extra_constraint_cleanup_fixup_scripts(
+            base_dir,
+            semantic_constraint_cleanup_candidates,
+        )
         if cleanup_path:
             log.info(
-                "[FIXUP] 额外对象清理候选已输出: %s (count=%d, duplicate_notnull_drop=%d, cleanup_safe_sql=%d)",
+                "[FIXUP] 额外对象清理候选已输出: %s (count=%d, duplicate_notnull_drop=%d, cleanup_safe_sql=%d, semantic_constraint_drop=%d, cleanup_semantic_sql=%d)",
                 cleanup_path,
                 len(cleanup_candidates),
                 len(safe_duplicate_notnull_cleanup_candidates),
-                len(cleanup_safe_paths)
+                len(cleanup_safe_paths),
+                len(semantic_constraint_cleanup_candidates),
+                len(cleanup_semantic_paths),
             )
             if cleanup_safe_paths:
                 log.warning(
                     "[FIXUP] 已生成 cleanup_safe/constraint/ 安全清理 SQL（默认不会被 run_fixup 执行，需显式 --only-dirs cleanup_safe/constraint）。"
+                )
+            if cleanup_semantic_paths:
+                log.warning(
+                    "[FIXUP] 已生成 cleanup_semantic/constraint/ 语义清理 SQL（默认不会被 run_fixup 执行，需显式 --only-dirs cleanup_semantic/constraint）。"
                 )
         else:
             log.info("[FIXUP] 未发现可输出的额外对象清理候选。")
