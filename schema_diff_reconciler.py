@@ -34429,12 +34429,20 @@ def generate_fixup_scripts(
         ]
         return "\n".join(lines).rstrip() + "\n"
 
+    def is_public_synonym_fixup_exempt(obj_type: str, tgt_schema: str, src_schema: Optional[str] = None) -> bool:
+        obj_type_u = (obj_type or "").upper()
+        if obj_type_u != "SYNONYM":
+            return False
+        return (tgt_schema or "").upper() == "PUBLIC" or (src_schema or "").upper() == "PUBLIC"
+
     def allow_fixup(obj_type: str, tgt_schema: str, src_schema: Optional[str] = None) -> bool:
         nonlocal fixup_schema_used_source_match
         obj_type_u = obj_type.upper()
         schema_u = tgt_schema.upper() if tgt_schema else ""
         if fixup_type_filter and obj_type_u not in fixup_type_filter:
             return False
+        if is_public_synonym_fixup_exempt(obj_type_u, schema_u, src_schema):
+            return True
         if not fixup_schema_filter:
             return True
         if schema_u in fixup_schema_filter:
@@ -34456,6 +34464,8 @@ def generate_fixup_scripts(
         schema_u = tgt_schema.upper() if tgt_schema else ""
         if fixup_type_filter and obj_type_u not in fixup_type_filter:
             return "type_filter"
+        if is_public_synonym_fixup_exempt(obj_type_u, schema_u, src_schema):
+            return None
         if not fixup_schema_filter:
             return None
         if schema_u in fixup_schema_filter:
@@ -35096,6 +35106,7 @@ def generate_fixup_scripts(
     missing_total_by_type: Dict[str, int] = defaultdict(int)
     missing_allowed_by_type: Dict[str, int] = defaultdict(int)
     synonym_scope_skipped = 0
+    other_skip_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
     index_missing_total = sum(len(item.missing_indexes) for item in extra_results.get('index_mismatched', []))
     index_skip_counts: Dict[str, int] = defaultdict(int)
 
@@ -35135,9 +35146,12 @@ def generate_fixup_scripts(
         support_row = support_state_map.get((obj_type_u, f"{src_schema.upper()}.{src_obj.upper()}"))
         support_state = support_row.support_state if support_row else SUPPORT_STATE_SUPPORTED
         if not allow_fixup(obj_type_u, tgt_schema, src_schema):
+            reason = classify_fixup_skip(obj_type_u, tgt_schema, src_schema) or "filtered"
+            other_skip_counts[obj_type_u][reason] += 1
             continue
         if obj_type_u == 'SYNONYM' and not allow_synonym_scope(src_schema, tgt_schema):
             synonym_scope_skipped += 1
+            other_skip_counts[obj_type_u]["synonym_scope"] += 1
             continue
         missing_allowed_by_type[obj_type_u] += 1
         queue_request(src_schema, obj_type_u, src_obj)
@@ -36586,6 +36600,7 @@ def generate_fixup_scripts(
     # 处理非VIEW对象
     other_progress = build_progress_tracker(len(non_view_missing_objects), "[FIXUP] (4b/9) 其他对象")
     other_jobs: List[Callable[[], None]] = []
+    other_generated_counts: Dict[str, int] = defaultdict(int)
     for (obj_type, src_schema, src_obj, tgt_schema, tgt_obj) in non_view_missing_objects:
         def _job(ot=obj_type, ss=src_schema, so=src_obj, ts=tgt_schema, to=tgt_obj):
             try:
@@ -36624,9 +36639,11 @@ def generate_fixup_scripts(
                             ]
                         )
                         mark_source(ot, 'missing')
+                        other_skip_counts[(ot or "").upper()]["ddl_missing"] += 1
                         return
                     log.warning("[FIXUP] 未找到 %s %s.%s 的 dbcat DDL。", ot, ss, so)
                     mark_source(ot, 'missing')
+                    other_skip_counts[(ot or "").upper()]["ddl_missing"] += 1
                     return
                 if ddl_source_label.startswith("DBCAT"):
                     mark_source(ot, 'dbcat')
@@ -36697,6 +36714,7 @@ def generate_fixup_scripts(
                     grants_to_add=grants_for_this_object,
                     extra_comments=cleanup_comments
                 )
+                other_generated_counts[(ot or "").upper()] += 1
             finally:
                 other_progress()
         other_jobs.append(_job)
@@ -36742,9 +36760,11 @@ def generate_fixup_scripts(
                                 extra_comments=extra_comments
                             )
                             mark_source(ot, 'missing')
+                            other_skip_counts[(ot or "").upper()]["ddl_missing"] += 1
                             return
                         log.warning("[FIXUP] 未找到 %s %s.%s 的 dbcat DDL。", ot, ss, so)
                         mark_source(ot, 'missing')
+                        other_skip_counts[(ot or "").upper()]["ddl_missing"] += 1
                         return
                     if ddl_source_label.startswith("DBCAT"):
                         mark_source(ot, 'dbcat')
@@ -36801,10 +36821,29 @@ def generate_fixup_scripts(
                         header,
                         extra_comments=extra_comments
                     )
+                    other_generated_counts[(ot or "").upper()] += 1
                 finally:
                     other_unsup_progress()
             other_unsup_jobs.append(_job)
         run_tasks(other_unsup_jobs, "OTHER_UNSUPPORTED")
+
+    synonym_task_total = sum(
+        1 for item in non_view_missing_supported if (item[0] or "").upper() == "SYNONYM"
+    ) + sum(
+        1 for item in non_view_missing_unsupported if (item[0] or "").upper() == "SYNONYM"
+    )
+    if fixup_skip_summary is not None and (
+        missing_total_by_type.get("SYNONYM", 0)
+        or synonym_task_total
+        or other_generated_counts.get("SYNONYM", 0)
+        or other_skip_counts.get("SYNONYM")
+    ):
+        fixup_skip_summary["SYNONYM"] = {
+            "missing_total": int(missing_total_by_type.get("SYNONYM", 0) or 0),
+            "task_total": int(synonym_task_total or 0),
+            "generated": int(other_generated_counts.get("SYNONYM", 0) or 0),
+            "skipped": dict(other_skip_counts.get("SYNONYM", {}) or {}),
+        }
 
     if (
         name_collision_mode == "fixup"

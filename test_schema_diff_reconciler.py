@@ -4782,6 +4782,75 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             self.assertFalse((Path(tmp_dir) / "synonym" / "TGT.S1.sql").exists())
             self.assertFalse((Path(tmp_dir) / "unsupported" / "synonym" / "TGT.S1.sql").exists())
 
+    def test_generate_fixup_allows_public_synonym_without_public_in_fixup_schemas(self):
+        tv_results = {
+            "missing": [("SYNONYM", "PUBLIC.S1", "PUBLIC.S1")],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": [],
+            "remap_conflicts": []
+        }
+        extra_results = {
+            "index_ok": [], "index_mismatched": [],
+            "constraint_ok": [], "constraint_mismatched": [],
+            "sequence_ok": [], "sequence_mismatched": [],
+            "trigger_ok": [], "trigger_mismatched": [],
+        }
+        master_list = [("PUBLIC.S1", "PUBLIC.S1", "SYNONYM")]
+        oracle_meta = self._make_oracle_meta()
+        ob_meta = self._make_ob_meta()._replace(objects_by_type={"SYNONYM": set()})
+        full_mapping = {"PUBLIC.S1": {"SYNONYM": "PUBLIC.S1"}}
+        settings = {
+            "fixup_dir": "",
+            "fixup_workers": 1,
+            "progress_log_interval": 999,
+            "fixup_type_set": {"SYNONYM"},
+            "fixup_schema_list": {"SRC"},
+            "source_schemas_list": ["SRC"],
+            "synonym_fixup_scope": "public_only",
+        }
+        fixup_skip_summary: Dict[str, Dict[str, object]] = {}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings["fixup_dir"] = tmp_dir
+            with mock.patch.object(sdr, "fetch_dbcat_schema_objects", return_value=({}, {})), \
+                 mock.patch.object(sdr, "oracle_get_ddl_batch", return_value={}), \
+                 mock.patch.object(sdr, "get_oceanbase_version", return_value=None):
+                sdr.generate_fixup_scripts(
+                    {"user": "u", "password": "p", "dsn": "d"},
+                    {"executable": "obclient", "host": "h", "port": "1", "user_string": "u", "password": "p"},
+                    settings,
+                    tv_results,
+                    extra_results,
+                    master_list,
+                    oracle_meta,
+                    full_mapping,
+                    {},
+                    grant_plan=None,
+                    enable_grant_generation=False,
+                    dependency_report={"missing": [], "unexpected": [], "skipped": []},
+                    ob_meta=ob_meta,
+                    expected_dependency_pairs=set(),
+                    synonym_metadata={("PUBLIC", "S1"): sdr.SynonymMeta("PUBLIC", "S1", "SRC", "T1", None)},
+                    trigger_filter_entries=None,
+                    trigger_filter_enabled=False,
+                    package_results=None,
+                    report_dir=None,
+                    report_timestamp=None,
+                    fixup_skip_summary=fixup_skip_summary,
+                    support_state_map={},
+                    unsupported_table_keys=set(),
+                    view_compat_map={}
+                )
+            synonym_path = Path(tmp_dir) / "synonym" / "PUBLIC.S1.sql"
+            self.assertTrue(synonym_path.exists())
+            content = synonym_path.read_text(encoding="utf-8")
+            self.assertIn("CREATE OR REPLACE PUBLIC SYNONYM", content)
+            self.assertEqual(fixup_skip_summary.get("SYNONYM", {}).get("missing_total"), 1)
+            self.assertEqual(fixup_skip_summary.get("SYNONYM", {}).get("task_total"), 1)
+            self.assertEqual(fixup_skip_summary.get("SYNONYM", {}).get("generated"), 1)
+
     def test_generate_fixup_skips_extra_when_parent_table_missing(self):
         tv_results = {
             "missing": [("TABLE", "TGT.T1", "SRC.T1")],
