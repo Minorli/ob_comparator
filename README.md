@@ -230,7 +230,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/target_extra_grants_detail_<ts>.txt`：目标端额外对象授权明细（含 PUBLIC 扩权风险）
 - `main_reports/run_<ts>/ddl_cleanup_detail_<ts>.txt`：DDL 清理/改写明细（区分 `format_only / syntax_compat / environment_detach / semantic_rewrite`，并标记 `evidence_level`）
 - `main_reports/run_<ts>/trigger_status_report.txt`：触发器清单/状态差异报告
-- `main_reports/run_<ts>/triggers_non_table_detail_<ts>.txt`：源端非表触发器明细（如 `BEFORE DROP ON DATABASE`、`INSTEAD OF ... ON VIEW`），这些对象不会按普通 `trigger/` DDL 自动生成
+- `main_reports/run_<ts>/triggers_non_table_detail_<ts>.txt`：源端非表触发器明细（如 `BEFORE DROP ON DATABASE`）；`DATABASE/SCHEMA` 级事件触发器不会按普通 `trigger/` DDL 自动生成
 - `main_reports/run_<ts>/triggers_temp_table_unsupported_detail_<ts>.txt`：临时表触发器不支持明细（`TRIGGER_ON_TEMP_TABLE_UNSUPPORTED`）；对应 DDL 仅输出到 `fixup_scripts/unsupported/trigger/` 供人工改造参考，不进入普通 `trigger/`
 - `main_reports/run_<ts>/triggers_view_reference_detail_<ts>.txt`：触发器中引用视图的提醒明细（保留视图语义，不改写为表）
 - `main_reports/run_<ts>/triggers_literal_object_path_detail_<ts>.txt`：触发器中 `SCHEMA.OBJECT.COLUMN` 字符串路径提醒明细（默认不自动改写）
@@ -280,7 +280,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - 触发器中的真实对象引用会继续按现有规则做 schema 补全和 remap。
 - 如果触发器字符串字面量完整等于 `SCHEMA.OBJECT`，也会按 remap 自动改写，例如 `'LIFEBASE.T1' -> 'BASEDATA.T1'`。
 - 如果字符串字面量是 `SCHEMA.OBJECT.COLUMN` 三段式路径，程序默认不自动改写，避免把列名、协议文本或日志内容误改坏；这类情况会输出到 `triggers_literal_object_path_detail_<ts>.txt` 供人工确认。
-- 如果源端触发器不是普通表触发器（例如 `BEFORE DROP ON DATABASE`、`INSTEAD OF ... ON VIEW`），程序不会再静默漏掉；会输出到 `triggers_non_table_detail_<ts>.txt`，并在 `manual_actions_required_<ts>.txt` 中显式提醒。
+- 如果源端触发器是 `DATABASE/SCHEMA` 级事件触发器（例如 `BEFORE DROP ON DATABASE`），程序不会再静默漏掉；会输出到 `triggers_non_table_detail_<ts>.txt`，并在 `manual_actions_required_<ts>.txt` 中显式提醒。`INSTEAD OF ... ON VIEW` 会按普通受管触发器参与 compare/fixup。
 - 触发器中的 `PRAGMA AUTONOMOUS_TRANSACTION` 现在会保留，不再被清洗掉。
 
 ## DDL 清理治理

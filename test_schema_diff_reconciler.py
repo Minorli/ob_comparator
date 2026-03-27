@@ -620,18 +620,29 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertFalse(sdr.is_mview_log_table_name("MLOG_TABLE"))
         self.assertFalse(sdr.is_mview_log_table_name("APP_MLOG$_T1"))
 
+    def test_is_oracle_derived_artifact_table_name(self):
+        self.assertTrue(sdr.is_oracle_derived_artifact_table_name("MLOG$_PERST_TRAIL"))
+        self.assertTrue(sdr.is_oracle_derived_artifact_table_name("RUPD$_PERST_TRAIL"))
+        self.assertTrue(sdr.is_oracle_derived_artifact_table_name('"snap$_trail"'))
+        self.assertFalse(sdr.is_oracle_derived_artifact_table_name("RUPD_TABLE"))
+        self.assertFalse(sdr.is_oracle_derived_artifact_table_name("APP_RUPD$_T1"))
+
     def test_collect_mview_log_artifact_table_keys_and_filter_master_list(self):
         source_objects = {
             "SRC.MLOG$_T1": {"TABLE"},
+            "SRC.RUPD$_T2": {"TABLE"},
+            "SRC.SNAP$_T3": {"TABLE"},
             "SRC.BIZ_T1": {"TABLE"},
             "SRC.MLOG$_V1": {"VIEW"},
         }
         keys = sdr.collect_mview_log_artifact_table_keys(source_objects)
-        self.assertEqual(keys, {("SRC", "MLOG$_T1")})
+        self.assertEqual(keys, {("SRC", "MLOG$_T1"), ("SRC", "RUPD$_T2"), ("SRC", "SNAP$_T3")})
 
         excluded_nodes = {(f"{schema}.{name}", "TABLE") for schema, name in keys}
         master_list = [
             ("SRC.MLOG$_T1", "TGT.MLOG$_T1", "TABLE"),
+            ("SRC.RUPD$_T2", "TGT.RUPD$_T2", "TABLE"),
+            ("SRC.SNAP$_T3", "TGT.SNAP$_T3", "TABLE"),
             ("SRC.BIZ_T1", "TGT.BIZ_T1", "TABLE"),
             ("SRC.V1", "TGT.V1", "VIEW"),
         ]
@@ -3996,6 +4007,54 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIsNotNone(mismatch)
         self.assertEqual(mismatch.missing_triggers, {"B.TR_Y"})
 
+    def test_compare_triggers_for_view_detects_missing_instead_of_trigger(self):
+        oracle_meta = self._make_oracle_meta(triggers={
+            ("SRC", "V1"): {
+                "SRC.TRG_V1_IOI": {"event": "INSERT", "status": "ENABLED", "owner": "SRC", "name": "TRG_V1_IOI"},
+            }
+        })
+        ob_meta = self._make_ob_meta(triggers={})
+        ok, mismatch = sdr.compare_triggers_for_table(
+            oracle_meta,
+            ob_meta,
+            "SRC",
+            "V1",
+            "TGT",
+            "V1",
+            {"SRC.TRG_V1_IOI": {"TRIGGER": "TGT.TRG_V1_IOI"}},
+        )
+        self.assertFalse(ok)
+        self.assertIsNotNone(mismatch)
+        self.assertEqual(mismatch.table, "TGT.V1")
+        self.assertEqual(mismatch.missing_triggers, {"TGT.TRG_V1_IOI"})
+
+    def test_check_extra_objects_detects_missing_view_trigger(self):
+        master_list = [("SRC.V1", "TGT.V1", "VIEW")]
+        oracle_meta = self._make_oracle_meta(triggers={
+            ("SRC", "V1"): {
+                "SRC.TRG_V1_IOI": {"event": "INSERT", "status": "ENABLED", "owner": "SRC", "name": "TRG_V1_IOI"},
+            }
+        })
+        ob_meta = self._make_ob_meta(triggers={})._replace(
+            objects_by_type={"VIEW": {"TGT.V1"}}
+        )
+        full_mapping = {
+            "SRC.V1": {"VIEW": "TGT.V1"},
+            "SRC.TRG_V1_IOI": {"TRIGGER": "TGT.TRG_V1_IOI"},
+        }
+        extra = sdr.check_extra_objects(
+            {"extra_check_workers": 1, "extra_check_progress_interval": 999},
+            master_list,
+            ob_meta,
+            oracle_meta,
+            full_mapping,
+            enabled_extra_types={"TRIGGER"},
+        )
+        self.assertEqual(extra["trigger_ok"], [])
+        self.assertEqual(len(extra["trigger_mismatched"]), 1)
+        self.assertEqual(extra["trigger_mismatched"][0].table, "TGT.V1")
+        self.assertEqual(extra["trigger_mismatched"][0].missing_triggers, {"TGT.TRG_V1_IOI"})
+
     def test_build_trigger_full_set_handles_full_key(self):
         trigger_meta = {
             ("A", "T1"): {
@@ -4853,6 +4912,107 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             content = unsupported_path.read_text(encoding="utf-8")
             self.assertIn(sdr.TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON_CODE, content)
             self.assertIn("action: 改造/不迁移", content)
+
+    def test_generate_fixup_writes_missing_view_trigger(self):
+        tv_results = {
+            "missing": [],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": [],
+            "remap_conflicts": []
+        }
+        extra_results = {
+            "index_ok": [], "index_mismatched": [],
+            "constraint_ok": [], "constraint_mismatched": [],
+            "sequence_ok": [], "sequence_mismatched": [],
+            "trigger_ok": [],
+            "trigger_mismatched": [
+                sdr.TriggerMismatch(
+                    table="TGT.V1",
+                    missing_triggers={"TGT.TRG_V1_IOI"},
+                    extra_triggers=set(),
+                    detail_mismatch=[],
+                    missing_mappings=[("SRC.TRG_V1_IOI", "TGT.TRG_V1_IOI")]
+                )
+            ],
+        }
+        master_list = [("SRC.V1", "TGT.V1", "VIEW")]
+        oracle_meta = self._make_oracle_meta(
+            triggers={
+                ("SRC", "V1"): {
+                    "SRC.TRG_V1_IOI": {
+                        "event": "INSERT",
+                        "status": "ENABLED",
+                        "owner": "SRC",
+                        "name": "TRG_V1_IOI",
+                    }
+                }
+            }
+        )._replace(
+            object_statuses={
+                ("SRC", "TRG_V1_IOI", "TRIGGER"): "VALID",
+                ("SRC", "V1", "VIEW"): "VALID",
+            }
+        )
+        ob_meta = self._make_ob_meta()._replace(objects_by_type={"VIEW": {"TGT.V1"}, "TRIGGER": set()})
+        full_mapping = {
+            "SRC.V1": {"VIEW": "TGT.V1"},
+            "SRC.TRG_V1_IOI": {"TRIGGER": "TGT.TRG_V1_IOI"},
+        }
+        settings = {
+            "fixup_dir": "",
+            "fixup_workers": 1,
+            "progress_log_interval": 999,
+            "fixup_type_set": {"TRIGGER"},
+            "fixup_schema_list": set(),
+            "source_schemas_list": ["SRC"],
+            "trigger_qualify_schema": True,
+        }
+        ddl_text = (
+            'CREATE OR REPLACE TRIGGER "SRC"."TRG_V1_IOI"\n'
+            'INSTEAD OF INSERT ON "SRC"."V1"\n'
+            'BEGIN\n'
+            '  NULL;\n'
+            'END;\n'
+            '/'
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings["fixup_dir"] = tmp_dir
+            dbcat_data = {"SRC": {"TRIGGER": {"TRG_V1_IOI": ddl_text}}}
+            with mock.patch.object(sdr, "fetch_dbcat_schema_objects", return_value=(dbcat_data, {})), \
+                 mock.patch.object(sdr, "get_oceanbase_version", return_value="4.2.5.7"):
+                sdr.generate_fixup_scripts(
+                    {"user": "u", "password": "p", "dsn": "d"},
+                    {"executable": "obclient", "host": "h", "port": "1", "user_string": "u", "password": "p"},
+                    settings,
+                    tv_results,
+                    extra_results,
+                    master_list,
+                    oracle_meta,
+                    full_mapping,
+                    {},
+                    grant_plan=None,
+                    enable_grant_generation=False,
+                    dependency_report={"missing": [], "unexpected": [], "skipped": []},
+                    ob_meta=ob_meta,
+                    expected_dependency_pairs=set(),
+                    synonym_metadata={},
+                    trigger_filter_entries=None,
+                    trigger_filter_enabled=False,
+                    package_results=None,
+                    report_dir=None,
+                    report_timestamp=None,
+                    support_state_map={},
+                    unsupported_table_keys=set(),
+                    view_compat_map={}
+                )
+            normal_path = Path(tmp_dir) / "trigger" / "TGT.TRG_V1_IOI.sql"
+            self.assertTrue(normal_path.exists())
+            content = normal_path.read_text(encoding="utf-8").upper()
+            self.assertIn("INSTEAD OF INSERT ON", content)
+            self.assertIn('"TGT"."V1"', content)
 
     def test_generate_fixup_skips_synonym_with_out_of_scope_terminal_target(self):
         tv_results = {
@@ -10671,6 +10831,65 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertEqual(rows[0].status, "NON_TABLE_SOURCE_TRIGGER")
         self.assertEqual(summary["non_table"], 1)
+
+    def test_dump_oracle_metadata_keeps_instead_of_view_trigger_in_scope(self):
+        class FakeCursor:
+            def __init__(self):
+                self._rows = []
+
+            def execute(self, sql, binds=None, **kwargs):
+                sql_u = " ".join(str(sql).upper().split())
+                if "FROM DBA_TAB_COLUMNS" in sql_u and "OWNER = 'SYS'" in sql_u:
+                    self._rows = [(0,)]
+                elif "FROM DBA_TRIGGERS" in sql_u:
+                    self._rows = [
+                        ("SRC", "SRC", "V1", "TRG_V1_IOI", "INSTEAD OF", "INSERT", "VIEW", "ENABLED"),
+                        ("SRC", "SYS", "-", "TRG_DB_DROP", "BEFORE EVENT", "DROP", "DATABASE", "ENABLED"),
+                    ]
+                else:
+                    self._rows = []
+
+            def fetchone(self):
+                return None
+
+            def __iter__(self):
+                return iter(self._rows)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeConnection:
+            def cursor(self):
+                return FakeCursor()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        master_list = [("SRC.V1", "TGT.V1", "VIEW")]
+        settings = {"source_schemas_list": ["SRC"]}
+        with mock.patch.object(sdr.oracledb, "connect", return_value=FakeConnection()):
+            meta = sdr.dump_oracle_metadata(
+                {"user": "u", "password": "p", "dsn": "d"},
+                master_list,
+                settings,
+                include_indexes=False,
+                include_constraints=False,
+                include_triggers=True,
+                include_sequences=False,
+                include_comments=False,
+                include_blacklist=False,
+                include_privileges=False,
+            )
+        self.assertIn(("SRC", "V1"), meta.triggers)
+        self.assertIn("SRC.TRG_V1_IOI", meta.triggers[("SRC", "V1")])
+        self.assertEqual(len(meta.non_table_triggers), 1)
+        self.assertEqual(meta.non_table_triggers[0].trigger_name, "TRG_DB_DROP")
 
     def test_build_view_fixup_chains_with_synonym(self):
         dependency_pairs = {
