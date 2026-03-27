@@ -57,6 +57,12 @@
 - 运行账号需具备 DBA_* 视图访问权限（Oracle 与 OB）
 - 安全说明：工具运行时不会把 OB/dbcat 密码作为明文参数暴露在 `ps` 命令中（配置文件仍按当前方式保留密码项）。
 
+## 贡献方式
+
+- 贡献规范见 [CONTRIBUTING.md](./CONTRIBUTING.md)。
+- 新能力、高风险修复、兼容性策略变化建议使用 `issue + branch + PR`。
+- 小范围低风险维护仍可直接提交，但应继续使用 `Refs #N` 关联已有 area issue，保留 GitHub 历史。
+
 ## 快速开始
 
 ### 1) 安装依赖
