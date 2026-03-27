@@ -1762,6 +1762,11 @@ NOISE_REASON_OMS_ROWID_INDEX = "OMS_ROWID_INDEX"
 NOISE_REASON_OBNOTNULL_CONSTRAINT = "OBNOTNULL_CONSTRAINT"
 OB_OBCHECK_NAME_PATTERN = re.compile(r"_OBCHECK_\d+$", re.IGNORECASE)
 MVIEW_LOG_TABLE_NAME_PATTERN = re.compile(r"^MLOG\$_", re.IGNORECASE)
+ORACLE_DERIVED_ARTIFACT_TABLE_PATTERNS: Tuple[Pattern[str], ...] = (
+    re.compile(r"^MLOG\$_", re.IGNORECASE),
+    re.compile(r"^RUPD\$_", re.IGNORECASE),
+    re.compile(r"^SNAP\$_", re.IGNORECASE),
+)
 
 CASE_SENSITIVE_IDENTIFIER_SAMPLE_LIMIT = 30
 METADATA_VOLUME_WARN_TABLES = 200000
@@ -2372,11 +2377,18 @@ def is_mview_log_table_name(table_name: Optional[str]) -> bool:
     return bool(MVIEW_LOG_TABLE_NAME_PATTERN.match(name_u))
 
 
+def is_oracle_derived_artifact_table_name(table_name: Optional[str]) -> bool:
+    name_u = normalize_identifier_name(table_name)
+    if not name_u:
+        return False
+    return any(pattern.match(name_u) for pattern in ORACLE_DERIVED_ARTIFACT_TABLE_PATTERNS)
+
+
 def collect_mview_log_artifact_table_keys(
     source_objects: Optional[SourceObjectMap]
 ) -> Set[Tuple[str, str]]:
     """
-    收集源端对象范围内的 MVIEW LOG 派生表（MLOG$_*）。
+    收集源端对象范围内的 Oracle 派生表工件。
     返回 {(OWNER, TABLE_NAME)}，均为大写。
     """
     result: Set[Tuple[str, str]] = set()
@@ -2388,7 +2400,7 @@ def collect_mview_log_artifact_table_keys(
         if "TABLE" not in {str(t).upper() for t in (obj_types or set())}:
             continue
         owner_u, table_u = full_name.upper().split(".", 1)
-        if is_mview_log_table_name(table_u):
+        if is_oracle_derived_artifact_table_name(table_u):
             result.add((owner_u, table_u))
     return result
 
@@ -9560,10 +9572,18 @@ def classify_missing_objects(
         else:
             missing_support_counts[obj_type_u]["supported"] += 1
 
-    # 扩展对象：索引/约束/触发器被不支持表阻断时的明细统计
+    # 扩展对象：索引/约束按表阻断；TRIGGER 允许挂在 TABLE/VIEW。
     table_map: Dict[str, str] = {}
     for (src_schema, src_table), (tgt_schema, tgt_table) in table_target_map.items():
         table_map[f"{tgt_schema.upper()}.{tgt_table.upper()}"] = f"{src_schema.upper()}.{src_table.upper()}"
+    trigger_base_map: Dict[str, str] = {
+        f"{tgt_schema.upper()}.{tgt_table.upper()}": f"{src_schema.upper()}.{src_table.upper()}"
+        for (src_schema, src_table), (tgt_schema, tgt_table) in table_target_map.items()
+    }
+    for src_full, type_map in (full_object_mapping or {}).items():
+        tgt_view = (type_map or {}).get("VIEW")
+        if tgt_view and "." in str(tgt_view):
+            trigger_base_map[str(tgt_view).upper()] = (src_full or "").upper()
     missing_target_table_keys = collect_missing_target_table_source_keys(tv_results)
 
     def _build_extra_blocked_row(
@@ -9669,7 +9689,7 @@ def classify_missing_objects(
         table_str = item.table.split()[0]
         if '.' not in table_str:
             continue
-        src_name = table_map.get(table_str)
+        src_name = trigger_base_map.get(table_str.upper())
         if not src_name or '.' not in src_name:
             continue
         src_schema, src_table = src_name.split('.', 1)
@@ -9691,7 +9711,7 @@ def classify_missing_objects(
         table_str = item.table.split()[0]
         if '.' not in table_str:
             continue
-        src_name = table_map.get(table_str)
+        src_name = trigger_base_map.get(table_str.upper())
         if not src_name or '.' not in src_name:
             continue
         src_schema, src_table = src_name.split('.', 1)
@@ -9745,7 +9765,7 @@ def classify_missing_objects(
         table_str = item.table.split()[0]
         if '.' not in table_str:
             continue
-        src_name = table_map.get(table_str)
+        src_name = trigger_base_map.get(table_str.upper())
         if not src_name or '.' not in src_name:
             continue
         src_schema, src_table = src_name.split('.', 1)
@@ -9791,7 +9811,7 @@ def classify_missing_objects(
         table_str = item.table.split()[0]
         if '.' not in table_str:
             continue
-        src_name = table_map.get(table_str)
+        src_name = trigger_base_map.get(table_str.upper())
         if not src_name or '.' not in src_name:
             continue
         src_schema, src_table = src_name.split('.', 1)
@@ -9815,7 +9835,7 @@ def classify_missing_objects(
         table_str = item.table.split()[0]
         if '.' not in table_str:
             continue
-        src_name = table_map.get(table_str)
+        src_name = trigger_base_map.get(table_str.upper())
         if not src_name or '.' not in src_name:
             continue
         src_schema, src_table = src_name.split('.', 1)
@@ -9839,7 +9859,7 @@ def classify_missing_objects(
         table_str = item.table.split()[0]
         if '.' not in table_str:
             continue
-        src_name = table_map.get(table_str)
+        src_name = trigger_base_map.get(table_str.upper())
         if not src_name or '.' not in src_name:
             continue
         src_schema, src_table = src_name.split('.', 1)
@@ -11981,14 +12001,20 @@ def find_source_by_target(
     return None
 
 
-def collect_table_pairs(master_list: MasterCheckList, use_target: bool = False) -> Set[Tuple[str, str]]:
+def collect_object_pairs(
+    master_list: MasterCheckList,
+    *,
+    use_target: bool = False,
+    allowed_types: Optional[Set[str]] = None,
+) -> Set[Tuple[str, str]]:
     """
-    提取 master_list 中的 (schema, table) 集合。
-    use_target=True 时基于目标端表名，否则使用源端。
+    提取 master_list 中指定对象类型的 (schema, object_name) 集合。
+    use_target=True 时基于目标端对象名，否则使用源端。
     """
     pairs: Set[Tuple[str, str]] = set()
+    allowed_types_u = {t.upper() for t in (allowed_types or {"TABLE"})}
     for src_name, tgt_name, obj_type in master_list:
-        if obj_type.upper() != 'TABLE':
+        if obj_type.upper() not in allowed_types_u:
             continue
         name = tgt_name if use_target else src_name
         if '.' not in name:
@@ -11996,6 +12022,14 @@ def collect_table_pairs(master_list: MasterCheckList, use_target: bool = False) 
         schema, table = name.split('.', 1)
         pairs.add((schema.upper(), table.upper()))
     return pairs
+
+
+def collect_table_pairs(master_list: MasterCheckList, use_target: bool = False) -> Set[Tuple[str, str]]:
+    """
+    提取 master_list 中的 (schema, table) 集合。
+    use_target=True 时基于目标端表名，否则使用源端。
+    """
+    return collect_object_pairs(master_list, use_target=use_target, allowed_types={"TABLE"})
 
 
 def build_table_target_map(master_list: MasterCheckList) -> Dict[Tuple[str, str], Tuple[str, str]]:
@@ -12010,6 +12044,25 @@ def build_table_target_map(master_list: MasterCheckList) -> Dict[Tuple[str, str]
         tgt_key = parse_full_object_name(tgt_name)
         if src_key and tgt_key:
             mapping[src_key] = tgt_key
+    return mapping
+
+
+def build_trigger_base_target_lookup(master_list: MasterCheckList) -> Dict[str, str]:
+    """
+    为 TRIGGER compare/fixup 构造目标基对象 -> 源基对象映射。
+
+    当前仅纳入:
+    - TABLE
+    - VIEW
+    """
+    mapping: Dict[str, str] = {}
+    for src_name, tgt_name, obj_type in master_list:
+        if (obj_type or "").upper() not in {"TABLE", "VIEW"}:
+            continue
+        src_full = (src_name or "").upper()
+        tgt_full = (tgt_name or "").upper()
+        if src_full and tgt_full and "." in src_full and "." in tgt_full:
+            mapping[tgt_full] = src_full
     return mapping
 
 
@@ -16982,7 +17035,13 @@ def dump_oracle_metadata(
     预先加载 Oracle 端所需的所有元数据，避免在校验/修补阶段频繁查询。
     """
     table_pairs: Set[Tuple[str, str]] = collect_table_pairs(master_list)
-    owner_set: Set[str] = {schema for schema, _ in table_pairs}
+    trigger_base_pairs: Set[Tuple[str, str]] = collect_object_pairs(
+        master_list,
+        allowed_types={"TABLE", "VIEW"},
+    )
+    owner_set: Set[str] = {schema for schema, _ in table_pairs} | {
+        schema for schema, _ in trigger_base_pairs
+    }
 
     owners = sorted(owner_set)
     seq_owners = sorted({s.upper() for s in settings.get('source_schemas_list', [])})
@@ -17717,9 +17776,9 @@ def dump_oracle_metadata(
                                 if not trg_name:
                                     continue
                                 trg_owner_u = trg_owner or owner or ""
-                                if base_object_type == "TABLE" and owner and table:
+                                if base_object_type in {"TABLE", "VIEW"} and owner and table:
                                     key = (owner, table)
-                                    if key in table_pairs:
+                                    if key in trigger_base_pairs:
                                         trg_key = f"{trg_owner_u}.{trg_name}" if trg_owner_u and trg_name else trg_name
                                         triggers.setdefault(key, {})[trg_key] = {
                                             "event": event,
@@ -22290,7 +22349,7 @@ def ensure_trigger_mappings_for_extra_checks(
     full_object_mapping: FullObjectMapping
 ) -> None:
     for src_name, _tgt_name, obj_type in master_list:
-        if (obj_type or "").upper() != "TABLE":
+        if (obj_type or "").upper() not in {"TABLE", "VIEW"}:
             continue
         try:
             src_schema, src_table = src_name.split('.', 1)
@@ -23669,6 +23728,39 @@ def run_extra_check_for_table(
     )
 
 
+def run_trigger_check_for_object(
+    src_schema: str,
+    src_object: str,
+    tgt_schema: str,
+    tgt_object: str,
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata,
+    full_object_mapping: FullObjectMapping,
+) -> Tuple[str, bool, Optional[TriggerMismatch], float]:
+    start = time.monotonic()
+    trg_cache = build_trigger_cache_for_table(
+        oracle_meta,
+        ob_meta,
+        src_schema,
+        src_object,
+        tgt_schema,
+        tgt_object,
+        full_object_mapping
+    )
+    trigger_ok, trigger_mismatch = compare_triggers_for_table(
+        oracle_meta,
+        ob_meta,
+        src_schema,
+        src_object,
+        tgt_schema,
+        tgt_object,
+        full_object_mapping,
+        cache=trg_cache
+    )
+    elapsed = time.monotonic() - start
+    return f"{tgt_schema}.{tgt_object}", trigger_ok, trigger_mismatch, elapsed
+
+
 def check_extra_objects(
     settings: Dict,
     master_list: MasterCheckList,
@@ -23679,10 +23771,9 @@ def check_extra_objects(
     transformed_blacklist_columns_by_table: Optional[Dict[Tuple[str, str], Set[str]]] = None,
 ) -> ExtraCheckResults:
     """
-    基于 master_list (TABLE 映射) 检查：
-      - 索引
-      - 约束 (PK/UK/FK/CHECK)
-      - 触发器
+    基于 master_list 检查：
+      - TABLE: 索引 / 约束 / 触发器
+      - VIEW: 触发器（当前主要覆盖 INSTEAD OF ... ON VIEW）
     基于 schema 映射检查：
       - 序列
     """
@@ -23712,29 +23803,39 @@ def check_extra_objects(
 
     log_subsection("扩展对象校验 (索引/约束/序列/触发器)")
 
-    # 1) 针对每个 TABLE 做索引/约束/触发器校验
+    # 1) 针对 TABLE 做索引/约束/触发器校验；针对 VIEW 做触发器校验
     if 'TRIGGER' in table_check_types:
         ensure_trigger_mappings_for_extra_checks(master_list, oracle_meta, full_object_mapping)
 
     table_entries: List[TableEntry] = []
+    trigger_view_entries: List[TableEntry] = []
     if table_check_types:
         for src_name, tgt_name, obj_type in master_list:
-            if (obj_type or "").upper() != 'TABLE':
-                continue
+            obj_type_u = (obj_type or "").upper()
             try:
                 src_schema, src_table = src_name.split('.', 1)
                 tgt_schema, tgt_table = tgt_name.split('.', 1)
             except ValueError:
                 continue
-            table_entries.append((
-                src_schema.upper(),
-                src_table.upper(),
-                tgt_schema.upper(),
-                tgt_table.upper()
-            ))
+            if obj_type_u == 'TABLE':
+                table_entries.append((
+                    src_schema.upper(),
+                    src_table.upper(),
+                    tgt_schema.upper(),
+                    tgt_table.upper()
+                ))
+            elif obj_type_u == 'VIEW' and 'TRIGGER' in table_check_types:
+                trigger_view_entries.append((
+                    src_schema.upper(),
+                    src_table.upper(),
+                    tgt_schema.upper(),
+                    tgt_table.upper()
+                ))
 
     table_entries.sort(key=lambda item: (item[2], item[3]))
+    trigger_view_entries.sort(key=lambda item: (item[2], item[3]))
     total_tables = len(table_entries)
+    total_trigger_views = len(trigger_view_entries)
     idx_time_sum = 0.0
     cons_time_sum = 0.0
     trg_time_sum = 0.0
@@ -23898,6 +23999,45 @@ def check_extra_objects(
             cons_time_sum,
             trg_time_sum
         )
+
+    if total_trigger_views:
+        log.info(
+            "[EXTRA] 正在补充校验 VIEW 上的 TRIGGER，数量=%d。",
+            total_trigger_views
+        )
+        start_ts = time.monotonic()
+        last_log = start_ts
+        done_views = 0
+        try:
+            progress_interval = float(settings.get('extra_check_progress_interval', 10))
+        except (TypeError, ValueError):
+            progress_interval = 10.0
+        progress_interval = max(1.0, progress_interval)
+        for entry in trigger_view_entries:
+            tgt_name, trigger_ok, trigger_mismatch, trigger_time = run_trigger_check_for_object(
+                entry[0],
+                entry[1],
+                entry[2],
+                entry[3],
+                oracle_meta,
+                ob_meta,
+                full_object_mapping,
+            )
+            done_views += 1
+            if trigger_ok is True:
+                extra_results["trigger_ok"].append(tgt_name)
+            elif trigger_ok is False and trigger_mismatch:
+                extra_results["trigger_mismatched"].append(trigger_mismatch)
+            trg_time_sum += trigger_time
+            now = time.monotonic()
+            if done_views == total_trigger_views or (now - last_log) >= progress_interval:
+                pct = done_views * 100.0 / total_trigger_views if total_trigger_views else 100.0
+                rate = done_views / max(1e-6, now - start_ts)
+                log.info(
+                    "VIEW 触发器扩展校验进度 %d/%d (%.1f%%, %.1f 对象/秒)...",
+                    done_views, total_trigger_views, pct, rate
+                )
+                last_log = now
 
     # 2) 序列校验（考虑 remap 后的目标 schema）
     sequence_groups: Dict[Tuple[str, str], List[Tuple[str, str]]] = defaultdict(list)
@@ -34438,6 +34578,7 @@ def generate_fixup_scripts(
         for (src_name, tgt_name, obj_type) in master_list
         if obj_type.upper() == 'TABLE'
     }
+    trigger_base_map: Dict[str, str] = build_trigger_base_target_lookup(master_list)
     object_replacements: List[Tuple[Tuple[str, str], Tuple[str, str]]] = []
     replacement_set: Set[Tuple[str, str, str, str]] = set()
     for src_name, type_map in full_object_mapping.items():
@@ -35561,7 +35702,7 @@ def generate_fixup_scripts(
         table_str = item.table.split()[0]
         if '.' not in table_str:
             continue
-        src_name = table_map.get(table_str)
+        src_name = trigger_base_map.get(table_str.upper())
         if not src_name or '.' not in src_name:
             continue
         src_schema, src_table = src_name.split('.', 1)

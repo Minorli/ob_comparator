@@ -320,7 +320,7 @@
 - trigger_list：触发器清单文件（每行 SCHEMA.TRIGGER_NAME）。默认：空。
   注意：配置后仅生成列表内触发器，并输出 trigger_status_report.txt 报告；清单读取失败会回退全量触发器。
   说明：若清单中的触发器属于非表触发器（如 `BEFORE DROP ON DATABASE` 或 `INSTEAD OF ... ON VIEW`），程序不会生成普通 trigger DDL，
-  会在 `trigger_status_report.txt` 中标成 `NON_TABLE_SOURCE_TRIGGER`，并额外输出 `triggers_non_table_detail_<ts>.txt` 与人工处理清单。
+  对 `DATABASE/SCHEMA` 级事件触发器，会在 `trigger_status_report.txt` 中标成 `NON_TABLE_SOURCE_TRIGGER`，并额外输出 `triggers_non_table_detail_<ts>.txt` 与人工处理清单；`INSTEAD OF ... ON VIEW` 会按普通触发器参与 compare/fixup。
 - trigger_qualify_schema：触发器 DDL 是否强制补全 schema 前缀。默认：true。
   说明：开启后会在触发器体内 DML 位点补全 schema，并把同义词引用优先解析到终点对象（如 TABLE/VIEW）后再重写；
   对未限定 schema 的序列 `NEXTVAL/CURRVAL` 也会补全为 `schema.sequence`，减少跨 schema 误绑定。
