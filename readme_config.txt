@@ -41,6 +41,11 @@
   说明：规则格式为 `SRC_SCHEMA.OBJECT = TGT_SCHEMA.OBJECT`，支持注释与空行。
   注意：文件不存在会报警但继续。
   说明：每轮运行会额外输出 `managed_target_scope_detail_<ts>.txt`，用于审计本轮派生出的目标 schema 范围。
+- blacklist_target_existing_policy：黑名单表目标已存在策略。默认：rehydrate_if_present。
+  可选值：keep_blocked、rehydrate_if_present。
+  说明：当源端 TABLE 命中阻断型黑名单、但映射后的目标 TABLE 已经由客户人工改造并创建在 OB 上时，`rehydrate_if_present` 会把该表重新纳入 compare/fixup。
+  说明：重纳管只对“目标端真实存在的 TABLE”生效；临时表等高风险对象仍继续阻断。
+  说明：黑名单改造列（如 ROWID/UROWID/XMLTYPE/自定义类型承接列）不会再自动回写 Oracle 原始类型、长度、默认值或空值语义；相关 INDEX/CONSTRAINT 若依赖这些列，会转为 manual/report-only。
 - case_sensitive_identifier_mode：大小写敏感(双引号)标识符处理模式。默认：warn。
   可选值：abort / warn / strict_fixup。
   说明：`abort` 发现即终止；`warn` 继续运行并输出专项明细；

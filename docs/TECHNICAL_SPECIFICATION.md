@@ -116,6 +116,7 @@
 - VIEW 依赖 remap 会同时处理 unquoted / quoted qualified 引用；当同义词终点无法安全解析时，不做 schema-only 盲改，而是优先 fallback 到受管目标同义词对象本身；若仍无法确认，则保留原引用并输出诊断日志
 - 当 `source_object_scope_mode=remap_root_closure` 时，源对象范围不再按 `source_schemas` 全量纳入，而是仅从 `remap_file` 中显式 TABLE/VIEW roots 出发，按依赖/附属关系扩展闭包；闭包外对象（含其相关 INDEX/CONSTRAINT/SYNONYM/SEQUENCE/TRIGGER）整体不进入 compare/fixup/report，`trigger_list` 可作为显式 keep set 保留触发器及其父对象
 - scoped mode 会输出 `source_scope_detail_<ts>.txt`，记录 remap roots、显式 trigger keep、闭包纳入对象和被过滤对象，供客户核对“不多对象、不少对象”边界
+- 当 `blacklist_target_existing_policy=rehydrate_if_present` 时，若源端阻断型黑名单 TABLE 在目标端已真实存在，则会进入“重纳管”模式：表本体恢复 compare/fixup，但黑名单改造列不会再自动回写 Oracle 原始语义；依赖这些列的 INDEX/CONSTRAINT 转为 manual/report-only，TRIGGER 在 v1 中继续保持人工处理
 - PUBLIC 同义词按 Oracle 语义处理（OB `__public` 归一化为 `PUBLIC`）
 - 若 SYNONYM 的终点对象不在本次迁移范围（含同义词链最终落到范围外对象），该 SYNONYM 会被分类为 `BLOCKED`，写入 unsupported/detail 报告，且不生成 normal synonym fixup DDL
 - 同义词的“源端终点对象是否受管”与“目标端 schema 是否受管”分开处理；不会再把 `source_schemas` 误当 target allowlist 使用

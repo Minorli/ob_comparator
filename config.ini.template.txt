@@ -26,6 +26,11 @@ remap_file              = remap_rules.txt
 #   remap_root_closure -> 仅以 remap_file 中显式 TABLE/VIEW 为根种子，按依赖/附属关系扩展闭包
 #                         trigger_list 中显式列出的触发器会作为额外 keep set 保留
 source_object_scope_mode = full_source
+# blacklist_target_existing_policy:
+#   keep_blocked         -> 黑名单表保持原阻断行为
+#   rehydrate_if_present -> 若映射后的目标 TABLE 已人工存在，则重新纳入 compare/fixup
+#                           但黑名单改造列不会再自动回写 Oracle 原始语义（默认）
+blacklist_target_existing_policy = rehydrate_if_present
 # 大小写敏感(双引号)标识符处理模式：
 #   abort        -> 发现即中止（最严格）
 #   warn         -> 继续运行并输出专项明细（默认）

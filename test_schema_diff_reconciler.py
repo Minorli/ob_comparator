@@ -221,6 +221,12 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(scope.target_to_source_schemas["LIFEDATA"], ("LIFEBASE",))
         self.assertEqual(scope.target_object_counts["LIFEDATA"], 2)
 
+    def test_should_load_constraint_metadata_for_table_semantics(self):
+        self.assertTrue(sdr.should_load_constraint_metadata({"TABLE"}, set()))
+        self.assertTrue(sdr.should_load_constraint_metadata(set(), {"CONSTRAINT"}))
+        self.assertTrue(sdr.should_load_constraint_metadata({"TABLE"}, {"INDEX"}))
+        self.assertFalse(sdr.should_load_constraint_metadata({"VIEW"}, {"INDEX", "TRIGGER"}))
+
     def test_export_managed_target_scope_detail_marks_remapped_only_schema(self):
         scope = sdr.derive_managed_target_scope(
             ["LIFEBASE", "BASEDATA"],
@@ -1700,6 +1706,138 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             enabled_primary_types={"TABLE"},
         )
         self.assertEqual(results["mismatched"], [])
+
+    def test_check_primary_objects_inline_novalidate_notnull_with_equivalent_obnotnull_is_clean(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "ID_COL": {
+                    "data_type": "VARCHAR2",
+                    "data_length": 32,
+                    "char_length": 32,
+                    "char_used": "B",
+                    "data_precision": None,
+                    "data_scale": None,
+                    "nullable": "N",
+                    "data_default": "TO_CHAR(RAWTOHEX(SYS_GUID()))",
+                    "hidden": False,
+                    "virtual": False,
+                    "virtual_expr": None,
+                }
+            }
+        })._replace(constraints={
+            ("A", "T1"): {
+                "SYS_C001234": {
+                    "type": "C",
+                    "status": "ENABLED",
+                    "validated": "NOT VALIDATED",
+                    "search_condition": '"ID_COL" IS NOT NULL',
+                    "columns": ["ID_COL"],
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "ID_COL": {
+                        "data_type": "VARCHAR2",
+                        "data_length": 48,
+                        "char_length": 48,
+                        "char_used": "B",
+                        "data_precision": None,
+                        "data_scale": None,
+                        "nullable": "Y",
+                        "data_default": "TO_CHAR(RAWTOHEX(SYS_GUID()))",
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                    }
+                }
+            }
+        )._replace(
+            constraints={("A", "T1"): {}},
+            enabled_notnull_check_columns={
+                ("A", "T1"): {
+                    "ID_COL": {
+                        "constraint_name": "T1_OBNOTNULL_1",
+                        "search_condition": '"ID_COL" IS NOT NULL',
+                        "status": "ENABLED",
+                        "validated": "NOT VALIDATED",
+                    }
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(results["mismatched"], [])
+
+    def test_check_primary_objects_inline_novalidate_notnull_missing_equivalent_check_uses_novalidate_issue(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "ID_COL": {
+                    "data_type": "VARCHAR2",
+                    "data_length": 32,
+                    "char_length": 32,
+                    "char_used": "B",
+                    "data_precision": None,
+                    "data_scale": None,
+                    "nullable": "N",
+                    "data_default": "TO_CHAR(RAWTOHEX(SYS_GUID()))",
+                    "hidden": False,
+                    "virtual": False,
+                    "virtual_expr": None,
+                }
+            }
+        })._replace(constraints={
+            ("A", "T1"): {
+                "SYS_C001234": {
+                    "type": "C",
+                    "status": "ENABLED",
+                    "validated": "NOT VALIDATED",
+                    "search_condition": '"ID_COL" IS NOT NULL',
+                    "columns": ["ID_COL"],
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "ID_COL": {
+                        "data_type": "VARCHAR2",
+                        "data_length": 48,
+                        "char_length": 48,
+                        "char_used": "B",
+                        "data_precision": None,
+                        "data_scale": None,
+                        "nullable": "Y",
+                        "data_default": "TO_CHAR(RAWTOHEX(SYS_GUID()))",
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                    }
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(len(results["mismatched"]), 1)
+        type_mismatches = results["mismatched"][0][5]
+        self.assertEqual(len(type_mismatches), 1)
+        self.assertEqual(type_mismatches[0].issue, "nullability_novalidate_tighten")
+        self.assertEqual(type_mismatches[0].expected_type, "NOT NULL ENABLE NOVALIDATE")
 
     def test_check_primary_objects_detects_default_mismatch(self):
         master_list = [("A.T1", "A.T1", "TABLE")]
@@ -4028,7 +4166,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(syn_row.reason_code, sdr.SYNONYM_TARGET_OUT_OF_SCOPE_REASON_CODE)
         self.assertEqual(syn_row.dependency, "SRC.S2")
 
-    def test_classify_missing_objects_blocks_explicit_remap_synonym_when_terminal_out_of_scope(self):
+    def test_classify_missing_objects_keeps_explicit_remap_synonym_in_scope(self):
         tv_results = {
             "missing": [
                 ("SYNONYM", "TGT.S1", "SRC.S1"),
@@ -4062,9 +4200,9 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             remap_rules={"SRC.S1": "TGT.S1"},
         )
         syn_row = next(row for row in summary.missing_detail_rows if row.src_full == "SRC.S1")
-        self.assertEqual(syn_row.support_state, sdr.SUPPORT_STATE_BLOCKED)
-        self.assertEqual(syn_row.reason_code, sdr.SYNONYM_TARGET_OUT_OF_SCOPE_REASON_CODE)
-        self.assertEqual(syn_row.dependency, "OTHER.T1")
+        self.assertEqual(syn_row.support_state, sdr.SUPPORT_STATE_SUPPORTED)
+        self.assertEqual(syn_row.reason_code, "-")
+        self.assertEqual(syn_row.action, "FIXUP")
 
     def test_resolve_synonym_scope_status_public_chain_stays_in_scope(self):
         synonym_meta = {
@@ -4082,6 +4220,21 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(terminal, "SRC.T1")
         self.assertEqual(state, "in_scope")
         self.assertEqual(detail, "TABLE")
+
+    def test_resolve_synonym_scope_status_explicit_remap_keeps_in_scope(self):
+        synonym_meta = {
+            ("SRC", "S1"): sdr.SynonymMeta("SRC", "S1", "SRC", "T1", None),
+        }
+        terminal, state, detail = sdr.resolve_synonym_scope_status(
+            "SRC",
+            "S1",
+            synonym_meta,
+            {},
+            remap_rules={"SRC.S1": "TGT.S1"},
+        )
+        self.assertEqual(terminal, "SRC.T1")
+        self.assertEqual(state, "in_scope")
+        self.assertIn("synonym_explicit_remap", detail)
 
     def test_resolve_synonym_terminal_source_prefers_public_chain_only_when_exact_object_missing(self):
         synonym_meta = {
@@ -4850,6 +5003,144 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             self.assertEqual(fixup_skip_summary.get("SYNONYM", {}).get("missing_total"), 1)
             self.assertEqual(fixup_skip_summary.get("SYNONYM", {}).get("task_total"), 1)
             self.assertEqual(fixup_skip_summary.get("SYNONYM", {}).get("generated"), 1)
+
+    def test_generate_fixup_public_synonym_without_meta_uses_fallback_ddl(self):
+        tv_results = {
+            "missing": [("SYNONYM", "PUBLIC.S1", "PUBLIC.S1")],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": [],
+            "remap_conflicts": []
+        }
+        extra_results = {
+            "index_ok": [], "index_mismatched": [],
+            "constraint_ok": [], "constraint_mismatched": [],
+            "sequence_ok": [], "sequence_mismatched": [],
+            "trigger_ok": [], "trigger_mismatched": [],
+        }
+        master_list = [("PUBLIC.S1", "PUBLIC.S1", "SYNONYM")]
+        oracle_meta = self._make_oracle_meta()
+        ob_meta = self._make_ob_meta()._replace(objects_by_type={"SYNONYM": set()})
+        full_mapping = {"PUBLIC.S1": {"SYNONYM": "PUBLIC.S1"}}
+        settings = {
+            "fixup_dir": "",
+            "fixup_workers": 1,
+            "progress_log_interval": 999,
+            "fixup_type_set": {"SYNONYM"},
+            "fixup_schema_list": {"SRC"},
+            "source_schemas_list": ["SRC"],
+            "synonym_fixup_scope": "public_only",
+        }
+        fixup_skip_summary: Dict[str, Dict[str, object]] = {}
+        fallback_map = {
+            ("PUBLIC", "SYNONYM", "S1"): 'CREATE OR REPLACE PUBLIC SYNONYM "S1" FOR "SRC"."T1";'
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings["fixup_dir"] = tmp_dir
+            with mock.patch.object(sdr, "fetch_dbcat_schema_objects", return_value=({}, {})), \
+                 mock.patch.object(sdr, "oracle_get_ddl_batch", return_value=fallback_map), \
+                 mock.patch.object(sdr, "get_oceanbase_version", return_value=None):
+                sdr.generate_fixup_scripts(
+                    {"user": "u", "password": "p", "dsn": "d"},
+                    {"executable": "obclient", "host": "h", "port": "1", "user_string": "u", "password": "p"},
+                    settings,
+                    tv_results,
+                    extra_results,
+                    master_list,
+                    oracle_meta,
+                    full_mapping,
+                    {},
+                    grant_plan=None,
+                    enable_grant_generation=False,
+                    dependency_report={"missing": [], "unexpected": [], "skipped": []},
+                    ob_meta=ob_meta,
+                    expected_dependency_pairs=set(),
+                    synonym_metadata={},
+                    trigger_filter_entries=None,
+                    trigger_filter_enabled=False,
+                    package_results=None,
+                    report_dir=None,
+                    report_timestamp=None,
+                    fixup_skip_summary=fixup_skip_summary,
+                    support_state_map={},
+                    unsupported_table_keys=set(),
+                    view_compat_map={}
+                )
+            synonym_path = Path(tmp_dir) / "synonym" / "PUBLIC.S1.sql"
+            self.assertTrue(synonym_path.exists())
+            self.assertEqual(fixup_skip_summary.get("SYNONYM", {}).get("missing_total"), 1)
+            self.assertEqual(fixup_skip_summary.get("SYNONYM", {}).get("task_total"), 1)
+            self.assertEqual(fixup_skip_summary.get("SYNONYM", {}).get("generated"), 1)
+
+    def test_generate_fixup_public_synonym_without_meta_records_ddl_missing(self):
+        tv_results = {
+            "missing": [("SYNONYM", "PUBLIC.S1", "PUBLIC.S1")],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": [],
+            "remap_conflicts": []
+        }
+        extra_results = {
+            "index_ok": [], "index_mismatched": [],
+            "constraint_ok": [], "constraint_mismatched": [],
+            "sequence_ok": [], "sequence_mismatched": [],
+            "trigger_ok": [], "trigger_mismatched": [],
+        }
+        master_list = [("PUBLIC.S1", "PUBLIC.S1", "SYNONYM")]
+        oracle_meta = self._make_oracle_meta()
+        ob_meta = self._make_ob_meta()._replace(objects_by_type={"SYNONYM": set()})
+        full_mapping = {"PUBLIC.S1": {"SYNONYM": "PUBLIC.S1"}}
+        settings = {
+            "fixup_dir": "",
+            "fixup_workers": 1,
+            "progress_log_interval": 999,
+            "fixup_type_set": {"SYNONYM"},
+            "fixup_schema_list": {"SRC"},
+            "source_schemas_list": ["SRC"],
+            "synonym_fixup_scope": "public_only",
+        }
+        fixup_skip_summary: Dict[str, Dict[str, object]] = {}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings["fixup_dir"] = tmp_dir
+            with mock.patch.object(sdr, "fetch_dbcat_schema_objects", return_value=({}, {})), \
+                 mock.patch.object(sdr, "oracle_get_ddl_batch", return_value={}), \
+                 mock.patch.object(sdr, "oracle_get_ddl", return_value=None), \
+                 mock.patch.object(sdr, "get_oceanbase_version", return_value=None):
+                sdr.generate_fixup_scripts(
+                    {"user": "u", "password": "p", "dsn": "d"},
+                    {"executable": "obclient", "host": "h", "port": "1", "user_string": "u", "password": "p"},
+                    settings,
+                    tv_results,
+                    extra_results,
+                    master_list,
+                    oracle_meta,
+                    full_mapping,
+                    {},
+                    grant_plan=None,
+                    enable_grant_generation=False,
+                    dependency_report={"missing": [], "unexpected": [], "skipped": []},
+                    ob_meta=ob_meta,
+                    expected_dependency_pairs=set(),
+                    synonym_metadata={},
+                    trigger_filter_entries=None,
+                    trigger_filter_enabled=False,
+                    package_results=None,
+                    report_dir=None,
+                    report_timestamp=None,
+                    fixup_skip_summary=fixup_skip_summary,
+                    support_state_map={},
+                    unsupported_table_keys=set(),
+                    view_compat_map={}
+                )
+            self.assertFalse((Path(tmp_dir) / "synonym" / "PUBLIC.S1.sql").exists())
+            self.assertEqual(fixup_skip_summary.get("SYNONYM", {}).get("missing_total"), 1)
+            self.assertEqual(fixup_skip_summary.get("SYNONYM", {}).get("task_total"), 1)
+            self.assertEqual(fixup_skip_summary.get("SYNONYM", {}).get("generated"), 0)
+            self.assertEqual(fixup_skip_summary.get("SYNONYM", {}).get("skipped", {}).get("ddl_missing"), 1)
 
     def test_generate_fixup_skips_extra_when_parent_table_missing(self):
         tv_results = {
@@ -7165,6 +7456,33 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             sdr.obclient_query_by_owner_chunks_best_effort = orig_best_effort
             sdr.obclient_query_by_owner_chunks = orig_query
             sdr.ob_has_dba_column = orig_has_col
+
+    def test_obclient_query_by_owner_chunks_best_effort_preserves_partial_success(self):
+        def fake_run(_cfg, sql, **_kwargs):
+            sql_u = " ".join(str(sql).upper().split())
+            if "OWNER IN ('A','B')" in sql_u:
+                return False, "", "chunk_failed"
+            if "OWNER IN ('A')" in sql_u:
+                return True, "A\tROW1", ""
+            if "OWNER IN ('B')" in sql_u:
+                return False, "", "owner_b_failed"
+            return False, "", "unexpected_sql"
+
+        orig_run = sdr.obclient_run_sql
+        try:
+            sdr.obclient_run_sql = fake_run
+            ok, lines, err = sdr.obclient_query_by_owner_chunks_best_effort(
+                {"executable": "/bin/obclient"},
+                [("basic", "SELECT * FROM T WHERE OWNER IN ({owners_in})")],
+                ["A", "B"],
+                chunk_size=2,
+            )
+        finally:
+            sdr.obclient_run_sql = orig_run
+
+        self.assertTrue(ok)
+        self.assertEqual(lines, [("basic", "A\tROW1")])
+        self.assertIn("OWNERS=B", err.upper())
 
     def test_dump_ob_metadata_merges_dba_tab_columns_and_tab_cols(self):
         def fake_run(_cfg, sql, **_kwargs):
@@ -10741,6 +11059,29 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn("X.T1", rewritten.upper())
         self.assertIn("Y.T2", rewritten.upper())
 
+    def test_should_skip_system_notnull_from_constraint_compare_only_when_enabled(self):
+        self.assertTrue(
+            sdr.should_skip_system_notnull_from_constraint_compare(
+                "SYS_C1",
+                '"C1" IS NOT NULL',
+                "ENABLED",
+            )
+        )
+        self.assertFalse(
+            sdr.should_skip_system_notnull_from_constraint_compare(
+                "SYS_C1",
+                '"C1" IS NOT NULL',
+                "DISABLED",
+            )
+        )
+        self.assertFalse(
+            sdr.should_skip_system_notnull_from_constraint_compare(
+                "SYS_C1",
+                '"C1" IS NOT NULL',
+                None,
+            )
+        )
+
     def test_remap_view_dependencies_rewrites_quoted_qualified(self):
         ddl = (
             'CREATE OR REPLACE VIEW A.V AS\n'
@@ -10754,6 +11095,22 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         rewritten = sdr.remap_view_dependencies(ddl, "A", "V", {}, full_mapping)
         self.assertIn('"X"."T1"', rewritten.upper())
         self.assertIn('"Y"."T2"', rewritten.upper())
+
+    def test_remap_view_dependencies_does_not_double_rewrite_qualified_targets(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW A.V AS\n"
+            "SELECT * FROM A.X a\n"
+            "JOIN B.X b ON a.ID=b.ID\n"
+        )
+        full_mapping = {
+            "A.X": {"TABLE": "B.X"},
+            "B.X": {"TABLE": "C.X"},
+        }
+        rewritten = sdr.remap_view_dependencies(ddl, "A", "V", {}, full_mapping)
+        upper = rewritten.upper()
+        self.assertIn("FROM B.X A", upper)
+        self.assertIn("JOIN C.X B", upper)
+        self.assertNotIn("FROM C.X A", upper)
 
     def test_remap_view_dependencies_resolves_public_synonym(self):
         ddl = (
@@ -13612,6 +13969,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
                     "type": "C",
                     "columns": ["C1"],
                     "search_condition": "C1 IS NOT NULL",
+                    "status": "ENABLED",
                 },
             }
         }
@@ -15527,6 +15885,197 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertNotIn(("SRC", "T2"), filtered)
         self.assertNotIn(("SRC", "T3"), filtered)
 
+    def test_build_blacklist_rehydration_state_rehydrates_existing_spe_table(self):
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("SRC", "T1"): {
+                "RID_COL": {"data_type": "ROWID"},
+                "BIZ_ID": {"data_type": "NUMBER"},
+            }
+        })._replace(blacklist_tables={
+            ("SRC", "T1"): {
+                ("SPE", "ROWID"): sdr.BlacklistEntry("SPE", "ROWID", "RULE=UNSUPPORTED_TYPES"),
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"TGT.T1"}},
+            {("TGT", "T1"): {"RID_COL": {"data_type": "VARCHAR2"}, "BIZ_ID": {"data_type": "NUMBER"}}},
+        )
+        state = sdr.build_blacklist_rehydration_state(
+            oracle_meta.blacklist_tables,
+            {("SRC", "T1"): ("TGT", "T1")},
+            oracle_meta,
+            ob_meta,
+            "rehydrate_if_present",
+        )
+        self.assertEqual(state.effective_blacklist_tables, {})
+        self.assertIn(("SRC", "T1"), state.rehydrated_table_keys)
+        self.assertEqual(state.transformed_columns_by_table[("SRC", "T1")], {"RID_COL"})
+        self.assertIn(("SRC", "T1"), state.manual_trigger_table_keys)
+
+    def test_build_blacklist_rehydration_state_keeps_temporary_table_blocked(self):
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("SRC", "T1"): {
+                "RID_COL": {"data_type": "ROWID"},
+            }
+        })._replace(blacklist_tables={
+            ("SRC", "T1"): {
+                ("TEMPORARY_TABLE", "TEMPORARY"): sdr.BlacklistEntry("TEMPORARY_TABLE", "TEMPORARY", "RULE=TEMP"),
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"TGT.T1"}},
+            {("TGT", "T1"): {"RID_COL": {"data_type": "VARCHAR2"}}},
+        )
+        state = sdr.build_blacklist_rehydration_state(
+            oracle_meta.blacklist_tables,
+            {("SRC", "T1"): ("TGT", "T1")},
+            oracle_meta,
+            ob_meta,
+            "rehydrate_if_present",
+        )
+        self.assertIn(("SRC", "T1"), state.effective_blacklist_tables)
+        self.assertNotIn(("SRC", "T1"), state.rehydrated_table_keys)
+
+    def test_check_primary_objects_ignores_transformed_blacklist_columns(self):
+        master_list = [("SRC.T1", "TGT.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("SRC", "T1"): {
+                "RID_COL": {
+                    "data_type": "ROWID",
+                    "data_length": None,
+                    "char_length": None,
+                    "char_used": None,
+                    "data_precision": None,
+                    "data_scale": None,
+                    "nullable": "Y",
+                    "data_default": None,
+                    "hidden": False,
+                    "virtual": False,
+                    "virtual_expr": None,
+                },
+                "BIZ_ID": {
+                    "data_type": "NUMBER",
+                    "data_length": None,
+                    "char_length": None,
+                    "char_used": None,
+                    "data_precision": 10,
+                    "data_scale": 0,
+                    "nullable": "Y",
+                    "data_default": None,
+                    "hidden": False,
+                    "virtual": False,
+                    "virtual_expr": None,
+                },
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"TGT.T1"}},
+            {
+                ("TGT", "T1"): {
+                    "RID_COL": {
+                        "data_type": "VARCHAR2",
+                        "data_length": 64,
+                        "char_length": 64,
+                        "char_used": "B",
+                        "data_precision": None,
+                        "data_scale": None,
+                        "nullable": "Y",
+                        "data_default": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                    },
+                    "BIZ_ID": {
+                        "data_type": "NUMBER",
+                        "data_length": None,
+                        "char_length": None,
+                        "char_used": None,
+                        "data_precision": 10,
+                        "data_scale": 0,
+                        "nullable": "Y",
+                        "data_default": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                    },
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+            transformed_blacklist_columns_by_table={("SRC", "T1"): {"RID_COL"}},
+        )
+        self.assertEqual(results["mismatched"], [])
+
+    def test_classify_unsupported_indexes_marks_transformed_blacklist_dependency(self):
+        extra_results = {
+            "index_ok": [],
+            "index_mismatched": [
+                sdr.IndexMismatch(
+                    table="TGT.T1",
+                    missing_indexes={"IDX_RID"},
+                    extra_indexes=set(),
+                    detail_mismatch=["索引列 ['RID_COL'] 在目标端未找到。"],
+                )
+            ],
+        }
+        oracle_meta = self._make_oracle_meta(
+            indexes={
+                ("SRC", "T1"): {
+                    "IDX_RID": {"columns": ["RID_COL"], "expressions": {}, "uniqueness": "NONUNIQUE"}
+                }
+            }
+        )
+        rows = sdr.classify_unsupported_indexes(
+            extra_results,
+            oracle_meta,
+            {("SRC", "T1"): ("TGT", "T1")},
+            transformed_blacklist_columns_by_table={("SRC", "T1"): {"RID_COL"}},
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].reason_code, sdr.BLACKLIST_REHYDRATION_REASON_CODE)
+        self.assertEqual(extra_results["index_mismatched"], [])
+
+    def test_classify_unsupported_constraints_marks_transformed_blacklist_dependency(self):
+        extra_results = {
+            "constraint_ok": [],
+            "constraint_mismatched": [
+                sdr.ConstraintMismatch(
+                    table="TGT.T1",
+                    missing_constraints={"CK_RID"},
+                    extra_constraints=set(),
+                    detail_mismatch=["CHECK: 源约束 CK_RID (条件 \"RID_COL\" IS NOT NULL) 在目标端未找到。"],
+                    downgraded_pk_constraints=set(),
+                )
+            ],
+        }
+        oracle_meta = self._make_oracle_meta(
+            constraints={
+                ("SRC", "T1"): {
+                    "CK_RID": {
+                        "type": "C",
+                        "columns": ["RID_COL"],
+                        "search_condition": '"RID_COL" IS NOT NULL',
+                        "status": "ENABLED",
+                        "validated": "VALIDATED",
+                    }
+                }
+            }
+        )
+        rows = sdr.classify_unsupported_check_constraints(
+            extra_results,
+            oracle_meta,
+            {("SRC", "T1"): ("TGT", "T1")},
+            transformed_blacklist_columns_by_table={("SRC", "T1"): {"RID_COL"}},
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].reason_code, sdr.BLACKLIST_REHYDRATION_REASON_CODE)
+        self.assertEqual(extra_results["constraint_mismatched"], [])
+
     def test_add_blacklist_entry_merges_sources(self):
         blacklist = {}
         sdr.add_blacklist_entry(blacklist, "A", "T1", "SPE", "XMLTYPE", "TABLE")
@@ -16605,6 +17154,32 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertTrue(all(row.detail == "POST_CREATE_NOT_VALIDATED" for row in rows))
         self.assertTrue(all("ENABLE NOVALIDATE CONSTRAINT" in row.action_sql for row in rows))
+
+    def test_collect_missing_table_constraint_status_rows_honors_enabled_only_mode(self):
+        oracle_meta = self._make_oracle_meta(constraints={
+            ("LIFEDATA", "EM_PREM_TBL"): {
+                "FK_EM_PREM_PARENT": {
+                    "type": "R",
+                    "columns": ["PID"],
+                    "ref_table_owner": "LIFEDATA",
+                    "ref_table_name": "PARENT_TBL",
+                    "status": "ENABLED",
+                    "validated": "NOT VALIDATED",
+                },
+                "CK_EM_PREM_AMT": {
+                    "type": "C",
+                    "search_condition": "AMT > 0",
+                    "status": "ENABLED",
+                    "validated": "NOT VALIDATED",
+                },
+            }
+        })
+        rows = sdr.collect_missing_table_constraint_status_rows(
+            oracle_meta,
+            [("LIFEDATA", "EM_PREM_TBL", "BASEDATA", "EM_PREM_TBL")],
+            sync_mode="enabled_only",
+        )
+        self.assertEqual(rows, [])
 
     def test_collect_constraint_status_drift_rows_fk_same_name_generates_validate(self):
         oracle_meta = self._make_oracle_meta(constraints={

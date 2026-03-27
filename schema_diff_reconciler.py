@@ -802,6 +802,25 @@ class BlacklistReportRow(NamedTuple):
     detail: str
 
 
+class BlacklistRehydratedDetailRow(NamedTuple):
+    src_full: str
+    tgt_full: str
+    blacklist_types: str
+    target_exists: str
+    target_object_type: str
+    rehydration_state: str
+    transformed_columns: str
+    detail: str
+
+
+class BlacklistRehydrationState(NamedTuple):
+    effective_blacklist_tables: BlacklistTableMap
+    rehydrated_table_keys: Set[Tuple[str, str]]
+    transformed_columns_by_table: Dict[Tuple[str, str], Set[str]]
+    manual_trigger_table_keys: Set[Tuple[str, str]]
+    detail_rows: List[BlacklistRehydratedDetailRow]
+
+
 class ObjectSupportReportRow(NamedTuple):
     obj_type: str
     src_full: str
@@ -1498,6 +1517,20 @@ TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON_CODE = "TRIGGER_ON_TEMP_TABLE_UNSUPPORTED"
 TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON = "OB 不支持在临时表上创建 DML 触发器（实测 ORA-00600/-4007）"
 BLACKLIST_MODES: Set[str] = {"auto", "table_only", "rules_only", "disabled"}
 DEFAULT_BLACKLIST_RULES_PATH = str(Path(__file__).resolve().parent / "blacklist_rules.json")
+BLACKLIST_TARGET_EXISTING_POLICY_VALUES: Set[str] = {"keep_blocked", "rehydrate_if_present"}
+BLACKLIST_TARGET_EXISTING_POLICY_ALIASES = {
+    "keep": "keep_blocked",
+    "blocked": "keep_blocked",
+    "rehydrate": "rehydrate_if_present",
+    "present": "rehydrate_if_present",
+    "if_present": "rehydrate_if_present",
+}
+REHYDRATABLE_BLACKLIST_TYPES: Set[str] = {"SPE", "DIY"}
+BLACKLIST_REHYDRATED_STATUS = "BLACKLIST_REHYDRATED_TARGET_EXISTS"
+BLACKLIST_REHYDRATION_REASON_CODE = "BLACKLIST_TRANSFORM_DEPENDENCY"
+BLACKLIST_REHYDRATION_REASON = "依赖黑名单改造列，需人工处理"
+BLACKLIST_REHYDRATED_TRIGGER_REASON_CODE = "BLACKLIST_REHYDRATED_TRIGGER_MANUAL"
+BLACKLIST_REHYDRATED_TRIGGER_REASON = "重纳管黑名单表上的触发器默认改为人工处理"
 
 SUPPORT_STATE_SUPPORTED = "SUPPORTED"
 SUPPORT_STATE_UNSUPPORTED = "UNSUPPORTED"
@@ -2086,6 +2119,18 @@ def normalize_blacklist_mode(value: Optional[str]) -> str:
     return mode
 
 
+def normalize_blacklist_target_existing_policy(value: Optional[str]) -> str:
+    policy = (value or "rehydrate_if_present").strip().lower()
+    policy = BLACKLIST_TARGET_EXISTING_POLICY_ALIASES.get(policy, policy)
+    if policy not in BLACKLIST_TARGET_EXISTING_POLICY_VALUES:
+        log.warning(
+            "blacklist_target_existing_policy=%s 不在支持范围内，将回退为 rehydrate_if_present。",
+            value,
+        )
+        return "rehydrate_if_present"
+    return policy
+
+
 def merge_blacklist_sources(existing: str, incoming: str) -> str:
     parts: List[str] = []
     for raw in (existing, incoming):
@@ -2239,6 +2284,13 @@ def collect_blacklist_types(entries: Optional[Dict[Tuple[str, str], BlacklistEnt
     return types
 
 
+def is_rehydratable_blacklist(entries: Optional[Dict[Tuple[str, str], BlacklistEntry]]) -> bool:
+    blacklist_types = collect_blacklist_types(entries)
+    if not blacklist_types:
+        return False
+    return blacklist_types.issubset(REHYDRATABLE_BLACKLIST_TYPES)
+
+
 def is_non_blocking_blacklist(entries: Optional[Dict[Tuple[str, str], BlacklistEntry]]) -> bool:
     """
     黑名单是否属于“仅风险提示，不阻断依赖”的类别。
@@ -2247,6 +2299,30 @@ def is_non_blocking_blacklist(entries: Optional[Dict[Tuple[str, str], BlacklistE
     if not blacklist_types:
         return False
     return blacklist_types.issubset({"LONG", "LOB_OVERSIZE"})
+
+
+def collect_blacklist_transform_column_names(
+    entries: Optional[Dict[Tuple[str, str], BlacklistEntry]],
+    source_column_meta: Optional[Dict[str, Dict]]
+) -> Set[str]:
+    if not entries or not source_column_meta or not is_rehydratable_blacklist(entries):
+        return set()
+    blocked_types: Set[str] = set()
+    for (_black_type, data_type), entry in entries.items():
+        bt = normalize_black_type(_black_type) or normalize_black_type(getattr(entry, "black_type", ""))
+        dt = normalize_black_data_type(data_type) or normalize_black_data_type(getattr(entry, "data_type", ""))
+        if bt in REHYDRATABLE_BLACKLIST_TYPES and dt:
+            blocked_types.add(dt)
+    if not blocked_types:
+        return set()
+    transformed_cols: Set[str] = set()
+    for col_name, meta in (source_column_meta or {}).items():
+        dtype = normalize_black_data_type((meta or {}).get("data_type"))
+        if dtype and dtype in blocked_types:
+            col_u = normalize_identifier_name(col_name)
+            if col_u:
+                transformed_cols.add(col_u)
+    return transformed_cols
 
 
 def has_lob_oversize_blacklist(entries: Optional[Dict[Tuple[str, str], BlacklistEntry]]) -> bool:
@@ -2656,7 +2732,7 @@ def should_skip_system_notnull_from_constraint_compare(
     """
     if not is_system_notnull_check(cons_name, search_condition):
         return False
-    return normalize_constraint_enabled_status(status) != "DISABLED"
+    return normalize_constraint_enabled_status(status) == "ENABLED"
 
 
 def build_system_notnull_novalidate_column_map(constraints: Optional[Dict[str, Dict]]) -> Dict[str, Dict[str, str]]:
@@ -4229,6 +4305,15 @@ def normalize_source_object_scope_mode(raw_value: Optional[str]) -> str:
     return value
 
 
+def should_load_constraint_metadata(
+    enabled_primary_types: Optional[Set[str]],
+    enabled_extra_types: Optional[Set[str]]
+) -> bool:
+    primary_types = {str(t).upper() for t in (enabled_primary_types or set()) if str(t).strip()}
+    extra_types = {str(t).upper() for t in (enabled_extra_types or set()) if str(t).strip()}
+    return "TABLE" in primary_types or "CONSTRAINT" in extra_types
+
+
 REPORT_DETAIL_MODE_VALUES = {"full", "split", "summary"}
 REPORT_DETAIL_MODE_ALIASES = {
     "detail": "full",
@@ -5695,6 +5780,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('interval_partition_cutoff', '20280301')
         settings.setdefault('interval_partition_cutoff_numeric', '')
         settings.setdefault('blacklist_mode', 'auto')
+        settings.setdefault('blacklist_target_existing_policy', 'rehydrate_if_present')
         settings.setdefault('blacklist_rules_path', '')
         settings.setdefault('blacklist_rules_enable', '')
         settings.setdefault('blacklist_rules_disable', '')
@@ -5902,6 +5988,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         )
         # interval 相关校验在主流程应用版本门控后再做，避免 auto 模式误报。
         settings['blacklist_mode'] = normalize_blacklist_mode(settings.get('blacklist_mode', 'auto'))
+        settings['blacklist_target_existing_policy'] = normalize_blacklist_target_existing_policy(
+            settings.get('blacklist_target_existing_policy', 'rehydrate_if_present')
+        )
         settings['blacklist_rules_enable_set'] = parse_csv_set(settings.get('blacklist_rules_enable', ''))
         settings['blacklist_rules_disable_set'] = parse_csv_set(settings.get('blacklist_rules_disable', ''))
         rules_path = (settings.get('blacklist_rules_path') or "").strip()
@@ -6479,6 +6568,14 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "仅支持 auto/table_only/rules_only/disabled"
 
+    def _validate_blacklist_target_existing_policy(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = BLACKLIST_TARGET_EXISTING_POLICY_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in BLACKLIST_TARGET_EXISTING_POLICY_VALUES:
+            return True, ""
+        return False, "仅支持 keep_blocked/rehydrate_if_present"
+
     def _validate_fixup_idempotent_mode(val: str) -> Tuple[bool, str]:
         if not val.strip():
             return True, ""
@@ -6931,6 +7028,14 @@ def run_config_wizard(config_path: Path) -> None:
         default=cfg.get("SETTINGS", "blacklist_mode", fallback="auto"),
         validator=_validate_blacklist_mode,
         transform=normalize_blacklist_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "blacklist_target_existing_policy",
+        "黑名单表目标已存在策略 (keep_blocked/rehydrate_if_present)",
+        default=cfg.get("SETTINGS", "blacklist_target_existing_policy", fallback="rehydrate_if_present"),
+        validator=_validate_blacklist_target_existing_policy,
+        transform=normalize_blacklist_target_existing_policy,
     )
     _prompt_field(
         "SETTINGS",
@@ -8459,6 +8564,7 @@ def collect_constraint_status_drift_rows(
 def collect_missing_table_constraint_status_rows(
     oracle_meta: OracleMetadata,
     missing_tables: List[Tuple[str, str, str, str]],
+    sync_mode: str = "full",
     name_collision_planned_map: Optional[Dict[Tuple[str, str, str, str], str]] = None,
     unsupported_table_keys: Optional[Set[Tuple[str, str]]] = None,
 ) -> List[MissingTableConstraintStatusRow]:
@@ -8466,6 +8572,7 @@ def collect_missing_table_constraint_status_rows(
     seen_rows: Set[Tuple[str, str, str]] = set()
     unsupported_keys = {(s.upper(), t.upper()) for s, t in (unsupported_table_keys or set())}
     collision_map = name_collision_planned_map or {}
+    sync_mode_u = normalize_constraint_status_sync_mode(sync_mode)
 
     for src_schema, src_table, tgt_schema, tgt_table in (missing_tables or []):
         src_schema_u = (src_schema or "").upper()
@@ -8506,7 +8613,7 @@ def collect_missing_table_constraint_status_rows(
                 "ENABLED",
                 src_validated_n,
                 "VALIDATED",
-                "full"
+                sync_mode_u
             )
             if not action_sql:
                 continue
@@ -8999,6 +9106,7 @@ def classify_missing_objects(
     remap_rules: Optional[RemapRules] = None,
     view_dependency_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
     ob_version: Optional[str] = None,
+    manual_trigger_table_keys: Optional[Set[Tuple[str, str]]] = None,
 ) -> SupportClassificationResult:
     """
     对缺失对象进行支持性分类，并输出支持/不支持/被阻断的统计与明细。
@@ -9163,6 +9271,10 @@ def classify_missing_objects(
     source_temporary_table_keys: Set[Tuple[str, str]] = {
         (str(owner).upper(), str(table).upper())
         for owner, table in (getattr(oracle_meta, "temporary_tables", set()) or set())
+    }
+    manual_trigger_blacklist_keys: Set[Tuple[str, str]] = {
+        (str(owner).upper(), str(table).upper())
+        for owner, table in (manual_trigger_table_keys or set())
     }
     target_temporary_table_fulls: Set[str] = {
         f"{str(owner).upper()}.{str(table).upper()}"
@@ -9473,25 +9585,47 @@ def classify_missing_objects(
         if (
             obj_type.upper() == "TRIGGER"
             and (
+                src_key in manual_trigger_blacklist_keys
+                or (
+                    src_key in source_temporary_table_keys
+                    or table_full_u in target_temporary_table_fulls
+                    or table_black_type in TEMP_TABLE_BLACKLIST_TYPES
+                    or is_temp_table_blacklist_reason_code(table_reason_code)
+                )
+            )
+        ):
+            if src_key in manual_trigger_blacklist_keys:
+                return ObjectSupportReportRow(
+                    obj_type=obj_type,
+                    src_full=src_full,
+                    tgt_full=tgt_full,
+                    support_state=SUPPORT_STATE_UNSUPPORTED,
+                    reason_code=BLACKLIST_REHYDRATED_TRIGGER_REASON_CODE,
+                    reason=BLACKLIST_REHYDRATED_TRIGGER_REASON,
+                    dependency=table_full_u,
+                    action="人工处理",
+                    detail="TRIGGER",
+                    root_cause=f"{src_schema.upper()}.{src_table.upper()}(BLACKLIST_REHYDRATED_TARGET_EXISTS)"
+                )
+            if (
                 src_key in source_temporary_table_keys
                 or table_full_u in target_temporary_table_fulls
                 or table_black_type in TEMP_TABLE_BLACKLIST_TYPES
                 or is_temp_table_blacklist_reason_code(table_reason_code)
-            )
-        ):
-            root_cause = _root_cause_label((f"{src_schema.upper()}.{src_table.upper()}", "TABLE"))
-            return ObjectSupportReportRow(
-                obj_type=obj_type,
-                src_full=src_full,
+            ):
+                root_cause = _root_cause_label((f"{src_schema.upper()}.{src_table.upper()}", "TABLE"))
+                return ObjectSupportReportRow(
+                    obj_type=obj_type,
+                    src_full=src_full,
                 tgt_full=tgt_full,
                 support_state=SUPPORT_STATE_UNSUPPORTED,
                 reason_code=TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON_CODE,
                 reason=TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON,
                 dependency=table_full_u,
                 action="改造/不迁移",
-                detail="TRIGGER",
-                root_cause=root_cause
-            )
+                    detail="TRIGGER",
+                    root_cause=root_cause
+                )
 
         if src_key in missing_target_table_keys:
             return ObjectSupportReportRow(
@@ -10713,7 +10847,7 @@ def resolve_synonym_scope_status(
         detail_parts.append(",".join(sorted(target_types)))
         return target_full, "in_scope", ";".join(part for part in detail_parts if part)
     if src_full in remap_rules:
-        return target_full, "out_of_scope", "synonym_explicit_remap_but_terminal_target_not_in_source_scope"
+        return target_full, "in_scope", "synonym_explicit_remap;terminal_target_not_in_source_scope"
     return target_full, "out_of_scope", "terminal_target_not_in_source_scope"
 
 
@@ -11900,7 +12034,8 @@ def filter_trigger_results_for_unsupported_tables(
     extra_results: ExtraCheckResults,
     unsupported_table_keys: Optional[Set[Tuple[str, str]]],
     table_target_map: Optional[Dict[Tuple[str, str], Tuple[str, str]]],
-    support_state_map: Optional[Dict[Tuple[str, str], ObjectSupportReportRow]] = None
+    support_state_map: Optional[Dict[Tuple[str, str], ObjectSupportReportRow]] = None,
+    manual_trigger_table_keys: Optional[Set[Tuple[str, str]]] = None,
 ) -> ExtraCheckResults:
     """
     将“已阻断表”相关的扩展差异从结果中剔除，避免统计口径与 fixup 漂移。
@@ -11914,6 +12049,9 @@ def filter_trigger_results_for_unsupported_tables(
     blocked_keys: Set[Tuple[str, str]] = {
         (s.upper(), t.upper()) for s, t in (unsupported_table_keys or set())
     }
+    blocked_keys.update({
+        (s.upper(), t.upper()) for s, t in (manual_trigger_table_keys or set())
+    })
     if support_state_map:
         for (obj_type, src_full), _row in support_state_map.items():
             if (obj_type or "").upper() != "TABLE":
@@ -12314,7 +12452,8 @@ def normalize_extra_results_names(extra_results: ExtraCheckResults) -> ExtraChec
 def classify_unsupported_check_constraints(
     extra_results: ExtraCheckResults,
     oracle_meta: OracleMetadata,
-    table_target_map: Optional[Dict[Tuple[str, str], Tuple[str, str]]]
+    table_target_map: Optional[Dict[Tuple[str, str], Tuple[str, str]]],
+    transformed_blacklist_columns_by_table: Optional[Dict[Tuple[str, str], Set[str]]] = None,
 ) -> List[ConstraintUnsupportedDetail]:
     """
     标记 Oracle->OB 不支持的约束（含 DEFERRABLE），并从缺失列表中移除。
@@ -12359,12 +12498,33 @@ def classify_unsupported_check_constraints(
             continue
         src_schema, src_table = src_pair
         cons_map = oracle_meta.constraints.get((src_schema, src_table), {})
+        transformed_cols = {
+            normalize_identifier_name(col)
+            for col in ((transformed_blacklist_columns_by_table or {}).get((src_schema, src_table), set()) or set())
+            if normalize_identifier_name(col)
+        }
         unsupported_names: Set[str] = set()
         for cons_name in item.missing_constraints:
             cons_meta = cons_map.get(cons_name.upper()) or cons_map.get(cons_name)
             if not cons_meta:
                 continue
             ctype = (cons_meta.get("type") or "").upper()
+            cons_cols = {
+                normalize_identifier_name(col)
+                for col in (cons_meta.get("columns") or [])
+                if normalize_identifier_name(col)
+            }
+            if transformed_cols and cons_cols & transformed_cols:
+                unsupported_names.add(cons_name)
+                unsupported_rows.append(ConstraintUnsupportedDetail(
+                    table_full=f"{src_schema}.{src_table}",
+                    constraint_name=cons_name.upper(),
+                    search_condition=str(cons_meta.get("search_condition") or "-") if ctype == "C" else "-",
+                    reason_code=BLACKLIST_REHYDRATION_REASON_CODE,
+                    reason=BLACKLIST_REHYDRATION_REASON,
+                    ob_error_hint="-"
+                ))
+                continue
             if ctype == "C" and should_skip_system_notnull_from_constraint_compare(
                 cons_name,
                 cons_meta.get("search_condition"),
@@ -12421,7 +12581,8 @@ def classify_unsupported_check_constraints(
 def classify_unsupported_indexes(
     extra_results: ExtraCheckResults,
     oracle_meta: OracleMetadata,
-    table_target_map: Optional[Dict[Tuple[str, str], Tuple[str, str]]]
+    table_target_map: Optional[Dict[Tuple[str, str], Tuple[str, str]]],
+    transformed_blacklist_columns_by_table: Optional[Dict[Tuple[str, str], Set[str]]] = None,
 ) -> List[IndexUnsupportedDetail]:
     """
     标记 Oracle->OB 不支持的索引（如 DESC），并从缺失列表中移除。
@@ -12470,18 +12631,35 @@ def classify_unsupported_indexes(
             continue
         src_schema, src_table = src_pair
         idx_map = oracle_meta.indexes.get((src_schema, src_table), {}) or {}
+        transformed_cols = {
+            normalize_identifier_name(col)
+            for col in ((transformed_blacklist_columns_by_table or {}).get((src_schema, src_table), set()) or set())
+            if normalize_identifier_name(col)
+        }
         unsupported_names: Set[str] = set()
         unsupported_cols: Set[Tuple[str, ...]] = set()
         for idx_name in item.missing_indexes:
             idx_meta = idx_map.get(idx_name.upper()) or idx_map.get(idx_name)
             if not idx_meta:
                 continue
-            if not index_has_desc(idx_meta):
-                continue
             cols = normalize_index_columns(
                 idx_meta.get("columns") or [],
                 idx_meta.get("expressions") or {}
             )
+            if transformed_cols and transformed_cols.intersection({normalize_identifier_name(col) for col in cols if normalize_identifier_name(col)}):
+                unsupported_names.add(idx_name)
+                unsupported_cols.add(cols)
+                unsupported_rows.append(IndexUnsupportedDetail(
+                    table_full=f"{src_schema}.{src_table}",
+                    index_name=idx_name.upper(),
+                    columns=",".join(cols) if cols else "-",
+                    reason_code=BLACKLIST_REHYDRATION_REASON_CODE,
+                    reason=BLACKLIST_REHYDRATION_REASON,
+                    ob_error_hint="-"
+                ))
+                continue
+            if not index_has_desc(idx_meta):
+                continue
             unsupported_names.add(idx_name)
             unsupported_cols.add(cols)
             unsupported_rows.append(IndexUnsupportedDetail(
@@ -13419,11 +13597,14 @@ def obclient_query_by_owner_chunks_best_effort(
     def _quote_owner(value: str) -> str:
         return "'" + str(value).replace("'", "''") + "'"
 
-    def _run_chunk(chunk_owners: List[str], mode_idx: int = 0) -> Tuple[bool, List[Tuple[str, str]], str]:
+    def _run_chunk(
+        chunk_owners: List[str],
+        mode_idx: int = 0
+    ) -> Tuple[bool, List[Tuple[str, str]], List[str], str]:
         if not chunk_owners:
-            return True, [], ""
+            return True, [], [], ""
         if mode_idx >= len(modes):
-            return False, [], "all modes failed"
+            return False, [], list(chunk_owners), "all modes failed"
 
         mode_name, sql_tpl = modes[mode_idx]
         owners_in = ",".join(_quote_owner(s) for s in chunk_owners)
@@ -13433,24 +13614,46 @@ def obclient_query_by_owner_chunks_best_effort(
             tagged_lines: List[Tuple[str, str]] = []
             if out:
                 tagged_lines.extend((mode_name, line) for line in out.splitlines())
-            return True, tagged_lines, ""
+            return True, tagged_lines, [], ""
 
         if len(chunk_owners) > 1:
             mid = len(chunk_owners) // 2
-            ok_left, left_lines, left_err = _run_chunk(chunk_owners[:mid], mode_idx)
-            ok_right, right_lines, right_err = _run_chunk(chunk_owners[mid:], mode_idx)
+            ok_left, left_lines, left_failed, left_err = _run_chunk(chunk_owners[:mid], mode_idx)
+            ok_right, right_lines, right_failed, right_err = _run_chunk(chunk_owners[mid:], mode_idx)
             if ok_left and ok_right:
-                return True, left_lines + right_lines, ""
-            return False, [], left_err or right_err or err
+                return True, left_lines + right_lines, [], ""
+            merged_lines = left_lines + right_lines
+            failed_owners = left_failed + right_failed
+            merged_err = left_err or right_err or err
+            if merged_lines:
+                return True, merged_lines, failed_owners, merged_err
+            return False, [], failed_owners, merged_err
 
         return _run_chunk(chunk_owners, mode_idx + 1)
 
     tagged_lines: List[Tuple[str, str]] = []
+    failed_owners: List[str] = []
+    error_messages: List[str] = []
     for chunk in chunk_list(owners, chunk_size):
-        ok, chunk_lines, err = _run_chunk(list(chunk), 0)
+        ok, chunk_lines, chunk_failed, err = _run_chunk(list(chunk), 0)
         if not ok:
             return False, [], err
         tagged_lines.extend(chunk_lines)
+        failed_owners.extend(chunk_failed)
+        if err:
+            error_messages.append(err)
+    if failed_owners:
+        failed_sorted = sorted(dict.fromkeys(owner.upper() for owner in failed_owners if owner))
+        log.warning(
+            "[OB] 按 owner best-effort 查询存在部分失败，已保留成功结果；失败 owners=%s",
+            ",".join(failed_sorted),
+        )
+        detail_parts: List[str] = []
+        if failed_sorted:
+            detail_parts.append("owners=" + ",".join(failed_sorted))
+        if error_messages:
+            detail_parts.append("errors=" + "; ".join(dict.fromkeys(msg for msg in error_messages if msg)))
+        return True, tagged_lines, "; ".join(detail_parts)
     return True, tagged_lines, ""
 
 
@@ -20982,6 +21185,7 @@ def check_primary_objects(
     settings: Optional[Dict] = None,
     suppress_unmanaged_target_extras: bool = False,
     managed_target_objects: Optional[Set[str]] = None,
+    transformed_blacklist_columns_by_table: Optional[Dict[Tuple[str, str], Set[str]]] = None,
 ) -> ReportResults:
     """
     核心主对象校验：
@@ -21146,6 +21350,13 @@ def check_primary_objects(
             )
             hidden_src_cols = {col for col, meta in src_cols_details.items() if meta.get("hidden")}
             invisible_src_cols = {col for col, meta in src_cols_details.items() if meta.get("invisible") is True}
+            transformed_blacklist_cols = {
+                normalize_identifier_name(col)
+                for col in (
+                    (transformed_blacklist_columns_by_table or {}).get((src_schema_u, src_obj_u), set())
+                )
+                if normalize_identifier_name(col)
+            }
             if visibility_policy == "auto" and not visibility_enabled:
                 results["visibility_skipped"].append(
                     ColumnVisibilitySkippedRow(
@@ -21161,10 +21372,12 @@ def check_primary_objects(
             src_col_names = {
                 col for col, meta in src_cols_details.items()
                 if not is_ignored_source_column(col, meta)
+                and normalize_identifier_name(col) not in transformed_blacklist_cols
             }
             tgt_col_names = {
                 col for col, meta in tgt_cols_details.items()
                 if not is_ignored_oms_column(col, meta) and col not in hidden_src_cols
+                and normalize_identifier_name(col) not in transformed_blacklist_cols
             }
 
             missing_in_tgt = src_col_names - tgt_col_names
@@ -21369,9 +21582,22 @@ def check_primary_objects(
                             )
                         )
 
+                source_novalidate_meta = src_notnull_novalidate_cols.get(col_name.upper())
+                target_has_notnull_check = col_name.upper() in tgt_enabled_notnull_cols
                 src_nullable = normalize_nullable_flag(src_info.get("nullable"))
                 tgt_nullable = normalize_nullable_flag(tgt_info.get("nullable"))
-                if src_nullable and tgt_nullable and src_nullable != tgt_nullable:
+                if source_novalidate_meta:
+                    if tgt_nullable == "Y" and not target_has_notnull_check:
+                        type_mismatches.append(
+                            ColumnTypeIssue(
+                                col_name,
+                                "NOT NULL ENABLE NOVALIDATE",
+                                "NULLABLE",
+                                "NOT NULL ENABLE NOVALIDATE",
+                                "nullability_novalidate_tighten"
+                            )
+                        )
+                elif src_nullable and tgt_nullable and src_nullable != tgt_nullable:
                     if src_nullable == "N":
                         type_mismatches.append(
                             ColumnTypeIssue(
@@ -21392,24 +21618,6 @@ def check_primary_objects(
                                 "nullability_relax"
                             )
                         )
-
-                source_novalidate_meta = src_notnull_novalidate_cols.get(col_name.upper())
-                target_has_notnull_check = col_name.upper() in tgt_enabled_notnull_cols
-                if (
-                    source_novalidate_meta
-                    and src_nullable != "N"
-                    and tgt_nullable == "Y"
-                    and not target_has_notnull_check
-                ):
-                    type_mismatches.append(
-                        ColumnTypeIssue(
-                            col_name,
-                            "NOT NULL ENABLE NOVALIDATE",
-                            "NULLABLE",
-                            "NOT NULL ENABLE NOVALIDATE",
-                            "nullability_novalidate_tighten"
-                        )
-                    )
 
                 if is_long_type(src_dtype):
                     expected_type = map_long_type_to_ob(src_dtype)
@@ -23467,7 +23675,8 @@ def check_extra_objects(
     ob_meta: ObMetadata,
     oracle_meta: OracleMetadata,
     full_object_mapping: FullObjectMapping,
-    enabled_extra_types: Optional[Set[str]] = None
+    enabled_extra_types: Optional[Set[str]] = None,
+    transformed_blacklist_columns_by_table: Optional[Dict[Tuple[str, str], Set[str]]] = None,
 ) -> ExtraCheckResults:
     """
     基于 master_list (TABLE 映射) 检查：
@@ -23746,14 +23955,16 @@ def check_extra_objects(
     index_unsupported = classify_unsupported_indexes(
         extra_results,
         oracle_meta,
-        build_table_target_map(master_list) if master_list else None
+        build_table_target_map(master_list) if master_list else None,
+        transformed_blacklist_columns_by_table=transformed_blacklist_columns_by_table,
     )
     extra_results["index_unsupported"] = index_unsupported
 
     constraint_unsupported = classify_unsupported_check_constraints(
         extra_results,
         oracle_meta,
-        build_table_target_map(master_list) if master_list else None
+        build_table_target_map(master_list) if master_list else None,
+        transformed_blacklist_columns_by_table=transformed_blacklist_columns_by_table,
     )
     extra_results["constraint_unsupported"] = constraint_unsupported
     return extra_results
@@ -23765,7 +23976,8 @@ def check_comments(
     master_list: MasterCheckList,
     oracle_meta: OracleMetadata,
     ob_meta: ObMetadata,
-    enable_comment_check: bool = True
+    enable_comment_check: bool = True,
+    transformed_blacklist_columns_by_table: Optional[Dict[Tuple[str, str], Set[str]]] = None,
 ) -> Dict[str, object]:
     results: Dict[str, object] = {
         "ok": [],
@@ -23804,6 +24016,13 @@ def check_comments(
 
         src_key = (src_schema.upper(), src_table.upper())
         tgt_key = (tgt_schema.upper(), tgt_table.upper())
+        transformed_blacklist_cols = {
+            normalize_identifier_name(col)
+            for col in (
+                (transformed_blacklist_columns_by_table or {}).get(src_key, set())
+            )
+            if normalize_identifier_name(col)
+        }
         ob_tables = ob_meta.objects_by_type.get("TABLE", set())
         if ob_tables:
             full_tgt = f"{tgt_key[0]}.{tgt_key[1]}"
@@ -23826,10 +24045,12 @@ def check_comments(
             if col not in tgt_col_cmts
             and col not in hidden_src_cols
             and not is_ignored_oms_column(col)
+            and normalize_identifier_name(col) not in transformed_blacklist_cols
         }
         extra_cols = {
             col for col in tgt_col_cmts.keys()
             if col not in src_col_cmts and not is_ignored_oms_column(col)
+            and normalize_identifier_name(col) not in transformed_blacklist_cols
         }
 
         # 额外验证：确保OMS列被完全过滤
@@ -23842,6 +24063,8 @@ def check_comments(
         column_diffs: List[Tuple[str, str, str]] = []
         for col in (src_col_cmts.keys() & tgt_col_cmts.keys()):
             if is_ignored_oms_column(col) or col in hidden_src_cols:
+                continue
+            if normalize_identifier_name(col) in transformed_blacklist_cols:
                 continue
             src_cmt = normalize_comment_text(src_col_cmts.get(col))
             tgt_cmt = normalize_comment_text(tgt_col_cmts.get(col))
@@ -28472,10 +28695,18 @@ def remap_view_dependencies(
     masker = SqlMasker(ddl)
     working_sql = masker.masked_sql
 
+    replacement_placeholders: Dict[str, str] = {}
+    replacement_seq = 0
     for src_ref in sorted(replacements_qualified.keys(), key=len, reverse=True):
         tgt_ref = replacements_qualified[src_ref]
         for pattern, replacement in _build_qualified_rewrite_specs(src_ref, tgt_ref):
-            working_sql = pattern.sub(replacement, working_sql)
+            placeholder = f"__CODX_VIEW_REMAP_{replacement_seq}__"
+            replacement_seq += 1
+            replacement_placeholders[placeholder] = replacement
+            working_sql = pattern.sub(placeholder, working_sql)
+
+    for placeholder, replacement in replacement_placeholders.items():
+        working_sql = working_sql.replace(placeholder, replacement)
 
     rewritten = masker.unmask(working_sql)
     if replacements_unqualified:
@@ -34525,6 +34756,15 @@ def generate_fixup_scripts(
                     schema, obj_name, obj_type, elapsed
                 )
                 return ddl, "META_SYN", elapsed
+            ddl, source_label = get_fallback_ddl(schema, obj_type, obj_name)
+            if not ddl:
+                source_label = "MISSING"
+            elapsed = time.time() - start_time
+            log.info(
+                "[DDL_FETCH] %s.%s (%s) 来源=%s 耗时=%.3fs",
+                schema, obj_name, obj_type, source_label, elapsed
+            )
+            return ddl, source_label, elapsed
 
         # VIEW 固定使用 DBMS_METADATA，忽略 dbcat 输出
         if obj_type.upper() == 'VIEW':
@@ -35124,7 +35364,6 @@ def generate_fixup_scripts(
         if obj_type_u == 'SYNONYM':
             src_schema_u = src_schema.upper()
             src_obj_u = src_obj.upper()
-            src_key = (src_schema_u, src_obj_u)
             src_full = f"{src_schema_u}.{src_obj_u}"
             support_row = support_state_map.get((obj_type_u, src_full))
             if support_row and (support_row.reason_code or "").upper() == SYNONYM_TARGET_OUT_OF_SCOPE_REASON_CODE:
@@ -35133,13 +35372,6 @@ def generate_fixup_scripts(
                     src_schema,
                     src_obj,
                     support_row.dependency or "-"
-                )
-                continue
-            syn_meta = synonym_meta_map.get(src_key)
-            if src_schema_u == 'PUBLIC' and not syn_meta and src_full not in remap_rules:
-                log.info(
-                    "[FIXUP] 跳过 PUBLIC 同义词 %s.%s（终点对象不在源端受管范围或元数据缺失）。",
-                    src_schema, src_obj
                 )
                 continue
         missing_total_by_type[obj_type_u] += 1
@@ -35453,6 +35685,7 @@ def generate_fixup_scripts(
     missing_table_constraint_status_rows = collect_missing_table_constraint_status_rows(
         oracle_meta,
         missing_tables,
+        sync_mode=constraint_status_sync_mode,
         name_collision_planned_map=name_collision_planned_map,
         unsupported_table_keys=unsupported_table_keys,
     )
@@ -38357,6 +38590,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "AUX", "VIEW 依赖链"
     if name == "blacklist_tables.txt":
         return "AUX", "黑名单表清单"
+    if name.startswith("blacklist_rehydrated_detail_"):
+        return "DETAIL", "黑名单表重纳管明细"
     if name == "trigger_status_report.txt":
         return "AUX", "触发器状态/清单报告"
     if name == "filtered_grants.txt":
@@ -40396,16 +40631,139 @@ def evaluate_long_conversion_status(
     return "VERIFIED", "已校验: LONG/LONG RAW 已转换为 CLOB/BLOB", True
 
 
+def build_blacklist_rehydration_state(
+    blacklist_tables: BlacklistTableMap,
+    table_target_map: Dict[Tuple[str, str], Tuple[str, str]],
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata,
+    policy: str,
+) -> BlacklistRehydrationState:
+    effective: BlacklistTableMap = {}
+    rehydrated_table_keys: Set[Tuple[str, str]] = set()
+    transformed_columns_by_table: Dict[Tuple[str, str], Set[str]] = {}
+    manual_trigger_table_keys: Set[Tuple[str, str]] = set()
+    detail_rows: List[BlacklistRehydratedDetailRow] = []
+
+    ob_objects_by_type = ob_meta.objects_by_type or {}
+
+    def _target_object_type(full_name: str) -> str:
+        full_u = (full_name or "").upper()
+        if not full_u:
+            return "-"
+        for obj_type, names in ob_objects_by_type.items():
+            if full_u in {str(name).upper() for name in (names or set())}:
+                return obj_type.upper()
+        return "-"
+
+    for (schema, table), entries in sorted((blacklist_tables or {}).items()):
+        schema_u = (schema or "").upper()
+        table_u = (table or "").upper()
+        src_key = (schema_u, table_u)
+        src_full = f"{schema_u}.{table_u}"
+        tgt_schema_u, tgt_table_u = table_target_map.get(src_key, src_key)
+        tgt_full = f"{tgt_schema_u.upper()}.{tgt_table_u.upper()}"
+        blacklist_types = collect_blacklist_types(entries)
+        blacklist_types_text = ",".join(sorted(blacklist_types)) if blacklist_types else "-"
+        target_object_type = _target_object_type(tgt_full)
+        target_exists = target_object_type == "TABLE"
+        transformed_cols = collect_blacklist_transform_column_names(
+            entries,
+            oracle_meta.table_columns.get(src_key, {}) or {},
+        )
+        transformed_cols_text = ",".join(sorted(transformed_cols)) if transformed_cols else "-"
+
+        rehydrated = (
+            normalize_blacklist_target_existing_policy(policy) == "rehydrate_if_present"
+            and target_exists
+            and is_rehydratable_blacklist(entries)
+            and bool(transformed_cols)
+            and "TEMPORARY_TABLE" not in blacklist_types
+        )
+
+        if rehydrated:
+            target_cols = {
+                normalize_identifier_name(col)
+                for col in (ob_meta.tab_columns.get((tgt_schema_u.upper(), tgt_table_u.upper()), {}) or {}).keys()
+                if normalize_identifier_name(col)
+            }
+            missing_same_name = sorted(col for col in transformed_cols if col not in target_cols)
+            state = "REHYDRATED_MANUAL_COLUMNS_MISSING" if missing_same_name else "REHYDRATED"
+            detail = merge_detail_parts(
+                summarize_blacklist_entries(entries)[2],
+                f"TARGET={tgt_full}",
+                (
+                    "MISSING_SAME_NAME_COLUMNS={cols}".format(cols=",".join(missing_same_name))
+                    if missing_same_name else ""
+                ),
+            )
+            rehydrated_table_keys.add(src_key)
+            transformed_columns_by_table[src_key] = set(transformed_cols)
+            manual_trigger_table_keys.add(src_key)
+            detail_rows.append(
+                BlacklistRehydratedDetailRow(
+                    src_full=src_full,
+                    tgt_full=tgt_full,
+                    blacklist_types=blacklist_types_text,
+                    target_exists="Y",
+                    target_object_type=target_object_type,
+                    rehydration_state=state,
+                    transformed_columns=transformed_cols_text,
+                    detail=detail,
+                )
+            )
+            continue
+
+        effective[src_key] = dict(entries or {})
+        state = "KEEP_BLOCKED"
+        if not target_exists:
+            state = "KEEP_BLOCKED_TARGET_MISSING"
+        elif "TEMPORARY_TABLE" in blacklist_types:
+            state = "KEEP_BLOCKED_TEMPORARY"
+        elif normalize_blacklist_target_existing_policy(policy) != "rehydrate_if_present":
+            state = "KEEP_BLOCKED_POLICY"
+        elif not is_rehydratable_blacklist(entries):
+            state = "KEEP_BLOCKED_UNSUPPORTED_BLACKLIST"
+        elif not transformed_cols:
+            state = "KEEP_BLOCKED_NO_TRANSFORM_COLUMNS"
+        detail_rows.append(
+            BlacklistRehydratedDetailRow(
+                src_full=src_full,
+                tgt_full=tgt_full,
+                blacklist_types=blacklist_types_text,
+                target_exists="Y" if target_exists else "N",
+                target_object_type=target_object_type,
+                rehydration_state=state,
+                transformed_columns=transformed_cols_text,
+                detail=merge_detail_parts(summarize_blacklist_entries(entries)[2], f"TARGET={tgt_full}"),
+            )
+        )
+
+    return BlacklistRehydrationState(
+        effective_blacklist_tables=effective,
+        rehydrated_table_keys=rehydrated_table_keys,
+        transformed_columns_by_table=transformed_columns_by_table,
+        manual_trigger_table_keys=manual_trigger_table_keys,
+        detail_rows=detail_rows,
+    )
+
+
 def build_blacklist_report_rows(
     blacklist_tables: BlacklistTableMap,
     table_target_map: Dict[Tuple[str, str], Tuple[str, str]],
     oracle_meta: OracleMetadata,
-    ob_meta: ObMetadata
+    ob_meta: ObMetadata,
+    rehydration_state: Optional[BlacklistRehydrationState] = None,
 ) -> List[BlacklistReportRow]:
     """
     生成黑名单表报告行，LONG/LONG RAW 额外校验目标端转换情况。
     """
     rows: List[BlacklistReportRow] = []
+    rehydrated_keys = set((rehydration_state.rehydrated_table_keys or set()) if rehydration_state else set())
+    rehydrated_row_map = {
+        (parse_full_object_name(row.src_full) or ("", "")): row
+        for row in ((rehydration_state.detail_rows or []) if rehydration_state else [])
+        if row.src_full
+    }
     for (schema, table), entries in blacklist_tables.items():
         schema_u = schema.upper()
         table_u = table.upper()
@@ -40423,6 +40781,16 @@ def build_blacklist_report_rows(
             status = "BLACKLISTED"
             source_detail = format_blacklist_source(entry.source)
             detail = source_detail or "-"
+            if (schema_u, table_u) in rehydrated_keys:
+                status = BLACKLIST_REHYDRATED_STATUS
+                re_row = rehydrated_row_map.get((schema_u, table_u))
+                detail = merge_detail_parts(
+                    source_detail,
+                    mapping_hint,
+                    (f"STATE={re_row.rehydration_state}" if re_row else ""),
+                    (f"TRANSFORMED_COLUMNS={re_row.transformed_columns}" if re_row and re_row.transformed_columns != "-" else ""),
+                    (re_row.detail if re_row else ""),
+                )
 
             if black_type_u == "LONG" or is_long_type(data_type_u):
                 status, detail, verified = evaluate_long_conversion_status(
@@ -40449,6 +40817,41 @@ def build_blacklist_report_rows(
                 )
             )
     return rows
+
+
+def export_blacklist_rehydrated_detail(
+    rows: List[BlacklistRehydratedDetailRow],
+    report_dir: Path,
+    report_timestamp: Optional[str],
+) -> Optional[Path]:
+    if not report_dir or not report_timestamp or not rows:
+        return None
+    output_path = Path(report_dir) / f"blacklist_rehydrated_detail_{report_timestamp}.txt"
+    header_fields = [
+        "SRC_FULL",
+        "TGT_FULL",
+        "BLACKLIST_TYPES",
+        "TARGET_EXISTS",
+        "TARGET_OBJECT_TYPE",
+        "REHYDRATION_STATE",
+        "TRANSFORMED_COLUMNS",
+        "DETAIL",
+    ]
+    rows_sorted = sorted(rows, key=lambda r: (r.src_full, r.tgt_full, r.blacklist_types))
+    data_rows = [
+        [
+            row.src_full,
+            row.tgt_full,
+            row.blacklist_types,
+            row.target_exists,
+            row.target_object_type,
+            row.rehydration_state,
+            row.transformed_columns,
+            row.detail,
+        ]
+        for row in rows_sorted
+    ]
+    return write_pipe_report("黑名单表重纳管明细", header_fields, data_rows, output_path)
 
 
 def export_blacklist_tables(
@@ -40536,6 +40939,17 @@ def export_blacklist_tables(
     except OSError as exc:
         log.warning("写入黑名单表清单失败 %s: %s", output_path, exc)
         return None
+
+
+def build_blacklist_rehydrated_summary_counts(
+    rows: Optional[List[BlacklistRehydratedDetailRow]]
+) -> Dict[str, int]:
+    counts: Dict[str, int] = defaultdict(int)
+    for row in (rows or []):
+        state = (row.rehydration_state or "").upper()
+        if state:
+            counts[state] += 1
+    return dict(counts)
 
 
 def export_trigger_status_report(
@@ -46745,7 +47159,9 @@ def print_final_report(
     noise_suppressed_details: Optional[List[NoiseSuppressedDetail]] = None,
     usability_summary: Optional[UsabilitySummary] = None,
     table_presence_summary: Optional[TablePresenceSummary] = None,
-    excluded_object_rows: Optional[List[Dict[str, object]]] = None
+    excluded_object_rows: Optional[List[Dict[str, object]]] = None,
+    blacklist_rehydration_state: Optional[BlacklistRehydrationState] = None,
+    blacklist_rehydrated_detail_path: Optional[Path] = None,
 ):
     custom_theme = Theme({
         "ok": "green",
@@ -48326,6 +48742,12 @@ def print_final_report(
         _add_index_entry("DETAIL", package_report_path, len(package_rows) if package_rows else None, "PACKAGE/PKG BODY 对比明细")
         blacklist_path = export_blacklist_tables(blacklist_report_rows or [], report_path.parent)
         _add_index_entry("AUX", blacklist_path, len(blacklist_report_rows or []), "黑名单表清单")
+        _add_index_entry(
+            "DETAIL",
+            blacklist_rehydrated_detail_path,
+            len((blacklist_rehydration_state.detail_rows or []) if blacklist_rehydration_state else []),
+            "黑名单表重纳管明细"
+        )
         trigger_report_path = None
         if trigger_list_summary or trigger_status_rows:
             trigger_report_path = export_trigger_status_report(
@@ -49353,12 +49775,18 @@ def main():
     object_created_after_cutoff_nodes: Set[DependencyNode] = set()
     source_scope_result: Optional[ScopedSourceScopeResult] = None
     source_scope_detail_path: Optional[Path] = None
+    blacklist_rehydration_state: Optional[BlacklistRehydrationState] = None
+    manual_trigger_blacklist_table_keys: Set[Tuple[str, str]] = set()
 
     log_section("对象映射准备")
     apply_config_hot_reload_at_phase(hot_reload_runtime, "对象映射准备", settings, ora_cfg, ob_cfg)
     with phase_timer("对象映射准备", phase_durations):
         # 2) 加载 Remap 规则
         remap_rules = load_remap_rules(settings['remap_file'])
+        schema_mapping_remap_rules: RemapRules = {
+            (src_full or "").upper(): tgt_full
+            for src_full, tgt_full in (remap_rules or {}).items()
+        }
 
         # 3) 加载源端主对象 (TABLE/VIEW/PROC/FUNC/PACKAGE/PACKAGE BODY/SYNONYM)
         source_objects, source_case_sensitive_findings = get_source_objects(
@@ -49640,7 +50068,7 @@ def main():
                 remap_conflicts,
                 source_scope_result.excluded_nodes,
             )
-            remap_rules = {
+            schema_mapping_remap_rules = {
                 (src_full or "").upper(): tgt_full
                 for src_full, tgt_full in (remap_rules or {}).items()
                 if (src_full or "").upper() in source_objects
@@ -49712,7 +50140,7 @@ def main():
         )
         if settings.get("enable_schema_mapping_infer"):
             schema_mapping_from_tables = build_schema_mapping(base_master_list)
-        schema_mapping_for_grants = derive_schema_mapping_from_rules(remap_rules)
+        schema_mapping_for_grants = derive_schema_mapping_from_rules(schema_mapping_remap_rules)
         if schema_mapping_from_tables:
             schema_mapping_for_grants.update(schema_mapping_from_tables)
 
@@ -49800,6 +50228,7 @@ def main():
         if config_diagnostics is None:
             config_diagnostics = []
         config_diagnostics.extend(source_scope_diagnostics)
+    blacklist_rehydrated_detail_path: Optional[Path] = None
 
     # 输出全量 remap 推导结果，便于人工审核
     mapping_path = report_dir / f"object_mapping_{timestamp}.txt"
@@ -49963,7 +50392,9 @@ def main():
             fixup_skip_summary=None,
             usability_summary=None,
             table_presence_summary=None,
-            excluded_object_rows=excluded_object_report_rows
+            excluded_object_rows=excluded_object_report_rows,
+            blacklist_rehydration_state=blacklist_rehydration_state,
+            blacklist_rehydrated_detail_path=blacklist_rehydrated_detail_path,
         )
         if run_summary:
             log_run_summary(run_summary)
@@ -50009,6 +50440,12 @@ def main():
         tracked_types = set(checked_primary_types) | (set(enabled_extra_types) & set(ALL_TRACKED_OBJECT_TYPES))
         if not tracked_types:
             tracked_types = {'TABLE'}
+        load_constraint_metadata = should_load_constraint_metadata(
+            enabled_primary_types,
+            enabled_extra_types,
+        )
+        if load_constraint_metadata and 'CONSTRAINT' not in enabled_extra_types:
+            log.info("[CHECK] TABLE 主校验需要 NOT NULL 约束语义，已额外加载 Oracle/OB 约束元数据（不等同于启用约束扩展校验）。")
 
         ob_meta = dump_ob_metadata(
             ob_cfg,
@@ -50019,7 +50456,7 @@ def main():
             include_tab_columns='TABLE' in enabled_primary_types,
             include_column_order=enable_column_order_check,
             include_indexes='INDEX' in enabled_extra_types,
-            include_constraints='CONSTRAINT' in enabled_extra_types,
+            include_constraints=load_constraint_metadata,
             include_triggers='TRIGGER' in enabled_extra_types,
             include_sequences='SEQUENCE' in enabled_extra_types,
             include_comments=enable_comment_check,
@@ -50069,7 +50506,7 @@ def main():
             master_list,
             settings,
             include_indexes='INDEX' in enabled_extra_types,
-            include_constraints='CONSTRAINT' in enabled_extra_types,
+            include_constraints=load_constraint_metadata,
             include_triggers='TRIGGER' in enabled_extra_types,
             include_sequences='SEQUENCE' in enabled_extra_types,
             include_comments=enable_comment_check,
@@ -50354,12 +50791,41 @@ def main():
                 log.warning("写入显式排除对象明细失败: %s (%s)", detail_path, exc)
 
         table_target_map = build_table_target_map(master_list)
-        blacklist_report_rows = build_blacklist_report_rows(
-            oracle_meta.blacklist_tables,
+        original_blacklist_tables = dict(oracle_meta.blacklist_tables or {})
+        blacklist_target_existing_policy = normalize_blacklist_target_existing_policy(
+            settings.get("blacklist_target_existing_policy", "rehydrate_if_present")
+        )
+        blacklist_rehydration_state = build_blacklist_rehydration_state(
+            original_blacklist_tables,
             table_target_map,
             oracle_meta,
-            ob_meta
+            ob_meta,
+            blacklist_target_existing_policy,
         )
+        effective_blacklist_tables = blacklist_rehydration_state.effective_blacklist_tables
+        transformed_blacklist_columns_by_table = blacklist_rehydration_state.transformed_columns_by_table
+        manual_trigger_blacklist_table_keys = blacklist_rehydration_state.manual_trigger_table_keys
+        if blacklist_rehydration_state.rehydrated_table_keys:
+            oracle_meta = oracle_meta._replace(blacklist_tables=effective_blacklist_tables)
+            log.info(
+                "[BLACKLIST] 目标端已存在的黑名单表已重纳管: %d 张，transformed_columns_tables=%d。",
+                len(blacklist_rehydration_state.rehydrated_table_keys),
+                len(transformed_blacklist_columns_by_table),
+            )
+        blacklist_report_rows = build_blacklist_report_rows(
+            original_blacklist_tables,
+            table_target_map,
+            oracle_meta,
+            ob_meta,
+            rehydration_state=blacklist_rehydration_state,
+        )
+        blacklist_rehydrated_detail_path = export_blacklist_rehydrated_detail(
+            list(blacklist_rehydration_state.detail_rows or []),
+            report_dir,
+            timestamp,
+        )
+        if blacklist_rehydrated_detail_path:
+            log.info("黑名单表重纳管明细已输出: %s", blacklist_rehydrated_detail_path)
 
     log_section("差异校验")
     monitored_types: Tuple[str, ...] = tuple(
@@ -50387,6 +50853,10 @@ def main():
             settings=settings,
             suppress_unmanaged_target_extras=(settings.get("source_object_scope_mode") == "remap_root_closure"),
             managed_target_objects=build_managed_target_object_set(full_object_mapping),
+            transformed_blacklist_columns_by_table=(
+                blacklist_rehydration_state.transformed_columns_by_table
+                if blacklist_rehydration_state else None
+            ),
         )
         supplement_missing_views_from_mapping(
             tv_results,
@@ -50410,7 +50880,11 @@ def main():
             master_list,
             oracle_meta,
             ob_meta,
-            enable_comment_check
+            enable_comment_check,
+            transformed_blacklist_columns_by_table=(
+                blacklist_rehydration_state.transformed_columns_by_table
+                if blacklist_rehydration_state else None
+            ),
         )
 
     table_presence_summary: Optional[TablePresenceSummary] = None
@@ -50438,7 +50912,11 @@ def main():
             ob_meta,
             oracle_meta,
             full_object_mapping,
-            enabled_extra_types
+            enabled_extra_types,
+            transformed_blacklist_columns_by_table=(
+                blacklist_rehydration_state.transformed_columns_by_table
+                if blacklist_rehydration_state else None
+            ),
         )
 
     noise_result = apply_noise_suppression(tv_results, extra_results, comment_results)
@@ -50462,7 +50940,11 @@ def main():
         synonym_meta,
         remap_rules=remap_rules,
         view_dependency_map=view_dependency_map,
-        ob_version=settings.get("ob_version")
+        ob_version=settings.get("ob_version"),
+        manual_trigger_table_keys=(
+            blacklist_rehydration_state.manual_trigger_table_keys
+            if blacklist_rehydration_state else None
+        ),
     )
 
     usability_summary: Optional[UsabilitySummary] = None
@@ -50489,6 +50971,7 @@ def main():
         support_summary.unsupported_table_keys if support_summary else None,
         table_target_map,
         support_summary.support_state_map if support_summary else None,
+        manual_trigger_table_keys=manual_trigger_blacklist_table_keys if blacklist_rehydration_state else None,
     )
     object_counts_summary = reconcile_object_counts_summary(
         object_counts_summary,
@@ -50898,7 +51381,9 @@ def main():
         noise_suppressed_details=noise_suppressed_details,
         usability_summary=usability_summary,
         table_presence_summary=table_presence_summary,
-        excluded_object_rows=excluded_object_report_rows
+        excluded_object_rows=excluded_object_report_rows,
+        blacklist_rehydration_state=blacklist_rehydration_state,
+        blacklist_rehydrated_detail_path=blacklist_rehydrated_detail_path,
     )
     if run_summary:
         log_run_summary(run_summary)
