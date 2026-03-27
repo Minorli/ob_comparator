@@ -1,13 +1,14 @@
 # OceanBase Comparator Toolkit
 
-> 当前版本：V0.9.8.8  
+> 当前版本：V0.9.8.9  
 > 面向 Oracle → OceanBase (Oracle 模式) 的结构一致性校验与修补脚本生成工具  
 > 核心理念：一次转储、本地对比、脚本审计优先
 
-## 近期更新（0.9.8.8）
-- 授权文件可读性增强：owner 级 `*.grants.sql` 在 `OBJECT_TYPE: TABLE` 段内继续细分 `TABLE_OBJECT_GRANTS` 与 `TABLE_COLUMN_GRANTS`，便于快速区分整表授权和列级授权。
-- 该细分仅影响授权文件渲染，不改变 grant 采集、过滤、合并、fixup 执行目录和执行语义。
-- README / `readme_config.txt` / OpenSpec release 元数据已同步到 `0.9.8.8`。
+## 近期更新（0.9.8.9）
+- 黑名单表重纳管增强：`blacklist_target_existing_policy=rehydrate_if_present` 已进入正式版本；当目标端已存在人工改造后的承接表时，可恢复后续 compare/fixup，并自动保护黑名单改造列不被写回 Oracle 原始语义。
+- 触发器边界更准确：`INSTEAD OF ... ON VIEW` 触发器已纳入正常 compare/fixup；`DATABASE/SCHEMA` 级事件触发器继续保留为人工处理。
+- Oracle 派生表降噪补齐：`RUPD$_*`、`SNAP$_*` 与既有 `MLOG$_*` 一样按系统工件从 compare/fixup 中排除。
+- README / `readme_config.txt` / 技术文档当前版本号已同步到 `0.9.8.9`。
 
 ## 核心能力
 - **对象覆盖完整**：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。

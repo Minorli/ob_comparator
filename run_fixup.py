@@ -62,7 +62,7 @@ try:
 except Exception:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 
-__version__ = "0.9.8.8"
+__version__ = "0.9.8.9"
 
 CONFIG_DEFAULT_PATH = "config.ini"
 DEFAULT_FIXUP_DIR = "fixup_scripts"
@@ -1086,7 +1086,7 @@ def build_run_fixup_change_notices(
     if selected_cleanup_safe and (fixup_dir / "cleanup_safe").exists():
         notices.append(RuntimeNotice(
             "cleanup_safe_review",
-            "0.9.8.8",
+            "0.9.8.9",
             "安全清理目录需要显式确认",
             "cleanup_safe/ 下是 destructive SQL；请先审 extra_cleanup_candidates.txt，再显式按目录执行。",
         ))

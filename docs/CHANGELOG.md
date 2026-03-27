@@ -2,6 +2,18 @@
 
 本文件记录 OceanBase Comparator Toolkit 的重要变更。
 
+## [0.9.8.9] - 2026-03-27
+
+### 新增
+- 黑名单表重纳管正式进入发布版本：当源端黑名单表已在目标端以人工改造后的 TABLE 形式存在时，可恢复进入 compare/fixup，并自动保护黑名单改造列不被写回 Oracle 原始类型/长度/default/nullability。
+
+### 变更
+- 触发器兼容边界调整：`INSTEAD OF ... ON VIEW` 已纳入正常 compare/fixup；`DATABASE/SCHEMA` 级事件触发器继续保留为人工处理。
+- Oracle 派生表排除补齐：`RUPD$_*`、`SNAP$_*` 与既有 `MLOG$_*` 一样按系统工件从 compare/fixup 中排除，降低物化视图/复制维护噪声。
+
+### 文档
+- README / `readme_config.txt` / `readme_lite.txt` / `docs/*` 当前版本号同步到 `0.9.8.9`。
+
 ## [0.9.8.8] - 2026-03-13
 
 ### 变更
