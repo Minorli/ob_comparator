@@ -3768,6 +3768,26 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             content,
         )
 
+    def test_export_fatal_error_matrix(self):
+        rows = [
+            sdr.FatalErrorMatrixRow(
+                category="SCOPED_TRIGGER_LIST",
+                trigger_condition="remap_root_closure + trigger_list 非法",
+                default_behavior="FATAL_ABORT",
+                currently_relevant="YES",
+                remediation="修正 trigger_list",
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = sdr.export_fatal_error_matrix(rows, Path(tmp_dir), "20260330_180000")
+            self.assertIsNotNone(path)
+            content = Path(path).read_text(encoding="utf-8")
+        self.assertIn("Fatal error 场景矩阵", content)
+        self.assertIn(
+            "SCOPED_TRIGGER_LIST|remap_root_closure + trigger_list 非法|FATAL_ABORT|YES|修正 trigger_list",
+            content,
+        )
+
     def test_locate_target_identity_sequences_object_id_match(self):
         ob_meta = self._make_ob_meta()._replace(
             objects_by_type={"TABLE": {"TGT.T1"}},
