@@ -37,7 +37,8 @@
 - source_object_scope_mode：源对象范围模式。默认：full_source。
   可选值：full_source、remap_root_closure。
   说明：`full_source` 保持当前行为，按 `source_schemas` 全量扫描；`remap_root_closure` 仅以 `remap_file` 中显式 TABLE/VIEW 为 root seeds，再按依赖/附属关系扩展闭包，不在闭包中的对象（及其相关 INDEX/CONSTRAINT/SYNONYM/SEQUENCE 等）整体忽略。
-  说明：当设置为 `remap_root_closure` 且配置了 `trigger_list` 时，`trigger_list` 中的触发器会作为显式 keep set 保留；若 `trigger_list` 非法或未启用 `TRIGGER` 检查，程序会 fail-fast。
+  说明：当设置为 `remap_root_closure` 且配置了 `trigger_list` 时，`trigger_list` 中的触发器会作为显式 keep set 保留；`trigger_list` 支持填写源端触发器名，或 remap 后的目标触发器名。
+  说明：若 `trigger_list` 非法或未启用 `TRIGGER` 检查，程序会 fail-fast；若个别条目无法在源端或显式 remap 规则中解析，程序不再中止，而是把这些条目写入 `source_scope_detail_<ts>.txt` / `trigger_status_report.txt`，并从本轮 scoped closure 与 fixup 中排除。
   说明：规则格式为 `SRC_SCHEMA.OBJECT = TGT_SCHEMA.OBJECT`，支持注释与空行。
   注意：文件不存在会报警但继续。
   说明：每轮运行会额外输出 `managed_target_scope_detail_<ts>.txt`，用于审计本轮派生出的目标 schema 范围。
@@ -274,6 +275,8 @@
   源端权限、目标端目录权限、是否支持、是否存在目录别名（如 `DEBUG -> OTHERS`）、以及最终决策。
   说明：若源端存在 `DBA_COL_PRIVS`，列级授权会进入普通 grants 闭环，生成如
   `GRANT UPDATE (COL) ON OWNER.TABLE TO USER` 的脚本。
+  说明：若源端把 identity 表授给其他 schema / PUBLIC，程序会额外定位目标端 identity 底层 `ISEQ$$_...`，检查对应 `SELECT` 是否缺失，并输出 `identity_sequence_grant_detail_<ts>.txt`；缺失时会把 `GRANT SELECT ON <ISEQ$$_...>` 写入 `grants_miss/`。
+  说明：若目标端 identity sequence 无法可靠定位（例如同秒多个候选、字典查询失败），不会盲猜生成授权，只会在 `identity_sequence_grant_detail_<ts>.txt` 和 `manual_actions_required_<ts>.txt` 中标记人工确认。
   说明：程序还会额外生成 `oracle_privilege_family_detail_<ts>.txt`，说明当前 run 覆盖到哪些 Oracle 权限族；
   因此 `grants_miss/` 不是“全部 Oracle 权限闭环”，而是“当前 runnable grants 闭环”。
   说明：所有“未自动闭环”的授权与其他人工项，还会统一聚合到 `manual_actions_required_<ts>.txt`，避免只看 `grants_miss/` 后遗漏 unsupported/deferred/review-first 场景。
@@ -319,8 +322,10 @@
   兼容说明：若检测到目标 OB 版本不支持 `ALTER TABLE ... RENAME CONSTRAINT`，系统会自动改用约束 `DROP + ADD` 路径，仅索引继续使用 RENAME。
 - trigger_list：触发器清单文件（每行 SCHEMA.TRIGGER_NAME）。默认：空。
   注意：配置后仅生成列表内触发器，并输出 trigger_status_report.txt 报告；清单读取失败会回退全量触发器。
+  说明：在 `source_object_scope_mode=remap_root_closure` 下，`trigger_list` 同时支持源端名和 remap 后目标名；若目标名能通过显式 remap 反查到源端触发器，会按该源端触发器继续 compare/fixup。
   说明：若清单中的触发器属于非表触发器（如 `BEFORE DROP ON DATABASE` 或 `INSTEAD OF ... ON VIEW`），程序不会生成普通 trigger DDL，
   对 `DATABASE/SCHEMA` 级事件触发器，会在 `trigger_status_report.txt` 中标成 `NON_TABLE_SOURCE_TRIGGER`，并额外输出 `triggers_non_table_detail_<ts>.txt` 与人工处理清单；`INSTEAD OF ... ON VIEW` 会按普通触发器参与 compare/fixup。
+  说明：若清单命中的缺失触发器依赖的目标 TABLE/VIEW 仍不存在，本轮不会生成 trigger DDL；会在 `fixup_skip_summary_<ts>.txt` 中记录 `base_table_missing` 或同类跳过原因，待依赖对象补齐后 rerun 再生成 trigger 脚本。
 - trigger_qualify_schema：触发器 DDL 是否强制补全 schema 前缀。默认：true。
   说明：开启后会在触发器体内 DML 位点补全 schema，并把同义词引用优先解析到终点对象（如 TABLE/VIEW）后再重写；
   对未限定 schema 的序列 `NEXTVAL/CURRVAL` 也会补全为 `schema.sequence`，减少跨 schema 误绑定。
