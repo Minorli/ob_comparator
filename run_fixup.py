@@ -2525,6 +2525,29 @@ def infer_error_object(statement: str, relative_path: Path) -> str:
     return "-"
 
 
+def infer_permission_retry_target(
+    statement: str,
+    relative_path: Path,
+) -> Optional[Tuple[str, str, Set[str]]]:
+    parsed = parse_grant_statement(statement)
+    if not parsed:
+        return None
+    grant_type, privileges, object_full, _grantees = parsed
+    if grant_type != "OBJECT" or not object_full:
+        return None
+    dir_name = (relative_path.parent.name or "").lower()
+    if dir_name == "view_post_grants":
+        obj_type = "VIEW"
+    elif dir_name == "view_prereq_grants":
+        obj_type = "VIEW"
+    else:
+        return None
+    privilege_set = {(item or "").upper() for item in (privileges or ()) if (item or "").strip()}
+    if not privilege_set:
+        return None
+    return normalize_full_name(object_full), obj_type, privilege_set
+
+
 def grant_statement_has_option(statement: str) -> bool:
     if not statement:
         return False
@@ -2537,7 +2560,12 @@ def format_privilege_label(privilege: str, grant_option: bool) -> str:
     return f"{privilege} WITH GRANT OPTION"
 
 
-def requires_grant_option(grantee: str, target_full: str, target_type: str) -> bool:
+def requires_grant_option(
+    grantee: str,
+    target_full: str,
+    target_type: str,
+    dependent_type: Optional[str] = None,
+) -> bool:
     if not grantee or not target_full or not target_type:
         return False
     target_schema, _ = split_full_name(target_full)
@@ -2545,7 +2573,11 @@ def requires_grant_option(grantee: str, target_full: str, target_type: str) -> b
         return False
     if target_schema.upper() == grantee.upper():
         return False
-    return target_type.upper() in GRANT_OPTION_TYPES
+    dep_type_u = (dependent_type or "").upper()
+    target_type_u = target_type.upper()
+    if dep_type_u in {"VIEW", "MATERIALIZED VIEW"} and target_type_u in {"TABLE", "VIEW", "MATERIALIZED VIEW"}:
+        return True
+    return target_type_u in GRANT_OPTION_TYPES
 
 
 def parse_chain_node(token: str) -> Optional[Tuple[str, str]]:
@@ -2937,7 +2969,8 @@ def init_auto_grant_context(
 def build_auto_grant_plan_for_object(
     ctx: AutoGrantContext,
     obj_full: str,
-    obj_type: str
+    obj_type: str,
+    required_privileges_override: Optional[Set[str]] = None,
 ) -> Tuple[List[str], List[str], bool]:
     obj_full_u = normalize_full_name(obj_full)
     obj_type_u = normalize_object_type(obj_type)
@@ -2953,35 +2986,42 @@ def build_auto_grant_plan_for_object(
     for ref_full, ref_type in sorted(deps):
         ref_full_u = normalize_full_name(ref_full)
         ref_type_u = normalize_object_type(ref_type)
-        required_priv = GRANT_PRIVILEGE_BY_TYPE.get(ref_type_u)
-        if not required_priv:
+        required_privs: List[str] = []
+        if required_privileges_override and obj_type_u in {"VIEW", "MATERIALIZED VIEW"} and ref_type_u in {"TABLE", "VIEW", "MATERIALIZED VIEW"}:
+            required_privs = sorted({(item or "").upper() for item in required_privileges_override if (item or "").strip()})
+        else:
+            required_priv = GRANT_PRIVILEGE_BY_TYPE.get(ref_type_u)
+            if required_priv:
+                required_privs = [required_priv]
+        if not required_privs:
             continue
         ref_schema, _ = split_full_name(ref_full_u)
         if not ref_schema or ref_schema.upper() == grantee_schema.upper():
             continue
-        require_option = requires_grant_option(grantee_schema, ref_full_u, ref_type_u)
-        blocked = plan_object_grant_for_dependency(
-            grantee_schema,
-            ref_full_u,
-            ref_type_u,
-            required_priv,
-            require_option,
-            ctx.settings.fallback,
-            ctx.obclient_cmd,
-            ctx.timeout,
-            ctx.grant_index_miss,
-            ctx.grant_index_all,
-            ctx.roles_cache,
-            ctx.tab_privs_cache,
-            ctx.tab_privs_grantable_cache,
-            ctx.sys_privs_cache,
-            ctx.planned_statements,
-            ctx.planned_object_privs,
-            ctx.planned_object_privs_with_option,
-            ctx.planned_sys_privs,
-            plan_lines,
-            sql_lines
-        ) or blocked
+        require_option = requires_grant_option(grantee_schema, ref_full_u, ref_type_u, obj_type_u)
+        for required_priv in required_privs:
+            blocked = plan_object_grant_for_dependency(
+                grantee_schema,
+                ref_full_u,
+                ref_type_u,
+                required_priv,
+                require_option,
+                ctx.settings.fallback,
+                ctx.obclient_cmd,
+                ctx.timeout,
+                ctx.grant_index_miss,
+                ctx.grant_index_all,
+                ctx.roles_cache,
+                ctx.tab_privs_cache,
+                ctx.tab_privs_grantable_cache,
+                ctx.sys_privs_cache,
+                ctx.planned_statements,
+                ctx.planned_object_privs,
+                ctx.planned_object_privs_with_option,
+                ctx.planned_sys_privs,
+                plan_lines,
+                sql_lines
+            ) or blocked
     return plan_lines, sql_lines, blocked
 
 
@@ -2989,7 +3029,8 @@ def execute_auto_grant_for_object(
     ctx: AutoGrantContext,
     obj_full: str,
     obj_type: str,
-    label: str
+    label: str,
+    required_privileges_override: Optional[Set[str]] = None,
 ) -> Tuple[int, bool]:
     if not ctx.settings.enabled:
         return 0, False
@@ -3003,7 +3044,12 @@ def execute_auto_grant_for_object(
         ctx.stats.skipped += 1
         log.info("%s [AUTO-GRANT] %s(%s) 已阻断，跳过重复规划。", label, obj_full_u, obj_type_u)
         return 0, True
-    plan_lines, sql_lines, blocked = build_auto_grant_plan_for_object(ctx, obj_full_u, obj_type_u)
+    plan_lines, sql_lines, blocked = build_auto_grant_plan_for_object(
+        ctx,
+        obj_full_u,
+        obj_type_u,
+        required_privileges_override=required_privileges_override,
+    )
     if blocked:
         ctx.stats.blocked += 1
         if not sql_lines:
@@ -3510,7 +3556,7 @@ def build_view_chain_plan(
                 plan_lines.append(f"BLOCK: 无法解析 grantee for {dep_full}")
                 blocked = True
                 continue
-            require_option = requires_grant_option(dep_schema, target_full, target_type)
+            require_option = requires_grant_option(dep_schema, target_full, target_type, dep_type)
             if require_option and target_type.upper() in GRANT_OPTION_TYPES:
                 blocked = ensure_view_owner_grant_option(
                     target_full,
@@ -4496,6 +4542,28 @@ def parse_grant_statement(statement: str) -> Optional[Tuple[str, Tuple[str, ...]
             return None
         return "SYSTEM", tuple(privs), None, grantees
     return None
+
+
+def infer_required_privileges_from_failed_statement(
+    statement: str,
+    object_full: str,
+    object_type: str,
+) -> Optional[Set[str]]:
+    parsed = parse_grant_statement(statement)
+    if not parsed:
+        return None
+    grant_type, privileges, parsed_object_full, _grantees = parsed
+    if grant_type != "OBJECT":
+        return None
+    parsed_object_u = normalize_full_name(parsed_object_full or "")
+    object_full_u = normalize_full_name(object_full or "")
+    if not parsed_object_u or not object_full_u or parsed_object_u != object_full_u:
+        return None
+    object_type_u = normalize_object_type(object_type)
+    if object_type_u not in {"VIEW", "MATERIALIZED VIEW"}:
+        return None
+    privilege_set = {(item or "").upper() for item in (privileges or ()) if (item or "").strip()}
+    return privilege_set or None
 
 
 def select_dependency_script(
@@ -5519,6 +5587,38 @@ def run_single_fixup(
                 state_ledger=state_ledger
             )
             error_truncated = error_truncated or truncated
+            if result.status == "FAILED":
+                first_error = summary.failures[0].error if summary.failures else result.message
+                error_type = classify_sql_error(first_error)
+                retry_target = None
+                if summary.failures:
+                    retry_target = infer_permission_retry_target(summary.failures[0].statement, relative_path)
+                if auto_grant_ctx and error_type == FailureType.PERMISSION_DENIED and retry_target:
+                    retry_full, retry_type, retry_privs = retry_target
+                    applied, _blocked = execute_auto_grant_for_object(
+                        auto_grant_ctx,
+                        retry_full,
+                        retry_type,
+                        f"{label} (grant)",
+                        required_privileges_override=retry_privs,
+                    )
+                    if applied > 0:
+                        retry_result, retry_summary, _removed2, _kept2, truncated2 = execute_grant_file_with_prune(
+                            obclient_cmd,
+                            sql_path,
+                            repo_root,
+                            done_dir,
+                            ob_timeout,
+                            layer,
+                            f"{label} (retry)",
+                            error_entries,
+                            DEFAULT_ERROR_REPORT_LIMIT,
+                            max_sql_file_bytes,
+                            state_ledger=state_ledger
+                        )
+                        error_truncated = error_truncated or truncated2
+                        results.append(retry_result)
+                        continue
             results.append(result)
         else:
             obj_type = DIR_OBJECT_TYPE_MAP.get(sql_path.parent.name.lower())
@@ -5564,6 +5664,13 @@ def run_single_fixup(
 
             first_error = summary.failures[0].error if summary.failures else result.message
             error_type = classify_sql_error(first_error)
+            required_priv_override = None
+            if summary.failures and obj_full and obj_type:
+                required_priv_override = infer_required_privileges_from_failed_statement(
+                    summary.failures[0].statement,
+                    obj_full,
+                    obj_type,
+                )
             handled = False
             if (
                 auto_grant_ctx
@@ -5575,7 +5682,8 @@ def run_single_fixup(
                     auto_grant_ctx,
                     obj_full,
                     obj_type,
-                    f"{label} (grant)"
+                    f"{label} (grant)",
+                    required_privileges_override=required_priv_override,
                 )
                 handled = applied > 0
 
@@ -6227,6 +6335,38 @@ def run_iterative_fixup(
                     state_ledger=state_ledger
                 )
                 error_truncated = error_truncated or truncated
+                if result.status == "FAILED":
+                    first_error = summary.failures[0].error if summary.failures else result.message
+                    error_type = classify_sql_error(first_error)
+                    retry_target = None
+                    if summary.failures:
+                        retry_target = infer_permission_retry_target(summary.failures[0].statement, relative_path)
+                    if auto_grant_ctx and error_type == FailureType.PERMISSION_DENIED and retry_target:
+                        retry_full, retry_type, retry_privs = retry_target
+                        applied, _blocked = execute_auto_grant_for_object(
+                            auto_grant_ctx,
+                            retry_full,
+                            retry_type,
+                            f"{label} (grant)",
+                            required_privileges_override=retry_privs,
+                        )
+                        if applied > 0:
+                            retry_result, retry_summary, _removed2, _kept2, truncated2 = execute_grant_file_with_prune(
+                                obclient_cmd,
+                                sql_path,
+                                repo_root,
+                                done_dir,
+                                ob_timeout,
+                                layer,
+                                f"{label} (retry)",
+                                error_entries,
+                                DEFAULT_ERROR_REPORT_LIMIT,
+                                current_max_sql_file_bytes,
+                                state_ledger=state_ledger
+                            )
+                            error_truncated = error_truncated or truncated2
+                            round_results.append(retry_result)
+                            continue
                 round_results.append(result)
                 continue
 
@@ -6325,12 +6465,20 @@ def run_iterative_fixup(
                         log.warning("%s %s -> 缺失对象未解析", label, relative_path)
 
             if error_type == FailureType.PERMISSION_DENIED:
+                required_priv_override = None
+                if summary.failures and obj_full and obj_type:
+                    required_priv_override = infer_required_privileges_from_failed_statement(
+                        summary.failures[0].statement,
+                        obj_full,
+                        obj_type,
+                    )
                 if auto_grant_ctx and obj_full and obj_type:
                     applied, _blocked = execute_auto_grant_for_object(
                         auto_grant_ctx,
                         obj_full,
                         obj_type,
-                        f"{label} (grant)"
+                        f"{label} (grant)",
+                        required_privileges_override=required_priv_override,
                     )
                     handled = applied > 0
                 else:

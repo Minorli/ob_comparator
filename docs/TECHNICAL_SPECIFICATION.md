@@ -186,6 +186,7 @@
 - 视图权限拆分：依赖对象授权输出到 `view_prereq_grants/`，视图自身授权输出到 `view_post_grants/`
 - 视图链路要求 `WITH GRANT OPTION` 的场景会单独标注缺失
 - 依赖推导不再对 PUBLIC 生成授权，仅保留源端显式 PUBLIC 授权
+- 对 `view_post_grants/` 中失败的 `GRANT ... ON <view>`，`run_fixup` 会从失败语句中提取真实 privilege（如 `UPDATE`），再按 VIEW 依赖链补底层对象授权；不再把所有此类失败统一降级成 `SELECT`
 - 对 identity 表的跨 schema 授权，系统会额外定位目标端底层 `ISEQ$$_...`：当源端存在 `INSERT` 授权而目标端缺少对应 sequence `SELECT` 时，会输出 `identity_sequence_grant_detail_<ts>.txt`，并把 `GRANT SELECT ON <ISEQ$$_...>` 注入 `grants_miss/`
 - identity sequence 定位优先使用目标端 `DBA_OBJECTS.CREATED` 与 `DBA_SEQUENCES` 的同秒候选收敛；若候选不唯一且 identity 选项无法进一步收敛，则保持 report-only，不盲猜 sequence 名
 - 输出 `grants_miss/` 与 `grants_all/`
@@ -216,6 +217,15 @@
 - `fixup_scripts/view_post_grants/`
 - `fixup_scripts/compile/`
 - `fixup_scripts/grants_miss/`
+
+### 7.4 Fatal 场景矩阵
+- 每轮报告会额外输出 `fatal_error_matrix_<ts>.txt`
+- 该矩阵不改变程序行为，只集中列出：
+  - fatal 分类
+  - 触发条件
+  - 默认行为
+  - 当前 run 是否相关
+  - 修复建议
 
 ---
 

@@ -66,6 +66,7 @@
   说明：若存在不支持的约束（如 DEFERRABLE / CHECK SYS_CONTEXT / 自引用外键），会额外输出 constraints_unsupported_detail_<timestamp>.txt（不受 report_detail_mode 影响）。
   说明：若存在“触发器挂在临时表”场景，会额外输出 triggers_temp_table_unsupported_detail_<timestamp>.txt（不受 report_detail_mode 影响）；
   对应 DDL 仅输出到 `fixup_scripts/unsupported/trigger/`，用于人工改造参考，不进入普通 `trigger/`。
+  说明：split/full 模式下还会额外输出 `fatal_error_matrix_<ts>.txt`，集中列出当前程序仍会直接终止运行的 fatal 场景、当前是否相关，以及修复建议。
 - report_to_db：是否将报告存储到 OceanBase（obclient 方式）。默认：true。
   说明：开启后仍会保留本地文本报告，写库失败时是否中断由 report_db_fail_abort 控制。
   说明：写库采用发布门禁；DIFF_REPORT_SUMMARY.WRITE_STATUS=READY 才表示可用于正式排查（WRITING/FAILED 为未完成或失败）。
@@ -295,6 +296,7 @@
   仍需先按运维基线补齐 `OB_CATALOG_ROLE` 的对象授权模型。
 - fixup_auto_grant：run_fixup 自动补权限。默认：true。
   说明：基于 dependency_chains 与 VIEWs_chain 预判依赖授权，执行前自动应用 grants_miss/grants_all 中的授权。
+  说明：当 `view_post_grants/` 中的视图授权命中 `ORA-01720` 时，执行器会按失败语句里的真实 privilege（SELECT/INSERT/UPDATE/DELETE）补底层依赖对象授权，而不是一律退化成 `SELECT`。
   说明：run_fixup 默认跳过 `fixup_scripts/grants_deferred/`，对象补齐后需显式执行该目录。
 - fixup_auto_grant_types：自动补权限对象类型（逗号分隔）。默认：
   VIEW, MATERIALIZED VIEW, SYNONYM, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, TYPE, TYPE BODY。

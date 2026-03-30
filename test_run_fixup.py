@@ -1429,6 +1429,167 @@ class TestViewChainCycle(unittest.TestCase):
         self.assertEqual(sql_lines, [])
         self.assertTrue(any("CYCLE" in line for line in plan))
 
+    def test_build_view_chain_plan_requires_grant_option_for_cross_schema_table(self):
+        chains = [
+            [("A.V1", "VIEW"), ("B.T1", "TABLE")],
+        ]
+        grant_index = rf.GrantIndex({}, {}, {})
+        require_option_calls = []
+
+        def fake_plan_object_grant_for_dependency(
+            grantee,
+            target_full,
+            target_type,
+            required_priv,
+            require_grant_option,
+            *_args,
+            **_kwargs,
+        ):
+            require_option_calls.append(
+                (grantee, target_full, target_type, required_priv, require_grant_option)
+            )
+            return False
+
+        with mock.patch.object(rf, "plan_object_grant_for_dependency", side_effect=fake_plan_object_grant_for_dependency), \
+             mock.patch.object(rf, "check_object_exists", return_value=True), \
+             mock.patch.object(rf, "select_fixup_script_for_node_with_fallback", return_value=(None, None)):
+            plan, sql_lines, blocked = rf.build_view_chain_plan(
+                "A.V1",
+                chains,
+                [],
+                None,
+                {},
+                {},
+                {},
+                {},
+                grant_index,
+                grant_index,
+                False,
+                Path("."),
+                {},
+                {},
+                {},
+                {},
+                {},
+                set(),
+                set(),
+                set(),
+                set(),
+                set(),
+                None
+            )
+
+        self.assertFalse(blocked)
+        self.assertEqual(sql_lines, [])
+        self.assertEqual(len(require_option_calls), 1)
+        self.assertEqual(require_option_calls[0], ("A", "B.T1", "TABLE", "SELECT", True))
+
+    def test_build_auto_grant_plan_for_view_requires_grant_option_for_cross_schema_table(self):
+        ctx = rf.AutoGrantContext(
+            settings=rf.FixupAutoGrantSettings(enabled=True, types={"VIEW"}, fallback=False, cache_limit=10000, exec_mode="auto", exec_file_fallback=True),
+            deps_by_object={("A.V1", "VIEW"): {("B.T1", "TABLE")}},
+            grant_index_miss=rf.GrantIndex({}, {}, {}),
+            grant_index_all=rf.GrantIndex({}, {}, {}),
+            obclient_cmd=[],
+            timeout=None,
+            roles_cache={},
+            tab_privs_cache={},
+            tab_privs_grantable_cache={},
+            sys_privs_cache={},
+            planned_statements=set(),
+            planned_object_privs=set(),
+            planned_object_privs_with_option=set(),
+            planned_sys_privs=set(),
+            applied_grants=set(),
+            blocked_objects=set(),
+            stats=rf.AutoGrantStats(),
+        )
+        require_option_calls = []
+
+        def fake_plan_object_grant_for_dependency(
+            grantee,
+            target_full,
+            target_type,
+            required_priv,
+            require_grant_option,
+            *_args,
+            **_kwargs,
+        ):
+            require_option_calls.append(
+                (grantee, target_full, target_type, required_priv, require_grant_option)
+            )
+            return False
+
+        with mock.patch.object(rf, "plan_object_grant_for_dependency", side_effect=fake_plan_object_grant_for_dependency):
+            plan_lines, sql_lines, blocked = rf.build_auto_grant_plan_for_object(ctx, "A.V1", "VIEW")
+
+        self.assertEqual(plan_lines, [])
+        self.assertEqual(sql_lines, [])
+        self.assertFalse(blocked)
+        self.assertEqual(require_option_calls[0], ("A", "B.T1", "TABLE", "SELECT", True))
+
+    def test_infer_required_privileges_from_failed_statement_for_view_grant(self):
+        privs = rf.infer_required_privileges_from_failed_statement(
+            "GRANT UPDATE ON MONSTER_A.V1 TO U1;",
+            "MONSTER_A.V1",
+            "VIEW",
+        )
+        self.assertEqual(privs, {"UPDATE"})
+
+    def test_infer_permission_retry_target_for_view_post_grant(self):
+        target = rf.infer_permission_retry_target(
+            "GRANT UPDATE ON MONSTER_A.V1 TO U1;",
+            Path("fixup/view_post_grants/MONSTER_A.update.sql"),
+        )
+        self.assertEqual(target, ("MONSTER_A.V1", "VIEW", {"UPDATE"}))
+
+    def test_build_auto_grant_plan_for_view_uses_failed_grant_privilege_override(self):
+        ctx = rf.AutoGrantContext(
+            settings=rf.FixupAutoGrantSettings(enabled=True, types={"VIEW"}, fallback=False, cache_limit=10000, exec_mode="auto", exec_file_fallback=True),
+            deps_by_object={("A.V1", "VIEW"): {("B.T1", "TABLE")}},
+            grant_index_miss=rf.GrantIndex({}, {}, {}),
+            grant_index_all=rf.GrantIndex({}, {}, {}),
+            obclient_cmd=[],
+            timeout=None,
+            roles_cache={},
+            tab_privs_cache={},
+            tab_privs_grantable_cache={},
+            sys_privs_cache={},
+            planned_statements=set(),
+            planned_object_privs=set(),
+            planned_object_privs_with_option=set(),
+            planned_sys_privs=set(),
+            applied_grants=set(),
+            blocked_objects=set(),
+            stats=rf.AutoGrantStats(),
+        )
+        calls = []
+
+        def fake_plan_object_grant_for_dependency(
+            grantee,
+            target_full,
+            target_type,
+            required_priv,
+            require_grant_option,
+            *_args,
+            **_kwargs,
+        ):
+            calls.append((grantee, target_full, target_type, required_priv, require_grant_option))
+            return False
+
+        with mock.patch.object(rf, "plan_object_grant_for_dependency", side_effect=fake_plan_object_grant_for_dependency):
+            plan_lines, sql_lines, blocked = rf.build_auto_grant_plan_for_object(
+                ctx,
+                "A.V1",
+                "VIEW",
+                required_privileges_override={"UPDATE"},
+            )
+
+        self.assertEqual(plan_lines, [])
+        self.assertEqual(sql_lines, [])
+        self.assertFalse(blocked)
+        self.assertEqual(calls, [("A", "B.T1", "TABLE", "UPDATE", True)])
+
 
 class TestSqlParsing(unittest.TestCase):
     def test_split_nested_block_comments(self):

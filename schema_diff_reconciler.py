@@ -1321,6 +1321,14 @@ class IdentitySequenceGrantDetailRow(NamedTuple):
     action: str
 
 
+class FatalErrorMatrixRow(NamedTuple):
+    category: str
+    trigger_condition: str
+    default_behavior: str
+    currently_relevant: str
+    remediation: str
+
+
 @dataclass(frozen=True)
 class GrantCapabilityDecision:
     support_status: str
@@ -39390,6 +39398,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "目标端额外授权明细"
     if name.startswith("identity_sequence_grant_detail_"):
         return "DETAIL", "identity sequence 跨 schema 授权明细"
+    if name.startswith("fatal_error_matrix_"):
+        return "DETAIL", "fatal error 场景矩阵"
     if name.startswith("manual_actions_required_"):
         return "DETAIL", "人工处理/确认统一清单"
     if name.startswith("fixup_skip_summary_"):
@@ -42396,6 +42406,147 @@ def export_identity_sequence_grant_detail(
     return write_pipe_report("identity sequence 跨 schema 授权明细", header_fields, data_rows, output_path)
 
 
+def build_fatal_error_matrix_rows(settings: Optional[Dict]) -> List[FatalErrorMatrixRow]:
+    settings = settings or {}
+    enabled_extra_types = {str(t).upper() for t in (settings.get("enabled_extra_types") or set()) if str(t).strip()}
+    source_scope_mode = normalize_source_object_scope_mode(settings.get("source_object_scope_mode", "full_source"))
+    object_created_before_enabled = bool(settings.get("object_created_before_enabled"))
+    missing_created_policy = normalize_object_created_missing_policy(
+        settings.get("object_created_before_missing_created_policy", "strict")
+    )
+    generate_fixup_enabled = parse_bool_flag(settings.get("generate_fixup", "true"), True)
+    report_to_db = parse_bool_flag(settings.get("report_to_db", "true"), True)
+    report_db_fail_abort = parse_bool_flag(settings.get("report_db_fail_abort", "false"), False)
+    hot_reload_fail_policy = normalize_config_hot_reload_fail_policy(
+        settings.get("config_hot_reload_fail_policy", "keep_last_good")
+    )
+    case_mode = (settings.get("case_sensitive_identifier_mode", "warn") or "warn").strip().lower()
+    trigger_list_path = str(settings.get("trigger_list", "") or "").strip()
+
+    rows = [
+        FatalErrorMatrixRow(
+            category="CONFIG",
+            trigger_condition="config.ini 缺失/不可读、source_schemas 为空、核心配置非法",
+            default_behavior="FATAL_ABORT",
+            currently_relevant="YES",
+            remediation="修正配置文件路径、补齐必填项并重新运行。",
+        ),
+        FatalErrorMatrixRow(
+            category="ORACLE_CLIENT",
+            trigger_condition="oracle_client_lib_dir 缺失/路径不存在/Thick Mode 初始化失败",
+            default_behavior="FATAL_ABORT",
+            currently_relevant="YES",
+            remediation="补齐 oracle_client_lib_dir，检查 Instant Client 与 LD_LIBRARY_PATH。",
+        ),
+        FatalErrorMatrixRow(
+            category="OBCLIENT_SECURITY",
+            trigger_condition="obclient 缺失，或当前 obclient 不支持安全凭据参数",
+            default_behavior="FATAL_ABORT",
+            currently_relevant="YES",
+            remediation="修正 obclient 路径，或升级到支持安全凭据参数的 obclient。",
+        ),
+        FatalErrorMatrixRow(
+            category="DBCAT_RUNTIME",
+            trigger_condition="generate_fixup=true 且 dbcat_bin/JAVA_HOME 不可用，或 dbcat 导出失败/超时",
+            default_behavior="FATAL_ABORT",
+            currently_relevant="YES" if generate_fixup_enabled else "NO",
+            remediation="修正 dbcat_bin、JAVA_HOME、dbcat_from/dbcat_to，并检查 Oracle 连通性。",
+        ),
+        FatalErrorMatrixRow(
+            category="ORACLE_METADATA",
+            trigger_condition="Oracle 源对象列表、核心元数据、依赖或 CREATED 时间加载失败",
+            default_behavior="FATAL_ABORT",
+            currently_relevant="YES",
+            remediation="检查 Oracle 连通性、账号权限与 DBA_* 字典访问能力。",
+        ),
+        FatalErrorMatrixRow(
+            category="OB_METADATA",
+            trigger_condition="OB 侧核心 DBA_* 字典（OBJECTS/TAB_COLUMNS/INDEXES/CONSTRAINTS/DEPENDENCIES/SEQUENCES）无法读取",
+            default_behavior="FATAL_ABORT",
+            currently_relevant="YES",
+            remediation="检查 OB 连通性、账号权限与目标租户 Oracle 兼容字典可用性。",
+        ),
+        FatalErrorMatrixRow(
+            category="CUTOFF_STRICT",
+            trigger_condition="object_created_before 已启用，且 strict 策略下存在对象缺少 CREATED",
+            default_behavior="FATAL_ABORT",
+            currently_relevant="YES" if object_created_before_enabled and missing_created_policy == "strict" else "NO",
+            remediation="改用 include_missing/exclude_missing，或先补齐 CREATED 可见性。",
+        ),
+        FatalErrorMatrixRow(
+            category="SCOPED_TRIGGER_LIST",
+            trigger_condition="remap_root_closure + trigger_list，但未启用 TRIGGER 检查、trigger_list 读失败、或存在非法条目",
+            default_behavior="FATAL_ABORT",
+            currently_relevant="YES" if source_scope_mode == "remap_root_closure" and bool(trigger_list_path) else "NO",
+            remediation="启用 check_extra_types=TRIGGER，并修正 trigger_list 文件格式/路径。",
+        ),
+        FatalErrorMatrixRow(
+            category="SCOPED_ROOTS",
+            trigger_condition="remap_root_closure 下 remap_file 中没有可用的 TABLE/VIEW roots",
+            default_behavior="FATAL_ABORT",
+            currently_relevant="YES" if source_scope_mode == "remap_root_closure" else "NO",
+            remediation="在 remap_file 中至少提供一个有效 TABLE/VIEW 根对象。",
+        ),
+        FatalErrorMatrixRow(
+            category="CASE_SENSITIVE_ABORT",
+            trigger_condition="case_sensitive_identifier_mode=abort 且发现双引号大小写敏感对象",
+            default_behavior="FATAL_ABORT",
+            currently_relevant="YES" if case_mode == "abort" else "NO",
+            remediation="改用 warn/strict_fixup，或先专项处理大小写敏感对象。",
+        ),
+        FatalErrorMatrixRow(
+            category="FIXUP_PATH_SAFETY",
+            trigger_condition="fixup_dir 在配置目录外且未显式允许",
+            default_behavior="FATAL_ABORT",
+            currently_relevant="YES" if generate_fixup_enabled else "NO",
+            remediation="显式开启 fixup_dir_allow_outside_repo，或把 fixup_dir 收回项目/配置目录内。",
+        ),
+        FatalErrorMatrixRow(
+            category="REPORT_DB",
+            trigger_condition="report_to_db=true 且写库失败后 db_ok=false（当前主流程会中止）",
+            default_behavior="FATAL_ABORT",
+            currently_relevant="YES" if report_to_db and report_db_fail_abort else "NO",
+            remediation="先修复 report_db 连接/权限/表结构问题，或临时关闭 fail_abort。",
+        ),
+        FatalErrorMatrixRow(
+            category="HOT_RELOAD_ABORT",
+            trigger_condition="热加载配置解析失败且 fail_policy=abort",
+            default_behavior="FATAL_ABORT",
+            currently_relevant="YES" if hot_reload_fail_policy == "abort" else "NO",
+            remediation="改用 keep_last_good，或先修正热加载涉及的配置文件内容。",
+        ),
+    ]
+    return rows
+
+
+def export_fatal_error_matrix(
+    rows: List[FatalErrorMatrixRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not report_timestamp or not rows:
+        return None
+    output_path = Path(report_dir) / f"fatal_error_matrix_{report_timestamp}.txt"
+    header_fields = [
+        "CATEGORY",
+        "TRIGGER_CONDITION",
+        "DEFAULT_BEHAVIOR",
+        "CURRENTLY_RELEVANT",
+        "REMEDIATION",
+    ]
+    data_rows = [
+        [
+            row.category,
+            row.trigger_condition,
+            row.default_behavior,
+            row.currently_relevant,
+            row.remediation,
+        ]
+        for row in rows
+    ]
+    return write_pipe_report("Fatal error 场景矩阵", header_fields, data_rows, output_path)
+
+
 OPERATOR_ACTION_PRIORITY_ORDER = {
     "BLOCKER": 0,
     "PREREQ": 1,
@@ -44701,6 +44852,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "ORACLE_PRIVILEGE_FAMILY_DETAIL"
     if name.startswith("identity_sequence_grant_detail_"):
         return "IDENTITY_SEQUENCE_GRANT_DETAIL"
+    if name.startswith("fatal_error_matrix_"):
+        return "FATAL_ERROR_MATRIX"
     if name.startswith("manual_actions_required_"):
         return "MANUAL_ACTION_REQUIRED"
     if name.startswith("ddl_cleanup_detail_"):
@@ -49720,6 +49873,18 @@ def print_final_report(
             identity_sequence_grant_detail_path,
             len(identity_sequence_grant_rows) if identity_sequence_grant_detail_path else None,
             "identity sequence 跨 schema 授权明细"
+        )
+        fatal_error_matrix_rows = build_fatal_error_matrix_rows(settings)
+        fatal_error_matrix_path = export_fatal_error_matrix(
+            fatal_error_matrix_rows,
+            report_path.parent,
+            report_ts,
+        )
+        _add_index_entry(
+            "DETAIL",
+            fatal_error_matrix_path,
+            len(fatal_error_matrix_rows) if fatal_error_matrix_path else None,
+            "fatal error 场景矩阵"
         )
         manual_actions_path = export_manual_actions_required(
             manual_action_rows,
