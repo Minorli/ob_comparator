@@ -3768,6 +3768,154 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             content,
         )
 
+    def test_locate_target_identity_sequences_object_id_match(self):
+        ob_meta = self._make_ob_meta()._replace(
+            objects_by_type={"TABLE": {"TGT.T1"}},
+            identity_modes={("TGT", "T1"): {"ID": "BY DEFAULT ON NULL"}},
+            identity_options={("TGT", "T1"): {"ID": {"INCREMENT BY": "1", "CACHE": "20"}}},
+        )
+
+        def fake_run(_cfg, sql, **_kwargs):
+            sql_u = " ".join(str(sql).upper().split())
+            if "FROM DBA_OBJECTS" in sql_u:
+                return True, "TGT\tT1\tTABLE\t2026-03-30 12:00:00\t123\nTGT\tISEQ$$_123_16\tSEQUENCE\t2026-03-30 12:00:00\t125", ""
+            if "FROM DBA_SEQUENCES" in sql_u:
+                return True, "TGT\tISEQ$$_123_16\t1\t999\t1\t20\tN\tN", ""
+            return False, "", "unexpected_sql"
+
+        with mock.patch.object(sdr, "obclient_run_sql", side_effect=fake_run):
+            rows = sdr.locate_target_identity_sequences(
+                {"executable": "obclient"},
+                ob_meta,
+                {("TGT", "T1")},
+            )
+        row = rows[("TGT", "T1")]
+        self.assertEqual(row.status, sdr.IDENTITY_SEQUENCE_STATUS_PRESENT)
+        self.assertEqual(row.reason_code, sdr.IDENTITY_SEQUENCE_REASON_OBJECT_ID_MATCH)
+        self.assertEqual(row.target_sequence, "TGT.ISEQ$$_123_16")
+
+    def test_locate_target_identity_sequences_created_fallback_match(self):
+        ob_meta = self._make_ob_meta()._replace(
+            objects_by_type={"TABLE": {"TGT.T1"}},
+            identity_modes={("TGT", "T1"): {"ID": "BY DEFAULT ON NULL"}},
+            identity_options={("TGT", "T1"): {"ID": {"INCREMENT BY": "1", "CACHE": "20"}}},
+        )
+
+        def fake_run(_cfg, sql, **_kwargs):
+            sql_u = " ".join(str(sql).upper().split())
+            if "FROM DBA_OBJECTS" in sql_u:
+                return True, "TGT\tT1\tTABLE\t2026-03-30 12:00:00\t123\nTGT\tISEQ$$_1\tSEQUENCE\t2026-03-30 12:00:00\t125", ""
+            if "FROM DBA_SEQUENCES" in sql_u:
+                return True, "TGT\tISEQ$$_1\t1\t999\t1\t20\tN\tN", ""
+            return False, "", "unexpected_sql"
+
+        with mock.patch.object(sdr, "obclient_run_sql", side_effect=fake_run):
+            rows = sdr.locate_target_identity_sequences(
+                {"executable": "obclient"},
+                ob_meta,
+                {("TGT", "T1")},
+            )
+        row = rows[("TGT", "T1")]
+        self.assertEqual(row.status, sdr.IDENTITY_SEQUENCE_STATUS_PRESENT)
+        self.assertEqual(row.reason_code, sdr.IDENTITY_SEQUENCE_REASON_CREATED_MATCH)
+        self.assertEqual(row.target_sequence, "TGT.ISEQ$$_1")
+
+    def test_locate_target_identity_sequences_ambiguous(self):
+        ob_meta = self._make_ob_meta()._replace(
+            objects_by_type={"TABLE": {"TGT.T1"}},
+            identity_modes={("TGT", "T1"): {"ID": "BY DEFAULT ON NULL"}},
+            identity_options={("TGT", "T1"): {"ID": {"INCREMENT BY": "1", "CACHE": "20"}}},
+        )
+
+        def fake_run(_cfg, sql, **_kwargs):
+            sql_u = " ".join(str(sql).upper().split())
+            if "FROM DBA_OBJECTS" in sql_u:
+                return True, (
+                    "TGT\tT1\tTABLE\t2026-03-30 12:00:00\n"
+                    "TGT\tISEQ$$_1\tSEQUENCE\t2026-03-30 12:00:00\n"
+                    "TGT\tISEQ$$_2\tSEQUENCE\t2026-03-30 12:00:00"
+                ), ""
+            if "FROM DBA_SEQUENCES" in sql_u:
+                return True, (
+                    "TGT\tISEQ$$_1\t1\t999\t1\t20\tN\tN\n"
+                    "TGT\tISEQ$$_2\t1\t999\t1\t20\tN\tN"
+                ), ""
+            return False, "", "unexpected_sql"
+
+        with mock.patch.object(sdr, "obclient_run_sql", side_effect=fake_run):
+            rows = sdr.locate_target_identity_sequences(
+                {"executable": "obclient"},
+                ob_meta,
+                {("TGT", "T1")},
+            )
+        row = rows[("TGT", "T1")]
+        self.assertEqual(row.status, sdr.IDENTITY_SEQUENCE_STATUS_UNRESOLVED)
+        self.assertEqual(row.reason_code, sdr.IDENTITY_SEQUENCE_REASON_AMBIGUOUS_CREATED_MATCH)
+        self.assertIn("ISEQ$$_1", row.detail)
+        self.assertIn("ISEQ$$_2", row.detail)
+
+    def test_augment_grant_plan_with_identity_sequence_grants(self):
+        oracle_meta = self._make_oracle_meta()._replace(
+            identity_modes={("SRC", "T1"): {"ID": "BY DEFAULT ON NULL"}},
+            identity_options={("SRC", "T1"): {"ID": {"INCREMENT BY": "1", "CACHE": "20"}}},
+        )
+        ob_meta = self._make_ob_meta()._replace(
+            objects_by_type={"TABLE": {"TGT.T1"}},
+            identity_modes={("TGT", "T1"): {"ID": "BY DEFAULT ON NULL"}},
+            identity_options={("TGT", "T1"): {"ID": {"INCREMENT BY": "1", "CACHE": "20"}}},
+        )
+        plan = sdr.GrantPlan(
+            object_grants={"APP": {sdr.ObjectGrantEntry("INSERT", "TGT.T1", False)}},
+            column_grants={},
+            sys_privs={},
+            role_privs={},
+            role_ddls=[],
+            filtered_grants=[],
+            view_grant_targets=set(),
+            object_target_types={"TGT.T1": "TABLE"},
+        )
+
+        def fake_run(_cfg, sql, **_kwargs):
+            sql_u = " ".join(str(sql).upper().split())
+            if "FROM DBA_OBJECTS" in sql_u:
+                return True, "TGT\tT1\tTABLE\t2026-03-30 12:00:00\nTGT\tISEQ$$_1\tSEQUENCE\t2026-03-30 12:00:00", ""
+            if "FROM DBA_SEQUENCES" in sql_u:
+                return True, "TGT\tISEQ$$_1\t1\t999\t1\t20\tN\tN", ""
+            return False, "", "unexpected_sql"
+
+        with mock.patch.object(sdr, "obclient_run_sql", side_effect=fake_run):
+            updated_plan, rows = sdr.augment_grant_plan_with_identity_sequence_grants(
+                plan,
+                oracle_meta,
+                ob_meta,
+                {"executable": "obclient"},
+                {"SRC.T1": {"TABLE": "TGT.T1"}},
+            )
+        self.assertIn(sdr.ObjectGrantEntry("SELECT", "TGT.ISEQ$$_1", False), updated_plan.object_grants["APP"])
+        self.assertEqual(updated_plan.object_target_types["TGT.ISEQ$$_1"], "SEQUENCE")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].target_sequence, "TGT.ISEQ$$_1")
+
+    def test_finalize_identity_sequence_grant_rows_marks_missing(self):
+        expectations = [
+            sdr.IdentitySequenceGrantExpectationRow(
+                grantee="APP",
+                src_table_full="SRC.T1",
+                tgt_table_full="TGT.T1",
+                identity_columns=("ID",),
+                target_sequence="TGT.ISEQ$$_1",
+                status=sdr.IDENTITY_SEQUENCE_STATUS_PRESENT,
+                reason_code=sdr.IDENTITY_SEQUENCE_REASON_CREATED_MATCH,
+                detail="created=2026-03-30 12:00:00",
+            )
+        ]
+        rows = sdr.finalize_identity_sequence_grant_rows(
+            expectations,
+            {"APP": {sdr.ObjectGrantEntry("SELECT", "TGT.ISEQ$$_1", False)}},
+        )
+        self.assertEqual(rows[0].status, sdr.IDENTITY_SEQUENCE_STATUS_MISSING_GRANT)
+        self.assertEqual(rows[0].action, "FIXUP_GRANT")
+
     def test_inflate_table_varchar_lengths_handles_byte_inside_parentheses(self):
         oracle_meta = self._make_oracle_meta_with_columns(
             {
@@ -10832,6 +10980,87 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(rows[0].status, "NON_TABLE_SOURCE_TRIGGER")
         self.assertEqual(summary["non_table"], 1)
 
+    def test_build_trigger_list_report_accepts_target_trigger_name(self):
+        oracle_meta = sdr.OracleMetadata(
+            table_columns={},
+            invisible_column_supported=False,
+            identity_column_supported=False,
+            default_on_null_supported=False,
+            indexes={},
+            constraints={},
+            triggers={
+                ("SRC", "T1"): {
+                    "TRG_T1": {"event": "INSERT", "status": "ENABLED"},
+                }
+            },
+            sequences={},
+            sequence_attrs={},
+            table_comments={},
+            column_comments={},
+            comments_complete=False,
+            blacklist_tables={},
+            object_privileges=[],
+            column_privileges=[],
+            sys_privileges=[],
+            role_privileges=[],
+            role_metadata={},
+            system_privilege_map=set(),
+            table_privilege_map=set(),
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False,
+            partition_key_columns={},
+            interval_partitions={},
+            non_table_triggers=(),
+        )
+        ob_meta = sdr.ObMetadata(
+            objects_by_type={},
+            tab_columns={},
+            invisible_column_supported=False,
+            identity_column_supported=False,
+            default_on_null_supported=False,
+            indexes={},
+            constraints={},
+            triggers={},
+            sequences={},
+            sequence_attrs={},
+            roles=set(),
+            table_comments={},
+            column_comments={},
+            comments_complete=False,
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False,
+            partition_key_columns={},
+        )
+        extra_results = {
+            "trigger_mismatched": [
+                sdr.TriggerMismatch(
+                    table="TGT.T1",
+                    missing_triggers={"TGT.TRG_T1"},
+                    extra_triggers=set(),
+                    detail_mismatch=[],
+                    missing_mappings=[("SRC.TRG_T1", "TGT.TRG_T1")],
+                )
+            ]
+        }
+        rows, summary = sdr.build_trigger_list_report(
+            "new_trigger_list.txt",
+            {"TGT.TRG_T1"},
+            [],
+            [],
+            1,
+            None,
+            extra_results,
+            oracle_meta,
+            ob_meta,
+            {"SRC.TRG_T1": {"TRIGGER": "TGT.TRG_T1"}},
+            True,
+        )
+        self.assertEqual(summary["selected_missing"], 1)
+        self.assertEqual(rows[0].status, "SELECTED_MISSING")
+        self.assertIn("SRC.TRG_T1", rows[0].detail)
+
     def test_dump_oracle_metadata_keeps_instead_of_view_trigger_in_scope(self):
         class FakeCursor:
             def __init__(self):
@@ -11082,6 +11311,30 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(missing_entries, [])
         self.assertTrue(any(row[0] == "TRIGGER_KEEP" for row in detail_rows))
         self.assertTrue(any(row[0] == "TRIGGER_PARENT" for row in detail_rows))
+
+    def test_build_scoped_trigger_keep_nodes_resolves_target_name(self):
+        source_objects = {
+            "SRC.TRG_T1": {"TRIGGER"},
+            "SRC.T1": {"TABLE"},
+        }
+        object_parent_map = {
+            "SRC.TRG_T1": "SRC.T1",
+        }
+        full_object_mapping = {
+            "SRC.TRG_T1": {"TRIGGER": "TGT.TRG_T1"},
+        }
+        keep_nodes, detail_rows, missing_entries = sdr.build_scoped_trigger_keep_nodes(
+            {"TGT.TRG_T1"},
+            source_objects,
+            object_parent_map,
+            full_object_mapping,
+        )
+        self.assertEqual(
+            keep_nodes,
+            {("SRC.TRG_T1", "TRIGGER"), ("SRC.T1", "TABLE")}
+        )
+        self.assertEqual(missing_entries, [])
+        self.assertTrue(any("TARGET_NAME" in row[3] for row in detail_rows if row[0] == "TRIGGER_KEEP"))
 
     def test_build_source_scope_closure_includes_dependencies_attached_and_paired(self):
         source_objects = {
@@ -20574,7 +20827,6 @@ class TestPlsqlQualifiedReferenceRemap(unittest.TestCase):
         self.assertIn('V_SQL := \'SELECT * FROM "SRC"."OBJ$SRC"\';', rewritten)
         self.assertIn('-- keep "SRC"."OBJ$SRC" here', rewritten)
         self.assertIn('FROM "TGT"."OBJ$TGT"', rewritten)
-
 
 if __name__ == "__main__":
     unittest.main()

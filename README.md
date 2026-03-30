@@ -8,6 +8,8 @@
 - 黑名单表重纳管增强：`blacklist_target_existing_policy=rehydrate_if_present` 已进入正式版本；当目标端已存在人工改造后的承接表时，可恢复后续 compare/fixup，并自动保护黑名单改造列不被写回 Oracle 原始语义。
 - 触发器边界更准确：`INSTEAD OF ... ON VIEW` 触发器已纳入正常 compare/fixup；`DATABASE/SCHEMA` 级事件触发器继续保留为人工处理。
 - Oracle 派生表降噪补齐：`RUPD$_*`、`SNAP$_*` 与既有 `MLOG$_*` 一样按系统工件从 compare/fixup 中排除。
+- identity 跨 schema 授权增强：会识别 OB identity 底层 `ISEQ$$_...`，对源端已授 `INSERT` 的 identity 表额外检查目标端 sequence `SELECT` 是否缺失，并输出 `identity_sequence_grant_detail_<ts>.txt` 与 `grants_miss/` 补授权脚本。
+- `remap_root_closure + trigger_list` 收口：`trigger_list` 现在可接受源端名或 remap 后目标名；未解析条目只进入报告不再 fatal。若触发器依赖的目标表尚未创建，首轮只生成 TABLE 脚本，不生成 TRIGGER 脚本，并在 `fixup_skip_summary_<ts>.txt` 中解释跳过原因。
 - README / `readme_config.txt` / 技术文档当前版本号已同步到 `0.9.8.9`。
 
 ## 核心能力
@@ -18,6 +20,7 @@
 - **黑名单表重纳管**：支持 `blacklist_target_existing_policy=rehydrate_if_present`；当源端黑名单表已在目标端被人工改造并创建为 TABLE 时，可恢复后续 compare/fixup，但会自动保护黑名单改造列，避免把 Oracle 原始类型/长度/default/nullability 再写回 OB。
 - **Target Scope 一等公民**：目标端受管 schema 不再等同于 `source_schemas`；会按 remap/full mapping 自动推导，哪怕 remap 到全新的目标 schema，也会继续进入 compare/fixup/report。
 - **依赖与授权**：基于 DBA_DEPENDENCIES/DBA_*_PRIVS 生成缺失依赖与授权脚本。
+- **identity sequence 授权感知**：跨 schema identity 表会额外检查 OB 侧 `ISEQ$$_...` 的 `SELECT` 授权 readiness，避免“表 grant 齐了但 INSERT 仍失败”。
 - **DDL 清洗与兼容**：VIEW DDL 走 DBMS_METADATA，PL/SQL 语法清洗与 Hint 过滤。
 - **DDL 输出格式化**：可选 SQLcl 格式化 fixup DDL（不影响校验与修补逻辑）。
 - **修补脚本执行器**：支持 smart-order、迭代重试、VIEW 链路自动修复、错误报告。
@@ -256,6 +259,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - 普通 `NOT NULL` 收紧默认改为 `plain_not_null_fixup_mode=runnable_if_no_nulls`：先探测目标端是否存在 `NULL`，仅无 `NULL` 时输出可执行 `MODIFY ... NOT NULL`；如需恢复纯 review-first，可改回 `review_only`
 - `main_reports/run_<ts>/column_identity_detail_<ts>.txt`：现有列 identity 差异明细（含 `ALWAYS / BY DEFAULT / BY DEFAULT ON NULL` 模式差异；首版为 review-first）
 - `main_reports/run_<ts>/column_identity_option_detail_<ts>.txt`：现有列 identity 细项差异明细（首批覆盖 `START WITH / INCREMENT BY / CACHE`；仅在 identity 模式一致时比较，首版为 review-first）
+- `main_reports/run_<ts>/identity_sequence_grant_detail_<ts>.txt`：identity 表跨 schema 授权明细（目标端 `ISEQ$$_...` 定位结果、缺失 grant、人工确认项）
 - `main_reports/run_<ts>/column_default_on_null_detail_<ts>.txt`：现有列 `DEFAULT ON NULL` 语义差异明细（双向 compare；首版为 review-first）
 - `main_reports/run_<ts>/column_default_detail_<ts>.txt`：现有列默认值差异明细（仅列级语义，不等同 `DEFAULT ON NULL`）
 - `main_reports/run_<ts>/dependency_detail_<ts>.txt`：依赖差异明细（report_detail_mode=split）
@@ -282,6 +286,8 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - 如果触发器字符串字面量完整等于 `SCHEMA.OBJECT`，也会按 remap 自动改写，例如 `'LIFEBASE.T1' -> 'BASEDATA.T1'`。
 - 如果字符串字面量是 `SCHEMA.OBJECT.COLUMN` 三段式路径，程序默认不自动改写，避免把列名、协议文本或日志内容误改坏；这类情况会输出到 `triggers_literal_object_path_detail_<ts>.txt` 供人工确认。
 - 如果源端触发器是 `DATABASE/SCHEMA` 级事件触发器（例如 `BEFORE DROP ON DATABASE`），程序不会再静默漏掉；会输出到 `triggers_non_table_detail_<ts>.txt`，并在 `manual_actions_required_<ts>.txt` 中显式提醒。`INSTEAD OF ... ON VIEW` 会按普通受管触发器参与 compare/fixup。
+- 当 `source_object_scope_mode=remap_root_closure` 且配置了 `trigger_list` 时，`trigger_list` 支持填写源端名或 remap 后目标名；若条目无法在源端或显式 remap 规则中解析，只会写入 `source_scope_detail_<ts>.txt` / `trigger_status_report.txt`，不会再中止整轮运行。
+- 在 scoped trigger 场景下，如果触发器依赖的目标 TABLE/VIEW 尚未创建，首轮只会生成依赖对象脚本；TRIGGER 自身会在 `fixup_skip_summary_<ts>.txt` 中标记为 `base_table_missing` 或同类跳过原因，待依赖补齐后 rerun 再生成 trigger DDL。
 - 触发器中的 `PRAGMA AUTONOMOUS_TRANSACTION` 现在会保留，不再被清洗掉。
 
 ## DDL 清理治理

@@ -115,6 +115,7 @@
 - VIEW 兼容性分析：SYS.OBJ$ / X$ 系统对象视为不支持（用户自建 X$ 对象除外）
 - VIEW 依赖 remap 会同时处理 unquoted / quoted qualified 引用；当同义词终点无法安全解析时，不做 schema-only 盲改，而是优先 fallback 到受管目标同义词对象本身；若仍无法确认，则保留原引用并输出诊断日志
 - 当 `source_object_scope_mode=remap_root_closure` 时，源对象范围不再按 `source_schemas` 全量纳入，而是仅从 `remap_file` 中显式 TABLE/VIEW roots 出发，按依赖/附属关系扩展闭包；闭包外对象（含其相关 INDEX/CONSTRAINT/SYNONYM/SEQUENCE/TRIGGER）整体不进入 compare/fixup/report，`trigger_list` 可作为显式 keep set 保留触发器及其父对象
+- scoped mode 下 `trigger_list` 同时接受源端触发器名与 remap 后目标名；若条目能通过显式 remap 反查到源端 TRIGGER，则继续纳入 scoped closure。无法解析的条目只会进入 `source_scope_detail_<ts>.txt` / `trigger_status_report.txt`，不再 fail-fast 中止整轮运行
 - scoped mode 会输出 `source_scope_detail_<ts>.txt`，记录 remap roots、显式 trigger keep、闭包纳入对象和被过滤对象，供客户核对“不多对象、不少对象”边界
 - 当 `blacklist_target_existing_policy=rehydrate_if_present` 时，若源端阻断型黑名单 TABLE 在目标端已真实存在，则会进入“重纳管”模式：表本体恢复 compare/fixup，但黑名单改造列不会再自动回写 Oracle 原始语义；依赖这些列的 INDEX/CONSTRAINT 转为 manual/report-only，TRIGGER 在 v1 中继续保持人工处理
 - PUBLIC 同义词按 Oracle 语义处理（OB `__public` 归一化为 `PUBLIC`）
@@ -157,6 +158,7 @@
 - 触发器头部 remap 兼容 `CREATE OR REPLACE [NON]EDITIONABLE TRIGGER`
 - `trigger_qualify_schema=false` 的 legacy 最小 remap 分支同样兼容该头部，至少保证 `ON <table>` remap 不受影响
 - `ON <table>` 目标表 remap 与事件头保护解耦，避免将关键字 `ON/OR` 误当对象名补 schema
+- 当 `trigger_list` 命中缺失触发器，但其依赖的目标 TABLE/VIEW 仍缺失时，本轮 fixup 不会生成 trigger DDL；会在 `fixup_skip_summary_<ts>.txt` 中记录 `base_table_missing` / `support_*` 等跳过原因。依赖对象补齐并 rerun 后，缺失触发器会重新进入 runnable trigger fixup 路径
 
 ### 5.8 PROCEDURE/FUNCTION/PACKAGE/TYPE
 - 非 TRIGGER 的 PL/SQL 对象继续使用 `remap_plsql_object_references()`
@@ -184,6 +186,8 @@
 - 视图权限拆分：依赖对象授权输出到 `view_prereq_grants/`，视图自身授权输出到 `view_post_grants/`
 - 视图链路要求 `WITH GRANT OPTION` 的场景会单独标注缺失
 - 依赖推导不再对 PUBLIC 生成授权，仅保留源端显式 PUBLIC 授权
+- 对 identity 表的跨 schema 授权，系统会额外定位目标端底层 `ISEQ$$_...`：当源端存在 `INSERT` 授权而目标端缺少对应 sequence `SELECT` 时，会输出 `identity_sequence_grant_detail_<ts>.txt`，并把 `GRANT SELECT ON <ISEQ$$_...>` 注入 `grants_miss/`
+- identity sequence 定位优先使用目标端 `DBA_OBJECTS.CREATED` 与 `DBA_SEQUENCES` 的同秒候选收敛；若候选不唯一且 identity 选项无法进一步收敛，则保持 report-only，不盲猜 sequence 名
 - 输出 `grants_miss/` 与 `grants_all/`
 
 ---

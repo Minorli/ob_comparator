@@ -1298,6 +1298,29 @@ class GrantPlan(NamedTuple):
     object_target_types: Optional[Dict[str, str]] = None
 
 
+class IdentitySequenceGrantExpectationRow(NamedTuple):
+    grantee: str
+    src_table_full: str
+    tgt_table_full: str
+    identity_columns: Tuple[str, ...]
+    target_sequence: str
+    status: str
+    reason_code: str
+    detail: str
+
+
+class IdentitySequenceGrantDetailRow(NamedTuple):
+    grantee: str
+    src_table_full: str
+    tgt_table_full: str
+    identity_columns: str
+    target_sequence: str
+    status: str
+    reason_code: str
+    detail: str
+    action: str
+
+
 @dataclass(frozen=True)
 class GrantCapabilityDecision:
     support_status: str
@@ -1548,6 +1571,24 @@ def support_state_to_report_type(support_state: str) -> str:
 
 UNSUPPORTED_GRANT_TARGET_REASON_PREFIX = "UNSUPPORTED_TARGET_"
 DEFERRED_GRANT_REASON_TARGET_MISSING_NOT_PLANNED = "DEFERRED_TARGET_MISSING_NOT_PLANNED"
+IDENTITY_SEQUENCE_STATUS_PRESENT = "PRESENT"
+IDENTITY_SEQUENCE_STATUS_MISSING_GRANT = "MISSING_GRANT"
+IDENTITY_SEQUENCE_STATUS_TARGET_TABLE_MISSING = "TARGET_TABLE_MISSING"
+IDENTITY_SEQUENCE_STATUS_TARGET_NOT_IDENTITY = "TARGET_NOT_IDENTITY"
+IDENTITY_SEQUENCE_STATUS_UNRESOLVED = "UNRESOLVED"
+
+IDENTITY_SEQUENCE_REASON_CREATED_MATCH = "IDENTITY_SEQUENCE_CREATED_MATCH"
+IDENTITY_SEQUENCE_REASON_CREATED_OPTION_MATCH = "IDENTITY_SEQUENCE_CREATED_OPTION_MATCH"
+IDENTITY_SEQUENCE_REASON_OBJECT_ID_MATCH = "IDENTITY_SEQUENCE_OBJECT_ID_MATCH"
+IDENTITY_SEQUENCE_REASON_OBJECT_ID_OPTION_MATCH = "IDENTITY_SEQUENCE_OBJECT_ID_OPTION_MATCH"
+IDENTITY_SEQUENCE_REASON_TARGET_TABLE_MISSING = "IDENTITY_TARGET_TABLE_MISSING"
+IDENTITY_SEQUENCE_REASON_TARGET_NOT_IDENTITY = "IDENTITY_TARGET_NOT_IDENTITY"
+IDENTITY_SEQUENCE_REASON_MULTIPLE_IDENTITY_COLUMNS = "IDENTITY_MULTIPLE_COLUMNS"
+IDENTITY_SEQUENCE_REASON_TABLE_CREATED_MISSING = "IDENTITY_TABLE_CREATED_MISSING"
+IDENTITY_SEQUENCE_REASON_NO_SEQUENCE_CREATED_MATCH = "IDENTITY_SEQUENCE_NO_CREATED_MATCH"
+IDENTITY_SEQUENCE_REASON_AMBIGUOUS_CREATED_MATCH = "IDENTITY_SEQUENCE_AMBIGUOUS_CREATED_MATCH"
+IDENTITY_SEQUENCE_REASON_SEQUENCE_QUERY_FAILED = "IDENTITY_SEQUENCE_QUERY_FAILED"
+IDENTITY_SEQUENCE_REASON_TABLE_QUERY_FAILED = "IDENTITY_TABLE_QUERY_FAILED"
 GRANT_CAPABILITY_SUPPORT_SUPPORTED = "SUPPORTED"
 GRANT_CAPABILITY_SUPPORT_SUPPORTED_ALIAS = "SUPPORTED_ALIAS"
 GRANT_CAPABILITY_SUPPORT_UNSUPPORTED = "UNSUPPORTED"
@@ -3238,6 +3279,69 @@ def extract_identity_options_from_table_ddl(
         if options:
             result[col] = options
     return result
+
+
+def collect_identity_column_specs(
+    meta: Union[OracleMetadata, ObMetadata],
+    table_key: Tuple[str, str]
+) -> Dict[str, Dict[str, object]]:
+    owner_u = (table_key[0] or "").upper()
+    table_u = (table_key[1] or "").upper()
+    if not owner_u or not table_u:
+        return {}
+    if hasattr(meta, "table_columns"):
+        column_map = (getattr(meta, "table_columns", {}) or {}).get((owner_u, table_u), {}) or {}
+    else:
+        column_map = (getattr(meta, "tab_columns", {}) or {}).get((owner_u, table_u), {}) or {}
+    identity_modes = (getattr(meta, "identity_modes", {}) or {}).get((owner_u, table_u), {}) or {}
+    identity_options = (getattr(meta, "identity_options", {}) or {}).get((owner_u, table_u), {}) or {}
+
+    specs: Dict[str, Dict[str, object]] = {}
+    for col_name, mode in sorted(identity_modes.items()):
+        col_u = normalize_identifier_name(col_name)
+        if not col_u:
+            continue
+        specs[col_u] = {
+            "mode": normalize_identity_mode(mode),
+            "options": normalize_identity_option_subset(identity_options.get(col_name) or identity_options.get(col_u) or {}),
+        }
+    for col_name, col_meta in sorted((column_map or {}).items()):
+        col_u = normalize_identifier_name(col_name)
+        if not col_u or not is_identity_candidate_column(col_meta):
+            continue
+        entry = specs.setdefault(col_u, {"mode": "", "options": {}})
+        if not entry.get("options"):
+            entry["options"] = normalize_identity_option_subset(
+                identity_options.get(col_name) or identity_options.get(col_u) or {}
+            )
+    return specs
+
+
+def is_identity_backed_table(
+    meta: Union[OracleMetadata, ObMetadata],
+    table_key: Tuple[str, str]
+) -> bool:
+    return bool(collect_identity_column_specs(meta, table_key))
+
+
+def _identity_sequence_locator_options_match(
+    candidate: Dict[str, str],
+    expected_options: Dict[str, str]
+) -> bool:
+    if not expected_options:
+        return True
+    expected_increment = str(expected_options.get(IDENTITY_OPTION_INCREMENT_BY) or "")
+    if expected_increment and str(candidate.get(IDENTITY_OPTION_INCREMENT_BY) or "") != expected_increment:
+        return False
+    expected_cache = str(expected_options.get(IDENTITY_OPTION_CACHE) or "")
+    if expected_cache:
+        candidate_cache = str(candidate.get(IDENTITY_OPTION_CACHE) or "")
+        if expected_cache == "NOCACHE":
+            if candidate_cache not in {"NOCACHE", "0"}:
+                return False
+        elif candidate_cache != expected_cache:
+            return False
+    return True
 
 
 def extract_default_on_null_columns_from_table_ddl(
@@ -7846,6 +7950,51 @@ def build_non_table_trigger_map(
     return result
 
 
+def resolve_trigger_list_entry_source_full(
+    entry: str,
+    source_objects: Optional[SourceObjectMap],
+    full_object_mapping: Optional[FullObjectMapping] = None,
+    remap_rules: Optional[RemapRules] = None,
+) -> Tuple[Optional[str], str]:
+    """
+    将 trigger_list 条目解析为源端触发器全名。
+
+    支持两种输入：
+    - 源端名：SRC_SCHEMA.TRIGGER_NAME
+    - 目标端 remap 后名字：TGT_SCHEMA.TRIGGER_NAME
+    """
+    entry_u = (entry or "").upper().strip()
+    if not entry_u:
+        return None, "EMPTY"
+    source_objects = source_objects or {}
+    source_types = {
+        (obj_type or "").upper()
+        for obj_type in source_objects.get(entry_u, set())
+        if obj_type
+    }
+    if "TRIGGER" in source_types:
+        return entry_u, "SOURCE"
+
+    mapped_source = None
+    if full_object_mapping:
+        mapped_source = find_source_by_target(full_object_mapping, entry_u, "TRIGGER")
+    if not mapped_source and remap_rules:
+        for src_full, tgt_full in (remap_rules or {}).items():
+            if (tgt_full or "").upper() == entry_u:
+                mapped_source = src_full
+                break
+    mapped_source_u = (mapped_source or "").upper().strip()
+    if mapped_source_u:
+        mapped_types = {
+            (obj_type or "").upper()
+            for obj_type in source_objects.get(mapped_source_u, set())
+            if obj_type
+        }
+        if "TRIGGER" in mapped_types:
+            return mapped_source_u, "TARGET_REMAP"
+    return None, "UNRESOLVED"
+
+
 def collect_missing_trigger_mappings(
     extra_results: ExtraCheckResults
 ) -> Tuple[Dict[str, str], Set[str], int]:
@@ -8020,6 +8169,11 @@ def build_trigger_list_report(
     source_triggers = build_trigger_full_set(oracle_meta.triggers or {})
     source_non_table_triggers = build_non_table_trigger_map(oracle_meta.non_table_triggers or ())
     source_trigger_all = set(source_triggers) | set(source_non_table_triggers)
+    source_trigger_objects: SourceObjectMap = defaultdict(set)
+    for src_full in source_triggers:
+        source_trigger_objects[src_full].add("TRIGGER")
+    for src_full in source_non_table_triggers:
+        source_trigger_objects[src_full].add("TRIGGER")
     target_triggers = build_trigger_full_set(ob_meta.triggers or {})
 
     selected_missing_targets: Set[str] = set()
@@ -8029,27 +8183,38 @@ def build_trigger_list_report(
 
     for entry in sorted(entries):
         entry_u = entry.upper()
-        if entry_u in missing_src_set:
-            tgt_full = src_to_tgt.get(entry_u)
+        resolved_src_u, resolution_mode = resolve_trigger_list_entry_source_full(
+            entry_u,
+            source_trigger_objects,
+            full_object_mapping,
+        )
+        matched_src_u = resolved_src_u or entry_u
+        resolution_detail = ""
+        if resolution_mode == "TARGET_REMAP" and resolved_src_u:
+            resolution_detail = f" (source={resolved_src_u})"
+
+        if matched_src_u in missing_src_set:
+            tgt_full = src_to_tgt.get(matched_src_u)
             if tgt_full:
                 selected_missing_targets.add(tgt_full)
             rows.append(TriggerListReportRow(
                 entry=entry_u,
                 status="SELECTED_MISSING",
-                detail=f"目标缺失: {tgt_full}" if tgt_full else "目标缺失"
+                detail=(f"目标缺失: {tgt_full}" if tgt_full else "目标缺失") + resolution_detail
             ))
             continue
         if entry_u in missing_targets:
-            src_full = missing_by_tgt.get(entry_u)
+            src_full = missing_by_tgt.get(entry_u) or resolved_src_u
             selected_missing_targets.add(entry_u)
             rows.append(TriggerListReportRow(
                 entry=entry_u,
                 status="SELECTED_MISSING",
-                detail=f"源触发器: {src_full}" if src_full else "目标缺失"
+                detail=(f"源触发器: {src_full}" if src_full else "目标缺失")
             ))
             continue
-        if entry_u in source_non_table_triggers:
-            detail_row = source_non_table_triggers[entry_u]
+        non_table_key = matched_src_u if matched_src_u in source_non_table_triggers else entry_u
+        if non_table_key in source_non_table_triggers:
+            detail_row = source_non_table_triggers[non_table_key]
             non_table += 1
             rows.append(TriggerListReportRow(
                 entry=entry_u,
@@ -8057,10 +8222,10 @@ def build_trigger_list_report(
                 detail=(
                     f"源端为非表触发器(base_object_type={detail_row.base_object_type or '-'}, "
                     f"event={detail_row.triggering_event or '-'})，不在普通 TABLE 触发器生成范围"
-                )
+                ) + resolution_detail
             ))
             continue
-        if entry_u not in source_trigger_all:
+        if matched_src_u not in source_trigger_all:
             if entry_u in target_triggers:
                 not_missing += 1
                 rows.append(TriggerListReportRow(
@@ -8077,20 +8242,20 @@ def build_trigger_list_report(
                 ))
             continue
 
-        target_full = get_mapped_target(full_object_mapping, entry_u, 'TRIGGER') or entry_u
+        target_full = get_mapped_target(full_object_mapping, matched_src_u, 'TRIGGER') or matched_src_u
         if target_full.upper() in target_triggers:
             not_missing += 1
             rows.append(TriggerListReportRow(
                 entry=entry_u,
                 status="EXISTS_IN_TARGET",
-                detail=f"目标端已存在: {target_full.upper()}"
+                detail=f"目标端已存在: {target_full.upper()}{resolution_detail}"
             ))
         else:
             not_missing += 1
             rows.append(TriggerListReportRow(
                 entry=entry_u,
                 status="NOT_MISSING_OR_OUT_OF_SCOPE",
-                detail="未在缺失清单中或不在本次校验范围"
+                detail=f"未在缺失清单中或不在本次校验范围{resolution_detail}"
             ))
 
     summary["selected_missing"] = len(selected_missing_targets)
@@ -8967,7 +9132,9 @@ def build_remap_root_seed_nodes(
 def build_scoped_trigger_keep_nodes(
     trigger_entries: Optional[Set[str]],
     source_objects: Optional[SourceObjectMap],
-    object_parent_map: Optional["ObjectParentMap"]
+    object_parent_map: Optional["ObjectParentMap"],
+    full_object_mapping: Optional[FullObjectMapping] = None,
+    remap_rules: Optional[RemapRules] = None,
 ) -> Tuple[Set[DependencyNode], List[Tuple[str, str, str, str]], List[str]]:
     """
     返回:
@@ -8982,17 +9149,21 @@ def build_scoped_trigger_keep_nodes(
     object_parent_map = object_parent_map or {}
     for full_name in sorted(trigger_entries or set()):
         full_u = (full_name or "").upper()
-        trigger_types = {
-            (obj_type or "").upper()
-            for obj_type in source_objects.get(full_u, set())
-            if (obj_type or "").upper() == "TRIGGER"
-        }
-        if not trigger_types:
+        resolved_source_full, resolution_mode = resolve_trigger_list_entry_source_full(
+            full_u,
+            source_objects,
+            full_object_mapping,
+            remap_rules,
+        )
+        if not resolved_source_full:
             missing_entries.append(full_u)
             continue
-        keep_nodes.add((full_u, "TRIGGER"))
-        detail_rows.append(("TRIGGER_KEEP", "TRIGGER", full_u, "EXPLICIT_TRIGGER_LIST"))
-        parent_full = (object_parent_map.get(full_u) or "").upper()
+        keep_nodes.add((resolved_source_full, "TRIGGER"))
+        keep_detail = "EXPLICIT_TRIGGER_LIST"
+        if resolution_mode == "TARGET_REMAP":
+            keep_detail = f"EXPLICIT_TRIGGER_LIST_TARGET_NAME:{full_u}"
+        detail_rows.append(("TRIGGER_KEEP", "TRIGGER", resolved_source_full, keep_detail))
+        parent_full = (object_parent_map.get(resolved_source_full) or "").upper()
         if not parent_full:
             continue
         parent_types = {
@@ -9002,7 +9173,7 @@ def build_scoped_trigger_keep_nodes(
         }
         for parent_type in sorted(parent_types):
             keep_nodes.add((parent_full, parent_type))
-            detail_rows.append(("TRIGGER_PARENT", parent_type, parent_full, f"EXPLICIT_TRIGGER_LIST:{full_u}"))
+            detail_rows.append(("TRIGGER_PARENT", parent_type, parent_full, f"EXPLICIT_TRIGGER_LIST:{resolved_source_full}"))
     return keep_nodes, detail_rows, missing_entries
 
 
@@ -16181,6 +16352,290 @@ def load_ob_grant_catalog(
     )
 
 
+def locate_target_identity_sequences(
+    ob_cfg: ObConfig,
+    ob_meta: ObMetadata,
+    target_tables: Set[Tuple[str, str]],
+) -> Dict[Tuple[str, str], IdentitySequenceGrantExpectationRow]:
+    results: Dict[Tuple[str, str], IdentitySequenceGrantExpectationRow] = {}
+    normalized_tables = {
+        ((owner or "").upper(), (table or "").upper())
+        for owner, table in (target_tables or set())
+        if (owner or "").strip() and (table or "").strip()
+    }
+    if not normalized_tables:
+        return results
+
+    existing_tables = {
+        (full_name or "").upper()
+        for full_name in ((ob_meta.objects_by_type or {}).get("TABLE", set()) or set())
+        if full_name
+    }
+    pending_by_owner: Dict[str, Set[str]] = defaultdict(set)
+    for owner_u, table_u in sorted(normalized_tables):
+        tgt_full = f"{owner_u}.{table_u}"
+        specs = collect_identity_column_specs(ob_meta, (owner_u, table_u))
+        identity_cols = tuple(sorted(specs.keys()))
+        if tgt_full not in existing_tables:
+            results[(owner_u, table_u)] = IdentitySequenceGrantExpectationRow(
+                grantee="",
+                src_table_full="",
+                tgt_table_full=tgt_full,
+                identity_columns=identity_cols,
+                target_sequence="",
+                status=IDENTITY_SEQUENCE_STATUS_TARGET_TABLE_MISSING,
+                reason_code=IDENTITY_SEQUENCE_REASON_TARGET_TABLE_MISSING,
+                detail="target_table_missing",
+            )
+            continue
+        if not specs:
+            results[(owner_u, table_u)] = IdentitySequenceGrantExpectationRow(
+                grantee="",
+                src_table_full="",
+                tgt_table_full=tgt_full,
+                identity_columns=(),
+                target_sequence="",
+                status=IDENTITY_SEQUENCE_STATUS_TARGET_NOT_IDENTITY,
+                reason_code=IDENTITY_SEQUENCE_REASON_TARGET_NOT_IDENTITY,
+                detail="target_table_has_no_identity_metadata",
+            )
+            continue
+        pending_by_owner[owner_u].add(table_u)
+
+    table_created_map: Dict[Tuple[str, str], str] = {}
+    table_object_id_map: Dict[Tuple[str, str], str] = {}
+    seq_candidates_by_owner: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+
+    for owner_u, table_names in sorted(pending_by_owner.items()):
+        table_list = ",".join(sql_quote_literal(name) for name in sorted(table_names))
+        obj_sql = textwrap.dedent(f"""
+            SELECT OWNER, OBJECT_NAME, OBJECT_TYPE, TO_CHAR(CREATED, 'YYYY-MM-DD HH24:MI:SS'), OBJECT_ID
+            FROM DBA_OBJECTS
+            WHERE OWNER = {sql_quote_literal(owner_u)}
+              AND (
+                    (OBJECT_TYPE = 'TABLE' AND OBJECT_NAME IN ({table_list}))
+                 OR (OBJECT_TYPE = 'SEQUENCE' AND OBJECT_NAME LIKE 'ISEQ$$_%')
+              )
+        """).strip()
+        ok, out, err = obclient_run_sql(ob_cfg, obj_sql)
+        if not ok:
+            for table_u in sorted(table_names):
+                tgt_full = f"{owner_u}.{table_u}"
+                specs = collect_identity_column_specs(ob_meta, (owner_u, table_u))
+                results[(owner_u, table_u)] = IdentitySequenceGrantExpectationRow(
+                    grantee="",
+                    src_table_full="",
+                    tgt_table_full=tgt_full,
+                    identity_columns=tuple(sorted(specs.keys())),
+                    target_sequence="",
+                    status=IDENTITY_SEQUENCE_STATUS_UNRESOLVED,
+                    reason_code=IDENTITY_SEQUENCE_REASON_TABLE_QUERY_FAILED,
+                    detail=f"dba_objects_failed:{err}",
+                )
+            continue
+        if out:
+            for line in out.splitlines():
+                parts = line.split('\t')
+                if len(parts) < 4:
+                    continue
+                row_owner = (parts[0] or "").strip().upper()
+                object_name = (parts[1] or "").strip().upper()
+                object_type = (parts[2] or "").strip().upper()
+                created_text = (parts[3] or "").strip()
+                object_id_text = (parts[4] or "").strip() if len(parts) > 4 else ""
+                if not row_owner or not object_name or not object_type:
+                    continue
+                if object_type == "TABLE":
+                    table_created_map[(row_owner, object_name)] = created_text
+                    if object_id_text:
+                        table_object_id_map[(row_owner, object_name)] = object_id_text
+                elif object_type == "SEQUENCE":
+                    seq_candidates_by_owner[row_owner].append({
+                        "sequence_name": object_name,
+                        "created": created_text,
+                        "object_id": object_id_text,
+                    })
+
+        seq_sql = textwrap.dedent(f"""
+            SELECT SEQUENCE_OWNER, SEQUENCE_NAME, MIN_VALUE, MAX_VALUE, INCREMENT_BY, CACHE_SIZE, ORDER_FLAG, CYCLE_FLAG
+            FROM DBA_SEQUENCES
+            WHERE SEQUENCE_OWNER = {sql_quote_literal(owner_u)}
+              AND SEQUENCE_NAME LIKE 'ISEQ$$_%'
+        """).strip()
+        ok, out, err = obclient_run_sql(ob_cfg, seq_sql)
+        if not ok:
+            for table_u in sorted(table_names):
+                if (owner_u, table_u) in results:
+                    continue
+                tgt_full = f"{owner_u}.{table_u}"
+                specs = collect_identity_column_specs(ob_meta, (owner_u, table_u))
+                results[(owner_u, table_u)] = IdentitySequenceGrantExpectationRow(
+                    grantee="",
+                    src_table_full="",
+                    tgt_table_full=tgt_full,
+                    identity_columns=tuple(sorted(specs.keys())),
+                    target_sequence="",
+                    status=IDENTITY_SEQUENCE_STATUS_UNRESOLVED,
+                    reason_code=IDENTITY_SEQUENCE_REASON_SEQUENCE_QUERY_FAILED,
+                    detail=f"dba_sequences_failed:{err}",
+                )
+            continue
+        seq_attrs: Dict[str, Dict[str, str]] = {}
+        if out:
+            for line in out.splitlines():
+                parts = line.split('\t')
+                if len(parts) < 8:
+                    continue
+                seq_owner = (parts[0] or "").strip().upper()
+                seq_name = (parts[1] or "").strip().upper()
+                if not seq_owner or not seq_name:
+                    continue
+                seq_attrs[seq_name] = {
+                    IDENTITY_OPTION_INCREMENT_BY: (parts[4] or "").strip(),
+                    IDENTITY_OPTION_CACHE: (parts[5] or "").strip(),
+                    "MIN_VALUE": (parts[2] or "").strip(),
+                    "MAX_VALUE": (parts[3] or "").strip(),
+                    "ORDER_FLAG": (parts[6] or "").strip(),
+                    "CYCLE_FLAG": (parts[7] or "").strip(),
+                }
+        for entry in seq_candidates_by_owner.get(owner_u, []):
+            seq_name = (entry.get("sequence_name") or "").upper()
+            if seq_name in seq_attrs:
+                entry.update(seq_attrs[seq_name])
+
+    for owner_u, table_u in sorted(normalized_tables):
+        if (owner_u, table_u) in results:
+            continue
+        tgt_full = f"{owner_u}.{table_u}"
+        specs = collect_identity_column_specs(ob_meta, (owner_u, table_u))
+        identity_cols = tuple(sorted(specs.keys()))
+        if len(identity_cols) != 1:
+            results[(owner_u, table_u)] = IdentitySequenceGrantExpectationRow(
+                grantee="",
+                src_table_full="",
+                tgt_table_full=tgt_full,
+                identity_columns=identity_cols,
+                target_sequence="",
+                status=IDENTITY_SEQUENCE_STATUS_UNRESOLVED,
+                reason_code=IDENTITY_SEQUENCE_REASON_MULTIPLE_IDENTITY_COLUMNS,
+                detail="multiple_identity_columns" if identity_cols else "identity_columns_missing",
+            )
+            continue
+        expected_options = normalize_identity_option_subset(specs.get(identity_cols[0], {}).get("options") or {})
+        object_id_text = (table_object_id_map.get((owner_u, table_u), "") or "").strip()
+        if object_id_text:
+            prefix = f"ISEQ$$_{object_id_text}_"
+            object_id_candidates = [
+                item for item in (seq_candidates_by_owner.get(owner_u, []) or [])
+                if (item.get("sequence_name") or "").upper().startswith(prefix)
+            ]
+            if len(object_id_candidates) > 1 and expected_options:
+                filtered = [
+                    item for item in object_id_candidates
+                    if _identity_sequence_locator_options_match(item, expected_options)
+                ]
+                if len(filtered) == 1:
+                    seq_name = (filtered[0].get("sequence_name") or "").upper()
+                    results[(owner_u, table_u)] = IdentitySequenceGrantExpectationRow(
+                        grantee="",
+                        src_table_full="",
+                        tgt_table_full=tgt_full,
+                        identity_columns=identity_cols,
+                        target_sequence=f"{owner_u}.{seq_name}",
+                        status=IDENTITY_SEQUENCE_STATUS_PRESENT,
+                        reason_code=IDENTITY_SEQUENCE_REASON_OBJECT_ID_OPTION_MATCH,
+                        detail=f"object_id={object_id_text}; options={format_identity_option_subset(expected_options)}",
+                    )
+                    continue
+                object_id_candidates = filtered or object_id_candidates
+            if len(object_id_candidates) == 1:
+                seq_name = (object_id_candidates[0].get("sequence_name") or "").upper()
+                results[(owner_u, table_u)] = IdentitySequenceGrantExpectationRow(
+                    grantee="",
+                    src_table_full="",
+                    tgt_table_full=tgt_full,
+                    identity_columns=identity_cols,
+                    target_sequence=f"{owner_u}.{seq_name}",
+                    status=IDENTITY_SEQUENCE_STATUS_PRESENT,
+                    reason_code=IDENTITY_SEQUENCE_REASON_OBJECT_ID_MATCH,
+                    detail=f"object_id={object_id_text}",
+                )
+                continue
+        created_text = table_created_map.get((owner_u, table_u), "")
+        if not created_text:
+            results[(owner_u, table_u)] = IdentitySequenceGrantExpectationRow(
+                grantee="",
+                src_table_full="",
+                tgt_table_full=tgt_full,
+                identity_columns=identity_cols,
+                target_sequence="",
+                status=IDENTITY_SEQUENCE_STATUS_UNRESOLVED,
+                reason_code=IDENTITY_SEQUENCE_REASON_TABLE_CREATED_MISSING,
+                detail="table_created_missing",
+            )
+            continue
+        candidates = [
+            item for item in (seq_candidates_by_owner.get(owner_u, []) or [])
+            if (item.get("created") or "") == created_text
+        ]
+        if not candidates:
+            results[(owner_u, table_u)] = IdentitySequenceGrantExpectationRow(
+                grantee="",
+                src_table_full="",
+                tgt_table_full=tgt_full,
+                identity_columns=identity_cols,
+                target_sequence="",
+                status=IDENTITY_SEQUENCE_STATUS_UNRESOLVED,
+                reason_code=IDENTITY_SEQUENCE_REASON_NO_SEQUENCE_CREATED_MATCH,
+                detail=f"created={created_text}",
+            )
+            continue
+        if len(candidates) > 1 and expected_options:
+            filtered = [
+                item for item in candidates
+                if _identity_sequence_locator_options_match(item, expected_options)
+            ]
+            if len(filtered) == 1:
+                seq_name = (filtered[0].get("sequence_name") or "").upper()
+                results[(owner_u, table_u)] = IdentitySequenceGrantExpectationRow(
+                    grantee="",
+                    src_table_full="",
+                    tgt_table_full=tgt_full,
+                    identity_columns=identity_cols,
+                    target_sequence=f"{owner_u}.{seq_name}",
+                    status=IDENTITY_SEQUENCE_STATUS_PRESENT,
+                    reason_code=IDENTITY_SEQUENCE_REASON_CREATED_OPTION_MATCH,
+                    detail=f"created={created_text}; options={format_identity_option_subset(expected_options)}",
+                )
+                continue
+            candidates = filtered or candidates
+        if len(candidates) == 1:
+            seq_name = (candidates[0].get("sequence_name") or "").upper()
+            results[(owner_u, table_u)] = IdentitySequenceGrantExpectationRow(
+                grantee="",
+                src_table_full="",
+                tgt_table_full=tgt_full,
+                identity_columns=identity_cols,
+                target_sequence=f"{owner_u}.{seq_name}",
+                status=IDENTITY_SEQUENCE_STATUS_PRESENT,
+                reason_code=IDENTITY_SEQUENCE_REASON_CREATED_MATCH,
+                detail=f"created={created_text}",
+            )
+            continue
+        preview = ",".join(sorted((item.get("sequence_name") or "").upper() for item in candidates if item.get("sequence_name"))[:10])
+        results[(owner_u, table_u)] = IdentitySequenceGrantExpectationRow(
+            grantee="",
+            src_table_full="",
+            tgt_table_full=tgt_full,
+            identity_columns=identity_cols,
+            target_sequence="",
+            status=IDENTITY_SEQUENCE_STATUS_UNRESOLVED,
+            reason_code=IDENTITY_SEQUENCE_REASON_AMBIGUOUS_CREATED_MATCH,
+            detail=f"created={created_text}; candidates={preview}",
+        )
+    return results
+
+
 def load_ob_object_privileges_by_owners(
     ob_cfg: ObConfig,
     owners: Set[str]
@@ -20984,6 +21439,148 @@ def build_grant_plan(
         view_grant_targets=view_grant_targets,
         object_target_types=object_target_types,
     )
+
+
+def augment_grant_plan_with_identity_sequence_grants(
+    grant_plan: Optional[GrantPlan],
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata,
+    ob_cfg: ObConfig,
+    full_object_mapping: FullObjectMapping,
+) -> Tuple[Optional[GrantPlan], List[IdentitySequenceGrantExpectationRow]]:
+    if not grant_plan:
+        return grant_plan, []
+
+    object_target_types = dict(grant_plan.object_target_types or {})
+    updated_object_grants: Dict[str, Set[ObjectGrantEntry]] = {
+        (grantee or "").upper(): set(entries or set())
+        for grantee, entries in (grant_plan.object_grants or {}).items()
+        if (grantee or "").strip()
+    }
+    candidates: List[Tuple[str, str, str, Tuple[str, ...]]] = []
+    target_table_keys: Set[Tuple[str, str]] = set()
+
+    for grantee, entries in sorted(updated_object_grants.items()):
+        grantee_u = (grantee or "").upper()
+        for entry in sorted(entries, key=lambda item: ((item.object_full or "").upper(), (item.privilege or "").upper(), "1" if item.grantable else "0")):
+            privilege_u = (entry.privilege or "").upper()
+            target_full_u = (entry.object_full or "").upper()
+            if privilege_u != "INSERT" or "." not in target_full_u:
+                continue
+            if object_target_types.get(target_full_u, "") != "TABLE":
+                continue
+            target_owner_u, target_table_u = target_full_u.split(".", 1)
+            if grantee_u == target_owner_u:
+                continue
+            src_table_full = find_source_by_target(full_object_mapping, target_full_u, "TABLE")
+            if not src_table_full or "." not in src_table_full:
+                continue
+            src_owner_u, src_table_u = src_table_full.upper().split(".", 1)
+            if not is_identity_backed_table(oracle_meta, (src_owner_u, src_table_u)):
+                continue
+            specs = collect_identity_column_specs(oracle_meta, (src_owner_u, src_table_u))
+            identity_cols = tuple(sorted(specs.keys()))
+            target_table_keys.add((target_owner_u, target_table_u))
+            candidates.append((grantee_u, f"{src_owner_u}.{src_table_u}", target_full_u, identity_cols))
+
+    if not candidates:
+        return grant_plan, []
+
+    locator_rows = locate_target_identity_sequences(ob_cfg, ob_meta, target_table_keys)
+    expectation_rows: List[IdentitySequenceGrantExpectationRow] = []
+
+    for grantee_u, src_table_full, tgt_table_full, identity_cols in candidates:
+        tgt_owner_u, tgt_table_u = tgt_table_full.split(".", 1)
+        locator = locator_rows.get((tgt_owner_u, tgt_table_u))
+        if not locator:
+            expectation_rows.append(
+                IdentitySequenceGrantExpectationRow(
+                    grantee=grantee_u,
+                    src_table_full=src_table_full,
+                    tgt_table_full=tgt_table_full,
+                    identity_columns=identity_cols,
+                    target_sequence="",
+                    status=IDENTITY_SEQUENCE_STATUS_UNRESOLVED,
+                    reason_code=IDENTITY_SEQUENCE_REASON_NO_SEQUENCE_CREATED_MATCH,
+                    detail="locator_missing",
+                )
+            )
+            continue
+        expectation_rows.append(
+            IdentitySequenceGrantExpectationRow(
+                grantee=grantee_u,
+                src_table_full=src_table_full,
+                tgt_table_full=tgt_table_full,
+                identity_columns=identity_cols or locator.identity_columns,
+                target_sequence=(locator.target_sequence or "").upper(),
+                status=locator.status,
+                reason_code=locator.reason_code,
+                detail=locator.detail,
+            )
+        )
+        if locator.status != IDENTITY_SEQUENCE_STATUS_PRESENT or not locator.target_sequence:
+            continue
+        seq_entry = ObjectGrantEntry("SELECT", locator.target_sequence.upper(), False)
+        updated_object_grants.setdefault(grantee_u, set()).add(seq_entry)
+        remember_object_target_type(object_target_types, locator.target_sequence.upper(), "SEQUENCE")
+
+    updated_plan = GrantPlan(
+        object_grants=updated_object_grants,
+        column_grants=dict(grant_plan.column_grants or {}),
+        sys_privs=dict(grant_plan.sys_privs or {}),
+        role_privs=dict(grant_plan.role_privs or {}),
+        role_ddls=list(grant_plan.role_ddls or []),
+        filtered_grants=list(grant_plan.filtered_grants or []),
+        view_grant_targets=set(grant_plan.view_grant_targets or set()),
+        object_target_types=object_target_types,
+    )
+    return updated_plan, expectation_rows
+
+
+def finalize_identity_sequence_grant_rows(
+    expectation_rows: Sequence[IdentitySequenceGrantExpectationRow],
+    object_grants_missing_by_grantee: Optional[Dict[str, Set[ObjectGrantEntry]]] = None,
+) -> List[IdentitySequenceGrantDetailRow]:
+    missing_lookup: Set[Tuple[str, str, str]] = set()
+    for grantee, entries in (object_grants_missing_by_grantee or {}).items():
+        grantee_u = (grantee or "").upper()
+        for entry in (entries or set()):
+            priv_u = (entry.privilege or "").upper()
+            object_u = (entry.object_full or "").upper()
+            if grantee_u and priv_u and object_u:
+                missing_lookup.add((grantee_u, priv_u, object_u))
+
+    rows: List[IdentitySequenceGrantDetailRow] = []
+    for row in expectation_rows or ():
+        status = row.status
+        action = "NO_ACTION"
+        if status == IDENTITY_SEQUENCE_STATUS_PRESENT:
+            key = ((row.grantee or "").upper(), "SELECT", (row.target_sequence or "").upper())
+            if key in missing_lookup:
+                status = IDENTITY_SEQUENCE_STATUS_MISSING_GRANT
+                action = "FIXUP_GRANT"
+            else:
+                action = "NO_ACTION"
+        elif status == IDENTITY_SEQUENCE_STATUS_TARGET_TABLE_MISSING:
+            action = "RERUN_AFTER_TABLE_FIXUP"
+        elif status == IDENTITY_SEQUENCE_STATUS_TARGET_NOT_IDENTITY:
+            action = "CHECK_TABLE_DIFF"
+        else:
+            action = "MANUAL_REVIEW"
+        rows.append(
+            IdentitySequenceGrantDetailRow(
+                grantee=(row.grantee or "").upper() or "-",
+                src_table_full=(row.src_table_full or "").upper() or "-",
+                tgt_table_full=(row.tgt_table_full or "").upper() or "-",
+                identity_columns=",".join(row.identity_columns or ()) or "-",
+                target_sequence=(row.target_sequence or "").upper() or "-",
+                status=status,
+                reason_code=(row.reason_code or "-").upper(),
+                detail=row.detail or "-",
+                action=action,
+            )
+        )
+    return rows
 
 
 def normalize_filtered_grant_reason_token(reason_code: Optional[str]) -> str:
@@ -35698,6 +36295,13 @@ def generate_fixup_scripts(
 
     trigger_tasks: List[Tuple[str, str, str, str, str, str, str]] = []
     unsupported_trigger_tasks: List[Tuple[str, str, str, str, str, str, str, ObjectSupportReportRow]] = []
+    trigger_missing_total = sum(
+        len(item.missing_triggers or set())
+        for item in (extra_results.get("trigger_mismatched", []) or [])
+    )
+    trigger_skip_counts: Dict[str, int] = defaultdict(int)
+    trigger_generated = 0
+    trigger_skip_lock = threading.Lock()
     for item in extra_results.get('trigger_mismatched', []):
         table_str = item.table.split()[0]
         if '.' not in table_str:
@@ -35717,8 +36321,10 @@ def generate_fixup_scripts(
                 tgt_schema_final, tgt_obj = tgt_full.split('.', 1)
                 support_row = support_state_map.get(("TRIGGER", src_full.upper()))
                 if not _trigger_allowed(src_full, tgt_full):
+                    trigger_skip_counts["trigger_list_filtered"] += 1
                     continue
                 if not allow_fixup('TRIGGER', tgt_schema_final, src_schema_u):
+                    trigger_skip_counts["schema_filter"] += 1
                     continue
                 if support_row and support_row.support_state != SUPPORT_STATE_SUPPORTED:
                     if support_row.reason_code == TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON_CODE:
@@ -35726,8 +36332,17 @@ def generate_fixup_scripts(
                         unsupported_trigger_tasks.append(
                             (src_schema_u, src_trg, tgt_schema_final, tgt_obj, src_table, tgt_schema, tgt_table, support_row)
                         )
+                    else:
+                        reason_token = normalize_filtered_grant_reason_token(
+                            support_row.reason_code or support_row.support_state or "unsupported"
+                        ).lower() or "unsupported"
+                        trigger_skip_counts[f"support_{reason_token}"] += 1
                     continue
-                if src_table_key in unsupported_table_keys or src_table_key in missing_target_table_keys:
+                if src_table_key in unsupported_table_keys:
+                    trigger_skip_counts["base_table_unsupported"] += 1
+                    continue
+                if src_table_key in missing_target_table_keys:
+                    trigger_skip_counts["base_table_missing"] += 1
                     continue
                 queue_request(src_schema_u, 'TRIGGER', src_trg)
                 trigger_tasks.append((src_schema_u, src_trg, tgt_schema_final, tgt_obj, src_table, tgt_schema, tgt_table))
@@ -35747,8 +36362,10 @@ def generate_fixup_scripts(
                 tgt_full = f"{tgt_schema_final}.{tgt_obj}"
                 support_row = support_state_map.get(("TRIGGER", src_full.upper()))
                 if not _trigger_allowed(src_full, tgt_full):
+                    trigger_skip_counts["trigger_list_filtered"] += 1
                     continue
                 if not allow_fixup('TRIGGER', tgt_schema_final, src_owner_u):
+                    trigger_skip_counts["schema_filter"] += 1
                     continue
                 if support_row and support_row.support_state != SUPPORT_STATE_SUPPORTED:
                     if support_row.reason_code == TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON_CODE:
@@ -35756,8 +36373,17 @@ def generate_fixup_scripts(
                         unsupported_trigger_tasks.append(
                             (src_owner_u, src_trg_u, tgt_schema_final, tgt_obj, src_table, tgt_schema, tgt_table, support_row)
                         )
+                    else:
+                        reason_token = normalize_filtered_grant_reason_token(
+                            support_row.reason_code or support_row.support_state or "unsupported"
+                        ).lower() or "unsupported"
+                        trigger_skip_counts[f"support_{reason_token}"] += 1
                     continue
-                if src_table_key in unsupported_table_keys or src_table_key in missing_target_table_keys:
+                if src_table_key in unsupported_table_keys:
+                    trigger_skip_counts["base_table_unsupported"] += 1
+                    continue
+                if src_table_key in missing_target_table_keys:
+                    trigger_skip_counts["base_table_missing"] += 1
                     continue
                 queue_request(src_owner_u, 'TRIGGER', src_trg_u)
                 trigger_tasks.append((src_owner_u, src_trg_u, tgt_schema_final, tgt_obj, src_table, tgt_schema, tgt_table))
@@ -35770,6 +36396,7 @@ def generate_fixup_scripts(
         ]
         skipped = before_count - len(trigger_tasks)
         if skipped:
+            trigger_skip_counts["invalid_source"] += skipped
             log.info("[FIXUP] 跳过源端 INVALID 的 TRIGGER %d 个。", skipped)
         before_unsupported_count = len(unsupported_trigger_tasks)
         unsupported_trigger_tasks = [
@@ -37693,6 +38320,7 @@ def generate_fixup_scripts(
             tt=tgt_table,
             sr=support_row,
         ):
+            nonlocal trigger_generated
             try:
                 if (ss.upper(), tn.upper()) in invalid_trigger_keys:
                     if sr:
@@ -37709,6 +38337,9 @@ def generate_fixup_scripts(
                 if not ddl:
                     log.warning("[FIXUP] 未找到 TRIGGER %s.%s 的 dbcat DDL。", ss, tn)
                     mark_source('TRIGGER', 'missing')
+                    if not sr:
+                        with trigger_skip_lock:
+                            trigger_skip_counts["ddl_missing"] += 1
                     return
                 if ddl_source_label.startswith("DBCAT"):
                     mark_source('TRIGGER', 'dbcat')
@@ -37841,6 +38472,8 @@ def generate_fixup_scripts(
                         grants_to_add=sorted(grants_for_trigger) if grants_for_trigger else None,
                         extra_comments=cleanup_comments
                     )
+                    with trigger_skip_lock:
+                        trigger_generated += 1
             finally:
                 if sr:
                     unsupported_trigger_progress()
@@ -37877,6 +38510,18 @@ def generate_fixup_scripts(
             )
         )
     run_tasks(unsupported_trigger_jobs, "TRIGGER_UNSUPPORTED")
+    if fixup_skip_summary is not None and (
+        trigger_missing_total
+        or trigger_tasks
+        or trigger_generated
+        or trigger_skip_counts
+    ):
+        fixup_skip_summary["TRIGGER"] = {
+            "missing_total": int(trigger_missing_total or 0),
+            "task_total": int(len(trigger_tasks) or 0),
+            "generated": int(trigger_generated or 0),
+            "skipped": dict(trigger_skip_counts),
+        }
     if trigger_view_reference_rows:
         dedup_rows = sorted(
             set(trigger_view_reference_rows),
@@ -38743,6 +39388,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "不支持授权明细"
     if name.startswith("target_extra_grants_detail_"):
         return "DETAIL", "目标端额外授权明细"
+    if name.startswith("identity_sequence_grant_detail_"):
+        return "DETAIL", "identity sequence 跨 schema 授权明细"
     if name.startswith("manual_actions_required_"):
         return "DETAIL", "人工处理/确认统一清单"
     if name.startswith("fixup_skip_summary_"):
@@ -41713,6 +42360,42 @@ def export_oracle_privilege_family_detail(
     return write_pipe_report("Oracle 权限族覆盖明细", header_fields, data_rows, output_path)
 
 
+def export_identity_sequence_grant_detail(
+    rows: List[IdentitySequenceGrantDetailRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not report_timestamp or not rows:
+        return None
+    output_path = Path(report_dir) / f"identity_sequence_grant_detail_{report_timestamp}.txt"
+    header_fields = [
+        "GRANTEE",
+        "SRC_TABLE",
+        "TGT_TABLE",
+        "IDENTITY_COLUMNS",
+        "TARGET_SEQUENCE",
+        "STATUS",
+        "REASON_CODE",
+        "DETAIL",
+        "ACTION",
+    ]
+    data_rows = [
+        [
+            row.grantee or "-",
+            row.src_table_full or "-",
+            row.tgt_table_full or "-",
+            row.identity_columns or "-",
+            row.target_sequence or "-",
+            row.status or "-",
+            row.reason_code or "-",
+            row.detail or "-",
+            row.action or "-",
+        ]
+        for row in rows
+    ]
+    return write_pipe_report("identity sequence 跨 schema 授权明细", header_fields, data_rows, output_path)
+
+
 OPERATOR_ACTION_PRIORITY_ORDER = {
     "BLOCKER": 0,
     "PREREQ": 1,
@@ -41739,6 +42422,7 @@ OPERATOR_ACTION_CATEGORY_LABELS = {
     "TRIGGER_TEMP_UNSUPPORTED": "临时表触发器",
     "TRIGGER_VIEW_REVIEW": "触发器视图引用",
     "TRIGGER_LITERAL_REVIEW": "触发器对象路径字符串",
+    "IDENTITY_SEQUENCE_REVIEW": "identity 序列授权定位",
     "SYS_C_FORCE_REVIEW": "SYS_C FORCE 候选",
     "CASE_SENSITIVE_REVIEW": "大小写敏感对象",
     "CONSTRAINT_VALIDATE_LATER": "约束后置 VALIDATE",
@@ -41787,6 +42471,7 @@ def build_operator_action_rows(
     trigger_temp_unsupported_count: int = 0,
     trigger_view_reference_count: int = 0,
     trigger_literal_alert_count: int = 0,
+    identity_sequence_unresolved_count: int = 0,
     sys_c_force_candidate_count: int = 0,
     case_sensitive_findings_count: int = 0,
     deferred_validate_count: int = 0,
@@ -41960,6 +42645,17 @@ def build_operator_action_rows(
         related_fixup_dir="trigger/",
         why="触发器中存在对象路径字符串，程序已保守保留原文，可能仍需人工改造。",
         recommended_action="先核对触发器对象路径字符串明细，再决定是否直接执行 trigger/。",
+    )
+    _add(
+        priority="REVIEW",
+        stage="POST_COMPARE_REVIEW",
+        category="IDENTITY_SEQUENCE_REVIEW",
+        count=identity_sequence_unresolved_count,
+        default_behavior="REPORT_ONLY",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "identity_sequence_grant_detail"),
+        related_fixup_dir="grants_miss/",
+        why="跨 schema identity 表插入可能需要底层 ISEQ$$_... 授权，但当前无法可靠定位目标序列。",
+        recommended_action="先看 identity sequence 授权明细，人工确认目标 ISEQ$$_... 并补授权。",
     )
     _add(
         priority="REVIEW",
@@ -44003,6 +44699,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "GRANT_CAPABILITY_DETAIL"
     if name.startswith("oracle_privilege_family_detail_"):
         return "ORACLE_PRIVILEGE_FAMILY_DETAIL"
+    if name.startswith("identity_sequence_grant_detail_"):
+        return "IDENTITY_SEQUENCE_GRANT_DETAIL"
     if name.startswith("manual_actions_required_"):
         return "MANUAL_ACTION_REQUIRED"
     if name.startswith("ddl_cleanup_detail_"):
@@ -47035,17 +47733,21 @@ def build_run_summary(
             findings.append(
                 f"目标端额外对象授权: {extra_object_grant_count} 条 (PUBLIC={extra_public_grant_count})"
             )
-    if fixup_skip_summary and fixup_skip_summary.get("INDEX"):
-        idx_summary = fixup_skip_summary.get("INDEX") or {}
-        skipped_map = idx_summary.get("skipped", {}) or {}
-        skipped_total = sum(int(v or 0) for v in skipped_map.values())
-        findings.append(
-            "INDEX 修补: 缺失 {missing}, 生成 {generated}, 跳过 {skipped}".format(
-                missing=idx_summary.get("missing_total", 0),
-                generated=idx_summary.get("generated", 0),
-                skipped=skipped_total
+    if fixup_skip_summary:
+        for obj_type in ("INDEX", "TRIGGER", "SYNONYM"):
+            obj_summary = fixup_skip_summary.get(obj_type) or {}
+            if not obj_summary:
+                continue
+            skipped_map = obj_summary.get("skipped", {}) or {}
+            skipped_total = sum(int(v or 0) for v in skipped_map.values())
+            findings.append(
+                "{obj_type} 修补: 缺失 {missing}, 生成 {generated}, 跳过 {skipped}".format(
+                    obj_type=obj_type,
+                    missing=obj_summary.get("missing_total", 0),
+                    generated=obj_summary.get("generated", 0),
+                    skipped=skipped_total
+                )
             )
-        )
 
     if trigger_summary.get("enabled"):
         if trigger_summary.get("fallback_full"):
@@ -47150,12 +47852,12 @@ def build_run_summary(
                 all=Path(ctx.fixup_dir) / 'grants_all'
             )
         )
-    if fixup_skip_summary and fixup_skip_summary.get("INDEX"):
+    if fixup_skip_summary and any(fixup_skip_summary.get(obj_type) for obj_type in ("INDEX", "TRIGGER", "SYNONYM")):
         if report_file:
             report_parent = Path(report_file).parent
-            _append_unique_guide_step(next_steps, f"如索引脚本数量和预期不符，再看 {report_parent}/fixup_skip_summary_*.txt。")
+            _append_unique_guide_step(next_steps, f"如脚本数量和预期不符，再看 {report_parent}/fixup_skip_summary_*.txt。")
         else:
-            _append_unique_guide_step(next_steps, "如索引脚本数量和预期不符，再看 fixup_skip_summary_*.txt。")
+            _append_unique_guide_step(next_steps, "如脚本数量和预期不符，再看 fixup_skip_summary_*.txt。")
     if unsupported_by_type:
         if report_file:
             report_parent = Path(report_file).parent
@@ -47607,6 +48309,11 @@ def print_final_report(
         1 for row in privilege_family_rows
         if (row.migration_mode or "").upper() != "RUNNABLE"
     )
+    identity_sequence_grant_rows = list((settings or {}).get("_identity_sequence_grant_rows") or [])
+    identity_sequence_unresolved_count = sum(
+        1 for row in identity_sequence_grant_rows
+        if (row.status or "").upper() == IDENTITY_SEQUENCE_STATUS_UNRESOLVED
+    )
     deferred_validate_count = int((settings or {}).get("_constraint_validate_deferred_count", 0) or 0)
     generated_fixup_dirs = list((settings or {}).get("_generated_fixup_dirs") or [])
     report_parent_path = Path(report_file).parent if report_file else None
@@ -47631,6 +48338,7 @@ def print_final_report(
         trigger_temp_unsupported_count=len(temp_trigger_unsupported_rows),
         trigger_view_reference_count=trigger_view_reference_count,
         trigger_literal_alert_count=trigger_literal_alert_count,
+        identity_sequence_unresolved_count=identity_sequence_unresolved_count,
         sys_c_force_candidate_count=sys_c_force_candidate_count,
         case_sensitive_findings_count=case_sensitive_findings_count,
         deferred_validate_count=deferred_validate_count,
@@ -48281,18 +48989,22 @@ def print_final_report(
         console.print(diag_table)
         console.print("")
 
-    if fixup_skip_summary and fixup_skip_summary.get("INDEX"):
-        idx_summary = fixup_skip_summary.get("INDEX") or {}
-        skip_table = Table(title="[header]0.d Fixup 跳过汇总 (INDEX)[/header]", width=section_width)
-        skip_table.add_column("指标", style="info", width=36)
+    if fixup_skip_summary and any(fixup_skip_summary.get(obj_type) for obj_type in ("INDEX", "TRIGGER", "SYNONYM")):
+        skip_table = Table(title="[header]0.d Fixup 跳过汇总[/header]", width=section_width)
+        skip_table.add_column("对象类型", style="info", width=12)
+        skip_table.add_column("指标", style="info", width=28)
         skip_table.add_column("数量", justify="right")
-        skip_table.add_row("缺失总数", str(idx_summary.get("missing_total", 0)))
-        skip_table.add_row("进入生成任务", str(idx_summary.get("task_total", 0)))
-        skip_table.add_row("实际生成脚本", str(idx_summary.get("generated", 0)))
-        skipped_map = idx_summary.get("skipped", {}) or {}
-        if skipped_map:
-            for reason, count in sorted(skipped_map.items()):
-                skip_table.add_row(f"跳过: {reason}", str(count))
+        for obj_type in ("INDEX", "TRIGGER", "SYNONYM"):
+            obj_summary = fixup_skip_summary.get(obj_type) or {}
+            if not obj_summary:
+                continue
+            skip_table.add_row(obj_type, "缺失总数", str(obj_summary.get("missing_total", 0)))
+            skip_table.add_row(obj_type, "进入生成任务", str(obj_summary.get("task_total", 0)))
+            skip_table.add_row(obj_type, "实际生成脚本", str(obj_summary.get("generated", 0)))
+            skipped_map = obj_summary.get("skipped", {}) or {}
+            if skipped_map:
+                for reason, count in sorted(skipped_map.items()):
+                    skip_table.add_row(obj_type, f"跳过: {reason}", str(count))
         console.print(skip_table)
         console.print("")
 
@@ -48313,7 +49025,10 @@ def print_final_report(
             addition_counts["SEQUENCE"] += len(item.missing_sequences)
         for item in extra_results.get("trigger_mismatched", []):
             addition_counts["TRIGGER"] += len(item.missing_triggers)
-        if trigger_list_summary and trigger_list_summary.get("enabled"):
+        trigger_fixup_summary = (fixup_skip_summary or {}).get("TRIGGER") or {}
+        if trigger_fixup_summary:
+            addition_counts["TRIGGER"] = int(trigger_fixup_summary.get("task_total", 0) or 0)
+        elif trigger_list_summary and trigger_list_summary.get("enabled"):
             if not trigger_list_summary.get("fallback_full") and not trigger_list_summary.get("error"):
                 addition_counts["TRIGGER"] = int(trigger_list_summary.get("selected_missing", 0) or 0)
 
@@ -48993,6 +49708,18 @@ def print_final_report(
             oracle_privilege_family_detail_path,
             len((settings or {}).get("_oracle_privilege_family_rows") or []) if oracle_privilege_family_detail_path else None,
             "Oracle 权限族覆盖明细"
+        )
+        identity_sequence_grant_rows = list((settings or {}).get("_identity_sequence_grant_rows") or [])
+        identity_sequence_grant_detail_path = export_identity_sequence_grant_detail(
+            identity_sequence_grant_rows,
+            report_path.parent,
+            report_ts,
+        )
+        _add_index_entry(
+            "DETAIL",
+            identity_sequence_grant_detail_path,
+            len(identity_sequence_grant_rows) if identity_sequence_grant_detail_path else None,
+            "identity sequence 跨 schema 授权明细"
         )
         manual_actions_path = export_manual_actions_required(
             manual_action_rows,
@@ -50156,14 +50883,19 @@ def main():
                 trigger_entries_scoped,
                 source_objects,
                 object_parent_map,
+                remap_rules=remap_rules,
             )
             if missing_trigger_entries:
-                log.error(
-                    "严重错误: source_object_scope_mode=remap_root_closure 下 trigger_list 中有 %d 个触发器未在源端对象范围内解析到: %s",
+                log.warning(
+                    "source_object_scope_mode=remap_root_closure 下 trigger_list 中有 %d 个触发器未在源端对象范围内解析到；"
+                    "这些条目将仅进入报告，不会进入作用域闭包或 fixup: %s",
                     len(missing_trigger_entries),
                     ", ".join(sorted(missing_trigger_entries[:10])),
                 )
-                abort_run()
+                for full_u in sorted(missing_trigger_entries):
+                    explicit_trigger_detail_rows.append(
+                        ("TRIGGER_KEEP_SKIPPED", "TRIGGER", full_u, "EXPLICIT_TRIGGER_LIST:NOT_FOUND_IN_SOURCE_OR_MAPPING")
+                    )
 
             source_scope_result = build_source_scope_closure(
                 source_objects,
@@ -50175,6 +50907,9 @@ def main():
                 mode=source_scope_mode,
             )
             detail_rows = list(source_scope_result.detail_rows or ())
+            for status, obj_type, full_u, detail in explicit_trigger_detail_rows:
+                if status == "TRIGGER_KEEP_SKIPPED":
+                    detail_rows.append((status, obj_type, full_u, detail))
             for src_full_u, source_types_text, reason in skipped_root_entries:
                 detail_rows.append(("ROOT_SKIPPED", source_types_text, src_full_u, reason))
             source_scope_result = source_scope_result._replace(detail_rows=tuple(detail_rows))
@@ -51342,6 +52077,13 @@ def main():
                     progress_interval=grant_progress_interval,
                     sequence_remap_policy=sequence_policy
                 )
+                grant_plan, identity_sequence_expectation_rows = augment_grant_plan_with_identity_sequence_grants(
+                    grant_plan,
+                    oracle_meta,
+                    ob_meta,
+                    ob_cfg,
+                    full_object_mapping,
+                )
                 unsupported_grant_target_extra_rows = build_blacklist_missing_grant_target_rows(
                     oracle_meta.blacklist_tables,
                     table_target_map,
@@ -51368,6 +52110,51 @@ def main():
                     sys_grant_cnt,
                     role_grant_cnt
                 )
+                identity_object_grants_missing_by_grantee: Dict[str, Set[ObjectGrantEntry]] = {}
+                if identity_sequence_expectation_rows:
+                    expected_grantees = set(grant_plan.object_grants.keys())
+                    expected_grantees.update(grant_plan.column_grants.keys())
+                    expected_grantees.update(grant_plan.sys_privs.keys())
+                    expected_grantees.update(grant_plan.role_privs.keys())
+                    ob_grant_catalog = load_ob_grant_catalog(ob_cfg, expected_grantees)
+                    if ob_grant_catalog is None:
+                        log.warning("[GRANT] identity sequence readiness 读取目标端权限目录失败，将仅输出定位结果。")
+                    else:
+                        (
+                            identity_object_grants_missing_by_grantee,
+                            _identity_column_missing,
+                            _identity_sys_missing,
+                            _identity_role_missing,
+                        ) = filter_missing_grant_entries(
+                            grant_plan.object_grants,
+                            grant_plan.column_grants,
+                            grant_plan.sys_privs,
+                            grant_plan.role_privs,
+                            ob_grant_catalog,
+                            capability_library=grant_capability_library,
+                            object_target_types=(grant_plan.object_target_types if grant_plan else None),
+                        )
+                identity_sequence_grant_rows = finalize_identity_sequence_grant_rows(
+                    identity_sequence_expectation_rows,
+                    identity_object_grants_missing_by_grantee,
+                )
+                settings["_identity_sequence_grant_rows"] = list(identity_sequence_grant_rows)
+                settings["_identity_sequence_grant_unresolved_count"] = sum(
+                    1 for item in identity_sequence_grant_rows
+                    if (item.status or "").upper() == IDENTITY_SEQUENCE_STATUS_UNRESOLVED
+                )
+                if identity_sequence_grant_rows:
+                    missing_identity_seq = sum(
+                        1 for item in identity_sequence_grant_rows
+                        if (item.status or "").upper() == IDENTITY_SEQUENCE_STATUS_MISSING_GRANT
+                    )
+                    unresolved_identity_seq = int(settings["_identity_sequence_grant_unresolved_count"] or 0)
+                    log.info(
+                        "[GRANT] identity sequence readiness: total=%d, missing=%d, unresolved=%d",
+                        len(identity_sequence_grant_rows),
+                        missing_identity_seq,
+                        unresolved_identity_seq,
+                    )
                 if grant_plan.filtered_grants:
                     report_dir_hint = settings.get("report_dir_effective") or settings.get("report_dir", "main_reports")
                     log.warning(
