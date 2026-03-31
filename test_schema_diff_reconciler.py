@@ -12512,10 +12512,33 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             self.assertIn("PRIORITY|STAGE|CATEGORY|COUNT|DEFAULT_BEHAVIOR", content)
             self.assertIn("BLOCKER|BEFORE_FIXUP|DATA_RISK|2|REPORT_ONLY", content)
 
+    def test_export_constraint_validate_deferred_detail_includes_scope_note(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows = [
+                sdr.ConstraintValidateDeferredRow(
+                    schema_name="OMS_USER",
+                    table_name="T1",
+                    constraint_name="FK_T1_PARENT",
+                    constraint_type="R",
+                    src_validated="VALIDATED",
+                    applied_mode="safe_novalidate",
+                    reason="safe_novalidate",
+                    validate_sql='ALTER TABLE "OMS_USER"."T1" ENABLE VALIDATE CONSTRAINT "FK_T1_PARENT";',
+                )
+            ]
+            output = sdr.export_constraint_validate_deferred_detail(rows, Path(tmpdir), "123")
+            self.assertIsNotNone(output)
+            content = Path(output).read_text(encoding="utf-8")
+            self.assertIn("仅覆盖：缺失约束当前以 ENABLE NOVALIDATE 落地", content)
+            self.assertIn("不会进入 constraint_validate_later/", content)
+            self.assertIn("fixup/status/constraint/", content)
+
     def test_write_fixup_root_readme_points_to_manual_actions(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             base_dir = Path(tmpdir) / "fixup_scripts"
             (base_dir / "grants_miss").mkdir(parents=True)
+            (base_dir / "constraint_validate_later").mkdir(parents=True)
+            (base_dir / "status").mkdir(parents=True)
             report_dir = Path(tmpdir) / "reports"
             report_dir.mkdir(parents=True)
             manual_path = report_dir / "manual_actions_required_123.txt"
@@ -12524,7 +12547,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
                 base_dir,
                 report_dir,
                 "123",
-                generated_dirs=["grants_miss"],
+                generated_dirs=["grants_miss", "constraint_validate_later", "status"],
                 manual_actions_path=manual_path,
                 unsupported_grant_count=3,
                 deferred_grant_count=0,
@@ -12532,6 +12555,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             content = Path(output).read_text(encoding="utf-8")
             self.assertIn(str(manual_path), content)
             self.assertIn("grants_miss/ 不是完整授权闭环", content)
+            self.assertIn("先 NOVALIDATE 落地、最终需 VALIDATED", content)
+            self.assertIn("恢复 ENABLE NOVALIDATE 也在这里", content)
 
     def test_build_report_index_guide_entries_prioritizes_manual_actions(self):
         with tempfile.TemporaryDirectory() as tmpdir:
