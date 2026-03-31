@@ -13805,6 +13805,246 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertNotIn("SELECT_CATALOG_ROLE", grant_plan.object_grants)
 
+    def test_build_grant_plan_filters_missing_oracle_maintained_role_grant(self):
+        oracle_meta = sdr.OracleMetadata(
+            table_columns={},
+            invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
+            indexes={},
+            constraints={},
+            triggers={},
+            sequences={},
+            sequence_attrs={},
+            table_comments={},
+            column_comments={},
+            comments_complete=True,
+            blacklist_tables={},
+            object_privileges=[],
+            column_privileges=[],
+            sys_privileges=[],
+            role_privileges=[
+                sdr.OracleRolePrivilege(grantee="DBA", role="EXP_FULL_DATABASE", admin_option=False),
+            ],
+            role_metadata={
+                "EXP_FULL_DATABASE": sdr.OracleRoleInfo(
+                    role="EXP_FULL_DATABASE",
+                    authentication_type="NONE",
+                    password_required=False,
+                    oracle_maintained=True,
+                )
+            },
+            system_privilege_map=set(),
+            table_privilege_map=set(),
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False, partition_key_columns={}, interval_partitions={}
+        )
+        grant_plan = sdr.build_grant_plan(
+            oracle_meta=oracle_meta,
+            full_mapping={},
+            remap_rules={},
+            source_objects={},
+            schema_mapping={},
+            object_parent_map=None,
+            dependency_graph=None,
+            transitive_table_cache=None,
+            source_dependencies=None,
+            source_schema_set={"DBA"},
+            remap_conflicts=None,
+            synonym_meta={},
+            ob_roles={"DBA"},
+            ob_users={"DBA"},
+            include_oracle_maintained_roles=False,
+        )
+        self.assertNotIn("DBA", grant_plan.role_privs)
+        self.assertTrue(any(
+            row.category == "ROLE"
+            and row.grantee == "DBA"
+            and row.privilege == "EXP_FULL_DATABASE"
+            and row.reason == sdr.ROLE_GRANT_ORACLE_MAINTAINED_TARGET_MISSING
+            for row in grant_plan.filtered_grants
+        ))
+
+    def test_build_grant_plan_filters_alias_role_when_target_role_missing(self):
+        oracle_meta = sdr.OracleMetadata(
+            table_columns={},
+            invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
+            indexes={},
+            constraints={},
+            triggers={},
+            sequences={},
+            sequence_attrs={},
+            table_comments={},
+            column_comments={},
+            comments_complete=True,
+            blacklist_tables={},
+            object_privileges=[],
+            column_privileges=[],
+            sys_privileges=[],
+            role_privileges=[
+                sdr.OracleRolePrivilege(grantee="U1", role="SELECT_CATALOG_ROLE", admin_option=False),
+            ],
+            role_metadata={
+                "SELECT_CATALOG_ROLE": sdr.OracleRoleInfo(
+                    role="SELECT_CATALOG_ROLE",
+                    authentication_type="NONE",
+                    password_required=False,
+                    oracle_maintained=True,
+                )
+            },
+            system_privilege_map=set(),
+            table_privilege_map=set(),
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False, partition_key_columns={}, interval_partitions={}
+        )
+        grant_plan = sdr.build_grant_plan(
+            oracle_meta=oracle_meta,
+            full_mapping={},
+            remap_rules={},
+            source_objects={},
+            schema_mapping={},
+            object_parent_map=None,
+            dependency_graph=None,
+            transitive_table_cache=None,
+            source_dependencies=None,
+            source_schema_set={"U1"},
+            remap_conflicts=None,
+            synonym_meta={},
+            ob_roles={"U1"},
+            ob_users={"U1"},
+            include_oracle_maintained_roles=False,
+        )
+        self.assertNotIn("U1", grant_plan.role_privs)
+        self.assertTrue(any(
+            row.category == "ROLE"
+            and row.grantee == "U1"
+            and row.privilege == "OB_CATALOG_ROLE"
+            and row.reason == sdr.ROLE_GRANT_ORACLE_MAINTAINED_TARGET_MISSING
+            for row in grant_plan.filtered_grants
+        ))
+
+    def test_build_grant_plan_filters_oracle_maintained_role_when_ob_roles_unavailable(self):
+        oracle_meta = sdr.OracleMetadata(
+            table_columns={},
+            invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
+            indexes={},
+            constraints={},
+            triggers={},
+            sequences={},
+            sequence_attrs={},
+            table_comments={},
+            column_comments={},
+            comments_complete=True,
+            blacklist_tables={},
+            object_privileges=[],
+            column_privileges=[],
+            sys_privileges=[],
+            role_privileges=[
+                sdr.OracleRolePrivilege(grantee="DBA", role="EXP_FULL_DATABASE", admin_option=False),
+            ],
+            role_metadata={
+                "EXP_FULL_DATABASE": sdr.OracleRoleInfo(
+                    role="EXP_FULL_DATABASE",
+                    authentication_type="NONE",
+                    password_required=False,
+                    oracle_maintained=True,
+                )
+            },
+            system_privilege_map=set(),
+            table_privilege_map=set(),
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False, partition_key_columns={}, interval_partitions={}
+        )
+        grant_plan = sdr.build_grant_plan(
+            oracle_meta=oracle_meta,
+            full_mapping={},
+            remap_rules={},
+            source_objects={},
+            schema_mapping={},
+            object_parent_map=None,
+            dependency_graph=None,
+            transitive_table_cache=None,
+            source_dependencies=None,
+            source_schema_set={"DBA"},
+            remap_conflicts=None,
+            synonym_meta={},
+            ob_roles=None,
+            ob_users={"DBA"},
+            include_oracle_maintained_roles=False,
+        )
+        self.assertNotIn("DBA", grant_plan.role_privs)
+        self.assertTrue(any(
+            row.category == "ROLE"
+            and row.grantee == "DBA"
+            and row.privilege == "EXP_FULL_DATABASE"
+            and row.reason == sdr.ROLE_GRANT_TARGET_ROLE_UNVERIFIED
+            for row in grant_plan.filtered_grants
+        ))
+
+    def test_build_grant_plan_keeps_existing_oracle_maintained_role_grant(self):
+        oracle_meta = sdr.OracleMetadata(
+            table_columns={},
+            invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
+            indexes={},
+            constraints={},
+            triggers={},
+            sequences={},
+            sequence_attrs={},
+            table_comments={},
+            column_comments={},
+            comments_complete=True,
+            blacklist_tables={},
+            object_privileges=[],
+            column_privileges=[],
+            sys_privileges=[],
+            role_privileges=[
+                sdr.OracleRolePrivilege(grantee="DBA", role="EXP_FULL_DATABASE", admin_option=False),
+            ],
+            role_metadata={
+                "EXP_FULL_DATABASE": sdr.OracleRoleInfo(
+                    role="EXP_FULL_DATABASE",
+                    authentication_type="NONE",
+                    password_required=False,
+                    oracle_maintained=True,
+                )
+            },
+            system_privilege_map=set(),
+            table_privilege_map=set(),
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False, partition_key_columns={}, interval_partitions={}
+        )
+        grant_plan = sdr.build_grant_plan(
+            oracle_meta=oracle_meta,
+            full_mapping={},
+            remap_rules={},
+            source_objects={},
+            schema_mapping={},
+            object_parent_map=None,
+            dependency_graph=None,
+            transitive_table_cache=None,
+            source_dependencies=None,
+            source_schema_set={"DBA"},
+            remap_conflicts=None,
+            synonym_meta={},
+            ob_roles={"DBA", "EXP_FULL_DATABASE"},
+            ob_users={"DBA"},
+            include_oracle_maintained_roles=False,
+        )
+        self.assertIn(
+            sdr.RoleGrantEntry("EXP_FULL_DATABASE", False),
+            grant_plan.role_privs.get("DBA", set())
+        )
+
     def test_dependency_grants_resolve_synonym_chain(self):
         deps = [
             sdr.DependencyRecord(

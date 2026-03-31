@@ -189,6 +189,10 @@
 - 对 `view_post_grants/` 中失败的 `GRANT ... ON <view>`，`run_fixup` 会从失败语句中提取真实 privilege（如 `UPDATE`），再按 VIEW 依赖链补底层对象授权；不再把所有此类失败统一降级成 `SELECT`
 - 对 identity 表的跨 schema 授权，系统会额外定位目标端底层 `ISEQ$$_...`：当源端存在 `INSERT` 授权而目标端缺少对应 sequence `SELECT` 时，会输出 `identity_sequence_grant_detail_<ts>.txt`，并把 `GRANT SELECT ON <ISEQ$$_...>` 注入 `grants_miss/`
 - identity sequence 定位优先使用目标端 `DBA_OBJECTS.CREATED` 与 `DBA_SEQUENCES` 的同秒候选收敛；若候选不唯一且 identity 选项无法进一步收敛，则保持 report-only，不盲猜 sequence 名
+- 角色授权不会再按静态默认白名单放行；每次运行会动态读取目标端 `DBA_ROLES`，把 Oracle 维护角色/兼容别名角色（例如 `SELECT_CATALOG_ROLE -> OB_CATALOG_ROLE`）与当前 OB 角色目录逐条对比：
+  - 目标端存在：保留在 `grants_all/grants_miss`
+  - 目标端不存在：移入 `filtered_grants.txt` / `unsupported_grant_detail_<ts>.txt`
+  - `DBA_ROLES` 不可读：降级为 report/manual，不进入 runnable role grant 输出
 - 输出 `grants_miss/` 与 `grants_all/`
 
 ---

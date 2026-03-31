@@ -291,9 +291,16 @@
 - grant_supported_object_privs：对象权限人工 override 清单（逗号分隔）。默认：空（使用本次运行动态规则库）。
   说明：这两个配置不再是“默认白名单”，而是人工强制覆盖；仅在需要临时收口/兜底时使用。
 - grant_include_oracle_maintained_roles：是否生成 ORACLE_MAINTAINED 角色。默认：false。
+  说明：该开关不仅影响 `CREATE ROLE`，也影响 `GRANT <ROLE> TO <GRANTEE>` 的 runnable 输出。
+  程序会在每次运行时动态读取目标端 `DBA_ROLES`，把 Oracle 维护角色授权与当前 OB 角色目录逐条对比：
+  目标端已存在时保留在 `grants_all/grants_miss`，目标端不存在时移出 runnable 输出并写入
+  `filtered_grants.txt` / `unsupported_grant_detail_<ts>.txt`。
+  说明：若当前运行拿不到 `DBA_ROLES`，Oracle 维护角色授权不会回退成默认放行，而是降级到
+  `filtered_grants.txt` / `unsupported_grant_detail_<ts>.txt`，等待人工确认目标端角色目录。
 - 角色兼容映射（内置）：`SELECT_CATALOG_ROLE -> OB_CATALOG_ROLE`。
-  说明：生成授权脚本时会自动替换；若目标端不存在该角色，工具可能仅生成 `CREATE ROLE OB_CATALOG_ROLE`（不含目录视图授权），
-  仍需先按运维基线补齐 `OB_CATALOG_ROLE` 的对象授权模型。
+  说明：生成授权脚本时会自动替换；是否保留在 runnable 输出，仍以本次读取到的目标端 `DBA_ROLES`
+  为准动态判断。若目标端不存在该角色，授权会进入 `filtered_grants.txt` / `unsupported_grant_detail_<ts>.txt`，
+  不会继续混进 `grants_all/grants_miss`。
 - fixup_auto_grant：run_fixup 自动补权限。默认：true。
   说明：基于 dependency_chains 与 VIEWs_chain 预判依赖授权，执行前自动应用 grants_miss/grants_all 中的授权。
   说明：当 `view_post_grants/` 中的视图授权命中 `ORA-01720` 时，执行器会按失败语句里的真实 privilege（SELECT/INSERT/UPDATE/DELETE）补底层依赖对象授权，而不是一律退化成 `SELECT`。

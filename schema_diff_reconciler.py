@@ -1611,6 +1611,9 @@ GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE = "GRANT_CAPABILITY_PROBE_INCOMPLETE"
 GRANT_CAPABILITY_REASON_OVERRIDE_EXCLUDED = "GRANT_CAPABILITY_OVERRIDE_EXCLUDED"
 GRANT_CAPABILITY_REASON_TARGET_UNKNOWN = "TARGET_UNKNOWN_OBJECT_PRIVILEGE"
 VIEW_DML_GRANT_PREREQ_UNVERIFIED = "VIEW_DML_GRANT_PREREQ_UNVERIFIED"
+ROLE_GRANT_ORACLE_MAINTAINED_TARGET_MISSING = "ROLE_GRANT_ORACLE_MAINTAINED_TARGET_MISSING"
+ROLE_GRANT_TARGET_ROLE_MISSING = "ROLE_GRANT_TARGET_ROLE_MISSING"
+ROLE_GRANT_TARGET_ROLE_UNVERIFIED = "ROLE_GRANT_TARGET_ROLE_UNVERIFIED"
 UNSUPPORTED_GRANT_REASON_DEFAULTS: Dict[str, Tuple[str, str]] = {
     "UNSUPPORTED_OBJECT_PRIV_IN_OB": ("OB 不支持该对象权限", "移除该权限或改造对象后手工授权"),
     "UNSUPPORTED_SYS_PRIV_IN_OB": ("OB 不支持该系统权限", "移除该权限或改造后手工授权"),
@@ -1631,6 +1634,18 @@ UNSUPPORTED_GRANT_REASON_DEFAULTS: Dict[str, Tuple[str, str]] = {
     VIEW_DML_GRANT_PREREQ_UNVERIFIED: (
         "跨 schema 视图 DML 授权缺少可证明的源端前置权限链，不能按普通 runnable grant 处理。",
         "检查 unsupported_grant_detail，确认 view owner 是否具备底层对象对应 DML WITH GRANT OPTION，必要时人工处理。"
+    ),
+    ROLE_GRANT_ORACLE_MAINTAINED_TARGET_MISSING: (
+        "Oracle 维护角色在目标端不存在，当前不进入 runnable role grant 闭环。",
+        "检查目标端角色目录；若确需承接，请先准备目标角色或显式开启 include_oracle_maintained_roles。"
+    ),
+    ROLE_GRANT_TARGET_ROLE_MISSING: (
+        "目标角色当前不存在，role grant 已从 runnable 输出中移除。",
+        "先确认该角色是否应由本轮创建或由目标端预置，再决定是否重新生成授权。"
+    ),
+    ROLE_GRANT_TARGET_ROLE_UNVERIFIED: (
+        "当前运行未能读取目标端角色目录，无法动态确认 Oracle 维护角色是否已存在，已降级为人工确认。",
+        "先检查 DBA_ROLES 读取权限/结果；确认目标端角色目录后再重新生成授权。"
     ),
     DEFERRED_GRANT_REASON_TARGET_MISSING_NOT_PLANNED: (
         "目标对象当前不存在且本轮不会创建，授权已延后。",
@@ -21170,6 +21185,30 @@ def build_grant_plan(
             return False
         return True
 
+    def resolve_oracle_role_info(role_name: str) -> Optional[OracleRoleInfo]:
+        role_u = (role_name or "").upper()
+        if not role_u:
+            return None
+        info = oracle_roles.get(role_u)
+        if info:
+            return info
+        reverse_u = GRANT_ROLE_ALIAS_REVERSE_MAP.get(role_u, "")
+        if reverse_u:
+            info = oracle_roles.get(reverse_u)
+            if info:
+                return info
+        return None
+
+    def role_grant_filter_reason(target_role_u: str) -> Optional[str]:
+        role_info = resolve_oracle_role_info(target_role_u)
+        if ob_roles_loaded and target_role_u in ob_roles:
+            return None
+        if role_info and role_info.oracle_maintained and not include_oracle_maintained_roles:
+            if ob_roles_loaded:
+                return ROLE_GRANT_ORACLE_MAINTAINED_TARGET_MISSING
+            return ROLE_GRANT_TARGET_ROLE_UNVERIFIED
+        return None
+
     # 1) Source object grants (DBA_TAB_PRIVS)
     total_obj = len(oracle_meta.object_privileges)
     if total_obj:
@@ -21304,6 +21343,10 @@ def build_grant_plan(
             continue
         target_role_u = remap_grant_role_alias(item.role)
         if not target_role_u:
+            continue
+        role_filter_reason = role_grant_filter_reason(target_role_u)
+        if role_filter_reason:
+            record_filtered("ROLE", grantee_u, target_role_u, target_role_u, role_filter_reason)
             continue
         role_privs[grantee_u].add(RoleGrantEntry(target_role_u, bool(item.admin_option)))
 
