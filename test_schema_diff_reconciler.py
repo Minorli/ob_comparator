@@ -1956,6 +1956,84 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertEqual(results["mismatched"], [])
 
+    def test_normalize_column_default_expression_semantic_literals(self):
+        self.assertEqual(
+            sdr.normalize_column_default_expression("0.98"),
+            sdr.normalize_column_default_expression(".98"),
+        )
+        self.assertEqual(
+            sdr.normalize_column_default_expression("0.0"),
+            sdr.normalize_column_default_expression("0"),
+        )
+        self.assertEqual(
+            sdr.normalize_column_default_expression("0.00"),
+            sdr.normalize_column_default_expression("0"),
+        )
+        self.assertEqual(
+            sdr.normalize_column_default_expression("0.001"),
+            sdr.normalize_column_default_expression(".001"),
+        )
+        self.assertEqual(
+            sdr.normalize_column_default_expression("0.0000"),
+            sdr.normalize_column_default_expression("0"),
+        )
+        self.assertEqual(
+            sdr.normalize_column_default_expression("DATE '1990-1-1'"),
+            sdr.normalize_column_default_expression("DATE '1990-01-01'"),
+        )
+        self.assertEqual(
+            sdr.normalize_column_default_expression("-1"),
+            sdr.normalize_column_default_expression("-(1)"),
+        )
+        self.assertEqual(
+            sdr.normalize_column_default_expression("USER--更新人"),
+            sdr.normalize_column_default_expression("user"),
+        )
+
+    def test_describe_column_default_expression_strips_trailing_comment_noise(self):
+        self.assertEqual(
+            sdr.describe_column_default_expression("USER--更新人"),
+            "USER",
+        )
+
+    def test_check_primary_objects_ignores_semantically_equivalent_default_forms(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "C1": {"data_type": "NUMBER", "data_length": None, "char_length": None, "char_used": None, "data_precision": 10, "data_scale": 2, "nullable": "Y", "data_default": "0.98", "hidden": False, "virtual": False, "virtual_expr": None, "identity": False},
+                "C2": {"data_type": "NUMBER", "data_length": None, "char_length": None, "char_used": None, "data_precision": 10, "data_scale": 1, "nullable": "Y", "data_default": "0.0", "hidden": False, "virtual": False, "virtual_expr": None, "identity": False},
+                "C3": {"data_type": "NUMBER", "data_length": None, "char_length": None, "char_used": None, "data_precision": 10, "data_scale": 2, "nullable": "Y", "data_default": "0.00", "hidden": False, "virtual": False, "virtual_expr": None, "identity": False},
+                "C4": {"data_type": "NUMBER", "data_length": None, "char_length": None, "char_used": None, "data_precision": 10, "data_scale": 3, "nullable": "Y", "data_default": "0.001", "hidden": False, "virtual": False, "virtual_expr": None, "identity": False},
+                "C5": {"data_type": "NUMBER", "data_length": None, "char_length": None, "char_used": None, "data_precision": 10, "data_scale": 4, "nullable": "Y", "data_default": "0.0000", "hidden": False, "virtual": False, "virtual_expr": None, "identity": False},
+                "C6": {"data_type": "DATE", "data_length": None, "char_length": None, "char_used": None, "data_precision": None, "data_scale": None, "nullable": "Y", "data_default": "DATE '1990-1-1'", "hidden": False, "virtual": False, "virtual_expr": None, "identity": False},
+                "C7": {"data_type": "NUMBER", "data_length": None, "char_length": None, "char_used": None, "data_precision": 10, "data_scale": 0, "nullable": "Y", "data_default": "-1", "hidden": False, "virtual": False, "virtual_expr": None, "identity": False},
+                "C8": {"data_type": "VARCHAR2", "data_length": 128, "char_length": 128, "char_used": "B", "data_precision": None, "data_scale": None, "nullable": "Y", "data_default": "USER--更新人", "hidden": False, "virtual": False, "virtual_expr": None, "identity": False},
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "C1": {"data_type": "NUMBER", "data_length": None, "char_length": None, "char_used": None, "data_precision": 10, "data_scale": 2, "nullable": "Y", "data_default": ".98", "hidden": False, "virtual": False, "virtual_expr": None, "identity": False},
+                    "C2": {"data_type": "NUMBER", "data_length": None, "char_length": None, "char_used": None, "data_precision": 10, "data_scale": 1, "nullable": "Y", "data_default": "0", "hidden": False, "virtual": False, "virtual_expr": None, "identity": False},
+                    "C3": {"data_type": "NUMBER", "data_length": None, "char_length": None, "char_used": None, "data_precision": 10, "data_scale": 2, "nullable": "Y", "data_default": "0", "hidden": False, "virtual": False, "virtual_expr": None, "identity": False},
+                    "C4": {"data_type": "NUMBER", "data_length": None, "char_length": None, "char_used": None, "data_precision": 10, "data_scale": 3, "nullable": "Y", "data_default": ".001", "hidden": False, "virtual": False, "virtual_expr": None, "identity": False},
+                    "C5": {"data_type": "NUMBER", "data_length": None, "char_length": None, "char_used": None, "data_precision": 10, "data_scale": 4, "nullable": "Y", "data_default": "0", "hidden": False, "virtual": False, "virtual_expr": None, "identity": False},
+                    "C6": {"data_type": "DATE", "data_length": None, "char_length": None, "char_used": None, "data_precision": None, "data_scale": None, "nullable": "Y", "data_default": "DATE '1990-01-01'", "hidden": False, "virtual": False, "virtual_expr": None, "identity": False},
+                    "C7": {"data_type": "NUMBER", "data_length": None, "char_length": None, "char_used": None, "data_precision": 10, "data_scale": 0, "nullable": "Y", "data_default": "-(1)", "hidden": False, "virtual": False, "virtual_expr": None, "identity": False},
+                    "C8": {"data_type": "VARCHAR2", "data_length": 192, "char_length": 192, "char_used": "B", "data_precision": None, "data_scale": None, "nullable": "Y", "data_default": "user", "hidden": False, "virtual": False, "virtual_expr": None, "identity": False},
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(results["mismatched"], [])
+
     def test_check_primary_objects_treats_null_default_as_no_default(self):
         master_list = [("A.T1", "A.T1", "TABLE")]
         oracle_meta = self._make_oracle_meta_with_columns({
