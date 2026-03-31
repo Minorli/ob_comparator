@@ -32930,14 +32930,14 @@ def write_fixup_root_readme(
         "trigger": "缺失 TRIGGER 的 CREATE 脚本。",
         "compile": "依赖重编译脚本。",
         "name_collision": "重名约束/索引处理脚本，通常应先于 constraint/index。",
-        "constraint_validate_later": "后置 VALIDATE 脚本，默认不建议首次执行。",
+        "constraint_validate_later": "后置 VALIDATE 脚本，仅针对“先 NOVALIDATE 落地、最终需 VALIDATED”的缺失约束；默认不建议首次执行。",
         "grants_miss": "缺失授权脚本，适合补齐当前缺口。",
         "grants_all": "全量授权审计脚本，主要用于核对，不等于都要执行。",
         "grants_deferred": "延后授权脚本，需对象补齐后再执行。",
         "grants_revoke": "目标端多余 PUBLIC 授权回收建议，先审后执行。",
         "view_prereq_grants": "VIEW 前置授权，通常先于 view/ 执行。",
         "view_post_grants": "VIEW 创建后授权。",
-        "status": "状态漂移修补脚本（trigger/constraint）。",
+        "status": "状态漂移修补脚本（trigger/constraint）；缺失 TABLE 首次创建后恢复 ENABLE NOVALIDATE 也在这里。",
         "job": "JOB 草案或修补脚本，通常需人工确认。",
         "schedule": "SCHEDULE 草案或修补脚本，通常需人工确认。",
         "cleanup_candidates": "目标端多余对象清理候选总览，默认不自动执行。",
@@ -40163,6 +40163,11 @@ def export_constraint_validate_deferred_detail(
         "REASON",
         "VALIDATE_SQL"
     ]
+    notes = [
+        "仅覆盖：缺失约束当前以 ENABLE NOVALIDATE 落地，但源端最终语义需要 VALIDATED 的场景。",
+        "若源端本来就是 ENABLED + NOT VALIDATED，则不会进入 constraint_validate_later/；",
+        "对于“缺失 TABLE 首次创建 + ENABLED + NOT VALIDATED”的约束，会改由 fixup/status/constraint/ 恢复 ENABLE NOVALIDATE。",
+    ]
     data_rows = [
         [
             row.schema_name,
@@ -40176,7 +40181,28 @@ def export_constraint_validate_deferred_detail(
         ]
         for row in rows_sorted
     ]
-    return write_pipe_report("约束后置 VALIDATE 明细", header_fields, data_rows, output_path)
+    delimiter = "|"
+    header = delimiter.join(header_fields)
+    lines: List[str] = [
+        "# 约束后置 VALIDATE 明细",
+        f"# total={len(data_rows)}",
+        "# 分隔符: |",
+    ]
+    for note in notes:
+        lines.append(f"# note: {note}")
+    lines.extend([
+        f"# 字段说明: {header}",
+        header,
+    ])
+    for row in data_rows:
+        lines.append(delimiter.join(sanitize_pipe_field(item) for item in row))
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        return output_path
+    except OSError as exc:
+        log.warning("写入报告失败 %s: %s", output_path, exc)
+        return None
 
 
 def export_name_collision_detail(
@@ -42838,8 +42864,8 @@ def build_operator_action_rows(
         default_behavior="GENERATED_AFTER_PREREQ",
         primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "constraint_validate_deferred_detail"),
         related_fixup_dir="constraint_validate_later/",
-        why="这些约束被故意后置到数据清理后再 VALIDATE。",
-        recommended_action="先完成脏数据清理，再执行 constraint_validate_later/。",
+        why="这些约束当前先以 ENABLE NOVALIDATE 落地，但源端最终语义要求 VALIDATED，因此被故意后置到数据清理后再 VALIDATE。",
+        recommended_action="先完成脏数据清理，再执行 constraint_validate_later/。若源端本来就是 NOT VALIDATED，请改看 status/constraint/ 的 ENABLE NOVALIDATE 恢复脚本，而不是本目录。",
     )
     _add(
         priority="REVIEW",
