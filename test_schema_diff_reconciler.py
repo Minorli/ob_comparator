@@ -3936,6 +3936,137 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(rows[0].status, sdr.IDENTITY_SEQUENCE_STATUS_MISSING_GRANT)
         self.assertEqual(rows[0].action, "FIXUP_GRANT")
 
+    def test_build_sequence_restart_detail_rows_generates_for_target_behind(self):
+        oracle_meta = self._make_oracle_meta(
+            sequences={"SRC": {"SEQ1"}},
+        )._replace(
+            sequence_attrs={"SRC": {"SEQ1": {"last_number": 21}}}
+        )
+        ob_meta = self._make_ob_meta(
+            sequences={"TGT": {"SEQ1"}},
+        )._replace(
+            sequence_attrs={"TGT": {"SEQ1": {"last_number": 1}}}
+        )
+        rows = sdr.build_sequence_restart_detail_rows(
+            oracle_meta,
+            ob_meta,
+            {"SRC.SEQ1": {"SEQUENCE": "TGT.SEQ1"}},
+            planned_sequence_creates=set(),
+            sequence_sync_mode="last_number",
+            allow_fixup_predicate=lambda _tgt, _src: True,
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].status, sdr.SEQUENCE_RESTART_STATUS_GENERATE)
+        self.assertEqual(rows[0].reason_code, sdr.SEQUENCE_RESTART_REASON_TARGET_LAST_NUMBER_BEHIND)
+        self.assertEqual(rows[0].src_last_number, "21")
+        self.assertEqual(rows[0].tgt_last_number, "1")
+
+    def test_build_sequence_restart_detail_rows_skips_when_target_caught_up(self):
+        oracle_meta = self._make_oracle_meta(
+            sequences={"SRC": {"SEQ1"}},
+        )._replace(
+            sequence_attrs={"SRC": {"SEQ1": {"last_number": 21}}}
+        )
+        ob_meta = self._make_ob_meta(
+            sequences={"TGT": {"SEQ1"}},
+        )._replace(
+            sequence_attrs={"TGT": {"SEQ1": {"last_number": 25}}}
+        )
+        rows = sdr.build_sequence_restart_detail_rows(
+            oracle_meta,
+            ob_meta,
+            {"SRC.SEQ1": {"SEQUENCE": "TGT.SEQ1"}},
+            planned_sequence_creates=set(),
+            sequence_sync_mode="last_number",
+            allow_fixup_predicate=lambda _tgt, _src: True,
+        )
+        self.assertEqual(rows[0].status, sdr.SEQUENCE_RESTART_STATUS_NO_ACTION)
+        self.assertEqual(rows[0].reason_code, sdr.SEQUENCE_RESTART_REASON_TARGET_ALREADY_CAUGHT_UP)
+
+    def test_build_sequence_restart_detail_rows_generates_for_missing_planned_create(self):
+        oracle_meta = self._make_oracle_meta(
+            sequences={"SRC": {"SEQ1"}},
+        )._replace(
+            sequence_attrs={"SRC": {"SEQ1": {"last_number": 21}}}
+        )
+        ob_meta = self._make_ob_meta(sequences={"TGT": set()})._replace(
+            sequence_attrs={"TGT": {}}
+        )
+        rows = sdr.build_sequence_restart_detail_rows(
+            oracle_meta,
+            ob_meta,
+            {"SRC.SEQ1": {"SEQUENCE": "TGT.SEQ1"}},
+            planned_sequence_creates={("TGT", "SEQ1")},
+            sequence_sync_mode="last_number",
+            allow_fixup_predicate=lambda _tgt, _src: True,
+        )
+        self.assertEqual(rows[0].status, sdr.SEQUENCE_RESTART_STATUS_GENERATE)
+        self.assertEqual(rows[0].reason_code, sdr.SEQUENCE_RESTART_REASON_TARGET_MISSING_PLANNED_CREATE)
+
+    def test_build_sequence_restart_detail_rows_marks_unresolved_without_last_number(self):
+        oracle_meta = self._make_oracle_meta(
+            sequences={"SRC": {"SEQ1"}},
+        )._replace(
+            sequence_attrs={"SRC": {"SEQ1": {}}}
+        )
+        ob_meta = self._make_ob_meta(
+            sequences={"TGT": {"SEQ1"}},
+        )._replace(
+            sequence_attrs={"TGT": {"SEQ1": {"last_number": 1}}}
+        )
+        rows = sdr.build_sequence_restart_detail_rows(
+            oracle_meta,
+            ob_meta,
+            {"SRC.SEQ1": {"SEQUENCE": "TGT.SEQ1"}},
+            planned_sequence_creates=set(),
+            sequence_sync_mode="last_number",
+            allow_fixup_predicate=lambda _tgt, _src: True,
+        )
+        self.assertEqual(rows[0].status, sdr.SEQUENCE_RESTART_STATUS_UNRESOLVED)
+        self.assertEqual(rows[0].reason_code, sdr.SEQUENCE_RESTART_REASON_SOURCE_LAST_NUMBER_UNAVAILABLE)
+
+    def test_build_sequence_restart_detail_rows_skips_auto_sequence(self):
+        oracle_meta = self._make_oracle_meta(
+            sequences={"SRC": {"ISEQ$$_1"}},
+        )._replace(
+            sequence_attrs={"SRC": {"ISEQ$$_1": {"last_number": 21}}}
+        )
+        ob_meta = self._make_ob_meta(
+            sequences={"TGT": {"ISEQ$$_1"}},
+        )._replace(
+            sequence_attrs={"TGT": {"ISEQ$$_1": {"last_number": 1}}}
+        )
+        rows = sdr.build_sequence_restart_detail_rows(
+            oracle_meta,
+            ob_meta,
+            {"SRC.ISEQ$$_1": {"SEQUENCE": "TGT.ISEQ$$_1"}},
+            planned_sequence_creates=set(),
+            sequence_sync_mode="last_number",
+            allow_fixup_predicate=lambda _tgt, _src: True,
+        )
+        self.assertEqual(rows[0].status, sdr.SEQUENCE_RESTART_STATUS_SKIPPED)
+        self.assertEqual(rows[0].reason_code, sdr.SEQUENCE_RESTART_REASON_AUTO_SEQUENCE_SKIPPED)
+
+    def test_export_sequence_restart_detail_writes_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows = [
+                sdr.SequenceRestartDetailRow(
+                    src_sequence_full="SRC.SEQ1",
+                    tgt_sequence_full="TGT.SEQ1",
+                    src_last_number="21",
+                    tgt_last_number="1",
+                    status=sdr.SEQUENCE_RESTART_STATUS_GENERATE,
+                    reason_code=sdr.SEQUENCE_RESTART_REASON_TARGET_LAST_NUMBER_BEHIND,
+                    detail="target last_number is behind oracle last_number",
+                    action="GENERATE_RESTART",
+                )
+            ]
+            output = sdr.export_sequence_restart_detail(rows, Path(tmpdir), "123")
+            self.assertIsNotNone(output)
+            content = Path(output).read_text(encoding="utf-8")
+            self.assertIn("sequence restart 规划明细", content)
+            self.assertIn("SRC.SEQ1|TGT.SEQ1|21|1|GENERATE", content)
+
     def test_inflate_table_varchar_lengths_handles_byte_inside_parentheses(self):
         oracle_meta = self._make_oracle_meta_with_columns(
             {
@@ -5728,6 +5859,235 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
                     view_compat_map={}
                 )
             self.assertFalse((Path(tmp_dir) / "compile").exists())
+
+    def test_generate_fixup_writes_sequence_restart_when_target_behind(self):
+        tv_results = {
+            "missing": [],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": [],
+            "remap_conflicts": []
+        }
+        extra_results = {
+            "index_ok": [], "index_mismatched": [],
+            "constraint_ok": [], "constraint_mismatched": [],
+            "sequence_ok": [], "sequence_mismatched": [],
+            "trigger_ok": [], "trigger_mismatched": [],
+        }
+        master_list = []
+        oracle_meta = self._make_oracle_meta(
+            sequences={"SRC": {"SEQ1"}},
+        )._replace(
+            sequence_attrs={"SRC": {"SEQ1": {"last_number": 21}}}
+        )
+        ob_meta = self._make_ob_meta(
+            sequences={"TGT": {"SEQ1"}},
+        )._replace(
+            sequence_attrs={"TGT": {"SEQ1": {"last_number": 1}}}
+        )
+        settings = {
+            "fixup_dir": "",
+            "fixup_workers": 1,
+            "progress_log_interval": 999,
+            "fixup_type_set": {"SEQUENCE"},
+            "fixup_schema_list": set(),
+            "source_schemas_list": ["SRC"],
+            "sequence_sync_mode": "last_number",
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings["fixup_dir"] = tmp_dir
+            with mock.patch.object(sdr, "fetch_dbcat_schema_objects", return_value=({}, {})), \
+                 mock.patch.object(sdr, "oracle_get_ddl_batch", return_value={}), \
+                 mock.patch.object(sdr, "get_oceanbase_version", return_value=None):
+                sdr.generate_fixup_scripts(
+                    {"user": "u", "password": "p", "dsn": "d"},
+                    {"executable": "obclient", "host": "h", "port": "1", "user_string": "u", "password": "p"},
+                    settings,
+                    tv_results,
+                    extra_results,
+                    master_list,
+                    oracle_meta,
+                    {"SRC.SEQ1": {"SEQUENCE": "TGT.SEQ1"}},
+                    {},
+                    grant_plan=None,
+                    enable_grant_generation=False,
+                    dependency_report={"missing": [], "unexpected": [], "skipped": []},
+                    ob_meta=ob_meta,
+                    expected_dependency_pairs=set(),
+                    synonym_metadata={},
+                    trigger_filter_entries=None,
+                    trigger_filter_enabled=False,
+                    package_results=None,
+                    report_dir=None,
+                    report_timestamp=None,
+                    support_state_map={},
+                    unsupported_table_keys=set(),
+                    view_compat_map={}
+                )
+            restart_path = Path(tmp_dir) / "sequence_restart" / "TGT.SEQ1.sql"
+            self.assertTrue(restart_path.exists())
+            content = restart_path.read_text(encoding="utf-8")
+            self.assertIn('ALTER SEQUENCE "TGT"."SEQ1" RESTART START WITH 21;', content)
+            self.assertIn("建议在数据装载完成后显式执行", content)
+
+    def test_generate_fixup_skips_sequence_restart_when_target_caught_up(self):
+        tv_results = {
+            "missing": [],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": [],
+            "remap_conflicts": []
+        }
+        extra_results = {
+            "index_ok": [], "index_mismatched": [],
+            "constraint_ok": [], "constraint_mismatched": [],
+            "sequence_ok": [], "sequence_mismatched": [],
+            "trigger_ok": [], "trigger_mismatched": [],
+        }
+        master_list = []
+        oracle_meta = self._make_oracle_meta(
+            sequences={"SRC": {"SEQ1"}},
+        )._replace(
+            sequence_attrs={"SRC": {"SEQ1": {"last_number": 21}}}
+        )
+        ob_meta = self._make_ob_meta(
+            sequences={"TGT": {"SEQ1"}},
+        )._replace(
+            sequence_attrs={"TGT": {"SEQ1": {"last_number": 25}}}
+        )
+        settings = {
+            "fixup_dir": "",
+            "fixup_workers": 1,
+            "progress_log_interval": 999,
+            "fixup_type_set": {"SEQUENCE"},
+            "fixup_schema_list": set(),
+            "source_schemas_list": ["SRC"],
+            "sequence_sync_mode": "last_number",
+        }
+        fixup_skip_summary = {}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings["fixup_dir"] = tmp_dir
+            with mock.patch.object(sdr, "fetch_dbcat_schema_objects", return_value=({}, {})), \
+                 mock.patch.object(sdr, "oracle_get_ddl_batch", return_value={}), \
+                 mock.patch.object(sdr, "get_oceanbase_version", return_value=None):
+                sdr.generate_fixup_scripts(
+                    {"user": "u", "password": "p", "dsn": "d"},
+                    {"executable": "obclient", "host": "h", "port": "1", "user_string": "u", "password": "p"},
+                    settings,
+                    tv_results,
+                    extra_results,
+                    master_list,
+                    oracle_meta,
+                    {"SRC.SEQ1": {"SEQUENCE": "TGT.SEQ1"}},
+                    {},
+                    grant_plan=None,
+                    enable_grant_generation=False,
+                    dependency_report={"missing": [], "unexpected": [], "skipped": []},
+                    ob_meta=ob_meta,
+                    expected_dependency_pairs=set(),
+                    synonym_metadata={},
+                    trigger_filter_entries=None,
+                    trigger_filter_enabled=False,
+                    package_results=None,
+                    report_dir=None,
+                    report_timestamp=None,
+                    support_state_map={},
+                    unsupported_table_keys=set(),
+                    fixup_skip_summary=fixup_skip_summary,
+                    view_compat_map={}
+                )
+            self.assertFalse((Path(tmp_dir) / "sequence_restart" / "TGT.SEQ1.sql").exists())
+            self.assertEqual(fixup_skip_summary.get("SEQUENCE_RESTART", {}).get("generated"), 0)
+
+    def test_generate_fixup_skips_missing_sequence_restart_when_create_already_synced(self):
+        tv_results = {
+            "missing": [],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": [],
+            "remap_conflicts": []
+        }
+        extra_results = {
+            "index_ok": [], "index_mismatched": [],
+            "constraint_ok": [], "constraint_mismatched": [],
+            "sequence_ok": [],
+            "sequence_mismatched": [
+                sdr.SequenceMismatch(
+                    src_schema="SRC",
+                    tgt_schema="TGT",
+                    missing_sequences={"SEQ1"},
+                    extra_sequences=set(),
+                    note=None,
+                    missing_mappings=[("SRC.SEQ1", "TGT.SEQ1")],
+                    detail_mismatch=None,
+                )
+            ],
+            "trigger_ok": [], "trigger_mismatched": [],
+        }
+        master_list = []
+        oracle_meta = self._make_oracle_meta(
+            sequences={"SRC": {"SEQ1"}},
+        )._replace(
+            sequence_attrs={"SRC": {"SEQ1": {"last_number": 21}}}
+        )
+        ob_meta = self._make_ob_meta(
+            sequences={"TGT": set()},
+        )._replace(sequence_attrs={"TGT": {}})
+        settings = {
+            "fixup_dir": "",
+            "fixup_workers": 1,
+            "progress_log_interval": 999,
+            "fixup_type_set": {"SEQUENCE"},
+            "fixup_schema_list": set(),
+            "source_schemas_list": ["SRC"],
+            "sequence_sync_mode": "last_number",
+        }
+        fixup_skip_summary = {}
+        raw_seq_ddl = 'CREATE SEQUENCE "SRC"."SEQ1" START WITH 21 INCREMENT BY 1 NOCACHE;'
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings["fixup_dir"] = tmp_dir
+            with mock.patch.object(sdr, "fetch_dbcat_schema_objects", return_value=({}, {})), \
+                 mock.patch.object(sdr, "oracle_get_ddl_batch", return_value={("SRC", "SEQUENCE", "SEQ1"): raw_seq_ddl}), \
+                 mock.patch.object(sdr, "get_oceanbase_version", return_value=None):
+                sdr.generate_fixup_scripts(
+                    {"user": "u", "password": "p", "dsn": "d"},
+                    {"executable": "obclient", "host": "h", "port": "1", "user_string": "u", "password": "p"},
+                    settings,
+                    tv_results,
+                    extra_results,
+                    master_list,
+                    oracle_meta,
+                    {"SRC.SEQ1": {"SEQUENCE": "TGT.SEQ1"}},
+                    {},
+                    grant_plan=None,
+                    enable_grant_generation=False,
+                    dependency_report={"missing": [], "unexpected": [], "skipped": []},
+                    ob_meta=ob_meta,
+                    expected_dependency_pairs=set(),
+                    synonym_metadata={},
+                    trigger_filter_entries=None,
+                    trigger_filter_enabled=False,
+                    package_results=None,
+                    report_dir=None,
+                    report_timestamp=None,
+                    support_state_map={},
+                    unsupported_table_keys=set(),
+                    fixup_skip_summary=fixup_skip_summary,
+                    view_compat_map={}
+                )
+            self.assertTrue((Path(tmp_dir) / "sequence" / "TGT.SEQ1.sql").exists())
+            self.assertFalse((Path(tmp_dir) / "sequence_restart" / "TGT.SEQ1.sql").exists())
+            self.assertEqual(fixup_skip_summary.get("SEQUENCE_RESTART", {}).get("generated"), 0)
+            self.assertEqual(
+                fixup_skip_summary.get("SEQUENCE_RESTART", {}).get("skipped", {}).get("TARGET_CREATE_ALREADY_SYNCED"),
+                1,
+            )
 
     def test_generate_fixup_view_avoids_implicit_dependency_rename(self):
         tv_results = {
@@ -12436,6 +12796,24 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             self.assertIn("- view/", content)
             self.assertNotIn("- table/", content)
 
+    def test_write_fixup_root_readme_describes_sequence_restart(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir) / "fixup_scripts"
+            (base_dir / "sequence_restart").mkdir(parents=True)
+            report_dir = Path(tmpdir) / "reports"
+            report_dir.mkdir(parents=True)
+
+            output = sdr.write_fixup_root_readme(
+                base_dir,
+                report_dir,
+                "123",
+                generated_dirs=["sequence_restart"],
+            )
+
+            content = Path(output).read_text(encoding="utf-8")
+            self.assertIn("sequence_restart/", content)
+            self.assertIn("RESTART START WITH", content)
+
     def test_build_report_index_guide_entries_uses_explicit_readme_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             report_path = Path(tmpdir) / "reports" / "run_1" / "report_123.txt"
@@ -12474,6 +12852,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             deferred_grant_count=4,
             extra_public_grant_count=1,
             trigger_literal_alert_count=2,
+            sequence_restart_generated_count=2,
+            sequence_restart_unresolved_count=1,
             ddl_cleanup_semantic_rows=1,
             generated_fixup_dirs=["job", "schedule"],
             job_missing_count=2,
@@ -12486,6 +12866,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn("DEFERRED_GRANT", categories)
         self.assertIn("PUBLIC_REVOKE_REVIEW", categories)
         self.assertIn("TRIGGER_LITERAL_REVIEW", categories)
+        self.assertIn("SEQUENCE_RESTART_REVIEW", categories)
+        self.assertIn("SEQUENCE_RESTART_UNRESOLVED", categories)
         self.assertIn("DDL_SEMANTIC_REWRITE", categories)
         self.assertIn("JOB_SCHEDULE_MANUAL", categories)
 

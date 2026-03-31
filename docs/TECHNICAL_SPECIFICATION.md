@@ -189,6 +189,11 @@
 - 对 `view_post_grants/` 中失败的 `GRANT ... ON <view>`，`run_fixup` 会从失败语句中提取真实 privilege（如 `UPDATE`），再按 VIEW 依赖链补底层对象授权；不再把所有此类失败统一降级成 `SELECT`
 - 对 identity 表的跨 schema 授权，系统会额外定位目标端底层 `ISEQ$$_...`：当源端存在 `INSERT` 授权而目标端缺少对应 sequence `SELECT` 时，会输出 `identity_sequence_grant_detail_<ts>.txt`，并把 `GRANT SELECT ON <ISEQ$$_...>` 注入 `grants_miss/`
 - identity sequence 定位优先使用目标端 `DBA_OBJECTS.CREATED` 与 `DBA_SEQUENCES` 的同秒候选收敛；若候选不唯一且 identity 选项无法进一步收敛，则保持 report-only，不盲猜 sequence 名
+- 当 `sequence_sync_mode=last_number` 时，系统会额外读取 Oracle 与 OceanBase 当前 `DBA_SEQUENCES.LAST_NUMBER`，在 `fixup_scripts/sequence_restart/` 生成值同步 SQL：
+  - 或目标 sequence 已存在但目标 `LAST_NUMBER` 小于源端
+- 若缺失 sequence 的 `CREATE SEQUENCE` DDL 已经 `START WITH` 到源端当前值，则不会重复生成 restart
+- OceanBase restart 语法固定使用 `ALTER SEQUENCE ... RESTART START WITH <n>`；不采用固定 `+100` 偏移
+- `sequence_restart/` 默认不由 `run_fixup` 执行，需显式按目录执行
 - 角色授权不会再按静态默认白名单放行；每次运行会动态读取目标端 `DBA_ROLES`，把 Oracle 维护角色/兼容别名角色（例如 `SELECT_CATALOG_ROLE -> OB_CATALOG_ROLE`）与当前 OB 角色目录逐条对比：
   - 目标端存在：保留在 `grants_all/grants_miss`
   - 目标端不存在：移入 `filtered_grants.txt` / `unsupported_grant_detail_<ts>.txt`
@@ -270,6 +275,7 @@
 - `filtered_grants.txt`：过滤权限
 - `grant_capability_detail_<ts>.txt`：动态授权规则库明细（支持结果、目录别名、最终决策）
 - `triggers_non_table_detail_<ts>.txt`：非表触发器明细（当前主要为 DATABASE/SCHEMA 级事件触发器；`INSTEAD OF ... ON VIEW` 已进入普通 compare/fixup）
+- `sequence_restart_detail_<ts>.txt`：sequence 值同步规划明细（源/目标 `LAST_NUMBER`、是否生成 restart、跳过原因）
 
 ---
 

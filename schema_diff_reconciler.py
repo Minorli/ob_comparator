@@ -1321,6 +1321,17 @@ class IdentitySequenceGrantDetailRow(NamedTuple):
     action: str
 
 
+class SequenceRestartDetailRow(NamedTuple):
+    src_sequence_full: str
+    tgt_sequence_full: str
+    src_last_number: str
+    tgt_last_number: str
+    status: str
+    reason_code: str
+    detail: str
+    action: str
+
+
 class FatalErrorMatrixRow(NamedTuple):
     category: str
     trigger_condition: str
@@ -1597,6 +1608,31 @@ IDENTITY_SEQUENCE_REASON_NO_SEQUENCE_CREATED_MATCH = "IDENTITY_SEQUENCE_NO_CREAT
 IDENTITY_SEQUENCE_REASON_AMBIGUOUS_CREATED_MATCH = "IDENTITY_SEQUENCE_AMBIGUOUS_CREATED_MATCH"
 IDENTITY_SEQUENCE_REASON_SEQUENCE_QUERY_FAILED = "IDENTITY_SEQUENCE_QUERY_FAILED"
 IDENTITY_SEQUENCE_REASON_TABLE_QUERY_FAILED = "IDENTITY_TABLE_QUERY_FAILED"
+
+SEQUENCE_SYNC_MODE_VALUES = {"off", "last_number"}
+SEQUENCE_SYNC_MODE_ALIASES = {
+    "false": "off",
+    "0": "off",
+    "none": "off",
+    "disabled": "off",
+    "last": "last_number",
+    "lastnumber": "last_number",
+}
+
+SEQUENCE_RESTART_STATUS_GENERATE = "GENERATE"
+SEQUENCE_RESTART_STATUS_NO_ACTION = "NO_ACTION"
+SEQUENCE_RESTART_STATUS_UNRESOLVED = "UNRESOLVED"
+SEQUENCE_RESTART_STATUS_SKIPPED = "SKIPPED"
+
+SEQUENCE_RESTART_REASON_TARGET_MISSING_PLANNED_CREATE = "TARGET_MISSING_PLANNED_CREATE"
+SEQUENCE_RESTART_REASON_TARGET_LAST_NUMBER_BEHIND = "TARGET_LAST_NUMBER_BEHIND"
+SEQUENCE_RESTART_REASON_TARGET_ALREADY_CAUGHT_UP = "TARGET_ALREADY_CAUGHT_UP"
+SEQUENCE_RESTART_REASON_SOURCE_LAST_NUMBER_UNAVAILABLE = "SOURCE_LAST_NUMBER_UNAVAILABLE"
+SEQUENCE_RESTART_REASON_TARGET_LAST_NUMBER_UNAVAILABLE = "TARGET_LAST_NUMBER_UNAVAILABLE"
+SEQUENCE_RESTART_REASON_TARGET_MISSING_NOT_PLANNED = "TARGET_MISSING_NOT_PLANNED"
+SEQUENCE_RESTART_REASON_TARGET_CREATE_ALREADY_SYNCED = "TARGET_CREATE_ALREADY_SYNCED"
+SEQUENCE_RESTART_REASON_FIXUP_SCOPE_EXCLUDED = "FIXUP_SCOPE_EXCLUDED"
+SEQUENCE_RESTART_REASON_AUTO_SEQUENCE_SKIPPED = "AUTO_SEQUENCE_SKIPPED"
 GRANT_CAPABILITY_SUPPORT_SUPPORTED = "SUPPORTED"
 GRANT_CAPABILITY_SUPPORT_SUPPORTED_ALIAS = "SUPPORTED_ALIAS"
 GRANT_CAPABILITY_SUPPORT_UNSUPPORTED = "UNSUPPORTED"
@@ -4403,6 +4439,17 @@ def normalize_sequence_remap_policy(raw_value: Optional[str]) -> str:
     return value
 
 
+def normalize_sequence_sync_mode(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "off"
+    value = str(raw_value).strip().lower()
+    value = SEQUENCE_SYNC_MODE_ALIASES.get(value, value)
+    if value not in SEQUENCE_SYNC_MODE_VALUES:
+        log.warning("sequence_sync_mode=%s 不在支持范围内，将回退为 off。", raw_value)
+        return "off"
+    return value
+
+
 REPORT_DIR_LAYOUT_VALUES = {"flat", "per_run"}
 REPORT_DIR_LAYOUT_ALIASES = {
     "per-run": "per_run",
@@ -5887,6 +5934,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('constraint_missing_fixup_validate_mode', 'safe_novalidate')
         settings.setdefault('trigger_validity_sync_mode', 'compile')
         settings.setdefault('sequence_remap_policy', 'source_only')
+        settings.setdefault('sequence_sync_mode', 'off')
         settings.setdefault('generate_grants', 'true')
         settings.setdefault('grant_tab_privs_scope', 'owner')
         settings.setdefault('grant_merge_privileges', 'true')
@@ -5989,6 +6037,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings['grant_include_oracle_maintained_roles'] = parse_bool_flag(
             settings.get('grant_include_oracle_maintained_roles', 'false'),
             False
+        )
+        settings['sequence_sync_mode'] = normalize_sequence_sync_mode(
+            settings.get('sequence_sync_mode', 'off')
         )
         settings['enable_comment_check'] = parse_bool_flag(
             settings.get('check_comments', 'true'),
@@ -6700,6 +6751,14 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "仅支持 infer/source_only/dominant_table"
 
+    def _validate_sequence_sync_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = SEQUENCE_SYNC_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in SEQUENCE_SYNC_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 off/last_number"
+
     def _validate_blacklist_mode(val: str) -> Tuple[bool, str]:
         if not val.strip():
             return True, ""
@@ -7159,6 +7218,14 @@ def run_config_wizard(config_path: Path) -> None:
         default=cfg.get("SETTINGS", "sequence_remap_policy", fallback="source_only"),
         validator=_validate_sequence_remap_policy,
         transform=normalize_sequence_remap_policy,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "sequence_sync_mode",
+        "SEQUENCE 值同步脚本模式 (off/last_number)",
+        default=cfg.get("SETTINGS", "sequence_sync_mode", fallback="off"),
+        validator=_validate_sequence_sync_mode,
+        transform=normalize_sequence_sync_mode,
     )
     _prompt_field(
         "SETTINGS",
@@ -15156,7 +15223,7 @@ def dump_ob_metadata(
 
         sql_attr_tpl = """
             SELECT SEQUENCE_OWNER, SEQUENCE_NAME,
-                   INCREMENT_BY, MIN_VALUE, MAX_VALUE, CYCLE_FLAG, ORDER_FLAG, CACHE_SIZE
+                   INCREMENT_BY, MIN_VALUE, MAX_VALUE, CYCLE_FLAG, ORDER_FLAG, CACHE_SIZE, LAST_NUMBER
             FROM DBA_SEQUENCES
             WHERE SEQUENCE_OWNER IN ({owners_in})
         """
@@ -15166,7 +15233,7 @@ def dump_ob_metadata(
         elif lines:
             for line in lines:
                 parts = line.split('\t')
-                if len(parts) < 8:
+                if len(parts) < 9:
                     continue
                 owner = parts[0].strip().upper()
                 name = parts[1].strip().upper()
@@ -15183,7 +15250,8 @@ def dump_ob_metadata(
                     "max_value": _as_int(parts[4].strip()),
                     "cycle_flag": (parts[5] or "").strip().upper(),
                     "order_flag": (parts[6] or "").strip().upper(),
-                    "cache_size": _as_int(parts[7].strip())
+                    "cache_size": _as_int(parts[7].strip()),
+                    "last_number": _as_int(parts[8].strip()),
                 }
                 sequence_attrs.setdefault(owner, {})[name] = seq_info
 
@@ -18655,7 +18723,7 @@ def dump_oracle_metadata(
                 with ora_conn.cursor() as cursor:
                     sql_seq_tpl = """
                         SELECT SEQUENCE_OWNER, SEQUENCE_NAME,
-                               INCREMENT_BY, MIN_VALUE, MAX_VALUE, CYCLE_FLAG, ORDER_FLAG, CACHE_SIZE
+                               INCREMENT_BY, MIN_VALUE, MAX_VALUE, CYCLE_FLAG, ORDER_FLAG, CACHE_SIZE, LAST_NUMBER
                         FROM DBA_SEQUENCES
                         WHERE SEQUENCE_OWNER IN ({owners_clause})
                     """
@@ -18680,7 +18748,8 @@ def dump_oracle_metadata(
                                 "max_value": _as_int(row[4]),
                                 "cycle_flag": _safe_upper(row[5]) or "",
                                 "order_flag": _safe_upper(row[6]) or "",
-                                "cache_size": _as_int(row[7])
+                                "cache_size": _as_int(row[7]),
+                                "last_number": _as_int(row[8]),
                             }
                             sequence_attrs.setdefault(owner, {})[seq_name] = seq_info
 
@@ -21632,6 +21701,192 @@ def finalize_identity_sequence_grant_rows(
             )
         )
     return rows
+
+
+def resolve_sequence_target_full(
+    src_schema: str,
+    seq_name: str,
+    full_object_mapping: FullObjectMapping,
+) -> Tuple[str, str, str]:
+    src_schema_u = (src_schema or "").upper()
+    seq_name_u = (seq_name or "").upper()
+    src_full = f"{src_schema_u}.{seq_name_u}".strip(".")
+    mapped = get_mapped_target(full_object_mapping, src_full, "SEQUENCE")
+    tgt_full = mapped or src_full
+    if "." in tgt_full:
+        tgt_schema_u, tgt_name_u = tgt_full.split(".", 1)
+        return src_full, tgt_schema_u.upper(), tgt_name_u.upper()
+    return src_full, src_schema_u, seq_name_u
+
+
+def build_sequence_restart_detail_rows(
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata,
+    full_object_mapping: FullObjectMapping,
+    planned_sequence_creates: Optional[Set[Tuple[str, str]]] = None,
+    sequence_sync_mode: str = "off",
+    allow_fixup_predicate: Optional[Callable[[str, str], bool]] = None,
+) -> List[SequenceRestartDetailRow]:
+    mode = normalize_sequence_sync_mode(sequence_sync_mode)
+    if mode == "off":
+        return []
+
+    planned_sequence_creates = {
+        ((schema or "").upper(), (name or "").upper())
+        for schema, name in (planned_sequence_creates or set())
+        if (schema or "").strip() and (name or "").strip()
+    }
+    rows: List[SequenceRestartDetailRow] = []
+
+    for src_schema, seq_names in sorted((oracle_meta.sequences or {}).items()):
+        src_schema_u = (src_schema or "").upper()
+        src_attr_map = (oracle_meta.sequence_attrs or {}).get(src_schema_u, {}) or {}
+        for seq_name in sorted(seq_names or set()):
+            seq_name_u = (seq_name or "").upper()
+            if not src_schema_u or not seq_name_u:
+                continue
+            src_full, tgt_schema_u, tgt_name_u = resolve_sequence_target_full(
+                src_schema_u, seq_name_u, full_object_mapping
+            )
+            tgt_full = f"{tgt_schema_u}.{tgt_name_u}"
+            if is_auto_sequence_name(seq_name_u) or is_auto_sequence_name(tgt_name_u):
+                rows.append(
+                    SequenceRestartDetailRow(
+                        src_sequence_full=src_full,
+                        tgt_sequence_full=tgt_full,
+                        src_last_number="-",
+                        tgt_last_number="-",
+                        status=SEQUENCE_RESTART_STATUS_SKIPPED,
+                        reason_code=SEQUENCE_RESTART_REASON_AUTO_SEQUENCE_SKIPPED,
+                        detail="identity/backing auto sequence excluded",
+                        action="NO_ACTION",
+                    )
+                )
+                continue
+
+            if allow_fixup_predicate and not allow_fixup_predicate(tgt_schema_u, src_schema_u):
+                rows.append(
+                    SequenceRestartDetailRow(
+                        src_sequence_full=src_full,
+                        tgt_sequence_full=tgt_full,
+                        src_last_number="-",
+                        tgt_last_number="-",
+                        status=SEQUENCE_RESTART_STATUS_SKIPPED,
+                        reason_code=SEQUENCE_RESTART_REASON_FIXUP_SCOPE_EXCLUDED,
+                        detail="fixup scope excluded",
+                        action="NO_ACTION",
+                    )
+                )
+                continue
+
+            src_last = (src_attr_map.get(seq_name_u, {}) or {}).get("last_number")
+            if src_last is None:
+                rows.append(
+                    SequenceRestartDetailRow(
+                        src_sequence_full=src_full,
+                        tgt_sequence_full=tgt_full,
+                        src_last_number="-",
+                        tgt_last_number="-",
+                        status=SEQUENCE_RESTART_STATUS_UNRESOLVED,
+                        reason_code=SEQUENCE_RESTART_REASON_SOURCE_LAST_NUMBER_UNAVAILABLE,
+                        detail="oracle last_number unavailable",
+                        action="MANUAL_REVIEW",
+                    )
+                )
+                continue
+
+            target_exists = tgt_name_u in {
+                (name or "").upper() for name in ((ob_meta.sequences or {}).get(tgt_schema_u, set()) or set())
+            }
+            tgt_attr_map = (ob_meta.sequence_attrs or {}).get(tgt_schema_u, {}) or {}
+            tgt_last = (tgt_attr_map.get(tgt_name_u, {}) or {}).get("last_number")
+            planned_create = (tgt_schema_u, tgt_name_u) in planned_sequence_creates
+
+            if not target_exists:
+                if planned_create:
+                    rows.append(
+                        SequenceRestartDetailRow(
+                            src_sequence_full=src_full,
+                            tgt_sequence_full=tgt_full,
+                            src_last_number=str(int(src_last)),
+                            tgt_last_number="-",
+                            status=SEQUENCE_RESTART_STATUS_GENERATE,
+                            reason_code=SEQUENCE_RESTART_REASON_TARGET_MISSING_PLANNED_CREATE,
+                            detail="target sequence missing but create is planned in current fixup",
+                            action="GENERATE_RESTART",
+                        )
+                    )
+                else:
+                    rows.append(
+                        SequenceRestartDetailRow(
+                            src_sequence_full=src_full,
+                            tgt_sequence_full=tgt_full,
+                            src_last_number=str(int(src_last)),
+                            tgt_last_number="-",
+                            status=SEQUENCE_RESTART_STATUS_SKIPPED,
+                            reason_code=SEQUENCE_RESTART_REASON_TARGET_MISSING_NOT_PLANNED,
+                            detail="target sequence missing and no create planned in current fixup",
+                            action="NO_ACTION",
+                        )
+                    )
+                continue
+
+            if tgt_last is None:
+                rows.append(
+                    SequenceRestartDetailRow(
+                        src_sequence_full=src_full,
+                        tgt_sequence_full=tgt_full,
+                        src_last_number=str(int(src_last)),
+                        tgt_last_number="-",
+                        status=SEQUENCE_RESTART_STATUS_UNRESOLVED,
+                        reason_code=SEQUENCE_RESTART_REASON_TARGET_LAST_NUMBER_UNAVAILABLE,
+                        detail="target last_number unavailable",
+                        action="MANUAL_REVIEW",
+                    )
+                )
+                continue
+
+            if int(tgt_last) < int(src_last):
+                rows.append(
+                    SequenceRestartDetailRow(
+                        src_sequence_full=src_full,
+                        tgt_sequence_full=tgt_full,
+                        src_last_number=str(int(src_last)),
+                        tgt_last_number=str(int(tgt_last)),
+                        status=SEQUENCE_RESTART_STATUS_GENERATE,
+                        reason_code=SEQUENCE_RESTART_REASON_TARGET_LAST_NUMBER_BEHIND,
+                        detail="target last_number is behind oracle last_number",
+                        action="GENERATE_RESTART",
+                    )
+                )
+                continue
+
+            rows.append(
+                SequenceRestartDetailRow(
+                    src_sequence_full=src_full,
+                    tgt_sequence_full=tgt_full,
+                    src_last_number=str(int(src_last)),
+                    tgt_last_number=str(int(tgt_last)),
+                    status=SEQUENCE_RESTART_STATUS_NO_ACTION,
+                    reason_code=SEQUENCE_RESTART_REASON_TARGET_ALREADY_CAUGHT_UP,
+                    detail="target last_number already catches up to source",
+                    action="NO_ACTION",
+                )
+            )
+
+    return rows
+
+
+def extract_sequence_start_with_value(ddl: Optional[str]) -> Optional[int]:
+    if not ddl:
+        return None
+    match = re.search(r"(?is)\bSTART\s+WITH\s+(-?\d+)\b", str(ddl))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
 
 
 def normalize_filtered_grant_reason_token(reason_code: Optional[str]) -> str:
@@ -32968,6 +33223,7 @@ def write_fixup_root_readme(
         "type_body": "缺失 TYPE BODY 的 CREATE 脚本。",
         "synonym": "缺失 SYNONYM 的 CREATE 脚本。",
         "sequence": "缺失 SEQUENCE 的 CREATE 脚本。",
+        "sequence_restart": "SEQUENCE 值同步脚本（ALTER SEQUENCE ... RESTART START WITH；默认不执行）。",
         "index": "缺失 INDEX 的 CREATE 脚本。",
         "constraint": "缺失约束脚本。",
         "trigger": "缺失 TRIGGER 的 CREATE 脚本。",
@@ -34972,6 +35228,7 @@ def generate_fixup_scripts(
     settings["_sys_c_force_candidates"] = []
     settings["_trigger_view_reference_rows"] = []
     settings["_trigger_literal_alert_rows"] = []
+    settings["_sequence_restart_rows"] = []
     settings["_generated_fixup_dirs"] = []
     settings["_fixup_root_readme_path"] = ""
     if managed_target_scope is None:
@@ -35013,6 +35270,7 @@ def generate_fixup_scripts(
         settings.get("constraint_missing_fixup_validate_mode", "safe_novalidate")
     )
     trigger_validity_sync_mode = settings.get("trigger_validity_sync_mode", "compile")
+    sequence_sync_mode = normalize_sequence_sync_mode(settings.get("sequence_sync_mode", "off"))
     job_schedule_fixup_mode = normalize_job_schedule_fixup_mode(
         settings.get("job_schedule_fixup_mode", "manual")
     )
@@ -35026,6 +35284,8 @@ def generate_fixup_scripts(
         log.info("[FIXUP] plain_not_null_fixup_mode=runnable_if_no_nulls，普通 NOT NULL 收紧将先做目标端 NULL 门禁探测。")
     elif plain_not_null_fixup_mode == "force_runnable":
         log.warning("[FIXUP] plain_not_null_fixup_mode=force_runnable，普通 NOT NULL 收紧将直接输出可执行 SQL。")
+    if sequence_sync_mode == "last_number":
+        log.info("[FIXUP] sequence_sync_mode=last_number，将额外规划 sequence_restart/ 值同步脚本（默认不执行）。")
     deferred_validation_rows: List[ConstraintValidateDeferredRow] = []
     deferred_validation_lock = threading.Lock()
     invalid_view_keys: Set[Tuple[str, str]] = set()
@@ -35200,10 +35460,9 @@ def generate_fixup_scripts(
 
     if not master_list:
         if safe_to_clean:
-            log.info("[FIXUP] master_list 为空，目录已清理，无新增订正 SQL。")
+            log.info("[FIXUP] master_list 为空，目录已清理；将继续按扩展对象/授权/值同步逻辑生成可用脚本。")
         else:
-            log.info("[FIXUP] master_list 为空，目录未清理，无新增订正 SQL。")
-        return None
+            log.info("[FIXUP] master_list 为空，目录未清理；将继续按扩展对象/授权/值同步逻辑生成可用脚本。")
 
     log.info(f"[FIXUP] 目标端订正 SQL 将生成到目录: {base_dir.resolve()}")
     fixup_write_started_at = time.time()
@@ -36245,6 +36504,23 @@ def generate_fixup_scripts(
             queue_request(src_schema, 'SEQUENCE', seq_name_u)
             sequence_tasks.append((src_schema, seq_name_u, tgt_schema, tgt_name))
 
+    sequence_restart_rows: List[SequenceRestartDetailRow] = []
+    if sequence_sync_mode == "last_number":
+        planned_sequence_creates = {
+            ((tgt_schema or "").upper(), (tgt_name or "").upper())
+            for _src_schema, _src_name, tgt_schema, tgt_name in sequence_tasks
+            if (tgt_schema or "").strip() and (tgt_name or "").strip()
+        }
+        sequence_restart_rows = build_sequence_restart_detail_rows(
+            oracle_meta,
+            ob_meta,
+            full_object_mapping,
+            planned_sequence_creates=planned_sequence_creates,
+            sequence_sync_mode=sequence_sync_mode,
+            allow_fixup_predicate=lambda tgt_schema_u, src_schema_u: allow_fixup("SEQUENCE", tgt_schema_u, src_schema_u),
+        )
+        settings["_sequence_restart_rows"] = list(sequence_restart_rows)
+
     index_tasks: List[Tuple[IndexMismatch, str, str, str, str]] = []
     for item in extra_results.get('index_mismatched', []):
         table_str = item.table.split()[0]
@@ -36969,6 +37245,8 @@ def generate_fixup_scripts(
     log.info("[FIXUP] (1/9) 正在生成 SEQUENCE 脚本...")
     seq_progress = build_progress_tracker(len(sequence_tasks), "[FIXUP] (1/9) SEQUENCE")
     seq_jobs: List[Callable[[], None]] = []
+    created_sequence_start_values: Dict[Tuple[str, str], Optional[int]] = {}
+    created_sequence_start_values_lock = threading.Lock()
     for src_schema, seq_name, tgt_schema, tgt_name in sequence_tasks:
         def _job(ss=src_schema, sn=seq_name, ts=tgt_schema, tn=tgt_name):
             try:
@@ -37007,6 +37285,8 @@ def generate_fixup_scripts(
                     ddl_adj,
                 )
                 ddl_adj = strip_constraint_enable(ddl_adj)
+                with created_sequence_start_values_lock:
+                    created_sequence_start_values[(ts.upper(), tn.upper())] = extract_sequence_start_with_value(ddl_adj)
                 ddl_adj = apply_fixup_idempotency(
                     ddl_adj,
                     'SEQUENCE',
@@ -37032,6 +37312,82 @@ def generate_fixup_scripts(
                 seq_progress()
         seq_jobs.append(_job)
     run_tasks(seq_jobs, "SEQUENCE")
+
+    if sequence_sync_mode == "last_number":
+        log.info("[FIXUP] (1b/9) 正在生成 SEQUENCE RESTART 脚本...")
+        restart_generated = 0
+        restart_skipped: Dict[str, int] = defaultdict(int)
+        finalized_sequence_restart_rows: List[SequenceRestartDetailRow] = []
+        for row in sequence_restart_rows:
+            if (
+                (row.status or "").upper() == SEQUENCE_RESTART_STATUS_GENERATE
+                and (row.reason_code or "").upper() == SEQUENCE_RESTART_REASON_TARGET_MISSING_PLANNED_CREATE
+            ):
+                parsed = parse_full_object_name(row.tgt_sequence_full)
+                if parsed:
+                    created_start = created_sequence_start_values.get((parsed[0], parsed[1]))
+                    try:
+                        src_last = int(row.src_last_number)
+                    except (TypeError, ValueError):
+                        src_last = None
+                    if created_start is not None and src_last is not None and created_start >= src_last:
+                        row = row._replace(
+                            status=SEQUENCE_RESTART_STATUS_NO_ACTION,
+                            reason_code=SEQUENCE_RESTART_REASON_TARGET_CREATE_ALREADY_SYNCED,
+                            detail=f"create sequence ddl already starts with {created_start}",
+                            action="NO_ACTION",
+                        )
+            finalized_sequence_restart_rows.append(row)
+
+        settings["_sequence_restart_rows"] = list(finalized_sequence_restart_rows)
+        for row in finalized_sequence_restart_rows:
+            status_u = (row.status or "").upper()
+            reason_u = (row.reason_code or "").upper()
+            if status_u != SEQUENCE_RESTART_STATUS_GENERATE:
+                restart_skipped[reason_u or "skipped"] += 1
+                continue
+            parsed = parse_full_object_name(row.tgt_sequence_full)
+            if not parsed:
+                restart_skipped["target_name_invalid"] += 1
+                continue
+            tgt_schema_u, tgt_name_u = parsed
+            sql = (
+                f"ALTER SEQUENCE {quote_qualified_parts(tgt_schema_u, tgt_name_u)} "
+                f"RESTART START WITH {row.src_last_number};"
+            )
+            extra_comments = [
+                f"-- source_last_number={row.src_last_number}",
+                f"-- target_last_number={row.tgt_last_number}",
+                f"-- reason={reason_u}",
+                "-- 注意: 该目录用于 sequence 值同步，建议在数据装载完成后显式执行。",
+            ]
+            write_fixup_file(
+                base_dir,
+                "sequence_restart",
+                f"{tgt_schema_u}.{tgt_name_u}.sql",
+                sql,
+                f"同步 SEQUENCE 当前值 {row.tgt_sequence_full} (源: {row.src_sequence_full})",
+                extra_comments=extra_comments,
+            )
+            restart_generated += 1
+        if sequence_restart_rows or restart_generated:
+            if fixup_skip_summary is not None:
+                fixup_skip_summary["SEQUENCE_RESTART"] = {
+                    "missing_total": len(finalized_sequence_restart_rows),
+                    "task_total": sum(
+                        1 for item in finalized_sequence_restart_rows
+                        if (item.status or "").upper() == SEQUENCE_RESTART_STATUS_GENERATE
+                    ),
+                    "generated": restart_generated,
+                    "skipped": dict(restart_skipped),
+                }
+            log.info(
+                "[FIXUP] sequence_restart 规划完成: total=%d, generated=%d, unresolved=%d, skipped=%d",
+                len(finalized_sequence_restart_rows),
+                restart_generated,
+                sum(1 for item in finalized_sequence_restart_rows if (item.status or "").upper() == SEQUENCE_RESTART_STATUS_UNRESOLVED),
+                sum(int(v or 0) for v in restart_skipped.values()),
+            )
 
     log.info("[FIXUP] (2/9) 正在生成缺失的 TABLE CREATE 脚本...")
     table_jobs: List[Callable[[], None]] = []
@@ -39441,6 +39797,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "目标端额外授权明细"
     if name.startswith("identity_sequence_grant_detail_"):
         return "DETAIL", "identity sequence 跨 schema 授权明细"
+    if name.startswith("sequence_restart_detail_"):
+        return "DETAIL", "sequence restart 规划明细"
     if name.startswith("fatal_error_matrix_"):
         return "DETAIL", "fatal error 场景矩阵"
     if name.startswith("manual_actions_required_"):
@@ -42475,6 +42833,40 @@ def export_identity_sequence_grant_detail(
     return write_pipe_report("identity sequence 跨 schema 授权明细", header_fields, data_rows, output_path)
 
 
+def export_sequence_restart_detail(
+    rows: List[SequenceRestartDetailRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not report_timestamp or not rows:
+        return None
+    output_path = Path(report_dir) / f"sequence_restart_detail_{report_timestamp}.txt"
+    header_fields = [
+        "SRC_SEQUENCE",
+        "TGT_SEQUENCE",
+        "SRC_LAST_NUMBER",
+        "TGT_LAST_NUMBER",
+        "STATUS",
+        "REASON_CODE",
+        "DETAIL",
+        "ACTION",
+    ]
+    data_rows = [
+        [
+            row.src_sequence_full or "-",
+            row.tgt_sequence_full or "-",
+            row.src_last_number or "-",
+            row.tgt_last_number or "-",
+            row.status or "-",
+            row.reason_code or "-",
+            row.detail or "-",
+            row.action or "-",
+        ]
+        for row in rows
+    ]
+    return write_pipe_report("sequence restart 规划明细", header_fields, data_rows, output_path)
+
+
 def build_fatal_error_matrix_rows(settings: Optional[Dict]) -> List[FatalErrorMatrixRow]:
     settings = settings or {}
     enabled_extra_types = {str(t).upper() for t in (settings.get("enabled_extra_types") or set()) if str(t).strip()}
@@ -42692,6 +43084,8 @@ def build_operator_action_rows(
     trigger_view_reference_count: int = 0,
     trigger_literal_alert_count: int = 0,
     identity_sequence_unresolved_count: int = 0,
+    sequence_restart_generated_count: int = 0,
+    sequence_restart_unresolved_count: int = 0,
     sys_c_force_candidate_count: int = 0,
     case_sensitive_findings_count: int = 0,
     deferred_validate_count: int = 0,
@@ -42876,6 +43270,28 @@ def build_operator_action_rows(
         related_fixup_dir="grants_miss/",
         why="跨 schema identity 表插入可能需要底层 ISEQ$$_... 授权，但当前无法可靠定位目标序列。",
         recommended_action="先看 identity sequence 授权明细，人工确认目标 ISEQ$$_... 并补授权。",
+    )
+    _add(
+        priority="REVIEW",
+        stage="BEFORE_DIR_EXECUTE",
+        category="SEQUENCE_RESTART_REVIEW",
+        count=sequence_restart_generated_count,
+        default_behavior="REVIEW_BEFORE_EXECUTE",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "sequence_restart_detail"),
+        related_fixup_dir="sequence_restart/",
+        why="sequence_restart/ 属于值同步 SQL，不等同普通 CREATE SEQUENCE，默认不会被 run_fixup 执行。",
+        recommended_action="先核对 sequence_restart 明细与目标端当前 LAST_NUMBER，再在数据装载完成后显式执行 sequence_restart/。",
+    )
+    _add(
+        priority="REVIEW",
+        stage="POST_COMPARE_REVIEW",
+        category="SEQUENCE_RESTART_UNRESOLVED",
+        count=sequence_restart_unresolved_count,
+        default_behavior="REPORT_ONLY",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "sequence_restart_detail"),
+        related_fixup_dir="sequence_restart/",
+        why="部分 sequence 无法可靠判断是否需要 restart，程序已保守降级为人工确认。",
+        recommended_action="查看 sequence_restart_detail，确认源/目标 LAST_NUMBER 与执行时机后再决定是否手工同步。",
     )
     _add(
         priority="REVIEW",
@@ -44921,6 +45337,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "ORACLE_PRIVILEGE_FAMILY_DETAIL"
     if name.startswith("identity_sequence_grant_detail_"):
         return "IDENTITY_SEQUENCE_GRANT_DETAIL"
+    if name.startswith("sequence_restart_detail_"):
+        return "SEQUENCE_RESTART_DETAIL"
     if name.startswith("fatal_error_matrix_"):
         return "FATAL_ERROR_MATRIX"
     if name.startswith("manual_actions_required_"):
@@ -48074,7 +48492,7 @@ def build_run_summary(
                 all=Path(ctx.fixup_dir) / 'grants_all'
             )
         )
-    if fixup_skip_summary and any(fixup_skip_summary.get(obj_type) for obj_type in ("INDEX", "TRIGGER", "SYNONYM")):
+    if fixup_skip_summary and any(fixup_skip_summary.get(obj_type) for obj_type in ("INDEX", "TRIGGER", "SYNONYM", "SEQUENCE_RESTART")):
         if report_file:
             report_parent = Path(report_file).parent
             _append_unique_guide_step(next_steps, f"如脚本数量和预期不符，再看 {report_parent}/fixup_skip_summary_*.txt。")
@@ -48536,6 +48954,15 @@ def print_final_report(
         1 for row in identity_sequence_grant_rows
         if (row.status or "").upper() == IDENTITY_SEQUENCE_STATUS_UNRESOLVED
     )
+    sequence_restart_rows = list((settings or {}).get("_sequence_restart_rows") or [])
+    sequence_restart_generated_count = sum(
+        1 for row in sequence_restart_rows
+        if (row.status or "").upper() == SEQUENCE_RESTART_STATUS_GENERATE
+    )
+    sequence_restart_unresolved_count = sum(
+        1 for row in sequence_restart_rows
+        if (row.status or "").upper() == SEQUENCE_RESTART_STATUS_UNRESOLVED
+    )
     deferred_validate_count = int((settings or {}).get("_constraint_validate_deferred_count", 0) or 0)
     generated_fixup_dirs = list((settings or {}).get("_generated_fixup_dirs") or [])
     report_parent_path = Path(report_file).parent if report_file else None
@@ -48561,6 +48988,8 @@ def print_final_report(
         trigger_view_reference_count=trigger_view_reference_count,
         trigger_literal_alert_count=trigger_literal_alert_count,
         identity_sequence_unresolved_count=identity_sequence_unresolved_count,
+        sequence_restart_generated_count=sequence_restart_generated_count,
+        sequence_restart_unresolved_count=sequence_restart_unresolved_count,
         sys_c_force_candidate_count=sys_c_force_candidate_count,
         case_sensitive_findings_count=case_sensitive_findings_count,
         deferred_validate_count=deferred_validate_count,
@@ -49211,7 +49640,7 @@ def print_final_report(
         console.print(diag_table)
         console.print("")
 
-    if fixup_skip_summary and any(fixup_skip_summary.get(obj_type) for obj_type in ("INDEX", "TRIGGER", "SYNONYM")):
+    if fixup_skip_summary and any(fixup_skip_summary.get(obj_type) for obj_type in ("INDEX", "TRIGGER", "SYNONYM", "SEQUENCE_RESTART")):
         skip_table = Table(title="[header]0.d Fixup 跳过汇总[/header]", width=section_width)
         skip_table.add_column("对象类型", style="info", width=12)
         skip_table.add_column("指标", style="info", width=28)
@@ -49697,6 +50126,7 @@ def print_final_report(
         "fixup_scripts/constraint    : 缺失约束的 CREATE 脚本\n"
         "fixup_scripts/name_collision : 约束/索引重名修复 (phase1/phase2)\n"
         "fixup_scripts/sequence      : 缺失 SEQUENCE 的 CREATE 脚本\n"
+        "fixup_scripts/sequence_restart : SEQUENCE 值同步脚本 (ALTER SEQUENCE ... RESTART START WITH；默认不执行)\n"
         "fixup_scripts/trigger       : 缺失 TRIGGER 的 CREATE 脚本\n"
         "fixup_scripts/constraint_validate_later : 约束后置 VALIDATE 脚本（脏数据清理后执行）\n"
         "fixup_scripts/unsupported/* : 不支持/阻断对象 DDL (默认不执行)\n"
@@ -49942,6 +50372,18 @@ def print_final_report(
             identity_sequence_grant_detail_path,
             len(identity_sequence_grant_rows) if identity_sequence_grant_detail_path else None,
             "identity sequence 跨 schema 授权明细"
+        )
+        sequence_restart_rows = list((settings or {}).get("_sequence_restart_rows") or [])
+        sequence_restart_detail_path = export_sequence_restart_detail(
+            sequence_restart_rows,
+            report_path.parent,
+            report_ts,
+        )
+        _add_index_entry(
+            "DETAIL",
+            sequence_restart_detail_path,
+            len(sequence_restart_rows) if sequence_restart_detail_path else None,
+            "sequence restart 规划明细"
         )
         fatal_error_matrix_rows = build_fatal_error_matrix_rows(settings)
         fatal_error_matrix_path = export_fatal_error_matrix(

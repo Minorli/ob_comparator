@@ -866,20 +866,21 @@ DIR_OBJECT_TYPE_MAP["table_alter"] = "TABLE"
 # Execution priority for dependency-aware ordering
 DEPENDENCY_LAYERS = [
     ["sequence"],                                    # Layer 0: No dependencies
-    ["table"],                                       # Layer 1: Base tables
-    ["table_alter"],                                 # Layer 2: Table modifications
-    ["view_prereq_grants", "grants"],                # Layer 3: View prereq + general grants
-    ["view", "synonym"],                             # Layer 4: Simple dependent objects
-    ["view_post_grants"],                            # Layer 5: View post grants
-    ["materialized_view"],                           # Layer 6: MVIEWs
-    ["type"],                                        # Layer 7: Types (specs)
-    ["package"],                                     # Layer 8: Package specs
-    ["procedure", "function"],                       # Layer 9: Standalone routines
-    ["type_body", "package_body"],                   # Layer 10: Type/package bodies
-    ["name_collision"],                              # Layer 11: Name collision remediation
-    ["constraint", "index"],                         # Layer 12: Constraints and indexes
-    ["trigger"],                                     # Layer 13: Triggers (last)
-    ["job", "schedule"],                             # Layer 14: Jobs
+    ["sequence_restart"],                            # Layer 1: Sequence value sync (default skipped)
+    ["table"],                                       # Layer 2: Base tables
+    ["table_alter"],                                 # Layer 3: Table modifications
+    ["view_prereq_grants", "grants"],                # Layer 4: View prereq + general grants
+    ["view", "synonym"],                             # Layer 5: Simple dependent objects
+    ["view_post_grants"],                            # Layer 6: View post grants
+    ["materialized_view"],                           # Layer 7: MVIEWs
+    ["type"],                                        # Layer 8: Types (specs)
+    ["package"],                                     # Layer 9: Package specs
+    ["procedure", "function"],                       # Layer 10: Standalone routines
+    ["type_body", "package_body"],                   # Layer 11: Type/package bodies
+    ["name_collision"],                              # Layer 12: Name collision remediation
+    ["constraint", "index"],                         # Layer 13: Constraints and indexes
+    ["trigger"],                                     # Layer 14: Triggers (last)
+    ["job", "schedule"],                             # Layer 15: Jobs
 ]
 
 CORE_GRANT_DIRS_ORDER = ("grants_all", "grants_miss", "grants")
@@ -1056,6 +1057,7 @@ def build_run_fixup_change_notices(
     selected_view = any(dir_filter_overlaps("view", item) for item in selected_dirs)
     selected_grants_revoke = any(dir_filter_overlaps("grants_revoke", item) for item in selected_dirs)
     selected_cleanup_safe = any(dir_filter_overlaps("cleanup_safe", item) for item in selected_dirs)
+    selected_sequence_restart = any(dir_filter_overlaps("sequence_restart", item) for item in selected_dirs)
     if not getattr(args, "allow_table_create", False) and (
         selected_table or (selected_all and (fixup_dir / "table").exists())
     ):
@@ -1089,6 +1091,13 @@ def build_run_fixup_change_notices(
             "0.9.8.9",
             "安全清理目录需要显式确认",
             "cleanup_safe/ 下是 destructive SQL；请先审 extra_cleanup_candidates.txt，再显式按目录执行。",
+        ))
+    if (selected_all or selected_sequence_restart) and (fixup_dir / "sequence_restart").exists():
+        notices.append(RuntimeNotice(
+            "sequence_restart_review",
+            "0.9.8.9",
+            "sequence_restart 默认不自动执行",
+            "sequence_restart/ 是值同步 SQL；请先核对 sequence_restart_detail 与源/目标 LAST_NUMBER，再显式按目录执行。",
         ))
     return notices
 
@@ -2208,7 +2217,7 @@ def collect_sql_files_by_layer(
     else:
         # Keep non-smart execution order aligned with dependency-aware layers.
         priority = [
-            "sequence", "table", "table_alter", "view_prereq_grants", "grants",
+            "sequence", "sequence_restart", "table", "table_alter", "view_prereq_grants", "grants",
             "view", "synonym", "view_post_grants", "materialized_view",
             "type", "package", "procedure", "function",
             "type_body", "package_body", "name_collision", "constraint", "index", "trigger",
@@ -5356,7 +5365,7 @@ def main() -> None:
         only_dirs = [normalize_dir_filter(d) for d in only_dirs] if only_dirs else []
     
     exclude_dirs = [normalize_dir_filter(d) for d in exclude_dirs]
-    default_excludes = {"tables_unsupported", "unsupported", "constraint_validate_later", "grants_deferred", "cleanup_safe", "cleanup_semantic"}
+    default_excludes = {"tables_unsupported", "unsupported", "constraint_validate_later", "grants_deferred", "cleanup_safe", "cleanup_semantic", "sequence_restart"}
     if not getattr(args, "allow_table_create", False):
         # Safety first: table create scripts are risky in migration workflows
         # because they can create empty target tables if OMS data load is skipped.
@@ -5381,6 +5390,8 @@ def main() -> None:
         log.warning("安全模式: 默认跳过 fixup_scripts/table/（防止误建空表）。")
     if not any(dir_filter_overlaps("grants_deferred", item) for item in only_dirs):
         log.warning("安全模式: 默认跳过 fixup_scripts/grants_deferred/（需对象补齐后再执行）。")
+    if not any(dir_filter_overlaps("sequence_restart", item) for item in only_dirs):
+        log.warning("安全模式: 默认跳过 fixup_scripts/sequence_restart/（值同步 SQL 需确认 LAST_NUMBER 与执行时机后再执行）。")
     if not any(dir_filter_overlaps("cleanup_safe", item) for item in only_dirs):
         log.warning("安全模式: 默认跳过 fixup_scripts/cleanup_safe/（显式审核后再执行 destructive 清理 SQL）。")
     if not any(dir_filter_overlaps("cleanup_semantic", item) for item in only_dirs):

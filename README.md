@@ -262,6 +262,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/column_identity_detail_<ts>.txt`：现有列 identity 差异明细（含 `ALWAYS / BY DEFAULT / BY DEFAULT ON NULL` 模式差异；首版为 review-first）
 - `main_reports/run_<ts>/column_identity_option_detail_<ts>.txt`：现有列 identity 细项差异明细（首批覆盖 `START WITH / INCREMENT BY / CACHE`；仅在 identity 模式一致时比较，首版为 review-first）
 - `main_reports/run_<ts>/identity_sequence_grant_detail_<ts>.txt`：identity 表跨 schema 授权明细（目标端 `ISEQ$$_...` 定位结果、缺失 grant、人工确认项）
+- `main_reports/run_<ts>/sequence_restart_detail_<ts>.txt`：sequence 值同步规划明细（Oracle/OB `LAST_NUMBER`、是否生成 restart、跳过原因）
 - `main_reports/run_<ts>/fatal_error_matrix_<ts>.txt`：fatal 场景矩阵（哪些错误会直接终止、当前是否相关、如何修复）
 - `main_reports/run_<ts>/column_default_on_null_detail_<ts>.txt`：现有列 `DEFAULT ON NULL` 语义差异明细（双向 compare；首版为 review-first）
 - `main_reports/run_<ts>/column_default_detail_<ts>.txt`：现有列默认值差异明细（仅列级语义，不等同 `DEFAULT ON NULL`）
@@ -276,6 +277,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `fixup_scripts/grants_all/*.grants.sql` / `fixup_scripts/grants_miss/*.grants.sql`：对象/列授权文件在同一 owner 文件内按 `OBJECT_TYPE` 分段；当 `OBJECT_TYPE=TABLE` 时，还会细分 `TABLE_OBJECT_GRANTS` 与 `TABLE_COLUMN_GRANTS`，便于人工审核
 - Oracle 维护角色授权现在会在每次运行时动态读取目标端 `DBA_ROLES` 做对比；只有目标端当前确实存在该角色时，才会保留到 `grants_all/grants_miss`。像 `EXP_FULL_DATABASE`、`DATAPUMP_*`、`SELECT_CATALOG_ROLE -> OB_CATALOG_ROLE` 这类角色若目标端不存在，会移到 `filtered_grants.txt` / `unsupported_grant_detail_<ts>.txt`，不再混进 runnable grant 文件
 - 如果当前运行拿不到目标端 `DBA_ROLES`，Oracle 维护角色授权会统一降级成 report/manual，不会回退成默认放行
+- `sequence_sync_mode=last_number` 开启后，会额外生成 `fixup_scripts/sequence_restart/`；脚本使用 `ALTER SEQUENCE ... RESTART START WITH <oracle_last_number>`，不采用固定 `+100` 偏移，并默认由 `run_fixup` 跳过。若本轮缺失 sequence 的 `CREATE SEQUENCE` 脚本已自带正确 `START WITH`，则不会重复生成 restart
 - `fixup_scripts/tables_unsupported/`：不支持 TABLE 的 DDL（默认不执行）
 - `fixup_scripts/unsupported/`：不支持/阻断对象 DDL（默认不执行）
 - `fixup_scripts/view_chain_plans/`：VIEW 链路修复计划
