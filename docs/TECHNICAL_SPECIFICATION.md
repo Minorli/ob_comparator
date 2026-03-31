@@ -276,6 +276,7 @@
 - `grant_capability_detail_<ts>.txt`：动态授权规则库明细（支持结果、目录别名、最终决策）
 - `triggers_non_table_detail_<ts>.txt`：非表触发器明细（当前主要为 DATABASE/SCHEMA 级事件触发器；`INSTEAD OF ... ON VIEW` 已进入普通 compare/fixup）
 - `sequence_restart_detail_<ts>.txt`：sequence 值同步规划明细（源/目标 `LAST_NUMBER`、是否生成 restart、跳过原因）
+- 默认值 compare 额外做默认值语义归一：数值字面量、`DATE '...'`、`-(1)` 以及字符串字面量外部的尾部注释会先 canonicalize，再参与 Oracle/OB compare；该归一仅作用于列默认值，不影响其他表达式 compare
 
 ---
 

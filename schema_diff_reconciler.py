@@ -3145,10 +3145,89 @@ def describe_nullable_flag(value: Optional[object]) -> str:
     return "UNKNOWN"
 
 
+DEFAULT_DATE_LITERAL_RE = re.compile(r"(?is)^DATE\s*'(\d{4})-(\d{1,2})-(\d{1,2})'$")
+DEFAULT_NUMERIC_LITERAL_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$")
+DEFAULT_NEG_PAREN_NUMERIC_RE = re.compile(r"^-\(\s*(.+?)\s*\)$")
+
+
+def strip_sql_comments_outside_literals(expr: Optional[str]) -> str:
+    if expr is None:
+        return ""
+    text = str(expr)
+    if not text:
+        return ""
+    masker = SqlMasker(text)
+    masked = masker.masked_sql
+    for key in masker.comments.keys():
+        masked = masked.replace(key, " ")
+    return masker.unmask(masked)
+
+
+def canonicalize_default_numeric_literal(expr: Optional[str]) -> Optional[str]:
+    if expr is None:
+        return None
+    text = str(expr).strip()
+    if not text:
+        return None
+    neg_match = DEFAULT_NEG_PAREN_NUMERIC_RE.match(text)
+    if neg_match:
+        inner = canonicalize_default_numeric_literal(neg_match.group(1))
+        if inner is None:
+            return None
+        return "0" if inner == "0" else f"-{inner}"
+    if not DEFAULT_NUMERIC_LITERAL_RE.match(text):
+        return None
+    try:
+        normalized = format(Decimal(text).normalize(), "f")
+    except (InvalidOperation, ValueError):
+        return None
+    if "." in normalized:
+        normalized = normalized.rstrip("0").rstrip(".")
+    if normalized in {"-0", "+0", ""}:
+        normalized = "0"
+    if normalized.startswith("."):
+        normalized = "0" + normalized
+    if normalized.startswith("-."):
+        normalized = "-0" + normalized[1:]
+    return normalized or "0"
+
+
+def canonicalize_default_date_literal(expr: Optional[str]) -> Optional[str]:
+    if expr is None:
+        return None
+    text = str(expr).strip()
+    if not text:
+        return None
+    match = DEFAULT_DATE_LITERAL_RE.match(text)
+    if not match:
+        return None
+    try:
+        year = int(match.group(1))
+        month = int(match.group(2))
+        day = int(match.group(3))
+        datetime(year, month, day)
+    except (TypeError, ValueError):
+        return None
+    return f"DATE '{year:04d}-{month:02d}-{day:02d}'"
+
+
+def canonicalize_default_expression(expr: Optional[str]) -> str:
+    text = normalize_sql_expression_casefold(expr)
+    if not text:
+        return ""
+    numeric = canonicalize_default_numeric_literal(text)
+    if numeric is not None:
+        return numeric
+    date_literal = canonicalize_default_date_literal(text)
+    if date_literal is not None:
+        return date_literal
+    return text
+
+
 def normalize_column_default_expression(expr: Optional[object]) -> str:
     if expr is None:
         return ""
-    text = normalize_sql_expression_casefold(str(expr))
+    text = canonicalize_default_expression(strip_sql_comments_outside_literals(str(expr)))
     while text.startswith("(") and text.endswith(")"):
         stripped = strip_wrapping_parentheses(text)
         if stripped == text:
@@ -3163,7 +3242,7 @@ def normalize_column_default_expression(expr: Optional[object]) -> str:
 def normalize_column_default_display_expression(expr: Optional[object]) -> str:
     if expr is None:
         return ""
-    text = normalize_sql_expression(str(expr))
+    text = normalize_sql_expression(strip_sql_comments_outside_literals(str(expr)))
     while text.startswith("(") and text.endswith(")"):
         stripped = strip_wrapping_parentheses(text)
         if stripped == text:
