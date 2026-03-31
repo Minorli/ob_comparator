@@ -180,6 +180,16 @@
 - sequence_remap_policy：SEQUENCE 目标 schema 推导策略。默认：source_only。
   可选值：infer（依赖+主流表推导）、source_only（保持源 schema）、dominant_table（仅主流表推导）。
   说明：仅影响 SEQUENCE 缺失与修补脚本的目标 schema。
+- sequence_sync_mode：SEQUENCE 值同步脚本模式。默认：off。
+  可选值：off（不生成）、last_number（基于 Oracle `DBA_SEQUENCES.LAST_NUMBER` 生成 `sequence_restart/`）。
+  说明：该能力不改变现有 sequence “存在性 compare” 逻辑，只额外生成值同步脚本。
+  说明：程序会同时读取 Oracle 与 OceanBase 当前 `DBA_SEQUENCES.LAST_NUMBER`：
+  - 目标 sequence 已存在且目标 `LAST_NUMBER` 小于源端时，生成同样脚本
+  - 若目标 sequence 缺失但本轮 `CREATE SEQUENCE` 脚本本身已经 `START WITH` 到源端当前值，则不会重复生成 restart
+  - 目标 `LAST_NUMBER` 已大于等于源端时，不生成 restart
+  说明：不采用固定 `+100` 偏移；`LAST_NUMBER` 在 CACHE 序列上本身可能前跳，但比固定偏移更可控。
+  说明：脚本输出到 `fixup_scripts/sequence_restart/`，默认不会被 `run_fixup` 执行；需显式 `--only-dirs sequence_restart`。
+  说明：每轮还会输出 `sequence_restart_detail_<ts>.txt`，记录源/目标 `LAST_NUMBER`、是否生成脚本、以及跳过原因。
 
 黑名单（不支持表过滤）
 - blacklist_mode：黑名单来源模式。默认：auto。

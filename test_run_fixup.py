@@ -2430,6 +2430,7 @@ class TestTableCreateSafety(unittest.TestCase):
 
             self.assertEqual(cm.exception.code, 0)
             self.assertIn("table", captured["exclude_dirs"])
+            self.assertIn("sequence_restart", captured["exclude_dirs"])
 
     def test_main_allow_table_create_removes_default_table_exclude(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2471,6 +2472,49 @@ class TestTableCreateSafety(unittest.TestCase):
 
             self.assertEqual(cm.exception.code, 0)
             self.assertNotIn("table", captured["exclude_dirs"])
+            self.assertIn("sequence_restart", captured["exclude_dirs"])
+
+    def test_main_only_dirs_sequence_restart_removes_default_sequence_restart_exclude(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fixup_dir = root / "fixup_scripts"
+            fixup_dir.mkdir(parents=True)
+            report_dir = root / "main_reports"
+            report_dir.mkdir(parents=True)
+            cfg = root / "config.ini"
+            cfg.write_text("", encoding="utf-8")
+            args = self._build_args(cfg, only_dirs=["sequence_restart"])
+
+            captured = {}
+
+            def fake_run_single(_args, _ob_cfg, _fixup_dir, _repo_root, _report_dir, only_dirs, exclude_dirs, _fixup_settings, _max_sql_file_bytes):
+                captured["only_dirs"] = only_dirs
+                captured["exclude_dirs"] = exclude_dirs
+                raise SystemExit(0)
+
+            with mock.patch.object(rf, "parse_args", return_value=args), \
+                 mock.patch.object(
+                     rf,
+                     "load_ob_config",
+                     return_value=(
+                         {"executable": "obclient", "host": "127.0.0.1", "port": "2881", "user_string": "u@tenant", "password": "p"},
+                         fixup_dir,
+                         root,
+                         "INFO",
+                         report_dir,
+                         rf.FixupAutoGrantSettings(False, set(), False, 100),
+                         None,
+                     ),
+                 ), \
+                 mock.patch.object(rf, "resolve_console_log_level", return_value=logging.INFO), \
+                 mock.patch.object(rf, "set_console_log_level"), \
+                 mock.patch.object(rf, "run_single_fixup", side_effect=fake_run_single):
+                with self.assertRaises(SystemExit) as cm:
+                    rf.main()
+
+            self.assertEqual(cm.exception.code, 0)
+            self.assertIn("sequence_restart", captured["only_dirs"])
+            self.assertNotIn("sequence_restart", captured["exclude_dirs"])
 
     def test_main_only_dirs_table_still_blocked_without_allow_flag(self):
         with tempfile.TemporaryDirectory() as tmpdir:

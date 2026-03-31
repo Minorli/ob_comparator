@@ -393,6 +393,15 @@ infer_schema_mapping    = true
 #   source_only    -> 始终保持源 schema（默认）
 #   dominant_table -> 仅按主流表 schema 推导
 sequence_remap_policy   = source_only
+# SEQUENCE 值同步脚本模式：
+#   off         -> 不生成 sequence_restart 脚本（默认）
+#   last_number -> 基于 Oracle DBA_SEQUENCES.LAST_NUMBER 生成
+#                  ALTER SEQUENCE ... RESTART START WITH <n>
+# 注意：
+#   1) 不采用固定 +100 偏移
+#   2) sequence_restart/ 默认不会被 run_fixup 执行
+#   3) 建议在对象就绪且数据装载完成后显式执行
+sequence_sync_mode     = off
 # 是否清洗 PL/SQL DDL 中的全角标点（默认开启，避免目标端解析失败）
 ddl_punct_sanitize      = true
 # DDL hint 清洗策略:
