@@ -233,6 +233,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/grant_capability_detail_<ts>.txt`：本次授权动态规则库明细（含目标端目录权限别名，如 `DEBUG -> OTHERS`）
 - `main_reports/run_<ts>/oracle_privilege_family_detail_<ts>.txt`：Oracle 权限族覆盖明细（区分 `RUNNABLE / MANUAL_ONLY`，当前 `DBA_COL_PRIVS` 已纳入 runnable grants，ACL/AQ/XS/Resource Manager 等仍先做盘点）
 - `main_reports/run_<ts>/target_extra_grants_detail_<ts>.txt`：目标端额外对象授权明细（含 PUBLIC 扩权风险）
+- `main_reports/run_<ts>/unsupported_grant_detail_<ts>.txt`：不进入 runnable grant 闭环的授权明细（含 Oracle 维护角色在目标端不存在、目标角色目录不可确认、OB 不支持权限等）
 - `main_reports/run_<ts>/ddl_cleanup_detail_<ts>.txt`：DDL 清理/改写明细（区分 `format_only / syntax_compat / environment_detach / semantic_rewrite`，并标记 `evidence_level`）
 - `main_reports/run_<ts>/trigger_status_report.txt`：触发器清单/状态差异报告
 - `main_reports/run_<ts>/triggers_non_table_detail_<ts>.txt`：源端非表触发器明细（如 `BEFORE DROP ON DATABASE`）；`DATABASE/SCHEMA` 级事件触发器不会按普通 `trigger/` DDL 自动生成
@@ -273,6 +274,8 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `fixup_scripts/grants_all/*.grants.sql` / `fixup_scripts/grants_miss/*.grants.sql`：现在既可能包含普通对象授权，也可能包含列级授权，如 `GRANT UPDATE (COL) ON OWNER.TABLE TO USER`
 - `fixup_scripts/grants_revoke/`：目标端额外 PUBLIC 授权回收建议（默认仅 PUBLIC 自动给出 REVOKE）
 - `fixup_scripts/grants_all/*.grants.sql` / `fixup_scripts/grants_miss/*.grants.sql`：对象/列授权文件在同一 owner 文件内按 `OBJECT_TYPE` 分段；当 `OBJECT_TYPE=TABLE` 时，还会细分 `TABLE_OBJECT_GRANTS` 与 `TABLE_COLUMN_GRANTS`，便于人工审核
+- Oracle 维护角色授权现在会在每次运行时动态读取目标端 `DBA_ROLES` 做对比；只有目标端当前确实存在该角色时，才会保留到 `grants_all/grants_miss`。像 `EXP_FULL_DATABASE`、`DATAPUMP_*`、`SELECT_CATALOG_ROLE -> OB_CATALOG_ROLE` 这类角色若目标端不存在，会移到 `filtered_grants.txt` / `unsupported_grant_detail_<ts>.txt`，不再混进 runnable grant 文件
+- 如果当前运行拿不到目标端 `DBA_ROLES`，Oracle 维护角色授权会统一降级成 report/manual，不会回退成默认放行
 - `fixup_scripts/tables_unsupported/`：不支持 TABLE 的 DDL（默认不执行）
 - `fixup_scripts/unsupported/`：不支持/阻断对象 DDL（默认不执行）
 - `fixup_scripts/view_chain_plans/`：VIEW 链路修复计划
