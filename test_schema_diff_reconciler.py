@@ -11995,6 +11995,40 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn(("SRC.IDX_T2", "INDEX"), result.included_nodes)
         self.assertFalse(result.excluded_nodes)
 
+    def test_build_synonym_parent_map_maps_public_chain_to_terminal_table(self):
+        synonym_meta = {
+            ("PUBLIC", "PUB_A"): sdr.SynonymMeta("PUBLIC", "PUB_A", "PUBLIC", "PUB_B", None),
+            ("PUBLIC", "PUB_B"): sdr.SynonymMeta("PUBLIC", "PUB_B", "SRC", "T1", None),
+        }
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "PUBLIC.PUB_A": {"SYNONYM"},
+            "PUBLIC.PUB_B": {"SYNONYM"},
+        }
+        parent_map = sdr.build_synonym_parent_map(synonym_meta, source_objects)
+        self.assertEqual(parent_map["PUBLIC.PUB_A"], "SRC.T1")
+        self.assertEqual(parent_map["PUBLIC.PUB_B"], "SRC.T1")
+
+    def test_build_source_scope_closure_includes_public_synonym_chain_when_parent_map_present(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "PUBLIC.PUB_A": {"SYNONYM"},
+            "PUBLIC.PUB_B": {"SYNONYM"},
+        }
+        object_parent_map = {
+            "PUBLIC.PUB_A": "SRC.T1",
+            "PUBLIC.PUB_B": "SRC.T1",
+        }
+        result = sdr.build_source_scope_closure(
+            source_objects,
+            {},
+            object_parent_map,
+            {("SRC.T1", "TABLE")},
+            mode="remap_root_closure",
+        )
+        self.assertIn(("PUBLIC.PUB_A", "SYNONYM"), result.included_nodes)
+        self.assertIn(("PUBLIC.PUB_B", "SYNONYM"), result.included_nodes)
+
     def test_build_source_scope_closure_full_source_keeps_all(self):
         source_objects = {
             "SRC.T1": {"TABLE"},

@@ -10794,7 +10794,8 @@ ObjectParentMap = Dict[str, str]  # {SCHEMA.OBJECT_NAME: SCHEMA.TABLE_NAME}
 def get_object_parent_tables(
     ora_cfg: OraConfig,
     schemas_list: List[str],
-    enabled_object_types: Optional[Set[str]] = None
+    enabled_object_types: Optional[Set[str]] = None,
+    known_source_types: Optional[SourceObjectMap] = None,
 ) -> ObjectParentMap:
     """
     获取依附对象（TRIGGER/SYNONYM/INDEX/CONSTRAINT 等）所属的父表。
@@ -10838,28 +10839,18 @@ def get_object_parent_tables(
                                 table_key = f"{table_owner}.{table_name}"
                                 parent_map[trigger_key] = table_key
 
-            # 获取同义词指向的表/视图，使同义词也能跟随父表 schema
+            # 获取同义词终点对象，使同义词也能跟随父表/视图 schema
             if include_synonyms:
-                sql_tpl = """
-                    SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME
-                    FROM DBA_SYNONYMS
-                    WHERE OWNER IN ({placeholders})
-                      AND TABLE_OWNER IS NOT NULL
-                      AND TABLE_NAME IS NOT NULL
-                """
-                with connection.cursor() as cursor:
-                    for placeholders, chunk in iter_in_chunks(schemas_list):
-                        sql = sql_tpl.format(placeholders=placeholders)
-                        cursor.execute(sql, chunk)
-                        for row in cursor:
-                            owner = (row[0] or '').strip().upper()
-                            syn_name = (row[1] or '').strip().upper()
-                            table_owner = (row[2] or '').strip().upper()
-                            table_name = (row[3] or '').strip().upper()
-                            if owner and syn_name and table_owner and table_name:
-                                syn_key = f"{owner}.{syn_name}"
-                                table_key = f"{table_owner}.{table_name}"
-                                parent_map[syn_key] = table_key
+                synonym_meta = load_synonym_metadata(
+                    ora_cfg,
+                    schemas_list,
+                    allowed_terminal_source_schemas=schemas_list,
+                )
+                synonym_parent_map = build_synonym_parent_map(
+                    synonym_meta,
+                    known_source_types=known_source_types,
+                )
+                parent_map.update(synonym_parent_map)
 
             # 获取索引所属的表
             if include_indexes:
@@ -10909,6 +10900,40 @@ def get_object_parent_tables(
     except oracledb.Error as e:
         log.warning(f"获取依附对象父表映射失败: {e}")
     
+    return parent_map
+
+
+def build_synonym_parent_map(
+    synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]],
+    known_source_types: Optional[SourceObjectMap] = None,
+) -> ObjectParentMap:
+    """
+    将同义词（含 relevant PUBLIC 链）映射到其终点对象，便于 remap_root_closure
+    把这些同义词当作根 TABLE/VIEW 的 attached objects 一起纳入。
+    """
+    parent_map: ObjectParentMap = {}
+    if not synonym_meta:
+        return parent_map
+
+    for owner_u, name_u in sorted(synonym_meta.keys()):
+        terminal_full, chain = resolve_synonym_terminal_source_with_chain(
+            owner_u,
+            name_u,
+            synonym_meta,
+            known_source_types=known_source_types,
+        )
+        if not terminal_full or "." not in terminal_full:
+            continue
+        terminal_types = {
+            (obj_type or "").upper()
+            for obj_type in (known_source_types or {}).get((terminal_full or "").upper(), set())
+            if obj_type
+        }
+        if terminal_types and not (terminal_types & {"TABLE", "VIEW", "MATERIALIZED VIEW"}):
+            continue
+        for chain_owner_u, chain_name_u in chain or ((owner_u, name_u),):
+            syn_full = f"{chain_owner_u}.{chain_name_u}".upper()
+            parent_map[syn_full] = terminal_full.upper()
     return parent_map
 
 
@@ -52224,7 +52249,8 @@ def main():
         object_parent_map = get_object_parent_tables(
             ora_cfg,
             settings['source_schemas_list'],
-            enabled_object_types=enabled_object_types
+            enabled_object_types=enabled_object_types,
+            known_source_types=source_objects_full_scope,
         )
         
         # 4.2) 加载源端依赖关系（用于智能推导一对多场景的目标 schema）
