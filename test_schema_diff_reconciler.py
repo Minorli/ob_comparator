@@ -12029,6 +12029,52 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn(("PUBLIC.PUB_A", "SYNONYM"), result.included_nodes)
         self.assertIn(("PUBLIC.PUB_B", "SYNONYM"), result.included_nodes)
 
+    def test_build_source_scope_closure_includes_reverse_dependent_view_and_attached_synonym(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "SRC.V_DEP": {"VIEW"},
+            "PUBLIC.SYN_V_DEP": {"SYNONYM"},
+        }
+        dependency_graph = {
+            ("SRC.V_DEP", "VIEW"): {("SRC.T1", "TABLE")},
+        }
+        object_parent_map = {
+            "PUBLIC.SYN_V_DEP": "SRC.V_DEP",
+        }
+        result = sdr.build_source_scope_closure(
+            source_objects,
+            dependency_graph,
+            object_parent_map,
+            {("SRC.T1", "TABLE")},
+            mode="remap_root_closure",
+        )
+        self.assertIn(("SRC.T1", "TABLE"), result.included_nodes)
+        self.assertIn(("SRC.V_DEP", "VIEW"), result.included_nodes)
+        self.assertIn(("PUBLIC.SYN_V_DEP", "SYNONYM"), result.included_nodes)
+        self.assertTrue(any(row[0] == "REVERSE_DEPENDENCY" and row[2] == "SRC.V_DEP" for row in result.detail_rows))
+
+    def test_build_source_scope_closure_includes_reverse_dependent_package_and_attached_synonym(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "SRC.PKG1": {"PACKAGE"},
+            "PUBLIC.SYN_PKG1": {"SYNONYM"},
+        }
+        dependency_graph = {
+            ("SRC.PKG1", "PACKAGE"): {("SRC.T1", "TABLE")},
+        }
+        object_parent_map = {
+            "PUBLIC.SYN_PKG1": "SRC.PKG1",
+        }
+        result = sdr.build_source_scope_closure(
+            source_objects,
+            dependency_graph,
+            object_parent_map,
+            {("SRC.T1", "TABLE")},
+            mode="remap_root_closure",
+        )
+        self.assertIn(("SRC.PKG1", "PACKAGE"), result.included_nodes)
+        self.assertIn(("PUBLIC.SYN_PKG1", "SYNONYM"), result.included_nodes)
+
     def test_build_source_scope_closure_full_source_keeps_all(self):
         source_objects = {
             "SRC.T1": {"TABLE"},
@@ -12058,6 +12104,17 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         diagnostics = sdr.build_source_scope_diagnostics(result)
         self.assertTrue(any("source_object_scope_mode=remap_root_closure" in item for item in diagnostics))
         self.assertTrue(any("roots=1" in item and "filtered_out=1" in item for item in diagnostics))
+
+    def test_build_synonym_parent_map_keeps_terminal_package(self):
+        synonym_meta = {
+            ("PUBLIC", "SYN_PKG"): sdr.SynonymMeta("PUBLIC", "SYN_PKG", "SRC", "PKG1", None),
+        }
+        source_objects = {
+            "SRC.PKG1": {"PACKAGE"},
+            "PUBLIC.SYN_PKG": {"SYNONYM"},
+        }
+        parent_map = sdr.build_synonym_parent_map(synonym_meta, source_objects)
+        self.assertEqual(parent_map["PUBLIC.SYN_PKG"], "SRC.PKG1")
 
     def test_build_non_table_trigger_detail_rows_respects_scoped_source_objects(self):
         oracle_meta = self._make_oracle_meta()._replace(non_table_triggers=(
