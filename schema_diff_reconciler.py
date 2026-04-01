@@ -9283,6 +9283,26 @@ def build_attached_object_reverse_map(
     return {key: set(value) for key, value in reverse_map.items()}
 
 
+def build_reverse_dependency_map(
+    dependency_graph: Optional[DependencyGraph]
+) -> Dict[DependencyNode, Set[DependencyNode]]:
+    reverse_map: Dict[DependencyNode, Set[DependencyNode]] = defaultdict(set)
+    if not dependency_graph:
+        return {}
+    for dep_node, refs in (dependency_graph or {}).items():
+        dep_full_u = (dep_node[0] or "").upper()
+        dep_type_u = (dep_node[1] or "").upper()
+        if not dep_full_u or not dep_type_u:
+            continue
+        for ref_full, ref_type in refs or set():
+            ref_full_u = (ref_full or "").upper()
+            ref_type_u = (ref_type or "").upper()
+            if not ref_full_u or not ref_type_u:
+                continue
+            reverse_map[(ref_full_u, ref_type_u)].add((dep_full_u, dep_type_u))
+    return {key: set(value) for key, value in reverse_map.items()}
+
+
 def build_remap_root_seed_nodes(
     source_objects: Optional[SourceObjectMap],
     remap_rules: RemapRules
@@ -9399,6 +9419,7 @@ def build_source_scope_closure(
 
     all_nodes = collect_source_object_nodes(source_objects)
     reverse_attached = build_attached_object_reverse_map(source_objects, object_parent_map)
+    reverse_dependency_graph = build_reverse_dependency_map(dependency_graph)
     included_nodes: Set[DependencyNode] = set()
     enqueued: Set[DependencyNode] = set()
     queue: deque = deque()
@@ -9440,12 +9461,14 @@ def build_source_scope_closure(
             if paired_type in source_objects.get(full_u, set()):
                 _queue((full_u, paired_type), "PAIRED_OBJECT", "%s:%s" % (type_u, full_u))
 
-        if type_u in {"TABLE", "VIEW"}:
-            for child_node in sorted(reverse_attached.get(full_u, set()), key=lambda item: (item[1], item[0])):
-                _queue(child_node, "ATTACHED_OBJECT", "%s:%s" % (type_u, full_u))
+        for child_node in sorted(reverse_attached.get(full_u, set()), key=lambda item: (item[1], item[0])):
+            _queue(child_node, "ATTACHED_OBJECT", "%s:%s" % (type_u, full_u))
 
         for ref_full, ref_type in sorted(dependency_graph.get((full_u, type_u), set()) if dependency_graph else set(), key=lambda item: (item[1], item[0])):
             _queue((ref_full.upper(), ref_type.upper()), "DEPENDENCY", "%s:%s" % (type_u, full_u))
+
+        for dep_full, dep_type in sorted(reverse_dependency_graph.get((full_u, type_u), set()), key=lambda item: (item[1], item[0])):
+            _queue((dep_full.upper(), dep_type.upper()), "REVERSE_DEPENDENCY", "%s:%s" % (type_u, full_u))
 
     excluded_nodes = all_nodes - included_nodes
     for full_u, type_u in sorted(excluded_nodes, key=lambda item: (item[1], item[0])):
@@ -10929,7 +10952,7 @@ def build_synonym_parent_map(
             for obj_type in (known_source_types or {}).get((terminal_full or "").upper(), set())
             if obj_type
         }
-        if terminal_types and not (terminal_types & {"TABLE", "VIEW", "MATERIALIZED VIEW"}):
+        if terminal_types and terminal_types <= {"SYNONYM"}:
             continue
         for chain_owner_u, chain_name_u in chain or ((owner_u, name_u),):
             syn_full = f"{chain_owner_u}.{chain_name_u}".upper()
