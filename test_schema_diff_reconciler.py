@@ -11171,6 +11171,134 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(miss_sys, {})
         self.assertEqual(miss_role, {})
 
+    def test_build_invalid_target_object_set_uses_object_type_map(self):
+        ob_meta = self._make_ob_meta()._replace(
+            object_statuses={
+                ("APP", "V1", "VIEW"): "INVALID",
+                ("APP", "V1", "TABLE"): "VALID",
+                ("APP", "P1", "PROCEDURE"): "INVALID",
+            }
+        )
+        invalid = sdr.build_invalid_target_object_set(
+            ob_meta,
+            object_target_types={
+                "APP.V1": "VIEW",
+                "APP.P1": "PROCEDURE",
+            },
+        )
+        self.assertEqual(invalid, {"APP.V1", "APP.P1"})
+
+    def test_defer_invalid_target_grants_moves_invalid_objects_out_of_runnable(self):
+        grants = {
+            "U1": {
+                sdr.ObjectGrantEntry("SELECT", "APP.V1", False),
+                sdr.ObjectGrantEntry("SELECT", "APP.T1", False),
+            }
+        }
+        kept, deferred, filtered = sdr.defer_invalid_target_grants(
+            grants,
+            {"APP.V1"},
+        )
+        self.assertEqual(kept, {
+            "U1": {sdr.ObjectGrantEntry("SELECT", "APP.T1", False)}
+        })
+        self.assertEqual(deferred, {
+            "U1": {sdr.ObjectGrantEntry("SELECT", "APP.V1", False)}
+        })
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0].reason, sdr.DEFERRED_GRANT_REASON_TARGET_INVALID)
+
+    def test_defer_invalid_target_column_grants_moves_invalid_objects_out_of_runnable(self):
+        grants = {
+            "U1": {
+                sdr.ColumnGrantEntry("UPDATE", "APP.V1", "C1", False),
+                sdr.ColumnGrantEntry("UPDATE", "APP.T1", "C1", False),
+            }
+        }
+        kept, deferred, filtered = sdr.defer_invalid_target_column_grants(
+            grants,
+            {"APP.V1"},
+        )
+        self.assertEqual(kept, {
+            "U1": {sdr.ColumnGrantEntry("UPDATE", "APP.T1", "C1", False)}
+        })
+        self.assertEqual(deferred, {
+            "U1": {sdr.ColumnGrantEntry("UPDATE", "APP.V1", "C1", False)}
+        })
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0].reason, sdr.DEFERRED_GRANT_REASON_TARGET_INVALID)
+
+    def test_build_grant_runnability_detail_rows_classifies_paths(self):
+        rows = sdr.build_grant_runnability_detail_rows(
+            object_grants_by_grantee={
+                "APP": {
+                    sdr.ObjectGrantEntry("SELECT", "A.T1", False),
+                    sdr.ObjectGrantEntry("UPDATE", "A.V1", True),
+                    sdr.ObjectGrantEntry("SELECT", "A.BADV", False),
+                }
+            },
+            column_grants_by_grantee={},
+            sys_privs_by_grantee={},
+            role_privs_by_grantee={},
+            object_grants_missing_by_grantee={
+                "APP": {sdr.ObjectGrantEntry("SELECT", "A.T1", False)}
+            },
+            column_grants_missing_by_grantee={},
+            sys_privs_missing_by_grantee={},
+            role_privs_missing_by_grantee={},
+            view_prereq_grants_by_grantee={},
+            view_post_grants_by_grantee={
+                "APP": {sdr.ObjectGrantEntry("UPDATE", "A.V1", True)}
+            },
+            deferred_object_grants_by_grantee={
+                "APP": {sdr.ObjectGrantEntry("SELECT", "A.BADV", False)}
+            },
+            deferred_column_grants_by_grantee={},
+            filtered_grants=[],
+            deferred_filtered_grants=[
+                sdr.FilteredGrantEntry("OBJECT", "APP", "SELECT", "A.BADV", sdr.DEFERRED_GRANT_REASON_TARGET_INVALID)
+            ],
+            ob_meta=self._make_ob_meta()._replace(
+                object_statuses={("A", "BADV", "VIEW"): "INVALID"}
+            ),
+            object_target_types={
+                "A.T1": "TABLE",
+                "A.V1": "VIEW",
+                "A.BADV": "VIEW",
+            },
+        )
+        by_key = {(row.object_full, row.privilege): row for row in rows if row.category == "OBJECT"}
+        self.assertEqual(by_key[("A.T1", "SELECT")].execution_class, "RUNNABLE_NOW")
+        self.assertEqual(by_key[("A.T1", "SELECT")].artifact_dir, "grants_miss")
+        self.assertEqual(by_key[("A.V1", "UPDATE WITH GRANT OPTION")].execution_class, "RUNNABLE_NOW")
+        self.assertEqual(by_key[("A.V1", "UPDATE WITH GRANT OPTION")].artifact_dir, "view_post_grants")
+        self.assertEqual(by_key[("A.BADV", "SELECT")].execution_class, "DEFERRED")
+        self.assertEqual(by_key[("A.BADV", "SELECT")].target_status, "INVALID")
+
+    def test_export_grant_runnability_detail(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows = [
+                sdr.GrantRunnabilityDetailRow(
+                    category="OBJECT",
+                    grantee="APP",
+                    privilege="SELECT",
+                    object_full="A.T1",
+                    object_type="TABLE",
+                    target_status="VALID",
+                    execution_class="RUNNABLE_NOW",
+                    artifact_dir="grants_miss",
+                    reason_code="TARGET_GRANT_MISSING",
+                    reason="目标端缺少该授权，可进入本轮授权闭环。",
+                    action="执行 grants_miss/。",
+                )
+            ]
+            path = sdr.export_grant_runnability_detail(rows, Path(tmpdir), "20240101")
+            self.assertIsNotNone(path)
+            output = Path(path).read_text(encoding="utf-8")
+            self.assertIn("授权可执行性明细", output)
+            self.assertIn("RUNNABLE_NOW", output)
+            self.assertIn("grants_miss", output)
+
     def test_build_target_extra_column_grant_rows_marks_public_revoke(self):
         rows = sdr.build_target_extra_column_grant_rows(
             {},
@@ -14791,7 +14919,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             output = Path(path).read_text(encoding="utf-8")
             self.assertIn("# probe_complete=false", output)
             self.assertIn("# summary: allow=1 filter=0 manual=0 alias=1", output)
-            self.assertIn("ALLOW/FILTER 中已验证结果仍有效", output)
+            self.assertIn("ALLOW/FILTER 中已标定结果仍有效", output)
             self.assertIn("GRANT DEBUG ON APP.P1 TO PUBLIC", output)
 
     def test_filter_grant_plan_unsupported_targets(self):
@@ -14921,7 +15049,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             path = sdr.export_grant_capability_detail(rows, Path(tmpdir), "20240101")
             self.assertIsNotNone(path)
             output = Path(path).read_text(encoding="utf-8")
-            self.assertIn("动态授权能力明细", output)
+            self.assertIn("授权能力标定明细", output)
             self.assertIn("DEBUG", output)
             self.assertIn("OTHERS", output)
             self.assertIn("PROCEDURE", output)
@@ -17836,12 +17964,34 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
                 sdr.ObjectGrantEntry("SELECT", "TGT.V1", False)
             }
         }
-        prereq, post, remaining = sdr.split_view_grants(view_targets, expected_pairs, grants)
+        prereq, post, remaining, refresh_targets = sdr.split_view_grants(view_targets, expected_pairs, grants)
         self.assertIn("TGT", prereq)
         self.assertIn(sdr.ObjectGrantEntry("SELECT", "TGT2.T1", True), prereq["TGT"])
         self.assertIn("APP", post)
         self.assertIn(sdr.ObjectGrantEntry("SELECT", "TGT.V1", False), post["APP"])
         self.assertEqual(remaining, {})
+        self.assertEqual(refresh_targets, {"TGT.V1"})
+
+    def test_split_view_grants_routes_existing_view_dml_chain(self):
+        view_targets = {"VOWNER.V1"}
+        expected_pairs = {("VOWNER.V1", "VIEW", "TOWNER.T1", "TABLE")}
+        grants = {
+            "VOWNER": {
+                sdr.ObjectGrantEntry("UPDATE", "TOWNER.T1", True),
+            },
+            "U3": {
+                sdr.ObjectGrantEntry("UPDATE", "VOWNER.V1", True),
+            },
+        }
+        prereq, post, remaining, refresh_targets = sdr.split_view_grants(view_targets, expected_pairs, grants)
+        self.assertEqual(prereq, {
+            "VOWNER": {sdr.ObjectGrantEntry("UPDATE", "TOWNER.T1", True)}
+        })
+        self.assertEqual(post, {
+            "U3": {sdr.ObjectGrantEntry("UPDATE", "VOWNER.V1", True)}
+        })
+        self.assertEqual(remaining, {})
+        self.assertEqual(refresh_targets, {"VOWNER.V1"})
 
     def test_compute_required_grants_skips_trigger_reference_type(self):
         expected_pairs = {

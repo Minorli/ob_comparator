@@ -183,10 +183,11 @@
 ### 6.2 授权生成
 - 基于 `DBA_TAB_PRIVS`、`DBA_SYS_PRIVS`、`DBA_ROLE_PRIVS`
 - 支持权限合并与白名单过滤
-- 视图权限拆分：依赖对象授权输出到 `view_prereq_grants/`，视图自身授权输出到 `view_post_grants/`
+- 视图权限拆分：依赖对象授权输出到 `view_prereq_grants/`，视图自身授权输出到 `view_post_grants/`；当目标端已有 VIEW 且 prerequisite grants 是后补的，会额外生成 `view_refresh/`
 - 视图链路要求 `WITH GRANT OPTION` 的场景会单独标注缺失
 - 依赖推导不再对 PUBLIC 生成授权，仅保留源端显式 PUBLIC 授权
-- 对 `view_post_grants/` 中失败的 `GRANT ... ON <view>`，`run_fixup` 会从失败语句中提取真实 privilege（如 `UPDATE`），再按 VIEW 依赖链补底层对象授权；不再把所有此类失败统一降级成 `SELECT`
+- 对 `view_post_grants/` 中失败的 `GRANT ... ON <view>`，`run_fixup` 会从失败语句中提取真实 privilege（如 `UPDATE`），再按 VIEW 依赖链补底层对象授权；如果 fixup 目录存在匹配的 `view_refresh/`，会先刷新 VIEW 再重试最终授权
+- `grants_miss/` 只保留当前可执行的缺失授权；目标对象缺失且本轮不创建、或目标对象当前为 `INVALID` 的授权，会转入 deferred/manual 路径而不是继续混在 runnable grants 中
 - 对 identity 表的跨 schema 授权，系统会额外定位目标端底层 `ISEQ$$_...`：当源端存在 `INSERT` 授权而目标端缺少对应 sequence `SELECT` 时，会输出 `identity_sequence_grant_detail_<ts>.txt`，并把 `GRANT SELECT ON <ISEQ$$_...>` 注入 `grants_miss/`
 - identity sequence 定位优先使用目标端 `DBA_OBJECTS.CREATED` 与 `DBA_SEQUENCES` 的同秒候选收敛；若候选不唯一且 identity 选项无法进一步收敛，则保持 report-only，不盲猜 sequence 名
 - 当 `sequence_sync_mode=last_number` 时，系统会额外读取 Oracle 与 OceanBase 当前 `DBA_SEQUENCES.LAST_NUMBER`，在 `fixup_scripts/sequence_restart/` 生成值同步 SQL：
@@ -223,6 +224,7 @@
 - `fixup_scripts/table/` / `table_alter/`
 - `fixup_scripts/view_prereq_grants/`
 - `fixup_scripts/view/`
+- `fixup_scripts/view_refresh/`
 - `fixup_scripts/view_post_grants/`
 - `fixup_scripts/compile/`
 - `fixup_scripts/grants_miss/`
@@ -273,7 +275,7 @@
 - `run_<ts>/VIEWs_chain_<ts>.txt`：VIEW 链路
 - `unsupported_<TYPE>_detail_*.txt`：按类型不支持明细（含 ROOT_CAUSE，如 VIEW_X$ 及命中对象）
 - `filtered_grants.txt`：过滤权限
-- `grant_capability_detail_<ts>.txt`：动态授权规则库明细（支持结果、目录别名、最终决策）
+- `grant_capability_detail_<ts>.txt`：授权能力标定明细（支持结果、目录别名、最终决策）
 - `triggers_non_table_detail_<ts>.txt`：非表触发器明细（当前主要为 DATABASE/SCHEMA 级事件触发器；`INSTEAD OF ... ON VIEW` 已进入普通 compare/fixup）
 - `sequence_restart_detail_<ts>.txt`：sequence 值同步规划明细（源/目标 `LAST_NUMBER`、是否生成 restart、跳过原因）
 - 默认值 compare 额外做默认值语义归一：数值字面量、`DATE '...'`、`-(1)` 以及字符串字面量外部的尾部注释会先 canonicalize，再参与 Oracle/OB compare；该归一仅作用于列默认值，不影响其他表达式 compare
