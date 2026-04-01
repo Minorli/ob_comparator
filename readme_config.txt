@@ -283,7 +283,7 @@
   说明：程序会额外审计目标端“源端未声明”的对象授权，输出 `target_extra_grants_detail_<ts>.txt`；
   extra grant 审计按“本轮受管 target object 集合”收敛，不会因为某个旧 schema 仍有其他受管对象就把该 schema 下未受管对象的授权误判进来；
   其中 PUBLIC 额外授权会生成 `fixup_scripts/grants_revoke/revoke_public_object_grants.sql` 回收建议。
-  说明：程序会为每次运行生成 `grant_capability_detail_<ts>.txt`，记录本次授权动态规则库：
+  说明：程序会为每次运行生成 `grant_capability_detail_<ts>.txt`，记录本次授权能力标定结果：
   源端权限、目标端目录权限、是否支持、是否存在目录别名（如 `DEBUG -> OTHERS`）、以及最终决策。
   说明：若源端存在 `DBA_COL_PRIVS`，列级授权会进入普通 grants 闭环，生成如
   `GRANT UPDATE (COL) ON OWNER.TABLE TO USER` 的脚本。
@@ -298,8 +298,8 @@
   可选值：owner（仅源 schema 所拥有对象）、owner_or_grantee（兼容旧逻辑）。
 - grant_merge_privileges：合并同一对象的多权限授权。默认：true。
 - grant_merge_grantees：合并同一权限的多 grantee 授权。默认：true。
-- grant_supported_sys_privs：系统权限人工 override 清单（逗号分隔）。默认：空（使用本次运行动态规则库）。
-- grant_supported_object_privs：对象权限人工 override 清单（逗号分隔）。默认：空（使用本次运行动态规则库）。
+- grant_supported_sys_privs：系统权限人工 override 清单（逗号分隔）。默认：空（使用本次运行授权能力标定结果）。
+- grant_supported_object_privs：对象权限人工 override 清单（逗号分隔）。默认：空（使用本次运行授权能力标定结果）。
   说明：这两个配置不再是“默认白名单”，而是人工强制覆盖；仅在需要临时收口/兜底时使用。
 - grant_include_oracle_maintained_roles：是否生成 ORACLE_MAINTAINED 角色。默认：false。
   说明：该开关不仅影响 `CREATE ROLE`，也影响 `GRANT <ROLE> TO <GRANTEE>` 的 runnable 输出。
@@ -315,7 +315,9 @@
 - fixup_auto_grant：run_fixup 自动补权限。默认：true。
   说明：基于 dependency_chains 与 VIEWs_chain 预判依赖授权，执行前自动应用 grants_miss/grants_all 中的授权。
   说明：当 `view_post_grants/` 中的视图授权命中 `ORA-01720` 时，执行器会按失败语句里的真实 privilege（SELECT/INSERT/UPDATE/DELETE）补底层依赖对象授权，而不是一律退化成 `SELECT`。
+  说明：若 comparator 已生成匹配的 `view_refresh/SCHEMA.VIEW.sql`，执行器会在 prerequisite grants 成功补齐后先刷新 VIEW，再重试最终 `view_post_grants/`。
   说明：run_fixup 默认跳过 `fixup_scripts/grants_deferred/`，对象补齐后需显式执行该目录。
+  说明：`grants_miss/` 会排除明显不可执行的授权；若目标对象当前不存在且本轮不会创建，或目标对象当前已是 `INVALID`，授权会转入 `grants_deferred/` 并在 `unsupported_grant_detail_<ts>.txt` 里保留原因。
 - fixup_auto_grant_types：自动补权限对象类型（逗号分隔）。默认：
   VIEW, MATERIALIZED VIEW, SYNONYM, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, TYPE, TYPE BODY。
   说明：仅对这些对象执行自动补权限；其他对象仍按原流程执行。

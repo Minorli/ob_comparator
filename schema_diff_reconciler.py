@@ -1275,6 +1275,20 @@ class UnsupportedGrantDetailRow(NamedTuple):
     action: str
 
 
+class GrantRunnabilityDetailRow(NamedTuple):
+    category: str
+    grantee: str
+    privilege: str
+    object_full: str
+    object_type: str
+    target_status: str
+    execution_class: str
+    artifact_dir: str
+    reason_code: str
+    reason: str
+    action: str
+
+
 class OperatorActionRow(NamedTuple):
     priority: str
     stage: str
@@ -1590,6 +1604,7 @@ def support_state_to_report_type(support_state: str) -> str:
 
 UNSUPPORTED_GRANT_TARGET_REASON_PREFIX = "UNSUPPORTED_TARGET_"
 DEFERRED_GRANT_REASON_TARGET_MISSING_NOT_PLANNED = "DEFERRED_TARGET_MISSING_NOT_PLANNED"
+DEFERRED_GRANT_REASON_TARGET_INVALID = "DEFERRED_TARGET_INVALID"
 IDENTITY_SEQUENCE_STATUS_PRESENT = "PRESENT"
 IDENTITY_SEQUENCE_STATUS_MISSING_GRANT = "MISSING_GRANT"
 IDENTITY_SEQUENCE_STATUS_TARGET_TABLE_MISSING = "TARGET_TABLE_MISSING"
@@ -1656,7 +1671,7 @@ UNSUPPORTED_GRANT_REASON_DEFAULTS: Dict[str, Tuple[str, str]] = {
     "NOT_IN_ORACLE_OBJECT_PRIVILEGE_MAP": ("源端对象权限映射缺失", "检查源端权限定义与元数据"),
     "NOT_IN_ORACLE_SYSTEM_PRIVILEGE_MAP": ("源端系统权限映射缺失", "检查源端权限定义与元数据"),
     GRANT_CAPABILITY_REASON_PROBE_INCOMPLETE: (
-        "当前运行未完成该权限能力探针，已降级为人工确认。",
+        "当前运行未完成该权限能力标定，已保守降级为人工确认。",
         "检查 grant_capability_detail 明细后人工处理该授权。"
     ),
     GRANT_CAPABILITY_REASON_OVERRIDE_EXCLUDED: (
@@ -1664,12 +1679,12 @@ UNSUPPORTED_GRANT_REASON_DEFAULTS: Dict[str, Tuple[str, str]] = {
         "检查 grant_supported_sys_privs / grant_supported_object_privs 配置，或人工处理授权。"
     ),
     GRANT_CAPABILITY_REASON_TARGET_UNKNOWN: (
-        "目标端存在无法归一化的对象权限标记，已降级为人工复核。",
+        "目标端存在无法归一化的对象权限标记，已保守降级为人工复核。",
         "检查 target_extra_grants_detail 与 grant_capability_detail，确认后再决定是否回收。"
     ),
     VIEW_DML_GRANT_PREREQ_UNVERIFIED: (
-        "跨 schema 视图 DML 授权缺少可证明的源端前置权限链，不能按普通 runnable grant 处理。",
-        "检查 unsupported_grant_detail，确认 view owner 是否具备底层对象对应 DML WITH GRANT OPTION，必要时人工处理。"
+        "跨 schema 视图 DML 授权缺少可证明的源端前置权限链，不能按普通 runnable grant 处理；源端这条 grant 也可能来自 DBA/SYS override。",
+        "检查 unsupported_grant_detail，确认 view owner 是否具备底层对象对应 DML WITH GRANT OPTION；若源端仅靠 DBA/SYS 旁路授出，请按人工 override 处理。"
     ),
     ROLE_GRANT_ORACLE_MAINTAINED_TARGET_MISSING: (
         "Oracle 维护角色在目标端不存在，当前不进入 runnable role grant 闭环。",
@@ -1686,6 +1701,10 @@ UNSUPPORTED_GRANT_REASON_DEFAULTS: Dict[str, Tuple[str, str]] = {
     DEFERRED_GRANT_REASON_TARGET_MISSING_NOT_PLANNED: (
         "目标对象当前不存在且本轮不会创建，授权已延后。",
         "先补齐对象（OMS/手工）后执行 grants_deferred 目录脚本。"
+    ),
+    DEFERRED_GRANT_REASON_TARGET_INVALID: (
+        "目标对象当前存在但处于 INVALID 状态，授权已延后。",
+        "先修复/重编译目标对象使其恢复 VALID，再执行 grants_deferred 目录脚本。"
     ),
 }
 
@@ -20154,6 +20173,32 @@ def build_planned_grant_target_set(
     return {name for name in planned if name and "." in name}
 
 
+def build_invalid_target_object_set(
+    ob_meta: Optional[ObMetadata],
+    object_target_types: Optional[Dict[str, str]] = None,
+) -> Set[str]:
+    invalid_targets: Set[str] = set()
+    if not ob_meta:
+        return invalid_targets
+    object_target_types = {
+        (key or "").upper(): normalize_privilege_object_type(value)
+        for key, value in (object_target_types or {}).items()
+        if key
+    }
+    for (owner, name, obj_type), status in (ob_meta.object_statuses or {}).items():
+        status_u = normalize_object_status(status)
+        if status_u != "INVALID":
+            continue
+        full_u = f"{(owner or '').upper()}.{(name or '').upper()}".strip(".")
+        obj_type_u = normalize_privilege_object_type(obj_type)
+        mapped_type_u = object_target_types.get(full_u, "")
+        if mapped_type_u and obj_type_u and mapped_type_u != obj_type_u:
+            continue
+        if full_u and "." in full_u:
+            invalid_targets.add(full_u)
+    return invalid_targets
+
+
 def defer_missing_target_grants(
     object_grants_missing_by_grantee: Dict[str, Set[ObjectGrantEntry]],
     existing_targets: Set[str],
@@ -20200,6 +20245,122 @@ def defer_missing_target_grants(
                     privilege=priv_u,
                     object_full=obj_u,
                     reason=DEFERRED_GRANT_REASON_TARGET_MISSING_NOT_PLANNED,
+                )
+            )
+
+    filtered_entries.sort(
+        key=lambda x: (
+            (x.category or "").upper(),
+            (x.grantee or "").upper(),
+            (x.privilege or "").upper(),
+            (x.object_full or "").upper(),
+            (x.reason or "").upper(),
+        )
+    )
+    return dict(kept), dict(deferred), filtered_entries
+
+
+def defer_invalid_target_grants(
+    object_grants_missing_by_grantee: Dict[str, Set[ObjectGrantEntry]],
+    invalid_targets: Set[str]
+) -> Tuple[
+    Dict[str, Set[ObjectGrantEntry]],
+    Dict[str, Set[ObjectGrantEntry]],
+    List[FilteredGrantEntry]
+]:
+    kept: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
+    deferred: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
+    filtered_entries: List[FilteredGrantEntry] = []
+    seen_filtered: Set[Tuple[str, str, str, str, str]] = set()
+
+    invalid_targets_u = {(item or "").upper() for item in (invalid_targets or set()) if item}
+    for grantee, entries in (object_grants_missing_by_grantee or {}).items():
+        grantee_u = (grantee or "").upper()
+        for entry in (entries or set()):
+            obj_u = (entry.object_full or "").upper()
+            priv_u = (entry.privilege or "").upper()
+            if not grantee_u or not obj_u or not priv_u:
+                continue
+            if obj_u not in invalid_targets_u:
+                kept[grantee_u].add(entry)
+                continue
+            deferred[grantee_u].add(entry)
+            dedupe_key = (
+                "OBJECT",
+                grantee_u,
+                priv_u,
+                obj_u,
+                DEFERRED_GRANT_REASON_TARGET_INVALID,
+            )
+            if dedupe_key in seen_filtered:
+                continue
+            seen_filtered.add(dedupe_key)
+            filtered_entries.append(
+                FilteredGrantEntry(
+                    category="OBJECT",
+                    grantee=grantee_u,
+                    privilege=priv_u,
+                    object_full=obj_u,
+                    reason=DEFERRED_GRANT_REASON_TARGET_INVALID,
+                )
+            )
+
+    filtered_entries.sort(
+        key=lambda x: (
+            (x.category or "").upper(),
+            (x.grantee or "").upper(),
+            (x.privilege or "").upper(),
+            (x.object_full or "").upper(),
+            (x.reason or "").upper(),
+        )
+    )
+    return dict(kept), dict(deferred), filtered_entries
+
+
+def defer_invalid_target_column_grants(
+    column_grants_missing_by_grantee: Dict[str, Set[ColumnGrantEntry]],
+    invalid_targets: Set[str]
+) -> Tuple[
+    Dict[str, Set[ColumnGrantEntry]],
+    Dict[str, Set[ColumnGrantEntry]],
+    List[FilteredGrantEntry]
+]:
+    kept: Dict[str, Set[ColumnGrantEntry]] = defaultdict(set)
+    deferred: Dict[str, Set[ColumnGrantEntry]] = defaultdict(set)
+    filtered_entries: List[FilteredGrantEntry] = []
+    seen_filtered: Set[Tuple[str, str, str, str, str]] = set()
+
+    invalid_targets_u = {(item or "").upper() for item in (invalid_targets or set()) if item}
+    for grantee, entries in (column_grants_missing_by_grantee or {}).items():
+        grantee_u = (grantee or "").upper()
+        for entry in (entries or set()):
+            obj_u = (entry.object_full or "").upper()
+            col_u = (entry.column_name or "").upper()
+            priv_u = (entry.privilege or "").upper()
+            if not grantee_u or not obj_u or not col_u or not priv_u:
+                continue
+            if obj_u not in invalid_targets_u:
+                kept[grantee_u].add(entry)
+                continue
+            deferred[grantee_u].add(entry)
+            object_text = f"{obj_u}({col_u})"
+            dedupe_key = (
+                "COLUMN",
+                grantee_u,
+                priv_u,
+                object_text,
+                DEFERRED_GRANT_REASON_TARGET_INVALID,
+            )
+            if dedupe_key in seen_filtered:
+                continue
+            seen_filtered.add(dedupe_key)
+            filtered_entries.append(
+                FilteredGrantEntry(
+                    category="COLUMN",
+                    grantee=grantee_u,
+                    privilege=priv_u,
+                    object_full=object_text,
+                    reason=DEFERRED_GRANT_REASON_TARGET_INVALID,
                 )
             )
 
@@ -20281,7 +20442,8 @@ def split_view_grants(
 ) -> Tuple[
     Dict[str, Set[ObjectGrantEntry]],
     Dict[str, Set[ObjectGrantEntry]],
-    Dict[str, Set[ObjectGrantEntry]]
+    Dict[str, Set[ObjectGrantEntry]],
+    Set[str],
 ]:
     """
     拆分视图相关授权：
@@ -20290,29 +20452,57 @@ def split_view_grants(
       - remaining: 其余授权
     """
     view_targets_u = {v.upper() for v in (view_targets or set()) if v}
-    prereq_needed: Set[Tuple[str, str, str]] = set()
+    downstream_privs_by_view: Dict[str, Set[str]] = defaultdict(set)
+    for grantee, entries in (object_grants_missing_by_grantee or {}).items():
+        grantee_u = (grantee or "").upper()
+        if not grantee_u:
+            continue
+        for entry in entries or set():
+            obj_u = (entry.object_full or "").upper()
+            if obj_u not in view_targets_u:
+                continue
+            owner_u = obj_u.split('.', 1)[0] if '.' in obj_u else ""
+            if not owner_u or grantee_u == owner_u:
+                continue
+            priv_u = (entry.privilege or "").upper()
+            if priv_u:
+                downstream_privs_by_view[obj_u].add(priv_u)
 
-    if view_targets_u and expected_dependency_pairs:
+    prereq_needed: Dict[Tuple[str, str, str], Set[str]] = defaultdict(set)
+    if downstream_privs_by_view and expected_dependency_pairs:
         for dep_full, dep_type, ref_full, ref_type in expected_dependency_pairs:
             dep_full_u = (dep_full or "").upper()
-            if dep_full_u not in view_targets_u:
+            dep_type_u = (dep_type or "").upper()
+            ref_full_u = (ref_full or "").upper()
+            ref_type_u = normalize_privilege_object_type(ref_type)
+            if dep_full_u not in downstream_privs_by_view:
                 continue
-            if (dep_type or "").upper() not in {"VIEW", "MATERIALIZED VIEW"}:
+            if dep_type_u not in {"VIEW", "MATERIALIZED VIEW"}:
                 continue
-            if not dep_full or not ref_full or '.' not in dep_full or '.' not in ref_full:
+            if not dep_full_u or not ref_full_u or '.' not in dep_full_u or '.' not in ref_full_u:
                 continue
             dep_schema = dep_full_u.split('.', 1)[0]
-            ref_schema = (ref_full or "").upper().split('.', 1)[0]
+            ref_schema = ref_full_u.split('.', 1)[0]
             if dep_schema == ref_schema:
                 continue
-            privilege = GRANT_PRIVILEGE_BY_TYPE.get((ref_type or "").upper())
-            if not privilege:
-                continue
-            prereq_needed.add((dep_schema, privilege.upper(), (ref_full or "").upper()))
+            required_privs: Set[str] = set()
+            if ref_type_u in {"TABLE", "VIEW", "MATERIALIZED VIEW"}:
+                required_privs.update(
+                    priv_u
+                    for priv_u in downstream_privs_by_view.get(dep_full_u, set())
+                    if priv_u in {"SELECT", "INSERT", "UPDATE", "DELETE"}
+                )
+            if not required_privs:
+                privilege = GRANT_PRIVILEGE_BY_TYPE.get(ref_type_u)
+                if privilege:
+                    required_privs.add(privilege.upper())
+            for privilege in required_privs:
+                prereq_needed[(dep_schema, privilege.upper(), ref_full_u)].add(dep_full_u)
 
     view_prereq: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
     view_post: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
     remaining: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
+    views_with_missing_prereq: Set[str] = set()
 
     for grantee, entries in (object_grants_missing_by_grantee or {}).items():
         grantee_u = (grantee or "").upper()
@@ -20322,6 +20512,7 @@ def split_view_grants(
             key = (grantee_u, priv_u, obj_u)
             if key in prereq_needed:
                 view_prereq[grantee_u].add(entry)
+                views_with_missing_prereq.update(prereq_needed[key])
                 continue
             if obj_u in view_targets_u:
                 owner_u = obj_u.split('.', 1)[0] if '.' in obj_u else ""
@@ -20330,7 +20521,7 @@ def split_view_grants(
                     continue
             remaining[grantee_u].add(entry)
 
-    return dict(view_prereq), dict(view_post), dict(remaining)
+    return dict(view_prereq), dict(view_post), dict(remaining), views_with_missing_prereq
 
 
 PRIVILEGE_TYPE_PRIORITY: Tuple[str, ...] = (
@@ -33323,8 +33514,9 @@ def write_fixup_root_readme(
         "grants_all": "全量授权审计脚本，主要用于核对，不等于都要执行。",
         "grants_deferred": "延后授权脚本，需对象补齐后再执行。",
         "grants_revoke": "目标端多余 PUBLIC 授权回收建议，先审后执行。",
-        "view_prereq_grants": "VIEW 前置授权，通常先于 view/ 执行。",
-        "view_post_grants": "VIEW 创建后授权。",
+        "view_prereq_grants": "VIEW 前置授权，通常先于 view_refresh/ 或 view/ 执行。",
+        "view_refresh": "已有 VIEW 的刷新脚本；当跨 schema 授权链在目标端后补时，需先刷新 VIEW 再执行 view_post_grants/。",
+        "view_post_grants": "VIEW 创建/刷新后的授权。",
         "status": "状态漂移修补脚本（trigger/constraint）；缺失 TABLE 首次创建后恢复 ENABLE NOVALIDATE 也在这里。",
         "job": "JOB 草案或修补脚本，通常需人工确认。",
         "schedule": "SCHEDULE 草案或修补脚本，通常需人工确认。",
@@ -37029,6 +37221,10 @@ def generate_fixup_scripts(
             non_view_missing_supported,
             sequence_tasks
         )
+        invalid_targets = build_invalid_target_object_set(
+            ob_meta,
+            object_target_types=(grant_plan.object_target_types if grant_plan else None),
+        )
         (
             object_grants_missing_by_grantee,
             deferred_object_grants_by_grantee,
@@ -37048,31 +37244,76 @@ def generate_fixup_scripts(
             planned_targets
         )
         deferred_filtered_grants.extend(deferred_column_filtered_grants)
+        if invalid_targets:
+            (
+                object_grants_missing_by_grantee,
+                invalid_deferred_object_grants_by_grantee,
+                invalid_filtered_grants,
+            ) = defer_invalid_target_grants(
+                object_grants_missing_by_grantee,
+                invalid_targets,
+            )
+            for grantee_u, entries in invalid_deferred_object_grants_by_grantee.items():
+                deferred_object_grants_by_grantee.setdefault(grantee_u, set()).update(entries)
+            deferred_filtered_grants.extend(invalid_filtered_grants)
+            (
+                column_grants_missing_by_grantee,
+                invalid_deferred_column_grants_by_grantee,
+                invalid_filtered_column_grants,
+            ) = defer_invalid_target_column_grants(
+                column_grants_missing_by_grantee,
+                invalid_targets,
+            )
+            for grantee_u, entries in invalid_deferred_column_grants_by_grantee.items():
+                deferred_column_grants_by_grantee.setdefault(grantee_u, set()).update(entries)
+            deferred_filtered_grants.extend(invalid_filtered_column_grants)
         if deferred_filtered_grants:
             settings["_deferred_filtered_grants"] = list(deferred_filtered_grants)
             log.warning(
-                "[GRANT] 已延后 %d 条授权（目标对象当前不存在且本轮不会创建），"
-                "请在补齐对象后执行 fixup_scripts/grants_deferred/。",
+                "[GRANT] 已延后 %d 条授权（目标对象不存在或处于 INVALID 状态），"
+                "请在补齐/修复对象后执行 fixup_scripts/grants_deferred/。",
                 len(deferred_filtered_grants)
             )
 
     view_target_set: Set[str] = {
-        f"{tgt_schema}.{tgt_obj}".upper()
-        for _src_schema, _src_obj, tgt_schema, tgt_obj in view_missing_supported
+        (item or "").upper()
+        for item in ((grant_plan.view_grant_targets or set()) if grant_plan else set())
+        if item
     }
     view_prereq_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]] = {}
     view_post_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]] = {}
+    views_with_missing_prereq: Set[str] = set()
     if grant_enabled and object_grants_missing_by_grantee and view_target_set:
         (
             view_prereq_grants_by_grantee,
             view_post_grants_by_grantee,
-            object_grants_missing_by_grantee
+            object_grants_missing_by_grantee,
+            views_with_missing_prereq,
         ) = split_view_grants(
             view_target_set,
             expected_dependency_pairs,
             object_grants_missing_by_grantee
         )
     view_grants_split_enabled = bool(view_prereq_grants_by_grantee or view_post_grants_by_grantee)
+    if grant_enabled:
+        settings["_grant_runnability_rows"] = build_grant_runnability_detail_rows(
+            object_grants_by_grantee=object_grants_by_grantee,
+            column_grants_by_grantee=column_grants_by_grantee,
+            sys_privs_by_grantee=sys_privs_by_grantee,
+            role_privs_by_grantee=role_privs_by_grantee,
+            object_grants_missing_by_grantee=object_grants_missing_by_grantee,
+            column_grants_missing_by_grantee=column_grants_missing_by_grantee,
+            sys_privs_missing_by_grantee=sys_privs_missing_by_grantee,
+            role_privs_missing_by_grantee=role_privs_missing_by_grantee,
+            view_prereq_grants_by_grantee=view_prereq_grants_by_grantee,
+            view_post_grants_by_grantee=view_post_grants_by_grantee,
+            deferred_object_grants_by_grantee=deferred_object_grants_by_grantee,
+            deferred_column_grants_by_grantee=deferred_column_grants_by_grantee,
+            filtered_grants=(grant_plan.filtered_grants or []) if grant_plan else [],
+            deferred_filtered_grants=deferred_filtered_grants,
+            ob_meta=ob_meta,
+            object_target_types=(grant_plan.object_target_types if grant_plan else None),
+        )
 
     def _order_plsql_fixups(
         items: List[Tuple[str, str, str, str, str]]
@@ -37795,6 +38036,70 @@ def generate_fixup_scripts(
             return compat.cleaned_ddl, compat
         return None, compat
 
+    def build_view_fixup_ddl(
+        src_schema: str,
+        src_obj: str,
+        tgt_schema: str,
+        tgt_obj: str,
+    ) -> Tuple[Optional[str], str, Optional[ViewCompatResult], List[str]]:
+        raw_ddl = None
+        ddl_source_label = "MISSING"
+        compat = view_compat_map.get((src_schema.upper(), src_obj.upper()))
+        if compat and compat.cleaned_ddl:
+            raw_ddl = compat.cleaned_ddl
+            ddl_source_label = "VIEW_CACHE"
+        else:
+            fetch_result = fetch_ddl_with_timing(src_schema, 'VIEW', src_obj)
+            if len(fetch_result) != 3:
+                log.error("[FIXUP] VIEW fetch_ddl_with_timing 返回了 %d 个值，期望 3 个: %s", len(fetch_result), fetch_result)
+                return None, "MISSING", compat, []
+            raw_ddl, ddl_source_label, _elapsed = fetch_result
+        if not raw_ddl:
+            return None, ddl_source_label, compat, []
+
+        cleaned_ddl, view_cleanup_actions = clean_view_ddl_for_oceanbase_with_audit(raw_ddl, ob_version)
+        col_meta = oracle_meta.table_columns.get((src_schema.upper(), src_obj.upper()), {}) or {}
+        cleaned_ddl = sanitize_view_ddl(cleaned_ddl, set(col_meta.keys()))
+        remapped_ddl = remap_view_dependencies(
+            cleaned_ddl,
+            src_schema,
+            src_obj,
+            remap_rules,
+            full_object_mapping,
+            synonym_meta=synonym_meta_map,
+            view_dependency_map=view_dependency_map
+        )
+        final_ddl = adjust_ddl_for_object(
+            remapped_ddl,
+            src_schema,
+            src_obj,
+            tgt_schema,
+            tgt_obj,
+            extra_identifiers=[],
+            obj_type='VIEW'
+        )
+        final_ddl = cleanup_dbcat_wrappers(final_ddl)
+        final_ddl = prepend_set_schema(final_ddl, tgt_schema)
+        final_ddl = normalize_ddl_for_ob(final_ddl)
+        obj_full = f"{tgt_schema}.{tgt_obj}"
+        final_ddl = apply_hint_filter('VIEW', obj_full, final_ddl)
+        final_ddl, cleanup_comments, _cleanup_actions = apply_fixup_cleanup_pipeline(
+            'VIEW',
+            obj_full,
+            final_ddl,
+            seed_actions=view_cleanup_actions,
+        )
+        final_ddl = strip_constraint_enable(final_ddl)
+        final_ddl = enforce_schema_for_ddl(final_ddl, tgt_schema, 'VIEW')
+        if not final_ddl.rstrip().endswith(';'):
+            final_ddl = final_ddl.rstrip() + ';'
+        extra_comments: List[str] = []
+        if compat and compat.rewrite_notes:
+            extra_comments.append("rewrite_notes: " + "; ".join(compat.rewrite_notes))
+        if cleanup_comments:
+            extra_comments.extend(cleanup_comments)
+        return final_ddl, ddl_source_label, compat, extra_comments
+
     # 处理VIEW对象 - 使用简化的拓扑排序
     if view_missing_objects:
         log.info("[FIXUP] (4a/9) 正在排序 %d 个VIEW依赖关系...", len(view_missing_objects))
@@ -37891,19 +38196,13 @@ def generate_fixup_scripts(
                     log.info("[FIXUP] 跳过源端 INVALID 的 VIEW %s.%s。", src_schema, src_obj)
                     mark_source('VIEW', 'invalid')
                     continue
-                raw_ddl = None
-                ddl_source_label = "MISSING"
-                compat = view_compat_map.get((src_schema.upper(), src_obj.upper()))
-                if compat and compat.cleaned_ddl:
-                    raw_ddl = compat.cleaned_ddl
-                    ddl_source_label = "VIEW_CACHE"
-                else:
-                    fetch_result = fetch_ddl_with_timing(src_schema, 'VIEW', src_obj)
-                    if len(fetch_result) != 3:
-                        log.error("[FIXUP] VIEW fetch_ddl_with_timing 返回了 %d 个值，期望 3 个: %s", len(fetch_result), fetch_result)
-                        continue
-                    raw_ddl, ddl_source_label, _elapsed = fetch_result
-                if not raw_ddl:
+                final_ddl, ddl_source_label, compat, extra_comments = build_view_fixup_ddl(
+                    src_schema,
+                    src_obj,
+                    tgt_schema,
+                    tgt_obj,
+                )
+                if not final_ddl:
                     log.warning("[FIXUP] 未找到 VIEW %s.%s 的 DDL。", src_schema, src_obj)
                     mark_source('VIEW', 'missing')
                     continue
@@ -37916,55 +38215,6 @@ def generate_fixup_scripts(
                 else:
                     mark_source('VIEW', 'missing')
                 
-                # 清理DDL使其兼容OceanBase
-                cleaned_ddl, view_cleanup_actions = clean_view_ddl_for_oceanbase_with_audit(raw_ddl, ob_version)
-
-                # 修复 dbcat DDL 的注释/列名异常
-                col_meta = oracle_meta.table_columns.get((src_schema.upper(), src_obj.upper()), {}) or {}
-                cleaned_ddl = sanitize_view_ddl(cleaned_ddl, set(col_meta.keys()))
-                
-                # 重写依赖对象引用
-                remapped_ddl = remap_view_dependencies(
-                    cleaned_ddl,
-                    src_schema,
-                    src_obj,
-                    remap_rules,
-                    full_object_mapping,
-                    synonym_meta=synonym_meta_map,
-                    view_dependency_map=view_dependency_map
-                )
-                
-                # 调整schema和对象名
-                final_ddl = adjust_ddl_for_object(
-                    remapped_ddl,
-                    src_schema,
-                    src_obj,
-                    tgt_schema,
-                    tgt_obj,
-                    # VIEW 依赖替换已由 remap_view_dependencies 完成，
-                    # 这里不再做 schema 级全量替换，避免同名对象误替换。
-                    extra_identifiers=[],
-                    obj_type='VIEW'
-                )
-                
-                # 最终清理
-                final_ddl = cleanup_dbcat_wrappers(final_ddl)
-                final_ddl = prepend_set_schema(final_ddl, tgt_schema)
-                final_ddl = normalize_ddl_for_ob(final_ddl)
-                obj_full = f"{tgt_schema}.{tgt_obj}"
-                final_ddl = apply_hint_filter('VIEW', obj_full, final_ddl)
-                final_ddl, cleanup_comments, _cleanup_actions = apply_fixup_cleanup_pipeline(
-                    'VIEW',
-                    obj_full,
-                    final_ddl,
-                    seed_actions=view_cleanup_actions,
-                )
-                final_ddl = strip_constraint_enable(final_ddl)
-                final_ddl = enforce_schema_for_ddl(final_ddl, tgt_schema, 'VIEW')
-                
-                # 确保DDL以分号结尾
-                if not final_ddl.rstrip().endswith(';'):
-                    final_ddl = final_ddl.rstrip() + ';'
                 final_ddl = apply_fixup_idempotency(
                     final_ddl,
                     'VIEW',
@@ -37977,11 +38227,7 @@ def generate_fixup_scripts(
                 # 写入文件
                 filename = f"{tgt_schema}.{tgt_obj}.sql"
                 header = f"修补缺失的 VIEW {tgt_obj} (源: {src_schema}.{src_obj})"
-                extra_comments = []
-                if compat and compat.rewrite_notes:
-                    extra_comments.append("rewrite_notes: " + "; ".join(compat.rewrite_notes))
-                if cleanup_comments:
-                    extra_comments.extend(cleanup_comments)
+                obj_full = f"{tgt_schema}.{tgt_obj}"
                 grants_for_view = [] if view_grants_split_enabled else collect_grants_for_object(obj_full)
                 log.info("[FIXUP]%s 写入 VIEW 脚本: %s", source_tag(ddl_source_label), filename)
                 write_fixup_file(
@@ -37996,6 +38242,63 @@ def generate_fixup_scripts(
                 
             except Exception as exc:
                 log.error("[FIXUP] 处理 VIEW %s.%s 时出错: %s", src_schema, src_obj, exc)
+
+    view_refresh_targets: List[Tuple[str, str, str, str]] = []
+    if grant_enabled and views_with_missing_prereq:
+        target_to_source = build_target_to_source_mapping(full_object_mapping)
+        for view_full in sorted(views_with_missing_prereq):
+            view_full_u = (view_full or "").upper()
+            view_type_u = (grant_plan.object_target_types or {}).get(view_full_u, "")
+            if view_type_u and view_type_u.upper() != "VIEW":
+                continue
+            if ob_meta and view_full_u not in ob_meta.objects_by_type.get("VIEW", set()):
+                continue
+            if view_full_u in view_target_set and view_full_u in {
+                f"{tgt_schema}.{tgt_obj}".upper()
+                for _src_schema, _src_obj, tgt_schema, tgt_obj in view_missing_supported
+            }:
+                continue
+            src_full = target_to_source.get((view_full_u, "VIEW"))
+            if not src_full or "." not in src_full or "." not in view_full_u:
+                continue
+            src_schema, src_obj = src_full.split(".", 1)
+            tgt_schema, tgt_obj = view_full_u.split(".", 1)
+            if not allow_fixup("VIEW", tgt_schema, src_schema):
+                continue
+            view_refresh_targets.append((src_schema, src_obj, tgt_schema, tgt_obj))
+
+    if view_refresh_targets:
+        log.info("[FIXUP] (4a/9) 正在生成 %d 个 VIEW refresh 脚本...", len(view_refresh_targets))
+        for src_schema, src_obj, tgt_schema, tgt_obj in view_refresh_targets:
+            try:
+                final_ddl, ddl_source_label, _compat, extra_comments = build_view_fixup_ddl(
+                    src_schema,
+                    src_obj,
+                    tgt_schema,
+                    tgt_obj,
+                )
+                if not final_ddl:
+                    log.warning("[FIXUP] 未找到 VIEW refresh %s.%s 的 DDL。", src_schema, src_obj)
+                    continue
+                filename = f"{tgt_schema}.{tgt_obj}.sql"
+                header = f"刷新已有 VIEW {tgt_obj} 以收敛跨 schema 授权链 (源: {src_schema}.{src_obj})"
+                refresh_comments = [
+                    "refresh_reason: prerequisite grants for downstream VIEW grants are missing on target",
+                    "执行顺序: 先 view_prereq_grants/，再 view_refresh/，最后 view_post_grants/。",
+                ]
+                if extra_comments:
+                    refresh_comments.extend(extra_comments)
+                log.info("[FIXUP]%s 写入 VIEW refresh 脚本: %s", source_tag(ddl_source_label), filename)
+                write_fixup_file(
+                    base_dir,
+                    'view_refresh',
+                    filename,
+                    final_ddl,
+                    header,
+                    extra_comments=refresh_comments
+                )
+            except Exception as exc:
+                log.error("[FIXUP] 处理 VIEW refresh %s.%s 时出错: %s", src_schema, src_obj, exc)
 
     if view_missing_unsupported:
         log.info("[FIXUP] (4a/9) 正在生成不支持 VIEW 的 DDL（仅输出，默认不执行）...")
@@ -39888,6 +40191,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "AUX", "过滤授权清单"
     if name.startswith("deferred_grants_detail_"):
         return "DETAIL", "延后授权明细"
+    if name.startswith("grant_runnability_detail_"):
+        return "DETAIL", "授权可执行性明细"
     if name.startswith("unsupported_grant_detail_"):
         return "DETAIL", "不支持授权明细"
     if name.startswith("target_extra_grants_detail_"):
@@ -42604,6 +42909,364 @@ def build_unsupported_grant_detail_rows(
     return rows
 
 
+def build_grant_runnability_detail_rows(
+    *,
+    object_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]],
+    column_grants_by_grantee: Dict[str, Set[ColumnGrantEntry]],
+    sys_privs_by_grantee: Dict[str, Set[SystemGrantEntry]],
+    role_privs_by_grantee: Dict[str, Set[RoleGrantEntry]],
+    object_grants_missing_by_grantee: Dict[str, Set[ObjectGrantEntry]],
+    column_grants_missing_by_grantee: Dict[str, Set[ColumnGrantEntry]],
+    sys_privs_missing_by_grantee: Dict[str, Set[SystemGrantEntry]],
+    role_privs_missing_by_grantee: Dict[str, Set[RoleGrantEntry]],
+    view_prereq_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]],
+    view_post_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]],
+    deferred_object_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]],
+    deferred_column_grants_by_grantee: Dict[str, Set[ColumnGrantEntry]],
+    filtered_grants: List[FilteredGrantEntry],
+    deferred_filtered_grants: List[FilteredGrantEntry],
+    ob_meta: Optional[ObMetadata],
+    object_target_types: Optional[Dict[str, str]] = None,
+) -> List[GrantRunnabilityDetailRow]:
+    rows: List[GrantRunnabilityDetailRow] = []
+    object_target_types = {
+        (key or "").upper(): normalize_privilege_object_type(value)
+        for key, value in (object_target_types or {}).items()
+        if key
+    }
+    target_status_map: Dict[str, str] = {}
+    if ob_meta:
+        for (owner, name, obj_type), status in (ob_meta.object_statuses or {}).items():
+            full_u = f"{(owner or '').upper()}.{(name or '').upper()}".strip(".")
+            obj_type_u = normalize_privilege_object_type(obj_type)
+            mapped_type_u = object_target_types.get(full_u, "")
+            if mapped_type_u and obj_type_u and mapped_type_u != obj_type_u:
+                continue
+            if full_u and "." in full_u:
+                target_status_map[full_u] = normalize_object_status(status) or "-"
+
+    object_missing_keys = {
+        ((grantee or "").upper(), (entry.privilege or "").upper(), (entry.object_full or "").upper())
+        for grantee, entries in (object_grants_missing_by_grantee or {}).items()
+        for entry in (entries or set())
+    }
+    column_missing_keys = {
+        ((grantee or "").upper(), (entry.privilege or "").upper(), (entry.object_full or "").upper(), (entry.column_name or "").upper())
+        for grantee, entries in (column_grants_missing_by_grantee or {}).items()
+        for entry in (entries or set())
+    }
+    sys_missing_keys = {
+        ((grantee or "").upper(), (entry.privilege or "").upper(), bool(entry.admin_option))
+        for grantee, entries in (sys_privs_missing_by_grantee or {}).items()
+        for entry in (entries or set())
+    }
+    role_missing_keys = {
+        ((grantee or "").upper(), (entry.role or "").upper(), bool(entry.admin_option))
+        for grantee, entries in (role_privs_missing_by_grantee or {}).items()
+        for entry in (entries or set())
+    }
+    view_prereq_keys = {
+        ((grantee or "").upper(), (entry.privilege or "").upper(), (entry.object_full or "").upper())
+        for grantee, entries in (view_prereq_grants_by_grantee or {}).items()
+        for entry in (entries or set())
+    }
+    view_post_keys = {
+        ((grantee or "").upper(), (entry.privilege or "").upper(), (entry.object_full or "").upper())
+        for grantee, entries in (view_post_grants_by_grantee or {}).items()
+        for entry in (entries or set())
+    }
+    deferred_object_keys = {
+        ((grantee or "").upper(), (entry.privilege or "").upper(), (entry.object_full or "").upper())
+        for grantee, entries in (deferred_object_grants_by_grantee or {}).items()
+        for entry in (entries or set())
+    }
+    deferred_column_keys = {
+        ((grantee or "").upper(), (entry.privilege or "").upper(), (entry.object_full or "").upper(), (entry.column_name or "").upper())
+        for grantee, entries in (deferred_column_grants_by_grantee or {}).items()
+        for entry in (entries or set())
+    }
+
+    filtered_reason_map: Dict[Tuple[str, str, str, str], str] = {}
+    for item in (filtered_grants or []):
+        key = (
+            (item.category or "").upper(),
+            (item.grantee or "").upper(),
+            (item.privilege or "").upper(),
+            (item.object_full or "").upper(),
+        )
+        filtered_reason_map[key] = (item.reason or "").upper()
+    for item in (deferred_filtered_grants or []):
+        key = (
+            (item.category or "").upper(),
+            (item.grantee or "").upper(),
+            (item.privilege or "").upper(),
+            (item.object_full or "").upper(),
+        )
+        filtered_reason_map[key] = (item.reason or "").upper()
+
+    def _reason_info(reason_code: str) -> Tuple[str, str]:
+        default_reason = UNSUPPORTED_GRANT_REASON_DEFAULTS.get(reason_code)
+        if default_reason:
+            return default_reason
+        return ("授权需要人工处理", "人工确认后再决定是否执行。")
+
+    def _append_row(
+        *,
+        category: str,
+        grantee: str,
+        privilege: str,
+        object_full: str,
+        object_type: str,
+        target_status: str,
+        execution_class: str,
+        artifact_dir: str,
+        reason_code: str,
+        reason: str,
+        action: str,
+    ) -> None:
+        rows.append(
+            GrantRunnabilityDetailRow(
+                category=category or "-",
+                grantee=grantee or "-",
+                privilege=privilege or "-",
+                object_full=object_full or "-",
+                object_type=object_type or "-",
+                target_status=target_status or "-",
+                execution_class=execution_class or "-",
+                artifact_dir=artifact_dir or "-",
+                reason_code=reason_code or "-",
+                reason=reason or "-",
+                action=action or "-",
+            )
+        )
+
+    for grantee, entries in (object_grants_by_grantee or {}).items():
+        grantee_u = (grantee or "").upper()
+        for entry in (entries or set()):
+            obj_u = (entry.object_full or "").upper()
+            priv_u = (entry.privilege or "").upper()
+            if not grantee_u or not obj_u or not priv_u:
+                continue
+            reason_code = filtered_reason_map.get(("OBJECT", grantee_u, priv_u, obj_u), "")
+            target_status = target_status_map.get(obj_u, "-")
+            object_type = object_target_types.get(obj_u, "-")
+            key = (grantee_u, priv_u, obj_u)
+            if reason_code:
+                reason, action = _reason_info(reason_code)
+                execution_class = "DEFERRED" if reason_code.startswith("DEFERRED_") else "MANUAL"
+                artifact_dir = "grants_deferred" if execution_class == "DEFERRED" else "unsupported_grant_detail"
+            elif key in view_prereq_keys:
+                execution_class = "RUNNABLE_NOW"
+                artifact_dir = "view_prereq_grants"
+                reason_code = "TARGET_GRANT_MISSING"
+                reason = "目标端缺少该授权，且 prerequisite 链已证明可执行。"
+                action = "执行 view_prereq_grants/。"
+            elif key in view_post_keys:
+                execution_class = "RUNNABLE_NOW"
+                artifact_dir = "view_post_grants"
+                reason_code = "TARGET_GRANT_MISSING"
+                reason = "目标端缺少该 VIEW 授权，且 prerequisite 链已证明可执行。"
+                action = "执行 view_post_grants/；若存在 view_refresh/，先按目录顺序执行。"
+            elif key in object_missing_keys:
+                execution_class = "RUNNABLE_NOW"
+                artifact_dir = "grants_miss"
+                reason_code = "TARGET_GRANT_MISSING"
+                reason = "目标端缺少该授权，可进入本轮授权闭环。"
+                action = "执行 grants_miss/。"
+            else:
+                execution_class = "PRESENT_ON_TARGET"
+                artifact_dir = "-"
+                reason_code = "TARGET_ALREADY_HAS_GRANT"
+                reason = "目标端已具备该授权（含角色/系统权限继承）。"
+                action = "NO_ACTION"
+            _append_row(
+                category="OBJECT",
+                grantee=grantee_u,
+                privilege=priv_u + (" WITH GRANT OPTION" if entry.grantable else ""),
+                object_full=obj_u,
+                object_type=object_type,
+                target_status=target_status,
+                execution_class=execution_class,
+                artifact_dir=artifact_dir,
+                reason_code=reason_code,
+                reason=reason,
+                action=action,
+            )
+
+    for grantee, entries in (column_grants_by_grantee or {}).items():
+        grantee_u = (grantee or "").upper()
+        for entry in (entries or set()):
+            obj_u = (entry.object_full or "").upper()
+            col_u = (entry.column_name or "").upper()
+            priv_u = (entry.privilege or "").upper()
+            if not grantee_u or not obj_u or not col_u or not priv_u:
+                continue
+            object_text = f"{obj_u}({col_u})"
+            reason_code = filtered_reason_map.get(("COLUMN", grantee_u, priv_u, object_text), "")
+            target_status = target_status_map.get(obj_u, "-")
+            object_type = object_target_types.get(obj_u, "-")
+            key = (grantee_u, priv_u, obj_u, col_u)
+            if reason_code:
+                reason, action = _reason_info(reason_code)
+                execution_class = "DEFERRED" if reason_code.startswith("DEFERRED_") else "MANUAL"
+                artifact_dir = "grants_deferred" if execution_class == "DEFERRED" else "unsupported_grant_detail"
+            elif key in column_missing_keys:
+                execution_class = "RUNNABLE_NOW"
+                artifact_dir = "grants_miss"
+                reason_code = "TARGET_GRANT_MISSING"
+                reason = "目标端缺少该列级授权，可进入本轮授权闭环。"
+                action = "执行 grants_miss/。"
+            else:
+                execution_class = "PRESENT_ON_TARGET"
+                artifact_dir = "-"
+                reason_code = "TARGET_ALREADY_HAS_GRANT"
+                reason = "目标端已具备该列级授权（含角色/系统权限继承）。"
+                action = "NO_ACTION"
+            _append_row(
+                category="COLUMN",
+                grantee=grantee_u,
+                privilege=priv_u + (" WITH GRANT OPTION" if entry.grantable else ""),
+                object_full=object_text,
+                object_type=object_type,
+                target_status=target_status,
+                execution_class=execution_class,
+                artifact_dir=artifact_dir,
+                reason_code=reason_code,
+                reason=reason,
+                action=action,
+            )
+
+    for grantee, entries in (sys_privs_by_grantee or {}).items():
+        grantee_u = (grantee or "").upper()
+        for entry in (entries or set()):
+            priv_u = (entry.privilege or "").upper()
+            if not grantee_u or not priv_u:
+                continue
+            key = (grantee_u, priv_u, bool(entry.admin_option))
+            reason_code = filtered_reason_map.get(("SYSTEM", grantee_u, priv_u, ""), "")
+            if reason_code:
+                reason, action = _reason_info(reason_code)
+                execution_class = "MANUAL"
+                artifact_dir = "unsupported_grant_detail"
+            elif key in sys_missing_keys:
+                execution_class = "RUNNABLE_NOW"
+                artifact_dir = "grants_miss"
+                reason_code = "TARGET_GRANT_MISSING"
+                reason = "目标端缺少该系统权限，可进入本轮授权闭环。"
+                action = "执行 grants_miss/。"
+            else:
+                execution_class = "PRESENT_ON_TARGET"
+                artifact_dir = "-"
+                reason_code = "TARGET_ALREADY_HAS_GRANT"
+                reason = "目标端已具备该系统权限。"
+                action = "NO_ACTION"
+            _append_row(
+                category="SYSTEM",
+                grantee=grantee_u,
+                privilege=priv_u + (" WITH ADMIN OPTION" if entry.admin_option else ""),
+                object_full="-",
+                object_type="-",
+                target_status="-",
+                execution_class=execution_class,
+                artifact_dir=artifact_dir,
+                reason_code=reason_code,
+                reason=reason,
+                action=action,
+            )
+
+    for grantee, entries in (role_privs_by_grantee or {}).items():
+        grantee_u = (grantee or "").upper()
+        for entry in (entries or set()):
+            role_u = (entry.role or "").upper()
+            if not grantee_u or not role_u:
+                continue
+            key = (grantee_u, role_u, bool(entry.admin_option))
+            reason_code = filtered_reason_map.get(("ROLE", grantee_u, role_u, role_u), "")
+            if reason_code:
+                reason, action = _reason_info(reason_code)
+                execution_class = "MANUAL"
+                artifact_dir = "unsupported_grant_detail"
+            elif key in role_missing_keys:
+                execution_class = "RUNNABLE_NOW"
+                artifact_dir = "grants_miss"
+                reason_code = "TARGET_GRANT_MISSING"
+                reason = "目标端缺少该角色授权，可进入本轮授权闭环。"
+                action = "执行 grants_miss/。"
+            else:
+                execution_class = "PRESENT_ON_TARGET"
+                artifact_dir = "-"
+                reason_code = "TARGET_ALREADY_HAS_GRANT"
+                reason = "目标端已具备该角色授权。"
+                action = "NO_ACTION"
+            _append_row(
+                category="ROLE",
+                grantee=grantee_u,
+                privilege=role_u + (" WITH ADMIN OPTION" if entry.admin_option else ""),
+                object_full=role_u,
+                object_type="ROLE",
+                target_status="-",
+                execution_class=execution_class,
+                artifact_dir=artifact_dir,
+                reason_code=reason_code,
+                reason=reason,
+                action=action,
+            )
+
+    rows.sort(
+        key=lambda x: (
+            x.execution_class,
+            x.category,
+            x.grantee,
+            x.object_full,
+            x.privilege,
+        )
+    )
+    return rows
+
+
+def export_grant_runnability_detail(
+    rows: List[GrantRunnabilityDetailRow],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not report_timestamp or not rows:
+        return None
+    output_path = Path(report_dir) / f"grant_runnability_detail_{report_timestamp}.txt"
+    return write_pipe_report(
+        "授权可执行性明细",
+        [
+            "CATEGORY",
+            "GRANTEE",
+            "PRIVILEGE",
+            "OBJECT",
+            "OBJECT_TYPE",
+            "TARGET_STATUS",
+            "EXECUTION_CLASS",
+            "ARTIFACT_DIR",
+            "REASON_CODE",
+            "REASON",
+            "ACTION",
+        ],
+        [
+            [
+                row.category,
+                row.grantee,
+                row.privilege,
+                row.object_full,
+                row.object_type,
+                row.target_status,
+                row.execution_class,
+                row.artifact_dir,
+                row.reason_code,
+                row.reason,
+                row.action,
+            ]
+            for row in rows
+        ],
+        output_path,
+    )
+
+
 def export_unsupported_grant_detail(
     filtered_grants: List[FilteredGrantEntry],
     support_summary: Optional[SupportClassificationResult],
@@ -42696,7 +43359,7 @@ def export_grant_capability_detail(
         for row in rows
     ]
     lines: List[str] = [
-        "# 动态授权能力明细",
+        "# 授权能力标定明细",
         f"# total={len(rows)}",
         "# 分隔符: |",
         f"# 字段说明: {'|'.join(header_fields)}",
@@ -42713,7 +43376,7 @@ def export_grant_capability_detail(
             )
         )
     if probe_complete is False:
-        lines.append("# note: probe_complete=false 表示本次仅部分完成运行期验证；ALLOW/FILTER 中已验证结果仍有效，MANUAL_REVIEW 表示需人工复核。")
+        lines.append("# note: probe_complete=false 表示本次仅部分完成运行期标定；ALLOW/FILTER 中已标定结果仍有效，MANUAL_REVIEW 表示需人工复核。")
     header = "|".join(header_fields)
     lines.append(header)
     for row in data_rows:
@@ -43122,8 +43785,8 @@ OPERATOR_ACTION_CATEGORY_LABELS = {
     "DATA_RISK": "数据风险",
     "UNSUPPORTED_OBJECT": "不支持/阻断对象",
     "UNSUPPORTED_GRANT": "不支持授权",
-    "GRANT_CAPABILITY_MANUAL": "授权能力人工复核",
-    "GRANT_CAPABILITY_PROBE_INCOMPLETE": "授权能力探针不完整",
+    "GRANT_CAPABILITY_MANUAL": "授权能力标定需人工复核",
+    "GRANT_CAPABILITY_PROBE_INCOMPLETE": "授权能力标定未完成",
     "DEFERRED_GRANT": "延后授权",
     "PUBLIC_REVOKE_REVIEW": "PUBLIC 扩权回收复核",
     "PRIVILEGE_FAMILY_MANUAL": "专项权限族人工处理",
@@ -43266,7 +43929,7 @@ def build_operator_action_rows(
         default_behavior="REPORT_ONLY",
         primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "grant_capability_detail"),
         related_fixup_dir="",
-        why="部分权限能力未被当前运行完整证明，程序已降级为人工复核。",
+        why="部分权限能力未被当前运行完整标定，程序已保守降级为人工复核。",
         recommended_action="查看 grant_capability_detail 中的 MANUAL_REVIEW 决策后再决定如何处理授权。",
     )
     _add(
@@ -43277,7 +43940,7 @@ def build_operator_action_rows(
         default_behavior="REPORT_ONLY",
         primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "grant_capability_detail"),
         related_fixup_dir="",
-        why="本次授权能力探针未完全闭环，部分结论属于降级判断。",
+        why="本次授权能力标定未完全完成，部分结论属于保守降级判断。",
         recommended_action="先看 grant_capability_detail 中的 PROBE_INCOMPLETE/MANUAL_REVIEW 行，再决定是否补授权或回收权限。",
     )
     _add(
@@ -45382,6 +46045,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "PACKAGE_COMPARE"
     if name.startswith("trigger_status_report"):
         return "TRIGGER_STATUS"
+    if name.startswith("grant_runnability_detail_"):
+        return "GRANT_RUNNABILITY_DETAIL"
     if name.startswith("usability_check_detail_"):
         return "USABILITY_DETAIL"
     if name.startswith("table_data_presence_detail_"):
@@ -49369,12 +50034,12 @@ def print_final_report(
         capability_text.append(str(int(grant_capability_summary.get("supported_alias_rows", 0) or 0)), style="info")
         capability_text.append("\n过滤: ", style="mismatch")
         capability_text.append(str(int(grant_capability_summary.get("filter_rows", 0) or 0)), style="mismatch")
-        capability_text.append("\n人工复核: ", style="mismatch")
+        capability_text.append("\n需人工复核: ", style="mismatch")
         capability_text.append(str(int(grant_capability_summary.get("manual_rows", 0) or 0)), style="mismatch")
         if report_ts:
             capability_text.append("\n详见: ", style="info")
             capability_text.append(f"grant_capability_detail_{report_ts}.txt", style="info")
-        summary_table.add_row("[bold]授权能力探针[/bold]", capability_text)
+        summary_table.add_row("[bold]授权能力标定[/bold]", capability_text)
 
     if privilege_family_rows:
         family_text = Text()
@@ -50218,7 +50883,8 @@ def print_final_report(
         "fixup_scripts/tables_unsupported/temporary : 不支持临时表 DDL\n"
         "fixup_scripts/view_prereq_grants : VIEW 前置授权 (依赖对象)\n"
         "fixup_scripts/view          : 缺失 VIEW 的 CREATE 脚本\n"
-        "fixup_scripts/view_post_grants : VIEW 创建后授权 (同步源端权限)\n"
+        "fixup_scripts/view_refresh  : 已有 VIEW 刷新脚本 (后补 prerequisite grants 后用于收敛授权链)\n"
+        "fixup_scripts/view_post_grants : VIEW 创建/刷新后授权 (同步源端权限)\n"
         + mview_fixup_line +
         "fixup_scripts/procedure     : 缺失 PROCEDURE 的 CREATE 脚本\n"
         "fixup_scripts/function      : 缺失 FUNCTION 的 CREATE 脚本\n"
@@ -50457,7 +51123,19 @@ def print_final_report(
             "DETAIL",
             grant_capability_detail_path,
             int((grant_capability_summary or {}).get("total_rows", 0) or 0) if grant_capability_detail_path else None,
-            "动态授权能力明细"
+            "授权能力标定明细"
+        )
+        grant_runnability_rows = list((settings or {}).get("_grant_runnability_rows") or [])
+        grant_runnability_detail_path = export_grant_runnability_detail(
+            grant_runnability_rows,
+            report_path.parent,
+            report_ts,
+        )
+        _add_index_entry(
+            "DETAIL",
+            grant_runnability_detail_path,
+            len(grant_runnability_rows) if grant_runnability_detail_path else None,
+            "授权可执行性明细"
         )
         oracle_privilege_family_detail_path = export_oracle_privilege_family_detail(
             list((settings or {}).get("_oracle_privilege_family_rows") or []),
@@ -51022,7 +51700,9 @@ def print_final_report(
             if target_extra_grant_detail_path:
                 log.info("目标端额外授权明细已输出到: %s", target_extra_grant_detail_path)
             if grant_capability_detail_path:
-                log.info("动态授权能力明细已输出到: %s", grant_capability_detail_path)
+                log.info("授权能力标定明细已输出到: %s", grant_capability_detail_path)
+            if grant_runnability_detail_path:
+                log.info("授权可执行性明细已输出到: %s", grant_runnability_detail_path)
             if manual_actions_path:
                 log.info("人工处理/确认统一清单已输出到: %s", manual_actions_path)
             if fixup_skip_path:
@@ -52786,11 +53466,11 @@ def main():
                 ob_users = load_ob_users(ob_cfg) if enable_grant_generation else None
                 if supported_sys_privs:
                     log.warning(
-                        "[GRANT] grant_supported_sys_privs 已显式配置，将覆盖本次系统权限动态探针的默认支持结论。"
+                        "[GRANT] grant_supported_sys_privs 已显式配置，将覆盖本次系统权限运行时标定的默认支持结论。"
                     )
                 if supported_object_privs:
                     log.warning(
-                        "[GRANT] grant_supported_object_privs 已显式配置，将覆盖本次对象权限动态探针的默认支持结论。"
+                        "[GRANT] grant_supported_object_privs 已显式配置，将覆盖本次对象权限运行时标定的默认支持结论。"
                     )
                 grant_capability_library = build_grant_capability_library(
                     oracle_meta,
@@ -52808,7 +53488,7 @@ def main():
                     build_oracle_privilege_family_detail_rows(oracle_meta, ob_cfg)
                 )
                 log.info(
-                    "[GRANT] 权限能力探针：rows=%d, allow=%d, alias=%d, filter=%d, manual=%d, probe_complete=%s, include_oracle_maintained_roles=%s, ob_roles=%d, ob_users=%d",
+                    "[GRANT] 权限能力标定：rows=%d, allow=%d, alias=%d, filter=%d, manual=%d, probe_complete=%s, include_oracle_maintained_roles=%s, ob_roles=%d, ob_users=%d",
                     int(settings["_grant_capability_summary"].get("total_rows", 0) or 0),
                     int(settings["_grant_capability_summary"].get("allow_rows", 0) or 0),
                     int(settings["_grant_capability_summary"].get("supported_alias_rows", 0) or 0),

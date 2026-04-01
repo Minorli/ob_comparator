@@ -1590,6 +1590,52 @@ class TestViewChainCycle(unittest.TestCase):
         self.assertFalse(blocked)
         self.assertEqual(calls, [("A", "B.T1", "TABLE", "UPDATE", True)])
 
+    def test_find_matching_view_refresh_script(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fixup_dir = Path(tmpdir)
+            refresh_dir = fixup_dir / "view_refresh"
+            refresh_dir.mkdir(parents=True)
+            target = refresh_dir / "MONSTER_A.V1.sql"
+            target.write_text("CREATE OR REPLACE VIEW ...;", encoding="utf-8")
+            found = rf.find_matching_view_refresh_script(fixup_dir, "MONSTER_A.V1", "VIEW")
+            self.assertEqual(found, target)
+            self.assertIsNone(rf.find_matching_view_refresh_script(fixup_dir, "MONSTER_A.V1", "TABLE"))
+
+    def test_execute_view_refresh_before_retry_runs_matching_script(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fixup_dir = Path(tmpdir)
+            done_dir = fixup_dir / "done"
+            done_dir.mkdir(parents=True)
+            refresh_dir = fixup_dir / "view_refresh"
+            refresh_dir.mkdir(parents=True)
+            refresh_path = refresh_dir / "MONSTER_A.V1.sql"
+            refresh_path.write_text("CREATE OR REPLACE VIEW MONSTER_A.V1 AS SELECT 1 FROM DUAL;", encoding="utf-8")
+
+            with mock.patch.object(
+                rf,
+                "execute_script_with_summary",
+                return_value=(rf.ScriptResult(refresh_path, "SUCCESS", "ok"), rf.ExecutionSummary(1, [])),
+            ) as mocked_exec:
+                result = rf.execute_view_refresh_before_retry(
+                    fixup_dir=fixup_dir,
+                    object_full="MONSTER_A.V1",
+                    object_type="VIEW",
+                    obclient_cmd=[],
+                    done_dir=done_dir,
+                    timeout=10,
+                    layer=5,
+                    label="[1/1]",
+                    max_sql_file_bytes=None,
+                    state_ledger=None,
+                    exec_mode="auto",
+                    exec_file_fallback=True,
+                    exec_stats=rf.new_exec_mode_stats(),
+                )
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result.status, "SUCCESS")
+            mocked_exec.assert_called_once()
+
 
 class TestSqlParsing(unittest.TestCase):
     def test_split_nested_block_comments(self):
@@ -2674,19 +2720,24 @@ class TestSqlCollectionRecursive(unittest.TestCase):
             root = Path(tmpdir)
             fixup_dir = root / "fixup"
             (fixup_dir / "view_prereq_grants").mkdir(parents=True)
+            (fixup_dir / "view_refresh").mkdir(parents=True)
             (fixup_dir / "view_post_grants").mkdir(parents=True)
             (fixup_dir / "grants_miss").mkdir(parents=True)
             f1 = fixup_dir / "view_prereq_grants" / "A.grants.sql"
-            f2 = fixup_dir / "view_post_grants" / "A.grants.sql"
-            f3 = fixup_dir / "grants_miss" / "A.grants.sql"
-            for path in (f1, f2, f3):
+            f2 = fixup_dir / "view_refresh" / "A.V1.sql"
+            f3 = fixup_dir / "view_post_grants" / "A.grants.sql"
+            f4 = fixup_dir / "grants_miss" / "A.grants.sql"
+            for path in (f1, f2, f3, f4):
                 path.write_text("GRANT SELECT ON A.T1 TO A;", encoding="utf-8")
 
             files = rf.collect_sql_files_by_layer(fixup_dir, smart_order=True)
             rels = [str(path.relative_to(fixup_dir)) for _, path in files]
             self.assertEqual(rels.count("view_prereq_grants/A.grants.sql"), 1)
+            self.assertEqual(rels.count("view_refresh/A.V1.sql"), 1)
             self.assertEqual(rels.count("view_post_grants/A.grants.sql"), 1)
             self.assertEqual(rels.count("grants_miss/A.grants.sql"), 1)
+            self.assertLess(rels.index("view_prereq_grants/A.grants.sql"), rels.index("view_refresh/A.V1.sql"))
+            self.assertLess(rels.index("view_refresh/A.V1.sql"), rels.index("view_post_grants/A.grants.sql"))
 
     def test_collect_sql_files_by_layer_supports_nested_only_dirs(self):
         with tempfile.TemporaryDirectory() as tmpdir:

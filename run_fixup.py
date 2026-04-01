@@ -842,6 +842,7 @@ TYPE_DIR_MAP = {
     "CONSTRAINT": "constraint",
     "INDEX": "index",
     "VIEW": "view",
+    "VIEW_REFRESH": "view_refresh",
     "MATERIALIZED_VIEW": "materialized_view",
     "SYNONYM": "synonym",
     "PROCEDURE": "procedure",
@@ -870,7 +871,7 @@ DEPENDENCY_LAYERS = [
     ["table"],                                       # Layer 2: Base tables
     ["table_alter"],                                 # Layer 3: Table modifications
     ["view_prereq_grants", "grants"],                # Layer 4: View prereq + general grants
-    ["view", "synonym"],                             # Layer 5: Simple dependent objects
+    ["view", "view_refresh", "synonym"],             # Layer 5: View create/refresh + simple dependent objects
     ["view_post_grants"],                            # Layer 6: View post grants
     ["materialized_view"],                           # Layer 7: MVIEWs
     ["type"],                                        # Layer 8: Types (specs)
@@ -1113,6 +1114,7 @@ CREATE_OBJECT_DIRS = {
     "sequence",
     "table",
     "view",
+    "view_refresh",
     "materialized_view",
     "synonym",
     "procedure",
@@ -2555,6 +2557,53 @@ def infer_permission_retry_target(
     if not privilege_set:
         return None
     return normalize_full_name(object_full), obj_type, privilege_set
+
+
+def find_matching_view_refresh_script(fixup_dir: Path, object_full: str, object_type: str) -> Optional[Path]:
+    if normalize_object_type(object_type or "") != "VIEW":
+        return None
+    schema, name = split_full_name(object_full or "")
+    if not schema or not name:
+        return None
+    candidate = fixup_dir / "view_refresh" / f"{schema.upper()}.{name.upper()}.sql"
+    return candidate if candidate.exists() else None
+
+
+def execute_view_refresh_before_retry(
+    *,
+    fixup_dir: Path,
+    object_full: str,
+    object_type: str,
+    obclient_cmd: List[str],
+    done_dir: Path,
+    timeout: Optional[int],
+    layer: int,
+    label: str,
+    max_sql_file_bytes: Optional[int],
+    state_ledger: Optional['FixupStateLedger'],
+    exec_mode: str,
+    exec_file_fallback: bool,
+    exec_stats: Dict[str, int],
+) -> Optional['ScriptResult']:
+    refresh_path = find_matching_view_refresh_script(fixup_dir, object_full, object_type)
+    if not refresh_path:
+        return None
+    log.info("%s [VIEW_REFRESH] 先执行 %s，再重试 VIEW 授权。", label, refresh_path)
+    result, _summary = execute_script_with_summary(
+        obclient_cmd,
+        refresh_path,
+        fixup_dir,
+        done_dir,
+        timeout,
+        layer,
+        f"{label} (view_refresh)",
+        max_sql_file_bytes,
+        state_ledger=state_ledger,
+        exec_mode=resolve_script_exec_mode(exec_mode, refresh_path),
+        exec_file_fallback=exec_file_fallback,
+        exec_stats=exec_stats,
+    )
+    return result
 
 
 def grant_statement_has_option(statement: str) -> bool:
@@ -5614,6 +5663,23 @@ def run_single_fixup(
                         required_privileges_override=retry_privs,
                     )
                     if applied > 0:
+                        refresh_result = execute_view_refresh_before_retry(
+                            fixup_dir=fixup_dir,
+                            object_full=retry_full,
+                            object_type=retry_type,
+                            obclient_cmd=obclient_cmd,
+                            done_dir=done_dir,
+                            timeout=ob_timeout,
+                            layer=layer,
+                            label=f"{label} (grant)",
+                            max_sql_file_bytes=max_sql_file_bytes,
+                            state_ledger=state_ledger,
+                            exec_mode=fixup_settings.exec_mode,
+                            exec_file_fallback=fixup_settings.exec_file_fallback,
+                            exec_stats=exec_stats,
+                        )
+                        if refresh_result:
+                            results.append(refresh_result)
                         retry_result, retry_summary, _removed2, _kept2, truncated2 = execute_grant_file_with_prune(
                             obclient_cmd,
                             sql_path,
@@ -6362,6 +6428,23 @@ def run_iterative_fixup(
                             required_privileges_override=retry_privs,
                         )
                         if applied > 0:
+                            refresh_result = execute_view_refresh_before_retry(
+                                fixup_dir=fixup_dir,
+                                object_full=retry_full,
+                                object_type=retry_type,
+                                obclient_cmd=obclient_cmd,
+                                done_dir=done_dir,
+                                timeout=ob_timeout,
+                                layer=layer,
+                                label=f"{label} (grant)",
+                                max_sql_file_bytes=current_max_sql_file_bytes,
+                                state_ledger=state_ledger,
+                                exec_mode=current_fixup_settings.exec_mode,
+                                exec_file_fallback=current_fixup_settings.exec_file_fallback,
+                                exec_stats=exec_stats,
+                            )
+                            if refresh_result:
+                                round_results.append(refresh_result)
                             retry_result, retry_summary, _removed2, _kept2, truncated2 = execute_grant_file_with_prune(
                                 obclient_cmd,
                                 sql_path,

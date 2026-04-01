@@ -5,7 +5,7 @@
 > 核心理念：一次转储、本地对比、脚本审计优先
 
 ## 近期更新（0.9.8.9）
-- VIEW 授权依赖补强：对 `ORA-01720` 敏感的 VIEW 授权链，程序会继续生成 `view_prereq_grants/`；`run_fixup` 在执行 `view_post_grants/` 命中 `ORA-01720` 时，也会按失败语句里的真实 privilege 回补底层 `WITH GRANT OPTION` 再重试。
+- VIEW 授权依赖补强：对 `ORA-01720` 敏感的 VIEW 授权链，程序会生成 `view_prereq_grants/`；如果目标端 VIEW 已存在且 prerequisite grants 是后补的，还会额外生成 `view_refresh/`。`run_fixup` 在执行 `view_post_grants/` 命中 `ORA-01720` 时，也会先应用 prerequisite grants，必要时执行匹配的 `view_refresh/`，再重试最终 VIEW grant。
 - 黑名单表重纳管增强：`blacklist_target_existing_policy=rehydrate_if_present` 已进入正式版本；当目标端已存在人工改造后的承接表时，可恢复后续 compare/fixup，并自动保护黑名单改造列不被写回 Oracle 原始语义。
 - 触发器边界更准确：`INSTEAD OF ... ON VIEW` 触发器已纳入正常 compare/fixup；`DATABASE/SCHEMA` 级事件触发器继续保留为人工处理。
 - Oracle 派生表降噪补齐：`RUPD$_*`、`SNAP$_*` 与既有 `MLOG$_*` 一样按系统工件从 compare/fixup 中排除。
@@ -230,7 +230,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/blacklist_rehydrated_detail_<ts>.txt`：黑名单表重纳管明细（目标端已存在且进入 rehydrate 的表、改造承接列、manual 边界）
 - `main_reports/run_<ts>/filtered_grants.txt`：过滤授权清单
 - `main_reports/run_<ts>/manual_actions_required_<ts>.txt`：本次必须人工处理/确认的统一清单（聚合 unsupported/deferred/review-first 项）
-- `main_reports/run_<ts>/grant_capability_detail_<ts>.txt`：本次授权动态规则库明细（含目标端目录权限别名，如 `DEBUG -> OTHERS`）
+- `main_reports/run_<ts>/grant_capability_detail_<ts>.txt`：本次授权能力标定明细（含目标端目录权限别名，如 `DEBUG -> OTHERS`）
 - `main_reports/run_<ts>/oracle_privilege_family_detail_<ts>.txt`：Oracle 权限族覆盖明细（区分 `RUNNABLE / MANUAL_ONLY`，当前 `DBA_COL_PRIVS` 已纳入 runnable grants，ACL/AQ/XS/Resource Manager 等仍先做盘点）
 - `main_reports/run_<ts>/target_extra_grants_detail_<ts>.txt`：目标端额外对象授权明细（含 PUBLIC 扩权风险）
 - `main_reports/run_<ts>/unsupported_grant_detail_<ts>.txt`：不进入 runnable grant 闭环的授权明细（含 Oracle 维护角色在目标端不存在、目标角色目录不可确认、OB 不支持权限等）
@@ -295,7 +295,8 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - 如果源端触发器是 `DATABASE/SCHEMA` 级事件触发器（例如 `BEFORE DROP ON DATABASE`），程序不会再静默漏掉；会输出到 `triggers_non_table_detail_<ts>.txt`，并在 `manual_actions_required_<ts>.txt` 中显式提醒。`INSTEAD OF ... ON VIEW` 会按普通受管触发器参与 compare/fixup。
 - 当 `source_object_scope_mode=remap_root_closure` 且配置了 `trigger_list` 时，`trigger_list` 支持填写源端名或 remap 后目标名；若条目无法在源端或显式 remap 规则中解析，只会写入 `source_scope_detail_<ts>.txt` / `trigger_status_report.txt`，不会再中止整轮运行。
 - 在 scoped trigger 场景下，如果触发器依赖的目标 TABLE/VIEW 尚未创建，首轮只会生成依赖对象脚本；TRIGGER 自身会在 `fixup_skip_summary_<ts>.txt` 中标记为 `base_table_missing` 或同类跳过原因，待依赖补齐后 rerun 再生成 trigger DDL。
-- 对 `view_post_grants/` 中的 `GRANT SELECT/INSERT/UPDATE/DELETE ON <view> TO <grantee>`，若目标端因缺少底层 `WITH GRANT OPTION` 命中 `ORA-01720`，`run_fixup` 会按失败语句里的真实 privilege 自动补底层依赖授权后重试，不再只把它记成普通权限不足。
+- 对 `view_post_grants/` 中的 `GRANT SELECT/INSERT/UPDATE/DELETE ON <view> TO <grantee>`，若目标端因缺少底层 `WITH GRANT OPTION` 命中 `ORA-01720`，`run_fixup` 会按失败语句里的真实 privilege 自动补底层依赖授权；若 fixup 目录存在匹配的 `view_refresh/`，会先刷新 VIEW 再重试最终 VIEW grant，不再只把它记成普通权限不足。
+- `grants_miss/` 现在会继续剔除明显不可执行的授权：目标对象当前不存在且本轮不会创建，或目标对象当前已是 `INVALID` 的授权，不再混进 runnable grants；这类会转入 `grants_deferred/` / `unsupported_grant_detail_<ts>.txt`。
 - 触发器中的 `PRAGMA AUTONOMOUS_TRANSACTION` 现在会保留，不再被清洗掉。
 
 ## DDL 清理治理
