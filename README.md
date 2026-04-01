@@ -268,7 +268,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/column_default_detail_<ts>.txt`：现有列默认值差异明细（仅列级语义，不等同 `DEFAULT ON NULL`）
 - `main_reports/run_<ts>/dependency_detail_<ts>.txt`：依赖差异明细（report_detail_mode=split）
 - `*_detail_*.txt` 明细文件采用 `|` 分隔，并包含 `# total/# 字段说明` 头，格式与 `package_compare` 一致，便于 Excel 直接分隔导入。
-- `main_reports/run_<ts>/missed_tables_views_for_OMS/`：OMS 缺失 TABLE/VIEW 规则
+- `main_reports/run_<ts>/missed_tables_views_for_OMS/`：OMS 缺失 TABLE/VIEW 规则；当 `source_object_scope_mode=remap_root_closure` 时，这里默认只导出 `remap_file` 中显式 TABLE/VIEW roots，不再把 closure 中的依赖对象一起导出
 - `fixup_scripts/`：修补脚本输出（执行前需人工审核）
 - `fixup_scripts/README_FIRST.txt`：fixup 根目录导航，说明本次生成目录的用途与默认执行边界；若存在人工项，会先指向 `manual_actions_required_<ts>.txt`
 - `fixup_scripts/grants_miss/`：缺失授权脚本
