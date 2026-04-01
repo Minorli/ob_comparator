@@ -19980,6 +19980,49 @@ class TestReportDbHelpers(unittest.TestCase):
         self.assertEqual(rows[0]["src_schema"], "SRC")
         self.assertEqual(rows[0]["tgt_schema"], "TGT")
 
+    def test_build_report_oms_missing_rows_filters_dependency_only_when_explicit_roots_provided(self):
+        tv_results = {
+            "missing": [
+                ("TABLE", "TGT.ROOT_T", "SRC.ROOT_T"),
+                ("TABLE", "TGT.DEP_T", "SRC.DEP_T"),
+            ]
+        }
+        rows, truncated, truncated_count = sdr._build_report_oms_missing_rows(
+            tv_results,
+            support_state_map={},
+            blacklisted_tables=set(),
+            max_rows=0,
+            explicit_root_fulls={"SRC.ROOT_T"},
+        )
+        self.assertFalse(truncated)
+        self.assertEqual(truncated_count, 0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["src_schema"], "SRC")
+        self.assertEqual(rows[0]["src_name"], "ROOT_T")
+
+    def test_export_missing_table_view_mappings_filters_dependency_only_when_explicit_roots_provided(self):
+        tv_results = {
+            "missing": [
+                ("TABLE", "TGT.ROOT_T", "SRC.ROOT_T"),
+                ("VIEW", "TGT.DEP_V", "SRC.DEP_V"),
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = sdr.export_missing_table_view_mappings(
+                tv_results,
+                Path(tmpdir),
+                blacklisted_tables=set(),
+                support_state_map={},
+                explicit_root_fulls={"SRC.ROOT_T"},
+            )
+            self.assertIsNotNone(output)
+            root_file = Path(output) / "TGT_T.txt"
+            self.assertTrue(root_file.exists())
+            content = root_file.read_text(encoding="utf-8")
+            self.assertIn("SRC.ROOT_T", content)
+            dep_view_file = Path(output) / "TGT_V.txt"
+            self.assertFalse(dep_view_file.exists())
+
     def test_build_report_artifact_rows(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             report_dir = Path(tmpdir)

@@ -13291,6 +13291,16 @@ def export_managed_target_scope_detail(
     return write_pipe_report("受管目标 Schema 明细", header_fields, rows, output_path)
 
 
+def collect_explicit_root_fulls(scope_result: Optional[ScopedSourceScopeResult]) -> Set[str]:
+    if not scope_result or (scope_result.mode or "").lower() != "remap_root_closure":
+        return set()
+    return {
+        (full or "").upper()
+        for full, obj_type in (scope_result.root_seed_nodes or set())
+        if (full or "").strip() and (obj_type or "").upper() in {"TABLE", "VIEW"}
+    }
+
+
 def compute_schema_coverage(
     configured_source_schemas: List[str],
     source_objects: SourceObjectMap,
@@ -39745,7 +39755,8 @@ def export_missing_table_view_mappings(
     tv_results: ReportResults,
     report_dir: Path,
     blacklisted_tables: Optional[Set[Tuple[str, str]]] = None,
-    support_state_map: Optional[Dict[Tuple[str, str], ObjectSupportReportRow]] = None
+    support_state_map: Optional[Dict[Tuple[str, str], ObjectSupportReportRow]] = None,
+    explicit_root_fulls: Optional[Set[str]] = None,
 ) -> Optional[Path]:
     """
     将缺失的 TABLE/VIEW 映射按目标 schema 输出为文本，便于迁移工具直接消费。
@@ -39761,9 +39772,16 @@ def export_missing_table_view_mappings(
         shutil.rmtree(output_dir, ignore_errors=True)
 
     grouped: Dict[str, Dict[str, List[str]]] = defaultdict(lambda: {"TABLE": [], "VIEW": []})
+    explicit_root_fulls_u = {
+        (item or "").upper()
+        for item in (explicit_root_fulls or set())
+        if (item or "").strip()
+    }
     for obj_type, tgt_name, src_name in tv_results.get("missing", []):
         obj_type_u = obj_type.upper()
         if obj_type_u not in ("TABLE", "VIEW"):
+            continue
+        if explicit_root_fulls_u and src_name.upper() not in explicit_root_fulls_u:
             continue
         if support_state_map and "." in src_name:
             src_full = src_name.upper()
@@ -45880,15 +45898,23 @@ def _build_report_oms_missing_rows(
     tv_results: Optional[ReportResults],
     support_state_map: Optional[Dict[Tuple[str, str], ObjectSupportReportRow]],
     blacklisted_tables: Optional[Set[Tuple[str, str]]],
-    max_rows: int
+    max_rows: int,
+    explicit_root_fulls: Optional[Set[str]] = None,
 ) -> Tuple[List[Dict[str, object]], bool, int]:
     if not tv_results:
         return [], False, 0
     rows: List[Dict[str, object]] = []
     support_state_map = support_state_map or {}
+    explicit_root_fulls_u = {
+        (item or "").upper()
+        for item in (explicit_root_fulls or set())
+        if (item or "").strip()
+    }
     for obj_type, tgt_name, src_name in tv_results.get("missing", []):
         obj_type_u = (obj_type or "").upper()
         if obj_type_u not in ("TABLE", "VIEW"):
+            continue
+        if explicit_root_fulls_u and src_name.upper() not in explicit_root_fulls_u:
             continue
         if support_state_map and "." in src_name:
             src_full = src_name.upper()
@@ -47923,11 +47949,13 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
             if not ok_skip:
                 _record_write_failure("写入 DIFF_REPORT_FIXUP_SKIP 失败")
 
+        explicit_oms_root_fulls = collect_explicit_root_fulls((settings or {}).get("_source_scope_result"))
         oms_rows, _oms_trunc, _oms_trunc_cnt = _build_report_oms_missing_rows(
             tv_results,
             (support_summary.support_state_map if support_summary else None),
             blacklisted_table_keys,
-            max_rows
+            max_rows,
+            explicit_root_fulls=explicit_oms_root_fulls,
         )
         if oms_rows:
             expected_rows_by_table["oms_missing"] = len(oms_rows)
@@ -50313,11 +50341,13 @@ def print_final_report(
             if is_long_only_blacklist(entries):
                 continue
             blacklisted_table_keys.add(key)
+        explicit_oms_root_fulls = collect_explicit_root_fulls((settings or {}).get("_source_scope_result"))
         export_dir = export_missing_table_view_mappings(
             tv_results,
             report_path.parent,
             blacklisted_tables=blacklisted_table_keys,
-            support_state_map=(support_summary.support_state_map if support_summary else None)
+            support_state_map=(support_summary.support_state_map if support_summary else None),
+            explicit_root_fulls=explicit_oms_root_fulls,
         )
         _add_index_entry("DIR", export_dir, None, "缺失 TABLE/VIEW 规则目录")
         package_report_path = None
@@ -51733,6 +51763,7 @@ def main():
                 explicit_trigger_detail_rows=[],
                 mode=source_scope_mode,
             )
+        settings["_source_scope_result"] = source_scope_result
         # 4.2.b) 预计算递归依赖表集合（性能优化：避免每对象 DFS）
         transitive_table_cache: Optional[TransitiveTableCache] = None
         if settings.get("enable_schema_mapping_infer") and dependency_graph:

@@ -38,6 +38,7 @@
   可选值：full_source、remap_root_closure。
   说明：`full_source` 保持当前行为，按 `source_schemas` 全量扫描；`remap_root_closure` 仅以 `remap_file` 中显式 TABLE/VIEW 为 root seeds，再按依赖/附属关系扩展闭包，不在闭包中的对象（及其相关 INDEX/CONSTRAINT/SYNONYM/SEQUENCE 等）整体忽略。
   说明：当设置为 `remap_root_closure` 且配置了 `trigger_list` 时，`trigger_list` 中的触发器会作为显式 keep set 保留；`trigger_list` 支持填写源端触发器名，或 remap 后的目标触发器名。
+  说明：`missed_tables_views_for_OMS/` 与 report_db 的 `OMS_MISSING` 在该模式下默认只导出 `remap_file` 中显式 TABLE/VIEW roots，不再把 closure 依赖对象一起带出。
   说明：若 `trigger_list` 非法或未启用 `TRIGGER` 检查，程序会 fail-fast；若个别条目无法在源端或显式 remap 规则中解析，程序不再中止，而是把这些条目写入 `source_scope_detail_<ts>.txt` / `trigger_status_report.txt`，并从本轮 scoped closure 与 fixup 中排除。
   说明：规则格式为 `SRC_SCHEMA.OBJECT = TGT_SCHEMA.OBJECT`，支持注释与空行。
   注意：文件不存在会报警但继续。
