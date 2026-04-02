@@ -46,6 +46,7 @@
 - **DDL 清洗与格式化**：支持 `ddl_cleanup_detail_<ts>.txt` 审计明细、全角标点清洗、hint 策略清洗、SQLcl 格式化（可按类型/体积/超时控制）；语义改写会在脚本头写 `DDL_REWRITE` 注释。
 - **黑名单与排除机制**：支持规则引擎、名称模式、显式排除清单（`exclude_objects_file`）与依赖联动过滤。
 - **版本门控**：按 OB 版本动态处理 MVIEW、interval 分区等能力差异，降低跨版本误报。
+- **GTT 改造模式**：支持把 Oracle 全局临时表按普通 TABLE 受管并输出改造 DDL，或保留原始 GTT 语义；两种模式下都不会进入 OMS 数据迁移规则。
 
 ## 适用场景
 - Oracle → OceanBase 迁移后的结构一致性审计
