@@ -1718,7 +1718,133 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertEqual(results["mismatched"], [])
 
+    def test_check_primary_objects_suppresses_nullability_relax_when_source_has_enabled_named_notnull_check_and_target_is_not_null(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "C1": {
+                    "data_type": "NUMBER",
+                    "data_length": None,
+                    "char_length": None,
+                    "char_used": None,
+                    "data_precision": 10,
+                    "data_scale": 0,
+                    "nullable": "Y",
+                    "data_default": None,
+                    "hidden": False,
+                    "virtual": False,
+                    "virtual_expr": None,
+                }
+            }
+        })._replace(constraints={
+            ("A", "T1"): {
+                "CK_NN_C1": {
+                    "type": "C",
+                    "status": "ENABLED",
+                    "validated": "VALIDATED",
+                    "search_condition": '"C1" IS NOT NULL',
+                    "columns": ["C1"],
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "NUMBER",
+                        "data_length": None,
+                        "char_length": None,
+                        "char_used": None,
+                        "data_precision": 10,
+                        "data_scale": 0,
+                        "nullable": "N",
+                        "data_default": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                    }
+                }
+            }
+        )._replace(constraints={("A", "T1"): {}})
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(results["mismatched"], [])
 
+    def test_check_primary_objects_suppresses_nullability_relax_when_source_has_enabled_named_notnull_check_non_ascii_and_target_has_enabled_notnull_check(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "业务员G代码": {
+                    "data_type": "VARCHAR2",
+                    "data_length": 30,
+                    "char_length": 30,
+                    "char_used": "B",
+                    "data_precision": None,
+                    "data_scale": None,
+                    "nullable": "Y",
+                    "data_default": None,
+                    "hidden": False,
+                    "virtual": False,
+                    "virtual_expr": None,
+                }
+            }
+        })._replace(constraints={
+            ("A", "T1"): {
+                "CK_NN_CN": {
+                    "type": "C",
+                    "status": "ENABLED",
+                    "validated": "VALIDATED",
+                    "search_condition": '(("业务员G代码" IS NOT NULL))',
+                    "columns": ["业务员G代码"],
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "业务员G代码": {
+                        "data_type": "VARCHAR2",
+                        "data_length": 45,
+                        "char_length": 45,
+                        "char_used": "B",
+                        "data_precision": None,
+                        "data_scale": None,
+                        "nullable": "Y",
+                        "data_default": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                    }
+                }
+            }
+        )._replace(
+            constraints={("A", "T1"): {}},
+            enabled_notnull_check_columns={
+                ("A", "T1"): {
+                    "业务员G代码": {
+                        "constraint_name": "T1_OBCHECK_1",
+                        "search_condition": '"业务员G代码" IS NOT NULL',
+                        "status": "ENABLED",
+                        "validated": "VALIDATED",
+                    }
+                }
+            }
+        )
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(results["mismatched"], [])
 
     def test_check_primary_objects_inline_novalidate_notnull_with_equivalent_obnotnull_is_clean(self):
         master_list = [("A.T1", "A.T1", "TABLE")]
@@ -15798,7 +15924,85 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIsNone(mismatch)
 
+    def test_compare_constraints_for_table_suppresses_missing_named_notnull_when_target_has_auto_semantics_non_ascii(self):
+        oracle_constraints = {
+            ("A", "T1"): {
+                "CK_NN_CN": {
+                    "type": "C",
+                    "columns": ["业务员G代码"],
+                    "search_condition": '(("业务员G代码" is not null))',
+                    "status": "ENABLED",
+                    "validated": "VALIDATED",
+                },
+            }
+        }
+        oracle_meta = self._make_oracle_meta(constraints=oracle_constraints)
+        ob_meta = self._make_ob_meta(constraints={("A", "T1"): {}})
+        ob_meta = ob_meta._replace(enabled_notnull_check_groups={
+            ("A", "T1"): {
+                "业务员G代码": (
+                    sdr.NotnullCheckEntry("T1_OBCHECK_1", '"业务员G代码" IS NOT NULL', "ENABLED", "VALIDATED", True, False),
+                )
+            }
+        })
+        ok, mismatch = sdr.compare_constraints_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+            {}
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(mismatch)
 
+    def test_compare_constraints_for_table_reports_duplicate_notnull_checks_in_target_non_ascii(self):
+        oracle_constraints = {
+            ("A", "T1"): {
+                "SYS_C_CN": {
+                    "type": "C",
+                    "columns": ["业务员G代码"],
+                    "search_condition": '(("业务员G代码" is not null))',
+                    "status": "ENABLED",
+                    "validated": "NOT VALIDATED",
+                },
+            }
+        }
+        ob_constraints = {
+            ("A", "T1"): {
+                "NN_T1_CN": {
+                    "type": "C",
+                    "columns": ["业务员G代码"],
+                    "search_condition": '"业务员G代码" is not null',
+                    "status": "ENABLED",
+                    "validated": "NOT VALIDATED",
+                },
+            }
+        }
+        oracle_meta = self._make_oracle_meta(constraints=oracle_constraints)
+        ob_meta = self._make_ob_meta(constraints=ob_constraints)
+        ob_meta = ob_meta._replace(enabled_notnull_check_groups={
+            ("A", "T1"): {
+                "业务员G代码": (
+                    sdr.NotnullCheckEntry("NN_T1_CN", '"业务员G代码" IS NOT NULL', "ENABLED", "NOT VALIDATED", False, False),
+                    sdr.NotnullCheckEntry("T1_OBCHECK_1", '"业务员G代码" IS NOT NULL', "ENABLED", "NOT VALIDATED", True, False),
+                )
+            }
+        })
+        ok, mismatch = sdr.compare_constraints_for_table(
+            oracle_meta,
+            ob_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+            {}
+        )
+        self.assertFalse(ok)
+        self.assertIsNotNone(mismatch)
+        self.assertEqual(mismatch.extra_constraints, {"NN_T1_CN"})
+        self.assertEqual(mismatch.duplicate_notnull_extra_constraints, frozenset({"NN_T1_CN"}))
 
     def test_compare_constraints_for_table_duplicate_notnull_prefers_ob_auto_when_source_is_system_named(self):
         oracle_constraints = {
@@ -16065,6 +16269,31 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             self.assertIn('ALTER SESSION SET CURRENT_SCHEMA = B;', text)
             self.assertIn('ALTER TABLE "B"."T1" DROP CONSTRAINT NN_T1_C1;', text)
 
+    def test_collect_and_export_safe_duplicate_notnull_cleanup_candidates_non_ascii(self):
+        extra_results = {
+            "constraint_mismatched": [
+                sdr.ConstraintMismatch(
+                    table="A.T1",
+                    missing_constraints=set(),
+                    extra_constraints={"NN_T1_CN"},
+                    detail_mismatch=["CHECK_DUPLICATE_NOTNULL: 列 业务员G代码 源端同语义数=1，目标端同语义数=2；保留=T1_OBCHECK_1；额外=NN_T1_CN。"],
+                    downgraded_pk_constraints=set(),
+                    duplicate_notnull_extra_constraints=frozenset({"NN_T1_CN"}),
+                )
+            ]
+        }
+        candidates = sdr.collect_safe_duplicate_notnull_cleanup_candidates(extra_results)
+        self.assertEqual(candidates, [
+            ("CONSTRAINT", "A.NN_T1_CN", "SAFE_DUPLICATE_NOTNULL", 'ALTER TABLE "A"."T1" DROP CONSTRAINT NN_T1_CN;')
+        ])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = sdr.export_safe_duplicate_notnull_cleanup_fixup_scripts(Path(tmpdir), candidates)
+            self.assertEqual(
+                [str(path.relative_to(tmpdir)) for path in paths],
+                ["cleanup_safe/constraint/A.NN_T1_CN.drop.sql"]
+            )
+            text = (Path(tmpdir) / "cleanup_safe" / "constraint" / "A.NN_T1_CN.drop.sql").read_text(encoding="utf-8")
+            self.assertIn('ALTER TABLE "A"."T1" DROP CONSTRAINT NN_T1_CN;', text)
 
     def test_classify_unsupported_check_constraints_filters_extra(self):
         oracle_meta = self._make_oracle_meta(
@@ -17838,8 +18067,20 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         norm_ob = sdr.normalize_check_constraint_expression(expr_ob, "C2")
         self.assertEqual(norm_oracle, norm_ob)
 
+    def test_normalize_check_constraint_expression_non_ascii_notnull_parentheses_equivalence(self):
+        expr_plain = '"业务员G代码" is not null'
+        expr_wrapped = '(("业务员G代码" is not null))'
+        norm_plain = sdr.normalize_check_constraint_expression(expr_plain, "CK1")
+        norm_wrapped = sdr.normalize_check_constraint_expression(expr_wrapped, "CK2")
+        self.assertEqual(norm_plain, norm_wrapped)
 
+    def test_is_notnull_check_condition_supports_non_ascii_quoted_identifier(self):
+        self.assertTrue(sdr.is_notnull_check_condition('"业务员G代码" is not null'))
+        self.assertTrue(sdr.is_notnull_check_condition('("业务员G代码" is not null)'))
+        self.assertTrue(sdr.is_notnull_check_condition('(("业务员G代码" is not null))'))
 
+    def test_extract_notnull_column_supports_non_ascii_quoted_identifier(self):
+        self.assertEqual(sdr._extract_notnull_column('(("业务员G代码" is not null))'), '业务员G代码')
 
     def test_normalize_check_constraint_expression_between_equivalence(self):
         expr_oracle = "QTY BETWEEN 0 AND 999"
