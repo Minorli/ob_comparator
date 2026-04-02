@@ -2602,20 +2602,29 @@ def extract_constraint_name(value: Optional[object]) -> str:
     return extract_name_value(value)
 
 
-def is_notnull_check_condition(search_condition: Optional[str]) -> bool:
+def _extract_single_column_is_notnull_identifier(search_condition: Optional[str]) -> str:
     if not search_condition:
-        return False
+        return ""
     cond = normalize_sql_expression(search_condition)
     if not cond:
-        return False
-    cond_u = cond.upper().strip()
+        return ""
+    cond_u = uppercase_outside_single_quotes(cond).strip()
     while cond_u.startswith("(") and cond_u.endswith(")"):
         stripped = strip_wrapping_parentheses(cond_u)
         if stripped == cond_u:
             break
         cond_u = stripped.strip()
-    cond_u = re.sub(r'"([A-Z0-9_#$]+)"', r'\1', cond_u)
-    return bool(re.match(r'^[A-Z0-9_#$]+\s+IS\s+NOT\s+NULL$', cond_u))
+    match = re.match(r'^(?P<ident>"(?:[^"]|"")+"|[A-Z0-9_#$]+)\s+IS\s+NOT\s+NULL$', cond_u)
+    if not match:
+        return ""
+    ident = match.group("ident")
+    if ident.startswith('"') and ident.endswith('"'):
+        ident = ident[1:-1].replace('""', '"')
+    return normalize_identifier_name(ident)
+
+
+def is_notnull_check_condition(search_condition: Optional[str]) -> bool:
+    return bool(_extract_single_column_is_notnull_identifier(search_condition))
 
 
 def is_ob_notnull_constraint(
@@ -22698,8 +22707,12 @@ def check_primary_objects(
                 ))
                 continue
 
+            src_constraint_map = oracle_meta.constraints.get((src_schema_u, src_obj_u), {})
             src_notnull_novalidate_cols = build_system_notnull_novalidate_column_map(
-                oracle_meta.constraints.get((src_schema_u, src_obj_u), {})
+                src_constraint_map
+            )
+            src_enabled_notnull_cols = build_enabled_notnull_check_column_map(
+                src_constraint_map
             )
             tgt_enabled_notnull_cols = (
                 (getattr(ob_meta, "enabled_notnull_check_columns", {}) or {}).get((tgt_schema_u, tgt_obj_u), {})
@@ -22952,7 +22965,9 @@ def check_primary_objects(
                         )
 
                 source_novalidate_meta = src_notnull_novalidate_cols.get(col_name.upper())
+                source_enabled_notnull_meta = src_enabled_notnull_cols.get(col_name.upper())
                 target_has_notnull_check = col_name.upper() in tgt_enabled_notnull_cols
+                target_has_notnull_semantic = target_has_notnull_check or normalize_nullable_flag(tgt_info.get("nullable")) == "N"
                 src_nullable = normalize_nullable_flag(src_info.get("nullable"))
                 tgt_nullable = normalize_nullable_flag(tgt_info.get("nullable"))
                 if source_novalidate_meta:
@@ -22966,6 +22981,9 @@ def check_primary_objects(
                                 "nullability_novalidate_tighten"
                             )
                         )
+                elif source_enabled_notnull_meta and src_nullable == "Y":
+                    if target_has_notnull_semantic:
+                        pass
                 elif src_nullable and tgt_nullable and src_nullable != tgt_nullable:
                     if src_nullable == "N":
                         type_mismatches.append(
@@ -34774,20 +34792,7 @@ def resolve_name_collision_constraint_strategy(ob_version: Optional[str]) -> str
 
 
 def _extract_notnull_column(search_condition: Optional[str]) -> str:
-    cond = normalize_sql_expression(search_condition)
-    if not cond:
-        return ""
-    cond_u = cond.upper().strip()
-    while cond_u.startswith("(") and cond_u.endswith(")"):
-        stripped = strip_wrapping_parentheses(cond_u)
-        if stripped == cond_u:
-            break
-        cond_u = stripped.strip()
-    cond_u = re.sub(r'"([A-Z0-9_#$]+)"', r'\1', cond_u)
-    m = re.match(r'^([A-Z0-9_#$]+)\s+IS\s+NOT\s+NULL$', cond_u)
-    if not m:
-        return ""
-    return normalize_identifier_name(m.group(1))
+    return _extract_single_column_is_notnull_identifier(search_condition)
 
 
 def _build_name_component_token(
