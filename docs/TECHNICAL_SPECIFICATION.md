@@ -118,6 +118,7 @@
 - scoped mode 下 `trigger_list` 同时接受源端触发器名与 remap 后目标名；若条目能通过显式 remap 反查到源端 TRIGGER，则继续纳入 scoped closure。无法解析的条目只会进入 `source_scope_detail_<ts>.txt` / `trigger_status_report.txt`，不再 fail-fast 中止整轮运行
 - scoped mode 会输出 `source_scope_detail_<ts>.txt`，记录 remap roots、显式 trigger keep、闭包纳入对象和被过滤对象，供客户核对“不多对象、不少对象”边界
 - 当 `blacklist_target_existing_policy=rehydrate_if_present` 时，若源端阻断型黑名单 TABLE 在目标端已真实存在，则会进入“重纳管”模式：表本体恢复 compare/fixup，但黑名单改造列不会再自动回写 Oracle 原始语义；依赖这些列的 INDEX/CONSTRAINT 转为 manual/report-only，TRIGGER 在 v1 中继续保持人工处理
+- 当 `gtt_table_handling_mode` 为 `rewrite_to_normal` 或 `preserve_original` 时，Oracle GTT 不再按 `TEMPORARY_TABLE` 黑名单阻断 TABLE 本体；其表本体进入正常 compare/fixup，依赖对象也恢复正常流程，但 OMS 缺失数据迁移规则会跳过这些表。
 - PUBLIC 同义词按 Oracle 语义处理（OB `__public` 归一化为 `PUBLIC`）
 - 若 SYNONYM 的终点对象不在本次迁移范围（含同义词链最终落到范围外对象），该 SYNONYM 会被分类为 `BLOCKED`，写入 unsupported/detail 报告，且不生成 normal synonym fixup DDL
 - 同义词的“源端终点对象是否受管”与“目标端 schema 是否受管”分开处理；不会再把 `source_schemas` 误当 target allowlist 使用

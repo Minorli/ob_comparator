@@ -821,6 +821,26 @@ class BlacklistRehydrationState(NamedTuple):
     detail_rows: List[BlacklistRehydratedDetailRow]
 
 
+class GttTransformDetailRow(NamedTuple):
+    src_full: str
+    tgt_full: str
+    handling_mode: str
+    target_exists: str
+    target_object_type: str
+    oms_export: str
+    fixup_behavior: str
+    detail: str
+
+
+class GttHandlingState(NamedTuple):
+    effective_blacklist_tables: BlacklistTableMap
+    managed_table_keys: Set[Tuple[str, str]]
+    rewrite_to_normal_table_keys: Set[Tuple[str, str]]
+    preserve_original_table_keys: Set[Tuple[str, str]]
+    oms_excluded_table_keys: Set[Tuple[str, str]]
+    detail_rows: List[GttTransformDetailRow]
+
+
 class ObjectSupportReportRow(NamedTuple):
     obj_type: str
     src_full: str
@@ -1508,6 +1528,18 @@ MVIEW_CHECK_FIXUP_MODE_ALIASES: Dict[str, str] = {
     "no": "off",
     "disable": "off",
     "disabled": "off",
+}
+GTT_TABLE_HANDLING_MODE_VALUES: Set[str] = {"rewrite_to_normal", "preserve_original", "blocked"}
+GTT_TABLE_HANDLING_MODE_ALIASES: Dict[str, str] = {
+    "rewrite": "rewrite_to_normal",
+    "rewrite_normal": "rewrite_to_normal",
+    "rewrite_to_heap": "rewrite_to_normal",
+    "normal": "rewrite_to_normal",
+    "preserve": "preserve_original",
+    "original": "preserve_original",
+    "keep_original": "preserve_original",
+    "off": "blocked",
+    "legacy": "blocked",
 }
 
 PACKAGE_OBJECT_TYPES: Tuple[str, ...] = (
@@ -2582,8 +2614,8 @@ def is_notnull_check_condition(search_condition: Optional[str]) -> bool:
         if stripped == cond_u:
             break
         cond_u = stripped.strip()
-    cond_u = re.sub(r'"([A-Z0-9_#$]+)"', r"\1", cond_u)
-    return bool(re.match(r"^[A-Z0-9_#$]+\s+IS\s+NOT\s+NULL$", cond_u))
+    cond_u = re.sub(r'"([A-Z0-9_#$]+)"', r'\1', cond_u)
+    return bool(re.match(r'^[A-Z0-9_#$]+\s+IS\s+NOT\s+NULL$', cond_u))
 
 
 def is_ob_notnull_constraint(
@@ -3904,6 +3936,20 @@ def normalize_mview_check_fixup_mode(raw_value: Optional[str]) -> str:
     return value
 
 
+def normalize_gtt_table_handling_mode(raw_value: Optional[str]) -> str:
+    value = (raw_value or "").strip().lower()
+    if not value:
+        return "rewrite_to_normal"
+    value = GTT_TABLE_HANDLING_MODE_ALIASES.get(value, value)
+    if value not in GTT_TABLE_HANDLING_MODE_VALUES:
+        log.warning(
+            "gtt_table_handling_mode=%s 不在支持范围内，将回退为 rewrite_to_normal。",
+            raw_value
+        )
+        return "rewrite_to_normal"
+    return value
+
+
 def parse_type_list(
     raw_value: str,
     allowed: Set[str],
@@ -4333,7 +4379,8 @@ def collect_fixup_config_diagnostics(
 
     primary_types = set(PRIMARY_OBJECT_TYPES)
     extra_types = set(EXTRA_OBJECT_CHECK_TYPES)
-    print_only_types = set(settings.get("effective_print_only_primary_types") or PRINT_ONLY_PRIMARY_TYPES)
+    effective_print_only_cfg = settings.get("effective_print_only_primary_types")
+    print_only_types = set(PRINT_ONLY_PRIMARY_TYPES if effective_print_only_cfg is None else effective_print_only_cfg)
 
     for obj_type in sorted(fixup_types):
         if obj_type in print_only_types:
@@ -6062,6 +6109,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('table_data_presence_zero_probe_workers', '1')
         settings.setdefault('generate_interval_partition_fixup', 'auto')
         settings.setdefault('mview_check_fixup_mode', 'auto')
+        settings.setdefault('gtt_table_handling_mode', 'rewrite_to_normal')
         settings.setdefault('interval_partition_cutoff', '20280301')
         settings.setdefault('interval_partition_cutoff_numeric', '')
         settings.setdefault('blacklist_mode', 'auto')
@@ -6259,6 +6307,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         )
         settings['mview_check_fixup_mode'] = normalize_mview_check_fixup_mode(
             settings.get('mview_check_fixup_mode', 'auto')
+        )
+        settings['gtt_table_handling_mode'] = normalize_gtt_table_handling_mode(
+            settings.get('gtt_table_handling_mode', 'rewrite_to_normal')
         )
         # 运行态会基于 OB 版本重新计算该布尔值；这里保留预估值供前置逻辑使用。
         settings['generate_interval_partition_fixup'] = (
@@ -6923,6 +6974,14 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "仅支持 auto/on/off"
 
+    def _validate_gtt_table_handling_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = GTT_TABLE_HANDLING_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in GTT_TABLE_HANDLING_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 rewrite_to_normal/preserve_original/blocked"
+
     def _validate_table_data_presence_mode(val: str) -> Tuple[bool, str]:
         if not val.strip():
             return True, ""
@@ -7174,6 +7233,14 @@ def run_config_wizard(config_path: Path) -> None:
         default=cfg.get("SETTINGS", "mview_check_fixup_mode", fallback="auto"),
         validator=_validate_mview_mode,
         transform=normalize_mview_check_fixup_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "gtt_table_handling_mode",
+        "GTT 处理模式 (rewrite_to_normal/preserve_original/blocked)",
+        default=cfg.get("SETTINGS", "gtt_table_handling_mode", fallback="rewrite_to_normal"),
+        validator=_validate_gtt_table_handling_mode,
+        transform=normalize_gtt_table_handling_mode,
     )
     _prompt_field(
         "SETTINGS",
@@ -9501,6 +9568,7 @@ def classify_missing_objects(
     view_dependency_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
     ob_version: Optional[str] = None,
     manual_trigger_table_keys: Optional[Set[Tuple[str, str]]] = None,
+    gtt_handling_state: Optional[GttHandlingState] = None,
 ) -> SupportClassificationResult:
     """
     对缺失对象进行支持性分类，并输出支持/不支持/被阻断的统计与明细。
@@ -9665,6 +9733,14 @@ def classify_missing_objects(
     source_temporary_table_keys: Set[Tuple[str, str]] = {
         (str(owner).upper(), str(table).upper())
         for owner, table in (getattr(oracle_meta, "temporary_tables", set()) or set())
+    }
+    gtt_rewrite_to_normal_keys: Set[Tuple[str, str]] = {
+        (str(owner).upper(), str(table).upper())
+        for owner, table in ((gtt_handling_state.rewrite_to_normal_table_keys if gtt_handling_state else set()) or set())
+    }
+    gtt_preserve_original_keys: Set[Tuple[str, str]] = {
+        (str(owner).upper(), str(table).upper())
+        for owner, table in ((gtt_handling_state.preserve_original_table_keys if gtt_handling_state else set()) or set())
     }
     manual_trigger_blacklist_keys: Set[Tuple[str, str]] = {
         (str(owner).upper(), str(table).upper())
@@ -10010,7 +10086,10 @@ def classify_missing_objects(
                     root_cause=f"{src_schema.upper()}.{src_table.upper()}(BLACKLIST_REHYDRATED_TARGET_EXISTS)"
                 )
             if (
-                src_key in source_temporary_table_keys
+                (
+                    src_key in source_temporary_table_keys
+                    and src_key not in gtt_rewrite_to_normal_keys
+                )
                 or table_full_u in target_temporary_table_fulls
                 or table_black_type in TEMP_TABLE_BLACKLIST_TYPES
                 or is_temp_table_blacklist_reason_code(table_reason_code)
@@ -32166,6 +32245,43 @@ def clean_oracle_specific_syntax(ddl: str) -> str:
     return clean_xmltype_xmlschema_clause(ddl)
 
 
+GTT_CREATE_PREFIX_PATTERN = re.compile(
+    r'(\bCREATE\s+)(GLOBAL\s+TEMPORARY\s+TABLE\b)',
+    re.IGNORECASE
+)
+GTT_ON_COMMIT_PATTERN = re.compile(
+    r'\s+ON\s+COMMIT\s+(?:DELETE|PRESERVE)\s+ROWS\b',
+    re.IGNORECASE
+)
+
+
+def rewrite_global_temporary_table_to_normal(ddl: str) -> str:
+    if not ddl:
+        return ddl
+    rewritten = GTT_CREATE_PREFIX_PATTERN.sub(r"\1TABLE", ddl)
+    rewritten = GTT_ON_COMMIT_PATTERN.sub("", rewritten)
+    return rewritten
+
+
+def apply_gtt_table_ddl_handling(
+    ddl: str,
+    handling_mode: str,
+) -> Tuple[str, List[str]]:
+    mode_u = normalize_gtt_table_handling_mode(handling_mode)
+    comments: List[str] = [
+        "source_table_kind: GLOBAL TEMPORARY TABLE",
+        f"gtt_table_handling_mode: {mode_u}",
+        "oms_export: excluded",
+    ]
+    if mode_u == "rewrite_to_normal":
+        comments.append("gtt_rewrite: Oracle GTT clauses removed; target DDL is ordinary TABLE")
+        return rewrite_global_temporary_table_to_normal(ddl), comments
+    if mode_u == "preserve_original":
+        comments.append("gtt_rewrite: preserve original Oracle GTT semantics")
+        return ddl, comments
+    return ddl, comments
+
+
 def clean_interval_partition_clause(ddl: str) -> str:
     """移除 TABLE DDL 中的 INTERVAL 分区子句（OceanBase 不支持）。"""
     if not ddl:
@@ -34667,8 +34783,8 @@ def _extract_notnull_column(search_condition: Optional[str]) -> str:
         if stripped == cond_u:
             break
         cond_u = stripped.strip()
-    cond_u = re.sub(r'"([A-Z0-9_#$]+)"', r"\1", cond_u)
-    m = re.match(r"^([A-Z0-9_#$]+)\s+IS\s+NOT\s+NULL$", cond_u)
+    cond_u = re.sub(r'"([A-Z0-9_#$]+)"', r'\1', cond_u)
+    m = re.match(r'^([A-Z0-9_#$]+)\s+IS\s+NOT\s+NULL$', cond_u)
     if not m:
         return ""
     return normalize_identifier_name(m.group(1))
@@ -37821,6 +37937,14 @@ def generate_fixup_scripts(
                     extra_identifiers=get_relevant_replacements(ss),
                     obj_type='TABLE'
                 )
+                table_extra_comments: List[str] = []
+                src_table_key = (ss.upper(), st.upper())
+                gtt_mode = normalize_gtt_table_handling_mode(settings.get("gtt_table_handling_mode", "rewrite_to_normal"))
+                if src_table_key in {
+                    (str(owner).upper(), str(table).upper())
+                    for owner, table in (getattr(oracle_meta, "temporary_tables", set()) or set())
+                } and gtt_mode in {"rewrite_to_normal", "preserve_original"}:
+                    ddl_adj, table_extra_comments = apply_gtt_table_ddl_handling(ddl_adj, gtt_mode)
                 ddl_adj = inflate_table_varchar_lengths(ddl_adj, ss, st, oracle_meta)
                 ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
                 ddl_adj = prepend_set_schema(ddl_adj, ts)
@@ -37868,7 +37992,7 @@ def generate_fixup_scripts(
                     ddl_adj,
                     header,
                     grants_to_add=grants_for_table if grants_for_table else None,
-                    extra_comments=cleanup_comments,
+                    extra_comments=(list(table_extra_comments) + list(cleanup_comments or [])) or None,
                 )
                 progress_label = ddl_source_label.lower()
             finally:
@@ -40108,6 +40232,7 @@ def export_missing_table_view_mappings(
     blacklisted_tables: Optional[Set[Tuple[str, str]]] = None,
     support_state_map: Optional[Dict[Tuple[str, str], ObjectSupportReportRow]] = None,
     explicit_root_fulls: Optional[Set[str]] = None,
+    oms_excluded_tables: Optional[Set[Tuple[str, str]]] = None,
 ) -> Optional[Path]:
     """
     将缺失的 TABLE/VIEW 映射按目标 schema 输出为文本，便于迁移工具直接消费。
@@ -40139,9 +40264,11 @@ def export_missing_table_view_mappings(
             support_row = support_state_map.get((obj_type_u, src_full))
             if support_row and support_row.support_state != SUPPORT_STATE_SUPPORTED:
                 continue
-        if obj_type_u == "TABLE" and blacklisted_tables:
+        if obj_type_u == "TABLE":
             src_key = parse_full_object_name(src_name)
-            if src_key and src_key in blacklisted_tables:
+            if blacklisted_tables and src_key and src_key in blacklisted_tables:
+                continue
+            if oms_excluded_tables and src_key and src_key in oms_excluded_tables:
                 continue
         if "." not in tgt_name or "." not in src_name:
             continue
@@ -40233,6 +40360,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "AUX", "黑名单表清单"
     if name.startswith("blacklist_rehydrated_detail_"):
         return "DETAIL", "黑名单表重纳管明细"
+    if name.startswith("gtt_transform_detail_"):
+        return "DETAIL", "GTT 处理明细"
     if name == "trigger_status_report.txt":
         return "AUX", "触发器状态/清单报告"
     if name == "filtered_grants.txt":
@@ -42306,6 +42435,100 @@ def evaluate_long_conversion_status(
     return "VERIFIED", "已校验: LONG/LONG RAW 已转换为 CLOB/BLOB", True
 
 
+def build_gtt_handling_state(
+    blacklist_tables: BlacklistTableMap,
+    table_target_map: Dict[Tuple[str, str], Tuple[str, str]],
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata,
+    mode: str,
+) -> GttHandlingState:
+    effective: BlacklistTableMap = {
+        key: dict(entries or {})
+        for key, entries in (blacklist_tables or {}).items()
+    }
+    managed_table_keys: Set[Tuple[str, str]] = set()
+    rewrite_to_normal_table_keys: Set[Tuple[str, str]] = set()
+    preserve_original_table_keys: Set[Tuple[str, str]] = set()
+    oms_excluded_table_keys: Set[Tuple[str, str]] = set()
+    detail_rows: List[GttTransformDetailRow] = []
+
+    normalized_mode = normalize_gtt_table_handling_mode(mode)
+    if normalized_mode == "blocked":
+        return GttHandlingState(
+            effective_blacklist_tables=effective,
+            managed_table_keys=managed_table_keys,
+            rewrite_to_normal_table_keys=rewrite_to_normal_table_keys,
+            preserve_original_table_keys=preserve_original_table_keys,
+            oms_excluded_table_keys=oms_excluded_table_keys,
+            detail_rows=detail_rows,
+        )
+
+    ob_objects_by_type = ob_meta.objects_by_type or {}
+
+    def _target_object_type(full_name: str) -> str:
+        full_u = (full_name or "").upper()
+        if not full_u:
+            return "-"
+        for obj_type, names in ob_objects_by_type.items():
+            if full_u in {str(name).upper() for name in (names or set())}:
+                return obj_type.upper()
+        return "-"
+
+    for schema, table in sorted(getattr(oracle_meta, "temporary_tables", set()) or set()):
+        schema_u = (schema or "").upper()
+        table_u = (table or "").upper()
+        if not schema_u or not table_u:
+            continue
+        src_key = (schema_u, table_u)
+        src_full = f"{schema_u}.{table_u}"
+        tgt_schema_u, tgt_table_u = table_target_map.get(src_key, src_key)
+        tgt_full = f"{tgt_schema_u.upper()}.{tgt_table_u.upper()}"
+        target_object_type = _target_object_type(tgt_full)
+        target_exists = "Y" if target_object_type == "TABLE" else "N"
+
+        managed_table_keys.add(src_key)
+        oms_excluded_table_keys.add(src_key)
+        if normalized_mode == "rewrite_to_normal":
+            rewrite_to_normal_table_keys.add(src_key)
+            fixup_behavior = "REWRITE_TO_NORMAL_TABLE"
+        else:
+            preserve_original_table_keys.add(src_key)
+            fixup_behavior = "PRESERVE_ORIGINAL_GTT_DDL"
+
+        entries = dict(effective.get(src_key, {}) or {})
+        filtered_entries = {
+            key: entry
+            for key, entry in entries.items()
+            if normalize_black_type((entry or BlacklistEntry("", "")).black_type) not in TEMP_TABLE_BLACKLIST_TYPES
+        }
+        if filtered_entries:
+            effective[src_key] = filtered_entries
+        else:
+            effective.pop(src_key, None)
+
+        detail_rows.append(
+            GttTransformDetailRow(
+                src_full=src_full,
+                tgt_full=tgt_full,
+                handling_mode=normalized_mode.upper(),
+                target_exists=target_exists,
+                target_object_type=target_object_type,
+                oms_export="EXCLUDED",
+                fixup_behavior=fixup_behavior,
+                detail="SOURCE_TEMPORARY_TABLE",
+            )
+        )
+
+    return GttHandlingState(
+        effective_blacklist_tables=effective,
+        managed_table_keys=managed_table_keys,
+        rewrite_to_normal_table_keys=rewrite_to_normal_table_keys,
+        preserve_original_table_keys=preserve_original_table_keys,
+        oms_excluded_table_keys=oms_excluded_table_keys,
+        detail_rows=detail_rows,
+    )
+
+
 def build_blacklist_rehydration_state(
     blacklist_tables: BlacklistTableMap,
     table_target_map: Dict[Tuple[str, str], Tuple[str, str]],
@@ -42428,12 +42651,19 @@ def build_blacklist_report_rows(
     oracle_meta: OracleMetadata,
     ob_meta: ObMetadata,
     rehydration_state: Optional[BlacklistRehydrationState] = None,
+    gtt_handling_state: Optional[GttHandlingState] = None,
 ) -> List[BlacklistReportRow]:
     """
     生成黑名单表报告行，LONG/LONG RAW 额外校验目标端转换情况。
     """
     rows: List[BlacklistReportRow] = []
     rehydrated_keys = set((rehydration_state.rehydrated_table_keys or set()) if rehydration_state else set())
+    gtt_managed_keys = set((gtt_handling_state.managed_table_keys or set()) if gtt_handling_state else set())
+    gtt_row_map = {
+        (parse_full_object_name(row.src_full) or ("", "")): row
+        for row in ((gtt_handling_state.detail_rows or []) if gtt_handling_state else [])
+        if row.src_full
+    }
     rehydrated_row_map = {
         (parse_full_object_name(row.src_full) or ("", "")): row
         for row in ((rehydration_state.detail_rows or []) if rehydration_state else [])
@@ -42465,6 +42695,18 @@ def build_blacklist_report_rows(
                     (f"STATE={re_row.rehydration_state}" if re_row else ""),
                     (f"TRANSFORMED_COLUMNS={re_row.transformed_columns}" if re_row and re_row.transformed_columns != "-" else ""),
                     (re_row.detail if re_row else ""),
+                )
+            elif (schema_u, table_u) in gtt_managed_keys:
+                gtt_row = gtt_row_map.get((schema_u, table_u))
+                status = f"GTT_{(gtt_row.handling_mode if gtt_row else 'MANAGED')}"
+                reason = "源表为全局临时表，已按配置纳入正常流程"
+                detail = merge_detail_parts(
+                    source_detail,
+                    mapping_hint,
+                    (f"HANDLING_MODE={gtt_row.handling_mode}" if gtt_row else ""),
+                    (f"OMS_EXPORT={gtt_row.oms_export}" if gtt_row else ""),
+                    (f"FIXUP={gtt_row.fixup_behavior}" if gtt_row else ""),
+                    (gtt_row.detail if gtt_row else ""),
                 )
 
             if black_type_u == "LONG" or is_long_type(data_type_u):
@@ -42527,6 +42769,41 @@ def export_blacklist_rehydrated_detail(
         for row in rows_sorted
     ]
     return write_pipe_report("黑名单表重纳管明细", header_fields, data_rows, output_path)
+
+
+def export_gtt_transform_detail(
+    rows: List[GttTransformDetailRow],
+    report_dir: Path,
+    report_timestamp: Optional[str],
+) -> Optional[Path]:
+    if not report_dir or not report_timestamp or not rows:
+        return None
+    output_path = Path(report_dir) / f"gtt_transform_detail_{report_timestamp}.txt"
+    header_fields = [
+        "SRC_FULL",
+        "TGT_FULL",
+        "HANDLING_MODE",
+        "TARGET_EXISTS",
+        "TARGET_OBJECT_TYPE",
+        "OMS_EXPORT",
+        "FIXUP_BEHAVIOR",
+        "DETAIL",
+    ]
+    rows_sorted = sorted(rows, key=lambda r: (r.src_full, r.tgt_full))
+    data_rows = [
+        [
+            row.src_full,
+            row.tgt_full,
+            row.handling_mode,
+            row.target_exists,
+            row.target_object_type,
+            row.oms_export,
+            row.fixup_behavior,
+            row.detail,
+        ]
+        for row in rows_sorted
+    ]
+    return write_pipe_report("GTT 处理明细", header_fields, data_rows, output_path)
 
 
 def export_blacklist_tables(
@@ -46613,6 +46890,7 @@ def _build_report_oms_missing_rows(
     blacklisted_tables: Optional[Set[Tuple[str, str]]],
     max_rows: int,
     explicit_root_fulls: Optional[Set[str]] = None,
+    oms_excluded_tables: Optional[Set[Tuple[str, str]]] = None,
 ) -> Tuple[List[Dict[str, object]], bool, int]:
     if not tv_results:
         return [], False, 0
@@ -46634,9 +46912,11 @@ def _build_report_oms_missing_rows(
             support_row = support_state_map.get((obj_type_u, src_full))
             if support_row and support_row.support_state != SUPPORT_STATE_SUPPORTED:
                 continue
-        if obj_type_u == "TABLE" and blacklisted_tables:
+        if obj_type_u == "TABLE":
             src_key = parse_full_object_name(src_name)
-            if src_key and src_key in blacklisted_tables:
+            if blacklisted_tables and src_key and src_key in blacklisted_tables:
+                continue
+            if oms_excluded_tables and src_key and src_key in oms_excluded_tables:
                 continue
         if "." not in tgt_name or "." not in src_name:
             continue
@@ -48663,12 +48943,14 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES['summary']} (
                 _record_write_failure("写入 DIFF_REPORT_FIXUP_SKIP 失败")
 
         explicit_oms_root_fulls = collect_explicit_root_fulls((settings or {}).get("_source_scope_result"))
+        gtt_state_db = (settings or {}).get("_gtt_handling_state")
         oms_rows, _oms_trunc, _oms_trunc_cnt = _build_report_oms_missing_rows(
             tv_results,
             (support_summary.support_state_map if support_summary else None),
             blacklisted_table_keys,
             max_rows,
             explicit_root_fulls=explicit_oms_root_fulls,
+            oms_excluded_tables=(gtt_state_db.oms_excluded_table_keys if gtt_state_db else None),
         )
         if oms_rows:
             expected_rows_by_table["oms_missing"] = len(oms_rows)
@@ -50967,6 +51249,10 @@ def print_final_report(
     notice_state_path: Optional[Path] = None
     notice_state: Optional[Dict[str, object]] = None
     notices_to_mark_seen: List[RuntimeNotice] = []
+    gtt_transform_detail_path: Optional[Path] = (
+        Path(settings["_gtt_transform_detail_path"])
+        if settings and settings.get("_gtt_transform_detail_path") else None
+    )
     if run_summary_ctx:
         run_summary_ctx.phase_durations["报告输出"] = time.perf_counter() - run_summary_ctx.report_start_perf
         filtered_grants_count = len(filtered_grants or [])
@@ -51056,12 +51342,14 @@ def print_final_report(
                 continue
             blacklisted_table_keys.add(key)
         explicit_oms_root_fulls = collect_explicit_root_fulls((settings or {}).get("_source_scope_result"))
+        gtt_state = (settings or {}).get("_gtt_handling_state")
         export_dir = export_missing_table_view_mappings(
             tv_results,
             report_path.parent,
             blacklisted_tables=blacklisted_table_keys,
             support_state_map=(support_summary.support_state_map if support_summary else None),
             explicit_root_fulls=explicit_oms_root_fulls,
+            oms_excluded_tables=(gtt_state.oms_excluded_table_keys if gtt_state else None),
         )
         _add_index_entry("DIR", export_dir, None, "缺失 TABLE/VIEW 规则目录")
         package_report_path = None
@@ -51078,6 +51366,12 @@ def print_final_report(
             blacklist_rehydrated_detail_path,
             len((blacklist_rehydration_state.detail_rows or []) if blacklist_rehydration_state else []),
             "黑名单表重纳管明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            gtt_transform_detail_path,
+            len((gtt_state.detail_rows or []) if gtt_state else []),
+            "GTT 处理明细"
         )
         trigger_report_path = None
         if trigger_list_summary or trigger_status_rows:
@@ -52068,7 +52362,8 @@ def main():
         ob_version = extract_ob_version_number(ob_env_info.get("version", ""))
         gate_info = apply_ob_feature_gates(settings, ob_version)
 
-        print_only_primary_types = set(settings.get("effective_print_only_primary_types") or PRINT_ONLY_PRIMARY_TYPES)
+        effective_print_only_cfg = settings.get("effective_print_only_primary_types")
+        print_only_primary_types = set(PRINT_ONLY_PRIMARY_TYPES if effective_print_only_cfg is None else effective_print_only_cfg)
         print_only_types = enabled_primary_types & print_only_primary_types
         checked_primary_types = enabled_primary_types - print_only_types
         enabled_object_types = enabled_primary_types | enabled_extra_types
@@ -52157,6 +52452,7 @@ def main():
     source_scope_result: Optional[ScopedSourceScopeResult] = None
     source_scope_detail_path: Optional[Path] = None
     blacklist_rehydration_state: Optional[BlacklistRehydrationState] = None
+    gtt_handling_state: Optional[GttHandlingState] = None
     manual_trigger_blacklist_table_keys: Set[Tuple[str, str]] = set()
 
     log_section("对象映射准备")
@@ -52620,6 +52916,7 @@ def main():
             config_diagnostics = []
         config_diagnostics.extend(source_scope_diagnostics)
     blacklist_rehydrated_detail_path: Optional[Path] = None
+    gtt_transform_detail_path: Optional[Path] = None
 
     # 输出全量 remap 推导结果，便于人工审核
     mapping_path = report_dir / f"object_mapping_{timestamp}.txt"
@@ -53196,12 +53493,27 @@ def main():
         effective_blacklist_tables = blacklist_rehydration_state.effective_blacklist_tables
         transformed_blacklist_columns_by_table = blacklist_rehydration_state.transformed_columns_by_table
         manual_trigger_blacklist_table_keys = blacklist_rehydration_state.manual_trigger_table_keys
-        if blacklist_rehydration_state.rehydrated_table_keys:
+        gtt_handling_state = build_gtt_handling_state(
+            effective_blacklist_tables,
+            table_target_map,
+            oracle_meta,
+            ob_meta,
+            settings.get("gtt_table_handling_mode", "rewrite_to_normal"),
+        )
+        effective_blacklist_tables = gtt_handling_state.effective_blacklist_tables
+        if blacklist_rehydration_state.rehydrated_table_keys or gtt_handling_state.managed_table_keys:
             oracle_meta = oracle_meta._replace(blacklist_tables=effective_blacklist_tables)
+        if blacklist_rehydration_state.rehydrated_table_keys:
             log.info(
                 "[BLACKLIST] 目标端已存在的黑名单表已重纳管: %d 张，transformed_columns_tables=%d。",
                 len(blacklist_rehydration_state.rehydrated_table_keys),
                 len(transformed_blacklist_columns_by_table),
+            )
+        if gtt_handling_state.managed_table_keys:
+            log.info(
+                "[GTT] 已按模式 %s 纳管 GTT 表: %d 张。",
+                settings.get("gtt_table_handling_mode", "rewrite_to_normal"),
+                len(gtt_handling_state.managed_table_keys),
             )
         blacklist_report_rows = build_blacklist_report_rows(
             original_blacklist_tables,
@@ -53209,6 +53521,7 @@ def main():
             oracle_meta,
             ob_meta,
             rehydration_state=blacklist_rehydration_state,
+            gtt_handling_state=gtt_handling_state,
         )
         blacklist_rehydrated_detail_path = export_blacklist_rehydrated_detail(
             list(blacklist_rehydration_state.detail_rows or []),
@@ -53217,6 +53530,15 @@ def main():
         )
         if blacklist_rehydrated_detail_path:
             log.info("黑名单表重纳管明细已输出: %s", blacklist_rehydrated_detail_path)
+        gtt_transform_detail_path = export_gtt_transform_detail(
+            list(gtt_handling_state.detail_rows or []) if gtt_handling_state else [],
+            report_dir,
+            timestamp,
+        )
+        if gtt_transform_detail_path:
+            log.info("GTT 处理明细已输出: %s", gtt_transform_detail_path)
+        settings["_gtt_handling_state"] = gtt_handling_state
+        settings["_gtt_transform_detail_path"] = str(gtt_transform_detail_path) if gtt_transform_detail_path else ""
 
     log_section("差异校验")
     monitored_types: Tuple[str, ...] = tuple(
@@ -53336,6 +53658,7 @@ def main():
             blacklist_rehydration_state.manual_trigger_table_keys
             if blacklist_rehydration_state else None
         ),
+        gtt_handling_state=gtt_handling_state,
     )
 
     usability_summary: Optional[UsabilitySummary] = None

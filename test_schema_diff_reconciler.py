@@ -1718,6 +1718,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertEqual(results["mismatched"], [])
 
+
+
     def test_check_primary_objects_inline_novalidate_notnull_with_equivalent_obnotnull_is_clean(self):
         master_list = [("A.T1", "A.T1", "TABLE")]
         oracle_meta = self._make_oracle_meta_with_columns({
@@ -15796,6 +15798,8 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIsNone(mismatch)
 
+
+
     def test_compare_constraints_for_table_duplicate_notnull_prefers_ob_auto_when_source_is_system_named(self):
         oracle_constraints = {
             ("A", "T1"): {
@@ -16060,6 +16064,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             text = (Path(tmpdir) / "cleanup_safe" / "constraint" / "B.NN_T1_C1.drop.sql").read_text(encoding="utf-8")
             self.assertIn('ALTER SESSION SET CURRENT_SCHEMA = B;', text)
             self.assertIn('ALTER TABLE "B"."T1" DROP CONSTRAINT NN_T1_C1;', text)
+
 
     def test_classify_unsupported_check_constraints_filters_extra(self):
         oracle_meta = self._make_oracle_meta(
@@ -17832,6 +17837,9 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         norm_oracle = sdr.normalize_check_constraint_expression(expr_oracle, "C1")
         norm_ob = sdr.normalize_check_constraint_expression(expr_ob, "C2")
         self.assertEqual(norm_oracle, norm_ob)
+
+
+
 
     def test_normalize_check_constraint_expression_between_equivalence(self):
         expr_oracle = "QTY BETWEEN 0 AND 999"
@@ -21209,6 +21217,17 @@ class TestReportDbHelpers(unittest.TestCase):
         self.assertIn("ALTER TABLE DIFF_REPORT_SUMMARY ADD (WRITE_ACTUAL_ROWS NUMBER DEFAULT 0)".upper(), ddl_text)
         self.assertIn("ALTER TABLE DIFF_REPORT_SUMMARY ADD (WRITE_CHECKED_AT TIMESTAMP)".upper(), ddl_text)
 
+    def test_collect_fixup_config_diagnostics_respects_empty_effective_print_only_set(self):
+        diagnostics = sdr.collect_fixup_config_diagnostics(
+            {
+                "fixup_type_set": {"MATERIALIZED VIEW"},
+                "effective_print_only_primary_types": set(),
+            },
+            {"MATERIALIZED VIEW"},
+            set(),
+        )
+        self.assertFalse(any("仅打印对象" in item for item in diagnostics))
+
     def test_apply_ob_feature_gates_auto_ob_442_plus(self):
         settings = {
             "generate_interval_partition_fixup": "auto",
@@ -21747,6 +21766,251 @@ class TestReportDbHelpers(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("写库行数复核失败", err)
         self.assertIn(sdr.REPORT_DB_WRITE_STATUS_FAILED, status_calls)
+
+
+
+class TestGttManagedFlow(unittest.TestCase):
+    def _make_oracle_meta(self, *, temporary_tables=None, blacklist_tables=None):
+        return sdr.OracleMetadata(
+            table_columns={},
+            invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
+            indexes={},
+            constraints={},
+            triggers={},
+            sequences={},
+            sequence_attrs={},
+            table_comments={},
+            column_comments={},
+            comments_complete=True,
+            blacklist_tables=blacklist_tables or {},
+            object_privileges=[],
+            column_privileges=[],
+            sys_privileges=[],
+            role_privileges=[],
+            role_metadata={},
+            system_privilege_map=set(),
+            table_privilege_map=set(),
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False,
+            partition_key_columns={},
+            interval_partitions={},
+            loaded_schemas=frozenset(),
+            temporary_tables=temporary_tables or set(),
+            identity_modes={},
+            default_on_null_columns={},
+            identity_options={},
+        )
+
+    def _make_ob_meta(self):
+        return sdr.ObMetadata(
+            objects_by_type={},
+            tab_columns={},
+            invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
+            indexes={},
+            constraints={},
+            triggers={},
+            sequences={},
+            sequence_attrs={},
+            roles=set(),
+            table_comments={},
+            column_comments={},
+            comments_complete=True,
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False,
+            partition_key_columns={},
+            constraint_deferrable_supported=False,
+            temporary_tables=set(),
+            enabled_notnull_check_groups=sdr.MappingProxyType({}),
+            case_sensitive_findings=(),
+            identity_modes={},
+            default_on_null_columns={},
+            identity_options={},
+        )
+    def test_normalize_gtt_table_handling_mode(self):
+        self.assertEqual(sdr.normalize_gtt_table_handling_mode(None), "rewrite_to_normal")
+        self.assertEqual(sdr.normalize_gtt_table_handling_mode("preserve"), "preserve_original")
+        self.assertEqual(sdr.normalize_gtt_table_handling_mode("blocked"), "blocked")
+
+    def test_build_gtt_handling_state_rewrite_removes_temp_blacklist_and_marks_oms_excluded(self):
+        oracle_meta = self._make_oracle_meta(temporary_tables={("SRC", "T1")})._replace(
+            blacklist_tables={
+                ("SRC", "T1"): {
+                    ("TEMPORARY_TABLE", "TEMPORARY"): sdr.BlacklistEntry("TEMPORARY_TABLE", "TEMPORARY", "RULE=TEMP")
+                }
+            }
+        )
+        ob_meta = self._make_ob_meta()._replace(objects_by_type={"TABLE": {"TGT.T1"}})
+        state = sdr.build_gtt_handling_state(
+            oracle_meta.blacklist_tables,
+            {("SRC", "T1"): ("TGT", "T1")},
+            oracle_meta,
+            ob_meta,
+            "rewrite_to_normal",
+        )
+        self.assertIn(("SRC", "T1"), state.managed_table_keys)
+        self.assertIn(("SRC", "T1"), state.rewrite_to_normal_table_keys)
+        self.assertIn(("SRC", "T1"), state.oms_excluded_table_keys)
+        self.assertNotIn(("SRC", "T1"), state.effective_blacklist_tables)
+
+    def test_build_blacklist_report_rows_marks_managed_gtt(self):
+        rows = sdr.build_blacklist_report_rows(
+            {("SRC", "T1"): {("TEMPORARY_TABLE", "TEMPORARY"): sdr.BlacklistEntry("TEMPORARY_TABLE", "TEMPORARY", "RULE=TEMP")}},
+            {("SRC", "T1"): ("TGT", "T1")},
+            self._make_oracle_meta(temporary_tables={("SRC", "T1")}),
+            self._make_ob_meta()._replace(objects_by_type={"TABLE": {"TGT.T1"}}),
+            gtt_handling_state=sdr.GttHandlingState(
+                effective_blacklist_tables={},
+                managed_table_keys={("SRC", "T1")},
+                rewrite_to_normal_table_keys={("SRC", "T1")},
+                preserve_original_table_keys=set(),
+                oms_excluded_table_keys={("SRC", "T1")},
+                detail_rows=[
+                    sdr.GttTransformDetailRow(
+                        src_full="SRC.T1",
+                        tgt_full="TGT.T1",
+                        handling_mode="REWRITE_TO_NORMAL",
+                        target_exists="Y",
+                        target_object_type="TABLE",
+                        oms_export="EXCLUDED",
+                        fixup_behavior="REWRITE_TO_NORMAL_TABLE",
+                        detail="SOURCE_TEMPORARY_TABLE",
+                    )
+                ],
+            ),
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].status, "GTT_REWRITE_TO_NORMAL")
+
+    def test_build_report_oms_missing_rows_excludes_managed_gtt(self):
+        tv_results = {"missing": [("TABLE", "TGT.S1", "SRC.S1")]}
+        rows, truncated, truncated_count = sdr._build_report_oms_missing_rows(
+            tv_results,
+            support_state_map={},
+            blacklisted_tables=set(),
+            max_rows=0,
+            oms_excluded_tables={("SRC", "S1")},
+        )
+        self.assertFalse(truncated)
+        self.assertEqual(truncated_count, 0)
+        self.assertEqual(rows, [])
+
+    def test_export_missing_table_view_mappings_excludes_managed_gtt(self):
+        tv_results = {"missing": [("TABLE", "TGT.S1", "SRC.S1")]}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = sdr.export_missing_table_view_mappings(
+                tv_results,
+                Path(tmpdir),
+                blacklisted_tables=set(),
+                support_state_map={},
+                oms_excluded_tables={("SRC", "S1")},
+            )
+            self.assertIsNone(output)
+
+    def test_apply_gtt_table_ddl_handling_rewrite_to_normal(self):
+        ddl = 'CREATE GLOBAL TEMPORARY TABLE "SRC"."T1" ("ID" NUMBER) ON COMMIT DELETE ROWS;'
+        rewritten, comments = sdr.apply_gtt_table_ddl_handling(ddl, 'rewrite_to_normal')
+        self.assertIn('CREATE TABLE', rewritten.upper())
+        self.assertNotIn('GLOBAL TEMPORARY', rewritten.upper())
+        self.assertNotIn('ON COMMIT DELETE ROWS', rewritten.upper())
+        self.assertTrue(any('gtt_table_handling_mode' in item for item in comments))
+
+    def test_classify_missing_objects_allows_trigger_on_rewritten_gtt(self):
+        tv_results = {
+            "missing": [],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": []
+        }
+        extra_results = {
+            "index_ok": [],
+            "index_mismatched": [],
+            "constraint_ok": [],
+            "constraint_mismatched": [],
+            "sequence_ok": [],
+            "sequence_mismatched": [],
+            "trigger_ok": [],
+            "trigger_mismatched": [sdr.TriggerMismatch("TGT.T_TEMP", {"TRG_T_TEMP_BI"}, set(), [], None)],
+        }
+        oracle_meta = self._make_oracle_meta(temporary_tables={("SRC", "T_TEMP")})
+        summary = sdr.classify_missing_objects(
+            {"user": "u", "password": "p", "dsn": "d"},
+            {"view_compat_rules": {}, "view_dblink_policy": "block"},
+            tv_results,
+            extra_results,
+            oracle_meta,
+            self._make_ob_meta(),
+            {"SRC.T_TEMP": {"TABLE": "TGT.T_TEMP"}},
+            {"SRC.T_TEMP": {"TABLE"}},
+            dependency_graph=None,
+            object_parent_map=None,
+            table_target_map={("SRC", "T_TEMP"): ("TGT", "T_TEMP")},
+            synonym_meta_map={},
+            gtt_handling_state=sdr.GttHandlingState(
+                effective_blacklist_tables={},
+                managed_table_keys={("SRC", "T_TEMP")},
+                rewrite_to_normal_table_keys={("SRC", "T_TEMP")},
+                preserve_original_table_keys=set(),
+                oms_excluded_table_keys={("SRC", "T_TEMP")},
+                detail_rows=[],
+            ),
+        )
+        trigger_rows = [row for row in summary.unsupported_rows if row.obj_type == "TRIGGER"]
+        self.assertEqual(trigger_rows, [])
+        self.assertEqual(summary.extra_blocked_counts.get("TRIGGER", 0), 0)
+
+    def test_classify_missing_objects_keeps_trigger_on_preserved_gtt_unsupported(self):
+        tv_results = {
+            "missing": [],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": []
+        }
+        extra_results = {
+            "index_ok": [],
+            "index_mismatched": [],
+            "constraint_ok": [],
+            "constraint_mismatched": [],
+            "sequence_ok": [],
+            "sequence_mismatched": [],
+            "trigger_ok": [],
+            "trigger_mismatched": [sdr.TriggerMismatch("TGT.T_TEMP", {"TRG_T_TEMP_BI"}, set(), [], None)],
+        }
+        oracle_meta = self._make_oracle_meta(temporary_tables={("SRC", "T_TEMP")})
+        summary = sdr.classify_missing_objects(
+            {"user": "u", "password": "p", "dsn": "d"},
+            {"view_compat_rules": {}, "view_dblink_policy": "block"},
+            tv_results,
+            extra_results,
+            oracle_meta,
+            self._make_ob_meta(),
+            {"SRC.T_TEMP": {"TABLE": "TGT.T_TEMP"}},
+            {"SRC.T_TEMP": {"TABLE"}},
+            dependency_graph=None,
+            object_parent_map=None,
+            table_target_map={("SRC", "T_TEMP"): ("TGT", "T_TEMP")},
+            synonym_meta_map={},
+            gtt_handling_state=sdr.GttHandlingState(
+                effective_blacklist_tables={},
+                managed_table_keys={("SRC", "T_TEMP")},
+                rewrite_to_normal_table_keys=set(),
+                preserve_original_table_keys={("SRC", "T_TEMP")},
+                oms_excluded_table_keys={("SRC", "T_TEMP")},
+                detail_rows=[],
+            ),
+        )
+        trigger_rows = [row for row in summary.unsupported_rows if row.obj_type == "TRIGGER"]
+        self.assertEqual(len(trigger_rows), 1)
+        self.assertEqual(trigger_rows[0].reason_code, sdr.TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON_CODE)
 
 
 class TestPlsqlQualifiedReferenceRemap(unittest.TestCase):

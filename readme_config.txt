@@ -218,6 +218,10 @@
 - mview_check_fixup_mode：MATERIALIZED VIEW 校验/修补模式。默认：auto。
   可选值：auto（OB>=4.4.2 开启校验+修补；低版本仅打印）、on（强制开启校验+修补）、off（强制仅打印）。
   说明：当 mode=auto 且 OB 版本无法识别时，为兼容旧行为会回退为“仅打印”并在日志提示。
+- gtt_table_handling_mode：Oracle 全局临时表（GTT）处理模式。默认：rewrite_to_normal。
+  可选值：rewrite_to_normal、preserve_original、blocked。
+  说明：`rewrite_to_normal` 会把源端 GTT 当作受管 TABLE，并在 fixup 中生成普通 TABLE DDL；`preserve_original` 仍纳入正常 compare/fixup，但保留 Oracle GTT 语义原样输出；`blocked` 保持旧行为，继续进入 unsupported/temporary 路径。
+  说明：当 GTT 处于 `rewrite_to_normal/preserve_original` 模式时，结构会进入正常 compare/fixup，但不会进入 `missed_tables_views_for_OMS/` 或 report_db `OMS_MISSING`，因为它们属于“结构迁移、不做数据迁移”。
 - generate_extra_cleanup：是否生成“目标端多余对象”的清理候选。默认：true。
   说明：普通候选会以注释形式输出到 `fixup_scripts/cleanup_candidates/extra_cleanup_candidates.txt`，不会被 run_fixup 自动执行；用于人工审核后再处理。
   说明：当目标端存在“重复的单列 `IS NOT NULL` 语义 CHECK”且源端仅保留一份等价语义时，`SAFE_DUPLICATE_NOTNULL_DROP_SQL` 区域会额外输出未注释的 `ALTER TABLE ... DROP CONSTRAINT ...;`，同时生成 `fixup_scripts/cleanup_safe/constraint/*.sql`；该目录默认会被 run_fixup 跳过，需显式 `--only-dirs cleanup_safe/constraint`。
