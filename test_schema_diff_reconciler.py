@@ -1846,6 +1846,134 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertEqual(results["mismatched"], [])
 
+    def test_check_primary_objects_reports_validated_named_notnull_when_target_lacks_semantic(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "C1": {
+                    "data_type": "NUMBER",
+                    "data_length": None,
+                    "char_length": None,
+                    "char_used": None,
+                    "data_precision": 10,
+                    "data_scale": 0,
+                    "nullable": "Y",
+                    "data_default": None,
+                    "hidden": False,
+                    "virtual": False,
+                    "virtual_expr": None,
+                }
+            }
+        })._replace(constraints={
+            ("A", "T1"): {
+                "CK_NN_C1": {
+                    "type": "C",
+                    "status": "ENABLED",
+                    "validated": "VALIDATED",
+                    "search_condition": '"C1" IS NOT NULL',
+                    "columns": ["C1"],
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "NUMBER",
+                        "data_length": None,
+                        "char_length": None,
+                        "char_used": None,
+                        "data_precision": 10,
+                        "data_scale": 0,
+                        "nullable": "Y",
+                        "data_default": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                    }
+                }
+            }
+        )._replace(constraints={("A", "T1"): {}})
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(len(results["mismatched"]), 1)
+        type_mismatches = results["mismatched"][0][5]
+        self.assertEqual(len(type_mismatches), 1)
+        self.assertEqual(type_mismatches[0].issue, "nullability_tighten")
+        self.assertEqual(type_mismatches[0].src_type, "NOT NULL")
+        self.assertEqual(type_mismatches[0].tgt_type, "NULLABLE")
+        self.assertEqual(type_mismatches[0].expected_type, "NOT NULL")
+
+    def test_check_primary_objects_reports_notvalidated_named_notnull_when_target_is_physical_not_null(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("A", "T1"): {
+                "C1": {
+                    "data_type": "NUMBER",
+                    "data_length": None,
+                    "char_length": None,
+                    "char_used": None,
+                    "data_precision": 10,
+                    "data_scale": 0,
+                    "nullable": "Y",
+                    "data_default": None,
+                    "hidden": False,
+                    "virtual": False,
+                    "virtual_expr": None,
+                }
+            }
+        })._replace(constraints={
+            ("A", "T1"): {
+                "CK_NN_C1": {
+                    "type": "C",
+                    "status": "ENABLED",
+                    "validated": "NOT VALIDATED",
+                    "search_condition": '"C1" IS NOT NULL',
+                    "columns": ["C1"],
+                }
+            }
+        })
+        ob_meta = self._make_ob_meta_with_columns(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "NUMBER",
+                        "data_length": None,
+                        "char_length": None,
+                        "char_used": None,
+                        "data_precision": 10,
+                        "data_scale": 0,
+                        "nullable": "N",
+                        "data_default": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                    }
+                }
+            }
+        )._replace(constraints={("A", "T1"): {}})
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+        self.assertEqual(len(results["mismatched"]), 1)
+        type_mismatches = results["mismatched"][0][5]
+        self.assertEqual(len(type_mismatches), 1)
+        self.assertEqual(type_mismatches[0].issue, "nullability_novalidate_relax")
+        self.assertEqual(type_mismatches[0].src_type, "NOT NULL ENABLE NOVALIDATE")
+        self.assertEqual(type_mismatches[0].tgt_type, "NOT NULL")
+        self.assertEqual(type_mismatches[0].expected_type, "NOT NULL ENABLE NOVALIDATE")
+
     def test_check_primary_objects_inline_novalidate_notnull_with_equivalent_obnotnull_is_clean(self):
         master_list = [("A.T1", "A.T1", "TABLE")]
         oracle_meta = self._make_oracle_meta_with_columns({
@@ -3519,6 +3647,47 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn('ALTER TABLE "TGT"."T1" ADD CONSTRAINT "NN_T1_C1" CHECK (C1 IS NOT NULL) ENABLE NOVALIDATE;', sql)
         self.assertIn('-- ALTER TABLE "TGT"."T1" MODIFY (C1 VARCHAR(10) NOT NULL);', sql)
 
+    def test_generate_alter_for_table_columns_novalidate_relax_review_only(self):
+        oracle_meta = self._make_oracle_meta_with_columns({
+            ("SRC", "T1"): {
+                "C1": {
+                    "data_type": "VARCHAR2",
+                    "data_length": 10,
+                    "char_length": 10,
+                    "char_used": "B",
+                    "nullable": "Y",
+                    "data_default": None,
+                    "hidden": False,
+                    "virtual": False,
+                    "identity": False,
+                    "default_on_null": False,
+                }
+            }
+        })
+        type_mismatches = [
+            sdr.ColumnTypeIssue(
+                "C1",
+                "NOT NULL ENABLE NOVALIDATE",
+                "NOT NULL",
+                "NOT NULL ENABLE NOVALIDATE",
+                "nullability_novalidate_relax"
+            )
+        ]
+        sql = sdr.generate_alter_for_table_columns(
+            oracle_meta,
+            "SRC",
+            "T1",
+            "TGT",
+            "T1",
+            missing_cols=set(),
+            extra_cols=set(),
+            length_mismatches=[],
+            type_mismatches=type_mismatches
+        )
+        self.assertIsNotNone(sql)
+        self.assertIn("REVIEW-FIRST: C1 源端为 NOT NULL ENABLE NOVALIDATE，目标端当前更严格 (NOT NULL)。", sql)
+        self.assertIn("请人工确认是否需要回退到 ENABLE NOVALIDATE 语义", sql)
+
     def test_generate_alter_for_table_columns_default_review_only(self):
         oracle_meta = self._make_oracle_meta_with_columns({
             ("SRC", "T1"): {
@@ -3679,6 +3848,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
                         "nullability_novalidate_tighten"
                     ),
                     sdr.ColumnTypeIssue("C2", "NULLABLE", "NOT NULL", "NULLABLE", "nullability_relax"),
+                    sdr.ColumnTypeIssue("C4", "NOT NULL ENABLE NOVALIDATE", "NOT NULL", "NOT NULL ENABLE NOVALIDATE", "nullability_novalidate_relax"),
                 ],
             )
         ]
@@ -3697,6 +3867,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             content
         )
         self.assertIn("A.T1|C2|NULLABLE|NOT NULL|NULLABLE|REVIEW_NULLABLE", content)
+        self.assertIn("A.T1|C4|NOT NULL ENABLE NOVALIDATE|NOT NULL|NOT NULL ENABLE NOVALIDATE|REVIEW_NOT_NULL_NOVALIDATE_STRICTER_TARGET", content)
 
     def test_export_column_default_detail(self):
         mismatched_items = [

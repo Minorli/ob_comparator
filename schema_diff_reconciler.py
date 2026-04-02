@@ -22966,8 +22966,10 @@ def check_primary_objects(
 
                 source_novalidate_meta = src_notnull_novalidate_cols.get(col_name.upper())
                 source_enabled_notnull_meta = src_enabled_notnull_cols.get(col_name.upper())
-                target_has_notnull_check = col_name.upper() in tgt_enabled_notnull_cols
-                target_has_notnull_semantic = target_has_notnull_check or normalize_nullable_flag(tgt_info.get("nullable")) == "N"
+                target_notnull_meta = tgt_enabled_notnull_cols.get(col_name.upper())
+                target_has_notnull_check = target_notnull_meta is not None
+                target_has_physical_notnull = normalize_nullable_flag(tgt_info.get("nullable")) == "N"
+                target_has_notnull_semantic = target_has_notnull_check or target_has_physical_notnull
                 src_nullable = normalize_nullable_flag(src_info.get("nullable"))
                 tgt_nullable = normalize_nullable_flag(tgt_info.get("nullable"))
                 if source_novalidate_meta:
@@ -22982,8 +22984,58 @@ def check_primary_objects(
                             )
                         )
                 elif source_enabled_notnull_meta and src_nullable == "Y":
-                    if target_has_notnull_semantic:
-                        pass
+                    source_enabled_validated = normalize_constraint_validated_status(
+                        source_enabled_notnull_meta.get("validated")
+                    )
+                    target_notnull_validated = normalize_constraint_validated_status(
+                        (target_notnull_meta or {}).get("validated")
+                    ) if target_notnull_meta else ""
+                    if source_enabled_validated == "VALIDATED":
+                        if target_has_physical_notnull or target_notnull_validated == "VALIDATED":
+                            pass
+                        else:
+                            tgt_notnull_desc = (
+                                "NOT NULL ENABLE NOVALIDATE"
+                                if target_notnull_validated == "NOT VALIDATED"
+                                else "NULLABLE"
+                            )
+                            type_mismatches.append(
+                                ColumnTypeIssue(
+                                    col_name,
+                                    "NOT NULL",
+                                    tgt_notnull_desc,
+                                    "NOT NULL",
+                                    "nullability_tighten"
+                                )
+                            )
+                    elif source_enabled_validated == "NOT VALIDATED":
+                        if target_notnull_validated == "NOT VALIDATED" and not target_has_physical_notnull:
+                            pass
+                        elif tgt_nullable == "Y" and not target_has_notnull_check:
+                            type_mismatches.append(
+                                ColumnTypeIssue(
+                                    col_name,
+                                    "NOT NULL ENABLE NOVALIDATE",
+                                    "NULLABLE",
+                                    "NOT NULL ENABLE NOVALIDATE",
+                                    "nullability_novalidate_tighten"
+                                )
+                            )
+                        else:
+                            tgt_notnull_desc = (
+                                "NOT NULL"
+                                if target_has_physical_notnull or target_notnull_validated == "VALIDATED"
+                                else "NOT NULL ENABLE NOVALIDATE"
+                            )
+                            type_mismatches.append(
+                                ColumnTypeIssue(
+                                    col_name,
+                                    "NOT NULL ENABLE NOVALIDATE",
+                                    tgt_notnull_desc,
+                                    "NOT NULL ENABLE NOVALIDATE",
+                                    "nullability_novalidate_relax"
+                                )
+                            )
                 elif src_nullable and tgt_nullable and src_nullable != tgt_nullable:
                     if src_nullable == "N":
                         type_mismatches.append(
@@ -34537,6 +34589,13 @@ def generate_alter_for_table_columns(
                     f"-- ALTER TABLE {table_full} "
                     f"MODIFY ({col_name.upper()} {review_type} NOT NULL);"
                 )
+            elif issue_type == "nullability_novalidate_relax":
+                lines.append(
+                    f"-- REVIEW-FIRST: {col_name.upper()} 源端为 NOT NULL ENABLE NOVALIDATE，目标端当前更严格 ({tgt_type})。"
+                )
+                lines.append(
+                    "-- 请人工确认是否需要回退到 ENABLE NOVALIDATE 语义，或保持目标端更严格约束。"
+                )
             elif issue_type == "nullability_relax":
                 lines.append(
                     f"-- REVIEW-FIRST: {col_name.upper()} 源端允许 NULL，目标端当前为 NOT NULL。"
@@ -41707,6 +41766,8 @@ def export_column_nullability_detail(
                 rows.append([tgt_name, col, src_type, tgt_type, expected_type, "REVIEW_NOT_NULL"])
             elif issue_type == "nullability_novalidate_tighten":
                 rows.append([tgt_name, col, src_type, tgt_type, expected_type, "REVIEW_NOT_NULL_NOVALIDATE"])
+            elif issue_type == "nullability_novalidate_relax":
+                rows.append([tgt_name, col, src_type, tgt_type, expected_type, "REVIEW_NOT_NULL_NOVALIDATE_STRICTER_TARGET"])
             elif issue_type == "nullability_relax":
                 rows.append([tgt_name, col, src_type, tgt_type, expected_type, "REVIEW_NULLABLE"])
     if not rows:
@@ -49838,7 +49899,7 @@ def print_final_report(
         in (tv_results.get("mismatched", []) or [])
         if (obj_type or "").upper() == "TABLE"
         for _col, _src_type, _tgt_type, _expected_type, issue_type in (type_mismatches or [])
-        if issue_type in {"nullability_tighten", "nullability_novalidate_tighten", "nullability_relax"}
+        if issue_type in {"nullability_tighten", "nullability_novalidate_tighten", "nullability_novalidate_relax", "nullability_relax"}
     )
     column_identity_issue_cnt = sum(
         1
@@ -51018,7 +51079,7 @@ def print_final_report(
                     details.append("* 类型不匹配:\n", style="mismatch")
                     for issue in type_mismatches:
                         col, src_type, tgt_type, expected_type, issue_type = issue
-                        if issue_type in ("nullability_tighten", "nullability_novalidate_tighten", "nullability_relax"):
+                        if issue_type in ("nullability_tighten", "nullability_novalidate_tighten", "nullability_novalidate_relax", "nullability_relax"):
                             details.append(
                                 f"    - {col}: 源={src_type}, 目标={tgt_type}, 期望={expected_type} ({issue_type}, review-first)\n"
                             )
