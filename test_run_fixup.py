@@ -1157,6 +1157,43 @@ class TestRunFixupHelpers(unittest.TestCase):
             self.assertIn("状态账本命中", result2.message)
             self.assertEqual(summary2.statements, 0)
 
+    def test_state_ledger_flush_uses_atomic_replace(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fixup_dir = Path(tmpdir)
+            ledger = rf.FixupStateLedger(fixup_dir)
+            ledger.mark_completed(Path("view/A.V1.sql"), "fp1", "ok")
+            observed = {}
+            original_replace = rf.os.replace
+
+            def fake_replace(src, dst):
+                observed["src"] = Path(src)
+                observed["dst"] = Path(dst)
+                self.assertTrue(Path(src).exists())
+                return original_replace(src, dst)
+
+            with mock.patch.object(rf.os, "replace", side_effect=fake_replace) as mocked_replace:
+                ledger.flush()
+
+            self.assertTrue(mocked_replace.called)
+            self.assertEqual(observed["dst"], fixup_dir / rf.STATE_LEDGER_FILENAME)
+            self.assertFalse(observed["src"].exists())
+            payload = json.loads((fixup_dir / rf.STATE_LEDGER_FILENAME).read_text(encoding="utf-8"))
+            self.assertIn("view/A.V1.sql", payload["completed"])
+
+    def test_state_ledger_flush_keeps_dirty_when_atomic_replace_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fixup_dir = Path(tmpdir)
+            ledger = rf.FixupStateLedger(fixup_dir)
+            ledger.mark_completed(Path("view/A.V1.sql"), "fp1", "ok")
+
+            with mock.patch.object(rf.os, "replace", side_effect=OSError("disk full")):
+                ledger.flush()
+
+            self.assertTrue(ledger._dirty)
+            self.assertFalse((fixup_dir / rf.STATE_LEDGER_FILENAME).exists())
+            tmp_files = list(fixup_dir.glob(f"{rf.STATE_LEDGER_FILENAME}.*.tmp"))
+            self.assertEqual(tmp_files, [])
+
     def test_build_run_fixup_change_notices_respects_selected_dirs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             fixup_dir = Path(tmpdir)
@@ -2698,6 +2735,57 @@ class TestRecompileSkipTypes(unittest.TestCase):
         self.assertEqual(summary.remaining_invalid, 1)
         self.assertEqual(summary.recompile_failed, 1)
 
+    def test_recompile_retries_after_all_fail_round(self):
+        invalid_batches = [
+            [("APP", "P1", "PROCEDURE")],
+            [("APP", "P1", "PROCEDURE")],
+            [],
+        ]
+        run_results = [
+            SimpleNamespace(returncode=0, stderr="", stdout="ORA-03113: end-of-file on communication channel"),
+            SimpleNamespace(returncode=0, stderr="", stdout=""),
+        ]
+
+        def fake_query(_cmd, _timeout, allowed_owners=None):
+            self.assertIsNone(allowed_owners)
+            return invalid_batches.pop(0)
+
+        with mock.patch.object(rf, "query_invalid_objects", side_effect=fake_query),              mock.patch.object(rf, "run_sql", side_effect=run_results),              mock.patch.object(rf, "is_object_invalid", return_value=False):
+            summary = rf.recompile_invalid_objects([], timeout=1, max_retries=2)
+
+        self.assertEqual(summary.total_recompiled, 1)
+        self.assertEqual(summary.remaining_invalid, 0)
+        self.assertEqual(summary.recompile_failed, 1)
+
+    def test_score_execution_error_line_ignores_ora_06512_stack_frames(self):
+        self.assertIsNone(rf.score_execution_error_line("ORA-06512: at package body APP.PKG, line 12"))
+
+    def test_read_sql_text_with_limit_replaces_invalid_utf8_bytes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sql_path = Path(tmpdir) / "bad.sql"
+            sql_path.write_bytes(b"SELECT '\xff';\n")
+            text, err = rf.read_sql_text_with_limit(sql_path, None)
+        self.assertIsNone(err)
+        self.assertIsNotNone(text)
+        self.assertIn("�", text)
+
+    def test_parse_view_chain_file_replaces_invalid_utf8_bytes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "VIEWs_chain_1.txt"
+            path.write_bytes(b"1. A.V1[VIEW] -> A.T1[TABLE]\n# bad:\xff\n")
+            parsed = rf.parse_view_chain_file(path)
+        self.assertIn("A.V1", parsed)
+
+    def test_build_grant_index_replaces_invalid_utf8_bytes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fixup_dir = Path(tmpdir)
+            grant_dir = fixup_dir / "grants_miss"
+            grant_dir.mkdir(parents=True)
+            grant_file = grant_dir / "APP.grants.sql"
+            grant_file.write_bytes(b"GRANT SELECT ON APP.T1 TO U1;\n-- \xff\n")
+            index = rf.build_grant_index(fixup_dir, set(), include_dirs={"grants_miss"})
+        self.assertIn("APP.T1", index.by_object)
+
 
 class TestSqlCollectionRecursive(unittest.TestCase):
     def test_collect_sql_files_by_layer_includes_nested_dirs(self):
@@ -3053,6 +3141,83 @@ class TestViewChainCacheRefresh(unittest.TestCase):
                     )
             self.assertEqual(cm.exception.code, 1)
             self.assertEqual(initial_sizes, [0, 0])
+
+    def test_view_chain_exists_cache_isolated_per_root_view(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            fixup_dir = repo_root / "fixup_scripts"
+            report_dir = repo_root / "main_reports"
+            fixup_dir.mkdir(parents=True)
+            report_dir.mkdir(parents=True)
+            chain_file = report_dir / "VIEWs_chain_20260101_000000.txt"
+            chain_file.write_text("dummy", encoding="utf-8")
+
+            args = SimpleNamespace(
+                config=str(repo_root / "config.ini"),
+                smart_order=False,
+                glob_patterns=None,
+            )
+            ob_cfg = {
+                "executable": "obclient",
+                "host": "127.0.0.1",
+                "port": "2881",
+                "user_string": "root@sys",
+                "password": "p",
+                "timeout": 10,
+            }
+            fixup_settings = rf.FixupAutoGrantSettings(
+                enabled=False,
+                types=set(),
+                fallback=False,
+                cache_limit=100,
+            )
+            shared_dep_queries = 0
+
+            def fake_check(_cmd, _timeout, full_name, obj_type, exists_cache, _planned, use_planned=False):
+                nonlocal shared_dep_queries
+                key = (full_name.upper(), obj_type.upper())
+                if key in exists_cache:
+                    return exists_cache[key]
+                if key == ("A.SHARED_T", "TABLE"):
+                    shared_dep_queries += 1
+                    exists_cache[key] = False
+                    return False
+                exists_cache[key] = False
+                return False
+
+            def fake_build_view_chain_plan(*bargs, **_kwargs):
+                rf.check_object_exists(
+                    ["obclient"],
+                    10,
+                    "A.SHARED_T",
+                    "TABLE",
+                    bargs[12],
+                    bargs[21],
+                )
+                return (["BLOCK: test"], [], True)
+
+            with mock.patch.object(rf, "find_latest_view_chain_file", return_value=chain_file),                  mock.patch.object(
+                     rf,
+                     "parse_view_chain_file",
+                     return_value={
+                         "A.V1": [[("A.V1", "VIEW"), ("A.SHARED_T", "TABLE")]],
+                         "A.V2": [[("A.V2", "VIEW"), ("A.SHARED_T", "TABLE")]],
+                     },
+                 ),                  mock.patch.object(rf, "collect_sql_files_by_layer", return_value=[]),                  mock.patch.object(rf, "collect_sql_files_from_root", return_value=[]),                  mock.patch.object(rf, "build_fixup_object_index", return_value=({}, {})),                  mock.patch.object(rf, "build_grant_index", return_value=rf.GrantIndex({}, {}, {})),                  mock.patch.object(rf, "build_obclient_command", return_value=["obclient"]),                  mock.patch.object(rf, "resolve_timeout_value", return_value=10),                  mock.patch.object(rf, "check_obclient_connectivity", return_value=(True, "")),                  mock.patch.object(rf, "check_object_exists", side_effect=fake_check),                  mock.patch.object(rf, "build_view_chain_plan", side_effect=fake_build_view_chain_plan):
+                with self.assertRaises(SystemExit):
+                    rf.run_view_chain_autofix(
+                        args,
+                        ob_cfg,
+                        fixup_dir,
+                        repo_root,
+                        report_dir,
+                        [],
+                        [],
+                        fixup_settings,
+                        None,
+                    )
+
+            self.assertEqual(shared_dep_queries, 2)
 
 
 if __name__ == "__main__":
