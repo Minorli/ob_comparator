@@ -1249,16 +1249,29 @@ class FixupStateLedger:
     def flush(self) -> None:
         if not self._dirty:
             return
+        tmp_path: Optional[Path] = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             payload = {"version": 1, "completed": self._data}
-            self.path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
-                encoding="utf-8"
-            )
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=str(self.path.parent),
+                prefix=f"{self.path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp_fp:
+                tmp_fp.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+                tmp_path = Path(tmp_fp.name)
+            os.replace(str(tmp_path), str(self.path))
             self._dirty = False
         except Exception as exc:
             log.warning("[STATE] 写入状态账本失败: %s", exc)
+            if tmp_path and tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
 
     def is_completed(self, relative_path: Path, fingerprint: str) -> bool:
         key = str(relative_path).replace("\\", "/")
@@ -1288,7 +1301,7 @@ def read_sql_text_with_limit(sql_path: Path, max_bytes: Optional[int]) -> Tuple[
             size = sql_path.stat().st_size
             if size > max_bytes:
                 return None, f"文件过大 ({size} bytes) 超过限制 {max_bytes} bytes"
-        return sql_path.read_text(encoding="utf-8"), None
+        return sql_path.read_text(encoding="utf-8", errors="replace"), None
     except Exception as exc:
         return None, f"读取文件失败: {exc}"
 
@@ -1322,7 +1335,7 @@ def score_execution_error_line(line: str) -> Optional[int]:
     if RE_PLS_ERROR.search(stripped):
         return 140
     if "ORA-06512" in upper:
-        return 20
+        return None
     if "ORA-06550" in upper:
         return 110
     if RE_ERROR_CODE.search(stripped):
@@ -2688,7 +2701,7 @@ def parse_view_chain_line_meta(line: str) -> Optional[List[Tuple[str, str, Tuple
 
 def parse_view_chain_file_meta(path: Path) -> Dict[str, List[List[Tuple[str, str, Tuple[str, ...]]]]]:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return {}
     chains_by_view: Dict[str, List[List[Tuple[str, str, Tuple[str, ...]]]]] = defaultdict(list)
@@ -2736,7 +2749,7 @@ def parse_view_chain_lines(lines: List[str]) -> Dict[str, List[List[Tuple[str, s
 
 def parse_view_chain_file(path: Path) -> Dict[str, List[List[Tuple[str, str]]]]:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return {}
     return parse_view_chain_lines(lines)
@@ -4506,7 +4519,7 @@ def build_grant_index(
             continue
         for grant_file in iter_sql_files_recursive(grants_path):
             try:
-                content = grant_file.read_text(encoding="utf-8")
+                content = grant_file.read_text(encoding="utf-8", errors="replace")
             except Exception as exc:
                 log.warning("读取授权文件失败: %s (%s)", grant_file, exc)
                 continue
@@ -5190,6 +5203,7 @@ def recompile_invalid_objects(
         )
         
         recompiled_this_round = 0
+        failed_this_round = 0
         for owner, obj_name, obj_type in invalid_objects:
             compile_sql = build_compile_statement(owner, obj_name, obj_type)
             if not compile_sql:
@@ -5206,11 +5220,13 @@ def recompile_invalid_objects(
                         log.info("  OK %s.%s (%s)", owner, obj_name, obj_type)
                     elif still_invalid is True:
                         recompile_failed += 1
+                        failed_this_round += 1
                         log.warning("  FAIL %s.%s (%s): still INVALID after COMPILE", owner, obj_name, obj_type)
                     else:
                         log.warning("  WARN %s.%s (%s): 无法确认编译后状态，未计入成功", owner, obj_name, obj_type)
                 else:
                     recompile_failed += 1
+                    failed_this_round += 1
                     log.warning(
                         "  FAIL %s.%s (%s): %s",
                         owner,
@@ -5220,6 +5236,7 @@ def recompile_invalid_objects(
                     )
             except Exception as e:
                 recompile_failed += 1
+                failed_this_round += 1
                 log.warning(
                     "  FAIL %s.%s (%s): %s",
                     owner,
@@ -5230,8 +5247,8 @@ def recompile_invalid_objects(
         
         total_recompiled += recompiled_this_round
         
-        if recompiled_this_round == 0:
-            # No progress, stop retrying
+        if recompiled_this_round == 0 and failed_this_round == 0:
+            # No success and no transient failure signal in this round, stop retrying
             break
     
     # Final check
@@ -5999,7 +6016,6 @@ def run_view_chain_autofix(
     precheck_report = write_fixup_precheck_report(fixup_dir, precheck_summary)
     log_fixup_precheck(precheck_summary, precheck_report)
 
-    exists_cache: Dict[Tuple[str, str], bool] = {}
     roles_cache: Dict[str, Set[str]] = LimitedCache(fixup_settings.cache_limit)
     tab_privs_cache: Dict[Tuple[str, str, str], Set[str]] = LimitedCache(fixup_settings.cache_limit)
     tab_privs_grantable_cache: Dict[Tuple[str, str, str], Set[str]] = LimitedCache(fixup_settings.cache_limit)
@@ -6024,6 +6040,7 @@ def run_view_chain_autofix(
     allow_fallback = bool(fixup_settings.fallback)
 
     for idx, view_full in enumerate(sorted(chains_by_view.keys()), start=1):
+        exists_cache: Dict[Tuple[str, str], bool] = {}
         view_key = normalize_identifier(view_full)
         planned_objects: Set[Tuple[str, str]] = set()
         label = format_progress_label(idx, total_views, view_width)

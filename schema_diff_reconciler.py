@@ -27401,7 +27401,7 @@ def load_from_flat_cache(
         schema, obj_type, name, file_path = task
         try:
             start = time.time()
-            ddl_text = file_path.read_text('utf-8')
+            ddl_text = file_path.read_text('utf-8', errors='replace')
             elapsed = time.time() - start
             return (schema, obj_type, name, ddl_text, elapsed)
         except OSError as e:
@@ -34016,7 +34016,7 @@ def format_fixup_outputs(
                 script_lines.append(f'FORMAT RULES "{profile_file}"')
             io_map: List[Tuple[DdlFormatItem, Path, bool]] = []
             for b_idx, item in enumerate(batch):
-                content = item.path.read_text(encoding="utf-8")
+                content = item.path.read_text(encoding="utf-8", errors="replace")
                 if item.line_count <= 0:
                     item.line_count = content.count("\n") + (1 if content else 0)
                 needs_slash = False
@@ -34074,7 +34074,7 @@ def format_fixup_outputs(
                         str(item.path)
                     ))
                     continue
-                formatted = out_path.read_text(encoding="utf-8")
+                formatted = out_path.read_text(encoding="utf-8", errors="replace")
                 if needs_slash:
                     formatted = formatted.rstrip() + "\n/\n"
                 item.path.write_text(formatted.rstrip() + "\n", encoding="utf-8")

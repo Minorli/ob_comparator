@@ -11190,6 +11190,21 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             repaired_index = sdr.load_flat_cache_index(base)
             self.assertIn("TR1", repaired_index["A"]["TRIGGER"])
 
+    def test_load_from_flat_cache_replaces_invalid_utf8_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            file_path = sdr.get_flat_cache_path(base, "A", "VIEW", "V1")
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_bytes(b"SELECT '\xff' FROM DUAL;\n")
+            schema_requests = {"A": {"VIEW": {"V1"}}}
+            accumulator = {}
+            source_meta = {}
+
+            loaded = sdr.load_from_flat_cache(base, schema_requests, accumulator, source_meta, parallel_workers=1)
+
+            self.assertEqual(loaded, 1)
+            self.assertIn("�", accumulator["A"]["VIEW"]["V1"])
+
     def test_insert_report_artifact_line_rows_counts_only_successful_batches(self):
         rows = [
             {"artifact_type": "A", "file_path": "f1", "line_no": 1, "line_text": "x"},
@@ -18763,6 +18778,51 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             report_text = report_path.read_text(encoding="utf-8")
             self.assertIn("size_lines>1", report_text)
             self.assertNotIn("-- formatted", view_path.read_text(encoding="utf-8"))
+
+    def test_format_fixup_outputs_replaces_invalid_utf8_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            fixup_dir = Path(tmp_dir) / "fixup"
+            report_dir = Path(tmp_dir) / "reports"
+            (fixup_dir / "view").mkdir(parents=True)
+            view_path = fixup_dir / "view" / "A.BAD.sql"
+            view_path.write_bytes(b"CREATE VIEW V AS SELECT '\xff' FROM DUAL;\n")
+
+            sqlcl_path = Path(tmp_dir) / "sql"
+            sqlcl_path.write_text("#!/bin/sh\n", encoding="utf-8")
+            sqlcl_path.chmod(0o755)
+
+            settings = {
+                "ddl_format_enable": True,
+                "ddl_formatter": "sqlcl",
+                "ddl_format_type_set": {"VIEW"},
+                "ddl_format_batch_size": 10,
+                "ddl_format_timeout": 5,
+                "ddl_format_max_lines": 0,
+                "ddl_format_max_bytes": 0,
+                "ddl_format_fail_policy": "fallback",
+                "sqlcl_bin": str(sqlcl_path),
+                "sqlcl_profile_path": ""
+            }
+
+            def fake_run(cmd, capture_output, text, timeout, env):
+                script_arg = cmd[-1]
+                script_path = Path(script_arg[1:])
+                lines = script_path.read_text(encoding="utf-8").splitlines()
+                for line in lines:
+                    if line.strip().upper().startswith("FORMAT FILE"):
+                        parts = line.split('\"')
+                        in_path = parts[1]
+                        out_path = parts[3]
+                        content = Path(in_path).read_text(encoding="utf-8")
+                        Path(out_path).write_text("-- formatted\n" + content, encoding="utf-8")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            with mock.patch.object(sdr.subprocess, "run", side_effect=fake_run):
+                report_path = sdr.format_fixup_outputs(settings, fixup_dir, report_dir, "20240103")
+
+            self.assertTrue(report_path and report_path.exists())
+            self.assertIn("�", view_path.read_text(encoding="utf-8"))
+
 
     def test_sanitize_view_ddl_repairs_inline_comment_collapse(self):
         ddl = (
