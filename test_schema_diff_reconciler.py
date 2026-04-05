@@ -2212,6 +2212,32 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertEqual(results["mismatched"], [])
 
+    def test_normalize_identifier_name_unescapes_double_quotes(self):
+        self.assertEqual(sdr.normalize_identifier_name('"A""B"'), 'A"B')
+
+    def test_resolve_remap_target_returns_none_when_path_depth_exceeded(self):
+        deep_path = {(f"SRC.N{i}", "VIEW") for i in range(70)}
+        conflicts = {}
+        target = sdr.resolve_remap_target(
+            'SRC.V1',
+            'VIEW',
+            {},
+            source_objects={'SRC.V1': {'VIEW'}},
+            remap_conflicts=conflicts,
+            _path=deep_path,
+        )
+        self.assertIsNone(target)
+        self.assertIn(('SRC.V1', 'VIEW'), conflicts)
+
+    def test_build_bind_placeholders_zero_returns_null(self):
+        self.assertEqual(sdr.build_bind_placeholders(0), 'NULL')
+
+    def test_mask_sql_for_scan_masks_nested_block_comments(self):
+        masked = sdr.mask_sql_for_scan('SELECT 1 /* outer /* inner */ still */ FROM T')
+        self.assertNotIn('still', masked.upper())
+        self.assertIn('SELECT 1', masked.upper())
+        self.assertIn('FROM T', masked.upper())
+
     def test_normalize_column_default_expression_semantic_literals(self):
         self.assertEqual(
             sdr.normalize_column_default_expression("0.98"),
@@ -2244,6 +2270,24 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(
             sdr.normalize_column_default_expression("USER--更新人"),
             sdr.normalize_column_default_expression("user"),
+        )
+
+    def test_is_number_equivalent_treats_bounded_vs_unbounded_as_different(self):
+        self.assertFalse(sdr.is_number_equivalent(10, 2, None, None))
+        self.assertTrue(sdr.is_number_equivalent(None, None, None, None))
+
+    def test_normalize_column_default_expression_current_time_equivalence(self):
+        self.assertEqual(
+            sdr.normalize_column_default_expression("SYSDATE"),
+            sdr.normalize_column_default_expression("CURRENT_TIMESTAMP"),
+        )
+        self.assertEqual(
+            sdr.normalize_column_default_expression("SYSTIMESTAMP"),
+            sdr.normalize_column_default_expression("LOCALTIMESTAMP"),
+        )
+        self.assertEqual(
+            sdr.normalize_column_default_expression("NOW()"),
+            sdr.normalize_column_default_expression("CURRENT_TIMESTAMP"),
         )
 
     def test_describe_column_default_expression_strips_trailing_comment_noise(self):
@@ -9098,6 +9142,27 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         mismatch = extra_results["sequence_mismatched"][0]
         self.assertIn("SEQ1", mismatch.missing_sequences)
 
+    def test_check_extra_objects_sequence_respects_full_object_mapping_scope(self):
+        oracle_meta = self._make_oracle_meta(sequences={"A": {"SEQ1", "SEQ2"}})
+        ob_meta = self._make_ob_meta(sequences={"A": set()})
+        settings = {
+            "extra_check_workers": 1,
+            "extra_check_chunk_size": 50,
+            "extra_check_progress_interval": 1,
+        }
+        extra_results = sdr.check_extra_objects(
+            settings,
+            [],
+            ob_meta,
+            oracle_meta,
+            {"A.SEQ1": {"SEQUENCE": "A.SEQ1"}},
+            enabled_extra_types={"SEQUENCE"}
+        )
+        self.assertEqual(len(extra_results["sequence_mismatched"]), 1)
+        mismatch = extra_results["sequence_mismatched"][0]
+        self.assertEqual(mismatch.missing_sequences, {"SEQ1"})
+        self.assertNotIn("SEQ2", mismatch.missing_sequences)
+
     def test_check_extra_objects_sequence_attribute_mismatch(self):
         oracle_meta = self._make_oracle_meta(sequences={"A": {"SEQ1"}})
         oracle_meta = oracle_meta._replace(sequence_attrs={
@@ -12343,6 +12408,29 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn(("PUBLIC.PUB_A", "SYNONYM"), result.included_nodes)
         self.assertIn(("PUBLIC.PUB_B", "SYNONYM"), result.included_nodes)
 
+    def test_build_source_scope_closure_includes_synonym_terminal_parent(self):
+        source_objects = {
+            "SRC.V4": {"VIEW"},
+            "PUBLIC.SYN_V4": {"SYNONYM"},
+            "SRC.V5": {"VIEW"},
+        }
+        dependency_graph = {
+            ("SRC.V5", "VIEW"): {("PUBLIC.SYN_V4", "SYNONYM")},
+        }
+        object_parent_map = {
+            "PUBLIC.SYN_V4": "SRC.V4",
+        }
+        result = sdr.build_source_scope_closure(
+            source_objects,
+            dependency_graph,
+            object_parent_map,
+            {("SRC.V5", "VIEW")},
+            mode="remap_root_closure",
+        )
+        self.assertIn(("PUBLIC.SYN_V4", "SYNONYM"), result.included_nodes)
+        self.assertIn(("SRC.V4", "VIEW"), result.included_nodes)
+        self.assertTrue(any(row[0] == "PARENT_OBJECT" and row[2] == "SRC.V4" for row in result.detail_rows))
+
     def test_build_source_scope_closure_includes_reverse_dependent_view_and_attached_synonym(self):
         source_objects = {
             "SRC.T1": {"TABLE"},
@@ -12367,6 +12455,27 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn(("PUBLIC.SYN_V_DEP", "SYNONYM"), result.included_nodes)
         self.assertTrue(any(row[0] == "REVERSE_DEPENDENCY" and row[2] == "SRC.V_DEP" for row in result.detail_rows))
 
+    def test_build_source_scope_closure_blocks_reverse_dependency_expansion_from_package(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "SRC.PKG1": {"PACKAGE"},
+            "SRC.PKG2": {"PACKAGE"},
+        }
+        dependency_graph = {
+            ("SRC.PKG1", "PACKAGE"): {("SRC.T1", "TABLE")},
+            ("SRC.PKG2", "PACKAGE"): {("SRC.PKG1", "PACKAGE")},
+        }
+        result = sdr.build_source_scope_closure(
+            source_objects,
+            dependency_graph,
+            {},
+            {("SRC.T1", "TABLE")},
+            mode="remap_root_closure",
+        )
+        self.assertIn(("SRC.PKG1", "PACKAGE"), result.included_nodes)
+        self.assertNotIn(("SRC.PKG2", "PACKAGE"), result.included_nodes)
+        self.assertTrue(any(row[0] == "REVERSE_BOUNDARY_SKIPPED" and row[2] == "SRC.PKG2" for row in result.detail_rows))
+
     def test_build_source_scope_closure_includes_reverse_dependent_package_and_attached_synonym(self):
         source_objects = {
             "SRC.T1": {"TABLE"},
@@ -12388,6 +12497,511 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertIn(("SRC.PKG1", "PACKAGE"), result.included_nodes)
         self.assertIn(("PUBLIC.SYN_PKG1", "SYNONYM"), result.included_nodes)
+
+    def test_build_scope_discovery_types_expands_for_remap_root_closure(self):
+        enabled = {"TABLE", "CONSTRAINT"}
+        self.assertEqual(
+            sdr.build_scope_discovery_types(enabled, "full_source"),
+            {"TABLE", "CONSTRAINT"},
+        )
+        scoped = sdr.build_scope_discovery_types(enabled, "remap_root_closure")
+        self.assertIn("TABLE", scoped)
+        self.assertIn("PACKAGE BODY", scoped)
+        self.assertIn("TYPE BODY", scoped)
+        self.assertIn("TRIGGER", scoped)
+        self.assertIn("SEQUENCE", scoped)
+
+    def test_build_scoped_text_reference_seed_rows_matches_schema_qualified_reference(self):
+        scope_result = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE")}),
+            excluded_nodes=frozenset({("SRC.PKG1", "PACKAGE BODY")}),
+            detail_rows=(),
+        )
+        text_index = {
+            ("SRC.PKG1", "PACKAGE BODY"): "BEGIN SELECT COUNT(*) INTO v_cnt FROM SRC.T1; END;"
+        }
+        rows = sdr.build_scoped_text_reference_seed_rows(scope_result, text_index)
+        self.assertEqual(rows, [(("SRC.PKG1", "PACKAGE BODY"), "TEXT_REFERENCE_HEURISTIC", "MATCH:SRC.T1")])
+
+    def test_build_scoped_text_reference_seed_rows_ignores_cross_schema_unqualified_reference_in_safe_mode(self):
+        scope_result = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE")}),
+            excluded_nodes=frozenset({("OTHER.PKG1", "PACKAGE BODY")}),
+            detail_rows=(),
+        )
+        text_index = {
+            ("OTHER.PKG1", "PACKAGE BODY"): "BEGIN EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM T1'; END;"
+        }
+        rows = sdr.build_scoped_text_reference_seed_rows(scope_result, text_index)
+        self.assertEqual(rows, [])
+
+    def test_build_scoped_text_reference_seed_rows_matches_same_schema_unqualified_dynamic_sql_reference(self):
+        scope_result = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE")}),
+            excluded_nodes=frozenset({("SRC.PKG1", "PACKAGE BODY")}),
+            detail_rows=(),
+        )
+        text_index = {
+            ("SRC.PKG1", "PACKAGE BODY"): "BEGIN EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM T1'; END;"
+        }
+        rows = sdr.build_scoped_text_reference_seed_rows(scope_result, text_index)
+        self.assertEqual(rows, [(("SRC.PKG1", "PACKAGE BODY"), "TEXT_REFERENCE_HEURISTIC", "MATCH:SRC.T1")])
+
+    def test_build_scoped_text_reference_seed_rows_matches_execute_immediate_literal_reference(self):
+        scope_result = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE")}),
+            excluded_nodes=frozenset({("SRC.PKG1", "PACKAGE BODY")}),
+            detail_rows=(),
+        )
+        text_index = {
+            ("SRC.PKG1", "PACKAGE BODY"): "BEGIN EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM SRC.T1'; END;"
+        }
+        rows = sdr.build_scoped_text_reference_seed_rows(scope_result, text_index)
+        self.assertEqual(rows, [(("SRC.PKG1", "PACKAGE BODY"), "TEXT_REFERENCE_HEURISTIC", "MATCH:SRC.T1")])
+
+    def test_build_scoped_text_reference_seed_rows_matches_execute_immediate_literal_concatenation(self):
+        scope_result = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE")}),
+            excluded_nodes=frozenset({("SRC.PKG1", "PACKAGE BODY")}),
+            detail_rows=(),
+        )
+        text_index = {
+            ("SRC.PKG1", "PACKAGE BODY"): "BEGIN EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM ' || 'SRC.T1'; END;"
+        }
+        rows = sdr.build_scoped_text_reference_seed_rows(scope_result, text_index)
+        self.assertEqual(rows, [(("SRC.PKG1", "PACKAGE BODY"), "TEXT_REFERENCE_HEURISTIC", "MATCH:SRC.T1")])
+
+    def test_build_scoped_text_reference_seed_rows_matches_execute_immediate_literal_with_into_without_ambiguity(self):
+        scope_result = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE")}),
+            excluded_nodes=frozenset({("SRC.PKG1", "PACKAGE BODY")}),
+            detail_rows=(),
+        )
+        text_index = {
+            ("SRC.PKG1", "PACKAGE BODY"): "BEGIN EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM SRC.T1' INTO v_cnt; END;"
+        }
+        diag_rows = []
+        rows = sdr.build_scoped_text_reference_seed_rows(scope_result, text_index, diagnostic_rows=diag_rows)
+        self.assertEqual(rows, [(("SRC.PKG1", "PACKAGE BODY"), "TEXT_REFERENCE_HEURISTIC", "MATCH:SRC.T1")])
+        self.assertEqual(diag_rows, [])
+
+    def test_build_scoped_text_reference_seed_rows_reports_ambiguous_execute_immediate_variable_concat(self):
+        scope_result = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE")}),
+            excluded_nodes=frozenset({("SRC.PKG1", "PACKAGE BODY")}),
+            detail_rows=(),
+        )
+        text_index = {
+            ("SRC.PKG1", "PACKAGE BODY"): "BEGIN v_sql := 'SELECT COUNT(*) FROM ' || tab_name; EXECUTE IMMEDIATE v_sql; END;"
+        }
+        diag_rows = []
+        rows = sdr.build_scoped_text_reference_seed_rows(scope_result, text_index, diagnostic_rows=diag_rows)
+        self.assertEqual(rows, [])
+        self.assertEqual(len(diag_rows), 1)
+        self.assertEqual(diag_rows[0][0], 'TEXT_REFERENCE_AMBIGUOUS')
+        self.assertEqual(diag_rows[0][2], 'SRC.PKG1')
+
+    def test_build_scoped_text_reference_seed_rows_matches_dbms_sql_parse_literal_reference(self):
+        scope_result = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE")}),
+            excluded_nodes=frozenset({("SRC.PKG1", "PACKAGE BODY")}),
+            detail_rows=(),
+        )
+        text_index = {
+            ("SRC.PKG1", "PACKAGE BODY"): "BEGIN DBMS_SQL.PARSE(c, q'[SELECT COUNT(*) FROM SRC.T1]', DBMS_SQL.NATIVE); END;"
+        }
+        rows = sdr.build_scoped_text_reference_seed_rows(scope_result, text_index)
+        self.assertEqual(rows, [(("SRC.PKG1", "PACKAGE BODY"), "TEXT_REFERENCE_HEURISTIC", "MATCH:SRC.T1")])
+
+    def test_build_scoped_text_reference_seed_rows_matches_dbms_sql_parse_named_argument_literal_reference(self):
+        scope_result = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE")}),
+            excluded_nodes=frozenset({("SRC.PKG1", "PACKAGE BODY")}),
+            detail_rows=(),
+        )
+        text_index = {
+            ("SRC.PKG1", "PACKAGE BODY"): "BEGIN DBMS_SQL.PARSE(c=>c, statement=>q'[SELECT COUNT(*) FROM SRC.T1]', language_flag=>DBMS_SQL.NATIVE); END;"
+        }
+        rows = sdr.build_scoped_text_reference_seed_rows(scope_result, text_index)
+        self.assertEqual(rows, [(("SRC.PKG1", "PACKAGE BODY"), "TEXT_REFERENCE_HEURISTIC", "MATCH:SRC.T1")])
+
+    def test_build_scoped_text_reference_seed_rows_matches_package_call_reference(self):
+        scope_result = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE"), ("SRC.PKG1", "PACKAGE")}),
+            excluded_nodes=frozenset({("SRC.JOB1", "JOB")}),
+            detail_rows=(),
+        )
+        text_index = {
+            ("SRC.JOB1", "JOB"): "BEGIN SRC.PKG1.P; END;"
+        }
+        rows = sdr.build_scoped_text_reference_seed_rows(scope_result, text_index)
+        self.assertEqual(rows, [(("SRC.JOB1", "JOB"), "TEXT_REFERENCE_HEURISTIC", "MATCH:SRC.PKG1")])
+
+    def test_build_scoped_text_reference_seed_rows_matches_same_schema_unqualified_package_call_reference(self):
+        scope_result = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE"), ("SRC.PKG1", "PACKAGE")}),
+            excluded_nodes=frozenset({("SRC.JOB1", "JOB")}),
+            detail_rows=(),
+        )
+        text_index = {
+            ("SRC.JOB1", "JOB"): "BEGIN PKG1.P; END;"
+        }
+        rows = sdr.build_scoped_text_reference_seed_rows(scope_result, text_index)
+        self.assertEqual(rows, [(("SRC.JOB1", "JOB"), "TEXT_REFERENCE_HEURISTIC", "MATCH:SRC.PKG1")])
+
+    def test_build_scoped_text_reference_seed_rows_ignores_package_member_selector_reference(self):
+        scope_result = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE"), ("SRC.PKG1", "PACKAGE")}),
+            excluded_nodes=frozenset({("SRC.JOB1", "JOB")}),
+            detail_rows=(),
+        )
+        text_index = {
+            ("SRC.JOB1", "JOB"): "BEGIN v := SRC.PKG1.C_STATUS; END;"
+        }
+        rows = sdr.build_scoped_text_reference_seed_rows(scope_result, text_index)
+        self.assertEqual(rows, [])
+
+    def test_build_scoped_text_reference_seed_rows_matches_procedure_call_reference(self):
+        scope_result = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE"), ("SRC.P1", "PROCEDURE")}),
+            excluded_nodes=frozenset({("SRC.JOB1", "JOB")}),
+            detail_rows=(),
+        )
+        text_index = {
+            ("SRC.JOB1", "JOB"): "BEGIN SRC.P1; END;"
+        }
+        rows = sdr.build_scoped_text_reference_seed_rows(scope_result, text_index)
+        self.assertEqual(rows, [(("SRC.JOB1", "JOB"), "TEXT_REFERENCE_HEURISTIC", "MATCH:SRC.P1")])
+
+    def test_build_scoped_text_reference_seed_rows_matches_same_schema_unqualified_procedure_call_reference(self):
+        scope_result = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE"), ("SRC.P1", "PROCEDURE")}),
+            excluded_nodes=frozenset({("SRC.JOB1", "JOB")}),
+            detail_rows=(),
+        )
+        text_index = {
+            ("SRC.JOB1", "JOB"): "BEGIN P1; END;"
+        }
+        rows = sdr.build_scoped_text_reference_seed_rows(scope_result, text_index)
+        self.assertEqual(rows, [(("SRC.JOB1", "JOB"), "TEXT_REFERENCE_HEURISTIC", "MATCH:SRC.P1")])
+
+    def test_build_scoped_text_reference_seed_rows_matches_function_call_reference(self):
+        scope_result = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE"), ("SRC.F1", "FUNCTION")}),
+            excluded_nodes=frozenset({("SRC.JOB1", "JOB")}),
+            detail_rows=(),
+        )
+        text_index = {
+            ("SRC.JOB1", "JOB"): "BEGIN v := SRC.F1(); END;"
+        }
+        rows = sdr.build_scoped_text_reference_seed_rows(scope_result, text_index)
+        self.assertEqual(rows, [(("SRC.JOB1", "JOB"), "TEXT_REFERENCE_HEURISTIC", "MATCH:SRC.F1")])
+
+    def test_build_scoped_text_reference_seed_rows_matches_same_schema_unqualified_function_call_reference(self):
+        scope_result = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE"), ("SRC.F1", "FUNCTION")}),
+            excluded_nodes=frozenset({("SRC.JOB1", "JOB")}),
+            detail_rows=(),
+        )
+        text_index = {
+            ("SRC.JOB1", "JOB"): "BEGIN v := F1(); END;"
+        }
+        rows = sdr.build_scoped_text_reference_seed_rows(scope_result, text_index)
+        self.assertEqual(rows, [(("SRC.JOB1", "JOB"), "TEXT_REFERENCE_HEURISTIC", "MATCH:SRC.F1")])
+
+    def test_extract_default_sequence_dependency_targets_matches_qualified_sequence(self):
+        source_objects = {
+            "SRC.SEQ1": {"SEQUENCE"},
+        }
+        targets = sdr.extract_default_sequence_dependency_targets('SRC.SEQ1.NEXTVAL', 'SRC', source_objects)
+        self.assertEqual(targets, {('SRC.SEQ1', 'SEQUENCE')})
+
+    def test_extract_default_sequence_dependency_targets_matches_same_schema_unqualified_sequence(self):
+        source_objects = {
+            "SRC.SEQ1": {"SEQUENCE"},
+        }
+        targets = sdr.extract_default_sequence_dependency_targets('SEQ1.NEXTVAL', 'SRC', source_objects)
+        self.assertEqual(targets, {('SRC.SEQ1', 'SEQUENCE')})
+
+    def test_extract_default_sequence_dependency_targets_prefers_same_schema_and_public_synonym(self):
+        source_objects = {
+            "PUBLIC.SEQ1": {"SYNONYM"},
+        }
+        targets = sdr.extract_default_sequence_dependency_targets('SEQ1.NEXTVAL', 'SRC', source_objects)
+        self.assertEqual(targets, {('PUBLIC.SEQ1', 'SYNONYM')})
+
+    def test_extract_default_sequence_dependency_targets_ignores_non_sequence_member(self):
+        source_objects = {
+            "SRC.PKG1": {"PACKAGE"},
+        }
+        targets = sdr.extract_default_sequence_dependency_targets('PKG1.C_STATUS', 'SRC', source_objects)
+        self.assertEqual(targets, set())
+
+    def test_build_default_sequence_dependency_records_from_table_columns(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "SRC.SEQ1": {"SEQUENCE"},
+            "PUBLIC.SEQ2": {"SYNONYM"},
+        }
+        table_columns = {
+            ("SRC", "T1"): {
+                "C1": {"data_default": "SEQ1.NEXTVAL"},
+                "C2": {"data_default": "PUBLIC.SEQ2.NEXTVAL"},
+                "C3": {"data_default": "42"},
+            }
+        }
+        records = sdr.build_default_sequence_dependency_records_from_table_columns(source_objects, table_columns)
+        self.assertEqual(
+            records,
+            [
+                sdr.DependencyRecord("SRC", "T1", "TABLE", "PUBLIC", "SEQ2", "SYNONYM"),
+                sdr.DependencyRecord("SRC", "T1", "TABLE", "SRC", "SEQ1", "SEQUENCE"),
+            ]
+        )
+
+    def test_extend_source_scope_result_with_text_reference_seed_rows_expands_paired_objects(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "SRC.PKG1": {"PACKAGE", "PACKAGE BODY"},
+        }
+        base = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE")}),
+            excluded_nodes=frozenset({("SRC.PKG1", "PACKAGE"), ("SRC.PKG1", "PACKAGE BODY")}),
+            detail_rows=(("ROOT_REMAP", "TABLE", "SRC.T1", "EXPLICIT_REMAP_ROOT"),),
+        )
+        seeds = [(("SRC.PKG1", "PACKAGE BODY"), "TEXT_REFERENCE_HEURISTIC", "MATCH:SRC.T1")]
+        result = sdr.extend_source_scope_result_with_seed_rows(base, source_objects, {}, {}, seeds)
+        self.assertIn(("SRC.PKG1", "PACKAGE BODY"), result.included_nodes)
+        self.assertIn(("SRC.PKG1", "PACKAGE"), result.included_nodes)
+        self.assertTrue(any(row[0] == "TEXT_REFERENCE_HEURISTIC" and row[2] == "SRC.PKG1" and row[1] == "PACKAGE BODY" for row in result.detail_rows))
+        self.assertTrue(any(row[0] == "PAIRED_OBJECT" and row[2] == "SRC.PKG1" and row[1] == "PACKAGE" for row in result.detail_rows))
+
+    def test_extend_source_scope_result_with_seed_rows_skips_filtered_out_nodes(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "SRC.PKG1": {"PACKAGE BODY"},
+            "SRC.UNRELATED": {"VIEW"},
+        }
+        base = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE")}),
+            excluded_nodes=frozenset({("SRC.PKG1", "PACKAGE BODY"), ("SRC.UNRELATED", "VIEW")}),
+            detail_rows=(("ROOT_REMAP", "TABLE", "SRC.T1", "EXPLICIT_REMAP_ROOT"),),
+        )
+        seeds = [(("SRC.PKG1", "PACKAGE BODY"), "TEXT_REFERENCE_HEURISTIC", "MATCH:SRC.T1")]
+        result = sdr.extend_source_scope_result_with_seed_rows(base, source_objects, {}, {}, seeds)
+        self.assertIn(("SRC.PKG1", "PACKAGE BODY"), result.included_nodes)
+        self.assertNotIn(("SRC.UNRELATED", "VIEW"), result.included_nodes)
+        self.assertIn(("SRC.UNRELATED", "VIEW"), result.excluded_nodes)
+
+    def test_extend_source_scope_result_with_seed_rows_skips_reverse_boundary_skipped_nodes(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "SRC.P1": {"PROCEDURE"},
+            "SRC.PKG1": {"PACKAGE BODY"},
+        }
+        base = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE")}),
+            excluded_nodes=frozenset({("SRC.P1", "PROCEDURE"), ("SRC.PKG1", "PACKAGE BODY")}),
+            detail_rows=(("ROOT_REMAP", "TABLE", "SRC.T1", "EXPLICIT_REMAP_ROOT"),),
+        )
+        dependency_graph = {
+            ("SRC.P1", "PROCEDURE"): {("SRC.T1", "TABLE")},
+            ("SRC.PKG1", "PACKAGE BODY"): {("SRC.P1", "PROCEDURE")},
+        }
+        seeds = [(("SRC.P1", "PROCEDURE"), "TEXT_REFERENCE_HEURISTIC", "MATCH:SRC.T1")]
+        result = sdr.extend_source_scope_result_with_seed_rows(base, source_objects, dependency_graph, {}, seeds)
+        self.assertIn(("SRC.P1", "PROCEDURE"), result.included_nodes)
+        self.assertNotIn(("SRC.PKG1", "PACKAGE BODY"), result.included_nodes)
+        self.assertIn(("SRC.PKG1", "PACKAGE BODY"), result.excluded_nodes)
+
+    def test_extend_source_scope_result_with_seed_rows_removes_stale_filtered_rows_for_admitted_nodes(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "SRC.PKG1": {"PACKAGE BODY"},
+        }
+        base = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE")}),
+            excluded_nodes=frozenset({("SRC.PKG1", "PACKAGE BODY")}),
+            detail_rows=(
+                ("ROOT_REMAP", "TABLE", "SRC.T1", "EXPLICIT_REMAP_ROOT"),
+                ("FILTERED_OUT", "PACKAGE BODY", "SRC.PKG1", "OUTSIDE_REMAP_ROOT_CLOSURE"),
+            ),
+        )
+        seeds = [(("SRC.PKG1", "PACKAGE BODY"), "TEXT_REFERENCE_HEURISTIC", "MATCH:SRC.T1")]
+        result = sdr.extend_source_scope_result_with_seed_rows(base, source_objects, {}, {}, seeds)
+        self.assertFalse(any(row[0] == "FILTERED_OUT" and row[2] == "SRC.PKG1" for row in result.detail_rows))
+        self.assertTrue(any(row[0] == "TEXT_REFERENCE_HEURISTIC" and row[2] == "SRC.PKG1" for row in result.detail_rows))
+
+    def test_extend_source_scope_result_with_seed_rows_preserves_explicit_trigger_keep_nodes(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "SRC.T2": {"TABLE"},
+            "SRC.TRG_T2": {"TRIGGER"},
+        }
+        object_parent_map = {"SRC.TRG_T2": "SRC.T2"}
+        keep_nodes, detail_rows, missing = sdr.build_scoped_trigger_keep_nodes(
+            {"SRC.TRG_T2"},
+            source_objects,
+            object_parent_map,
+        )
+        self.assertEqual(missing, [])
+        base = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(keep_nodes),
+            included_nodes=frozenset({("SRC.T1", "TABLE")}),
+            excluded_nodes=frozenset({("SRC.T2", "TABLE"), ("SRC.TRG_T2", "TRIGGER")}),
+            detail_rows=(("ROOT_REMAP", "TABLE", "SRC.T1", "EXPLICIT_REMAP_ROOT"),),
+        )
+        seeds = [(("SRC.T2", "TABLE"), "TEXT_REFERENCE_HEURISTIC", "MATCH:SRC.T1")]
+        result = sdr.extend_source_scope_result_with_seed_rows(
+            base,
+            source_objects,
+            {},
+            object_parent_map,
+            seeds,
+            explicit_trigger_keep_nodes=keep_nodes,
+            explicit_trigger_detail_rows=detail_rows,
+        )
+        self.assertIn(("SRC.T2", "TABLE"), result.included_nodes)
+        self.assertIn(("SRC.TRG_T2", "TRIGGER"), result.included_nodes)
+        self.assertTrue(any(row[0] == "TRIGGER_KEEP" and row[2] == "SRC.TRG_T2" for row in result.detail_rows))
+
+    def test_build_scoped_text_reference_seed_rows_ignores_string_literal_reference(self):
+        scope_result = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE")}),
+            excluded_nodes=frozenset({("SRC.PKG1", "PACKAGE BODY")}),
+            detail_rows=(),
+        )
+        text_index = {
+            ("SRC.PKG1", "PACKAGE BODY"): "BEGIN DBMS_OUTPUT.PUT_LINE('SELECT * FROM SRC.T1'); END;"
+        }
+        rows = sdr.build_scoped_text_reference_seed_rows(scope_result, text_index)
+        self.assertEqual(rows, [])
+
+    def test_apply_scoped_text_reference_fallback_stops_at_max_rounds(self):
+        scope_result = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE")}),
+            excluded_nodes=frozenset({("SRC.PKG1", "PACKAGE BODY")}),
+            detail_rows=(("ROOT_REMAP", "TABLE", "SRC.T1", "EXPLICIT_REMAP_ROOT"),),
+        )
+
+        def fake_extend(current, *_args, **_kwargs):
+            size = len(current.included_nodes)
+            return current._replace(
+                included_nodes=frozenset(set(current.included_nodes) | {(f"SRC.EXTRA{size}", "VIEW")}),
+                excluded_nodes=frozenset({("SRC.PKG1", "PACKAGE BODY")}),
+            )
+
+        with mock.patch.object(sdr, 'load_oracle_scoped_text_reference_index', return_value={}),              mock.patch.object(sdr, 'build_scoped_text_reference_seed_rows', return_value=[(("SRC.PKG1", "PACKAGE BODY"), "TEXT_REFERENCE_HEURISTIC", "MATCH:SRC.T1")]),              mock.patch.object(sdr, 'extend_source_scope_result_with_seed_rows', side_effect=fake_extend),              mock.patch.object(sdr.log, 'warning') as warning_mock:
+            result, added = sdr.apply_scoped_text_reference_fallback(
+                {"user": "u", "password": "p", "dsn": "d"},
+                scope_result,
+                {"SRC.T1": {"TABLE"}, "SRC.PKG1": {"PACKAGE BODY"}},
+                {},
+                {},
+                max_rounds=3,
+            )
+        self.assertEqual(added, 3)
+        self.assertEqual(len(result.included_nodes), 4)
+        self.assertTrue(any('最大轮次' in str(call.args[0]) for call in warning_mock.call_args_list))
+
+    def test_load_oracle_scoped_text_reference_index_bounds_view_and_job_names(self):
+        executed_sql = []
+
+        class FakeCursor:
+            def execute(self, sql, params=None):
+                executed_sql.append((sql, list(params or [])))
+            def __iter__(self):
+                return iter(())
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeConn:
+            def cursor(self):
+                return FakeCursor()
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        candidate_nodes = {
+            ("SRC.V1", "VIEW"),
+            ("SRC.J1", "JOB"),
+        }
+        with mock.patch.object(sdr.oracledb, 'connect', return_value=FakeConn()):
+            sdr.load_oracle_scoped_text_reference_index({"user": "u", "password": "p", "dsn": "d"}, candidate_nodes)
+        sql_text = "\n".join(sql for sql, _ in executed_sql)
+        self.assertIn("VIEW_NAME IN", sql_text)
+        self.assertIn("JOB_NAME IN", sql_text)
 
     def test_build_source_scope_closure_full_source_keeps_all(self):
         source_objects = {
@@ -18025,6 +18639,46 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         finally:
             Path(path).unlink(missing_ok=True)
         self.assertEqual(patterns, ["_rename", "cc_dd", "AA_BB"])
+
+    def test_load_blacklist_name_patterns_handles_non_utf8_file(self):
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            handle.write(b"#" + bytes([0xFF]) + b"comment\nAA_BB\n")
+            path = handle.name
+        try:
+            patterns = sdr.load_blacklist_name_patterns(None, path)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        self.assertEqual(patterns, ["AA_BB"])
+
+    def test_load_exclude_object_rules_handles_non_utf8_file(self):
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            handle.write(b"TABLE|APP|T1\n#" + bytes([0xFF]) + b"tail\n")
+            path = handle.name
+        try:
+            rules = sdr.load_exclude_object_rules(path, {"APP"})
+        finally:
+            Path(path).unlink(missing_ok=True)
+        self.assertEqual(rules, [(1, "TABLE", "APP", "T1")])
+
+    def test_load_hint_allowlist_file_handles_non_utf8_file(self):
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            handle.write(b"USE_NL\n#" + bytes([0xFF]) + b"tail\n")
+            path = handle.name
+        try:
+            hints = sdr.load_hint_allowlist_file(path)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        self.assertEqual(hints, {"USE_NL"})
+
+    def test_load_remap_rules_handles_non_utf8_file(self):
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            handle.write(b"SRC.T1=TGT.T1\n#" + bytes([0xFF]) + b"tail\n")
+            path = handle.name
+        try:
+            rules = sdr.load_remap_rules(path)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        self.assertEqual(rules, {"SRC.T1": "TGT.T1"})
 
     def test_is_rename_only_blacklist(self):
         rename_entries = {

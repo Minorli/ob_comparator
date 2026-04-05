@@ -1930,7 +1930,10 @@ METADATA_VOLUME_WARN_TRIGGERS = 500000
 def normalize_identifier_name(name: Optional[str]) -> str:
     if not name:
         return ""
-    return str(name).strip().strip('"').upper()
+    text = str(name).strip()
+    if len(text) >= 2 and text.startswith('"') and text.endswith('"'):
+        text = text[1:-1].replace('""', '"')
+    return text.upper()
 
 
 def is_case_sensitive_identifier(raw_name: Optional[str]) -> bool:
@@ -3271,10 +3274,34 @@ def canonicalize_default_date_literal(expr: Optional[str]) -> Optional[str]:
     return f"DATE '{year:04d}-{month:02d}-{day:02d}'"
 
 
+CURRENT_TIME_DEFAULT_EXPRESSIONS = {
+    "SYSDATE",
+    "CURRENT_DATE",
+    "CURRENT_TIMESTAMP",
+    "SYSTIMESTAMP",
+    "LOCALTIMESTAMP",
+    "NOW()",
+}
+
+
+def canonicalize_current_time_default(expr: Optional[str]) -> Optional[str]:
+    if expr is None:
+        return None
+    text = normalize_sql_expression_casefold(expr)
+    if not text:
+        return None
+    if text in CURRENT_TIME_DEFAULT_EXPRESSIONS:
+        return "CURRENT_TIME"
+    return None
+
+
 def canonicalize_default_expression(expr: Optional[str]) -> str:
     text = normalize_sql_expression_casefold(expr)
     if not text:
         return ""
+    current_time = canonicalize_current_time_default(text)
+    if current_time is not None:
+        return current_time
     numeric = canonicalize_default_numeric_literal(text)
     if numeric is not None:
         return numeric
@@ -3852,7 +3879,7 @@ def is_number_equivalent(
     if src_unbounded:
         return tgt_unbounded
     if tgt_unbounded:
-        return True
+        return False
     if tgt_scale_n != src_scale_n:
         return False
     if tgt_prec_n is None or src_prec_n is None:
@@ -4131,7 +4158,7 @@ def load_blacklist_name_patterns(
         path = Path(path_raw).expanduser()
         if path.exists():
             try:
-                for line in path.read_text(encoding="utf-8").splitlines():
+                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
                     token = line.strip()
                     if not token or token.startswith('#') or token.startswith(';'):
                         continue
@@ -4184,7 +4211,7 @@ def load_exclude_object_rules(
     seen: Set[Tuple[str, str, str]] = set()
 
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError as exc:
         log.warning("读取 exclude_objects_file 失败: %s (%s)，将忽略显式排除规则。", path, exc)
         return []
@@ -4643,6 +4670,447 @@ def normalize_source_object_scope_mode(raw_value: Optional[str]) -> str:
         log.warning("source_object_scope_mode=%s 不在支持范围内，将回退为 full_source。", raw_value)
         return "full_source"
     return value
+
+
+REMAP_SCOPE_TEXT_FALLBACK_MODE_VALUES = {"off", "safe"}
+REMAP_SCOPE_TEXT_FALLBACK_MODE_ALIASES = {
+    "": "off",
+    "none": "off",
+    "disabled": "off",
+}
+
+
+def normalize_remap_scope_text_fallback_mode(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "off"
+    value = str(raw_value).strip().lower()
+    value = REMAP_SCOPE_TEXT_FALLBACK_MODE_ALIASES.get(value, value)
+    if value not in REMAP_SCOPE_TEXT_FALLBACK_MODE_VALUES:
+        log.warning("remap_scope_text_fallback_mode=%s 不在支持范围内，将回退为 off。", raw_value)
+        return "off"
+    return value
+
+
+def build_scope_discovery_types(enabled_types: Optional[Set[str]], source_scope_mode: str) -> Set[str]:
+    enabled_types_u = {str(t).upper() for t in (enabled_types or set()) if str(t).strip()}
+    if normalize_source_object_scope_mode(source_scope_mode) == "remap_root_closure":
+        return set(ALL_TRACKED_OBJECT_TYPES)
+    return enabled_types_u
+
+
+SCOPED_TEXT_REFERENCE_ELIGIBLE_TYPES: Set[str] = {
+    "VIEW",
+    "MATERIALIZED VIEW",
+    "PROCEDURE",
+    "FUNCTION",
+    "PACKAGE",
+    "PACKAGE BODY",
+    "TYPE",
+    "TYPE BODY",
+    "TRIGGER",
+    "JOB",
+    "SCHEDULE",
+}
+
+SCOPED_TEXT_REFERENCE_TARGET_TYPES: Set[str] = {
+    "TABLE",
+    "VIEW",
+    "MATERIALIZED VIEW",
+    "PROCEDURE",
+    "FUNCTION",
+    "PACKAGE",
+    "PACKAGE BODY",
+    "TYPE",
+    "TYPE BODY",
+    "SYNONYM",
+    "SEQUENCE",
+}
+
+
+def _build_schema_qualified_reference_patterns(full_name: str) -> Tuple[re.Pattern, ...]:
+    full_u = (full_name or "").upper()
+    if "." not in full_u:
+        return tuple()
+    owner_u, name_u = full_u.split(".", 1)
+    owner_re = re.escape(owner_u)
+    name_re = re.escape(name_u)
+    return (
+        re.compile(rf'(?<![A-Z0-9_$#"])' + owner_re + r'\s*\.\s*' + name_re + r'(?![A-Z0-9_$#"])'),
+        re.compile(rf'"{owner_re}"\s*\.\s*"{name_re}"'),
+        re.compile(rf'"{owner_re}"\s*\.\s*' + name_re + r'(?![A-Z0-9_$#"])'),
+        re.compile(rf'(?<![A-Z0-9_$#"])' + owner_re + r'\s*\.\s*"{name_re}"'),
+    )
+
+
+def _build_scoped_reference_patterns(full_name: str, object_types: Set[str]) -> Tuple[re.Pattern, ...]:
+    types_u = {(item or "").upper() for item in (object_types or set()) if item}
+    patterns: List[re.Pattern] = []
+    if not (types_u & {"PACKAGE", "PACKAGE BODY"}):
+        patterns.extend(_build_schema_qualified_reference_patterns(full_name))
+    full_u = (full_name or "").upper()
+    if "." not in full_u:
+        return tuple(patterns)
+    owner_u, name_u = full_u.split(".", 1)
+    owner_re = re.escape(owner_u)
+    name_re = re.escape(name_u)
+    if types_u & {"PACKAGE", "PACKAGE BODY"}:
+        member_token = r'(?:"[A-Z0-9_$#]+"|[A-Z0-9_$#]+)'
+        qualified_member_core = r'\s*\.\s*' + member_token
+        package_prefix_variants = [
+            rf'(?<![A-Z0-9_$#"])' + owner_re + r'\s*\.\s*' + name_re,
+            rf'"{owner_re}"\s*\.\s*"{name_re}"',
+            rf'"{owner_re}"\s*\.\s*' + name_re,
+            rf'(?<![A-Z0-9_$#"])' + owner_re + r'\s*\.\s*"{name_re}"',
+        ]
+        statement_prefix = r'(?:^|[;\n]|\bBEGIN\b|\bTHEN\b|\bELSE\b|\bLOOP\b)\s*'
+        for prefix in package_prefix_variants:
+            patterns.append(re.compile(prefix + qualified_member_core + r'\s*(?=\()'))
+            patterns.append(re.compile(statement_prefix + prefix + qualified_member_core + r'\s*(?=;)'))
+    if types_u & {"PROCEDURE", "FUNCTION"}:
+        patterns.extend([
+            re.compile(rf'(?<![A-Z0-9_$#"])' + owner_re + r'\s*\.\s*' + name_re + r'\s*(?=[(;])'),
+            re.compile(rf'"{owner_re}"\s*\.\s*"{name_re}"\s*(?=[(;])'),
+            re.compile(rf'"{owner_re}"\s*\.\s*' + name_re + r'\s*(?=[(;])'),
+            re.compile(rf'(?<![A-Z0-9_$#"])' + owner_re + r'\s*\.\s*"{name_re}"\s*(?=[(;])'),
+        ])
+    return tuple(patterns)
+
+
+def _build_same_schema_outer_reference_patterns(object_name: str, object_types: Set[str]) -> Tuple[re.Pattern, ...]:
+    name_u = (object_name or "").upper()
+    if not name_u:
+        return tuple()
+    name_re = re.escape(name_u)
+    quoted_name_re = rf'"{name_re}"'
+    name_variants = [name_re, quoted_name_re]
+    types_u = {(item or "").upper() for item in (object_types or set()) if item}
+    patterns: List[re.Pattern] = []
+    statement_prefix = r'(?:^|[;\n]|\bBEGIN\b|\bTHEN\b|\bELSE\b|\bLOOP\b)\s*'
+    if types_u & {"PACKAGE", "PACKAGE BODY"}:
+        member_token = r'(?:"[A-Z0-9_$#]+"|[A-Z0-9_$#]+)'
+        for variant in name_variants:
+            patterns.append(re.compile(statement_prefix + variant + r'\s*\.\s*' + member_token + r'\s*(?=;)'))
+            patterns.append(re.compile(variant + r'\s*\.\s*' + member_token + r'\s*(?=\()'))
+    if types_u & {"PROCEDURE"}:
+        for variant in name_variants:
+            patterns.append(re.compile(statement_prefix + variant + r'\s*(?=[;(])'))
+    if types_u & {"FUNCTION"}:
+        for variant in name_variants:
+            patterns.append(re.compile(r'(?<![A-Z0-9_$#".])' + variant + r'\s*(?=\()'))
+    return tuple(patterns)
+
+
+def _build_same_schema_dynamic_sql_reference_patterns(object_name: str, object_types: Set[str]) -> Tuple[re.Pattern, ...]:
+    name_u = (object_name or "").upper()
+    if not name_u:
+        return tuple()
+    name_re = re.escape(name_u)
+    quoted_name_re = rf'"{name_re}"'
+    name_variants = [name_re, quoted_name_re]
+    types_u = {(item or "").upper() for item in (object_types or set()) if item}
+    patterns: List[re.Pattern] = []
+    table_like = types_u & {"TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM"}
+    if table_like:
+        for variant in name_variants:
+            patterns.append(re.compile(r'\b(?:FROM|JOIN|UPDATE|USING)\b\s+(?:ONLY\s+)?' + variant + r'(?![A-Z0-9_$#"])'))
+            patterns.append(re.compile(r'\b(?:INSERT\s+INTO|MERGE\s+INTO|DELETE\s+FROM|TRUNCATE\s+TABLE|LOCK\s+TABLE|ALTER\s+TABLE|COMMENT\s+ON\s+TABLE)\b\s+' + variant + r'(?![A-Z0-9_$#"])'))
+    if types_u & {"SEQUENCE"}:
+        for variant in name_variants:
+            patterns.append(re.compile(r'(?<![A-Z0-9_$#".])' + variant + r'\s*\.\s*(?:NEXTVAL|CURRVAL)\b'))
+    return tuple(patterns)
+
+
+def _skip_sql_whitespace(sql: str, pos: int) -> int:
+    length = len(sql or "")
+    while pos < length and (sql[pos] or "").isspace():
+        pos += 1
+    return pos
+
+
+def _consume_sql_string_literal(sql: str, pos: int) -> Tuple[Optional[str], int]:
+    if not sql or pos >= len(sql):
+        return None, pos
+    q_pairs = {"[": "]", "{": "}", "(": ")", "<": ">"}
+    if sql[pos] in ("q", "Q") and pos + 2 < len(sql) and sql[pos + 1] == "'":
+        delimiter = sql[pos + 2]
+        if delimiter.isspace():
+            return None, pos
+        end_delim = q_pairs.get(delimiter, delimiter)
+        end_marker = end_delim + "'"
+        end_pos = sql.find(end_marker, pos + 3)
+        if end_pos == -1:
+            return None, pos
+        return sql[pos + 3:end_pos], end_pos + 2
+    if sql[pos] != "'":
+        return None, pos
+    parts: List[str] = []
+    i = pos + 1
+    chunk_start = i
+    while i < len(sql):
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < len(sql) else ""
+        if ch == "'" and nxt == "'":
+            parts.append(sql[chunk_start:i])
+            parts.append("'")
+            i += 2
+            chunk_start = i
+            continue
+        if ch == "'":
+            parts.append(sql[chunk_start:i])
+            return "".join(parts), i + 1
+        i += 1
+    return None, pos
+
+
+def _decode_dynamic_sql_fragment(expr: str) -> Tuple[Optional[str], Optional[str]]:
+    stripped = (expr or "").strip()
+    if not stripped:
+        return "", None
+    literal, end_pos = _consume_sql_string_literal(stripped, _skip_sql_whitespace(stripped, 0))
+    if literal is not None and _skip_sql_whitespace(stripped, end_pos) >= len(stripped):
+        return literal, None
+    chr_match = re.match(r'(?is)^CHR\s*\(\s*(9|10|13|32)\s*\)$', stripped)
+    if chr_match:
+        return chr(int(chr_match.group(1))), None
+    return None, stripped
+
+
+def _split_top_level_concat_parts(expr: str) -> List[str]:
+    if not expr:
+        return []
+    masked = mask_sql_for_scan(expr)
+    parts: List[str] = []
+    depth = 0
+    start = 0
+    i = 0
+    while i < len(masked):
+        ch = masked[i]
+        nxt = masked[i + 1] if i + 1 < len(masked) else ""
+        if ch == '(':
+            depth += 1
+        elif ch == ')' and depth > 0:
+            depth -= 1
+        elif ch == '|' and nxt == '|' and depth == 0:
+            parts.append(expr[start:i].strip())
+            i += 2
+            start = i
+            continue
+        i += 1
+    parts.append(expr[start:].strip())
+    return [part for part in parts if part]
+
+
+def _fold_dynamic_sql_expression(expr: str) -> Tuple[Optional[str], Optional[str]]:
+    stripped = (expr or "").strip()
+    if not stripped:
+        return None, None
+    direct, reason = _decode_dynamic_sql_fragment(stripped)
+    if direct is not None:
+        return direct, None
+    parts = _split_top_level_concat_parts(stripped)
+    if len(parts) <= 1:
+        return None, reason or stripped
+    folded_parts: List[str] = []
+    for part in parts:
+        value, unsupported = _decode_dynamic_sql_fragment(part)
+        if value is None:
+            return None, unsupported or part
+        folded_parts.append(value)
+    return "".join(folded_parts), None
+
+
+def _split_top_level_call_arguments(sql: str, open_pos: int, masked: Optional[str] = None) -> List[str]:
+    if not sql or open_pos < 0 or open_pos >= len(sql) or sql[open_pos] != '(':
+        return []
+    masked_sql = masked if masked is not None else mask_sql_for_scan(sql)
+    args: List[str] = []
+    depth = 0
+    arg_start: Optional[int] = None
+    for idx in range(open_pos, len(masked_sql)):
+        ch = masked_sql[idx]
+        if ch == '(':
+            depth += 1
+            if depth == 1:
+                arg_start = idx + 1
+        elif ch == ')':
+            if depth == 1 and arg_start is not None:
+                args.append(sql[arg_start:idx].strip())
+            depth -= 1
+            if depth == 0:
+                return args
+        elif ch == ',' and depth == 1 and arg_start is not None:
+            args.append(sql[arg_start:idx].strip())
+            arg_start = idx + 1
+    return args
+
+
+def _masked_has_word(masked_sql: str, pos: int, word: str) -> bool:
+    end = pos + len(word)
+    if masked_sql[pos:end] != word:
+        return False
+    prev = masked_sql[pos - 1] if pos > 0 else ' '
+    nxt = masked_sql[end] if end < len(masked_sql) else ' '
+    word_chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$#"'
+    return prev not in word_chars and nxt not in word_chars
+
+
+def _extract_execute_immediate_expression(sql: str, start_pos: int, masked_sql: Optional[str] = None) -> str:
+    masked = (masked_sql if masked_sql is not None else mask_sql_for_scan(sql)).upper()
+    pos = _skip_sql_whitespace(sql, start_pos)
+    depth = 0
+    i = pos
+    while i < len(masked):
+        ch = masked[i]
+        if ch == '(':
+            depth += 1
+        elif ch == ')' and depth > 0:
+            depth -= 1
+        elif depth == 0:
+            if ch == ';':
+                return sql[pos:i].strip()
+            if any(_masked_has_word(masked, i, word) for word in ('INTO', 'USING', 'RETURNING')):
+                return sql[pos:i].strip()
+        i += 1
+    return sql[pos:].strip()
+
+
+def _extract_dynamic_sql_literals_for_scan(sql: str) -> Tuple[List[str], List[str]]:
+    if not sql:
+        return [], []
+    masked = mask_sql_for_scan(sql).upper()
+    literals: List[str] = []
+    ambiguities: List[str] = []
+    seen_literals: Set[str] = set()
+    seen_ambiguities: Set[str] = set()
+
+    def _append_literal(text: Optional[str]) -> None:
+        raw = (text or "").strip()
+        if not raw:
+            return
+        key = raw.upper()
+        if key in seen_literals:
+            return
+        seen_literals.add(key)
+        literals.append(raw)
+
+    def _append_ambiguity(source: str, expr: Optional[str], reason: Optional[str]) -> None:
+        preview = " ".join((expr or "").strip().split())[:160] or "-"
+        detail = f"{source}:{(reason or 'UNRESOLVED')}:{preview}"
+        if detail in seen_ambiguities:
+            return
+        seen_ambiguities.add(detail)
+        ambiguities.append(detail)
+
+    for match in re.finditer(r'\bEXECUTE\s+IMMEDIATE\b', masked):
+        expr = _extract_execute_immediate_expression(sql, match.end(), masked)
+        folded, reason = _fold_dynamic_sql_expression(expr)
+        if folded is not None:
+            _append_literal(folded)
+        else:
+            _append_ambiguity('EXECUTE_IMMEDIATE', expr, reason)
+
+    for match in re.finditer(r'\bDBMS_SQL\s*\.\s*PARSE\s*\(', masked):
+        open_pos = masked.find("(", match.start())
+        if open_pos == -1:
+            continue
+        args = _split_top_level_call_arguments(sql, open_pos, masked)
+        if not args:
+            continue
+        candidate_expr: Optional[str] = None
+        for arg in args:
+            stripped = arg.strip()
+            if re.match(r'(?is)^statement\s*=>', stripped):
+                candidate_expr = re.sub(r'(?is)^statement\s*=>', '', stripped, count=1).strip()
+                break
+        if candidate_expr is None and len(args) >= 2:
+            candidate_expr = args[1].strip()
+        if not candidate_expr:
+            continue
+        folded, reason = _fold_dynamic_sql_expression(candidate_expr)
+        if folded is not None:
+            _append_literal(folded)
+        else:
+            _append_ambiguity('DBMS_SQL.PARSE', candidate_expr, reason)
+
+    return literals, ambiguities
+
+
+def build_scoped_text_reference_seed_rows(
+    scope_result: ScopedSourceScopeResult,
+    text_index: Dict[DependencyNode, str],
+    diagnostic_rows: Optional[List[Tuple[str, str, str, str]]] = None,
+) -> List[Tuple[DependencyNode, str, str]]:
+    if not scope_result or not text_index:
+        return []
+    candidate_types_by_full: Dict[str, Set[str]] = defaultdict(set)
+    for full, obj_type in (scope_result.included_nodes or frozenset()):
+        full_u = (full or "").upper()
+        type_u = (obj_type or "").upper()
+        if full_u and type_u in SCOPED_TEXT_REFERENCE_TARGET_TYPES:
+            candidate_types_by_full[full_u].add(type_u)
+    if not candidate_types_by_full:
+        return []
+    patterns: List[Tuple[str, Tuple[re.Pattern, ...]]] = []
+    same_schema_outer_patterns: Dict[str, List[Tuple[str, Tuple[re.Pattern, ...]]]] = defaultdict(list)
+    same_schema_dynamic_patterns: Dict[str, List[Tuple[str, Tuple[re.Pattern, ...]]]] = defaultdict(list)
+    for full_u in sorted(candidate_types_by_full):
+        candidate_types = candidate_types_by_full.get(full_u) or set()
+        regexes = _build_scoped_reference_patterns(full_u, candidate_types)
+        if regexes:
+            patterns.append((full_u, regexes))
+        if "." in full_u:
+            owner_u, name_u = full_u.split(".", 1)
+            outer_regexes = _build_same_schema_outer_reference_patterns(name_u, candidate_types)
+            if outer_regexes:
+                same_schema_outer_patterns[owner_u].append((full_u, outer_regexes))
+            dynamic_regexes = _build_same_schema_dynamic_sql_reference_patterns(name_u, candidate_types)
+            if dynamic_regexes:
+                same_schema_dynamic_patterns[owner_u].append((full_u, dynamic_regexes))
+    rows: List[Tuple[DependencyNode, str, str]] = []
+    seen: Set[DependencyNode] = set()
+    for node, raw_text in sorted((text_index or {}).items(), key=lambda item: (item[0][1], item[0][0])):
+        if node in seen:
+            continue
+        type_u = (node[1] or "").upper()
+        if type_u not in SCOPED_TEXT_REFERENCE_ELIGIBLE_TYPES:
+            continue
+        raw_text = raw_text or ""
+        cleaned_text = mask_sql_for_scan(raw_text).upper()
+        dynamic_sql_texts_raw, dynamic_sql_ambiguities = _extract_dynamic_sql_literals_for_scan(raw_text)
+        dynamic_sql_texts = [item.upper() for item in dynamic_sql_texts_raw]
+        if not cleaned_text and not dynamic_sql_texts and not dynamic_sql_ambiguities:
+            continue
+        node_owner = (node[0].split('.', 1)[0].upper() if '.' in (node[0] or '') else "")
+        matched_full: Optional[str] = None
+        for full_u, regexes in patterns:
+            if any(regex.search(cleaned_text) for regex in regexes) or any(
+                regex.search(dynamic_text)
+                for dynamic_text in dynamic_sql_texts
+                for regex in regexes
+            ):
+                matched_full = full_u
+                break
+        if matched_full is None and node_owner:
+            for full_u, regexes in same_schema_outer_patterns.get(node_owner, []):
+                if any(regex.search(cleaned_text) for regex in regexes):
+                    matched_full = full_u
+                    break
+        if matched_full is None and node_owner and dynamic_sql_texts:
+            for full_u, regexes in same_schema_dynamic_patterns.get(node_owner, []):
+                if any(
+                    regex.search(dynamic_text)
+                    for dynamic_text in dynamic_sql_texts
+                    for regex in regexes
+                ):
+                    matched_full = full_u
+                    break
+        if matched_full is not None:
+            rows.append((node, "TEXT_REFERENCE_HEURISTIC", f"MATCH:{matched_full}"))
+            seen.add(node)
+        elif diagnostic_rows is not None:
+            for detail in dynamic_sql_ambiguities:
+                diagnostic_rows.append(("TEXT_REFERENCE_AMBIGUOUS", type_u, (node[0] or "").upper(), detail))
+    return rows
 
 
 def should_load_constraint_metadata(
@@ -5124,7 +5592,7 @@ def load_hint_allowlist_file(path_value: Optional[str]) -> Set[str]:
         return set()
     path = Path(str(path_value).strip()).expanduser()
     try:
-        raw_lines = path.read_text(encoding="utf-8").splitlines()
+        raw_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError as exc:
         log.warning("ddl_hint_allowlist_file 读取失败: %s (%s)", path, exc)
         return set()
@@ -5148,7 +5616,7 @@ def chunk_list(items: List[str], size: int) -> List[List[str]]:
 
 def build_bind_placeholders(count: int, offset: int = 0) -> str:
     if count <= 0:
-        return ""
+        return "NULL"
     return ",".join(f":{i+1+offset}" for i in range(count))
 
 
@@ -6081,6 +6549,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('trigger_list', '')
         settings.setdefault('trigger_qualify_schema', 'true')
         settings.setdefault('source_object_scope_mode', 'full_source')
+        settings.setdefault('remap_scope_text_fallback_mode', 'off')
         settings.setdefault('check_status_drift_types', 'trigger,constraint')
         settings.setdefault('generate_status_fixup', 'true')
         settings.setdefault('status_fixup_types', 'trigger,constraint')
@@ -6427,6 +6896,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         )
         settings['source_object_scope_mode'] = normalize_source_object_scope_mode(
             settings.get('source_object_scope_mode', 'full_source')
+        )
+        settings['remap_scope_text_fallback_mode'] = normalize_remap_scope_text_fallback_mode(
+            settings.get('remap_scope_text_fallback_mode', 'off')
         )
         settings['report_dir_layout'] = normalize_report_dir_layout(
             settings.get('report_dir_layout', 'per_run')
@@ -7073,6 +7545,14 @@ def run_config_wizard(config_path: Path) -> None:
         if normalized in SOURCE_OBJECT_SCOPE_MODE_VALUES:
             return True, ""
         return False, "仅支持 full_source/remap_root_closure"
+
+    def _validate_remap_scope_text_fallback_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = REMAP_SCOPE_TEXT_FALLBACK_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in REMAP_SCOPE_TEXT_FALLBACK_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 off/safe"
 
     def _validate_report_detail_mode(val: str) -> Tuple[bool, str]:
         if not val.strip():
@@ -7782,6 +8262,14 @@ def run_config_wizard(config_path: Path) -> None:
     )
     _prompt_field(
         "SETTINGS",
+        "remap_scope_text_fallback_mode",
+        "scoped 文本补盲模式 (off/safe，默认 off)",
+        default=cfg.get("SETTINGS", "remap_scope_text_fallback_mode", fallback="off"),
+        validator=_validate_remap_scope_text_fallback_mode,
+        transform=normalize_remap_scope_text_fallback_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
         "generate_status_fixup",
         "是否生成状态漂移修复脚本 (true/false，默认 true)",
         default=cfg.get("SETTINGS", "generate_status_fixup", fallback="true"),
@@ -8094,7 +8582,7 @@ def load_remap_rules(file_path: str) -> RemapRules:
     log.info(f"正在加载 Remap 规则文件: {file_path}")
     rules: RemapRules = {}
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
             for i, line in enumerate(f):
                 line = line.strip()
                 # 支持行内注释：仅在注释符前存在空白时生效，避免误伤对象名中的 '#'
@@ -8142,7 +8630,7 @@ def parse_trigger_list_file(
 
     path = Path(file_path).expanduser()
     try:
-        with path.open("r", encoding="utf-8") as fp:
+        with path.open("r", encoding="utf-8", errors="replace") as fp:
             for line_no, raw in enumerate(fp, start=1):
                 line = raw.strip()
                 if not line or line.startswith("#"):
@@ -9474,6 +9962,13 @@ def paired_object_types_for(obj_type: str) -> Tuple[str, ...]:
     return ()
 
 
+REVERSE_DEPENDENCY_EXPAND_SOURCE_TYPES: Set[str] = {"TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM"}
+
+
+def should_expand_reverse_dependency(obj_type: str) -> bool:
+    return (obj_type or "").upper() in REVERSE_DEPENDENCY_EXPAND_SOURCE_TYPES
+
+
 def build_source_scope_closure(
     source_objects: SourceObjectMap,
     dependency_graph: Optional[DependencyGraph],
@@ -9500,6 +9995,7 @@ def build_source_scope_closure(
     enqueued: Set[DependencyNode] = set()
     queue: deque = deque()
     detail_rows: List[Tuple[str, str, str, str]] = []
+    blocked_reverse_nodes: Dict[DependencyNode, str] = {}
     source_objects = source_objects or {}
 
     def _queue(node: DependencyNode, status: str, detail: str) -> None:
@@ -9537,18 +10033,37 @@ def build_source_scope_closure(
             if paired_type in source_objects.get(full_u, set()):
                 _queue((full_u, paired_type), "PAIRED_OBJECT", "%s:%s" % (type_u, full_u))
 
+        parent_full = (object_parent_map.get(full_u) or "").upper() if object_parent_map else ""
+        if parent_full:
+            parent_types = {
+                (obj_type or "").upper()
+                for obj_type in source_objects.get(parent_full, set())
+                if obj_type
+            }
+            for parent_type in sorted(parent_types):
+                _queue((parent_full, parent_type), "PARENT_OBJECT", "%s:%s" % (type_u, full_u))
+
         for child_node in sorted(reverse_attached.get(full_u, set()), key=lambda item: (item[1], item[0])):
             _queue(child_node, "ATTACHED_OBJECT", "%s:%s" % (type_u, full_u))
 
         for ref_full, ref_type in sorted(dependency_graph.get((full_u, type_u), set()) if dependency_graph else set(), key=lambda item: (item[1], item[0])):
             _queue((ref_full.upper(), ref_type.upper()), "DEPENDENCY", "%s:%s" % (type_u, full_u))
 
-        for dep_full, dep_type in sorted(reverse_dependency_graph.get((full_u, type_u), set()), key=lambda item: (item[1], item[0])):
-            _queue((dep_full.upper(), dep_type.upper()), "REVERSE_DEPENDENCY", "%s:%s" % (type_u, full_u))
+        reverse_edges = sorted(reverse_dependency_graph.get((full_u, type_u), set()), key=lambda item: (item[1], item[0]))
+        if should_expand_reverse_dependency(type_u):
+            for dep_full, dep_type in reverse_edges:
+                _queue((dep_full.upper(), dep_type.upper()), "REVERSE_DEPENDENCY", "%s:%s" % (type_u, full_u))
+        else:
+            for dep_full, dep_type in reverse_edges:
+                blocked_reverse_nodes[((dep_full or "").upper(), (dep_type or "").upper())] = f"REVERSE_DEPENDENCY_BOUNDARY:{type_u}:{full_u}"
 
     excluded_nodes = all_nodes - included_nodes
     for full_u, type_u in sorted(excluded_nodes, key=lambda item: (item[1], item[0])):
-        detail_rows.append(("FILTERED_OUT", type_u, full_u, "OUTSIDE_REMAP_ROOT_CLOSURE"))
+        boundary_detail = blocked_reverse_nodes.get((full_u, type_u))
+        if boundary_detail:
+            detail_rows.append(("REVERSE_BOUNDARY_SKIPPED", type_u, full_u, boundary_detail))
+        else:
+            detail_rows.append(("FILTERED_OUT", type_u, full_u, "OUTSIDE_REMAP_ROOT_CLOSURE"))
 
     return ScopedSourceScopeResult(
         mode=mode,
@@ -9558,6 +10073,212 @@ def build_source_scope_closure(
         excluded_nodes=frozenset(excluded_nodes),
         detail_rows=tuple(detail_rows),
     )
+
+
+def load_oracle_scoped_text_reference_index(
+    ora_cfg: OraConfig,
+    candidate_nodes: Set[DependencyNode],
+) -> Dict[DependencyNode, str]:
+    if not candidate_nodes:
+        return {}
+
+    candidate_keys = {
+        ((full or "").upper(), (obj_type or "").upper())
+        for full, obj_type in candidate_nodes
+        if (full or "").upper() and (obj_type or "").upper() in SCOPED_TEXT_REFERENCE_ELIGIBLE_TYPES
+    }
+    if not candidate_keys:
+        return {}
+
+    keys_by_type_owner: Dict[str, Dict[str, Set[str]]] = defaultdict(lambda: defaultdict(set))
+    for full_u, obj_type_u in candidate_keys:
+        if "." not in full_u:
+            continue
+        owner_u, name_u = full_u.split(".", 1)
+        keys_by_type_owner[obj_type_u][owner_u].add(name_u)
+
+    text_map_parts: Dict[DependencyNode, List[str]] = defaultdict(list)
+
+    def _append(key: DependencyNode, value: object) -> None:
+        if value is None:
+            return
+        text_value = str(value)
+        if text_value:
+            text_map_parts[key].append(text_value)
+
+    try:
+        with oracledb.connect(
+            user=ora_cfg['user'],
+            password=ora_cfg['password'],
+            dsn=ora_cfg['dsn']
+        ) as connection:
+            with connection.cursor() as cursor:
+                for obj_type_u in sorted({"PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE BODY", "TYPE", "TYPE BODY", "TRIGGER"} & set(keys_by_type_owner.keys())):
+                    for owner_u, names in sorted(keys_by_type_owner[obj_type_u].items()):
+                        for name_chunk in chunk_list(sorted(names), ORACLE_IN_BATCH_SIZE):
+                            if not name_chunk:
+                                continue
+                            name_ph = build_bind_placeholders(len(name_chunk), offset=2)
+                            sql = f"""
+                                SELECT OWNER, NAME, TYPE, LINE, TEXT
+                                FROM DBA_SOURCE
+                                WHERE OWNER = :1
+                                  AND TYPE = :2
+                                  AND NAME IN ({name_ph})
+                                ORDER BY OWNER, NAME, TYPE, LINE
+                            """
+                            cursor.execute(sql, [owner_u, obj_type_u] + name_chunk)
+                            for row in cursor:
+                                owner_found = (row[0] or "").strip().upper()
+                                name_found = (row[1] or "").strip().upper()
+                                type_found = (row[2] or "").strip().upper()
+                                key = (f"{owner_found}.{name_found}", type_found)
+                                if key not in candidate_keys:
+                                    continue
+                                _append(key, row[4])
+
+                query_specs = [
+                    ("VIEW", "DBA_VIEWS", "VIEW_NAME", "TEXT"),
+                    ("MATERIALIZED VIEW", "DBA_MVIEWS", "MVIEW_NAME", "QUERY"),
+                    ("JOB", "DBA_SCHEDULER_JOBS", "JOB_NAME", "JOB_ACTION"),
+                    ("SCHEDULE", "DBA_SCHEDULER_SCHEDULES", "SCHEDULE_NAME", "REPEAT_INTERVAL"),
+                ]
+                for obj_type_u, table_name, name_col, text_col in query_specs:
+                    owner_map = keys_by_type_owner.get(obj_type_u) or {}
+                    for owner_u, names in sorted(owner_map.items()):
+                        for name_chunk in chunk_list(sorted(names), ORACLE_IN_BATCH_SIZE):
+                            if not name_chunk:
+                                continue
+                            name_ph = build_bind_placeholders(len(name_chunk), offset=1)
+                            sql = f"""
+                                SELECT OWNER, {name_col}, {text_col}
+                                FROM {table_name}
+                                WHERE OWNER = :1
+                                  AND {name_col} IN ({name_ph})
+                            """
+                            cursor.execute(sql, [owner_u] + name_chunk)
+                            for row in cursor:
+                                owner_found = (row[0] or "").strip().upper()
+                                name_found = (row[1] or "").strip().upper()
+                                key = (f"{owner_found}.{name_found}", obj_type_u)
+                                if key not in candidate_keys:
+                                    continue
+                                _append(key, row[2])
+    except oracledb.Error as exc:
+        log.warning("读取 scoped text reference 元数据失败，将跳过 safe text fallback: %s", exc)
+        return {}
+
+    return {
+        key: "\n".join(parts)
+        for key, parts in text_map_parts.items()
+        if parts
+    }
+
+
+def extend_source_scope_result_with_seed_rows(
+    scope_result: ScopedSourceScopeResult,
+    source_objects: SourceObjectMap,
+    dependency_graph: Optional[DependencyGraph],
+    object_parent_map: Optional["ObjectParentMap"],
+    seed_rows: List[Tuple[DependencyNode, str, str]],
+    explicit_trigger_keep_nodes: Optional[Set[DependencyNode]] = None,
+    explicit_trigger_detail_rows: Optional[List[Tuple[str, str, str, str]]] = None,
+) -> ScopedSourceScopeResult:
+    if not seed_rows:
+        return scope_result
+    extra_seed_nodes = {node for node, _status, _detail in seed_rows}
+    extra_result = build_source_scope_closure(
+        source_objects,
+        dependency_graph,
+        object_parent_map,
+        extra_seed_nodes,
+        explicit_trigger_keep_nodes=explicit_trigger_keep_nodes,
+        explicit_trigger_detail_rows=explicit_trigger_detail_rows,
+        mode=scope_result.mode,
+    )
+    override_map = {
+        ((node[0] or "").upper(), (node[1] or "").upper()): (status, detail)
+        for node, status, detail in seed_rows
+    }
+    existing_nodes = set(scope_result.included_nodes or frozenset())
+    merged_included = set(existing_nodes)
+    merged_detail_rows = list(scope_result.detail_rows or ())
+    for status, obj_type, full_u, detail in (extra_result.detail_rows or ()):
+        node_key = ((full_u or "").upper(), (obj_type or "").upper())
+        if node_key in existing_nodes:
+            continue
+        if status in {"FILTERED_OUT", "REVERSE_BOUNDARY_SKIPPED"}:
+            continue
+        if node_key in override_map and status == "ROOT_REMAP":
+            status, detail = override_map[node_key]
+        merged_included.add(node_key)
+        merged_detail_rows.append((status, obj_type, full_u, detail))
+    excluded_nodes = collect_source_object_nodes(source_objects) - merged_included
+    excluded_set = frozenset(excluded_nodes)
+    filtered_detail_rows = []
+    for status, obj_type, full_u, detail in merged_detail_rows:
+        node_key = ((full_u or "").upper(), (obj_type or "").upper())
+        if status in {"FILTERED_OUT", "REVERSE_BOUNDARY_SKIPPED"} and node_key not in excluded_set:
+            continue
+        filtered_detail_rows.append((status, obj_type, full_u, detail))
+    return scope_result._replace(
+        included_nodes=frozenset(merged_included),
+        excluded_nodes=excluded_set,
+        detail_rows=tuple(filtered_detail_rows),
+    )
+
+
+MAX_SCOPED_TEXT_FALLBACK_ROUNDS = 50
+
+
+def apply_scoped_text_reference_fallback(
+    ora_cfg: OraConfig,
+    scope_result: ScopedSourceScopeResult,
+    source_objects: SourceObjectMap,
+    dependency_graph: Optional[DependencyGraph],
+    object_parent_map: Optional["ObjectParentMap"],
+    explicit_trigger_keep_nodes: Optional[Set[DependencyNode]] = None,
+    explicit_trigger_detail_rows: Optional[List[Tuple[str, str, str, str]]] = None,
+    max_rounds: int = MAX_SCOPED_TEXT_FALLBACK_ROUNDS,
+) -> Tuple[ScopedSourceScopeResult, int]:
+    total_added = 0
+    for _round in range(max_rounds):
+        scoped_text_index = load_oracle_scoped_text_reference_index(
+            ora_cfg,
+            set(scope_result.excluded_nodes or frozenset()),
+        )
+        diagnostic_rows: List[Tuple[str, str, str, str]] = []
+        text_seed_rows = build_scoped_text_reference_seed_rows(
+            scope_result,
+            scoped_text_index,
+            diagnostic_rows=diagnostic_rows,
+        )
+        if diagnostic_rows:
+            existing_detail_rows = list(scope_result.detail_rows or ())
+            existing_diag = {(status, obj_type, full_u, detail) for status, obj_type, full_u, detail in existing_detail_rows}
+            for row in diagnostic_rows:
+                if row not in existing_diag:
+                    existing_detail_rows.append(row)
+                    existing_diag.add(row)
+            scope_result = scope_result._replace(detail_rows=tuple(existing_detail_rows))
+        if not text_seed_rows:
+            return scope_result, total_added
+        total_added += len(text_seed_rows)
+        next_scope = extend_source_scope_result_with_seed_rows(
+            scope_result,
+            source_objects,
+            dependency_graph,
+            object_parent_map,
+            text_seed_rows,
+            explicit_trigger_keep_nodes=explicit_trigger_keep_nodes,
+            explicit_trigger_detail_rows=explicit_trigger_detail_rows,
+        )
+        if next_scope.included_nodes == scope_result.included_nodes:
+            log.warning("[SOURCE_SCOPE] safe text fallback 在第 %d 轮无进展，停止继续扩展。", _round + 1)
+            return scope_result, total_added
+        scope_result = next_scope
+    log.warning("[SOURCE_SCOPE] safe text fallback 达到最大轮次 %d，强制退出。", max_rounds)
+    return scope_result, total_added
 
 
 def classify_missing_objects(
@@ -10640,6 +11361,133 @@ def summarize_missing_created_keys(
     return ", ".join(count_parts), "; ".join(sample_parts)
 
 
+DEFAULT_SEQUENCE_SUFFIX_PATTERN = r'"?(?:NEXTVAL|CURRVAL)"?(?![A-Z0-9_$#"])'
+DEFAULT_SEQUENCE_QUALIFIED_PATTERN = re.compile(
+    r'(?<![A-Z0-9_$#".])(?P<schema>"[^"]+"|[A-Z0-9_$#]+)\s*\.\s*(?P<name>"[^"]+"|[A-Z0-9_$#]+)\s*\.\s*(?P<suffix>'
+    + DEFAULT_SEQUENCE_SUFFIX_PATTERN
+    + r')',
+    re.IGNORECASE,
+)
+DEFAULT_SEQUENCE_UNQUALIFIED_PATTERN = re.compile(
+    r'(?<![A-Z0-9_$#".])(?P<name>"[^"]+"|[A-Z0-9_$#]+)\s*\.\s*(?P<suffix>'
+    + DEFAULT_SEQUENCE_SUFFIX_PATTERN
+    + r')',
+    re.IGNORECASE,
+)
+
+
+def extract_default_sequence_dependency_targets(
+    data_default: Optional[object],
+    owner: str,
+    source_objects: Optional[SourceObjectMap],
+) -> Set[DependencyNode]:
+    expr = str(data_default or "").upper()
+    if not expr or "NEXTVAL" not in expr and "CURRVAL" not in expr:
+        return set()
+    source_objects = source_objects or {}
+    owner_u = (owner or "").upper()
+    result: Set[DependencyNode] = set()
+
+    def _add_candidate(schema_u: str, name_u: str) -> None:
+        for full_u in (f"{schema_u}.{name_u}", f"PUBLIC.{name_u}") if schema_u == owner_u else (f"{schema_u}.{name_u}",):
+            types = {(item or "").upper() for item in (source_objects.get(full_u) or set()) if item}
+            for type_u in ("SEQUENCE", "SYNONYM"):
+                if type_u in types:
+                    result.add((full_u, type_u))
+
+    for match in DEFAULT_SEQUENCE_QUALIFIED_PATTERN.finditer(expr):
+        schema_u = normalize_identifier_name(match.group('schema'))
+        name_u = normalize_identifier_name(match.group('name'))
+        if schema_u and name_u:
+            _add_candidate(schema_u, name_u)
+    for match in DEFAULT_SEQUENCE_UNQUALIFIED_PATTERN.finditer(expr):
+        name_u = normalize_identifier_name(match.group('name'))
+        if name_u:
+            _add_candidate(owner_u, name_u)
+    return result
+
+
+def build_default_sequence_dependency_records_from_table_columns(
+    source_objects: Optional[SourceObjectMap],
+    table_columns: Optional[Dict[Tuple[str, str], Dict[str, Dict]]],
+) -> List[DependencyRecord]:
+    source_objects = source_objects or {}
+    table_columns = table_columns or {}
+    records: Set[DependencyRecord] = set()
+    for (owner_u, table_u), column_map in sorted(table_columns.items()):
+        table_full = f"{(owner_u or '').upper()}.{(table_u or '').upper()}"
+        if 'TABLE' not in {(item or '').upper() for item in (source_objects.get(table_full) or set()) if item}:
+            continue
+        for column_meta in (column_map or {}).values():
+            targets = extract_default_sequence_dependency_targets(
+                (column_meta or {}).get('data_default'),
+                (owner_u or '').upper(),
+                source_objects,
+            )
+            for ref_full, ref_type in targets:
+                if '.' not in ref_full:
+                    continue
+                ref_owner, ref_name = ref_full.split('.', 1)
+                records.add(DependencyRecord(
+                    owner=(owner_u or '').upper(),
+                    name=(table_u or '').upper(),
+                    object_type='TABLE',
+                    referenced_owner=ref_owner,
+                    referenced_name=ref_name,
+                    referenced_type=ref_type,
+                ))
+    return sorted(records, key=lambda item: (item.owner, item.name, item.referenced_owner, item.referenced_name, item.referenced_type))
+
+
+def load_oracle_default_sequence_dependency_records(
+    ora_cfg: OraConfig,
+    source_objects: Optional[SourceObjectMap],
+) -> List[DependencyRecord]:
+    source_objects = source_objects or {}
+    table_pairs_by_owner: Dict[str, Set[str]] = defaultdict(set)
+    for full_u, obj_types in source_objects.items():
+        types_u = {(item or '').upper() for item in (obj_types or set()) if item}
+        if 'TABLE' not in types_u or '.' not in (full_u or ''):
+            continue
+        owner_u, table_u = full_u.upper().split('.', 1)
+        table_pairs_by_owner[owner_u].add(table_u)
+    if not table_pairs_by_owner:
+        return []
+
+    table_columns: Dict[Tuple[str, str], Dict[str, Dict]] = {}
+    try:
+        with oracledb.connect(user=ora_cfg['user'], password=ora_cfg['password'], dsn=ora_cfg['dsn']) as connection:
+            with connection.cursor() as cursor:
+                for owner_u, table_names in sorted(table_pairs_by_owner.items()):
+                    for table_chunk in chunk_list(sorted(table_names), ORACLE_IN_BATCH_SIZE):
+                        table_ph = build_bind_placeholders(len(table_chunk), offset=1)
+                        sql = f"""
+                            SELECT OWNER, TABLE_NAME, COLUMN_NAME, DATA_DEFAULT
+                            FROM DBA_TAB_COLUMNS
+                            WHERE OWNER = :1
+                              AND TABLE_NAME IN ({table_ph})
+                              AND DATA_DEFAULT IS NOT NULL
+                        """
+                        cursor.execute(sql, [owner_u] + table_chunk)
+                        for row in cursor:
+                            owner = (row[0] or '').strip().upper()
+                            table = (row[1] or '').strip().upper()
+                            col = (row[2] or '').strip().upper()
+                            if not owner or not table or not col:
+                                continue
+                            table_columns.setdefault((owner, table), {})[col] = {
+                                'data_default': row[3],
+                            }
+    except oracledb.Error as exc:
+        log.warning('[SOURCE_SCOPE] 读取 Oracle DATA_DEFAULT 序列依赖失败，将跳过 TABLE 默认值的 SEQUENCE 补边: %s', exc)
+        return []
+
+    rows = build_default_sequence_dependency_records_from_table_columns(source_objects, table_columns)
+    if rows:
+        log.info('[SOURCE_SCOPE] 已从 Oracle 列默认值补充 TABLE->SEQUENCE/SYNONYM 依赖 %d 条。', len(rows))
+    return rows
+
+
 def get_source_objects(
     ora_cfg: OraConfig,
     schemas_list: List[str],
@@ -10658,6 +11506,8 @@ def get_source_objects(
     enabled_types = {t.upper() for t in (object_types or set(ALL_TRACKED_OBJECT_TYPES))}
     enabled_types &= set(ALL_TRACKED_OBJECT_TYPES)
     include_synonyms = 'SYNONYM' in enabled_types
+    include_jobs = 'JOB' in enabled_types
+    include_schedules = 'SCHEDULE' in enabled_types
     synonym_scope = normalize_synonym_check_scope(synonym_check_scope)
     object_types_for_objects = set(enabled_types)
     if include_synonyms:
@@ -10805,6 +11655,32 @@ def get_source_objects(
                                     table_name=table_name,
                                     db_link=None,
                                 )
+            if include_jobs:
+                with connection.cursor() as cursor:
+                    for placeholders, chunk in iter_in_chunks(schemas_list):
+                        cursor.execute(
+                            f"SELECT OWNER, JOB_NAME FROM DBA_SCHEDULER_JOBS WHERE OWNER IN ({placeholders})",
+                            chunk
+                        )
+                        for row in cursor:
+                            owner = (row[0] or '').strip().upper()
+                            name = (row[1] or '').strip().upper()
+                            if owner and name:
+                                source_objects[f"{owner}.{name}"].add('JOB')
+
+            if include_schedules:
+                with connection.cursor() as cursor:
+                    for placeholders, chunk in iter_in_chunks(schemas_list):
+                        cursor.execute(
+                            f"SELECT OWNER, SCHEDULE_NAME FROM DBA_SCHEDULER_SCHEDULES WHERE OWNER IN ({placeholders})",
+                            chunk
+                        )
+                        for row in cursor:
+                            owner = (row[0] or '').strip().upper()
+                            name = (row[1] or '').strip().upper()
+                            if owner and name:
+                                source_objects[f"{owner}.{name}"].add('SCHEDULE')
+
             # 精确认定物化视图集合，避免误删真实表
             with connection.cursor() as cursor:
                 for placeholders, chunk in iter_in_chunks(schemas_list):
@@ -11486,7 +12362,7 @@ def validate_remap_rules(
         if remap_file_path:
             remap_path = Path(remap_file_path).expanduser()
             try:
-                raw_lines = remap_path.read_text(encoding="utf-8").splitlines()
+                raw_lines = remap_path.read_text(encoding="utf-8", errors="replace").splitlines()
             except OSError as exc:
                 log.warning("  [规则警告] 无法读取 remap 文件以清洗无效条目: %s", exc)
             else:
@@ -12020,6 +12896,9 @@ def infer_target_schema_from_dependencies(
     return None, True
 
 
+MAX_REMAP_TARGET_DEPTH = 64
+
+
 def resolve_remap_target(
     src_name: str,
     obj_type: str,
@@ -12049,6 +12928,10 @@ def resolve_remap_target(
     sequence_policy = (sequence_remap_policy or "source_only").lower()
     path = _path if _path is not None else set()
     node = (src_name_u, obj_type_u)
+    if len(path) >= MAX_REMAP_TARGET_DEPTH:
+        if remap_conflicts is not None:
+            remap_conflicts.setdefault((src_name_u, obj_type_u), f"递归推导超过最大深度 {MAX_REMAP_TARGET_DEPTH}")
+        return None
     if node in path:
         return None
     path.add(node)
@@ -14705,6 +15588,44 @@ def dump_ob_metadata(
             full = f"{owner}.{name}"
             objects_by_type.setdefault(obj_type, set()).add(full)
             object_statuses[(owner, name, obj_type)] = status or "UNKNOWN"
+
+    if 'JOB' in object_types_filter:
+        sql_jobs_tpl = """
+            SELECT OWNER, JOB_NAME
+            FROM DBA_SCHEDULER_JOBS
+            WHERE OWNER IN ({owners_in})
+        """
+        ok_jobs, job_lines, err_jobs = obclient_query_by_owner_chunks(ob_cfg, sql_jobs_tpl, owners_in_list)
+        if not ok_jobs:
+            log.warning("读取 OB DBA_SCHEDULER_JOBS 失败，JOB 检查可能不完整: %s", err_jobs)
+        elif job_lines:
+            for line in job_lines:
+                parts = line.split('\t')
+                if len(parts) < 2:
+                    continue
+                owner = parts[0].strip().upper()
+                name = parts[1].strip().upper()
+                if owner and name:
+                    objects_by_type.setdefault('JOB', set()).add(f"{owner}.{name}")
+
+    if 'SCHEDULE' in object_types_filter:
+        sql_sched_tpl = """
+            SELECT OWNER, SCHEDULE_NAME
+            FROM DBA_SCHEDULER_SCHEDULES
+            WHERE OWNER IN ({owners_in})
+        """
+        ok_sched, sched_lines, err_sched = obclient_query_by_owner_chunks(ob_cfg, sql_sched_tpl, owners_in_list)
+        if not ok_sched:
+            log.warning("读取 OB DBA_SCHEDULER_SCHEDULES 失败，SCHEDULE 检查可能不完整: %s", err_sched)
+        elif sched_lines:
+            for line in sched_lines:
+                parts = line.split('\t')
+                if len(parts) < 2:
+                    continue
+                owner = parts[0].strip().upper()
+                name = parts[1].strip().upper()
+                if owner and name:
+                    objects_by_type.setdefault('SCHEDULE', set()).add(f"{owner}.{name}")
 
     case_sensitive_findings = handle_case_sensitive_identifiers(
         case_sensitive_issues,
@@ -17909,9 +18830,9 @@ def dump_oracle_metadata(
         if value is None:
             return None
         try:
-            return value.upper()
+            return value.strip().upper()
         except AttributeError:
-            return str(value).upper()
+            return str(value).strip().upper()
 
     try:
         with oracledb.connect(
@@ -21141,7 +22062,7 @@ def resolve_privilege_target(
     remap_rules: RemapRules,
     source_objects: Optional[SourceObjectMap],
     schema_mapping: Optional[Dict[str, str]],
-    object_parent_map: Optional[ObjectParentMap],
+    object_parent_map: Optional["ObjectParentMap"],
     dependency_graph: Optional[DependencyGraph],
     transitive_table_cache: Optional[TransitiveTableCache],
     source_dependencies: Optional[SourceDependencySet],
@@ -21218,7 +22139,7 @@ def build_dependency_pairs_for_grants(
     remap_rules: RemapRules,
     source_objects: Optional[SourceObjectMap],
     schema_mapping: Optional[Dict[str, str]],
-    object_parent_map: Optional[ObjectParentMap],
+    object_parent_map: Optional["ObjectParentMap"],
     dependency_graph: Optional[DependencyGraph],
     transitive_table_cache: Optional[TransitiveTableCache],
     source_dependencies: Optional[SourceDependencySet],
@@ -21426,7 +22347,7 @@ def build_grant_plan(
     remap_rules: RemapRules,
     source_objects: Optional[SourceObjectMap],
     schema_mapping: Optional[Dict[str, str]],
-    object_parent_map: Optional[ObjectParentMap],
+    object_parent_map: Optional["ObjectParentMap"],
     dependency_graph: Optional[DependencyGraph],
     transitive_table_cache: Optional[TransitiveTableCache],
     source_dependencies: Optional[SourceDependencySet],
@@ -25423,22 +26344,43 @@ def check_extra_objects(
     sequence_groups: Dict[Tuple[str, str], List[Tuple[str, str]]] = defaultdict(list)
     tgt_schema_all_expected: Dict[str, Set[str]] = defaultdict(set)
     if 'SEQUENCE' in enabled_types:
-        for src_schema, seq_names in oracle_meta.sequences.items():
-            src_schema_u = src_schema.upper()
-            for seq_name in seq_names:
-                seq_name_u = seq_name.upper()
-                src_full = f"{src_schema_u}.{seq_name_u}"
-                mapped = get_mapped_target(full_object_mapping, src_full, 'SEQUENCE')
-                tgt_full = mapped or src_full
-                if '.' not in tgt_full:
+        scoped_sequence_entries = [
+            (src_full, (type_map or {}).get('SEQUENCE'))
+            for src_full, type_map in sorted((full_object_mapping or {}).items())
+            if (type_map or {}).get('SEQUENCE')
+        ]
+        if scoped_sequence_entries:
+            for src_full, tgt_full in scoped_sequence_entries:
+                if '.' not in (src_full or ''):
+                    continue
+                src_schema_u, seq_name_u = src_full.upper().split('.', 1)
+                tgt_full_u = (tgt_full or src_full).upper()
+                if '.' not in tgt_full_u:
                     tgt_schema_u = src_schema_u
                     tgt_name_u = seq_name_u
                 else:
-                    tgt_schema_u, tgt_name_u = tgt_full.split('.', 1)
+                    tgt_schema_u, tgt_name_u = tgt_full_u.split('.', 1)
                     tgt_schema_u = tgt_schema_u.upper()
                     tgt_name_u = tgt_name_u.upper()
                 sequence_groups[(src_schema_u, tgt_schema_u)].append((seq_name_u, tgt_name_u))
                 tgt_schema_all_expected[tgt_schema_u].add(tgt_name_u)
+        else:
+            for src_schema, seq_names in oracle_meta.sequences.items():
+                src_schema_u = src_schema.upper()
+                for seq_name in seq_names:
+                    seq_name_u = seq_name.upper()
+                    src_full = f"{src_schema_u}.{seq_name_u}"
+                    mapped = get_mapped_target(full_object_mapping, src_full, 'SEQUENCE')
+                    tgt_full = mapped or src_full
+                    if '.' not in tgt_full:
+                        tgt_schema_u = src_schema_u
+                        tgt_name_u = seq_name_u
+                    else:
+                        tgt_schema_u, tgt_name_u = tgt_full.split('.', 1)
+                        tgt_schema_u = tgt_schema_u.upper()
+                        tgt_name_u = tgt_name_u.upper()
+                    sequence_groups[(src_schema_u, tgt_schema_u)].append((seq_name_u, tgt_name_u))
+                    tgt_schema_all_expected[tgt_schema_u].add(tgt_name_u)
 
         for (src_schema_u, tgt_schema_u), entries in sequence_groups.items():
             expected_tgt_names = {tgt_name for _, tgt_name in entries}
@@ -29174,7 +30116,7 @@ def mask_sql_for_scan(sql: str) -> str:
     in_q_quote = False
     q_quote_end = ""
     in_line_comment = False
-    in_block_comment = False
+    in_block_comment_depth = 0
     length = len(chars)
     q_quote_pairs = {
         "[": "]",
@@ -29192,12 +30134,17 @@ def mask_sql_for_scan(sql: str) -> str:
                 chars[i] = " "
             i += 1
             continue
-        if in_block_comment:
+        if in_block_comment_depth:
             chars[i] = " "
+            if ch == "/" and nxt == "*":
+                chars[i + 1] = " "
+                i += 2
+                in_block_comment_depth += 1
+                continue
             if ch == "*" and nxt == "/":
                 chars[i + 1] = " "
                 i += 2
-                in_block_comment = False
+                in_block_comment_depth -= 1
                 continue
             i += 1
             continue
@@ -29240,7 +30187,7 @@ def mask_sql_for_scan(sql: str) -> str:
             chars[i] = " "
             chars[i + 1] = " "
             i += 2
-            in_block_comment = True
+            in_block_comment_depth = 1
             continue
         if ch == "'":
             chars[i] = " "
@@ -52630,11 +53577,22 @@ def main():
         schema_mapping_from_tables: Optional[Dict[str, str]] = None
         remap_conflicts: RemapConflictMap = {}
         
+        source_scope_mode_setting = normalize_source_object_scope_mode(
+            settings.get("source_object_scope_mode", "full_source")
+        )
+        remap_scope_text_fallback_mode = normalize_remap_scope_text_fallback_mode(
+            settings.get("remap_scope_text_fallback_mode", "off")
+        )
+        scope_discovery_types = build_scope_discovery_types(
+            enabled_object_types,
+            source_scope_mode_setting,
+        )
+
         # 4.1) 获取依附对象（如 TRIGGER）的父表映射，用于 one-to-many schema 拆分场景
         object_parent_map = get_object_parent_tables(
             ora_cfg,
             settings['source_schemas_list'],
-            enabled_object_types=enabled_object_types,
+            enabled_object_types=scope_discovery_types,
             known_source_types=source_objects_full_scope,
         )
         
@@ -52643,16 +53601,18 @@ def main():
         oracle_dependencies_for_grants: List[DependencyRecord] = []
         source_dependencies_set: Optional[SourceDependencySet] = None
         source_schema_set = {s.upper() for s in settings.get("source_schemas_list", []) if s}
-        source_scope_mode_setting = normalize_source_object_scope_mode(
-            settings.get("source_object_scope_mode", "full_source")
-        )
         # 依赖既用于缺失依赖校验，也用于 one-to-many remap 推导；grant 生成亦依赖依赖链
-        infer_candidate_types = enabled_object_types - NO_INFER_SCHEMA_TYPES - {'TABLE', 'INDEX', 'CONSTRAINT'}
+        infer_candidate_types = scope_discovery_types - NO_INFER_SCHEMA_TYPES - {'TABLE', 'INDEX', 'CONSTRAINT'}
         need_dependency_infer = enable_dependencies_check or (
             bool(settings.get("enable_schema_mapping_infer", True)) and bool(infer_candidate_types)
         )
         need_grant_dependencies = enable_grant_generation and generate_fixup_enabled
-        need_dependency_load = need_dependency_infer or enable_dependencies_check or need_grant_dependencies
+        need_dependency_load = (
+            source_scope_mode_setting == "remap_root_closure"
+            or need_dependency_infer
+            or enable_dependencies_check
+            or need_grant_dependencies
+        )
         if need_dependency_load:
             include_external_refs = bool(
                 need_grant_dependencies or source_scope_mode_setting == "remap_root_closure"
@@ -52660,13 +53620,14 @@ def main():
             oracle_dependencies_for_grants = load_oracle_dependencies(
                 ora_cfg,
                 settings['source_schemas_list'],
-                object_types=enabled_object_types,
+                object_types=scope_discovery_types,
                 include_external_refs=include_external_refs
             )
             if include_external_refs:
                 oracle_dependencies_internal = [
                     dep for dep in oracle_dependencies_for_grants
                     if (dep.referenced_owner or "").upper() in source_schema_set
+                    or (dep.referenced_owner or "").upper() == "PUBLIC"
                 ]
             else:
                 oracle_dependencies_internal = list(oracle_dependencies_for_grants)
@@ -52677,6 +53638,24 @@ def main():
                      dep.referenced_owner.upper(), dep.referenced_name.upper(), dep.referenced_type.upper())
                     for dep in oracle_dependencies_internal
                 }
+        if source_scope_mode_setting == "remap_root_closure":
+            default_sequence_dependency_records = load_oracle_default_sequence_dependency_records(
+                ora_cfg,
+                source_objects,
+            )
+            if default_sequence_dependency_records:
+                oracle_dependencies_internal.extend(default_sequence_dependency_records)
+                oracle_dependencies_for_grants.extend(default_sequence_dependency_records)
+                default_sequence_dependency_set = {
+                    (
+                        dep.owner.upper(), dep.name.upper(), dep.object_type.upper(),
+                        dep.referenced_owner.upper(), dep.referenced_name.upper(), dep.referenced_type.upper(),
+                    )
+                    for dep in default_sequence_dependency_records
+                }
+                if source_dependencies_set is None:
+                    source_dependencies_set = set()
+                source_dependencies_set.update(default_sequence_dependency_set)
         dependency_graph: DependencyGraph = build_dependency_graph(source_dependencies_set) if source_dependencies_set else {}
         view_dependency_map: Dict[Tuple[str, str], Set[str]] = build_view_dependency_map(
             source_dependencies_set
@@ -52782,6 +53761,21 @@ def main():
                 explicit_trigger_detail_rows=explicit_trigger_detail_rows,
                 mode=source_scope_mode,
             )
+            if remap_scope_text_fallback_mode == "safe":
+                source_scope_result, text_fallback_added = apply_scoped_text_reference_fallback(
+                    ora_cfg,
+                    source_scope_result,
+                    source_objects,
+                    dependency_graph,
+                    object_parent_map,
+                    explicit_trigger_keep_nodes=explicit_trigger_keep_nodes,
+                    explicit_trigger_detail_rows=explicit_trigger_detail_rows,
+                )
+                if text_fallback_added:
+                    log.info(
+                        "[SOURCE_SCOPE] safe text fallback 累计纳入 %d 个对象。",
+                        text_fallback_added,
+                    )
             detail_rows = list(source_scope_result.detail_rows or ())
             for status, obj_type, full_u, detail in explicit_trigger_detail_rows:
                 if status == "TRIGGER_KEEP_SKIPPED":
@@ -52874,7 +53868,7 @@ def main():
             transitive_table_cache=transitive_table_cache,
             source_dependencies=source_dependencies_set,
             dependency_graph=dependency_graph,
-            enabled_types=enabled_object_types,
+            enabled_types=scope_discovery_types,
             remap_conflicts=remap_conflicts,
             sequence_remap_policy=sequence_policy
         )
@@ -52906,7 +53900,7 @@ def main():
             transitive_table_cache=transitive_table_cache,
             source_dependencies=source_dependencies_set,
             dependency_graph=dependency_graph,
-            enabled_types=enabled_object_types,
+            enabled_types=scope_discovery_types,
             remap_conflicts=remap_conflicts,
             sequence_remap_policy=sequence_policy
         )

@@ -26,6 +26,11 @@ remap_file              = remap_rules.txt
 #   remap_root_closure -> 仅以 remap_file 中显式 TABLE/VIEW 为根种子，按依赖/附属关系扩展闭包
 #                         trigger_list 中显式列出的触发器会作为额外 keep set 保留
 source_object_scope_mode = full_source
+# remap_scope_text_fallback_mode：scoped 文本补盲模式
+#   off  -> 关闭（默认）
+#   safe -> 仅从 DBA_SOURCE/DBA_VIEWS/DBA_MVIEWS/DBA_SCHEDULER_* 等受控文本来源补盲
+#           不做全 schema DBMS_METADATA 全量 grep
+remap_scope_text_fallback_mode = off
 # blacklist_target_existing_policy:
 #   keep_blocked         -> 黑名单表保持原阻断行为
 #   rehydrate_if_present -> 若映射后的目标 TABLE 已人工存在，则重新纳入 compare/fixup

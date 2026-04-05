@@ -76,7 +76,7 @@ DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC = 5
 DEFAULT_FIXUP_EXEC_MODE = "auto"
 DEFAULT_FIXUP_EXEC_FILE_FALLBACK = True
 MAX_RECOMPILE_RETRIES = 5
-STATE_LEDGER_FILENAME = ".fixup_state_ledger.json"
+STATE_LEDGER_FILENAME = os.environ.get("COMPARATOR_FIXUP_STATE_LEDGER_FILENAME", ".fixup_state_ledger.json")
 FIXUP_RUN_LOCK_FILENAME = ".run_fixup.lock"
 FIXUP_HOT_RELOAD_EVENTS_DIR = "errors"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
@@ -1521,25 +1521,72 @@ def sanitize_view_chain_view_ddl(ddl_text: str) -> str:
 
 def move_sql_to_done(sql_path: Path, done_dir: Path) -> str:
     """Move executed SQL to done directory with backup if needed."""
+
+    def _next_backup_path(target_dir: Path, sql_path: Path) -> Path:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        candidate = target_dir / f"{sql_path.stem}.bak_{timestamp}{sql_path.suffix}"
+        index = 1
+        while candidate.exists():
+            candidate = target_dir / f"{sql_path.stem}.bak_{timestamp}_{index}{sql_path.suffix}"
+            index += 1
+        return candidate
+
+    target_dir = done_dir / sql_path.parent.name
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / sql_path.name
+    staging_path = target_dir / f".{sql_path.name}.staging_{os.getpid()}_{time.time_ns()}"
+    backup_names: List[str] = []
+
+    def _backup_existing_target() -> Optional[str]:
+        if not target_path.exists():
+            return None
+        backup_path = _next_backup_path(target_dir, sql_path)
+        try:
+            os.replace(target_path, backup_path)
+        except Exception as exc:
+            log.warning("已存在文件备份失败: %s (%s)", target_path, str(exc)[:200])
+            raise
+        backup_names.append(backup_path.name)
+        return backup_path.name
+
+    def _restore_source() -> None:
+        if not staging_path.exists():
+            return
+        try:
+            shutil.move(str(staging_path), str(sql_path))
+        except Exception as restore_exc:
+            log.warning("移动失败后恢复源文件失败: %s (%s)", sql_path, str(restore_exc)[:200])
+
     try:
-        target_dir = done_dir / sql_path.parent.name
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target_path = target_dir / sql_path.name
-        backup_note = ""
-        if target_path.exists():
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_path = target_dir / f"{sql_path.stem}.bak_{timestamp}{sql_path.suffix}"
+        shutil.move(str(sql_path), str(staging_path))
+        try:
+            _backup_existing_target()
+        except Exception as exc:
+            _restore_source()
+            return f"(移动失败: 目标已存在且备份失败: {exc})"
+
+        while True:
             try:
-                target_path.replace(backup_path)
-                backup_note = f" (已备份: {backup_path.name})"
+                os.link(staging_path, target_path)
+                break
+            except FileExistsError:
+                try:
+                    _backup_existing_target()
+                except Exception as exc:
+                    _restore_source()
+                    return f"(移动失败: 目标在发布时重现且备份失败: {exc})"
             except Exception as exc:
-                log.warning("已存在文件备份失败: %s (%s)", target_path, str(exc)[:200])
-                return f"(移动失败: 目标已存在且备份失败: {exc})"
-            if target_path.exists():
-                return f"(移动失败: 目标文件在备份后被重新创建: {target_path.name})"
-        shutil.move(str(sql_path), target_path)
+                _restore_source()
+                return f"(移动失败: {exc})"
+
+        try:
+            staging_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        backup_note = f" (已备份: {', '.join(backup_names)})" if backup_names else ""
         return f"(已移至 done/{sql_path.parent.name}/){backup_note}"
     except Exception as exc:
+        _restore_source()
         return f"(移动失败: {exc})"
 
 
@@ -1623,7 +1670,7 @@ class FixupPrecheckSummary:
 
 
 class LimitedCache(OrderedDict):
-    """Simple size-limited cache with FIFO eviction."""
+    """Simple size-limited cache with LRU-style eviction."""
 
     def __init__(self, max_size: int):
         super().__init__()
@@ -2804,6 +2851,13 @@ def select_fixup_script_for_node_with_fallback(
 def build_view_dependency_graph(
     chains: List[List[Tuple[str, str]]]
 ) -> Tuple[Set[Tuple[str, str]], Dict[Tuple[str, str], Set[Tuple[str, str]]]]:
+    """Build a dependency graph where edges point from dependent VIEW to referenced object.
+
+    For a chain A.V1 -> B.V2 -> C.T1, the graph stores:
+      A.V1 -> B.V2
+      B.V2 -> C.T1
+    This orientation matches topo_sort_nodes(), which walks references first so prerequisites appear earlier.
+    """
     nodes: Set[Tuple[str, str]] = set()
     edges: Dict[Tuple[str, str], Set[Tuple[str, str]]] = defaultdict(set)
     for chain in chains:
@@ -2924,7 +2978,7 @@ def parse_dependency_chains_file(path: Path) -> Dict[Tuple[str, str], Set[Tuple[
     if not path:
         return deps
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return deps
     section = ""
@@ -4862,6 +4916,9 @@ def write_error_report(
         lines.append(
             f"{entry.file_path} | {entry.statement_index} | {entry.error_code} | {entry.object_name} | {entry.message}"
         )
+    if truncated:
+        lines.append("[... TRUNCATED ...]")
+        log.warning("[ERROR_REPORT] 错误报告达到上限 %d，输出已截断。", limit)
     report_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return report_path
 
@@ -5138,8 +5195,12 @@ def is_object_invalid(
     timeout: Optional[int],
     owner: str,
     obj_name: str,
-    obj_type: str
+    obj_type: str,
+    cache: Optional[Dict[Tuple[str, str, str], Optional[bool]]] = None,
 ) -> Optional[bool]:
+    key = (str(owner or '').upper(), str(obj_name or '').upper(), str(obj_type or '').upper())
+    if cache is not None and key in cache:
+        return cache[key]
     sql = (
         "SELECT COUNT(*) FROM DBA_OBJECTS "
         f"WHERE OWNER='{escape_sql_literal(owner)}' "
@@ -5148,9 +5209,10 @@ def is_object_invalid(
         "AND STATUS='INVALID'"
     )
     count = query_count(obclient_cmd, sql, timeout)
-    if count is None:
-        return None
-    return count > 0
+    result = None if count is None else count > 0
+    if cache is not None:
+        cache[key] = result
+    return result
 
 
 def build_compile_statement(owner: str, obj_name: str, obj_type: str) -> Optional[str]:
@@ -5204,6 +5266,7 @@ def recompile_invalid_objects(
         
         recompiled_this_round = 0
         failed_this_round = 0
+        invalid_status_cache: Dict[Tuple[str, str, str], Optional[bool]] = {}
         for owner, obj_name, obj_type in invalid_objects:
             compile_sql = build_compile_statement(owner, obj_name, obj_type)
             if not compile_sql:
@@ -5214,7 +5277,7 @@ def recompile_invalid_objects(
                 result = run_sql(obclient_cmd, compile_sql, timeout)
                 error_msg = extract_execution_error(result)
                 if not error_msg:
-                    still_invalid = is_object_invalid(obclient_cmd, timeout, owner, obj_name, obj_type)
+                    still_invalid = is_object_invalid(obclient_cmd, timeout, owner, obj_name, obj_type, cache=invalid_status_cache)
                     if still_invalid is False:
                         recompiled_this_round += 1
                         log.info("  OK %s.%s (%s)", owner, obj_name, obj_type)
@@ -5400,6 +5463,9 @@ def main() -> None:
     - Progress tracking across rounds
     """
     args = parse_args()
+    if getattr(args, "iterative", False) and getattr(args, "view_chain_autofix", False):
+        log.error("参数冲突: --iterative 和 --view-chain-autofix 不能同时启用。")
+        sys.exit(2)
     config_arg = Path(args.config)
     
     # Parse filters

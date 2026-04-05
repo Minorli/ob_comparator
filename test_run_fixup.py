@@ -342,6 +342,18 @@ class TestDependencyChainParsing(unittest.TestCase):
             self.assertIn(key, deps)
             self.assertIn(("TGT.T1", "TABLE"), deps[key])
 
+    def test_parse_dependency_chains_handles_non_utf8_bytes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "dependency_chains_20260101_000001.txt"
+            path.write_bytes(
+                b"[TARGET - REMAPPED] chain:\n"
+                b"00001. TGT.V1(VIEW) -> TGT.T1(TABLE)\n"
+                + b"#" + bytes([0xFF]) + b"broken\n"
+            )
+            deps = rf.parse_dependency_chains_file(path)
+            self.assertIn(("TGT.V1", "VIEW"), deps)
+            self.assertIn(("TGT.T1", "TABLE"), deps[("TGT.V1", "VIEW")])
+
 
 class TestFixupAutoGrantTypes(unittest.TestCase):
     def test_parse_fixup_auto_grant_types_defaults(self):
@@ -928,7 +940,7 @@ class TestRunFixupHelpers(unittest.TestCase):
             target = target_dir / "A.V1.sql"
             target.write_text("old", encoding="utf-8")
 
-            with mock.patch.object(Path, "replace", side_effect=OSError("backup fail")):
+            with mock.patch.object(os, "replace", side_effect=OSError("backup fail")):
                 note = rf.move_sql_to_done(src, done_dir)
             self.assertIn("移动失败", note)
             self.assertTrue(src.exists())
@@ -948,19 +960,43 @@ class TestRunFixupHelpers(unittest.TestCase):
             target = target_dir / "A.V1.sql"
             target.write_text("old", encoding="utf-8")
 
-            original_replace = Path.replace
+            original_link = os.link
+            call_count = {"count": 0}
 
-            def fake_replace(self, backup_path):
-                result = original_replace(self, backup_path)
-                target.write_text("new", encoding="utf-8")
-                return result
+            def fake_link(src_name, dst_name, *args, **kwargs):
+                call_count["count"] += 1
+                if call_count["count"] == 1:
+                    Path(dst_name).write_text("new", encoding="utf-8")
+                    raise FileExistsError("target reappeared")
+                return original_link(src_name, dst_name, *args, **kwargs)
 
-            with mock.patch.object(Path, "replace", new=fake_replace):
+            with mock.patch.object(os, "link", new=fake_link):
                 note = rf.move_sql_to_done(src, done_dir)
 
-            self.assertIn("重新创建", note)
+            self.assertIn("已移至", note)
+            self.assertFalse(src.exists())
+            self.assertEqual(target.read_text(encoding="utf-8"), "SELECT 1;")
+            backups = sorted(target_dir.glob("A.V1.bak_*"))
+            self.assertGreaterEqual(len(backups), 2)
+            backup_contents = {path.read_text(encoding="utf-8") for path in backups}
+            self.assertIn("old", backup_contents)
+            self.assertIn("new", backup_contents)
+
+    def test_move_sql_to_done_restores_source_when_publish_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            done_dir = root / "done"
+            src_dir = root / "view"
+            src_dir.mkdir(parents=True)
+            src = src_dir / "A.V2.sql"
+            src.write_text("SELECT 2;", encoding="utf-8")
+
+            with mock.patch.object(os, "link", side_effect=OSError("publish fail")):
+                note = rf.move_sql_to_done(src, done_dir)
+
+            self.assertIn("移动失败", note)
             self.assertTrue(src.exists())
-            self.assertEqual(target.read_text(encoding="utf-8"), "new")
+            self.assertEqual(src.read_text(encoding="utf-8"), "SELECT 2;")
 
     def test_invalidate_exists_cache_removes_all_planned_keys(self):
         cache = {
@@ -1398,6 +1434,27 @@ class TestRunFixupHelpers(unittest.TestCase):
             mock_manual_preflight.assert_called_once_with(None, [])
             mock_persist.assert_called_once_with(notice_state_path, notice_state, rf.__version__, notices)
 
+    def test_main_rejects_iterative_and_view_chain_autofix_together(self):
+        args = SimpleNamespace(
+            config='config.ini',
+            only_dirs=[],
+            exclude_dirs=[],
+            only_types=[],
+            allow_table_create=False,
+            smart_order=False,
+            recompile=False,
+            max_retries=5,
+            glob_patterns=None,
+            iterative=True,
+            max_rounds=10,
+            min_progress=1,
+            view_chain_autofix=True,
+        )
+        with mock.patch.object(rf, 'parse_args', return_value=args),              mock.patch.object(rf.log, 'error') as log_error,              self.assertRaises(SystemExit) as cm:
+            rf.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertTrue(any('不能同时启用' in str(call.args[0]) for call in log_error.call_args_list))
+
 
 class TestLimitedCache(unittest.TestCase):
     def test_eviction(self):
@@ -1407,6 +1464,21 @@ class TestLimitedCache(unittest.TestCase):
         cache["c"] = 3
         self.assertEqual(len(cache), 2)
         self.assertNotIn("a", cache)
+
+
+class TestErrorReport(unittest.TestCase):
+    def test_write_error_report_marks_truncated_output(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fixup_dir = Path(tmpdir)
+            report = rf.write_error_report(
+                [rf.ErrorReportEntry('a.sql', 1, 'ORA-00942', 'A.T1', 'boom')],
+                fixup_dir,
+                limit=1,
+                truncated=True,
+            )
+            self.assertIsNotNone(report)
+            content = Path(report).read_text(encoding='utf-8')
+            self.assertIn('[... TRUNCATED ...]', content)
 
 
 class TestSqlFileSizeLimit(unittest.TestCase):
@@ -2734,6 +2806,13 @@ class TestRecompileSkipTypes(unittest.TestCase):
         self.assertEqual(summary.total_recompiled, 0)
         self.assertEqual(summary.remaining_invalid, 1)
         self.assertEqual(summary.recompile_failed, 1)
+
+    def test_is_object_invalid_uses_cache_when_provided(self):
+        cache = {}
+        with mock.patch.object(rf, 'query_count', return_value=1) as query_count:
+            self.assertTrue(rf.is_object_invalid([], 1, 'APP', 'P1', 'PROCEDURE', cache=cache))
+            self.assertTrue(rf.is_object_invalid([], 1, 'APP', 'P1', 'PROCEDURE', cache=cache))
+        query_count.assert_called_once()
 
     def test_recompile_retries_after_all_fail_round(self):
         invalid_batches = [
