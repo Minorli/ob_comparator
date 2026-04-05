@@ -114,7 +114,11 @@
 - 存在性校验
 - VIEW 兼容性分析：SYS.OBJ$ / X$ 系统对象视为不支持（用户自建 X$ 对象除外）
 - VIEW 依赖 remap 会同时处理 unquoted / quoted qualified 引用；当同义词终点无法安全解析时，不做 schema-only 盲改，而是优先 fallback 到受管目标同义词对象本身；若仍无法确认，则保留原引用并输出诊断日志
-- 当 `source_object_scope_mode=remap_root_closure` 时，源对象范围不再按 `source_schemas` 全量纳入，而是仅从 `remap_file` 中显式 TABLE/VIEW roots 出发，按依赖、反向依赖、附属关系扩展闭包；闭包外对象（含其相关 INDEX/CONSTRAINT/SYNONYM/SEQUENCE/TRIGGER）整体不进入 compare/fixup/report，`trigger_list` 可作为显式 keep set 保留触发器及其父对象。注意：`missed_tables_views_for_OMS/` 与 report_db `OMS_MISSING` 默认只导出显式 remap roots，不把 closure 中的依赖 TABLE/VIEW 一起导出。
+- 当 `source_object_scope_mode=remap_root_closure` 时，源对象范围不再按 `source_schemas` 全量纳入，而是仅从 `remap_file` 中显式 TABLE/VIEW roots 出发，按依赖、反向依赖、附属关系扩展闭包；闭包外对象整体不进入 compare/fixup/report，`trigger_list` 可作为显式 keep set 保留触发器及其父对象。注意：`missed_tables_views_for_OMS/` 与 report_db `OMS_MISSING` 默认只导出显式 remap roots，不把 closure 中的依赖 TABLE/VIEW 一起导出。
+- 当 `remap_scope_text_fallback_mode=safe` 时，结构化闭包之外的剩余对象会额外从 `DBA_SOURCE`、`DBA_VIEWS.TEXT`、`DBA_MVIEWS.QUERY`、scheduler/job 文本等受控来源做 scoped 补盲；命中的对象以 `TEXT_REFERENCE_HEURISTIC` 写入 `source_scope_detail_<ts>.txt`，随后重新进入结构化 closure 扩展。
+- `safe` 额外支持受控 dynamic SQL (`EXECUTE IMMEDIATE` / `DBMS_SQL.PARSE`)、纯字符串拼接 SQL 与 same-schema 未带前缀的 package/procedure/function 调用、dynamic SQL object reference；但不会对普通字符串或跨 schema 未带前缀引用做盲猜。
+- 变量参与的 dynamic SQL（例如 `v_sql := ... || var_name`）只输出 `TEXT_REFERENCE_AMBIGUOUS` 诊断，不自动纳入 closure。
+- `safe` 模式不允许退化为全 schema `DBMS_METADATA` 全量 DDL grep。
 - scoped mode 下 `trigger_list` 同时接受源端触发器名与 remap 后目标名；若条目能通过显式 remap 反查到源端 TRIGGER，则继续纳入 scoped closure。无法解析的条目只会进入 `source_scope_detail_<ts>.txt` / `trigger_status_report.txt`，不再 fail-fast 中止整轮运行
 - scoped mode 会输出 `source_scope_detail_<ts>.txt`，记录 remap roots、显式 trigger keep、闭包纳入对象和被过滤对象，供客户核对“不多对象、不少对象”边界
 - 当 `blacklist_target_existing_policy=rehydrate_if_present` 时，若源端阻断型黑名单 TABLE 在目标端已真实存在，则会进入“重纳管”模式：表本体恢复 compare/fixup，但黑名单改造列不会再自动回写 Oracle 原始语义；依赖这些列的 INDEX/CONSTRAINT 转为 manual/report-only，TRIGGER 在 v1 中继续保持人工处理

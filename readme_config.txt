@@ -40,6 +40,12 @@
   说明：当设置为 `remap_root_closure` 且配置了 `trigger_list` 时，`trigger_list` 中的触发器会作为显式 keep set 保留；`trigger_list` 支持填写源端触发器名，或 remap 后的目标触发器名。
   说明：`missed_tables_views_for_OMS/` 与 report_db 的 `OMS_MISSING` 在该模式下默认只导出 `remap_file` 中显式 TABLE/VIEW roots，不再把 closure 依赖对象一起带出。
   说明：若 `trigger_list` 非法或未启用 `TRIGGER` 检查，程序会 fail-fast；若个别条目无法在源端或显式 remap 规则中解析，程序不再中止，而是把这些条目写入 `source_scope_detail_<ts>.txt` / `trigger_status_report.txt`，并从本轮 scoped closure 与 fixup 中排除。
+- remap_scope_text_fallback_mode：scoped 文本补盲模式。默认：off。
+  可选值：off、safe。
+  说明：`off` 仅使用结构化路径（依赖/反向依赖/附属对象/配对对象）扩展 closure；`safe` 会对结构化闭包之外的剩余对象，从 `DBA_SOURCE`、`DBA_VIEWS.TEXT`、`DBA_MVIEWS.QUERY`、scheduler/job 文本等受控来源做补盲，并以 `TEXT_REFERENCE_HEURISTIC` 写入 `source_scope_detail_<ts>.txt`。
+  说明：`safe` 额外支持受控 dynamic SQL（`EXECUTE IMMEDIATE`/`DBMS_SQL.PARSE`）、纯字符串拼接 SQL，以及同 schema 未带前缀的 package/procedure/function 调用；普通字符串字面量和跨 schema 未带前缀引用仍不会被猜测。
+  说明：变量拼接 SQL 不会自动纳入 closure；会在 `source_scope_detail_<ts>.txt` 中以 `TEXT_REFERENCE_AMBIGUOUS` 输出，供人工复核。
+  说明：`safe` 不会对全 schema 对象 DDL 做 `DBMS_METADATA` 全量 grep。
   说明：规则格式为 `SRC_SCHEMA.OBJECT = TGT_SCHEMA.OBJECT`，支持注释与空行。
   注意：文件不存在会报警但继续。
   说明：每轮运行会额外输出 `managed_target_scope_detail_<ts>.txt`，用于审计本轮派生出的目标 schema 范围。

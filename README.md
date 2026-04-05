@@ -18,6 +18,7 @@
 - **Dump-Once 架构**：Oracle Thick Mode + 少量 obclient 调用，元数据一次性落本地内存。
 - **Remap 推导**：支持显式规则、依附对象跟随、依赖推导、schema 回退策略。
 - **源范围收缩模式**：支持 `source_object_scope_mode=remap_root_closure`，仅以 `remap_file` 中显式 TABLE/VIEW 为根种子，按依赖、反向依赖、附属关系扩展闭包；闭包外对象整体忽略，`trigger_list` 可作为显式 keep set。
+- **scoped 文本补盲**：支持 `remap_scope_text_fallback_mode=safe`，仅从 `DBA_SOURCE` / `DBA_VIEWS.TEXT` / `DBA_MVIEWS.QUERY` / scheduler 文本等受控来源补盲；支持受控 dynamic SQL、纯字符串拼接 SQL 以及 same-schema 未带前缀调用补盲，不走全 schema DDL grep。变量拼接 SQL 仅报告，不自动纳入。
 - **黑名单表重纳管**：支持 `blacklist_target_existing_policy=rehydrate_if_present`；当源端黑名单表已在目标端被人工改造并创建为 TABLE 时，可恢复后续 compare/fixup，但会自动保护黑名单改造列，避免把 Oracle 原始类型/长度/default/nullability 再写回 OB。
 - **Target Scope 一等公民**：目标端受管 schema 不再等同于 `source_schemas`；会按 remap/full mapping 自动推导，哪怕 remap 到全新的目标 schema，也会继续进入 compare/fixup/report。
 - **依赖与授权**：基于 DBA_DEPENDENCIES/DBA_*_PRIVS 生成缺失依赖与授权脚本。
@@ -101,6 +102,7 @@ password = xxx
 source_schemas = SCOTT,HR
 remap_file = remap_rules.txt
 source_object_scope_mode = full_source
+remap_scope_text_fallback_mode = off
 synonym_check_scope = public_only
 synonym_fixup_scope = public_only
 sequence_remap_policy = source_only
