@@ -84,6 +84,7 @@
   - 是否也出现在 `source_schemas`
   - 由哪些源 schema 推导而来
   - 该目标 schema 下的受管对象数
+- `object_mapping_<ts>.txt` 表示本轮 managed mapping；若存在 closure 内 discovery-only 对象，则额外输出 `object_mapping_discovery_<ts>.txt`，不再把两者混为一谈。
 
 ---
 
@@ -121,6 +122,13 @@
 - `safe` 模式不允许退化为全 schema `DBMS_METADATA` 全量 DDL grep。
 - scoped mode 下 `trigger_list` 同时接受源端触发器名与 remap 后目标名；若条目能通过显式 remap 反查到源端 TRIGGER，则继续纳入 scoped closure。无法解析的条目只会进入 `source_scope_detail_<ts>.txt` / `trigger_status_report.txt`，不再 fail-fast 中止整轮运行
 - scoped mode 会输出 `source_scope_detail_<ts>.txt`，记录 remap roots、显式 trigger keep、闭包纳入对象和被过滤对象，供客户核对“不多对象、不少对象”边界
+- closure 内部允许 discovery 比 operator-facing enabled types 更宽；但 target-side `managed_target_scope`、默认 `object_mapping_<ts>.txt`、extra target filtering、grant owner allowlist 只消费 managed mapping，discovery-only 对象仅出现在独立 discovery artifact 和 diagnostics 中
+- 当 `scope_integrity_check=true` 且 `source_object_scope_mode=remap_root_closure` 时，程序会额外检查 scoped `VIEW` / `MATERIALIZED VIEW` 的前置依赖完整性，并输出 `scope_integrity_detail_<ts>.txt`、`scope_integrity_remap_candidates_<ts>.txt`，同时在 `source_scope_detail_<ts>.txt` 中追加 `INTEGRITY_CRITICAL` / `INTEGRITY_WARNING` 状态。
+- `scope_integrity_check_depth=direct` 仅校验直接依赖；`transitive` 会追踪 `VIEW/MVIEW` 链式缺失路径。
+- `scope_integrity_advisory_check=true` 时，程序会对 `PROCEDURE/FUNCTION/PACKAGE/PACKAGE BODY/TYPE/TYPE BODY/JOB/SCHEDULE/TRIGGER` 输出 `INFO` 级 scope 完整性诊断，并在 `source_scope_detail_<ts>.txt` 中追加 `INTEGRITY_INFO`。
+- advisory-family 诊断不升级为 `CRITICAL/WARNING`，也不默认生成 remap candidate。
+- `scope_integrity_fk_check=true` 时，程序会基于 Oracle FK 元数据检查引用表是否仍在最终 managed scope 中，并以 `WARNING` 输出到现有 scope integrity detail / panel。
+- FK scope integrity 只做 operator-facing 提示，不改变现有 FK compare/fixup 主逻辑。
 - 当 `blacklist_target_existing_policy=rehydrate_if_present` 时，若源端阻断型黑名单 TABLE 在目标端已真实存在，则会进入“重纳管”模式：表本体恢复 compare/fixup，但黑名单改造列不会再自动回写 Oracle 原始语义；依赖这些列的 INDEX/CONSTRAINT 转为 manual/report-only，TRIGGER 在 v1 中继续保持人工处理
 - 当 `gtt_table_handling_mode` 为 `rewrite_to_normal` 或 `preserve_original` 时，Oracle GTT 不再按 `TEMPORARY_TABLE` 黑名单阻断 TABLE 本体；其表本体进入正常 compare/fixup，依赖对象也恢复正常流程，但 OMS 缺失数据迁移规则会跳过这些表。
 - Oracle 源端若以 enabled 单列 `CHECK (<col> IS NOT NULL)` 表达 NOT NULL 语义，TABLE 列级 compare 会按语义参与判定；当目标端已有等价 NOT NULL 语义（列 NOT NULL 或 enabled single-column IS NOT NULL CHECK）时，不再重复报 `NULLABLE -> NOT NULL`。

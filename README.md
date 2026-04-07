@@ -21,6 +21,7 @@
 - **scoped 文本补盲**：支持 `remap_scope_text_fallback_mode=safe`，仅从 `DBA_SOURCE` / `DBA_VIEWS.TEXT` / `DBA_MVIEWS.QUERY` / scheduler 文本等受控来源补盲；支持受控 dynamic SQL、纯字符串拼接 SQL 以及 same-schema 未带前缀调用补盲，不走全 schema DDL grep。变量拼接 SQL 仅报告，不自动纳入。
 - **黑名单表重纳管**：支持 `blacklist_target_existing_policy=rehydrate_if_present`；当源端黑名单表已在目标端被人工改造并创建为 TABLE 时，可恢复后续 compare/fixup，但会自动保护黑名单改造列，避免把 Oracle 原始类型/长度/default/nullability 再写回 OB。
 - **Target Scope 一等公民**：目标端受管 schema 不再等同于 `source_schemas`；会按 remap/full mapping 自动推导，哪怕 remap 到全新的目标 schema，也会继续进入 compare/fixup/report。
+- **Mapping 分层可审计**：`object_mapping_<ts>.txt` 表示本轮受管 managed mapping；若 closure 内部还发现了未纳入 compare/fixup 的 related object，会额外输出 `object_mapping_discovery_<ts>.txt`。
 - **依赖与授权**：基于 DBA_DEPENDENCIES/DBA_*_PRIVS 生成缺失依赖与授权脚本。
 - **identity sequence 授权感知**：跨 schema identity 表会额外检查 OB 侧 `ISEQ$$_...` 的 `SELECT` 授权 readiness，避免“表 grant 齐了但 INSERT 仍失败”。
 - **DDL 清洗与兼容**：VIEW DDL 走 DBMS_METADATA，PL/SQL 语法清洗与 Hint 过滤。
@@ -103,6 +104,10 @@ source_schemas = SCOTT,HR
 remap_file = remap_rules.txt
 source_object_scope_mode = full_source
 remap_scope_text_fallback_mode = off
+scope_integrity_check = true
+scope_integrity_check_depth = direct
+scope_integrity_advisory_check = false
+scope_integrity_fk_check = false
 synonym_check_scope = public_only
 synonym_fixup_scope = public_only
 sequence_remap_policy = source_only
@@ -127,6 +132,7 @@ java_home = /usr/lib/jvm/java-11
 
 `dbcat_output/cache/` 扁平缓存以实际对象文件为准；如果 `cache/index.json` 漏项，但对应 `SCHEMA/TYPE/OBJ.sql` 存在，主程序会继续命中该缓存并自动修复索引。
 `main_reports/run_<ts>/managed_target_scope_detail_<ts>.txt` 会列出本轮实际受管的目标 schema，明确哪些 schema 是仅由 remap 导出的新目标范围。
+`main_reports/run_<ts>/object_mapping_<ts>.txt` 现在表示本轮真正参与 compare/fixup 的受管映射；若存在 closure 内部额外发现但未纳入 managed scope 的对象，会额外输出 `object_mapping_discovery_<ts>.txt` 供审计。
 
 ### 3) 运行对比
 ```bash
@@ -228,6 +234,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/report_index_<ts>.txt`：报告索引，包含 `GUIDE` 行，提示先看哪些文件
 - `main_reports/run_<ts>/package_compare_<ts>.txt`：PACKAGE/PKG BODY 明细
 - `main_reports/run_<ts>/remap_conflicts_<ts>.txt`：Remap 冲突清单
+- `main_reports/run_<ts>/object_mapping_discovery_<ts>.txt`：discovery-only 对象映射（closure 内发现但未纳入 managed compare/fixup 的对象）
 - `main_reports/run_<ts>/VIEWs_chain_<ts>.txt`：VIEW 依赖链报告
 - `main_reports/run_<ts>/blacklist_tables.txt`：黑名单表清单
 - `main_reports/run_<ts>/blacklist_rehydrated_detail_<ts>.txt`：黑名单表重纳管明细（目标端已存在且进入 rehydrate 的表、改造承接列、manual 边界）
@@ -249,7 +256,9 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/sys_c_force_candidates_detail_<ts>.txt`：SYS_C* FORCE 候选表明细（用于评估是否开启 `fixup_drop_sys_c_columns`）
 - `main_reports/run_<ts>/missing_objects_detail_<ts>.txt`：缺失对象支持性明细（report_detail_mode=split）
 - `main_reports/run_<ts>/unsupported_objects_detail_<ts>.txt`：不支持/阻断对象明细（report_detail_mode=split）
-- `main_reports/run_<ts>/source_scope_detail_<ts>.txt`：源对象范围明细（`source_object_scope_mode=remap_root_closure` 时的 roots/closure/filter 诊断）
+- `main_reports/run_<ts>/source_scope_detail_<ts>.txt`：源对象范围明细（`source_object_scope_mode=remap_root_closure` 时的 roots/closure/filter 诊断，必要时追加 `INTEGRITY_CRITICAL` / `INTEGRITY_WARNING`）
+- `main_reports/run_<ts>/scope_integrity_detail_<ts>.txt`：scope 完整性明细（blocking `VIEW/MVIEW` + 可选 advisory-family `INFO`）
+- `main_reports/run_<ts>/scope_integrity_remap_candidates_<ts>.txt`：可直接补入 remap 文件的候选对象清单
 - `main_reports/run_<ts>/extra_mismatch_detail_<ts>.txt`：扩展对象差异明细（report_detail_mode=split）
 - `main_reports/run_<ts>/column_nullability_detail_<ts>.txt`：现有列空值语义差异明细（含 `NOT NULL`、`NOT NULL ENABLE NOVALIDATE` 与反向漂移；其中 `ENABLE NOVALIDATE` 补位会在 `table_alter` 中默认输出可执行约束 SQL）
 - OceanBase 侧等价 `CHECK (<col> IS NOT NULL)` 识别依赖 `DBA_CONSTRAINTS` 条件文本；当前版本已改为按 chunk 保留成功的 `SEARCH_CONDITION`，并在退化时按表/约束回填，避免因个别 owner 查询失败而误生 `NOT NULL ENABLE NOVALIDATE` DDL
