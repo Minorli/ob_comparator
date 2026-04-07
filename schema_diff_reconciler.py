@@ -10018,6 +10018,33 @@ def build_attached_object_reverse_map(
     return {key: set(value) for key, value in reverse_map.items()}
 
 
+def build_dependency_graph_from_records(
+    dependency_records: Optional[Sequence[DependencyRecord]],
+    allowed_nodes: Optional[Set[DependencyNode]] = None,
+) -> DependencyGraph:
+    allowed_nodes_u = {
+        (((full or '').upper()), ((obj_type or '').upper()))
+        for full, obj_type in (allowed_nodes or set())
+        if (full or '').strip() and (obj_type or '').strip()
+    }
+    graph: Dict[DependencyNode, Set[DependencyNode]] = defaultdict(set)
+    for dep in (dependency_records or []):
+        dep_full_u = f"{(dep.owner or '').upper()}.{(dep.name or '').upper()}"
+        ref_full_u = f"{(dep.referenced_owner or '').upper()}.{(dep.referenced_name or '').upper()}"
+        dep_type_u = (dep.object_type or '').upper()
+        ref_type_u = (dep.referenced_type or '').upper()
+        dep_node = (dep_full_u, dep_type_u)
+        ref_node = (ref_full_u, ref_type_u)
+        if not dep_full_u or not ref_full_u or not dep_type_u or not ref_type_u:
+            continue
+        if allowed_nodes_u and dep_node not in allowed_nodes_u:
+            continue
+        if allowed_nodes_u and ref_node not in allowed_nodes_u:
+            continue
+        graph[dep_node].add(ref_node)
+    return {key: set(value) for key, value in graph.items()}
+
+
 def build_reverse_dependency_map(
     dependency_graph: Optional[DependencyGraph]
 ) -> Dict[DependencyNode, Set[DependencyNode]]:
@@ -10402,23 +10429,161 @@ def build_job_action_dependency_records(
     return sorted(records, key=lambda item: (item.owner, item.name, item.referenced_owner, item.referenced_name, item.referenced_type))
 
 
+def collect_job_action_candidate_nodes(
+    source_objects: Optional[SourceObjectMap],
+) -> Set[DependencyNode]:
+    source_objects = source_objects or {}
+    return {
+        ((full_u or "").upper(), "JOB")
+        for full_u, obj_types in source_objects.items()
+        if "JOB" in {(item or "").upper() for item in (obj_types or set()) if item}
+    }
+
+
+def build_job_action_dependency_records_with_loader(
+    source_objects: Optional[SourceObjectMap],
+    load_text_index,
+) -> List[DependencyRecord]:
+    source_objects = source_objects or {}
+    job_nodes = collect_job_action_candidate_nodes(source_objects)
+    if not job_nodes:
+        return []
+
+    candidate_types_by_full: Dict[str, Set[str]] = defaultdict(set)
+    for full_u, obj_types in source_objects.items():
+        for obj_type_u in {(item or "").upper() for item in (obj_types or set()) if item}:
+            if obj_type_u == "JOB":
+                continue
+            candidate_types_by_full[(full_u or "").upper()].add(obj_type_u)
+    if not candidate_types_by_full:
+        return []
+
+    patterns: List[Tuple[str, Tuple[re.Pattern, ...]]] = []
+    same_schema_outer_patterns: Dict[str, List[Tuple[str, Tuple[re.Pattern, ...]]]] = defaultdict(list)
+    same_schema_dynamic_patterns: Dict[str, List[Tuple[str, Tuple[re.Pattern, ...]]]] = defaultdict(list)
+    for full_u in sorted(candidate_types_by_full):
+        candidate_types = candidate_types_by_full.get(full_u) or set()
+        regexes = _build_scoped_reference_patterns(full_u, candidate_types)
+        if regexes:
+            patterns.append((full_u, regexes))
+        if "." in full_u:
+            owner_u, name_u = full_u.split(".", 1)
+            outer_regexes = _build_same_schema_outer_reference_patterns(name_u, candidate_types)
+            if outer_regexes:
+                same_schema_outer_patterns[owner_u].append((full_u, outer_regexes))
+            dynamic_regexes = _build_same_schema_dynamic_sql_reference_patterns(name_u, candidate_types)
+            if dynamic_regexes:
+                same_schema_dynamic_patterns[owner_u].append((full_u, dynamic_regexes))
+
+    def _collect_matches(node_full: str, raw_text: str) -> List[str]:
+        cleaned_text = mask_sql_for_scan(raw_text or "").upper()
+        dynamic_sql_texts_raw, _dynamic_sql_ambiguities = _extract_dynamic_sql_literals_for_scan(raw_text or "")
+        dynamic_sql_texts = [item.upper() for item in dynamic_sql_texts_raw]
+        node_owner = node_full.split('.', 1)[0].upper() if '.' in node_full else ""
+        matched_fulls: List[str] = []
+        seen_fulls: Set[str] = set()
+
+        def _add_match(full_u: str) -> None:
+            full_u = (full_u or "").upper()
+            if not full_u or full_u in seen_fulls:
+                return
+            seen_fulls.add(full_u)
+            matched_fulls.append(full_u)
+
+        for full_u, regexes in patterns:
+            if any(regex.search(cleaned_text) for regex in regexes) or any(
+                regex.search(dynamic_text)
+                for dynamic_text in dynamic_sql_texts
+                for regex in regexes
+            ):
+                _add_match(full_u)
+        for full_u, regexes in same_schema_outer_patterns.get(node_owner, []):
+            if any(regex.search(cleaned_text) for regex in regexes):
+                _add_match(full_u)
+        for full_u, regexes in same_schema_dynamic_patterns.get(node_owner, []):
+            if any(
+                regex.search(dynamic_text)
+                for dynamic_text in dynamic_sql_texts
+                for regex in regexes
+            ):
+                _add_match(full_u)
+        return matched_fulls
+
+    def _expand_program_unit_candidates(full_u: str, type_u: str) -> Set[DependencyNode]:
+        candidates: Set[DependencyNode] = {(full_u, type_u)}
+        if type_u == "PACKAGE":
+            candidates.add((full_u, "PACKAGE BODY"))
+        if type_u == "TYPE":
+            candidates.add((full_u, "TYPE BODY"))
+        return candidates
+
+    text_index = dict(load_text_index(set(job_nodes)) or {})
+    records: Set[DependencyRecord] = set()
+    for node, raw_text in sorted(text_index.items(), key=lambda item: (item[0][1], item[0][0])):
+        if node not in job_nodes:
+            continue
+        dep_full = (node[0] or "").upper()
+        dep_type = (node[1] or "").upper()
+        if dep_type != "JOB" or "." not in dep_full:
+            continue
+        dep_owner, dep_name = dep_full.split('.', 1)
+        seen_targets: Set[str] = set()
+        frontier_program_units: List[Tuple[str, str]] = []
+        for matched_full in [target for target in _collect_matches(dep_full, raw_text or "") if target]:
+            ref_type = _resolve_scoped_reference_dependency_type(source_objects, matched_full)
+            if ref_type and "." in matched_full:
+                ref_owner, ref_name = matched_full.split('.', 1)
+                records.add(DependencyRecord(dep_owner, dep_name, dep_type, ref_owner, ref_name, ref_type))
+                seen_targets.add(f"{matched_full}|{ref_type}")
+                if ref_type in {"PACKAGE", "PACKAGE BODY", "PROCEDURE", "FUNCTION", "TYPE", "TYPE BODY"}:
+                    frontier_program_units.append((matched_full, ref_type))
+        visited_program_units: Set[Tuple[str, str]] = set()
+        while frontier_program_units:
+            batch_to_load: Set[DependencyNode] = set()
+            current_batch = list(frontier_program_units)
+            frontier_program_units = []
+            for current_full, current_type in current_batch:
+                key = (current_full, current_type)
+                if key in visited_program_units:
+                    continue
+                visited_program_units.add(key)
+                batch_to_load.update(_expand_program_unit_candidates(current_full, current_type))
+            missing_nodes = {key for key in batch_to_load if key not in text_index}
+            if missing_nodes:
+                text_index.update(load_text_index(missing_nodes) or {})
+            for current_full, current_type in sorted(batch_to_load, key=lambda item: (item[1], item[0])):
+                current_text = text_index.get((current_full, current_type))
+                if not current_text:
+                    continue
+                for matched_full in _collect_matches(current_full, current_text):
+                    ref_type = _resolve_scoped_reference_dependency_type(source_objects, matched_full)
+                    if not ref_type or "." not in matched_full:
+                        continue
+                    edge_key = f"{matched_full}|{ref_type}"
+                    if edge_key not in seen_targets:
+                        ref_owner, ref_name = matched_full.split('.', 1)
+                        records.add(DependencyRecord(dep_owner, dep_name, dep_type, ref_owner, ref_name, ref_type))
+                        seen_targets.add(edge_key)
+                    if ref_type in {"PACKAGE", "PACKAGE BODY", "PROCEDURE", "FUNCTION", "TYPE", "TYPE BODY"} and (matched_full, ref_type) not in visited_program_units:
+                        frontier_program_units.append((matched_full, ref_type))
+    return sorted(records, key=lambda item: (item.owner, item.name, item.referenced_owner, item.referenced_name, item.referenced_type))
+
+
 def load_oracle_job_action_dependency_records(
     ora_cfg: OraConfig,
     source_objects: Optional[SourceObjectMap],
 ) -> List[DependencyRecord]:
     source_objects = source_objects or {}
-    candidate_nodes: Set[DependencyNode] = set()
-    for full_u, obj_types in source_objects.items():
-        obj_types_u = {(item or "").upper() for item in (obj_types or set()) if item}
-        if "JOB" in obj_types_u:
-            candidate_nodes.add((full_u, "JOB"))
-        if obj_types_u & {"PACKAGE", "PACKAGE BODY", "PROCEDURE", "FUNCTION", "TYPE", "TYPE BODY"}:
-            for obj_type_u in sorted(obj_types_u & {"PACKAGE", "PACKAGE BODY", "PROCEDURE", "FUNCTION", "TYPE", "TYPE BODY"}):
-                candidate_nodes.add((full_u, obj_type_u))
-    if not candidate_nodes:
+    job_nodes = collect_job_action_candidate_nodes(source_objects)
+    if not job_nodes:
         return []
-    text_index = load_oracle_scoped_text_reference_index(ora_cfg, candidate_nodes)
-    rows = build_job_action_dependency_records(source_objects, text_index)
+
+    log.info('[PERF] JOB_ACTION candidate_nodes: jobs=%d', len(job_nodes))
+
+    def _loader(candidate_nodes: Set[DependencyNode]) -> Dict[DependencyNode, str]:
+        return load_oracle_scoped_text_reference_index(ora_cfg, candidate_nodes)
+
+    rows = build_job_action_dependency_records_with_loader(source_objects, _loader)
     if rows:
         log.info('[SOURCE_SCOPE] 已从 JOB_ACTION 补充 JOB 依赖 %d 条。', len(rows))
     return rows
@@ -54733,6 +54898,13 @@ def main():
         remap_scope_text_fallback_mode = normalize_remap_scope_text_fallback_mode(
             settings.get("remap_scope_text_fallback_mode", "off")
         )
+        _need_scope_integrity_graph = bool(
+            source_scope_mode_setting == "remap_root_closure" and (
+                settings.get('scope_integrity_check')
+                or settings.get('scope_integrity_advisory_check')
+                or settings.get('scope_integrity_fk_check')
+            )
+        )
         scope_discovery_types = build_scope_discovery_types(
             enabled_object_types,
             source_scope_mode_setting,
@@ -55844,6 +56016,18 @@ def main():
         integrity_excluded_seed_nodes.update(explicit_seed_nodes or set())
         integrity_excluded_seed_nodes.update(system_artifact_seed_nodes or set())
         integrity_included_nodes = set(source_scope_result.included_nodes or frozenset()) - integrity_excluded_seed_nodes
+        if _need_scope_integrity_graph and oracle_dependencies_for_grants:
+            allowed_integrity_nodes = {
+                ((full or '').upper(), (obj_type or '').upper())
+                for full, obj_type in integrity_included_nodes
+                if (full or '').strip() and (obj_type or '').strip()
+            }
+            log.info('[PERF] 开始构建 scope_integrity raw graph: input_records=%d, allowed_nodes=%d', len(oracle_dependencies_for_grants), len(allowed_integrity_nodes))
+            scope_integrity_dependency_graph_raw = build_dependency_graph_from_records(
+                oracle_dependencies_for_grants,
+                allowed_nodes=allowed_integrity_nodes,
+            )
+            log.info('[PERF] scope_integrity raw graph 完成，nodes=%d，开始 build_source_scope_closure...', len(scope_integrity_dependency_graph_raw))
         if (
             (settings.get('scope_integrity_check') or settings.get('scope_integrity_advisory_check') or settings.get('scope_integrity_fk_check'))
             and normalize_source_object_scope_mode(settings.get('source_object_scope_mode', 'full_source')) == 'remap_root_closure'

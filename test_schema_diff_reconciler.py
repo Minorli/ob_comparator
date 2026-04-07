@@ -12967,6 +12967,40 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn(sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "P1", "PROCEDURE"), rows)
         self.assertIn(sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "T1", "TABLE"), rows)
 
+    def test_collect_job_action_candidate_nodes_starts_from_jobs_only(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "SRC.P1": {"PROCEDURE"},
+            "SRC.PKG1": {"PACKAGE", "PACKAGE BODY"},
+            "SRC.J1": {"JOB"},
+        }
+        nodes = sdr.collect_job_action_candidate_nodes(source_objects)
+        self.assertEqual(nodes, {("SRC.J1", "JOB")})
+
+    def test_build_job_action_dependency_records_lazy_loader_preserves_multi_hop_resolution(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "SRC.P1": {"PROCEDURE"},
+            "SRC.PKG1": {"PACKAGE", "PACKAGE BODY"},
+            "SRC.J1": {"JOB"},
+        }
+        calls = []
+        text_map = {
+            ("SRC.J1", "JOB"): "BEGIN PKG1.P; END;",
+            ("SRC.PKG1", "PACKAGE BODY"): "BEGIN P1; END;",
+            ("SRC.P1", "PROCEDURE"): "BEGIN EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM T1'; END;",
+        }
+        def fake_loader(nodes):
+            calls.append(set(nodes))
+            return {node: text_map[node] for node in nodes if node in text_map}
+        rows = sdr.build_job_action_dependency_records_with_loader(source_objects, fake_loader)
+        self.assertEqual(calls[0], {("SRC.J1", "JOB")})
+        self.assertTrue(any(("SRC.PKG1", "PACKAGE BODY") in batch for batch in calls[1:]))
+        self.assertTrue(any(("SRC.P1", "PROCEDURE") in batch for batch in calls[1:]))
+        self.assertIn(sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "PKG1", "PACKAGE"), rows)
+        self.assertIn(sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "P1", "PROCEDURE"), rows)
+        self.assertIn(sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "T1", "TABLE"), rows)
+
     def test_extend_source_scope_result_with_text_reference_seed_rows_expands_paired_objects(self):
         source_objects = {
             "SRC.T1": {"TABLE"},
@@ -13509,6 +13543,50 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(issues[0].severity, sdr.SCOPE_INTEGRITY_SEVERITY_INFO)
         self.assertEqual(issues[0].object_type, "PROCEDURE")
         self.assertEqual(issues[0].missing_deps[0].dep_full, "SRC.T2")
+
+    def test_build_dependency_graph_from_records_filters_to_allowed_nodes(self):
+        records = [
+            sdr.DependencyRecord("SRC", "V1", "VIEW", "SRC", "T1", "TABLE"),
+            sdr.DependencyRecord("SRC", "V1", "VIEW", "SYS", "STANDARD", "PACKAGE"),
+            sdr.DependencyRecord("SRC", "P1", "PROCEDURE", "SRC", "T2", "TABLE"),
+        ]
+        graph = sdr.build_dependency_graph_from_records(
+            records,
+            allowed_nodes={("SRC.V1", "VIEW"), ("SRC.T1", "TABLE")},
+        )
+        self.assertEqual(graph, {("SRC.V1", "VIEW"): {("SRC.T1", "TABLE")}})
+
+    def test_load_oracle_job_action_dependency_records_only_loads_jobs_initially(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "SRC.P1": {"PROCEDURE"},
+            "SRC.PKG1": {"PACKAGE", "PACKAGE BODY"},
+            "SRC.J1": {"JOB"},
+        }
+        calls = []
+        text_map = {
+            ("SRC.J1", "JOB"): "BEGIN PKG1.P; END;",
+            ("SRC.PKG1", "PACKAGE BODY"): "BEGIN P1; END;",
+            ("SRC.P1", "PROCEDURE"): "BEGIN EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM T1'; END;",
+        }
+        def fake_loader(_cfg, candidate_nodes):
+            calls.append(set(candidate_nodes))
+            return {node: text_map[node] for node in candidate_nodes if node in text_map}
+        with mock.patch.object(sdr, 'load_oracle_scoped_text_reference_index', side_effect=fake_loader):
+            rows = sdr.load_oracle_job_action_dependency_records({"user": "u", "password": "p", "dsn": "d"}, source_objects)
+        self.assertEqual(calls[0], {("SRC.J1", "JOB")})
+        self.assertIn(sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "T1", "TABLE"), rows)
+
+    def test_build_dependency_graph_from_records_returns_empty_without_allowed_nodes_match(self):
+        records = [
+            sdr.DependencyRecord("SRC", "V1", "VIEW", "SYS", "STANDARD", "PACKAGE"),
+            sdr.DependencyRecord("SRC", "P1", "PROCEDURE", "SRC", "T2", "TABLE"),
+        ]
+        graph = sdr.build_dependency_graph_from_records(
+            records,
+            allowed_nodes={("SRC.V1", "VIEW")},
+        )
+        self.assertEqual(graph, {})
 
     def test_build_scope_integrity_detail_rows_for_scope_detail_includes_info(self):
         issues = [
