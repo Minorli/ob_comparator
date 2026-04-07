@@ -114,9 +114,10 @@
 ### 5.2 VIEW / PLSQL / TYPE / SYNONYM / JOB / SCHEDULE
 - 存在性校验
 - VIEW 兼容性分析：SYS.OBJ$ / X$ 系统对象视为不支持（用户自建 X$ 对象除外）
-- VIEW 依赖 remap 会同时处理 unquoted / quoted qualified 引用；当同义词终点无法安全解析时，不做 schema-only 盲改，而是优先 fallback 到受管目标同义词对象本身；若仍无法确认，则保留原引用并输出诊断日志
+- VIEW 依赖 remap 会同时处理 unquoted / quoted qualified 引用，并补充支持 `TABLE(...)`、`XMLTABLE(...)`、`JSON_TABLE(...)` 等特殊构造中的受管对象 token 重写；当同义词终点无法安全解析时，不再 fallback 到受管目标同义词对象本身，而是保留原引用并输出诊断日志，同时禁止 schema-only 盲改
 - 当 `source_object_scope_mode=remap_root_closure` 时，源对象范围不再按 `source_schemas` 全量纳入，而是仅从 `remap_file` 中显式 TABLE/VIEW roots 出发，按依赖、反向依赖、附属关系扩展闭包；闭包外对象整体不进入 compare/fixup/report，`trigger_list` 可作为显式 keep set 保留触发器及其父对象。注意：`missed_tables_views_for_OMS/` 与 report_db `OMS_MISSING` 默认只导出显式 remap roots，不把 closure 中的依赖 TABLE/VIEW 一起导出。
 - 当 `remap_scope_text_fallback_mode=safe` 时，结构化闭包之外的剩余对象会额外从 `DBA_SOURCE`、`DBA_VIEWS.TEXT`、`DBA_MVIEWS.QUERY`、scheduler/job 文本等受控来源做 scoped 补盲；命中的对象以 `TEXT_REFERENCE_HEURISTIC` 写入 `source_scope_detail_<ts>.txt`，随后重新进入结构化 closure 扩展。
+- `JOB_ACTION` 与 `safe text fallback` 的 scoped text matching 采用统一索引化匹配：先提取文本 token，再只对命中 token 的候选对象做精确 regex；对非标准/quoted 标识符保留保守慢路径，优先 correctness。运行日志会输出 `[PERF] ... pattern_index / scan / round` 计数，帮助判断成本主要落在 index build 还是 text scan。
 - `safe` 额外支持受控 dynamic SQL (`EXECUTE IMMEDIATE` / `DBMS_SQL.PARSE`)、纯字符串拼接 SQL 与 same-schema 未带前缀的 package/procedure/function 调用、dynamic SQL object reference；但不会对普通字符串或跨 schema 未带前缀引用做盲猜。
 - 变量参与的 dynamic SQL（例如 `v_sql := ... || var_name`）只输出 `TEXT_REFERENCE_AMBIGUOUS` 诊断，不自动纳入 closure。
 - `safe` 模式不允许退化为全 schema `DBMS_METADATA` 全量 DDL grep。

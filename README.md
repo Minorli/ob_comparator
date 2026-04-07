@@ -266,7 +266,8 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - 源端系统命名的单列 `IS NOT NULL` CHECK 仅在 `ENABLED` 时走列语义建模；若源端这类约束为 `DISABLED`，当前会按普通 CHECK 参与缺失 compare/fixup，并生成 `ADD CONSTRAINT ... CHECK (...) DISABLE`
 - 当目标端同一列存在多份等价单列 `IS NOT NULL` CHECK、而源端仅保留一份语义时，扩展约束 compare 会把多余约束列为 `extra mismatch`，并在 `fixup/cleanup_candidates/extra_cleanup_candidates.txt` 的 `SAFE_DUPLICATE_NOTNULL_DROP_SQL` 区域输出未注释的 `DROP CONSTRAINT` 候选，同时生成 `fixup/cleanup_safe/constraint/*.sql`；`generate_extra_cleanup` 默认开启，但 `cleanup_safe/` 默认不会被 `run_fixup` 执行，需显式 `--only-dirs cleanup_safe/constraint`
 - 当 `extra_constraint_cleanup_mode=semantic_fk_check` 时，compare 后仍判定为 target-only 的 `FK/CHECK` 会额外生成到 `fixup/cleanup_semantic/constraint/*.sql`；这类 SQL 同样属于 destructive cleanup，默认不会被 `run_fixup` 自动执行，需显式 `--only-dirs cleanup_semantic/constraint`
-- VIEW 依赖 remap 现在会处理 `FROM/JOIN` 中的带引号 qualified 引用（如 `"SRC"."T1"`），并对同义词终点无法安全解析的场景输出诊断日志；若仅能确认目标同义词对象自身映射，则优先 fallback 到目标同义词，不做盲目的 schema-only 改写
+- VIEW 依赖 remap 现在会处理 `FROM/JOIN` 中的带引号 qualified 引用（如 `"SRC"."T1"`），并支持 `TABLE(...)`、`XMLTABLE(...)`、`JSON_TABLE(...)` 等特殊构造中的受管对象 token 重写；当同义词终点无法安全解析时，会保留原始引用并输出诊断日志，不再 fallback 到目标同义词名，也不会做盲目的 schema-only 改写
+- scoped text matching（`JOB_ACTION` / `safe text fallback`）已改为索引化匹配：先从文本提取标识符 token，再只对命中 token 的候选对象做精确 regex；日志会额外输出 `[PERF] ... pattern_index / scan / round` 计数，便于区分“建索引慢”还是“扫文本慢”
 - 列默认值 compare 继续按大小写不敏感语义比较（字符串字面量除外）；并额外对数值字面量、`DATE '...'`、`-(1)` 这类负号包裹数字、以及字符串字面量外部的尾部注释做语义归一，避免 `.98/0/DATE '1990-01-01'/user` 这类目标端字典表现差异被误报成 drift。报告和 review-first fixup SQL 仍尽量保留源端显示形式，但会剥掉 `USER--更新人` 这类非语义尾注释，避免把注释残片写回 SQL
 - `main_reports/run_<ts>/column_visibility_skipped_detail_<ts>.txt`：`column_visibility_policy=auto` 且 `INVISIBLE_COLUMN` 元数据不完整时的跳过明细，说明哪些表本轮未做 INVISIBLE compare/fixup
 - OceanBase 列元数据现在联合 `DBA_TAB_COLUMNS` 与 `DBA_TAB_COLS` 取长补短；标准字段优先保留 `DBA_TAB_COLUMNS`，可选标记/缺失值由 `DBA_TAB_COLS` 补齐，降低单视图元数据不一致带来的漏检
