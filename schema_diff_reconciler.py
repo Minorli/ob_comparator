@@ -91,6 +91,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Dict, FrozenSet, Iterable, Iterator, List, NamedTuple, NoReturn, Optional, Pattern, Sequence, Set, Tuple, Union
 
@@ -5106,34 +5107,18 @@ def _extract_dynamic_sql_literals_for_scan(sql: str) -> Tuple[List[str], List[st
 def build_scoped_text_reference_seed_rows(
     scope_result: ScopedSourceScopeResult,
     text_index: Dict[DependencyNode, str],
+    pattern_index: Optional["ScopedPatternIndex"] = None,
     diagnostic_rows: Optional[List[Tuple[str, str, str, str]]] = None,
 ) -> List[Tuple[DependencyNode, str, str]]:
     if not scope_result or not text_index:
         return []
-    candidate_types_by_full: Dict[str, Set[str]] = defaultdict(set)
-    for full, obj_type in (scope_result.included_nodes or frozenset()):
-        full_u = (full or "").upper()
-        type_u = (obj_type or "").upper()
-        if full_u and type_u in SCOPED_TEXT_REFERENCE_TARGET_TYPES:
-            candidate_types_by_full[full_u].add(type_u)
+    candidate_types_by_full = build_scoped_candidate_types_by_full_from_nodes(
+        set(scope_result.included_nodes or frozenset()),
+        include_types=SCOPED_TEXT_REFERENCE_TARGET_TYPES,
+    )
     if not candidate_types_by_full:
         return []
-    patterns: List[Tuple[str, Tuple[re.Pattern, ...]]] = []
-    same_schema_outer_patterns: Dict[str, List[Tuple[str, Tuple[re.Pattern, ...]]]] = defaultdict(list)
-    same_schema_dynamic_patterns: Dict[str, List[Tuple[str, Tuple[re.Pattern, ...]]]] = defaultdict(list)
-    for full_u in sorted(candidate_types_by_full):
-        candidate_types = candidate_types_by_full.get(full_u) or set()
-        regexes = _build_scoped_reference_patterns(full_u, candidate_types)
-        if regexes:
-            patterns.append((full_u, regexes))
-        if "." in full_u:
-            owner_u, name_u = full_u.split(".", 1)
-            outer_regexes = _build_same_schema_outer_reference_patterns(name_u, candidate_types)
-            if outer_regexes:
-                same_schema_outer_patterns[owner_u].append((full_u, outer_regexes))
-            dynamic_regexes = _build_same_schema_dynamic_sql_reference_patterns(name_u, candidate_types)
-            if dynamic_regexes:
-                same_schema_dynamic_patterns[owner_u].append((full_u, dynamic_regexes))
+    pattern_index = pattern_index or ScopedPatternIndex(candidate_types_by_full)
     rows: List[Tuple[DependencyNode, str, str]] = []
     seen: Set[DependencyNode] = set()
     for node, raw_text in sorted((text_index or {}).items(), key=lambda item: (item[0][1], item[0][0])):
@@ -5149,29 +5134,15 @@ def build_scoped_text_reference_seed_rows(
         if not cleaned_text and not dynamic_sql_texts and not dynamic_sql_ambiguities:
             continue
         node_owner = (node[0].split('.', 1)[0].upper() if '.' in (node[0] or '') else "")
-        matched_full: Optional[str] = None
-        for full_u, regexes in patterns:
-            if any(regex.search(cleaned_text) for regex in regexes) or any(
-                regex.search(dynamic_text)
-                for dynamic_text in dynamic_sql_texts
-                for regex in regexes
-            ):
-                matched_full = full_u
-                break
-        if matched_full is None and node_owner:
-            for full_u, regexes in same_schema_outer_patterns.get(node_owner, []):
-                if any(regex.search(cleaned_text) for regex in regexes):
-                    matched_full = full_u
-                    break
-        if matched_full is None and node_owner and dynamic_sql_texts:
-            for full_u, regexes in same_schema_dynamic_patterns.get(node_owner, []):
-                if any(
-                    regex.search(dynamic_text)
-                    for dynamic_text in dynamic_sql_texts
-                    for regex in regexes
-                ):
-                    matched_full = full_u
-                    break
+        text_tokens = pattern_index.extract_tokens(cleaned_text, dynamic_sql_texts)
+        matches = pattern_index.find_matches(
+            cleaned_text,
+            dynamic_sql_texts,
+            node_owner,
+            find_first=True,
+            text_tokens=text_tokens,
+        )
+        matched_full = matches[0] if matches else None
         if matched_full is not None:
             rows.append((node, "TEXT_REFERENCE_HEURISTIC", f"MATCH:{matched_full}"))
             seen.add(node)
@@ -10189,6 +10160,10 @@ def build_source_scope_closure(
     all_nodes = collect_source_object_nodes(source_objects)
     reverse_attached = build_attached_object_reverse_map(source_objects, object_parent_map)
     reverse_dependency_graph = build_reverse_dependency_map(dependency_graph)
+    source_types_sorted = _build_sorted_type_map(source_objects)
+    reverse_attached_sorted = _build_sorted_attached_map(reverse_attached)
+    dependency_graph_sorted = _build_sorted_node_map(dependency_graph)
+    reverse_dependency_graph_sorted = _build_sorted_node_map(reverse_dependency_graph)
     included_nodes: Set[DependencyNode] = set()
     enqueued: Set[DependencyNode] = set()
     queue: deque = deque()
@@ -10233,21 +10208,16 @@ def build_source_scope_closure(
 
         parent_full = (object_parent_map.get(full_u) or "").upper() if object_parent_map else ""
         if parent_full:
-            parent_types = {
-                (obj_type or "").upper()
-                for obj_type in source_objects.get(parent_full, set())
-                if obj_type
-            }
-            for parent_type in sorted(parent_types):
+            for parent_type in source_types_sorted.get(parent_full, ()):
                 _queue((parent_full, parent_type), "PARENT_OBJECT", "%s:%s" % (type_u, full_u))
 
-        for child_node in sorted(reverse_attached.get(full_u, set()), key=lambda item: (item[1], item[0])):
+        for child_node in reverse_attached_sorted.get(full_u, ()):
             _queue(child_node, "ATTACHED_OBJECT", "%s:%s" % (type_u, full_u))
 
-        for ref_full, ref_type in sorted(dependency_graph.get((full_u, type_u), set()) if dependency_graph else set(), key=lambda item: (item[1], item[0])):
+        for ref_full, ref_type in dependency_graph_sorted.get((full_u, type_u), ()):
             _queue((ref_full.upper(), ref_type.upper()), "DEPENDENCY", "%s:%s" % (type_u, full_u))
 
-        reverse_edges = sorted(reverse_dependency_graph.get((full_u, type_u), set()), key=lambda item: (item[1], item[0]))
+        reverse_edges = reverse_dependency_graph_sorted.get((full_u, type_u), ())
         if should_expand_reverse_dependency(type_u):
             for dep_full, dep_type in reverse_edges:
                 _queue((dep_full.upper(), dep_type.upper()), "REVERSE_DEPENDENCY", "%s:%s" % (type_u, full_u))
@@ -10289,6 +10259,260 @@ SCOPED_REFERENCE_DEP_PREFERRED_TYPES: Tuple[str, ...] = (
 )
 
 
+_IDENT_TOKEN_RE = re.compile(r'[A-Z0-9_$#]+')
+_STANDARD_IDENTIFIER_RE = re.compile(r'^[A-Z0-9_$#]+$')
+ORACLE_CURSOR_FETCH_TUNING: Dict[str, Tuple[int, int]] = {
+    "large_text": (5000, 5000),
+    "bulk_metadata": (5000, 5000),
+    "medium_metadata": (2000, 2000),
+}
+
+
+def apply_oracle_cursor_fetch_tuning(cursor, profile: str = "small_lookup") -> None:
+    tuning = ORACLE_CURSOR_FETCH_TUNING.get((profile or "").strip().lower())
+    if not tuning or cursor is None:
+        return
+    arraysize, prefetchrows = tuning
+    try:
+        cursor.arraysize = max(1, int(arraysize))
+    except Exception:
+        pass
+    try:
+        cursor.prefetchrows = max(1, int(prefetchrows))
+    except Exception:
+        pass
+
+
+def build_scoped_candidate_types_by_full_from_source_objects(
+    source_objects: Optional[SourceObjectMap],
+    *,
+    include_types: Optional[Set[str]] = None,
+    exclude_types: Optional[Set[str]] = None,
+) -> Dict[str, Set[str]]:
+    candidate_types_by_full: Dict[str, Set[str]] = defaultdict(set)
+    include_types_u = {(item or "").upper() for item in (include_types or set()) if item}
+    exclude_types_u = {(item or "").upper() for item in (exclude_types or set()) if item}
+    for full_u, obj_types in (source_objects or {}).items():
+        full_norm = (full_u or "").upper()
+        if not full_norm:
+            continue
+        for obj_type_u in {(item or "").upper() for item in (obj_types or set()) if item}:
+            if include_types_u and obj_type_u not in include_types_u:
+                continue
+            if exclude_types_u and obj_type_u in exclude_types_u:
+                continue
+            candidate_types_by_full[full_norm].add(obj_type_u)
+    return {key: set(value) for key, value in candidate_types_by_full.items() if value}
+
+
+def build_scoped_candidate_types_by_full_from_nodes(
+    nodes: Optional[Set[DependencyNode]],
+    *,
+    include_types: Optional[Set[str]] = None,
+) -> Dict[str, Set[str]]:
+    candidate_types_by_full: Dict[str, Set[str]] = defaultdict(set)
+    include_types_u = {(item or "").upper() for item in (include_types or set()) if item}
+    for full_u, obj_type_u in (nodes or set()):
+        full_norm = (full_u or "").upper()
+        type_norm = (obj_type_u or "").upper()
+        if not full_norm or not type_norm:
+            continue
+        if include_types_u and type_norm not in include_types_u:
+            continue
+        candidate_types_by_full[full_norm].add(type_norm)
+    return {key: set(value) for key, value in candidate_types_by_full.items() if value}
+
+
+class ScopedPatternIndex:
+    """
+    为 scoped text matching 构建可复用的 candidate 索引。
+    - 标准对象名走 token -> candidate 倒排，再做精确 regex
+    - 非标准对象名保留保守慢路径，避免因 fast path 漏对象
+    """
+
+    def __init__(self, candidate_types_by_full: Optional[Dict[str, Set[str]]] = None):
+        self._candidate_types_by_full: Dict[str, Set[str]] = {}
+        self._by_name: Dict[str, List[str]] = defaultdict(list)
+        self._same_schema_outer_by_owner_name: Dict[str, Dict[str, List[str]]] = defaultdict(lambda: defaultdict(list))
+        self._same_schema_dynamic_by_owner_name: Dict[str, Dict[str, List[str]]] = defaultdict(lambda: defaultdict(list))
+        self._slow_scoped_fulls: List[str] = []
+        self._slow_same_schema_outer_by_owner: Dict[str, List[str]] = defaultdict(list)
+        self._slow_same_schema_dynamic_by_owner: Dict[str, List[str]] = defaultdict(list)
+        self._scoped_patterns_cache: Dict[str, Tuple[re.Pattern, ...]] = {}
+        self._same_schema_outer_cache: Dict[str, Tuple[re.Pattern, ...]] = {}
+        self._same_schema_dynamic_cache: Dict[str, Tuple[re.Pattern, ...]] = {}
+        self.extend(candidate_types_by_full or {})
+
+    @property
+    def candidate_count(self) -> int:
+        return len(self._candidate_types_by_full)
+
+    @property
+    def name_bucket_count(self) -> int:
+        return len(self._by_name)
+
+    @property
+    def slow_candidate_count(self) -> int:
+        return len(self._slow_scoped_fulls)
+
+    def _is_standard_identifier(self, name_u: str) -> bool:
+        return bool(_STANDARD_IDENTIFIER_RE.match((name_u or "").upper()))
+
+    def _invalidate(self, full_u: str) -> None:
+        self._scoped_patterns_cache.pop(full_u, None)
+        self._same_schema_outer_cache.pop(full_u, None)
+        self._same_schema_dynamic_cache.pop(full_u, None)
+
+    def _register(self, full_u: str) -> None:
+        if "." not in full_u:
+            return
+        owner_u, name_u = full_u.split(".", 1)
+        if self._is_standard_identifier(name_u):
+            self._by_name[name_u].append(full_u)
+            self._same_schema_outer_by_owner_name[owner_u][name_u].append(full_u)
+            self._same_schema_dynamic_by_owner_name[owner_u][name_u].append(full_u)
+        else:
+            self._slow_scoped_fulls.append(full_u)
+            self._slow_same_schema_outer_by_owner[owner_u].append(full_u)
+            self._slow_same_schema_dynamic_by_owner[owner_u].append(full_u)
+
+    def extend(self, candidate_types_by_full: Optional[Dict[str, Set[str]]]) -> int:
+        added = 0
+        for full_u in sorted((candidate_types_by_full or {}).keys()):
+            full_norm = (full_u or "").upper()
+            if not full_norm:
+                continue
+            new_types = {(item or "").upper() for item in ((candidate_types_by_full or {}).get(full_u) or set()) if item}
+            if not new_types:
+                continue
+            existing_types = self._candidate_types_by_full.get(full_norm)
+            merged_types = set(existing_types or set()) | set(new_types)
+            if existing_types == merged_types:
+                continue
+            self._candidate_types_by_full[full_norm] = merged_types
+            if existing_types is None:
+                self._register(full_norm)
+                added += 1
+            else:
+                self._invalidate(full_norm)
+        return added
+
+    def _get_scoped_patterns(self, full_u: str) -> Tuple[re.Pattern, ...]:
+        patterns = self._scoped_patterns_cache.get(full_u)
+        if patterns is None:
+            patterns = _build_scoped_reference_patterns(full_u, self._candidate_types_by_full.get(full_u, set()))
+            self._scoped_patterns_cache[full_u] = patterns
+        return patterns
+
+    def _get_same_schema_outer_patterns(self, full_u: str) -> Tuple[re.Pattern, ...]:
+        patterns = self._same_schema_outer_cache.get(full_u)
+        if patterns is None:
+            name_u = full_u.split(".", 1)[1] if "." in full_u else full_u
+            patterns = _build_same_schema_outer_reference_patterns(name_u, self._candidate_types_by_full.get(full_u, set()))
+            self._same_schema_outer_cache[full_u] = patterns
+        return patterns
+
+    def _get_same_schema_dynamic_patterns(self, full_u: str) -> Tuple[re.Pattern, ...]:
+        patterns = self._same_schema_dynamic_cache.get(full_u)
+        if patterns is None:
+            name_u = full_u.split(".", 1)[1] if "." in full_u else full_u
+            patterns = _build_same_schema_dynamic_sql_reference_patterns(name_u, self._candidate_types_by_full.get(full_u, set()))
+            self._same_schema_dynamic_cache[full_u] = patterns
+        return patterns
+
+    def extract_tokens(self, cleaned_text: str, dynamic_sql_texts: List[str]) -> Set[str]:
+        text_tokens: Set[str] = set(_IDENT_TOKEN_RE.findall(cleaned_text or ""))
+        for dynamic_text in dynamic_sql_texts or []:
+            text_tokens.update(_IDENT_TOKEN_RE.findall(dynamic_text or ""))
+        return text_tokens
+
+    def estimate_prefilter_hits(self, text_tokens: Set[str], node_owner: str) -> Tuple[int, int, int]:
+        owner_u = (node_owner or "").upper()
+        scoped_hits: Set[str] = set()
+        for token in text_tokens or set():
+            scoped_hits.update(self._by_name.get((token or "").upper(), []))
+        outer_hits: Set[str] = set()
+        dynamic_hits: Set[str] = set()
+        if owner_u:
+            outer_bucket = self._same_schema_outer_by_owner_name.get(owner_u) or {}
+            dynamic_bucket = self._same_schema_dynamic_by_owner_name.get(owner_u) or {}
+            for token in text_tokens or set():
+                token_u = (token or "").upper()
+                outer_hits.update(outer_bucket.get(token_u, []))
+                dynamic_hits.update(dynamic_bucket.get(token_u, []))
+        return len(scoped_hits), len(outer_hits), len(dynamic_hits)
+
+    def find_matches(
+        self,
+        cleaned_text: str,
+        dynamic_sql_texts: List[str],
+        node_owner: str,
+        find_first: bool = False,
+        text_tokens: Optional[Set[str]] = None,
+    ) -> List[str]:
+        matched_fulls: List[str] = []
+        seen_fulls: Set[str] = set()
+        text_tokens = {
+            (item or "").upper()
+            for item in (text_tokens or self.extract_tokens(cleaned_text or "", dynamic_sql_texts or []))
+            if (item or "").strip()
+        }
+
+        def _add_match(full_u: str) -> bool:
+            full_norm = (full_u or "").upper()
+            if not full_norm or full_norm in seen_fulls:
+                return False
+            seen_fulls.add(full_norm)
+            matched_fulls.append(full_norm)
+            return True
+
+        def _match_candidates(full_names: List[str], regex_getter, *, match_cleaned: bool, match_dynamic: bool) -> bool:
+            for full_u in full_names:
+                regexes = regex_getter(full_u)
+                if not regexes:
+                    continue
+                hit = False
+                if match_cleaned and cleaned_text:
+                    hit = any(regex.search(cleaned_text) for regex in regexes)
+                if not hit and match_dynamic and dynamic_sql_texts:
+                    hit = any(
+                        regex.search(dynamic_text)
+                        for dynamic_text in dynamic_sql_texts
+                        for regex in regexes
+                    )
+                if hit and _add_match(full_u) and find_first:
+                    return True
+            return False
+
+        scoped_candidates: Set[str] = set()
+        for token in text_tokens:
+            scoped_candidates.update(self._by_name.get(token, []))
+        if _match_candidates(sorted(scoped_candidates), self._get_scoped_patterns, match_cleaned=True, match_dynamic=True):
+            return matched_fulls
+        if _match_candidates(self._slow_scoped_fulls, self._get_scoped_patterns, match_cleaned=True, match_dynamic=True):
+            return matched_fulls
+
+        owner_u = (node_owner or "").upper()
+        if owner_u:
+            outer_candidates: Set[str] = set()
+            for token in text_tokens:
+                outer_candidates.update((self._same_schema_outer_by_owner_name.get(owner_u) or {}).get(token, []))
+            if _match_candidates(sorted(outer_candidates), self._get_same_schema_outer_patterns, match_cleaned=True, match_dynamic=False):
+                return matched_fulls
+            if _match_candidates(self._slow_same_schema_outer_by_owner.get(owner_u, []), self._get_same_schema_outer_patterns, match_cleaned=True, match_dynamic=False):
+                return matched_fulls
+
+            dynamic_candidates: Set[str] = set()
+            for token in text_tokens:
+                dynamic_candidates.update((self._same_schema_dynamic_by_owner_name.get(owner_u) or {}).get(token, []))
+            if _match_candidates(sorted(dynamic_candidates), self._get_same_schema_dynamic_patterns, match_cleaned=False, match_dynamic=True):
+                return matched_fulls
+            if _match_candidates(self._slow_same_schema_dynamic_by_owner.get(owner_u, []), self._get_same_schema_dynamic_patterns, match_cleaned=False, match_dynamic=True):
+                return matched_fulls
+
+        return matched_fulls
+
+
 def _resolve_scoped_reference_dependency_type(
     source_objects: Optional[SourceObjectMap],
     full_name: str,
@@ -10298,6 +10522,54 @@ def _resolve_scoped_reference_dependency_type(
         if candidate in type_set:
             return candidate
     return None
+
+
+def _build_sorted_type_map(
+    source_objects: Optional[SourceObjectMap],
+) -> Dict[str, Tuple[str, ...]]:
+    return {
+        (full_u or "").upper(): tuple(sorted({(obj_type or "").upper() for obj_type in (obj_types or set()) if obj_type}))
+        for full_u, obj_types in (source_objects or {}).items()
+        if (full_u or "").strip()
+    }
+
+
+def _build_sorted_node_map(
+    node_map: Optional[Dict[DependencyNode, Set[DependencyNode]]]
+) -> Dict[DependencyNode, Tuple[DependencyNode, ...]]:
+    return {
+        (((full_u or "").upper()), ((obj_type or "").upper())): tuple(
+            sorted(
+                {
+                    (((dep_full or "").upper()), ((dep_type or "").upper()))
+                    for dep_full, dep_type in (nodes or set())
+                    if (dep_full or "").strip() and (dep_type or "").strip()
+                },
+                key=lambda item: (item[1], item[0]),
+            )
+        )
+        for (full_u, obj_type), nodes in (node_map or {}).items()
+        if (full_u or "").strip() and (obj_type or "").strip()
+    }
+
+
+def _build_sorted_attached_map(
+    attached_map: Optional[Dict[str, Set[DependencyNode]]]
+) -> Dict[str, Tuple[DependencyNode, ...]]:
+    return {
+        (full_u or "").upper(): tuple(
+            sorted(
+                {
+                    (((child_full or "").upper()), ((child_type or "").upper()))
+                    for child_full, child_type in (nodes or set())
+                    if (child_full or "").strip() and (child_type or "").strip()
+                },
+                key=lambda item: (item[1], item[0]),
+            )
+        )
+        for full_u, nodes in (attached_map or {}).items()
+        if (full_u or "").strip()
+    }
 
 
 def build_job_action_dependency_records(
@@ -10314,65 +10586,13 @@ def build_job_action_dependency_records(
     if not job_nodes or not text_index:
         return []
 
-    candidate_types_by_full: Dict[str, Set[str]] = defaultdict(set)
-    for full_u, obj_types in source_objects.items():
-        for obj_type_u in {(item or "").upper() for item in (obj_types or set()) if item}:
-            if obj_type_u == "JOB":
-                continue
-            candidate_types_by_full[(full_u or "").upper()].add(obj_type_u)
+    candidate_types_by_full = build_scoped_candidate_types_by_full_from_source_objects(
+        source_objects,
+        exclude_types={"JOB"},
+    )
     if not candidate_types_by_full:
         return []
-
-    patterns: List[Tuple[str, Tuple[re.Pattern, ...]]] = []
-    same_schema_outer_patterns: Dict[str, List[Tuple[str, Tuple[re.Pattern, ...]]]] = defaultdict(list)
-    same_schema_dynamic_patterns: Dict[str, List[Tuple[str, Tuple[re.Pattern, ...]]]] = defaultdict(list)
-    for full_u in sorted(candidate_types_by_full):
-        candidate_types = candidate_types_by_full.get(full_u) or set()
-        regexes = _build_scoped_reference_patterns(full_u, candidate_types)
-        if regexes:
-            patterns.append((full_u, regexes))
-        if "." in full_u:
-            owner_u, name_u = full_u.split(".", 1)
-            outer_regexes = _build_same_schema_outer_reference_patterns(name_u, candidate_types)
-            if outer_regexes:
-                same_schema_outer_patterns[owner_u].append((full_u, outer_regexes))
-            dynamic_regexes = _build_same_schema_dynamic_sql_reference_patterns(name_u, candidate_types)
-            if dynamic_regexes:
-                same_schema_dynamic_patterns[owner_u].append((full_u, dynamic_regexes))
-
-    def _collect_matches(node_full: str, raw_text: str) -> List[str]:
-        cleaned_text = mask_sql_for_scan(raw_text or "").upper()
-        dynamic_sql_texts_raw, _dynamic_sql_ambiguities = _extract_dynamic_sql_literals_for_scan(raw_text or "")
-        dynamic_sql_texts = [item.upper() for item in dynamic_sql_texts_raw]
-        node_owner = node_full.split('.', 1)[0].upper() if '.' in node_full else ""
-        matched_fulls: List[str] = []
-        seen_fulls: Set[str] = set()
-
-        def _add_match(full_u: str) -> None:
-            full_u = (full_u or "").upper()
-            if not full_u or full_u in seen_fulls:
-                return
-            seen_fulls.add(full_u)
-            matched_fulls.append(full_u)
-
-        for full_u, regexes in patterns:
-            if any(regex.search(cleaned_text) for regex in regexes) or any(
-                regex.search(dynamic_text)
-                for dynamic_text in dynamic_sql_texts
-                for regex in regexes
-            ):
-                _add_match(full_u)
-        for full_u, regexes in same_schema_outer_patterns.get(node_owner, []):
-            if any(regex.search(cleaned_text) for regex in regexes):
-                _add_match(full_u)
-        for full_u, regexes in same_schema_dynamic_patterns.get(node_owner, []):
-            if any(
-                regex.search(dynamic_text)
-                for dynamic_text in dynamic_sql_texts
-                for regex in regexes
-            ):
-                _add_match(full_u)
-        return matched_fulls
+    pattern_index = ScopedPatternIndex(candidate_types_by_full)
 
     def _expand_program_unit(full_u: str, type_u: str) -> List[Tuple[str, str]]:
         candidates: List[Tuple[str, str]] = []
@@ -10395,7 +10615,17 @@ def build_job_action_dependency_records(
             continue
         dep_owner, dep_name = dep_full.split('.', 1)
         seen_targets: Set[str] = set()
-        queue: List[Tuple[str, str]] = [target for target in _collect_matches(dep_full, raw_text or "") if target]
+        cleaned_text = mask_sql_for_scan(raw_text or "").upper()
+        dynamic_sql_texts_raw, _dynamic_sql_ambiguities = _extract_dynamic_sql_literals_for_scan(raw_text or "")
+        dynamic_sql_texts = [item.upper() for item in dynamic_sql_texts_raw]
+        queue: List[Tuple[str, str]] = [
+            target for target in pattern_index.find_matches(
+                cleaned_text,
+                dynamic_sql_texts,
+                dep_full.split('.', 1)[0].upper(),
+                find_first=False,
+            ) if target
+        ]
         frontier_program_units: List[Tuple[str, str]] = []
         for matched_full in queue:
             ref_type = _resolve_scoped_reference_dependency_type(source_objects, matched_full)
@@ -10415,7 +10645,15 @@ def build_job_action_dependency_records(
             current_text = text_index.get(key)
             if not current_text:
                 continue
-            for matched_full in _collect_matches(current_full, current_text):
+            current_cleaned = mask_sql_for_scan(current_text or "").upper()
+            current_dynamic_raw, _dynamic_sql_ambiguities = _extract_dynamic_sql_literals_for_scan(current_text or "")
+            current_dynamic = [item.upper() for item in current_dynamic_raw]
+            for matched_full in pattern_index.find_matches(
+                current_cleaned,
+                current_dynamic,
+                current_full.split('.', 1)[0].upper() if '.' in current_full else "",
+                find_first=False,
+            ):
                 ref_type = _resolve_scoped_reference_dependency_type(source_objects, matched_full)
                 if not ref_type or "." not in matched_full:
                     continue
@@ -10449,65 +10687,19 @@ def build_job_action_dependency_records_with_loader(
     if not job_nodes:
         return []
 
-    candidate_types_by_full: Dict[str, Set[str]] = defaultdict(set)
-    for full_u, obj_types in source_objects.items():
-        for obj_type_u in {(item or "").upper() for item in (obj_types or set()) if item}:
-            if obj_type_u == "JOB":
-                continue
-            candidate_types_by_full[(full_u or "").upper()].add(obj_type_u)
+    candidate_types_by_full = build_scoped_candidate_types_by_full_from_source_objects(
+        source_objects,
+        exclude_types={"JOB"},
+    )
     if not candidate_types_by_full:
         return []
-
-    patterns: List[Tuple[str, Tuple[re.Pattern, ...]]] = []
-    same_schema_outer_patterns: Dict[str, List[Tuple[str, Tuple[re.Pattern, ...]]]] = defaultdict(list)
-    same_schema_dynamic_patterns: Dict[str, List[Tuple[str, Tuple[re.Pattern, ...]]]] = defaultdict(list)
-    for full_u in sorted(candidate_types_by_full):
-        candidate_types = candidate_types_by_full.get(full_u) or set()
-        regexes = _build_scoped_reference_patterns(full_u, candidate_types)
-        if regexes:
-            patterns.append((full_u, regexes))
-        if "." in full_u:
-            owner_u, name_u = full_u.split(".", 1)
-            outer_regexes = _build_same_schema_outer_reference_patterns(name_u, candidate_types)
-            if outer_regexes:
-                same_schema_outer_patterns[owner_u].append((full_u, outer_regexes))
-            dynamic_regexes = _build_same_schema_dynamic_sql_reference_patterns(name_u, candidate_types)
-            if dynamic_regexes:
-                same_schema_dynamic_patterns[owner_u].append((full_u, dynamic_regexes))
-
-    def _collect_matches(node_full: str, raw_text: str) -> List[str]:
-        cleaned_text = mask_sql_for_scan(raw_text or "").upper()
-        dynamic_sql_texts_raw, _dynamic_sql_ambiguities = _extract_dynamic_sql_literals_for_scan(raw_text or "")
-        dynamic_sql_texts = [item.upper() for item in dynamic_sql_texts_raw]
-        node_owner = node_full.split('.', 1)[0].upper() if '.' in node_full else ""
-        matched_fulls: List[str] = []
-        seen_fulls: Set[str] = set()
-
-        def _add_match(full_u: str) -> None:
-            full_u = (full_u or "").upper()
-            if not full_u or full_u in seen_fulls:
-                return
-            seen_fulls.add(full_u)
-            matched_fulls.append(full_u)
-
-        for full_u, regexes in patterns:
-            if any(regex.search(cleaned_text) for regex in regexes) or any(
-                regex.search(dynamic_text)
-                for dynamic_text in dynamic_sql_texts
-                for regex in regexes
-            ):
-                _add_match(full_u)
-        for full_u, regexes in same_schema_outer_patterns.get(node_owner, []):
-            if any(regex.search(cleaned_text) for regex in regexes):
-                _add_match(full_u)
-        for full_u, regexes in same_schema_dynamic_patterns.get(node_owner, []):
-            if any(
-                regex.search(dynamic_text)
-                for dynamic_text in dynamic_sql_texts
-                for regex in regexes
-            ):
-                _add_match(full_u)
-        return matched_fulls
+    pattern_index = ScopedPatternIndex(candidate_types_by_full)
+    log.info(
+        '[PERF] JOB_ACTION pattern_index: candidates=%d, name_buckets=%d, slow_candidates=%d',
+        pattern_index.candidate_count,
+        pattern_index.name_bucket_count,
+        pattern_index.slow_candidate_count,
+    )
 
     def _expand_program_unit_candidates(full_u: str, type_u: str) -> Set[DependencyNode]:
         candidates: Set[DependencyNode] = {(full_u, type_u)}
@@ -10519,7 +10711,8 @@ def build_job_action_dependency_records_with_loader(
 
     text_index = dict(load_text_index(set(job_nodes)) or {})
     records: Set[DependencyRecord] = set()
-    for node, raw_text in sorted(text_index.items(), key=lambda item: (item[0][1], item[0][0])):
+    total_job_texts = len([node for node in text_index.keys() if node in job_nodes])
+    for idx, (node, raw_text) in enumerate(sorted(text_index.items(), key=lambda item: (item[0][1], item[0][0])), start=1):
         if node not in job_nodes:
             continue
         dep_full = (node[0] or "").upper()
@@ -10529,7 +10722,34 @@ def build_job_action_dependency_records_with_loader(
         dep_owner, dep_name = dep_full.split('.', 1)
         seen_targets: Set[str] = set()
         frontier_program_units: List[Tuple[str, str]] = []
-        for matched_full in [target for target in _collect_matches(dep_full, raw_text or "") if target]:
+        cleaned_text = mask_sql_for_scan(raw_text or "").upper()
+        dynamic_sql_texts_raw, _dynamic_sql_ambiguities = _extract_dynamic_sql_literals_for_scan(raw_text or "")
+        dynamic_sql_texts = [item.upper() for item in dynamic_sql_texts_raw]
+        text_tokens = pattern_index.extract_tokens(cleaned_text, dynamic_sql_texts)
+        if idx == 1 or idx % 50 == 0 or idx == total_job_texts:
+            scoped_hits, outer_hits, dynamic_hits = pattern_index.estimate_prefilter_hits(
+                text_tokens,
+                dep_full.split('.', 1)[0].upper(),
+            )
+            log.info(
+                '[PERF] JOB_ACTION scan %d/%d: owner=%s, tokens=%d, scoped_hits=%d, outer_hits=%d, dynamic_hits=%d',
+                idx,
+                total_job_texts,
+                dep_owner,
+                len(text_tokens),
+                scoped_hits,
+                outer_hits,
+                dynamic_hits,
+            )
+        for matched_full in [
+            target for target in pattern_index.find_matches(
+                cleaned_text,
+                dynamic_sql_texts,
+                dep_full.split('.', 1)[0].upper(),
+                find_first=False,
+                text_tokens=text_tokens,
+            ) if target
+        ]:
             ref_type = _resolve_scoped_reference_dependency_type(source_objects, matched_full)
             if ref_type and "." in matched_full:
                 ref_owner, ref_name = matched_full.split('.', 1)
@@ -10555,7 +10775,17 @@ def build_job_action_dependency_records_with_loader(
                 current_text = text_index.get((current_full, current_type))
                 if not current_text:
                     continue
-                for matched_full in _collect_matches(current_full, current_text):
+                current_cleaned = mask_sql_for_scan(current_text or "").upper()
+                current_dynamic_raw, _dynamic_sql_ambiguities = _extract_dynamic_sql_literals_for_scan(current_text or "")
+                current_dynamic = [item.upper() for item in current_dynamic_raw]
+                current_tokens = pattern_index.extract_tokens(current_cleaned, current_dynamic)
+                for matched_full in pattern_index.find_matches(
+                    current_cleaned,
+                    current_dynamic,
+                    current_full.split('.', 1)[0].upper() if '.' in current_full else "",
+                    find_first=False,
+                    text_tokens=current_tokens,
+                ):
                     ref_type = _resolve_scoped_reference_dependency_type(source_objects, matched_full)
                     if not ref_type or "." not in matched_full:
                         continue
@@ -10627,6 +10857,7 @@ def load_oracle_scoped_text_reference_index(
             dsn=ora_cfg['dsn']
         ) as connection:
             with connection.cursor() as cursor:
+                apply_oracle_cursor_fetch_tuning(cursor, "large_text")
                 for obj_type_u in sorted({"PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE BODY", "TYPE", "TYPE BODY", "TRIGGER"} & set(keys_by_type_owner.keys())):
                     for owner_u, names in sorted(keys_by_type_owner[obj_type_u].items()):
                         for name_chunk in chunk_list(sorted(names), ORACLE_IN_BATCH_SIZE):
@@ -10756,15 +10987,34 @@ def apply_scoped_text_reference_fallback(
     max_rounds: int = MAX_SCOPED_TEXT_FALLBACK_ROUNDS,
 ) -> Tuple[ScopedSourceScopeResult, int]:
     total_added = 0
+    pattern_index = ScopedPatternIndex(
+        build_scoped_candidate_types_by_full_from_nodes(
+            set(scope_result.included_nodes or frozenset()),
+            include_types=SCOPED_TEXT_REFERENCE_TARGET_TYPES,
+        )
+    )
+    log.info(
+        '[PERF] SAFE_TEXT pattern_index init: candidates=%d, name_buckets=%d, slow_candidates=%d',
+        pattern_index.candidate_count,
+        pattern_index.name_bucket_count,
+        pattern_index.slow_candidate_count,
+    )
     for _round in range(max_rounds):
         scoped_text_index = load_oracle_scoped_text_reference_index(
             ora_cfg,
             set(scope_result.excluded_nodes or frozenset()),
         )
+        log.info(
+            '[PERF] SAFE_TEXT round=%d: excluded_text_nodes=%d, index_candidates=%d',
+            _round + 1,
+            len(set(scope_result.excluded_nodes or frozenset())),
+            pattern_index.candidate_count,
+        )
         diagnostic_rows: List[Tuple[str, str, str, str]] = []
         text_seed_rows = build_scoped_text_reference_seed_rows(
             scope_result,
             scoped_text_index,
+            pattern_index=pattern_index,
             diagnostic_rows=diagnostic_rows,
         )
         if diagnostic_rows:
@@ -10790,6 +11040,21 @@ def apply_scoped_text_reference_fallback(
         if next_scope.included_nodes == scope_result.included_nodes:
             log.warning("[SOURCE_SCOPE] safe text fallback 在第 %d 轮无进展，停止继续扩展。", _round + 1)
             return scope_result, total_added
+        new_nodes = set(next_scope.included_nodes or frozenset()) - set(scope_result.included_nodes or frozenset())
+        growth = pattern_index.extend(
+            build_scoped_candidate_types_by_full_from_nodes(
+                new_nodes,
+                include_types=SCOPED_TEXT_REFERENCE_TARGET_TYPES,
+            )
+        )
+        if growth:
+            log.info(
+                '[PERF] SAFE_TEXT round=%d index growth: new_candidates=%d, total_candidates=%d, name_buckets=%d',
+                _round + 1,
+                growth,
+                pattern_index.candidate_count,
+                pattern_index.name_bucket_count,
+            )
         scope_result = next_scope
     log.warning("[SOURCE_SCOPE] safe text fallback 达到最大轮次 %d，强制退出。", max_rounds)
     return scope_result, total_added
@@ -12059,6 +12324,7 @@ def get_source_objects(
                       )
                 """
                 with connection.cursor() as cursor:
+                    apply_oracle_cursor_fetch_tuning(cursor, "bulk_metadata")
                     for placeholders, chunk in iter_in_chunks(schemas_list):
                         sql = sql_tpl.format(
                             placeholders=placeholders,
@@ -12090,6 +12356,7 @@ def get_source_objects(
                 private_synonym_meta_owners = list(source_schema_owners)
                 private_synonym_output_owners = {owner for owner in synonym_owners if owner != "PUBLIC"}
                 with connection.cursor() as cursor:
+                    apply_oracle_cursor_fetch_tuning(cursor, "medium_metadata")
                     if private_synonym_meta_owners:
                         private_chunks = chunk_list(private_synonym_meta_owners, ORACLE_IN_BATCH_SIZE)
                         private_sql_tpl = """
@@ -12171,6 +12438,7 @@ def get_source_objects(
                                 )
             if include_jobs:
                 with connection.cursor() as cursor:
+                    apply_oracle_cursor_fetch_tuning(cursor, "medium_metadata")
                     for placeholders, chunk in iter_in_chunks(schemas_list):
                         cursor.execute(
                             f"SELECT OWNER, JOB_NAME FROM DBA_SCHEDULER_JOBS WHERE OWNER IN ({placeholders})",
@@ -12184,6 +12452,7 @@ def get_source_objects(
 
             if include_schedules:
                 with connection.cursor() as cursor:
+                    apply_oracle_cursor_fetch_tuning(cursor, "medium_metadata")
                     for placeholders, chunk in iter_in_chunks(schemas_list):
                         cursor.execute(
                             f"SELECT OWNER, SCHEDULE_NAME FROM DBA_SCHEDULER_SCHEDULES WHERE OWNER IN ({placeholders})",
@@ -12197,6 +12466,7 @@ def get_source_objects(
 
             # 精确认定物化视图集合，避免误删真实表
             with connection.cursor() as cursor:
+                apply_oracle_cursor_fetch_tuning(cursor, "medium_metadata")
                 for placeholders, chunk in iter_in_chunks(schemas_list):
                     cursor.execute(
                         f"SELECT OWNER, MVIEW_NAME FROM DBA_MVIEWS WHERE OWNER IN ({placeholders})",
@@ -12208,6 +12478,7 @@ def get_source_objects(
                         if owner and name:
                             mview_pairs.add((owner, name))
             with connection.cursor() as cursor:
+                apply_oracle_cursor_fetch_tuning(cursor, "medium_metadata")
                 for placeholders, chunk in iter_in_chunks(schemas_list):
                     cursor.execute(
                         f"SELECT OWNER, TABLE_NAME FROM DBA_TABLES WHERE OWNER IN ({placeholders})",
@@ -20054,6 +20325,7 @@ def dump_oracle_metadata(
 
                 try:
                     with ora_conn.cursor() as cursor:
+                        apply_oracle_cursor_fetch_tuning(cursor, "small_lookup")
                         for view_name in ("DBA_TAB_COLUMNS", "DBA_TAB_COLS"):
                             for col_name in optional_cols:
                                 support_by_view[view_name][col_name] = _probe_dict_col(
@@ -20190,6 +20462,7 @@ def dump_oracle_metadata(
                         view_name=tab_cols_view
                     )
                     with ora_conn.cursor() as cursor:
+                        apply_oracle_cursor_fetch_tuning(cursor, "bulk_metadata")
                         for owner_chunk in owner_chunks:
                             owners_clause = build_bind_placeholders(len(owner_chunk))
                             sql = sql_tpl.format(owners_clause=owners_clause)
@@ -20234,6 +20507,7 @@ def dump_oracle_metadata(
                             view_name=tab_cols_view
                         )
                         with ora_conn.cursor() as cursor:
+                            apply_oracle_cursor_fetch_tuning(cursor, "bulk_metadata")
                             for owner_chunk in owner_chunks:
                                 owners_clause = build_bind_placeholders(len(owner_chunk))
                                 sql = sql_tpl.format(owners_clause=owners_clause)
@@ -20267,6 +20541,7 @@ def dump_oracle_metadata(
                         WHERE TABLE_OWNER IN ({owners_clause})
                     """
                     with ora_conn.cursor() as cursor:
+                        apply_oracle_cursor_fetch_tuning(cursor, "bulk_metadata")
                         for owner_chunk in owner_chunks:
                             owners_clause = build_bind_placeholders(len(owner_chunk))
                             sql_idx = sql_idx_tpl.format(owners_clause=owners_clause)
@@ -20296,6 +20571,7 @@ def dump_oracle_metadata(
                         ORDER BY TABLE_OWNER, TABLE_NAME, INDEX_NAME, COLUMN_POSITION
                     """
                     with ora_conn.cursor() as cursor:
+                        apply_oracle_cursor_fetch_tuning(cursor, "bulk_metadata")
                         for owner_chunk in owner_chunks:
                             owners_clause = build_bind_placeholders(len(owner_chunk))
                             sql_idx_cols = sql_idx_cols_tpl.format(owners_clause=owners_clause)
@@ -20328,6 +20604,7 @@ def dump_oracle_metadata(
                     """
                     try:
                         with ora_conn.cursor() as cursor:
+                            apply_oracle_cursor_fetch_tuning(cursor, "bulk_metadata")
                             for owner_chunk in owner_chunks:
                                 owners_clause = build_bind_placeholders(len(owner_chunk))
                                 sql_idx_expr = sql_idx_expr_tpl.format(owners_clause=owners_clause)
@@ -20363,6 +20640,7 @@ def dump_oracle_metadata(
                     support_update_rule = False
                     try:
                         with ora_conn.cursor() as cursor:
+                            apply_oracle_cursor_fetch_tuning(cursor, "small_lookup")
                             cursor.execute(
                                 "SELECT SEARCH_CONDITION_VC FROM DBA_CONSTRAINTS WHERE ROWNUM = 1"
                             )
@@ -20371,6 +20649,7 @@ def dump_oracle_metadata(
                         search_condition_col = "SEARCH_CONDITION"
                     try:
                         with ora_conn.cursor() as cursor:
+                            apply_oracle_cursor_fetch_tuning(cursor, "small_lookup")
                             cursor.execute(
                                 "SELECT UPDATE_RULE FROM DBA_CONSTRAINTS WHERE ROWNUM = 1"
                             )
@@ -20386,6 +20665,7 @@ def dump_oracle_metadata(
                           AND CONSTRAINT_TYPE IN ('P','U','R','C')
                     """
                     with ora_conn.cursor() as cursor:
+                        apply_oracle_cursor_fetch_tuning(cursor, "bulk_metadata")
                         if search_condition_col == "SEARCH_CONDITION" and hasattr(cursor, "longfetchsize"):
                             try:
                                 cursor.longfetchsize = max(int(cursor.longfetchsize or 0), 100000)
@@ -20442,6 +20722,7 @@ def dump_oracle_metadata(
                         ORDER BY OWNER, TABLE_NAME, CONSTRAINT_NAME, POSITION
                     """
                     with ora_conn.cursor() as cursor:
+                        apply_oracle_cursor_fetch_tuning(cursor, "bulk_metadata")
                         for owner_chunk in owner_chunks:
                             owners_clause = build_bind_placeholders(len(owner_chunk))
                             sql_cons_cols = sql_cons_cols_tpl.format(owners_clause=owners_clause)
@@ -20545,6 +20826,7 @@ def dump_oracle_metadata(
                     """
                     try:
                         with ora_conn.cursor() as cursor:
+                            apply_oracle_cursor_fetch_tuning(cursor, "bulk_metadata")
                             for owner_chunk in owner_chunks:
                                 owners_clause = build_bind_placeholders(len(owner_chunk))
                                 sql_interval = sql_interval_tpl.format(owners_clause=owners_clause)
@@ -20584,6 +20866,7 @@ def dump_oracle_metadata(
                         """
                         try:
                             with ora_conn.cursor() as cursor:
+                                apply_oracle_cursor_fetch_tuning(cursor, "bulk_metadata")
                                 for owner_chunk in owner_chunks:
                                     owners_clause = build_bind_placeholders(len(owner_chunk))
                                     sql_part = sql_part_tpl.format(owners_clause=owners_clause)
@@ -20636,6 +20919,7 @@ def dump_oracle_metadata(
                         WHERE OWNER IN ({owners_clause})
                     """
                     with ora_conn.cursor() as cursor:
+                        apply_oracle_cursor_fetch_tuning(cursor, "bulk_metadata")
                         for owner_chunk in owner_chunks:
                             owners_clause = build_bind_placeholders(len(owner_chunk))
                             sql_trg = sql_trg_tpl.format(owners_clause=owners_clause)
@@ -20709,6 +20993,7 @@ def dump_oracle_metadata(
                               AND OBJECT_TYPE IN ({status_types_clause})
                         """
                         with ora_conn.cursor() as cursor:
+                            apply_oracle_cursor_fetch_tuning(cursor, "bulk_metadata")
                             for owner_chunk in status_owner_chunks:
                                 owners_clause = build_bind_placeholders(len(owner_chunk))
                                 sql_status = sql_status_tpl.format(owners_clause=owners_clause)
@@ -20738,6 +21023,7 @@ def dump_oracle_metadata(
                                 lambda: {"count": 0, "first_error": ""}
                             )
                             with ora_conn.cursor() as cursor:
+                                apply_oracle_cursor_fetch_tuning(cursor, "large_text")
                                 for owner_chunk in pkg_owner_chunks:
                                     owners_clause = build_bind_placeholders(len(owner_chunk))
                                     sql_pkg_err = sql_pkg_err_tpl.format(owners_clause=owners_clause)
@@ -20774,6 +21060,7 @@ def dump_oracle_metadata(
                         comments_complete = True
                         try:
                             with ora_conn.cursor() as cursor:
+                                apply_oracle_cursor_fetch_tuning(cursor, "medium_metadata")
                                 for chunk in chunk_list(comment_keys, COMMENT_BATCH_SIZE):
                                     if not chunk:
                                         continue
@@ -21241,6 +21528,7 @@ def load_oracle_dependencies(
             dsn=ora_cfg['dsn']
         ) as connection:
             with connection.cursor() as cursor:
+                apply_oracle_cursor_fetch_tuning(cursor, "bulk_metadata")
                 if include_external_refs:
                     for owner_chunk in owner_chunks:
                         owner_ph = build_bind_placeholders(len(owner_chunk))
@@ -31274,6 +31562,8 @@ def mask_sql_for_scan(sql: str) -> str:
     """
     if not sql:
         return sql
+    if "'" not in sql and '"' not in sql and "--" not in sql and "/*" not in sql:
+        return sql
     chars = list(sql)
     i = 0
     in_single = False
@@ -31856,6 +32146,58 @@ def extract_view_dependencies(
             return "%s.%s" % (parts[0], parts[1])
         return None
 
+    def _extract_special_construct_candidates(part_text: str) -> Tuple[bool, Set[str]]:
+        if not part_text or not part_text.strip():
+            return False, set()
+        stripped = part_text.lstrip()
+        masked_part = mask_sql_for_scan(stripped)
+        masked_part_upper = masked_part.upper()
+        part_length = len(masked_part_upper)
+
+        def _match_construct_prefix(keyword: str) -> Optional[int]:
+            if not masked_part_upper.startswith(keyword):
+                return None
+            keyword_len = len(keyword)
+            if part_length > keyword_len and _is_word_char(masked_part_upper[keyword_len]):
+                return None
+            idx = keyword_len
+            while idx < part_length and masked_part_upper[idx].isspace():
+                idx += 1
+            if idx >= part_length or masked_part_upper[idx] != "(":
+                return None
+            return idx
+
+        for keyword in ("TABLE", "XMLTABLE", "JSON_TABLE"):
+            open_idx = _match_construct_prefix(keyword)
+            if open_idx is None:
+                continue
+            depth = 0
+            close_idx: Optional[int] = None
+            for idx in range(open_idx, part_length):
+                ch = masked_part[idx]
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        close_idx = idx
+                        break
+            if close_idx is None:
+                return True, set()
+            if keyword != "TABLE":
+                return True, set()
+            inner = stripped[open_idx + 1:close_idx]
+            match = re.match(
+                r'^\s*((?:"[^"]+"|[A-Z0-9_$#]+)(?:\s*\.\s*(?:"[^"]+"|[A-Z0-9_$#]+))?)\s*\(',
+                inner,
+                re.IGNORECASE,
+            )
+            if not match:
+                return True, set()
+            candidate = _normalize_dep_candidate(match.group(1))
+            return True, {candidate} if candidate else set()
+        return False, set()
+
     def _extract_inner_subquery(part_text: str) -> Optional[str]:
         if not part_text:
             return None
@@ -31876,6 +32218,10 @@ def extract_view_dependencies(
     def _process_part(part_start: int, part_end: int, segment_offset: int, recurse_depth: int) -> None:
         part_text = ddl[segment_offset + part_start:segment_offset + part_end]
         if not part_text or not part_text.strip():
+            return
+        special_handled, special_candidates = _extract_special_construct_candidates(part_text)
+        if special_handled:
+            dependencies.update(dep for dep in special_candidates if dep)
             return
         inner = _extract_inner_subquery(part_text)
         if inner is not None:
@@ -32106,6 +32452,97 @@ def replace_unqualified_table_refs(
     return ddl
 
 
+def replace_special_construct_refs(
+    ddl: str,
+    replacements: Dict[str, str]
+) -> str:
+    """
+    在 TABLE/XMLTABLE/JSON_TABLE 等特殊构造内部，替换受管的未带 schema callable token。
+    仅替换后跟 '(' 的对象名，避免误改普通列名或别名。
+    """
+    if not ddl or not replacements:
+        return ddl
+
+    masked = mask_sql_for_scan(ddl)
+    masked_upper = masked.upper()
+    length = len(masked_upper)
+    edits: List[Tuple[int, int, str]] = []
+
+    def _is_word_char(ch: str) -> bool:
+        return ch.isalnum() or ch in "_$#"
+
+    def _match_word_at(pos: int, word: str) -> Optional[int]:
+        end = pos + len(word)
+        if end > length:
+            return None
+        if masked_upper[pos:end] != word:
+            return None
+        if pos > 0 and _is_word_char(masked_upper[pos - 1]):
+            return None
+        if end < length and _is_word_char(masked_upper[end]):
+            return None
+        return end
+
+    def _find_matching_paren(open_idx: int) -> Optional[int]:
+        depth = 0
+        for idx in range(open_idx, length):
+            ch = masked[idx]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return idx
+        return None
+
+    token_patterns = [
+        (
+            token_u,
+            re.compile(
+                rf'(?<![A-Z0-9_\$#"\.])(?:\"{re.escape(token_u)}\"|{re.escape(token_u)})(?=\s*\()',
+                re.IGNORECASE,
+            ),
+        )
+        for token_u in sorted({(key or "").upper() for key in replacements.keys() if (key or "").strip()}, key=len, reverse=True)
+    ]
+
+    i = 0
+    while i < length:
+        construct_open: Optional[int] = None
+        for keyword in ("TABLE", "XMLTABLE", "JSON_TABLE"):
+            keyword_end = _match_word_at(i, keyword)
+            if keyword_end is None:
+                continue
+            idx = keyword_end
+            while idx < length and masked_upper[idx].isspace():
+                idx += 1
+            if idx < length and masked_upper[idx] == "(":
+                construct_open = idx
+                break
+        if construct_open is None:
+            i += 1
+            continue
+        construct_close = _find_matching_paren(construct_open)
+        if construct_close is None:
+            break
+        inner_start = construct_open + 1
+        inner_masked = masked[inner_start:construct_close]
+        for token_u, pattern in token_patterns:
+            tgt = replacements.get(token_u)
+            if not tgt:
+                continue
+            for match in pattern.finditer(inner_masked):
+                edits.append((inner_start + match.start(), inner_start + match.end(), tgt))
+        i = construct_close + 1
+
+    if not edits:
+        return ddl
+
+    for start, end, tgt in sorted(edits, key=lambda item: item[0], reverse=True):
+        ddl = ddl[:start] + tgt + ddl[end:]
+    return ddl
+
+
 def remap_view_dependencies(
     ddl: str, 
     view_schema: str,
@@ -32141,9 +32578,9 @@ def remap_view_dependencies(
     synonym_meta = synonym_meta or {}
     preferred_types = ("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM", "FUNCTION")
     unresolved_dependencies: List[str] = []
-    synonym_object_fallbacks: List[str] = []
+    preserved_synonym_dependencies: List[str] = []
 
-    def _resolve_managed_synonym_object(owner: str, dep_obj: str) -> Optional[str]:
+    def _get_managed_synonym_object(owner: str, dep_obj: str) -> Optional[str]:
         owner_u = (owner or "").upper()
         dep_obj_u = (dep_obj or "").upper()
         if not owner_u or not dep_obj_u:
@@ -32166,44 +32603,6 @@ def remap_view_dependencies(
             mapped = explicit
         return (mapped or terminal_source).upper()
 
-    def _build_qualified_rewrite_specs(src_ref: str, tgt_ref: str) -> List[Tuple[Pattern[str], str]]:
-        src_u = (src_ref or "").upper()
-        tgt_u = (tgt_ref or "").upper()
-        if "." not in src_u or "." not in tgt_u:
-            return []
-        src_schema_u, src_obj_u = src_u.split(".", 1)
-        tgt_schema_u, tgt_obj_u = tgt_u.split(".", 1)
-        specs: List[Tuple[Pattern[str], str]] = []
-        variants = [
-            (
-                rf'(?<![A-Z0-9_\$#"])'
-                rf'"{re.escape(src_schema_u)}"\s*\.\s*"{re.escape(src_obj_u)}"'
-                rf'(?![A-Z0-9_\$#"])',
-                f'{quote_identifier(tgt_schema_u)}.{quote_identifier(tgt_obj_u)}',
-            ),
-            (
-                rf'(?<![A-Z0-9_\$#"])'
-                rf'"{re.escape(src_schema_u)}"\s*\.\s*{re.escape(src_obj_u)}'
-                rf'(?![A-Z0-9_\$#"])',
-                f'{quote_identifier(tgt_schema_u)}.{tgt_obj_u}',
-            ),
-            (
-                rf'(?<![A-Z0-9_\$#"])'
-                rf'{re.escape(src_schema_u)}\s*\.\s*"{re.escape(src_obj_u)}"'
-                rf'(?![A-Z0-9_\$#"])',
-                f'{tgt_schema_u}.{quote_identifier(tgt_obj_u)}',
-            ),
-            (
-                rf'(?<![A-Z0-9_\$#"])'
-                rf'{re.escape(src_schema_u)}\s*\.\s*{re.escape(src_obj_u)}'
-                rf'(?![A-Z0-9_\$#"])',
-                f'{tgt_schema_u}.{tgt_obj_u}',
-            ),
-        ]
-        for pattern_text, replacement in variants:
-            specs.append((re.compile(pattern_text, re.IGNORECASE), replacement))
-        return specs
-
     for dep in dependencies:
         dep_u = dep.upper()
         if not dep_u:
@@ -32216,6 +32615,7 @@ def remap_view_dependencies(
         mapped_target: Optional[str] = None
         explicit_dep_target = remap_rules.get(dep_u)
         resolved_by_synonym = False
+        preserve_original_for_unresolved_synonym = False
         dep_type_map = dict(full_object_mapping.get(dep_u, {}) or {})
         has_direct_non_synonym = any(
             (obj_type or "").upper() != "SYNONYM"
@@ -32239,31 +32639,31 @@ def remap_view_dependencies(
                 if mapped_target:
                     resolved_by_synonym = True
                 else:
-                    mapped_target = _resolve_managed_synonym_object("PUBLIC", dep_obj)
-                    if mapped_target:
-                        resolved_by_synonym = True
-                        synonym_object_fallbacks.append(f"PUBLIC.{dep_obj}->{mapped_target}")
+                    managed_synonym_target = _get_managed_synonym_object("PUBLIC", dep_obj)
+                    if managed_synonym_target:
+                        preserve_original_for_unresolved_synonym = True
+                        preserved_synonym_dependencies.append(f"PUBLIC.{dep_obj}->{managed_synonym_target}")
             else:
                 # 同义词依赖优先解析为终点对象，再做 remap，避免停留在目标同义词名。
                 mapped_target = _resolve_synonym(dep_schema, dep_obj)
                 if mapped_target:
                     resolved_by_synonym = True
                 else:
-                    mapped_target = _resolve_managed_synonym_object(dep_schema, dep_obj)
-                    if mapped_target:
-                        resolved_by_synonym = True
-                        synonym_object_fallbacks.append(f"{dep_schema}.{dep_obj}->{mapped_target}")
+                    managed_synonym_target = _get_managed_synonym_object(dep_schema, dep_obj)
+                    if managed_synonym_target:
+                        preserve_original_for_unresolved_synonym = True
+                        preserved_synonym_dependencies.append(f"{dep_schema}.{dep_obj}->{managed_synonym_target}")
                 if not mapped_target and dep_schema == view_schema_u:
                     mapped_target = _resolve_synonym("PUBLIC", dep_obj)
                     if mapped_target:
                         resolved_by_synonym = True
                     else:
-                        mapped_target = _resolve_managed_synonym_object("PUBLIC", dep_obj)
-                        if mapped_target:
-                            resolved_by_synonym = True
-                            synonym_object_fallbacks.append(f"PUBLIC.{dep_obj}->{mapped_target}")
+                        managed_public_synonym_target = _get_managed_synonym_object("PUBLIC", dep_obj)
+                        if managed_public_synonym_target:
+                            preserve_original_for_unresolved_synonym = True
+                            preserved_synonym_dependencies.append(f"PUBLIC.{dep_obj}->{managed_public_synonym_target}")
 
-            if not mapped_target:
+            if not mapped_target and not preserve_original_for_unresolved_synonym:
                 mapped_target = find_mapped_target_any_type(
                     full_object_mapping,
                     dep_u,
@@ -32299,13 +32699,13 @@ def remap_view_dependencies(
             # 无前缀引用也替换为全名(或目标名)，避免跨 schema 迁移后失效
             replacements_unqualified.setdefault(dep_obj.upper(), tgt_u)
 
-    if synonym_object_fallbacks:
-        preview = ", ".join(sorted(dict.fromkeys(synonym_object_fallbacks))[:10])
-        log.info(
-            "[VIEW] %s.%s 使用目标同义词对象 fallback 重写 %d 条依赖: %s",
+    if preserved_synonym_dependencies:
+        preview = ", ".join(sorted(dict.fromkeys(preserved_synonym_dependencies))[:10])
+        log.warning(
+            "[VIEW] %s.%s 有 %d 条同义词依赖终点无法安全解析，已保留原引用而未使用目标同义词 fallback: %s",
             view_schema_u,
             view_name_u,
-            len(synonym_object_fallbacks),
+            len(preserved_synonym_dependencies),
             preview,
         )
     if unresolved_dependencies:
@@ -32331,7 +32731,7 @@ def remap_view_dependencies(
     replacement_seq = 0
     for src_ref in sorted(replacements_qualified.keys(), key=len, reverse=True):
         tgt_ref = replacements_qualified[src_ref]
-        for pattern, replacement in _build_qualified_rewrite_specs(src_ref, tgt_ref):
+        for pattern, replacement in build_qualified_rewrite_specs(src_ref, tgt_ref):
             placeholder = f"__CODX_VIEW_REMAP_{replacement_seq}__"
             replacement_seq += 1
             replacement_placeholders[placeholder] = replacement
@@ -32343,7 +32743,48 @@ def remap_view_dependencies(
     rewritten = masker.unmask(working_sql)
     if replacements_unqualified:
         rewritten = replace_unqualified_table_refs(rewritten, replacements_unqualified)
+        rewritten = replace_special_construct_refs(rewritten, replacements_unqualified)
     return rewritten
+
+
+@lru_cache(maxsize=None)
+def build_qualified_rewrite_specs(src_ref: str, tgt_ref: str) -> Tuple[Tuple[Pattern[str], str], ...]:
+    src_u = (src_ref or "").upper()
+    tgt_u = (tgt_ref or "").upper()
+    if "." not in src_u or "." not in tgt_u:
+        return tuple()
+    src_schema_u, src_obj_u = src_u.split(".", 1)
+    tgt_schema_u, tgt_obj_u = tgt_u.split(".", 1)
+    variants = [
+        (
+            rf'(?<![A-Z0-9_\$#"])'
+            rf'"{re.escape(src_schema_u)}"\s*\.\s*"{re.escape(src_obj_u)}"'
+            rf'(?![A-Z0-9_\$#"])',
+            f'{quote_identifier(tgt_schema_u)}.{quote_identifier(tgt_obj_u)}',
+        ),
+        (
+            rf'(?<![A-Z0-9_\$#"])'
+            rf'"{re.escape(src_schema_u)}"\s*\.\s*{re.escape(src_obj_u)}'
+            rf'(?![A-Z0-9_\$#"])',
+            f'{quote_identifier(tgt_schema_u)}.{tgt_obj_u}',
+        ),
+        (
+            rf'(?<![A-Z0-9_\$#"])'
+            rf'{re.escape(src_schema_u)}\s*\.\s*"{re.escape(src_obj_u)}"'
+            rf'(?![A-Z0-9_\$#"])',
+            f'{tgt_schema_u}.{quote_identifier(tgt_obj_u)}',
+        ),
+        (
+            rf'(?<![A-Z0-9_\$#"])'
+            rf'{re.escape(src_schema_u)}\s*\.\s*{re.escape(src_obj_u)}'
+            rf'(?![A-Z0-9_\$#"])',
+            f'{tgt_schema_u}.{tgt_obj_u}',
+        ),
+    ]
+    return tuple(
+        (re.compile(pattern_text, re.IGNORECASE), replacement)
+        for pattern_text, replacement in variants
+    )
 
 
 def remap_synonym_target(

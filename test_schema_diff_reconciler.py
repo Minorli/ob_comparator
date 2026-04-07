@@ -2268,6 +2268,17 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn('SELECT 1', masked.upper())
         self.assertIn('FROM T', masked.upper())
 
+    def test_mask_sql_for_scan_fast_path_returns_simple_sql_unchanged(self):
+        sql = "SELECT COL1 FROM SRC_T1 WHERE ID = 1"
+        self.assertEqual(sdr.mask_sql_for_scan(sql), sql)
+
+    def test_mask_sql_for_scan_fast_path_does_not_skip_strings_or_comments(self):
+        sql = "SELECT 'X' AS C1 /* comment */ FROM T1 -- trailing"
+        masked = sdr.mask_sql_for_scan(sql)
+        self.assertNotIn("'X'", masked)
+        self.assertNotIn("comment", masked.lower())
+        self.assertNotIn("trailing", masked.lower())
+
     def test_normalize_column_default_expression_semantic_literals(self):
         self.assertEqual(
             sdr.normalize_column_default_expression("0.98"),
@@ -13136,6 +13147,53 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         rows = sdr.build_scoped_text_reference_seed_rows(scope_result, text_index)
         self.assertEqual(rows, [])
 
+    def test_scoped_pattern_index_matches_standard_identifier_tokens(self):
+        index = sdr.ScopedPatternIndex({
+            "SRC.T1": {"TABLE"},
+            "SRC.PKG1": {"PACKAGE"},
+            "SRC.P1": {"PROCEDURE"},
+        })
+        raw_text = "BEGIN PKG1.P; EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM SRC.T1'; SRC.P1; END;"
+        matches = index.find_matches(
+            sdr.mask_sql_for_scan(raw_text).upper(),
+            [item.upper() for item in sdr._extract_dynamic_sql_literals_for_scan(raw_text)[0]],
+            "SRC",
+            find_first=False,
+        )
+        self.assertEqual(matches, ["SRC.P1", "SRC.T1", "SRC.PKG1"])
+
+    def test_scoped_pattern_index_find_first_uses_same_semantics_as_seed_rows(self):
+        index = sdr.ScopedPatternIndex({
+            "SRC.P1": {"PROCEDURE"},
+            "SRC.T1": {"TABLE"},
+        })
+        matches = index.find_matches(
+            "BEGIN SRC.P1; EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM SRC.T1'; END;".upper(),
+            [],
+            "SRC",
+            find_first=True,
+        )
+        self.assertEqual(matches, ["SRC.P1"])
+
+    def test_scoped_pattern_index_extend_adds_new_candidates_without_rebuild(self):
+        index = sdr.ScopedPatternIndex({"SRC.T1": {"TABLE"}})
+        self.assertEqual(index.find_matches("", ["SELECT * FROM T2"], "SRC"), [])
+        growth = index.extend({"SRC.T2": {"TABLE"}})
+        self.assertEqual(growth, 1)
+        self.assertEqual(index.find_matches("", ["SELECT * FROM T2"], "SRC"), ["SRC.T2"])
+
+    def test_scoped_pattern_index_preserves_nonstandard_identifier_via_slow_path(self):
+        index = sdr.ScopedPatternIndex({
+            "SRC.ODD-NAME": {"FUNCTION"},
+        })
+        matches = index.find_matches(
+            'BEGIN "ODD-NAME"(); END;'.upper(),
+            [],
+            "SRC",
+            find_first=False,
+        )
+        self.assertEqual(matches, ["SRC.ODD-NAME"])
+
     def test_apply_scoped_text_reference_fallback_stops_at_max_rounds(self):
         scope_result = sdr.ScopedSourceScopeResult(
             mode="remap_root_closure",
@@ -13170,8 +13228,11 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         executed_sql = []
 
         class FakeCursor:
+            def __init__(self):
+                self.arraysize = None
+                self.prefetchrows = None
             def execute(self, sql, params=None):
-                executed_sql.append((sql, list(params or [])))
+                executed_sql.append((sql, list(params or []), self.arraysize, self.prefetchrows))
             def __iter__(self):
                 return iter(())
             def __enter__(self):
@@ -13193,9 +13254,26 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         }
         with mock.patch.object(sdr.oracledb, 'connect', return_value=FakeConn()):
             sdr.load_oracle_scoped_text_reference_index({"user": "u", "password": "p", "dsn": "d"}, candidate_nodes)
-        sql_text = "\n".join(sql for sql, _ in executed_sql)
+        sql_text = "\n".join(sql for sql, *_rest in executed_sql)
         self.assertIn("VIEW_NAME IN", sql_text)
         self.assertIn("JOB_NAME IN", sql_text)
+        self.assertTrue(all(arraysize and arraysize >= 1000 for _sql, _params, arraysize, _prefetch in executed_sql))
+
+    def test_apply_oracle_cursor_fetch_tuning_selective_profiles(self):
+        class FakeCursor:
+            def __init__(self):
+                self.arraysize = 100
+                self.prefetchrows = 2
+
+        cursor = FakeCursor()
+        sdr.apply_oracle_cursor_fetch_tuning(cursor, "large_text")
+        self.assertGreaterEqual(cursor.arraysize, 1000)
+        self.assertGreaterEqual(cursor.prefetchrows, cursor.arraysize)
+
+        small_cursor = FakeCursor()
+        sdr.apply_oracle_cursor_fetch_tuning(small_cursor, "small_lookup")
+        self.assertEqual(small_cursor.arraysize, 100)
+        self.assertEqual(small_cursor.prefetchrows, 2)
 
     def test_build_source_scope_closure_full_source_keeps_all(self):
         source_objects = {
@@ -13291,6 +13369,37 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         diagnostics = sdr.build_source_scope_diagnostics(result)
         self.assertTrue(any("synonym terminal skipped=1" in item and "PUBLIC.SYN_OUT:TERMINAL_OUT_OF_SCOPE:OTHER.T2" in item for item in diagnostics))
+
+    def test_build_source_scope_closure_is_deterministic_with_unsorted_inputs(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "SRC.V1": {"VIEW"},
+            "SRC.V2": {"VIEW"},
+            "SRC.TRG1": {"TRIGGER"},
+        }
+        dependency_graph = {
+            ("SRC.V2", "VIEW"): {("SRC.T1", "TABLE")},
+            ("SRC.V1", "VIEW"): {("SRC.T1", "TABLE")},
+        }
+        object_parent_map = {
+            "SRC.TRG1": "SRC.T1",
+        }
+        first = sdr.build_source_scope_closure(
+            source_objects,
+            dependency_graph,
+            object_parent_map,
+            {("SRC.T1", "TABLE")},
+            mode="remap_root_closure",
+        )
+        second = sdr.build_source_scope_closure(
+            source_objects,
+            dependency_graph,
+            object_parent_map,
+            {("SRC.T1", "TABLE")},
+            mode="remap_root_closure",
+        )
+        self.assertEqual(first.included_nodes, second.included_nodes)
+        self.assertEqual(first.detail_rows, second.detail_rows)
 
     def test_check_scope_integrity_detects_explicit_root_view_missing_table(self):
         included_nodes = {("SRC.V1", "VIEW"), ("SRC.T1", "TABLE")}
@@ -13881,6 +13990,14 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn("JOIN C.X B", upper)
         self.assertNotIn("FROM C.X A", upper)
 
+    def test_build_qualified_rewrite_specs_is_cached(self):
+        sdr.build_qualified_rewrite_specs.cache_clear()
+        first = sdr.build_qualified_rewrite_specs("SRC.T1", "TGT.T1")
+        second = sdr.build_qualified_rewrite_specs("SRC.T1", "TGT.T1")
+        self.assertEqual(len(first), 4)
+        self.assertEqual(first, second)
+        self.assertGreaterEqual(sdr.build_qualified_rewrite_specs.cache_info().hits, 1)
+
     def test_remap_view_dependencies_resolves_public_synonym(self):
         ddl = (
             "CREATE OR REPLACE VIEW A.V AS\n"
@@ -13900,21 +14017,24 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertIn("TGT.T1", rewritten.upper())
 
-    def test_remap_view_dependencies_fallback_to_managed_public_synonym_object(self):
+    def test_remap_view_dependencies_preserves_original_when_public_synonym_terminal_unresolved(self):
         ddl = (
             "CREATE OR REPLACE VIEW A.V AS\n"
             "SELECT * FROM SYN1\n"
         )
         full_mapping = {"PUBLIC.SYN1": {"SYNONYM": "TGT.SYN1"}}
-        rewritten = sdr.remap_view_dependencies(
-            ddl,
-            "A",
-            "V",
-            {},
-            full_mapping,
-            synonym_meta={},
-        )
-        self.assertIn("TGT.SYN1", rewritten.upper())
+        with mock.patch.object(sdr.log, "warning") as m_warning:
+            rewritten = sdr.remap_view_dependencies(
+                ddl,
+                "A",
+                "V",
+                {},
+                full_mapping,
+                synonym_meta={},
+            )
+        self.assertIn("FROM SYN1", rewritten.upper())
+        self.assertNotIn("TGT.SYN1", rewritten.upper())
+        self.assertTrue(m_warning.called)
 
     def test_remap_view_dependencies_logs_unresolved_dependency_when_no_safe_mapping(self):
         ddl = (
@@ -14270,6 +14390,103 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         upper = rewritten.upper()
         self.assertIn("TGT.T1 T", upper)
         self.assertIn("T.C1", upper)
+
+    def test_extract_view_dependencies_table_construct_extracts_callable_dependency(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW A.V AS\n"
+            "SELECT * FROM TABLE(A.SYNF())\n"
+        )
+        deps = sdr.extract_view_dependencies(ddl, default_schema="A")
+        self.assertIn("A.SYNF", deps)
+        self.assertNotIn("A.TABLE", deps)
+
+    def test_remap_view_dependencies_rewrites_table_construct_qualified(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW A.V AS\n"
+            "SELECT * FROM TABLE(A.SYNF())\n"
+        )
+        full_mapping = {"A.SYNF": {"FUNCTION": "TGT.SYNF"}}
+        with mock.patch.object(sdr.log, "warning") as m_warning:
+            rewritten = sdr.remap_view_dependencies(
+                ddl,
+                "A",
+                "V",
+                {},
+                full_mapping,
+            )
+        upper = rewritten.upper()
+        self.assertIn("TABLE(TGT.SYNF())", upper)
+        self.assertNotIn("A.TABLE", upper)
+        self.assertFalse(m_warning.called)
+
+    def test_remap_view_dependencies_rewrites_table_construct_unqualified(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW A.V AS\n"
+            "SELECT * FROM TABLE(SYNF())\n"
+        )
+        full_mapping = {"A.SYNF": {"FUNCTION": "TGT.SYNF"}}
+        rewritten = sdr.remap_view_dependencies(
+            ddl,
+            "A",
+            "V",
+            {},
+            full_mapping,
+        )
+        upper = rewritten.upper()
+        self.assertIn("TABLE(TGT.SYNF())", upper)
+        self.assertNotIn("TABLE(SYNF())", upper)
+
+    def test_remap_view_dependencies_rewrites_xmltable_and_json_table_tokens_from_dependency_map(self):
+        full_mapping = {"A.SYNF": {"FUNCTION": "TGT.SYNF"}}
+        view_dep_map = {("A", "V"): {"A.SYNF"}}
+
+        xml_ddl = (
+            "CREATE OR REPLACE VIEW A.V AS\n"
+            "SELECT * FROM XMLTABLE('/x' PASSING SYNF() COLUMNS C1 PATH '/x') X\n"
+        )
+        xml_rewritten = sdr.remap_view_dependencies(
+            xml_ddl,
+            "A",
+            "V",
+            {},
+            full_mapping,
+            view_dependency_map=view_dep_map,
+        )
+        self.assertIn("PASSING TGT.SYNF()", xml_rewritten.upper())
+
+        json_ddl = (
+            "CREATE OR REPLACE VIEW A.V AS\n"
+            "SELECT * FROM JSON_TABLE(SYNF(), '$' COLUMNS C1 PATH '$.A') X\n"
+        )
+        json_rewritten = sdr.remap_view_dependencies(
+            json_ddl,
+            "A",
+            "V",
+            {},
+            full_mapping,
+            view_dependency_map=view_dep_map,
+        )
+        self.assertIn("JSON_TABLE(TGT.SYNF()", json_rewritten.upper())
+
+    def test_remap_view_dependencies_table_construct_does_not_rewrite_plain_column_name(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW A.V AS\n"
+            "SELECT SYNF FROM TABLE(T1())\n"
+        )
+        full_mapping = {
+            "A.SYNF": {"FUNCTION": "TGT.SYNF"},
+            "A.T1": {"FUNCTION": "TGT.T1"},
+        }
+        rewritten = sdr.remap_view_dependencies(
+            ddl,
+            "A",
+            "V",
+            {},
+            full_mapping,
+        )
+        upper = rewritten.upper()
+        self.assertIn("SELECT SYNF FROM TABLE(TGT.T1())", upper)
+        self.assertNotIn("SELECT TGT.SYNF", upper)
 
     def test_remap_view_dependencies_subquery_alias_kept(self):
         ddl = (
