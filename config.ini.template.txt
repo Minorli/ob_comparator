@@ -31,6 +31,22 @@ source_object_scope_mode = full_source
 #   safe -> 仅从 DBA_SOURCE/DBA_VIEWS/DBA_MVIEWS/DBA_SCHEDULER_* 等受控文本来源补盲
 #           不做全 schema DBMS_METADATA 全量 grep
 remap_scope_text_fallback_mode = off
+# scope_integrity_check：是否检查 remap_root_closure 下 scoped VIEW/MVIEW 的前置依赖完整性
+#   true  -> 输出 blocking prerequisite 诊断（默认）
+#   false -> 跳过该诊断
+scope_integrity_check = true
+# scope_integrity_check_depth：scope 完整性检查深度
+#   direct     -> 仅检查直接依赖（默认）
+#   transitive -> 递归追踪 VIEW/MVIEW 链式依赖
+scope_integrity_check_depth = direct
+# scope_integrity_advisory_check：是否输出 advisory-family 的 INFO 级 scope 完整性诊断
+#   true  -> 为 PROCEDURE/FUNCTION/PACKAGE/TYPE/JOB/SCHEDULE/TRIGGER 输出运行时依赖提示
+#   false -> 关闭（默认）
+scope_integrity_advisory_check = false
+# scope_integrity_fk_check：是否输出 FK scope 完整性 WARNING 诊断
+#   true  -> 检查 FK 引用表是否仍在最终 managed scope
+#   false -> 关闭（默认）
+scope_integrity_fk_check = false
 # blacklist_target_existing_policy:
 #   keep_blocked         -> 黑名单表保持原阻断行为
 #   rehydrate_if_present -> 若映射后的目标 TABLE 已人工存在，则重新纳入 compare/fixup

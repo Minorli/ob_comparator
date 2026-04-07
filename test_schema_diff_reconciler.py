@@ -738,6 +738,36 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn("A.T1", mapping)
         self.assertNotIn("A.P1", mapping)
 
+    def test_filter_full_object_mapping_by_types_excludes_discovery_only_types(self):
+        full_mapping = {
+            "SRC.T1": {"TABLE": "TGT_TABLE.T1"},
+            "SRC.PKG1": {"PACKAGE": "TGT_PKG.PKG1"},
+        }
+        managed = sdr.filter_full_object_mapping_by_types(full_mapping, {"TABLE"})
+        self.assertEqual(managed, {"SRC.T1": {"TABLE": "TGT_TABLE.T1"}})
+
+    def test_managed_target_scope_ignores_discovery_only_target_schema(self):
+        discovery_mapping = {
+            "SRC.T1": {"TABLE": "TGT_TABLE.T1"},
+            "SRC.PKG1": {"PACKAGE": "TGT_PKG.PKG1"},
+        }
+        managed_mapping = sdr.filter_full_object_mapping_by_types(discovery_mapping, {"TABLE"})
+        scope = sdr.derive_managed_target_scope(["SRC"], managed_mapping)
+        self.assertEqual(scope.target_schemas, frozenset({"TGT_TABLE"}))
+        self.assertEqual(scope.target_only_schemas, frozenset({"TGT_TABLE"}))
+
+    def test_build_mapping_scope_diagnostics_reports_discovery_only_types(self):
+        discovery_mapping = {
+            "SRC.T1": {"TABLE": "TGT_TABLE.T1"},
+            "SRC.PKG1": {"PACKAGE": "TGT_PKG.PKG1"},
+        }
+        managed_mapping = {
+            "SRC.T1": {"TABLE": "TGT_TABLE.T1"},
+        }
+        diagnostics = sdr.build_mapping_scope_diagnostics(discovery_mapping, managed_mapping)
+        self.assertTrue(any("PACKAGE" in item for item in diagnostics))
+        self.assertTrue(any("discovery-only" in item for item in diagnostics))
+
     def test_check_primary_objects_print_only_types(self):
         master_list = [
             ("A.MV1", "A.MV1", "MATERIALIZED VIEW"),
@@ -7679,6 +7709,32 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             self.assertEqual(settings["object_created_before_missing_created_policy"], "strict")
             self.assertFalse(settings["fixup_drop_sys_c_columns"])
 
+    def test_load_config_can_disable_all_extra_types(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "config.ini"
+            path.write_text(
+                "\n".join([
+                    "[ORACLE_SOURCE]",
+                    "user = scott",
+                    "password = tiger",
+                    "dsn = 127.0.0.1:1521/ORCL",
+                    "[OCEANBASE_TARGET]",
+                    "executable = /bin/obclient",
+                    "host = 127.0.0.1",
+                    "port = 2881",
+                    "user_string = root@sys",
+                    "password = p",
+                    "[SETTINGS]",
+                    "source_schemas = A",
+                    "check_primary_types = VIEW",
+                    "check_extra_types = NONE",
+                ]) + "\n",
+                encoding="utf-8"
+            )
+            _ora_cfg, _ob_cfg, settings = sdr.load_config(str(path))
+            self.assertEqual(settings["enabled_primary_types"], {"VIEW"})
+            self.assertEqual(settings["enabled_extra_types"], set())
+
     def test_probe_target_plain_not_null_columns(self):
         calls = []
 
@@ -10822,6 +10878,63 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             package_report_path = Path(tmp_dir) / "package_compare_20240101.txt"
             self.assertTrue(package_report_path.exists())
 
+    def test_print_final_report_includes_scope_integrity_panel(self):
+        tv_results = {
+            "missing": [], "mismatched": [], "ok": [], "skipped": [], "extraneous": [], "extra_targets": []
+        }
+        extra_results = {
+            "index_ok": [], "index_mismatched": [], "constraint_ok": [], "constraint_mismatched": [],
+            "sequence_ok": [], "sequence_mismatched": [], "trigger_ok": [], "trigger_mismatched": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            report_path = Path(tmp_dir) / "report_20240101.txt"
+            detail_path = Path(tmp_dir) / "scope_integrity_detail_20240101.txt"
+            detail_path.write_text('x', encoding='utf-8')
+            candidate_path = Path(tmp_dir) / "scope_integrity_remap_candidates_20240101.txt"
+            candidate_path.write_text('x', encoding='utf-8')
+            sdr.print_final_report(
+                tv_results, total_checked=0, extra_results=extra_results, comment_results={"ok": [], "mismatched": [], "skipped_reason": "skip"},
+                dependency_report={"missing": [], "unexpected": [], "skipped": []}, report_file=report_path, object_counts_summary=None, endpoint_info=None,
+                schema_summary=None, settings={"report_width": 120, "report_detail_mode": "full", "scope_integrity_check": True, "source_object_scope_mode": "remap_root_closure"},
+                blacklisted_missing_tables={}, blacklist_report_rows=[], trigger_list_summary=None, trigger_list_rows=None, package_results=None,
+                run_summary_ctx=None, filtered_grants=None, source_scope_detail_path=None,
+                scope_integrity_issues=[
+                    sdr.ScopeIntegrityIssue("SII-0001", sdr.SCOPE_INTEGRITY_SEVERITY_CRITICAL, "VIEW", "SRC.V1", "TGT.V1", "ROOT_REMAP", ()),
+                    sdr.ScopeIntegrityIssue("SII-0002", sdr.SCOPE_INTEGRITY_SEVERITY_INFO, "PROCEDURE", "SRC.P1", "TGT.P1", "REVERSE_DEPENDENCY", ()),
+                ],
+                scope_integrity_detail_path=detail_path, scope_integrity_candidate_path=candidate_path,
+            )
+            content = report_path.read_text(encoding='utf-8')
+            self.assertIn("SOURCE SCOPE 完整性", content)
+            self.assertIn("CRITICAL  1", content)
+            self.assertIn("INFO      1", content)
+            self.assertIn("scope_integrity_detail_20240101.txt", content)
+
+    def test_print_final_report_indexes_discovery_mapping_artifact(self):
+        tv_results = {
+            "missing": [], "mismatched": [], "ok": [], "skipped": [], "extraneous": [], "extra_targets": []
+        }
+        extra_results = {
+            "index_ok": [], "index_mismatched": [], "constraint_ok": [], "constraint_mismatched": [],
+            "sequence_ok": [], "sequence_mismatched": [], "trigger_ok": [], "trigger_mismatched": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            report_path = Path(tmp_dir) / "report_20240101.txt"
+            discovery_path = Path(tmp_dir) / "object_mapping_discovery_20240101.txt"
+            discovery_path.write_text('SRC.PKG1\tPACKAGE\tTGT_PKG.PKG1\n', encoding='utf-8')
+            sdr.print_final_report(
+                tv_results, total_checked=0, extra_results=extra_results, comment_results={"ok": [], "mismatched": [], "skipped_reason": "skip"},
+                dependency_report={"missing": [], "unexpected": [], "skipped": []}, report_file=report_path, object_counts_summary=None, endpoint_info=None,
+                schema_summary=None, settings={"report_width": 120, "report_detail_mode": "full"},
+                blacklisted_missing_tables={}, blacklist_report_rows=[], trigger_list_summary=None, trigger_list_rows=None, package_results=None,
+                run_summary_ctx=None, filtered_grants=None, source_scope_detail_path=None,
+                discovery_mapping_path=discovery_path,
+            )
+            index_path = Path(tmp_dir) / "report_index_20240101.txt"
+            content = index_path.read_text(encoding='utf-8')
+            self.assertIn("object_mapping_discovery_20240101.txt", content)
+            self.assertIn("discovery-only 对象映射", content)
+
     def test_print_final_report_suggests_view_chain_autofix_when_view_missing(self):
         tv_results = {
             "missing": [("VIEW", "A.V1", "A.V1")],
@@ -12235,26 +12348,28 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         deps = sdr.extract_view_dependencies(ddl, default_schema="A")
         self.assertEqual(deps, {"A.T1", "B.T2"})
 
-    def test_build_remap_root_seed_nodes_only_table_and_view(self):
+    def test_build_remap_root_seed_nodes_only_table_view_and_mview(self):
         source_objects = {
             "SRC.T1": {"TABLE"},
             "SRC.V1": {"VIEW"},
+            "SRC.MV1": {"MATERIALIZED VIEW"},
             "SRC.P1": {"PROCEDURE"},
         }
         remap_rules = {
             "SRC.T1": "TGT.T1",
             "SRC.V1": "TGT.V1",
+            "SRC.MV1": "TGT.MV1",
             "SRC.P1": "TGT.P1",
             "SRC.MISSING": "TGT.MISSING",
         }
         roots, skipped, explicit_keys = sdr.build_remap_root_seed_nodes(source_objects, remap_rules)
         self.assertEqual(
             roots,
-            {("SRC.T1", "TABLE"), ("SRC.V1", "VIEW")}
+            {("SRC.T1", "TABLE"), ("SRC.V1", "VIEW"), ("SRC.MV1", "MATERIALIZED VIEW")}
         )
         self.assertIn(("SRC.P1", "PROCEDURE", "NON_ROOT_OBJECT_TYPE"), skipped)
         self.assertIn(("SRC.MISSING", "-", "SOURCE_OBJECT_NOT_FOUND"), skipped)
-        self.assertEqual(explicit_keys, ["SRC.T1", "SRC.V1"])
+        self.assertEqual(explicit_keys, ["SRC.MV1", "SRC.T1", "SRC.V1"])
 
     def test_build_scoped_trigger_keep_nodes_adds_parent(self):
         source_objects = {
@@ -12807,6 +12922,51 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             ]
         )
 
+    def test_build_job_action_dependency_records_matches_schema_qualified_table(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "SRC.J1": {"JOB"},
+        }
+        text_index = {
+            ("SRC.J1", "JOB"): "BEGIN EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM SRC.T1'; END;"
+        }
+        rows = sdr.build_job_action_dependency_records(source_objects, text_index)
+        self.assertEqual(
+            rows,
+            [sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "T1", "TABLE")]
+        )
+
+    def test_build_job_action_dependency_records_matches_same_schema_package_call(self):
+        source_objects = {
+            "SRC.PKG1": {"PACKAGE", "PACKAGE BODY"},
+            "SRC.J1": {"JOB"},
+        }
+        text_index = {
+            ("SRC.J1", "JOB"): "BEGIN PKG1.P; END;"
+        }
+        rows = sdr.build_job_action_dependency_records(source_objects, text_index)
+        self.assertEqual(
+            rows,
+            [sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "PKG1", "PACKAGE")]
+        )
+
+    def test_build_job_action_dependency_records_collects_transitive_table_refs_through_package_and_procedure(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "SRC.P1": {"PROCEDURE"},
+            "SRC.PKG1": {"PACKAGE", "PACKAGE BODY"},
+            "SRC.J1": {"JOB"},
+        }
+        text_index = {
+            ("SRC.J1", "JOB"): "BEGIN PKG1.P; END;",
+            ("SRC.PKG1", "PACKAGE BODY"): "BEGIN P1; END;",
+            ("SRC.P1", "PROCEDURE"): "BEGIN EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM T1'; END;",
+        }
+        rows = sdr.build_job_action_dependency_records(source_objects, text_index)
+        self.assertIn(sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "PKG1", "PACKAGE"), rows)
+        self.assertIn(sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "P1", "PROCEDURE"), rows)
+        self.assertIn(sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "T1", "TABLE"), rows)
+
     def test_extend_source_scope_result_with_text_reference_seed_rows_expands_paired_objects(self):
         source_objects = {
             "SRC.T1": {"TABLE"},
@@ -13027,11 +13187,41 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             explicit_trigger_nodes=frozenset({("SRC.TRG1", "TRIGGER")}),
             included_nodes=frozenset({("SRC.T1", "TABLE"), ("SRC.TRG1", "TRIGGER")}),
             excluded_nodes=frozenset({("SRC.T2", "TABLE")}),
-            detail_rows=(),
+            detail_rows=(("ROOT_SKIPPED", "PROCEDURE", "SRC.P1", "NON_ROOT_OBJECT_TYPE"),),
         )
         diagnostics = sdr.build_source_scope_diagnostics(result)
         self.assertTrue(any("source_object_scope_mode=remap_root_closure" in item for item in diagnostics))
         self.assertTrue(any("roots=1" in item and "filtered_out=1" in item for item in diagnostics))
+        self.assertTrue(any("remap roots skipped=1" in item and "SRC.P1:NON_ROOT_OBJECT_TYPE" in item for item in diagnostics))
+
+    def test_build_scope_discovery_diagnostics_for_closure_widening(self):
+        diagnostics = sdr.build_scope_discovery_diagnostics(
+            "remap_root_closure",
+            {"TABLE", "VIEW"},
+            {"TABLE", "VIEW", "PACKAGE BODY", "JOB"},
+        )
+        self.assertEqual(len(diagnostics), 1)
+        self.assertIn("closure 内部 discovery/mapping 范围宽于 operator-facing enabled types", diagnostics[0])
+        self.assertIn("PACKAGE BODY", diagnostics[0])
+        self.assertIn("JOB", diagnostics[0])
+
+    def test_build_scheduler_scope_diagnostics_warns_schedule_off_mode(self):
+        diagnostics = sdr.build_scheduler_scope_diagnostics(
+            "remap_root_closure",
+            "off",
+            {"SRC.J1": {"JOB"}, "SRC.S1": {"SCHEDULE"}},
+        )
+        self.assertEqual(len(diagnostics), 1)
+        self.assertIn("SCHEDULE", diagnostics[0])
+        self.assertIn("不做结构化补边", diagnostics[0])
+
+    def test_build_scheduler_scope_diagnostics_empty_without_schedule(self):
+        diagnostics = sdr.build_scheduler_scope_diagnostics(
+            "remap_root_closure",
+            "off",
+            {"SRC.J1": {"JOB"}},
+        )
+        self.assertEqual(diagnostics, [])
 
     def test_build_synonym_parent_map_keeps_terminal_package(self):
         synonym_meta = {
@@ -13043,6 +13233,430 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         }
         parent_map = sdr.build_synonym_parent_map(synonym_meta, source_objects)
         self.assertEqual(parent_map["PUBLIC.SYN_PKG"], "SRC.PKG1")
+
+    def test_build_synonym_parent_map_records_dblink_and_out_of_scope_diagnostics(self):
+        synonym_meta = {
+            ("PUBLIC", "SYN_DBLINK"): sdr.SynonymMeta("PUBLIC", "SYN_DBLINK", "SRC", "T1", "DB1"),
+            ("PUBLIC", "SYN_OUT"): sdr.SynonymMeta("PUBLIC", "SYN_OUT", "OTHER", "T2", None),
+        }
+        diagnostic_rows = []
+        parent_map = sdr.build_synonym_parent_map(synonym_meta, {"SRC.T1": {"TABLE"}}, diagnostic_rows=diagnostic_rows)
+        self.assertNotIn("PUBLIC.SYN_DBLINK", parent_map)
+        self.assertEqual(parent_map.get("PUBLIC.SYN_OUT"), "OTHER.T2")
+        self.assertIn(("SYNONYM_TERMINAL_SKIPPED", "SYNONYM", "PUBLIC.SYN_DBLINK", "DBLINK"), diagnostic_rows)
+        self.assertIn(("SYNONYM_TERMINAL_SKIPPED", "SYNONYM", "PUBLIC.SYN_OUT", "TERMINAL_OUT_OF_SCOPE:OTHER.T2"), diagnostic_rows)
+
+    def test_build_source_scope_diagnostics_reports_synonym_terminal_skipped(self):
+        result = sdr.ScopedSourceScopeResult(
+            mode="remap_root_closure",
+            root_seed_nodes=frozenset({("SRC.T1", "TABLE")}),
+            explicit_trigger_nodes=frozenset(),
+            included_nodes=frozenset({("SRC.T1", "TABLE")}),
+            excluded_nodes=frozenset({("PUBLIC.SYN_OUT", "SYNONYM")}),
+            detail_rows=(("SYNONYM_TERMINAL_SKIPPED", "SYNONYM", "PUBLIC.SYN_OUT", "TERMINAL_OUT_OF_SCOPE:OTHER.T2"),),
+        )
+        diagnostics = sdr.build_source_scope_diagnostics(result)
+        self.assertTrue(any("synonym terminal skipped=1" in item and "PUBLIC.SYN_OUT:TERMINAL_OUT_OF_SCOPE:OTHER.T2" in item for item in diagnostics))
+
+    def test_check_scope_integrity_detects_explicit_root_view_missing_table(self):
+        included_nodes = {("SRC.V1", "VIEW"), ("SRC.T1", "TABLE")}
+        dependency_graph = {
+            ("SRC.V1", "VIEW"): {("SRC.T1", "TABLE"), ("SRC.T2", "TABLE")},
+        }
+        source_objects_full_scope = {
+            "SRC.V1": {"VIEW"},
+            "SRC.T1": {"TABLE"},
+            "SRC.T2": {"TABLE"},
+        }
+        issues = sdr.check_scope_integrity(
+            included_nodes,
+            dependency_graph,
+            source_objects_full_scope,
+            ["SRC"],
+            [("ROOT_REMAP", "VIEW", "SRC.V1", "EXPLICIT_REMAP_ROOT")],
+            check_depth="direct",
+        )
+        self.assertEqual(len(issues), 1)
+        issue = issues[0]
+        self.assertEqual(issue.severity, sdr.SCOPE_INTEGRITY_SEVERITY_CRITICAL)
+        self.assertEqual(issue.entry_reason, "ROOT_REMAP")
+        self.assertEqual(issue.source_full, "SRC.V1")
+        self.assertEqual(len(issue.missing_deps), 1)
+        self.assertEqual(issue.missing_deps[0].dep_full, "SRC.T2")
+        self.assertEqual(issue.missing_deps[0].dep_location, sdr.SCOPE_INTEGRITY_LOCATION_IN_SOURCE_SCHEMAS_NOT_SCOPED)
+
+    def test_check_scope_integrity_transitive_view_chain(self):
+        included_nodes = {("SRC.V_A", "VIEW"), ("SRC.V_B", "VIEW")}
+        dependency_graph = {
+            ("SRC.V_A", "VIEW"): {("SRC.V_B", "VIEW")},
+            ("SRC.V_B", "VIEW"): {("SRC.T1", "TABLE")},
+        }
+        source_objects_full_scope = {
+            "SRC.V_A": {"VIEW"},
+            "SRC.V_B": {"VIEW"},
+            "SRC.T1": {"TABLE"},
+        }
+        issues = sdr.check_scope_integrity(
+            included_nodes,
+            dependency_graph,
+            source_objects_full_scope,
+            ["SRC"],
+            [("REVERSE_DEPENDENCY", "VIEW", "SRC.V_A", "TABLE:SRC.T0"), ("DEPENDENCY", "VIEW", "SRC.V_B", "VIEW:SRC.V_A")],
+            check_depth="transitive",
+        )
+        issue_map = {issue.source_full: issue for issue in issues}
+        self.assertIn("SRC.V_A", issue_map)
+        self.assertIn("SRC.V_B", issue_map)
+        self.assertEqual(issue_map["SRC.V_A"].missing_deps[0].path, "SRC.V_A -> SRC.V_B -> SRC.T1")
+        self.assertEqual(issue_map["SRC.V_B"].missing_deps[0].path, "SRC.V_B -> SRC.T1")
+
+    def test_check_scope_integrity_classifies_cutoff_and_user_excluded(self):
+        included_nodes = {("SRC.V1", "VIEW")}
+        dependency_graph = {
+            ("SRC.V1", "VIEW"): {("SRC.T1", "TABLE"), ("SRC.T2", "TABLE")},
+        }
+        source_objects_full_scope = {
+            "SRC.V1": {"VIEW"},
+            "SRC.T1": {"TABLE"},
+            "SRC.T2": {"TABLE"},
+        }
+        excluded_rows = [
+            {"status": sdr.EXCLUDED_STATUS_FILTERED_BY_CREATED_AFTER_CUTOFF, "object_type": "TABLE", "schema_name": "SRC", "object_name": "T1", "detail": "CREATED>"},
+            {"status": "APPLIED", "object_type": "TABLE", "schema_name": "SRC", "object_name": "T2", "detail": "MATCHED"},
+        ]
+        issues = sdr.check_scope_integrity(
+            included_nodes,
+            dependency_graph,
+            source_objects_full_scope,
+            ["SRC"],
+            [("ROOT_REMAP", "VIEW", "SRC.V1", "EXPLICIT_REMAP_ROOT")],
+            excluded_rows=excluded_rows,
+            check_depth="direct",
+        )
+        dep_map = {dep.dep_full: dep.dep_location for dep in issues[0].missing_deps}
+        self.assertEqual(dep_map["SRC.T1"], sdr.SCOPE_INTEGRITY_LOCATION_FILTERED_BY_CREATED_AFTER_CUTOFF)
+        self.assertEqual(dep_map["SRC.T2"], sdr.SCOPE_INTEGRITY_LOCATION_USER_EXCLUDED)
+
+    def test_check_scope_integrity_user_excluded_and_cutoff_are_warning(self):
+        included_nodes = {("SRC.V1", "VIEW")}
+        dependency_graph = {
+            ("SRC.V1", "VIEW"): {("SRC.T1", "TABLE"), ("SRC.T2", "TABLE")},
+        }
+        source_objects_full_scope = {
+            "SRC.V1": {"VIEW"},
+            "SRC.T1": {"TABLE"},
+            "SRC.T2": {"TABLE"},
+        }
+        excluded_rows = [
+            {"status": sdr.EXCLUDED_STATUS_FILTERED_BY_CREATED_AFTER_CUTOFF, "object_type": "TABLE", "schema_name": "SRC", "object_name": "T1", "detail": "CREATED>"},
+            {"status": "APPLIED", "object_type": "TABLE", "schema_name": "SRC", "object_name": "T2", "detail": "MATCHED"},
+        ]
+        issues = sdr.check_scope_integrity(
+            included_nodes, dependency_graph, source_objects_full_scope, ["SRC"],
+            [("ROOT_REMAP", "VIEW", "SRC.V1", "EXPLICIT_REMAP_ROOT")],
+            excluded_rows=excluded_rows, check_depth="direct",
+        )
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].severity, sdr.SCOPE_INTEGRITY_SEVERITY_WARNING)
+
+    def test_check_scope_integrity_mixed_missing_and_user_excluded_is_critical(self):
+        included_nodes = {("SRC.V1", "VIEW")}
+        dependency_graph = {
+            ("SRC.V1", "VIEW"): {("SRC.T1", "TABLE"), ("SRC.T2", "TABLE")},
+        }
+        source_objects_full_scope = {
+            "SRC.V1": {"VIEW"},
+            "SRC.T1": {"TABLE"},
+            "SRC.T2": {"TABLE"},
+        }
+        excluded_rows = [
+            {"status": "APPLIED", "object_type": "TABLE", "schema_name": "SRC", "object_name": "T2", "detail": "MATCHED"},
+        ]
+        issues = sdr.check_scope_integrity(
+            included_nodes, dependency_graph, source_objects_full_scope, ["SRC"],
+            [("ROOT_REMAP", "VIEW", "SRC.V1", "EXPLICIT_REMAP_ROOT")],
+            excluded_rows=excluded_rows, check_depth="direct",
+        )
+        self.assertEqual(issues[0].severity, sdr.SCOPE_INTEGRITY_SEVERITY_CRITICAL)
+
+    def test_check_scope_integrity_reverse_dependency_cross_schema_is_warning(self):
+        included_nodes = {("SRC.T1", "TABLE"), ("SRC.V1", "VIEW")}
+        dependency_graph = {
+            ("SRC.V1", "VIEW"): {("OTHER.T2", "TABLE")},
+        }
+        source_objects_full_scope = {
+            "SRC.T1": {"TABLE"},
+            "SRC.V1": {"VIEW"},
+            "OTHER.T2": {"TABLE"},
+        }
+        issues = sdr.check_scope_integrity(
+            included_nodes, dependency_graph, source_objects_full_scope, ["SRC"],
+            [("REVERSE_DEPENDENCY", "VIEW", "SRC.V1", "TABLE:SRC.T1")],
+            check_depth="direct",
+        )
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].severity, sdr.SCOPE_INTEGRITY_SEVERITY_WARNING)
+        self.assertEqual(issues[0].entry_reason, "REVERSE_DEPENDENCY")
+        self.assertEqual(issues[0].missing_deps[0].dep_location, sdr.SCOPE_INTEGRITY_LOCATION_CROSS_SCHEMA)
+
+    def test_check_scope_integrity_transitive_dedup_aggregates_paths(self):
+        included_nodes = {("SRC.V_TOP", "VIEW"), ("SRC.V_A", "VIEW"), ("SRC.V_B", "VIEW")}
+        dependency_graph = {
+            ("SRC.V_TOP", "VIEW"): {("SRC.V_A", "VIEW"), ("SRC.V_B", "VIEW")},
+            ("SRC.V_A", "VIEW"): {("SRC.T_MISS", "TABLE")},
+            ("SRC.V_B", "VIEW"): {("SRC.T_MISS", "TABLE")},
+        }
+        source_objects_full_scope = {
+            "SRC.V_TOP": {"VIEW"}, "SRC.V_A": {"VIEW"}, "SRC.V_B": {"VIEW"}, "SRC.T_MISS": {"TABLE"}
+        }
+        issues = sdr.check_scope_integrity(
+            included_nodes, dependency_graph, source_objects_full_scope, ["SRC"],
+            [("ROOT_REMAP", "VIEW", "SRC.V_TOP", "EXPLICIT_REMAP_ROOT")],
+            check_depth="transitive",
+        )
+        top_issue = next(item for item in issues if item.source_full == "SRC.V_TOP")
+        self.assertEqual(len(top_issue.missing_deps), 1)
+        self.assertIn("SRC.V_TOP -> SRC.V_A -> SRC.T_MISS", top_issue.missing_deps[0].path)
+        self.assertIn("SRC.V_TOP -> SRC.V_B -> SRC.T_MISS", top_issue.missing_deps[0].path)
+        self.assertIn(" || ", top_issue.missing_deps[0].path)
+
+    def test_build_fk_scope_integrity_issues_excluded_table_is_warning(self):
+        oracle_meta = self._make_oracle_meta()._replace(constraints={
+            ("SRC", "CHILD"): {
+                "FK_CHILD_PARENT": {
+                    "type": "R",
+                    "columns": ["PARENT_ID"],
+                    "ref_table_owner": "SRC",
+                    "ref_table_name": "PARENT",
+                }
+            }
+        })
+        issues = sdr.build_fk_scope_integrity_issues(
+            {("SRC.FK_CHILD_PARENT", "CONSTRAINT"), ("SRC.CHILD", "TABLE")},
+            oracle_meta,
+            {"SRC.CHILD": {"TABLE"}, "SRC.PARENT": {"TABLE"}, "SRC.FK_CHILD_PARENT": {"CONSTRAINT"}},
+            ["SRC"],
+            [("ATTACHED_OBJECT", "CONSTRAINT", "SRC.FK_CHILD_PARENT", "TABLE:SRC.CHILD")],
+            excluded_rows=[{"status": "APPLIED", "object_type": "TABLE", "schema_name": "SRC", "object_name": "PARENT", "detail": "MATCHED"}],
+        )
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].severity, sdr.SCOPE_INTEGRITY_SEVERITY_WARNING)
+        self.assertEqual(issues[0].object_type, "CONSTRAINT")
+        self.assertEqual(issues[0].missing_deps[0].dep_location, sdr.SCOPE_INTEGRITY_LOCATION_USER_EXCLUDED)
+
+    def test_build_fk_scope_integrity_issues_cross_schema_is_warning(self):
+        oracle_meta = self._make_oracle_meta()._replace(constraints={
+            ("SRC", "CHILD"): {
+                "FK_CHILD_PARENT": {
+                    "type": "R",
+                    "columns": ["PARENT_ID"],
+                    "ref_table_owner": "OTHER",
+                    "ref_table_name": "PARENT",
+                }
+            }
+        })
+        issues = sdr.build_fk_scope_integrity_issues(
+            {("SRC.FK_CHILD_PARENT", "CONSTRAINT"), ("SRC.CHILD", "TABLE")},
+            oracle_meta,
+            {"SRC.CHILD": {"TABLE"}, "OTHER.PARENT": {"TABLE"}, "SRC.FK_CHILD_PARENT": {"CONSTRAINT"}},
+            ["SRC"],
+            [("ATTACHED_OBJECT", "CONSTRAINT", "SRC.FK_CHILD_PARENT", "TABLE:SRC.CHILD")],
+        )
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].severity, sdr.SCOPE_INTEGRITY_SEVERITY_WARNING)
+        self.assertEqual(issues[0].missing_deps[0].dep_location, sdr.SCOPE_INTEGRITY_LOCATION_CROSS_SCHEMA)
+
+    def test_build_fk_scope_integrity_issues_skips_in_scope_ref_table(self):
+        oracle_meta = self._make_oracle_meta()._replace(constraints={
+            ("SRC", "CHILD"): {
+                "FK_CHILD_PARENT": {
+                    "type": "R",
+                    "columns": ["PARENT_ID"],
+                    "ref_table_owner": "SRC",
+                    "ref_table_name": "PARENT",
+                }
+            }
+        })
+        issues = sdr.build_fk_scope_integrity_issues(
+            {("SRC.FK_CHILD_PARENT", "CONSTRAINT"), ("SRC.CHILD", "TABLE"), ("SRC.PARENT", "TABLE")},
+            oracle_meta,
+            {"SRC.CHILD": {"TABLE"}, "SRC.PARENT": {"TABLE"}, "SRC.FK_CHILD_PARENT": {"CONSTRAINT"}},
+            ["SRC"],
+            [("ATTACHED_OBJECT", "CONSTRAINT", "SRC.FK_CHILD_PARENT", "TABLE:SRC.CHILD")],
+        )
+        self.assertEqual(issues, [])
+
+    def test_check_scope_integrity_advisory_procedure_is_info(self):
+        included_nodes = {("SRC.T1", "TABLE"), ("SRC.P1", "PROCEDURE")}
+        dependency_graph = {
+            ("SRC.P1", "PROCEDURE"): {("SRC.T1", "TABLE"), ("SRC.T2", "TABLE")},
+        }
+        source_objects_full_scope = {
+            "SRC.T1": {"TABLE"},
+            "SRC.T2": {"TABLE"},
+            "SRC.P1": {"PROCEDURE"},
+        }
+        issues = sdr.check_scope_integrity(
+            included_nodes,
+            dependency_graph,
+            source_objects_full_scope,
+            ["SRC"],
+            [("REVERSE_DEPENDENCY", "PROCEDURE", "SRC.P1", "TABLE:SRC.T1")],
+            check_depth="direct",
+            include_advisory=True,
+        )
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].severity, sdr.SCOPE_INTEGRITY_SEVERITY_INFO)
+        self.assertEqual(issues[0].object_type, "PROCEDURE")
+        self.assertEqual(issues[0].missing_deps[0].dep_full, "SRC.T2")
+
+    def test_build_scope_integrity_detail_rows_for_scope_detail_includes_info(self):
+        issues = [
+            sdr.ScopeIntegrityIssue(
+                issue_id="SII-0007",
+                severity=sdr.SCOPE_INTEGRITY_SEVERITY_INFO,
+                object_type="PROCEDURE",
+                source_full="SRC.P1",
+                target_full="TGT.P1",
+                entry_reason="REVERSE_DEPENDENCY",
+                missing_deps=(),
+            )
+        ]
+        rows = sdr.build_scope_integrity_detail_rows_for_scope_detail(issues)
+        self.assertEqual(rows, [(sdr.SCOPE_INTEGRITY_STATUS_INFO, "PROCEDURE", "SRC.P1", "ISSUE:SII-0007;MISSING_DEPS:0")])
+
+    def test_build_scope_integrity_remap_candidate_rows_skips_info(self):
+        issues = [
+            sdr.ScopeIntegrityIssue(
+                issue_id="SII-0008",
+                severity=sdr.SCOPE_INTEGRITY_SEVERITY_INFO,
+                object_type="PROCEDURE",
+                source_full="SRC.P1",
+                target_full="TGT.P1",
+                entry_reason="REVERSE_DEPENDENCY",
+                missing_deps=(
+                    sdr.MissingDep(
+                        dep_full="SRC.T2",
+                        dep_type="TABLE",
+                        dep_schema="SRC",
+                        dep_location=sdr.SCOPE_INTEGRITY_LOCATION_IN_SOURCE_SCHEMAS_NOT_SCOPED,
+                        suggested_action="ADD_REMAP_RULE",
+                        suggested_remap="SRC.T2 = TGT.T2",
+                        path="SRC.P1 -> SRC.T2",
+                        detail="SOURCE_SCOPE_MISSING",
+                    ),
+                ),
+            )
+        ]
+        self.assertEqual(sdr.build_scope_integrity_remap_candidate_rows(issues), [])
+
+    def test_finalize_scope_integrity_issues_derives_remap_candidates(self):
+        issues = [
+            sdr.ScopeIntegrityIssue(
+                issue_id="",
+                severity=sdr.SCOPE_INTEGRITY_SEVERITY_CRITICAL,
+                object_type="VIEW",
+                source_full="SRC.V1",
+                target_full="-",
+                entry_reason="ROOT_REMAP",
+                missing_deps=(
+                    sdr.MissingDep(
+                        dep_full="SRC.T2",
+                        dep_type="TABLE",
+                        dep_schema="SRC",
+                        dep_location=sdr.SCOPE_INTEGRITY_LOCATION_IN_SOURCE_SCHEMAS_NOT_SCOPED,
+                        suggested_action="ADD_REMAP_RULE",
+                        suggested_remap="-",
+                        path="SRC.V1 -> SRC.T2",
+                        detail="SOURCE_SCOPE_MISSING",
+                    ),
+                ),
+            )
+        ]
+        full_mapping = {"SRC.V1": {"VIEW": "TGT.V1"}}
+        finalized = sdr.finalize_scope_integrity_issues(
+            issues,
+            full_object_mapping=full_mapping,
+            remap_rules={},
+            schema_mapping={"SRC": "TGT"},
+        )
+        self.assertEqual(finalized[0].issue_id, "SII-0001")
+        self.assertEqual(finalized[0].target_full, "TGT.V1")
+        self.assertEqual(finalized[0].missing_deps[0].suggested_remap, "SRC.T2 = TGT.T2")
+
+    def test_finalize_scope_integrity_issues_can_use_discovery_mapping_for_advisory_object(self):
+        issues = [
+            sdr.ScopeIntegrityIssue(
+                issue_id="",
+                severity=sdr.SCOPE_INTEGRITY_SEVERITY_INFO,
+                object_type="PACKAGE",
+                source_full="SRC.PKG1",
+                target_full="-",
+                entry_reason="DEPENDENCY",
+                missing_deps=(),
+            )
+        ]
+        finalized = sdr.finalize_scope_integrity_issues(
+            issues,
+            full_object_mapping={"SRC.PKG1": {"PACKAGE": "TGT_PKG.PKG1"}},
+            remap_rules={},
+            schema_mapping={"SRC": "TGT"},
+        )
+        self.assertEqual(finalized[0].target_full, "TGT_PKG.PKG1")
+
+    def test_export_scope_integrity_detail_and_candidates(self):
+        issues = [
+            sdr.ScopeIntegrityIssue(
+                issue_id="SII-0001",
+                severity=sdr.SCOPE_INTEGRITY_SEVERITY_CRITICAL,
+                object_type="VIEW",
+                source_full="SRC.V1",
+                target_full="TGT.V1",
+                entry_reason="ROOT_REMAP",
+                missing_deps=(
+                    sdr.MissingDep(
+                        dep_full="SRC.T2",
+                        dep_type="TABLE",
+                        dep_schema="SRC",
+                        dep_location=sdr.SCOPE_INTEGRITY_LOCATION_IN_SOURCE_SCHEMAS_NOT_SCOPED,
+                        suggested_action="ADD_REMAP_RULE",
+                        suggested_remap="SRC.T2 = TGT.T2",
+                        path="SRC.V1 -> SRC.T2",
+                        detail="SOURCE_SCOPE_MISSING",
+                    ),
+                ),
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_dir = Path(tmpdir)
+            detail_path = sdr.export_scope_integrity_detail(issues, report_dir, "20260405_120000")
+            candidate_path = sdr.export_scope_integrity_remap_candidates(issues, report_dir, "20260405_120000")
+            self.assertIsNotNone(detail_path)
+            self.assertIsNotNone(candidate_path)
+            detail_text = Path(detail_path).read_text(encoding="utf-8")
+            candidate_text = Path(candidate_path).read_text(encoding="utf-8")
+            self.assertIn("SII-0001|CRITICAL|VIEW|SRC.V1|TGT.V1", detail_text)
+            self.assertIn("SRC.T2|TGT.T2|SRC.T2 = TGT.T2|SII-0001", candidate_text)
+
+    def test_build_scope_integrity_diagnostics(self):
+        issues = [
+            sdr.ScopeIntegrityIssue(
+                issue_id="SII-0001",
+                severity=sdr.SCOPE_INTEGRITY_SEVERITY_CRITICAL,
+                object_type="VIEW",
+                source_full="SRC.V1",
+                target_full="TGT.V1",
+                entry_reason="ROOT_REMAP",
+                missing_deps=(),
+            )
+        ]
+        diagnostics = sdr.build_scope_integrity_diagnostics(issues)
+        self.assertEqual(len(diagnostics), 1)
+        self.assertIn("critical=1", diagnostics[0])
+        self.assertEqual(
+            sdr.build_scope_integrity_diagnostics([]),
+            ["scope integrity: scoped VIEW/MVIEW blocking prerequisites complete"],
+        )
 
     def test_build_non_table_trigger_detail_rows_respects_scoped_source_objects(self):
         oracle_meta = self._make_oracle_meta()._replace(non_table_triggers=(
@@ -21279,6 +21893,15 @@ class TestReportDbHelpers(unittest.TestCase):
         self.assertFalse(truncated)
         self.assertEqual(truncated_count, 0)
         self.assertEqual(rows[0]["map_source"], "rule")
+
+    def test_build_discovery_only_object_mapping_returns_only_non_managed_entries(self):
+        discovery_mapping = {
+            "SRC.T1": {"TABLE": "TGT_TABLE.T1"},
+            "SRC.PKG1": {"PACKAGE": "TGT_PKG.PKG1"},
+        }
+        managed_mapping = {"SRC.T1": {"TABLE": "TGT_TABLE.T1"}}
+        discovery_only = sdr.build_discovery_only_object_mapping(discovery_mapping, managed_mapping)
+        self.assertEqual(discovery_only, {"SRC.PKG1": {"PACKAGE": "TGT_PKG.PKG1"}})
 
     def test_build_report_blacklist_rows(self):
         row = sdr.BlacklistReportRow(
