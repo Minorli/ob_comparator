@@ -39,6 +39,7 @@
   说明：`full_source` 保持当前行为，按 `source_schemas` 全量扫描；`remap_root_closure` 仅以 `remap_file` 中显式 TABLE/VIEW 为 root seeds，再按依赖、反向依赖、附属关系扩展闭包，不在闭包中的对象（及其相关 INDEX/CONSTRAINT/SYNONYM/SEQUENCE 等）整体忽略。
   说明：当设置为 `remap_root_closure` 且配置了 `trigger_list` 时，`trigger_list` 中的触发器会作为显式 keep set 保留；`trigger_list` 支持填写源端触发器名，或 remap 后的目标触发器名。
   说明：`missed_tables_views_for_OMS/` 与 report_db 的 `OMS_MISSING` 在该模式下默认只导出 `remap_file` 中显式 TABLE/VIEW roots，不再把 closure 依赖对象一起带出。
+  说明：该模式下 `object_mapping_<ts>.txt` 表示本轮 managed mapping；若 closure 内还发现了未进入 operator-facing compare/fixup 的 related object，会额外输出 `object_mapping_discovery_<ts>.txt`。
   说明：若 `trigger_list` 非法或未启用 `TRIGGER` 检查，程序会 fail-fast；若个别条目无法在源端或显式 remap 规则中解析，程序不再中止，而是把这些条目写入 `source_scope_detail_<ts>.txt` / `trigger_status_report.txt`，并从本轮 scoped closure 与 fixup 中排除。
 - remap_scope_text_fallback_mode：scoped 文本补盲模式。默认：off。
   可选值：off、safe。
@@ -46,9 +47,18 @@
   说明：`safe` 额外支持受控 dynamic SQL（`EXECUTE IMMEDIATE`/`DBMS_SQL.PARSE`）、纯字符串拼接 SQL，以及同 schema 未带前缀的 package/procedure/function 调用；普通字符串字面量和跨 schema 未带前缀引用仍不会被猜测。
   说明：变量拼接 SQL 不会自动纳入 closure；会在 `source_scope_detail_<ts>.txt` 中以 `TEXT_REFERENCE_AMBIGUOUS` 输出，供人工复核。
   说明：`safe` 不会对全 schema 对象 DDL 做 `DBMS_METADATA` 全量 grep。
-  说明：规则格式为 `SRC_SCHEMA.OBJECT = TGT_SCHEMA.OBJECT`，支持注释与空行。
-  注意：文件不存在会报警但继续。
-  说明：每轮运行会额外输出 `managed_target_scope_detail_<ts>.txt`，用于审计本轮派生出的目标 schema 范围。
+- scope_integrity_check：是否检查 `remap_root_closure` 下 scoped VIEW/MVIEW 的前置依赖完整性。默认：true。
+  说明：仅在 `source_object_scope_mode=remap_root_closure` 下生效。
+  说明：首版只对 `VIEW` / `MATERIALIZED VIEW` 输出 blocking 级诊断；`PROCEDURE/FUNCTION/PACKAGE/JOB/...` 仍按现有 compare/fixup 子系统处理。
+- scope_integrity_check_depth：scope 完整性检查深度。默认：direct。
+  可选值：direct、transitive。
+  说明：`direct` 只看直接依赖；`transitive` 会递归追踪 `VIEW/MVIEW -> VIEW/MVIEW -> ...` 的链式缺失路径。
+- scope_integrity_advisory_check：是否输出 advisory-family 的 INFO 级 scope 完整性诊断。默认：false。
+  说明：对象范围为 `PROCEDURE/FUNCTION/PACKAGE/PACKAGE BODY/TYPE/TYPE BODY/JOB/SCHEDULE/TRIGGER`。
+  说明：该模式只输出 `INFO`，不会把 advisory-family 依赖缺口升级成 `CRITICAL/WARNING`，也不会默认生成 remap 候选。
+- scope_integrity_fk_check：是否输出 FK scope 完整性 WARNING 诊断。默认：false。
+  说明：仅检查 FK 引用表是否仍在最终 managed scope。
+  说明：该模式只输出 `WARNING`，不改变现有 FK compare/fixup 主逻辑，也不生成独立 fixup SQL。
 - blacklist_target_existing_policy：黑名单表目标已存在策略。默认：rehydrate_if_present。
   可选值：keep_blocked、rehydrate_if_present。
   说明：当源端 TABLE 命中阻断型黑名单、但映射后的目标 TABLE 已经由客户人工改造并创建在 OB 上时，`rehydrate_if_present` 会把该表重新纳入 compare/fixup。

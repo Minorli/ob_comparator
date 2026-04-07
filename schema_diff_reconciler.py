@@ -1059,6 +1059,27 @@ class ScopedSourceScopeResult(NamedTuple):
     detail_rows: Tuple[Tuple[str, str, str, str], ...]  # (STATUS, TYPE, SOURCE_FULL, DETAIL)
 
 
+class MissingDep(NamedTuple):
+    dep_full: str
+    dep_type: str
+    dep_schema: str
+    dep_location: str
+    suggested_action: str
+    suggested_remap: str
+    path: str
+    detail: str
+
+
+class ScopeIntegrityIssue(NamedTuple):
+    issue_id: str
+    severity: str
+    object_type: str
+    source_full: str
+    target_full: str
+    entry_reason: str
+    missing_deps: Tuple[MissingDep, ...]
+
+
 @dataclass
 class DdlFormatItem:
     path: Path
@@ -1918,6 +1939,9 @@ ORACLE_DERIVED_ARTIFACT_TABLE_PATTERNS: Tuple[Pattern[str], ...] = (
     re.compile(r"^RUPD\$_", re.IGNORECASE),
     re.compile(r"^SNAP\$_", re.IGNORECASE),
 )
+ORACLE_SYSTEM_SCHEMAS: FrozenSet[str] = frozenset({
+    'SYS', 'SYSTEM', 'XDB', 'MDSYS', 'WMSYS', 'CTXSYS', 'OLAPSYS', 'DMSYS', 'EXFSYS', 'ORDSYS', 'DBSNMP'
+})
 
 CASE_SENSITIVE_IDENTIFIER_SAMPLE_LIMIT = 30
 METADATA_VOLUME_WARN_TABLES = 200000
@@ -4691,6 +4715,50 @@ def normalize_remap_scope_text_fallback_mode(raw_value: Optional[str]) -> str:
     return value
 
 
+SCOPE_INTEGRITY_CHECK_DEPTH_VALUES = {"direct", "transitive"}
+SCOPE_INTEGRITY_CHECK_DEPTH_ALIASES = {
+    "": "direct",
+    "one_hop": "direct",
+    "recursive": "transitive",
+}
+
+SCOPE_INTEGRITY_SEVERITY_CRITICAL = "CRITICAL"
+SCOPE_INTEGRITY_SEVERITY_WARNING = "WARNING"
+SCOPE_INTEGRITY_SEVERITY_INFO = "INFO"
+SCOPE_INTEGRITY_LOCATION_IN_SOURCE_SCHEMAS_NOT_SCOPED = "IN_SOURCE_SCHEMAS_NOT_SCOPED"
+SCOPE_INTEGRITY_LOCATION_USER_EXCLUDED = "USER_EXCLUDED"
+SCOPE_INTEGRITY_LOCATION_FILTERED_BY_CREATED_AFTER_CUTOFF = "FILTERED_BY_CREATED_AFTER_CUTOFF"
+SCOPE_INTEGRITY_LOCATION_CROSS_SCHEMA = "CROSS_SCHEMA"
+SCOPE_INTEGRITY_LOCATION_DBLINK = "DBLINK"
+SCOPE_INTEGRITY_LOCATION_NOT_FOUND = "NOT_FOUND"
+SCOPE_INTEGRITY_LOCATION_SYSTEM_OBJECT_SKIPPED = "SYSTEM_OBJECT_SKIPPED"
+SCOPE_INTEGRITY_STATUS_CRITICAL = "INTEGRITY_CRITICAL"
+SCOPE_INTEGRITY_STATUS_WARNING = "INTEGRITY_WARNING"
+SCOPE_INTEGRITY_STATUS_INFO = "INTEGRITY_INFO"
+SCOPE_INTEGRITY_MAX_TRANSITIVE_DEPTH = 10
+SCOPE_INTEGRITY_VIEW_TYPES: Set[str] = {"VIEW", "MATERIALIZED VIEW"}
+SCOPE_INTEGRITY_ADVISORY_TYPES: Set[str] = {"PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE BODY", "TYPE", "TYPE BODY", "JOB", "SCHEDULE", "TRIGGER"}
+SCOPE_INTEGRITY_REASON_PRIORITY: Dict[str, int] = {
+    "ROOT_REMAP": 1,
+    "TRIGGER_KEEP": 2,
+    "TEXT_REFERENCE_HEURISTIC": 3,
+    "REVERSE_DEPENDENCY": 4,
+    "DEPENDENCY": 5,
+    "PAIRED_OBJECT": 6,
+}
+
+
+def normalize_scope_integrity_check_depth(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return "direct"
+    value = str(raw_value).strip().lower()
+    value = SCOPE_INTEGRITY_CHECK_DEPTH_ALIASES.get(value, value)
+    if value not in SCOPE_INTEGRITY_CHECK_DEPTH_VALUES:
+        log.warning("scope_integrity_check_depth=%s 不在支持范围内，将回退为 direct。", raw_value)
+        return "direct"
+    return value
+
+
 def build_scope_discovery_types(enabled_types: Optional[Set[str]], source_scope_mode: str) -> Set[str]:
     enabled_types_u = {str(t).upper() for t in (enabled_types or set()) if str(t).strip()}
     if normalize_source_object_scope_mode(source_scope_mode) == "remap_root_closure":
@@ -6550,6 +6618,10 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('trigger_qualify_schema', 'true')
         settings.setdefault('source_object_scope_mode', 'full_source')
         settings.setdefault('remap_scope_text_fallback_mode', 'off')
+        settings.setdefault('scope_integrity_check', 'true')
+        settings.setdefault('scope_integrity_check_depth', 'direct')
+        settings.setdefault('scope_integrity_advisory_check', 'false')
+        settings.setdefault('scope_integrity_fk_check', 'false')
         settings.setdefault('check_status_drift_types', 'trigger,constraint')
         settings.setdefault('generate_status_fixup', 'true')
         settings.setdefault('status_fixup_types', 'trigger,constraint')
@@ -6899,6 +6971,21 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         )
         settings['remap_scope_text_fallback_mode'] = normalize_remap_scope_text_fallback_mode(
             settings.get('remap_scope_text_fallback_mode', 'off')
+        )
+        settings['scope_integrity_check'] = parse_bool_flag(
+            settings.get('scope_integrity_check', 'true'),
+            True
+        )
+        settings['scope_integrity_check_depth'] = normalize_scope_integrity_check_depth(
+            settings.get('scope_integrity_check_depth', 'direct')
+        )
+        settings['scope_integrity_advisory_check'] = parse_bool_flag(
+            settings.get('scope_integrity_advisory_check', 'false'),
+            False
+        )
+        settings['scope_integrity_fk_check'] = parse_bool_flag(
+            settings.get('scope_integrity_fk_check', 'false'),
+            False
         )
         settings['report_dir_layout'] = normalize_report_dir_layout(
             settings.get('report_dir_layout', 'per_run')
@@ -7553,6 +7640,14 @@ def run_config_wizard(config_path: Path) -> None:
         if normalized in REMAP_SCOPE_TEXT_FALLBACK_MODE_VALUES:
             return True, ""
         return False, "仅支持 off/safe"
+
+    def _validate_scope_integrity_check_depth(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = SCOPE_INTEGRITY_CHECK_DEPTH_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in SCOPE_INTEGRITY_CHECK_DEPTH_VALUES:
+            return True, ""
+        return False, "仅支持 direct/transitive"
 
     def _validate_report_detail_mode(val: str) -> Tuple[bool, str]:
         if not val.strip():
@@ -8267,6 +8362,35 @@ def run_config_wizard(config_path: Path) -> None:
         default=cfg.get("SETTINGS", "remap_scope_text_fallback_mode", fallback="off"),
         validator=_validate_remap_scope_text_fallback_mode,
         transform=normalize_remap_scope_text_fallback_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "scope_integrity_check",
+        "是否检查 scoped VIEW/MVIEW 前置依赖完整性 (true/false)",
+        default=cfg.get("SETTINGS", "scope_integrity_check", fallback="true"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "scope_integrity_check_depth",
+        "scope 完整性检查深度 (direct/transitive，默认 direct)",
+        default=cfg.get("SETTINGS", "scope_integrity_check_depth", fallback="direct"),
+        validator=_validate_scope_integrity_check_depth,
+        transform=normalize_scope_integrity_check_depth,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "scope_integrity_advisory_check",
+        "是否输出 advisory-family scope 完整性 INFO 诊断 (true/false)",
+        default=cfg.get("SETTINGS", "scope_integrity_advisory_check", fallback="false"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "scope_integrity_fk_check",
+        "是否输出 FK scope 完整性 WARNING 诊断 (true/false)",
+        default=cfg.get("SETTINGS", "scope_integrity_fk_check", fallback="false"),
+        transform=_bool_transform,
     )
     _prompt_field(
         "SETTINGS",
@@ -9668,6 +9792,53 @@ def filter_full_object_mapping_by_nodes(
     return filtered
 
 
+def filter_full_object_mapping_by_types(
+    full_object_mapping: Optional[FullObjectMapping],
+    enabled_types: Optional[Set[str]]
+) -> FullObjectMapping:
+    enabled_types_u = {
+        (item or "").upper()
+        for item in (enabled_types or set())
+        if (item or "").strip()
+    }
+    if not full_object_mapping:
+        return {}
+    if not enabled_types_u:
+        return {}
+    filtered: FullObjectMapping = {}
+    for src_full, type_map in (full_object_mapping or {}).items():
+        src_full_u = (src_full or "").upper()
+        scoped_type_map = {
+            (obj_type or "").upper(): (tgt_full or "").upper()
+            for obj_type, tgt_full in (type_map or {}).items()
+            if (obj_type or "").upper() in enabled_types_u and (tgt_full or "").strip()
+        }
+        if scoped_type_map:
+            filtered[src_full_u] = scoped_type_map
+    return filtered
+
+
+def build_discovery_only_object_mapping(
+    discovery_full_object_mapping: Optional[FullObjectMapping],
+    managed_full_object_mapping: Optional[FullObjectMapping],
+) -> FullObjectMapping:
+    discovery_only: FullObjectMapping = {}
+    managed_full_object_mapping = managed_full_object_mapping or {}
+    for src_full, type_map in (discovery_full_object_mapping or {}).items():
+        src_full_u = (src_full or "").upper()
+        managed_type_map = managed_full_object_mapping.get(src_full_u, {}) or {}
+        discovery_only_type_map: Dict[str, str] = {}
+        for obj_type, tgt_full in (type_map or {}).items():
+            obj_type_u = (obj_type or "").upper()
+            tgt_full_u = (tgt_full or "").upper()
+            if managed_type_map.get(obj_type_u) == tgt_full_u:
+                continue
+            discovery_only_type_map[obj_type_u] = tgt_full_u
+        if discovery_only_type_map:
+            discovery_only[src_full_u] = discovery_only_type_map
+    return discovery_only
+
+
 def filter_master_list_by_nodes(
     master_list: MasterCheckList,
     excluded_nodes: Optional[Set[DependencyNode]]
@@ -9873,9 +10044,9 @@ def build_remap_root_seed_nodes(
 ) -> Tuple[Set[DependencyNode], List[Tuple[str, str, str]], List[str]]:
     """
     返回:
-      - root_seed_nodes: 来自 remap_file 显式 TABLE/VIEW 条目的根种子
+      - root_seed_nodes: 来自 remap_file 显式 TABLE/VIEW/MATERIALIZED VIEW 条目的根种子
       - skipped_entries: [(SRC_FULL, SOURCE_TYPES, REASON)]
-      - explicit_root_keys: 按 remap 文件出现的显式 TABLE/VIEW 源对象全名
+      - explicit_root_keys: 按 remap 文件出现的显式合法 root 源对象全名
     """
     source_objects = source_objects or {}
     root_seed_nodes: Set[DependencyNode] = set()
@@ -9891,7 +10062,7 @@ def build_remap_root_seed_nodes(
         if not types:
             skipped_entries.append((src_full_u, "-", "SOURCE_OBJECT_NOT_FOUND"))
             continue
-        root_types = sorted(t for t in types if t in {"TABLE", "VIEW"})
+        root_types = sorted(t for t in types if t in {"TABLE", "VIEW", "MATERIALIZED VIEW"})
         if not root_types:
             skipped_entries.append((src_full_u, ",".join(sorted(types)), "NON_ROOT_OBJECT_TYPE"))
             continue
@@ -10073,6 +10244,184 @@ def build_source_scope_closure(
         excluded_nodes=frozenset(excluded_nodes),
         detail_rows=tuple(detail_rows),
     )
+
+
+SCOPED_REFERENCE_DEP_PREFERRED_TYPES: Tuple[str, ...] = (
+    "TABLE",
+    "VIEW",
+    "MATERIALIZED VIEW",
+    "SYNONYM",
+    "SEQUENCE",
+    "PACKAGE",
+    "PACKAGE BODY",
+    "PROCEDURE",
+    "FUNCTION",
+    "TYPE",
+    "TYPE BODY",
+    "TRIGGER",
+)
+
+
+def _resolve_scoped_reference_dependency_type(
+    source_objects: Optional[SourceObjectMap],
+    full_name: str,
+) -> Optional[str]:
+    type_set = {(item or "").upper() for item in ((source_objects or {}).get((full_name or "").upper()) or set()) if item}
+    for candidate in SCOPED_REFERENCE_DEP_PREFERRED_TYPES:
+        if candidate in type_set:
+            return candidate
+    return None
+
+
+def build_job_action_dependency_records(
+    source_objects: Optional[SourceObjectMap],
+    text_index: Optional[Dict[DependencyNode, str]],
+) -> List[DependencyRecord]:
+    source_objects = source_objects or {}
+    text_index = text_index or {}
+    job_nodes = {
+        (full_u, "JOB")
+        for full_u, obj_types in source_objects.items()
+        if "JOB" in {(item or "").upper() for item in (obj_types or set()) if item}
+    }
+    if not job_nodes or not text_index:
+        return []
+
+    candidate_types_by_full: Dict[str, Set[str]] = defaultdict(set)
+    for full_u, obj_types in source_objects.items():
+        for obj_type_u in {(item or "").upper() for item in (obj_types or set()) if item}:
+            if obj_type_u == "JOB":
+                continue
+            candidate_types_by_full[(full_u or "").upper()].add(obj_type_u)
+    if not candidate_types_by_full:
+        return []
+
+    patterns: List[Tuple[str, Tuple[re.Pattern, ...]]] = []
+    same_schema_outer_patterns: Dict[str, List[Tuple[str, Tuple[re.Pattern, ...]]]] = defaultdict(list)
+    same_schema_dynamic_patterns: Dict[str, List[Tuple[str, Tuple[re.Pattern, ...]]]] = defaultdict(list)
+    for full_u in sorted(candidate_types_by_full):
+        candidate_types = candidate_types_by_full.get(full_u) or set()
+        regexes = _build_scoped_reference_patterns(full_u, candidate_types)
+        if regexes:
+            patterns.append((full_u, regexes))
+        if "." in full_u:
+            owner_u, name_u = full_u.split(".", 1)
+            outer_regexes = _build_same_schema_outer_reference_patterns(name_u, candidate_types)
+            if outer_regexes:
+                same_schema_outer_patterns[owner_u].append((full_u, outer_regexes))
+            dynamic_regexes = _build_same_schema_dynamic_sql_reference_patterns(name_u, candidate_types)
+            if dynamic_regexes:
+                same_schema_dynamic_patterns[owner_u].append((full_u, dynamic_regexes))
+
+    def _collect_matches(node_full: str, raw_text: str) -> List[str]:
+        cleaned_text = mask_sql_for_scan(raw_text or "").upper()
+        dynamic_sql_texts_raw, _dynamic_sql_ambiguities = _extract_dynamic_sql_literals_for_scan(raw_text or "")
+        dynamic_sql_texts = [item.upper() for item in dynamic_sql_texts_raw]
+        node_owner = node_full.split('.', 1)[0].upper() if '.' in node_full else ""
+        matched_fulls: List[str] = []
+        seen_fulls: Set[str] = set()
+
+        def _add_match(full_u: str) -> None:
+            full_u = (full_u or "").upper()
+            if not full_u or full_u in seen_fulls:
+                return
+            seen_fulls.add(full_u)
+            matched_fulls.append(full_u)
+
+        for full_u, regexes in patterns:
+            if any(regex.search(cleaned_text) for regex in regexes) or any(
+                regex.search(dynamic_text)
+                for dynamic_text in dynamic_sql_texts
+                for regex in regexes
+            ):
+                _add_match(full_u)
+        for full_u, regexes in same_schema_outer_patterns.get(node_owner, []):
+            if any(regex.search(cleaned_text) for regex in regexes):
+                _add_match(full_u)
+        for full_u, regexes in same_schema_dynamic_patterns.get(node_owner, []):
+            if any(
+                regex.search(dynamic_text)
+                for dynamic_text in dynamic_sql_texts
+                for regex in regexes
+            ):
+                _add_match(full_u)
+        return matched_fulls
+
+    def _expand_program_unit(full_u: str, type_u: str) -> List[Tuple[str, str]]:
+        candidates: List[Tuple[str, str]] = []
+        full_upper = (full_u or "").upper()
+        if type_u == "PACKAGE" and (full_upper, "PACKAGE BODY") in text_index:
+            candidates.append((full_upper, "PACKAGE BODY"))
+        if type_u == "TYPE" and (full_upper, "TYPE BODY") in text_index:
+            candidates.append((full_upper, "TYPE BODY"))
+        if (full_upper, type_u) in text_index:
+            candidates.append((full_upper, type_u))
+        return candidates
+
+    records: Set[DependencyRecord] = set()
+    for node, raw_text in sorted(text_index.items(), key=lambda item: (item[0][1], item[0][0])):
+        if node not in job_nodes:
+            continue
+        dep_full = (node[0] or "").upper()
+        dep_type = (node[1] or "").upper()
+        if dep_type != "JOB" or "." not in dep_full:
+            continue
+        dep_owner, dep_name = dep_full.split('.', 1)
+        seen_targets: Set[str] = set()
+        queue: List[Tuple[str, str]] = [target for target in _collect_matches(dep_full, raw_text or "") if target]
+        frontier_program_units: List[Tuple[str, str]] = []
+        for matched_full in queue:
+            ref_type = _resolve_scoped_reference_dependency_type(source_objects, matched_full)
+            if ref_type and "." in matched_full:
+                ref_owner, ref_name = matched_full.split('.', 1)
+                records.add(DependencyRecord(dep_owner, dep_name, dep_type, ref_owner, ref_name, ref_type))
+                seen_targets.add(f"{matched_full}|{ref_type}")
+                if ref_type in {"PACKAGE", "PACKAGE BODY", "PROCEDURE", "FUNCTION", "TYPE", "TYPE BODY"}:
+                    frontier_program_units.extend(_expand_program_unit(matched_full, ref_type))
+        visited_program_units: Set[Tuple[str, str]] = set()
+        while frontier_program_units:
+            current_full, current_type = frontier_program_units.pop(0)
+            key = (current_full, current_type)
+            if key in visited_program_units:
+                continue
+            visited_program_units.add(key)
+            current_text = text_index.get(key)
+            if not current_text:
+                continue
+            for matched_full in _collect_matches(current_full, current_text):
+                ref_type = _resolve_scoped_reference_dependency_type(source_objects, matched_full)
+                if not ref_type or "." not in matched_full:
+                    continue
+                edge_key = f"{matched_full}|{ref_type}"
+                if edge_key not in seen_targets:
+                    ref_owner, ref_name = matched_full.split('.', 1)
+                    records.add(DependencyRecord(dep_owner, dep_name, dep_type, ref_owner, ref_name, ref_type))
+                    seen_targets.add(edge_key)
+                if ref_type in {"PACKAGE", "PACKAGE BODY", "PROCEDURE", "FUNCTION", "TYPE", "TYPE BODY"}:
+                    frontier_program_units.extend(_expand_program_unit(matched_full, ref_type))
+    return sorted(records, key=lambda item: (item.owner, item.name, item.referenced_owner, item.referenced_name, item.referenced_type))
+
+
+def load_oracle_job_action_dependency_records(
+    ora_cfg: OraConfig,
+    source_objects: Optional[SourceObjectMap],
+) -> List[DependencyRecord]:
+    source_objects = source_objects or {}
+    candidate_nodes: Set[DependencyNode] = set()
+    for full_u, obj_types in source_objects.items():
+        obj_types_u = {(item or "").upper() for item in (obj_types or set()) if item}
+        if "JOB" in obj_types_u:
+            candidate_nodes.add((full_u, "JOB"))
+        if obj_types_u & {"PACKAGE", "PACKAGE BODY", "PROCEDURE", "FUNCTION", "TYPE", "TYPE BODY"}:
+            for obj_type_u in sorted(obj_types_u & {"PACKAGE", "PACKAGE BODY", "PROCEDURE", "FUNCTION", "TYPE", "TYPE BODY"}):
+                candidate_nodes.add((full_u, obj_type_u))
+    if not candidate_nodes:
+        return []
+    text_index = load_oracle_scoped_text_reference_index(ora_cfg, candidate_nodes)
+    rows = build_job_action_dependency_records(source_objects, text_index)
+    if rows:
+        log.info('[SOURCE_SCOPE] 已从 JOB_ACTION 补充 JOB 依赖 %d 条。', len(rows))
+    return rows
 
 
 def load_oracle_scoped_text_reference_index(
@@ -11783,6 +12132,7 @@ def get_object_parent_tables(
     schemas_list: List[str],
     enabled_object_types: Optional[Set[str]] = None,
     known_source_types: Optional[SourceObjectMap] = None,
+    diagnostic_rows: Optional[List[Tuple[str, str, str, str]]] = None,
 ) -> ObjectParentMap:
     """
     获取依附对象（TRIGGER/SYNONYM/INDEX/CONSTRAINT 等）所属的父表。
@@ -11836,6 +12186,7 @@ def get_object_parent_tables(
                 synonym_parent_map = build_synonym_parent_map(
                     synonym_meta,
                     known_source_types=known_source_types,
+                    diagnostic_rows=diagnostic_rows,
                 )
                 parent_map.update(synonym_parent_map)
 
@@ -11893,6 +12244,7 @@ def get_object_parent_tables(
 def build_synonym_parent_map(
     synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]],
     known_source_types: Optional[SourceObjectMap] = None,
+    diagnostic_rows: Optional[List[Tuple[str, str, str, str]]] = None,
 ) -> ObjectParentMap:
     """
     将同义词（含 relevant PUBLIC 链）映射到其终点对象，便于 remap_root_closure
@@ -11909,7 +12261,14 @@ def build_synonym_parent_map(
             synonym_meta,
             known_source_types=known_source_types,
         )
+        syn_full = f"{owner_u}.{name_u}".upper()
+        meta = synonym_meta.get((owner_u, name_u))
         if not terminal_full or "." not in terminal_full:
+            if diagnostic_rows is not None:
+                reason = "TERMINAL_UNRESOLVED"
+                if meta and meta.db_link:
+                    reason = "DBLINK"
+                diagnostic_rows.append(("SYNONYM_TERMINAL_SKIPPED", "SYNONYM", syn_full, reason))
             continue
         terminal_types = {
             (obj_type or "").upper()
@@ -11917,10 +12276,14 @@ def build_synonym_parent_map(
             if obj_type
         }
         if terminal_types and terminal_types <= {"SYNONYM"}:
+            if diagnostic_rows is not None:
+                diagnostic_rows.append(("SYNONYM_TERMINAL_SKIPPED", "SYNONYM", syn_full, f"TERMINAL_ONLY_SYNONYM:{terminal_full.upper()}"))
             continue
+        if not terminal_types and diagnostic_rows is not None:
+            diagnostic_rows.append(("SYNONYM_TERMINAL_SKIPPED", "SYNONYM", syn_full, f"TERMINAL_OUT_OF_SCOPE:{terminal_full.upper()}"))
         for chain_owner_u, chain_name_u in chain or ((owner_u, name_u),):
-            syn_full = f"{chain_owner_u}.{chain_name_u}".upper()
-            parent_map[syn_full] = terminal_full.upper()
+            chain_full = f"{chain_owner_u}.{chain_name_u}".upper()
+            parent_map[chain_full] = terminal_full.upper()
     return parent_map
 
 
@@ -14252,6 +14615,36 @@ def build_managed_target_scope_diagnostics(scope: ManagedTargetScope) -> List[st
     return diagnostics
 
 
+def build_mapping_scope_diagnostics(
+    discovery_full_object_mapping: Optional[FullObjectMapping],
+    managed_full_object_mapping: Optional[FullObjectMapping],
+    discovery_mapping_path: Optional[Path] = None,
+) -> List[str]:
+    discovery_only_mapping = build_discovery_only_object_mapping(
+        discovery_full_object_mapping,
+        managed_full_object_mapping,
+    )
+    discovery_only_count = sum(len(type_map or {}) for type_map in discovery_only_mapping.values())
+    if not discovery_only_count:
+        return []
+    discovery_only_types = sorted({
+        (obj_type or "").upper()
+        for type_map in discovery_only_mapping.values()
+        for obj_type in (type_map or {}).keys()
+        if obj_type
+    })
+    detail_suffix = ""
+    if discovery_mapping_path:
+        detail_suffix = "; detail={name}".format(name=discovery_mapping_path.name)
+    return [
+        "discovery-only mapping objects={count}; types={types}{detail}".format(
+            count=discovery_only_count,
+            types=", ".join(discovery_only_types[:12]) + (" ..." if len(discovery_only_types) > 12 else ""),
+            detail=detail_suffix,
+        )
+    ]
+
+
 def build_source_scope_diagnostics(scope_result: ScopedSourceScopeResult) -> List[str]:
     if not scope_result:
         return []
@@ -14267,7 +14660,614 @@ def build_source_scope_diagnostics(scope_result: ScopedSourceScopeResult) -> Lis
             excluded=len(scope_result.excluded_nodes or []),
         )
     )
+    root_skipped = [
+        (obj_type, full_name, detail)
+        for status, obj_type, full_name, detail in (scope_result.detail_rows or ())
+        if (status or "").upper() == "ROOT_SKIPPED"
+    ]
+    if root_skipped:
+        sample = ", ".join(f"{full}:{detail}" for _obj_type, full, detail in root_skipped[:5])
+        diagnostics.append(
+            "remap roots skipped={count}; sample={sample}".format(
+                count=len(root_skipped),
+                sample=sample or "-",
+            )
+        )
+    synonym_skipped = [
+        (obj_type, full_name, detail)
+        for status, obj_type, full_name, detail in (scope_result.detail_rows or ())
+        if (status or "").upper() == "SYNONYM_TERMINAL_SKIPPED"
+    ]
+    if synonym_skipped:
+        sample = ", ".join(f"{full}:{detail}" for _obj_type, full, detail in synonym_skipped[:5])
+        diagnostics.append(
+            "synonym terminal skipped={count}; sample={sample}".format(
+                count=len(synonym_skipped),
+                sample=sample or "-",
+            )
+        )
     return diagnostics
+
+
+def build_scope_discovery_diagnostics(
+    source_scope_mode: str,
+    enabled_object_types: Optional[Set[str]],
+    scope_discovery_types: Optional[Set[str]],
+) -> List[str]:
+    mode_u = normalize_source_object_scope_mode(source_scope_mode)
+    if mode_u != "remap_root_closure":
+        return []
+    enabled_u = {(item or "").upper() for item in (enabled_object_types or set()) if item}
+    discovery_u = {(item or "").upper() for item in (scope_discovery_types or set()) if item}
+    extra = sorted(discovery_u - enabled_u)
+    if not extra:
+        return []
+    return [
+        "closure 内部 discovery/mapping 范围宽于 operator-facing enabled types: {value}".format(
+            value=", ".join(extra[:12]) + (" ..." if len(extra) > 12 else "")
+        )
+    ]
+
+
+def build_scheduler_scope_diagnostics(
+    source_scope_mode: str,
+    remap_scope_text_fallback_mode: str,
+    source_objects: Optional[SourceObjectMap],
+) -> List[str]:
+    if normalize_source_object_scope_mode(source_scope_mode) != "remap_root_closure":
+        return []
+    source_objects = source_objects or {}
+    has_schedule = any(
+        "SCHEDULE" in {(item or "").upper() for item in (obj_types or set()) if item}
+        for obj_types in source_objects.values()
+    )
+    if not has_schedule:
+        return []
+    diagnostics: List[str] = []
+    diagnostics.append(
+        "SCHEDULE 对象当前不做结构化补边；REPEAT_INTERVAL 不按数据库对象依赖解析。mode={mode}".format(
+            mode=normalize_remap_scope_text_fallback_mode(remap_scope_text_fallback_mode)
+        )
+    )
+    return diagnostics
+
+
+def build_scope_integrity_entry_reason_map(
+    detail_rows: Optional[Sequence[Tuple[str, str, str, str]]]
+) -> Dict[DependencyNode, str]:
+    reason_map: Dict[DependencyNode, str] = {}
+    priority_map: Dict[DependencyNode, int] = {}
+    for status, obj_type, full_name, _detail in (detail_rows or []):
+        full_u = (full_name or '').upper()
+        type_u = (obj_type or '').upper()
+        status_u = (status or '').upper()
+        if not full_u or not type_u:
+            continue
+        priority = SCOPE_INTEGRITY_REASON_PRIORITY.get(status_u, 999)
+        key = (full_u, type_u)
+        if key not in reason_map or priority < priority_map.get(key, 999):
+            reason_map[key] = status_u
+            priority_map[key] = priority
+    return reason_map
+
+
+def is_scope_integrity_system_object(full_name: str, obj_type: Optional[str] = None) -> bool:
+    parsed = parse_full_object_name(full_name or '')
+    if not parsed:
+        return False
+    schema_u, name_u = parsed[0].upper(), parsed[1].upper()
+    if schema_u in ORACLE_SYSTEM_SCHEMAS:
+        return True
+    if name_u.startswith('DBMS_') or name_u.startswith('UTL_'):
+        return True
+    if MVIEW_LOG_TABLE_NAME_PATTERN.match(name_u):
+        return True
+    return False
+
+
+def build_scope_integrity_excluded_reason_map(
+    excluded_rows: Optional[Sequence[Dict[str, object]]]
+) -> Dict[DependencyNode, Tuple[str, str]]:
+    result: Dict[DependencyNode, Tuple[str, str]] = {}
+    priority = {
+        EXCLUDED_STATUS_FILTERED_BY_CREATED_AFTER_CUTOFF: 1,
+        EXCLUDED_STATUS_FILTERED_BY_MISSING_CREATED: 1,
+        'APPLIED_SYSTEM': 2,
+        'APPLIED': 3,
+        'CASCADED': 4,
+    }
+    seen_priority: Dict[DependencyNode, int] = {}
+    for row in excluded_rows or []:
+        status_u = str(row.get('status') or '').upper()
+        obj_type_u = str(row.get('object_type') or '').upper()
+        schema_u = str(row.get('schema_name') or '').upper()
+        object_u = str(row.get('object_name') or '').upper()
+        detail = str(row.get('detail') or '')
+        if not status_u or not obj_type_u or not schema_u or not object_u:
+            continue
+        key = (f'{schema_u}.{object_u}', obj_type_u)
+        if status_u in {EXCLUDED_STATUS_FILTERED_BY_CREATED_AFTER_CUTOFF, EXCLUDED_STATUS_FILTERED_BY_MISSING_CREATED}:
+            cause = SCOPE_INTEGRITY_LOCATION_FILTERED_BY_CREATED_AFTER_CUTOFF
+        elif status_u == 'APPLIED_SYSTEM':
+            cause = SCOPE_INTEGRITY_LOCATION_SYSTEM_OBJECT_SKIPPED
+        elif status_u in {'APPLIED', 'CASCADED'}:
+            cause = SCOPE_INTEGRITY_LOCATION_USER_EXCLUDED
+        else:
+            continue
+        if key not in result or priority.get(status_u, 999) < seen_priority.get(key, 999):
+            result[key] = (cause, detail)
+            seen_priority[key] = priority.get(status_u, 999)
+    return result
+
+
+def build_scope_integrity_synonym_terminal_map(
+    detail_rows: Optional[Sequence[Tuple[str, str, str, str]]]
+) -> Dict[DependencyNode, str]:
+    result: Dict[DependencyNode, str] = {}
+    for status, obj_type, full_name, detail in (detail_rows or []):
+        if (status or '').upper() != 'SYNONYM_TERMINAL_SKIPPED':
+            continue
+        full_u = (full_name or '').upper()
+        type_u = (obj_type or '').upper() or 'SYNONYM'
+        if full_u:
+            result[(full_u, type_u)] = str(detail or '')
+    return result
+
+
+def classify_scope_integrity_missing_dep(
+    dep_full: str,
+    dep_type: str,
+    *,
+    source_objects_full_scope: Optional[SourceObjectMap],
+    source_schemas: Optional[Sequence[str]],
+    excluded_reason_map: Optional[Dict[DependencyNode, Tuple[str, str]]] = None,
+    synonym_terminal_map: Optional[Dict[DependencyNode, str]] = None,
+) -> Tuple[str, str]:
+    dep_full_u = (dep_full or '').upper()
+    dep_type_u = (dep_type or '').upper()
+    key = (dep_full_u, dep_type_u)
+    excluded_reason_map = excluded_reason_map or {}
+    synonym_terminal_map = synonym_terminal_map or {}
+    source_objects_full_scope = source_objects_full_scope or {}
+    source_schema_set = {str(item or '').upper() for item in (source_schemas or []) if str(item or '').strip()}
+
+    if key in excluded_reason_map:
+        return excluded_reason_map[key]
+
+    synonym_reason = synonym_terminal_map.get(key)
+    if synonym_reason:
+        if synonym_reason == 'DBLINK':
+            return SCOPE_INTEGRITY_LOCATION_DBLINK, synonym_reason
+        if synonym_reason.startswith('TERMINAL_OUT_OF_SCOPE:'):
+            terminal_full = synonym_reason.split(':', 1)[1].strip().upper()
+            if is_scope_integrity_system_object(terminal_full, 'TABLE'):
+                return SCOPE_INTEGRITY_LOCATION_SYSTEM_OBJECT_SKIPPED, synonym_reason
+            return SCOPE_INTEGRITY_LOCATION_CROSS_SCHEMA, synonym_reason
+        if synonym_reason.startswith('TERMINAL_ONLY_SYNONYM:') or synonym_reason == 'TERMINAL_UNRESOLVED':
+            return SCOPE_INTEGRITY_LOCATION_NOT_FOUND, synonym_reason
+
+    if '@' in dep_full_u:
+        return SCOPE_INTEGRITY_LOCATION_DBLINK, 'DBLINK_REFERENCE'
+
+    if is_scope_integrity_system_object(dep_full_u, dep_type_u):
+        return SCOPE_INTEGRITY_LOCATION_SYSTEM_OBJECT_SKIPPED, 'SYSTEM_OBJECT'
+
+    parsed = parse_full_object_name(dep_full_u)
+    dep_schema = (parsed[0].upper() if parsed else '')
+    if dep_full_u in source_objects_full_scope:
+        if dep_schema and dep_schema in source_schema_set:
+            return SCOPE_INTEGRITY_LOCATION_IN_SOURCE_SCHEMAS_NOT_SCOPED, 'SOURCE_SCOPE_MISSING'
+        return SCOPE_INTEGRITY_LOCATION_CROSS_SCHEMA, 'OUTSIDE_SOURCE_SCHEMAS'
+
+    if dep_schema and dep_schema not in source_schema_set and dep_schema not in {'PUBLIC'}:
+        return SCOPE_INTEGRITY_LOCATION_CROSS_SCHEMA, 'OUTSIDE_SOURCE_SCHEMAS'
+
+    return SCOPE_INTEGRITY_LOCATION_NOT_FOUND, 'NOT_FOUND_IN_SOURCE_OBJECTS'
+
+
+def _collect_scope_integrity_missing_refs(
+    node: DependencyNode,
+    dependency_graph: Optional[DependencyGraph],
+    included_nodes: Set[DependencyNode],
+    depth_mode: str,
+    *,
+    max_depth: int,
+    path: Optional[List[str]] = None,
+    visited: Optional[Set[DependencyNode]] = None,
+    depth: int = 0,
+) -> List[Tuple[str, str, str]]:
+    dependency_graph = dependency_graph or {}
+    current_full, current_type = (node[0] or '').upper(), (node[1] or '').upper()
+    if not current_full or not current_type:
+        return []
+    path = list(path or [current_full])
+    visited = set(visited or set())
+    visited.add((current_full, current_type))
+    results: List[Tuple[str, str, str]] = []
+    for ref_full_raw, ref_type_raw in sorted(dependency_graph.get((current_full, current_type), set()), key=lambda item: ((item[1] or '').upper(), (item[0] or '').upper())):
+        ref_full = (ref_full_raw or '').upper()
+        ref_type = (ref_type_raw or '').upper()
+        if not ref_full or not ref_type:
+            continue
+        ref_node = (ref_full, ref_type)
+        current_path = path + [ref_full]
+        if ref_node in included_nodes:
+            if depth_mode == 'transitive' and ref_type in SCOPE_INTEGRITY_VIEW_TYPES and depth < max_depth and ref_node not in visited:
+                results.extend(
+                    _collect_scope_integrity_missing_refs(
+                        ref_node,
+                        dependency_graph,
+                        included_nodes,
+                        depth_mode,
+                        max_depth=max_depth,
+                        path=current_path,
+                        visited=visited | {ref_node},
+                        depth=depth + 1,
+                    )
+                )
+            continue
+        results.append((ref_full, ref_type, ' -> '.join(current_path)))
+    return results
+
+
+def check_scope_integrity(
+    included_nodes: Set[DependencyNode],
+    dependency_graph: Optional[DependencyGraph],
+    source_objects_full_scope: Optional[SourceObjectMap],
+    source_schemas: Optional[Sequence[str]],
+    detail_rows: Optional[Sequence[Tuple[str, str, str, str]]],
+    *,
+    excluded_rows: Optional[Sequence[Dict[str, object]]] = None,
+    check_depth: str = 'direct',
+    synonym_terminal_rows: Optional[Sequence[Tuple[str, str, str, str]]] = None,
+    max_depth: int = SCOPE_INTEGRITY_MAX_TRANSITIVE_DEPTH,
+    include_advisory: bool = False,
+) -> List[ScopeIntegrityIssue]:
+    included_set = {
+        ((full or '').upper(), (obj_type or '').upper())
+        for full, obj_type in (included_nodes or set())
+        if (full or '').strip() and (obj_type or '').strip()
+    }
+    if not included_set:
+        return []
+    depth_mode = normalize_scope_integrity_check_depth(check_depth)
+    entry_reason_map = build_scope_integrity_entry_reason_map(detail_rows)
+    excluded_reason_map = build_scope_integrity_excluded_reason_map(excluded_rows)
+    synonym_terminal_map = build_scope_integrity_synonym_terminal_map(synonym_terminal_rows or detail_rows)
+    issues: List[ScopeIntegrityIssue] = []
+    for full_u, type_u in sorted(included_set, key=lambda item: (item[1], item[0])):
+        is_blocking_type = type_u in SCOPE_INTEGRITY_VIEW_TYPES
+        is_advisory_type = include_advisory and type_u in SCOPE_INTEGRITY_ADVISORY_TYPES
+        if not is_blocking_type and not is_advisory_type:
+            continue
+        raw_missing = _collect_scope_integrity_missing_refs(
+            (full_u, type_u),
+            dependency_graph,
+            included_set,
+            depth_mode,
+            max_depth=max_depth,
+        )
+        missing_dep_map: Dict[Tuple[str, str], MissingDep] = {}
+        for dep_full, dep_type, dep_path in raw_missing:
+            dep_full_u = (dep_full or '').upper()
+            dep_type_u = (dep_type or '').upper()
+            dep_schema = (parse_full_object_name(dep_full_u) or ('', ''))[0].upper()
+            dep_location, dep_detail = classify_scope_integrity_missing_dep(
+                dep_full_u,
+                dep_type_u,
+                source_objects_full_scope=source_objects_full_scope,
+                source_schemas=source_schemas,
+                excluded_reason_map=excluded_reason_map,
+                synonym_terminal_map=synonym_terminal_map,
+            )
+            if dep_location == SCOPE_INTEGRITY_LOCATION_SYSTEM_OBJECT_SKIPPED:
+                continue
+            if dep_location in {
+                SCOPE_INTEGRITY_LOCATION_IN_SOURCE_SCHEMAS_NOT_SCOPED,
+                SCOPE_INTEGRITY_LOCATION_USER_EXCLUDED,
+                SCOPE_INTEGRITY_LOCATION_FILTERED_BY_CREATED_AFTER_CUTOFF,
+            }:
+                suggested_action = 'ADD_REMAP_RULE'
+            elif dep_location == SCOPE_INTEGRITY_LOCATION_CROSS_SCHEMA:
+                suggested_action = 'CONFIRM_TARGET_OBJECT_EXISTS'
+            elif dep_location == SCOPE_INTEGRITY_LOCATION_DBLINK:
+                suggested_action = 'CONFIRM_DBLINK_OR_EXTERNAL_OBJECT'
+            else:
+                suggested_action = 'MANUAL_REVIEW'
+            key = (dep_full_u, dep_type_u)
+            existing = missing_dep_map.get(key)
+            if existing is None:
+                missing_dep_map[key] = MissingDep(
+                    dep_full=dep_full_u,
+                    dep_type=dep_type_u,
+                    dep_schema=dep_schema,
+                    dep_location=dep_location,
+                    suggested_action=suggested_action,
+                    suggested_remap='-',
+                    path=dep_path,
+                    detail=dep_detail,
+                )
+            else:
+                paths = [item for item in (existing.path or '').split(' || ') if item]
+                if dep_path not in paths:
+                    paths.append(dep_path)
+                missing_dep_map[key] = existing._replace(path=' || '.join(paths))
+        missing_deps = list(missing_dep_map.values())
+        if not missing_deps:
+            continue
+        severity = SCOPE_INTEGRITY_SEVERITY_WARNING
+        if is_advisory_type:
+            severity = SCOPE_INTEGRITY_SEVERITY_INFO
+        elif any(dep.dep_location in {SCOPE_INTEGRITY_LOCATION_IN_SOURCE_SCHEMAS_NOT_SCOPED, SCOPE_INTEGRITY_LOCATION_NOT_FOUND} for dep in missing_deps):
+            severity = SCOPE_INTEGRITY_SEVERITY_CRITICAL
+        entry_reason = entry_reason_map.get((full_u, type_u), 'DEPENDENCY')
+        issues.append(ScopeIntegrityIssue(
+            issue_id='',
+            severity=severity,
+            object_type=type_u,
+            source_full=full_u,
+            target_full='-',
+            entry_reason=entry_reason,
+            missing_deps=tuple(sorted(missing_deps, key=lambda item: (item.dep_location, item.dep_type, item.dep_full, item.path))),
+        ))
+    issues.sort(key=lambda item: (0 if item.severity == SCOPE_INTEGRITY_SEVERITY_CRITICAL else 1, item.object_type, item.source_full))
+    return issues
+
+
+def derive_scope_integrity_target_candidate(
+    src_full: str,
+    obj_type: str,
+    full_object_mapping: Optional[FullObjectMapping],
+    remap_rules: Optional[RemapRules],
+    schema_mapping: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    src_full_u = (src_full or '').upper()
+    obj_type_u = (obj_type or '').upper()
+    full_object_mapping = full_object_mapping or {}
+    remap_rules = {(key or '').upper(): (value or '').upper() for key, value in (remap_rules or {}).items() if key and value}
+    mapped = get_mapped_target(full_object_mapping, src_full_u, obj_type_u)
+    if mapped:
+        return mapped.upper()
+    mapped_any = find_mapped_target_any_type(
+        full_object_mapping,
+        src_full_u,
+        preferred_types=(obj_type_u, 'TABLE', 'VIEW', 'MATERIALIZED VIEW', 'SYNONYM'),
+    )
+    if mapped_any:
+        return mapped_any.upper()
+    explicit = remap_rules.get(src_full_u)
+    if explicit:
+        return explicit.upper()
+    parsed = parse_full_object_name(src_full_u)
+    if parsed and schema_mapping:
+        src_schema_u, obj_name_u = parsed[0].upper(), parsed[1].upper()
+        target_schema_u = (schema_mapping.get(src_schema_u) or '').upper()
+        if target_schema_u:
+            return f'{target_schema_u}.{obj_name_u}'
+    return None
+
+
+def finalize_scope_integrity_issues(
+    issues: Sequence[ScopeIntegrityIssue],
+    *,
+    full_object_mapping: Optional[FullObjectMapping],
+    remap_rules: Optional[RemapRules],
+    schema_mapping: Optional[Dict[str, str]] = None,
+) -> List[ScopeIntegrityIssue]:
+    finalized: List[ScopeIntegrityIssue] = []
+    for issue in issues or []:
+        target_full = derive_scope_integrity_target_candidate(
+            issue.source_full,
+            issue.object_type,
+            full_object_mapping,
+            remap_rules,
+            schema_mapping,
+        ) or issue.source_full.upper()
+        missing_deps: List[MissingDep] = []
+        for dep in issue.missing_deps:
+            suggested_action = dep.suggested_action
+            suggested_remap = dep.suggested_remap
+            if dep.dep_location in {
+                SCOPE_INTEGRITY_LOCATION_IN_SOURCE_SCHEMAS_NOT_SCOPED,
+                SCOPE_INTEGRITY_LOCATION_USER_EXCLUDED,
+                SCOPE_INTEGRITY_LOCATION_FILTERED_BY_CREATED_AFTER_CUTOFF,
+            }:
+                target_candidate = derive_scope_integrity_target_candidate(
+                    dep.dep_full,
+                    dep.dep_type,
+                    full_object_mapping,
+                    remap_rules,
+                    schema_mapping,
+                )
+                if target_candidate:
+                    suggested_remap = f'{dep.dep_full} = {target_candidate}'
+                if issue.entry_reason != 'ROOT_REMAP':
+                    suggested_action = 'ADD_REMAP_RULE_OR_EXCLUDE_OBJECT'
+            missing_deps.append(dep._replace(
+                suggested_action=suggested_action,
+                suggested_remap=suggested_remap,
+            ))
+        finalized.append(issue._replace(
+            target_full=target_full,
+            missing_deps=tuple(sorted(missing_deps, key=lambda item: (item.dep_location, item.dep_type, item.dep_full, item.path))),
+        ))
+    finalized.sort(key=lambda item: (0 if item.severity == SCOPE_INTEGRITY_SEVERITY_CRITICAL else 1, item.object_type, item.source_full))
+    return [
+        issue._replace(issue_id=f'SII-{idx:04d}')
+        for idx, issue in enumerate(finalized, start=1)
+    ]
+
+
+def build_scope_integrity_detail_rows_for_scope_detail(
+    issues: Sequence[ScopeIntegrityIssue]
+) -> List[Tuple[str, str, str, str]]:
+    rows: List[Tuple[str, str, str, str]] = []
+    for issue in issues or []:
+        if issue.severity == SCOPE_INTEGRITY_SEVERITY_CRITICAL:
+            status = SCOPE_INTEGRITY_STATUS_CRITICAL
+        elif issue.severity == SCOPE_INTEGRITY_SEVERITY_WARNING:
+            status = SCOPE_INTEGRITY_STATUS_WARNING
+        else:
+            status = SCOPE_INTEGRITY_STATUS_INFO
+        rows.append((
+            status,
+            issue.object_type,
+            issue.source_full,
+            f'ISSUE:{issue.issue_id};MISSING_DEPS:{len(issue.missing_deps)}',
+        ))
+    return rows
+
+
+def build_scope_integrity_diagnostics(
+    issues: Sequence[ScopeIntegrityIssue],
+    *,
+    detail_path: Optional[Path] = None,
+    candidate_path: Optional[Path] = None,
+) -> List[str]:
+    issues = list(issues or [])
+    critical = sum(1 for item in issues if item.severity == SCOPE_INTEGRITY_SEVERITY_CRITICAL)
+    warning = sum(1 for item in issues if item.severity == SCOPE_INTEGRITY_SEVERITY_WARNING)
+    info = sum(1 for item in issues if item.severity == SCOPE_INTEGRITY_SEVERITY_INFO)
+    if not issues:
+        return ['scope integrity: scoped VIEW/MVIEW blocking prerequisites complete']
+    detail_hint = detail_path.name if detail_path else 'scope_integrity_detail_<ts>.txt'
+    diagnostics = [
+        f'scope integrity: critical={critical}, warning={warning}, info={info}; detail={detail_hint}'
+    ]
+    if candidate_path:
+        diagnostics.append(f'scope integrity remap candidates: {candidate_path.name}')
+    return diagnostics
+
+
+def build_oracle_fk_constraint_index(
+    oracle_meta: OracleMetadata,
+) -> Dict[str, Dict[str, str]]:
+    result: Dict[str, Dict[str, str]] = {}
+    for (owner_u, table_u), cons_map in (oracle_meta.constraints or {}).items():
+        for cons_name_u, cons in (cons_map or {}).items():
+            if str((cons or {}).get('type') or '').upper() != 'R':
+                continue
+            cons_full = f"{(owner_u or '').upper()}.{(cons_name_u or '').upper()}"
+            result[cons_full] = {
+                'table_full': f"{(owner_u or '').upper()}.{(table_u or '').upper()}",
+                'ref_full': f"{str((cons or {}).get('ref_table_owner') or '').upper()}.{str((cons or {}).get('ref_table_name') or '').upper()}".strip('.'),
+            }
+    return result
+
+
+
+def load_oracle_pkuk_constraint_table_lookup(
+    ora_cfg: OraConfig,
+    schemas_list: Sequence[str],
+) -> Dict[Tuple[str, str], Tuple[str, str]]:
+    owners = [str(item or '').upper() for item in (schemas_list or []) if str(item or '').strip()]
+    if not owners:
+        return {}
+    lookup: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    sql_tpl = """
+        SELECT OWNER, TABLE_NAME, CONSTRAINT_NAME
+        FROM DBA_CONSTRAINTS
+        WHERE OWNER IN ({placeholders})
+          AND CONSTRAINT_TYPE IN ('P', 'U')
+    """
+    try:
+        with oracledb.connect(user=ora_cfg['user'], password=ora_cfg['password'], dsn=ora_cfg['dsn']) as connection:
+            with connection.cursor() as cursor:
+                for placeholders, chunk in iter_in_chunks(sorted(set(owners))):
+                    cursor.execute(sql_tpl.format(placeholders=placeholders), chunk)
+                    for row in cursor:
+                        owner_u = str(row[0] or '').strip().upper()
+                        table_u = str(row[1] or '').strip().upper()
+                        cons_u = str(row[2] or '').strip().upper()
+                        if owner_u and table_u and cons_u:
+                            lookup[(owner_u, cons_u)] = (owner_u, table_u)
+    except oracledb.Error as exc:
+        log.warning('[SCOPE_INTEGRITY] Oracle FK 引用表补充查询失败，将退回现有 FK 元数据: %s', exc)
+        return {}
+    return lookup
+
+
+def build_fk_scope_integrity_issues(
+    included_nodes: Set[DependencyNode],
+    oracle_meta: OracleMetadata,
+    source_objects_full_scope: Optional[SourceObjectMap],
+    source_schemas: Optional[Sequence[str]],
+    detail_rows: Optional[Sequence[Tuple[str, str, str, str]]],
+    *,
+    excluded_rows: Optional[Sequence[Dict[str, object]]] = None,
+    pkuk_lookup: Optional[Dict[Tuple[str, str], Tuple[str, str]]] = None,
+) -> List[ScopeIntegrityIssue]:
+    included_set = {
+        ((full or '').upper(), (obj_type or '').upper())
+        for full, obj_type in (included_nodes or set())
+        if (full or '').strip() and (obj_type or '').strip()
+    }
+    if not included_set:
+        return []
+    entry_reason_map = build_scope_integrity_entry_reason_map(detail_rows)
+    excluded_reason_map = build_scope_integrity_excluded_reason_map(excluded_rows)
+    issues: List[ScopeIntegrityIssue] = []
+    seen_constraints: Set[str] = set()
+    included_tables = {
+        full_u for full_u, type_u in included_set
+        if type_u == 'TABLE'
+    }
+    for table_full in sorted(included_tables):
+        parsed = parse_full_object_name(table_full)
+        if not parsed:
+            continue
+        owner_u, table_u = parsed[0].upper(), parsed[1].upper()
+        cons_map = (oracle_meta.constraints or {}).get((owner_u, table_u), {}) or {}
+        for cons_name_u, cons in sorted(cons_map.items()):
+            if str((cons or {}).get('type') or '').upper() != 'R':
+                continue
+            cons_full = f'{owner_u}.{(cons_name_u or "").upper()}'
+            if cons_full in seen_constraints:
+                continue
+            seen_constraints.add(cons_full)
+            ref_owner_u = str((cons or {}).get('ref_table_owner') or '').upper()
+            ref_table_u = str((cons or {}).get('ref_table_name') or '').upper()
+            if not (ref_owner_u and ref_table_u):
+                r_owner_u = str((cons or {}).get('r_owner') or '').upper()
+                r_cons_u = str((cons or {}).get('r_constraint') or '').upper()
+                if pkuk_lookup and r_owner_u and r_cons_u:
+                    resolved = pkuk_lookup.get((r_owner_u, r_cons_u))
+                    if resolved:
+                        ref_owner_u, ref_table_u = resolved
+            ref_full = f"{ref_owner_u}.{ref_table_u}".strip('.')
+            if not ref_full:
+                continue
+            if (ref_full, 'TABLE') in included_set:
+                continue
+            dep_location, dep_detail = classify_scope_integrity_missing_dep(
+                ref_full,
+                'TABLE',
+                source_objects_full_scope=source_objects_full_scope,
+                source_schemas=source_schemas,
+                excluded_reason_map=excluded_reason_map,
+                synonym_terminal_map=None,
+            )
+            if dep_location == SCOPE_INTEGRITY_LOCATION_SYSTEM_OBJECT_SKIPPED:
+                continue
+            issues.append(ScopeIntegrityIssue(
+                issue_id='',
+                severity=SCOPE_INTEGRITY_SEVERITY_WARNING,
+                object_type='CONSTRAINT',
+                source_full=cons_full,
+                target_full='-',
+                entry_reason=entry_reason_map.get((table_full, 'TABLE'), 'ATTACHED_OBJECT'),
+                missing_deps=(MissingDep(
+                    dep_full=ref_full,
+                    dep_type='TABLE',
+                    dep_schema=(parse_full_object_name(ref_full) or ('', ''))[0].upper(),
+                    dep_location=dep_location,
+                    suggested_action='CONFIRM_TARGET_OBJECT_EXISTS' if dep_location == SCOPE_INTEGRITY_LOCATION_CROSS_SCHEMA else 'ADD_REMAP_RULE_OR_EXCLUDE_OBJECT',
+                    suggested_remap='-',
+                    path=f"{cons_full} -> {ref_full}",
+                    detail=dep_detail,
+                ),),
+            ))
+    return issues
 
 
 def export_source_scope_detail(
@@ -24126,7 +25126,7 @@ def supplement_missing_views_from_mapping(
     当主对象校验未能产出 VIEW 缺失清单时，基于映射+目标端对象集补齐。
     用于保障 fixup/report 能进入 VIEW 生成流程。
     """
-    enabled_types = {t.upper() for t in (enabled_primary_types or set(PRIMARY_OBJECT_TYPES))}
+    enabled_types = {t.upper() for t in (set(PRIMARY_OBJECT_TYPES) if enabled_primary_types is None else set(enabled_primary_types))}
     if 'VIEW' not in enabled_types:
         return 0
 
@@ -24186,7 +25186,7 @@ def compare_package_objects(
     对 PACKAGE / PACKAGE BODY 做存在性 + VALID/INVALID 对比，并记录错误信息（若可用）。
     SOURCE_INVALID 不计入 mismatch 统计，但会列出详情。
     """
-    enabled_types = {t.upper() for t in (enabled_primary_types or set(PRIMARY_OBJECT_TYPES))}
+    enabled_types = {t.upper() for t in (set(PRIMARY_OBJECT_TYPES) if enabled_primary_types is None else set(enabled_primary_types))}
     if not (set(PACKAGE_OBJECT_TYPES) & enabled_types):
         return {"rows": [], "summary": {}}
 
@@ -26093,7 +27093,7 @@ def check_extra_objects(
         "constraint_status_drift": [],
     }
 
-    enabled_types = {t.upper() for t in (enabled_extra_types or set(EXTRA_OBJECT_CHECK_TYPES))}
+    enabled_types = {t.upper() for t in (set(EXTRA_OBJECT_CHECK_TYPES) if enabled_extra_types is None else set(enabled_extra_types))}
     table_check_types = enabled_types & {"INDEX", "CONSTRAINT", "TRIGGER"}
 
     if not enabled_types:
@@ -41195,7 +42195,7 @@ def export_full_object_mapping(
     output_path: Path
 ) -> Optional[Path]:
     """
-    将最终推导的全量对象映射输出为纯文本，便于人工审计。
+    将对象映射输出为纯文本，便于人工审计（可用于受管映射或 discovery-only 映射）。
     每行格式：SRC_FULL<TAB>OBJECT_TYPE<TAB>TGT_FULL
     """
     if not full_object_mapping:
@@ -41211,7 +42211,7 @@ def export_full_object_mapping(
         output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return output_path
     except OSError as exc:
-        log.warning("写入全量对象映射文件失败 %s: %s", output_path, exc)
+        log.warning("写入对象映射文件失败 %s: %s", output_path, exc)
         return None
 
 
@@ -41360,7 +42360,9 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
     if name.startswith("package_compare_"):
         return "DETAIL", "PACKAGE/PKG BODY 对比明细"
     if name.startswith("object_mapping_"):
-        return "AUX", "全量对象映射"
+        if name.startswith("object_mapping_discovery_"):
+            return "DETAIL", "discovery-only 对象映射"
+        return "AUX", "受管对象映射"
     if name.startswith("remap_conflicts_"):
         return "AUX", "无法自动推导对象"
     if name.startswith("dependency_chains_"):
@@ -44179,6 +45181,110 @@ def export_objects_after_cutoff_detail(
         ["STATUS", "OBJECT_TYPE", "SCHEMA_NAME", "OBJECT_NAME", "CREATED_TS", "CUTOFF_TS", "DETAIL"],
         rows,
         output_path
+    )
+
+
+def export_scope_integrity_detail(
+    issues: Sequence[ScopeIntegrityIssue],
+    report_dir: Path,
+    report_timestamp: Optional[str],
+) -> Optional[Path]:
+    if not report_dir or not report_timestamp or not issues:
+        return None
+    output_path = Path(report_dir) / f"scope_integrity_detail_{report_timestamp}.txt"
+    rows: List[List[str]] = []
+    for issue in issues:
+        for dep in issue.missing_deps:
+            rows.append([
+                issue.issue_id,
+                issue.severity,
+                issue.object_type,
+                issue.source_full,
+                issue.target_full,
+                issue.entry_reason,
+                dep.dep_full,
+                dep.dep_type,
+                dep.dep_location,
+                dep.path,
+                dep.suggested_action,
+                dep.suggested_remap,
+                dep.detail or '-',
+            ])
+    return write_pipe_report(
+        "SOURCE SCOPE 依赖完整性明细",
+        [
+            "ISSUE_ID",
+            "SEVERITY",
+            "OBJECT_TYPE",
+            "SOURCE_FULL",
+            "TARGET_FULL",
+            "ENTRY_REASON",
+            "MISSING_DEP_FULL",
+            "MISSING_DEP_TYPE",
+            "MISSING_CAUSE",
+            "PATH",
+            "SUGGESTED_ACTION",
+            "SUGGESTED_REMAP",
+            "DETAIL",
+        ],
+        rows,
+        output_path,
+    )
+
+
+def build_scope_integrity_remap_candidate_rows(
+    issues: Sequence[ScopeIntegrityIssue],
+) -> List[List[str]]:
+    rows_by_key: Dict[Tuple[str, str], Dict[str, object]] = {}
+    for issue in issues or []:
+        if issue.severity != SCOPE_INTEGRITY_SEVERITY_CRITICAL:
+            continue
+        for dep in issue.missing_deps:
+            if not dep.suggested_remap or dep.suggested_remap == '-':
+                continue
+            remap_line = dep.suggested_remap
+            target_full = remap_line.split('=', 1)[1].strip() if '=' in remap_line else '-'
+            key = (dep.dep_full, remap_line)
+            bucket = rows_by_key.setdefault(key, {
+                'source_full': dep.dep_full,
+                'target_full': target_full,
+                'issue_ids': set(),
+                'reasons': set(),
+                'actions': set(),
+            })
+            bucket['issue_ids'].add(issue.issue_id)
+            bucket['reasons'].add(dep.dep_location)
+            bucket['actions'].add(dep.suggested_action)
+    rows: List[List[str]] = []
+    for key in sorted(rows_by_key.keys()):
+        bucket = rows_by_key[key]
+        rows.append([
+            str(bucket['source_full']),
+            str(bucket['target_full']),
+            key[1],
+            ",".join(sorted(bucket['issue_ids'])),
+            ",".join(sorted(bucket['reasons'])),
+            ",".join(sorted(bucket['actions'])),
+        ])
+    return rows
+
+
+def export_scope_integrity_remap_candidates(
+    issues: Sequence[ScopeIntegrityIssue],
+    report_dir: Path,
+    report_timestamp: Optional[str],
+) -> Optional[Path]:
+    if not report_dir or not report_timestamp:
+        return None
+    rows = build_scope_integrity_remap_candidate_rows(issues)
+    if not rows:
+        return None
+    output_path = Path(report_dir) / f"scope_integrity_remap_candidates_{report_timestamp}.txt"
+    return write_pipe_report(
+        "SOURCE SCOPE remap 候选清单",
+        ["SOURCE_FULL", "SUGGESTED_TARGET", "REMAP_LINE", "ISSUE_IDS", "REASONS", "ACTIONS"],
+        rows,
+        output_path,
     )
 
 
@@ -49537,7 +50643,7 @@ def save_report_to_db(
     missing_fixable_count = sum(int(v or 0) for v in fixable_missing_by_type.values())
     missing_count_from_counts = sum_primary_missing_count(
         object_counts_summary,
-        set(settings.get("enabled_primary_types") or set(PRIMARY_OBJECT_TYPES))
+        set(PRIMARY_OBJECT_TYPES) if settings.get("enabled_primary_types") is None else set(settings.get("enabled_primary_types"))
     )
     if missing_count_from_counts is not None:
         missing_count = int(missing_count_from_counts)
@@ -50165,7 +51271,7 @@ def sum_primary_missing_count(
     missing_by_type = dict((object_counts_summary or {}).get("missing", {}) or {})
     if not missing_by_type:
         return 0
-    primary_types = {t.upper() for t in (enabled_primary_types or set(PRIMARY_OBJECT_TYPES))}
+    primary_types = {t.upper() for t in (set(PRIMARY_OBJECT_TYPES) if enabled_primary_types is None else set(enabled_primary_types))}
     return sum(int(missing_by_type.get(obj_type, 0) or 0) for obj_type in primary_types)
 
 
@@ -50760,6 +51866,11 @@ def print_final_report(
     excluded_object_rows: Optional[List[Dict[str, object]]] = None,
     blacklist_rehydration_state: Optional[BlacklistRehydrationState] = None,
     blacklist_rehydrated_detail_path: Optional[Path] = None,
+    source_scope_detail_path: Optional[Path] = None,
+    discovery_mapping_path: Optional[Path] = None,
+    scope_integrity_issues: Optional[List[ScopeIntegrityIssue]] = None,
+    scope_integrity_detail_path: Optional[Path] = None,
+    scope_integrity_candidate_path: Optional[Path] = None,
 ):
     custom_theme = Theme({
         "ok": "green",
@@ -51015,7 +52126,7 @@ def print_final_report(
     missing_supported_cnt = len(missing_supported_rows)
     missing_count_from_counts = sum_primary_missing_count(
         object_counts_summary,
-        set(settings.get("enabled_primary_types") or set(PRIMARY_OBJECT_TYPES))
+        set(PRIMARY_OBJECT_TYPES) if settings.get("enabled_primary_types") is None else set(settings.get("enabled_primary_types"))
     )
     if missing_count_from_counts is not None:
         missing_count = int(missing_count_from_counts)
@@ -51747,8 +52858,32 @@ def print_final_report(
             )
         console.print(Panel.fit("\n".join(detail_hint_lines), style="info", width=section_width))
 
+    scope_integrity_panel_enabled = bool(
+        settings
+        and (settings.get('scope_integrity_check') or settings.get('scope_integrity_advisory_check') or settings.get('scope_integrity_fk_check'))
+        and normalize_source_object_scope_mode(settings.get('source_object_scope_mode', 'full_source')) == 'remap_root_closure'
+    )
+    if scope_integrity_panel_enabled:
+        critical_count = sum(1 for item in (scope_integrity_issues or []) if item.severity == SCOPE_INTEGRITY_SEVERITY_CRITICAL)
+        warning_count = sum(1 for item in (scope_integrity_issues or []) if item.severity == SCOPE_INTEGRITY_SEVERITY_WARNING)
+        info_count = sum(1 for item in (scope_integrity_issues or []) if item.severity == SCOPE_INTEGRITY_SEVERITY_INFO)
+        scope_lines: List[str] = []
+        if critical_count or warning_count or info_count:
+            scope_lines.append(f'CRITICAL  {critical_count}  VIEW/MVIEW DDL 将失败（依赖缺失）')
+            scope_lines.append(f'WARNING   {warning_count}  外部或用户已知依赖缺口')
+            if info_count:
+                scope_lines.append(f'INFO      {info_count}  advisory-family 运行时依赖缺口')
+            if scope_integrity_detail_path:
+                scope_lines.append(f'明细: {scope_integrity_detail_path.name}')
+            if scope_integrity_candidate_path:
+                scope_lines.append(f'候选: {scope_integrity_candidate_path.name}')
+        else:
+            scope_lines.append('✓ 所有 scoped VIEW/MVIEW 前置依赖完整')
+        console.print(Panel.fit("\n".join(scope_lines), title='[header]0.c SOURCE SCOPE 完整性[/header]', border_style='info', width=section_width))
+        console.print('')
+
     if config_diagnostics:
-        diag_table = Table(title="[header]0.c 配置诊断[/header]", width=section_width)
+        diag_table = Table(title="[header]0.d 配置诊断[/header]", width=section_width)
         diag_table.add_column("提示", style="mismatch")
         for item in config_diagnostics:
             diag_table.add_row(item)
@@ -51756,7 +52891,7 @@ def print_final_report(
         console.print("")
 
     if fixup_skip_summary and any(fixup_skip_summary.get(obj_type) for obj_type in ("INDEX", "TRIGGER", "SYNONYM", "SEQUENCE_RESTART")):
-        skip_table = Table(title="[header]0.d Fixup 跳过汇总[/header]", width=section_width)
+        skip_table = Table(title="[header]0.e Fixup 跳过汇总[/header]", width=section_width)
         skip_table.add_column("对象类型", style="info", width=12)
         skip_table.add_column("指标", style="info", width=28)
         skip_table.add_column("数量", justify="right")
@@ -52349,6 +53484,11 @@ def print_final_report(
             index_entries.append(ReportIndexEntry(category, rel_path, row_text, description))
 
         _add_index_entry("REPORT", report_path, None, "主报告")
+        _add_index_entry("DETAIL", source_scope_detail_path, None, "源对象范围明细")
+        _add_index_entry("DETAIL", discovery_mapping_path, None, "discovery-only 对象映射")
+        _add_index_entry("DETAIL", scope_integrity_detail_path, len(scope_integrity_issues) if scope_integrity_detail_path else None, "scope 完整性明细")
+        candidate_rows = build_scope_integrity_remap_candidate_rows(scope_integrity_issues)
+        _add_index_entry("AUX", scope_integrity_candidate_path, len(candidate_rows) if scope_integrity_candidate_path else None, "scope 完整性 remap 候选")
         blacklisted_table_keys: Set[Tuple[str, str]] = set()
         for key, entries in (blacklisted_missing_tables or {}).items():
             if is_long_only_blacklist(entries):
@@ -53007,7 +54147,7 @@ def print_final_report(
         if report_ts:
             mapping_path = report_path.parent / f"object_mapping_{report_ts}.txt"
             if mapping_path.exists():
-                _add_index_entry("AUX", mapping_path, None, "全量对象映射")
+                _add_index_entry("AUX", mapping_path, None, "受管对象映射")
             conflict_path = report_path.parent / f"remap_conflicts_{report_ts}.txt"
             if conflict_path.exists():
                 _add_index_entry("AUX", conflict_path, None, "无法自动推导对象")
@@ -53347,8 +54487,10 @@ def main():
 
         log.info("OceanBase Comparator Toolkit v%s", __version__)
         log.info("项目主页: %s (问题反馈: %s)", REPO_URL, REPO_ISSUES_URL)
-        enabled_primary_types: Set[str] = set(settings.get('enabled_primary_types') or set(PRIMARY_OBJECT_TYPES))
-        enabled_extra_types: Set[str] = set(settings.get('enabled_extra_types') or set(EXTRA_OBJECT_CHECK_TYPES))
+        enabled_primary_types_raw = settings.get('enabled_primary_types')
+        enabled_extra_types_raw = settings.get('enabled_extra_types')
+        enabled_primary_types: Set[str] = set(PRIMARY_OBJECT_TYPES) if enabled_primary_types_raw is None else set(enabled_primary_types_raw)
+        enabled_extra_types: Set[str] = set(EXTRA_OBJECT_CHECK_TYPES) if enabled_extra_types_raw is None else set(enabled_extra_types_raw)
         enable_dependencies_check: bool = bool(settings.get('enable_dependencies_check', True))
         enable_comment_check: bool = bool(settings.get('enable_comment_check', True))
         enable_column_order_check: bool = bool(settings.get('enable_column_order_check', False))
@@ -53464,9 +54606,17 @@ def main():
     object_created_after_cutoff_nodes: Set[DependencyNode] = set()
     source_scope_result: Optional[ScopedSourceScopeResult] = None
     source_scope_detail_path: Optional[Path] = None
+    scope_integrity_issues: List[ScopeIntegrityIssue] = []
+    scope_integrity_detail_path: Optional[Path] = None
+    scope_integrity_candidate_path: Optional[Path] = None
+    scope_integrity_fk_lookup: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    discovery_full_object_mapping: FullObjectMapping = {}
+    discovery_mapping_path: Optional[Path] = None
     blacklist_rehydration_state: Optional[BlacklistRehydrationState] = None
     gtt_handling_state: Optional[GttHandlingState] = None
     manual_trigger_blacklist_table_keys: Set[Tuple[str, str]] = set()
+    explicit_seed_nodes: Set[DependencyNode] = set()
+    system_artifact_seed_nodes: Set[DependencyNode] = set()
 
     log_section("对象映射准备")
     apply_config_hot_reload_at_phase(hot_reload_runtime, "对象映射准备", settings, ora_cfg, ob_cfg)
@@ -53589,11 +54739,13 @@ def main():
         )
 
         # 4.1) 获取依附对象（如 TRIGGER）的父表映射，用于 one-to-many schema 拆分场景
+        synonym_terminal_diagnostic_rows: List[Tuple[str, str, str, str]] = []
         object_parent_map = get_object_parent_tables(
             ora_cfg,
             settings['source_schemas_list'],
             enabled_object_types=scope_discovery_types,
             known_source_types=source_objects_full_scope,
+            diagnostic_rows=synonym_terminal_diagnostic_rows,
         )
         
         # 4.2) 加载源端依赖关系（用于智能推导一对多场景的目标 schema）
@@ -53639,24 +54791,41 @@ def main():
                     for dep in oracle_dependencies_internal
                 }
         if source_scope_mode_setting == "remap_root_closure":
+            supplemental_dependency_records: List[DependencyRecord] = []
             default_sequence_dependency_records = load_oracle_default_sequence_dependency_records(
                 ora_cfg,
                 source_objects,
             )
-            if default_sequence_dependency_records:
-                oracle_dependencies_internal.extend(default_sequence_dependency_records)
-                oracle_dependencies_for_grants.extend(default_sequence_dependency_records)
-                default_sequence_dependency_set = {
+            supplemental_dependency_records.extend(default_sequence_dependency_records)
+            if remap_scope_text_fallback_mode == "off":
+                supplemental_dependency_records.extend(
+                    load_oracle_job_action_dependency_records(ora_cfg, source_objects)
+                )
+            if supplemental_dependency_records:
+                oracle_dependencies_internal.extend(supplemental_dependency_records)
+                oracle_dependencies_for_grants.extend(supplemental_dependency_records)
+                supplemental_dependency_set = {
                     (
                         dep.owner.upper(), dep.name.upper(), dep.object_type.upper(),
                         dep.referenced_owner.upper(), dep.referenced_name.upper(), dep.referenced_type.upper(),
                     )
-                    for dep in default_sequence_dependency_records
+                    for dep in supplemental_dependency_records
                 }
                 if source_dependencies_set is None:
                     source_dependencies_set = set()
-                source_dependencies_set.update(default_sequence_dependency_set)
+                source_dependencies_set.update(supplemental_dependency_set)
         dependency_graph: DependencyGraph = build_dependency_graph(source_dependencies_set) if source_dependencies_set else {}
+        scope_integrity_dependency_graph_raw: DependencyGraph = build_dependency_graph({
+            (
+                dep.owner.upper(),
+                dep.name.upper(),
+                dep.object_type.upper(),
+                dep.referenced_owner.upper(),
+                dep.referenced_name.upper(),
+                dep.referenced_type.upper(),
+            )
+            for dep in (oracle_dependencies_for_grants or [])
+        }) if oracle_dependencies_for_grants else {}
         view_dependency_map: Dict[Tuple[str, str], Set[str]] = build_view_dependency_map(
             source_dependencies_set
         ) if source_dependencies_set else {}
@@ -53782,6 +54951,20 @@ def main():
                     detail_rows.append((status, obj_type, full_u, detail))
             for src_full_u, source_types_text, reason in skipped_root_entries:
                 detail_rows.append(("ROOT_SKIPPED", source_types_text, src_full_u, reason))
+            for row in synonym_terminal_diagnostic_rows:
+                detail_rows.append(row)
+            non_root_skipped = [
+                (src_full_u, source_types_text)
+                for src_full_u, source_types_text, reason in skipped_root_entries
+                if reason == "NON_ROOT_OBJECT_TYPE"
+            ]
+            if non_root_skipped:
+                sample = ", ".join(f"{full}({types_text})" for full, types_text in non_root_skipped[:5])
+                log.warning(
+                    "source_object_scope_mode=remap_root_closure 下有 %d 个 remap roots 因非合法 root 类型被跳过: %s",
+                    len(non_root_skipped),
+                    sample,
+                )
             source_scope_result = source_scope_result._replace(detail_rows=tuple(detail_rows))
 
             before_scope_cnt = sum(len(v) for v in source_objects.values())
@@ -53860,7 +55043,7 @@ def main():
             log.info("递归依赖表缓存完成，共 %d 个节点。", len(transitive_table_cache))
         sequence_policy = settings.get("sequence_remap_policy", "source_only")
         # 5) 先不推导 schema，生成基础映射/清单，用于推导 TABLE 唯一映射
-        base_full_mapping = build_full_object_mapping(
+        base_discovery_mapping = build_full_object_mapping(
             source_objects,
             remap_rules,
             schema_mapping=None,
@@ -53871,6 +55054,10 @@ def main():
             enabled_types=scope_discovery_types,
             remap_conflicts=remap_conflicts,
             sequence_remap_policy=sequence_policy
+        )
+        base_full_mapping = filter_full_object_mapping_by_types(
+            base_discovery_mapping,
+            enabled_object_types,
         )
         base_master_list = generate_master_list(
             source_objects,
@@ -53892,7 +55079,7 @@ def main():
             schema_mapping_for_grants.update(schema_mapping_from_tables)
 
         # 6) 基于 TABLE 推导的 schema 映射（仅作用于非 TABLE 对象）+ 依赖分析，重建映射与校验清单
-        full_object_mapping = build_full_object_mapping(
+        discovery_full_object_mapping = build_full_object_mapping(
             source_objects,
             remap_rules,
             schema_mapping=schema_mapping_from_tables,
@@ -53903,6 +55090,10 @@ def main():
             enabled_types=scope_discovery_types,
             remap_conflicts=remap_conflicts,
             sequence_remap_policy=sequence_policy
+        )
+        full_object_mapping = filter_full_object_mapping_by_types(
+            discovery_full_object_mapping,
+            enabled_object_types,
         )
         master_list = generate_master_list(
             source_objects,
@@ -53971,18 +55162,48 @@ def main():
     if source_scope_detail_path:
         log.info("源对象范围明细已输出: %s", source_scope_detail_path)
     source_scope_diagnostics = build_source_scope_diagnostics(source_scope_result)
-    if source_scope_diagnostics:
+    scope_discovery_diagnostics = build_scope_discovery_diagnostics(
+        settings.get("source_object_scope_mode", "full_source"),
+        enabled_object_types,
+        scope_discovery_types,
+    )
+    scheduler_scope_diagnostics = build_scheduler_scope_diagnostics(
+        settings.get("source_object_scope_mode", "full_source"),
+        settings.get("remap_scope_text_fallback_mode", "off"),
+        source_objects,
+    )
+    combined_scope_diagnostics = list(source_scope_diagnostics) + list(scope_discovery_diagnostics) + list(scheduler_scope_diagnostics)
+    if combined_scope_diagnostics:
         if config_diagnostics is None:
             config_diagnostics = []
-        config_diagnostics.extend(source_scope_diagnostics)
+        config_diagnostics.extend(combined_scope_diagnostics)
     blacklist_rehydrated_detail_path: Optional[Path] = None
     gtt_transform_detail_path: Optional[Path] = None
 
-    # 输出全量 remap 推导结果，便于人工审核
+    # 输出受管对象映射；若 closure discovery 更宽，则另存 discovery-only 映射供审计。
     mapping_path = report_dir / f"object_mapping_{timestamp}.txt"
     mapping_written = export_full_object_mapping(full_object_mapping, mapping_path)
     if mapping_written:
-        log.info("全量对象映射已输出: %s", mapping_written)
+        log.info("受管对象映射已输出: %s", mapping_written)
+    discovery_only_mapping = build_discovery_only_object_mapping(
+        discovery_full_object_mapping,
+        full_object_mapping,
+    )
+    discovery_mapping_path = export_full_object_mapping(
+        discovery_only_mapping,
+        report_dir / f"object_mapping_discovery_{timestamp}.txt",
+    ) if discovery_only_mapping else None
+    if discovery_mapping_path:
+        log.info("discovery-only 对象映射已输出: %s", discovery_mapping_path)
+    mapping_scope_diagnostics = build_mapping_scope_diagnostics(
+        discovery_full_object_mapping,
+        full_object_mapping,
+        discovery_mapping_path,
+    )
+    if mapping_scope_diagnostics:
+        if config_diagnostics is None:
+            config_diagnostics = []
+        config_diagnostics.extend(mapping_scope_diagnostics)
 
     remap_conflict_items: List[Tuple[str, str, str]] = []
     if remap_conflicts:
@@ -54143,6 +55364,10 @@ def main():
             excluded_object_rows=excluded_object_report_rows,
             blacklist_rehydration_state=blacklist_rehydration_state,
             blacklist_rehydrated_detail_path=blacklist_rehydrated_detail_path,
+            source_scope_detail_path=source_scope_detail_path,
+            scope_integrity_issues=scope_integrity_issues,
+            scope_integrity_detail_path=scope_integrity_detail_path,
+            scope_integrity_candidate_path=scope_integrity_candidate_path,
         )
         if run_summary:
             log_run_summary(run_summary)
@@ -54385,6 +55610,7 @@ def main():
             before_mapping_cnt = sum(len(v) for v in full_object_mapping.values())
 
             source_objects = filter_source_objects_by_nodes(source_objects, excluded_nodes)
+            discovery_full_object_mapping = filter_full_object_mapping_by_nodes(discovery_full_object_mapping, excluded_nodes)
             full_object_mapping = filter_full_object_mapping_by_nodes(full_object_mapping, excluded_nodes)
             master_list = filter_master_list_by_nodes(master_list, excluded_nodes)
             source_dependencies_set = filter_source_dependencies_by_nodes(source_dependencies_set, excluded_nodes)
@@ -54457,7 +55683,17 @@ def main():
 
             mapping_written = export_full_object_mapping(full_object_mapping, mapping_path)
             if mapping_written:
-                log.info("已按排除规则更新对象映射清单: %s", mapping_written)
+                log.info("已按排除规则更新受管对象映射清单: %s", mapping_written)
+            discovery_only_mapping = build_discovery_only_object_mapping(
+                discovery_full_object_mapping,
+                full_object_mapping,
+            )
+            discovery_mapping_path = export_full_object_mapping(
+                discovery_only_mapping,
+                report_dir / f"object_mapping_discovery_{timestamp}.txt",
+            ) if discovery_only_mapping else None
+            if discovery_mapping_path:
+                log.info("已按排除规则更新 discovery-only 对象映射清单: %s", discovery_mapping_path)
 
             after_mapping_cnt = sum(len(v) for v in full_object_mapping.values())
             managed_target_scope = derive_managed_target_scope(
@@ -54599,6 +55835,132 @@ def main():
             log.info("GTT 处理明细已输出: %s", gtt_transform_detail_path)
         settings["_gtt_handling_state"] = gtt_handling_state
         settings["_gtt_transform_detail_path"] = str(gtt_transform_detail_path) if gtt_transform_detail_path else ""
+
+    if settings.get('scope_integrity_fk_check') and normalize_source_object_scope_mode(settings.get('source_object_scope_mode', 'full_source')) == 'remap_root_closure':
+        scope_integrity_fk_lookup = load_oracle_pkuk_constraint_table_lookup(ora_cfg, settings.get('source_schemas_list', []))
+
+    if source_scope_result is not None:
+        integrity_excluded_seed_nodes: Set[DependencyNode] = set(object_created_after_cutoff_nodes or set())
+        integrity_excluded_seed_nodes.update(explicit_seed_nodes or set())
+        integrity_excluded_seed_nodes.update(system_artifact_seed_nodes or set())
+        integrity_included_nodes = set(source_scope_result.included_nodes or frozenset()) - integrity_excluded_seed_nodes
+        if (
+            (settings.get('scope_integrity_check') or settings.get('scope_integrity_advisory_check') or settings.get('scope_integrity_fk_check'))
+            and normalize_source_object_scope_mode(settings.get('source_object_scope_mode', 'full_source')) == 'remap_root_closure'
+        ):
+            raw_scope_integrity_issues = check_scope_integrity(
+                integrity_included_nodes,
+                scope_integrity_dependency_graph_raw,
+                source_objects_full_scope,
+                settings.get('source_schemas_list', []),
+                source_scope_result.detail_rows,
+                excluded_rows=excluded_object_report_rows,
+                check_depth=settings.get('scope_integrity_check_depth', 'direct'),
+                synonym_terminal_rows=synonym_terminal_diagnostic_rows,
+                include_advisory=bool(settings.get('scope_integrity_advisory_check')),
+            )
+            if settings.get('scope_integrity_fk_check'):
+                raw_scope_integrity_issues.extend(build_fk_scope_integrity_issues(
+                    integrity_included_nodes,
+                    oracle_meta,
+                    source_objects_full_scope,
+                    settings.get('source_schemas_list', []),
+                    source_scope_result.detail_rows,
+                    excluded_rows=excluded_object_report_rows,
+                    pkuk_lookup=scope_integrity_fk_lookup,
+                ))
+            scope_integrity_issues = finalize_scope_integrity_issues(
+                raw_scope_integrity_issues,
+                full_object_mapping=discovery_full_object_mapping or full_object_mapping,
+                remap_rules=remap_rules,
+                schema_mapping=schema_mapping_from_tables,
+            )
+            integrity_rows = build_scope_integrity_detail_rows_for_scope_detail(scope_integrity_issues)
+            if integrity_rows:
+                detail_rows = list(source_scope_result.detail_rows or ())
+                existing_keys = {
+                    ((obj_type or '').upper(), (full_name or '').upper())
+                    for status, obj_type, full_name, _detail in detail_rows
+                    if (status or '').upper() in {SCOPE_INTEGRITY_STATUS_CRITICAL, SCOPE_INTEGRITY_STATUS_WARNING, SCOPE_INTEGRITY_STATUS_INFO}
+                }
+                for row in integrity_rows:
+                    key = ((row[1] or '').upper(), (row[2] or '').upper())
+                    if key in existing_keys:
+                        continue
+                    detail_rows.append(row)
+                    existing_keys.add(key)
+                source_scope_result = source_scope_result._replace(detail_rows=tuple(detail_rows))
+            scope_integrity_detail_path = export_scope_integrity_detail(
+                scope_integrity_issues,
+                report_dir,
+                timestamp,
+            )
+            scope_integrity_candidate_path = export_scope_integrity_remap_candidates(
+                scope_integrity_issues,
+                report_dir,
+                timestamp,
+            )
+            if scope_integrity_detail_path:
+                log.info('scope integrity 明细已输出: %s', scope_integrity_detail_path)
+            if scope_integrity_candidate_path:
+                log.info('scope integrity remap 候选已输出: %s', scope_integrity_candidate_path)
+
+        refreshed_source_scope_detail_path = export_source_scope_detail(
+            source_scope_result,
+            report_dir,
+            timestamp,
+        )
+        if refreshed_source_scope_detail_path:
+            source_scope_detail_path = refreshed_source_scope_detail_path
+            log.info('已更新源对象范围明细: %s', refreshed_source_scope_detail_path)
+        settings['_source_scope_result'] = source_scope_result
+
+        integrity_diagnostics: List[str] = []
+        if (
+            (settings.get('scope_integrity_check') or settings.get('scope_integrity_advisory_check') or settings.get('scope_integrity_fk_check'))
+            and normalize_source_object_scope_mode(settings.get('source_object_scope_mode', 'full_source')) == 'remap_root_closure'
+        ):
+            integrity_diagnostics = list(build_scope_integrity_diagnostics(
+                scope_integrity_issues,
+                detail_path=scope_integrity_detail_path,
+                candidate_path=scope_integrity_candidate_path,
+            ))
+        refreshed_scope_diagnostics = (
+            list(build_source_scope_diagnostics(source_scope_result))
+            + list(build_scope_discovery_diagnostics(
+                settings.get('source_object_scope_mode', 'full_source'),
+                enabled_object_types,
+                scope_discovery_types,
+            ))
+            + list(build_scheduler_scope_diagnostics(
+                settings.get('source_object_scope_mode', 'full_source'),
+                settings.get('remap_scope_text_fallback_mode', 'off'),
+                source_objects,
+            ))
+            + list(build_mapping_scope_diagnostics(
+                discovery_full_object_mapping,
+                full_object_mapping,
+                discovery_mapping_path,
+            ))
+            + integrity_diagnostics
+        )
+        if config_diagnostics is None:
+            config_diagnostics = []
+        config_diagnostics = [
+            item for item in config_diagnostics
+            if not (
+                item.startswith('source_object_scope_mode=')
+                or item.startswith('scoped roots=')
+                or item.startswith('remap roots skipped=')
+                or item.startswith('synonym terminal skipped=')
+                or item.startswith('closure 内部 discovery/mapping 范围宽于 operator-facing enabled types:')
+                or item.startswith('discovery-only mapping objects=')
+                or item.startswith('SCHEDULE 对象当前不做结构化补边；')
+                or item.startswith('scope integrity:')
+                or item.startswith('scope integrity remap candidates:')
+            )
+        ]
+        config_diagnostics.extend(refreshed_scope_diagnostics)
 
     log_section("差异校验")
     monitored_types: Tuple[str, ...] = tuple(
@@ -55210,6 +56572,11 @@ def main():
         excluded_object_rows=excluded_object_report_rows,
         blacklist_rehydration_state=blacklist_rehydration_state,
         blacklist_rehydrated_detail_path=blacklist_rehydrated_detail_path,
+        source_scope_detail_path=source_scope_detail_path,
+        scope_integrity_issues=scope_integrity_issues,
+        discovery_mapping_path=discovery_mapping_path,
+        scope_integrity_detail_path=scope_integrity_detail_path,
+        scope_integrity_candidate_path=scope_integrity_candidate_path,
     )
     if run_summary:
         log_run_summary(run_summary)
