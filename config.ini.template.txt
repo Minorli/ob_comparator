@@ -112,6 +112,7 @@ report_detail_mode      = split
 # report_db_detail_item_max_rows: 明细行化表最大行数（0 不限制）
 # report_db_insert_batch: INSERT ALL 批量大小
 # report_db_save_full_json: 是否保存完整 JSON（可能很大）
+# 说明：启动时会自动扩容 report_db 中过窄的 STATUS/REASON/DETAIL 列，兼容旧版本建出的表
 report_to_db            = true
 report_db_schema        =
 report_retention_days   = 30
@@ -200,6 +201,10 @@ interval_partition_cutoff_numeric =
 # 是否生成授权脚本并附加到修补 DDL（依赖于源端权限/依赖推导）
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 generate_grants         = true
+# 授权生成模式
+# full: 默认，尽量镜像 Oracle 当前授权（对象/列级/系统/角色 + 依赖补充）
+# structural: 仅生成对象创建/编译所需的最小跨 schema 授权；业务权限需另行处理
+grant_generation_mode   = full
 # run_fixup 自动补权限（默认开启）
 # fixup_auto_grant: true/false
 # fixup_auto_grant_types: 自动补权限对象类型（逗号分隔）
@@ -222,6 +227,7 @@ fixup_exec_file_fallback = true
 # 授权抽取范围（DBA_TAB_PRIVS）
 # owner: 仅加载源 schema 拥有的对象权限（默认，性能更佳）
 # owner_or_grantee: 兼容旧逻辑，额外加载 grantee 在源 schema 的对象授权
+# structural 模式下该项不影响授权生成结果，程序会按 owner 范围抽取盘点
 grant_tab_privs_scope   = owner
 # 授权合并（减少 GRANT 语句数量）
 # grant_merge_privileges: 合并同一对象的多权限
@@ -335,6 +341,7 @@ trigger_validity_sync_mode = compile
 check_dependencies      = true
 # 是否输出依赖链路拓扑（依赖在前的顺序），用于审计/排查
 # 可选值：true/false/1/0/yes/no（大小写不敏感；仅在 check_dependencies=true 时生效）
+# 大图场景下可能提前跳过或截断，并在 runtime_degraded_detail_<ts>.txt 中说明影响范围
 print_dependency_chains = true
 # 是否比对表/列注释 (DBA_TAB_COMMENTS / DBA_COL_COMMENTS)，若元数据权限不足可设为 false
 # 可选值：true/false/1/0/yes/no（大小写不敏感）

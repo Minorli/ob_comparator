@@ -1,5 +1,5 @@
 OceanBase 对比工具极简手册（现场版）
-当前版本：V0.9.8.9
+当前版本：V0.9.9.0
 
 0. 先更新版本
 - 项目地址：https://github.com/Minorli/ob_comparator
@@ -46,6 +46,7 @@ cp config.ini.template.txt config.ini
 - 在 config.ini 填写源库/目标库连接、source_schemas。
 - remap_file 指向 remap_rules.txt。
 - 建议保留：table_data_presence_check = auto
+- 如果这次只想补“对象能创建/能编译”的最小权限，把 `grant_generation_mode = structural` 打开；业务访问权限让 DBA 另行发。
 
 6. 运行主程序
 python3 schema_diff_reconciler.py config.ini
@@ -53,6 +54,7 @@ python3 schema_diff_reconciler.py config.ini
 重点看：
 - main_reports/run_<ts>/report_<ts>.txt
 - main_reports/run_<ts>/report_index_<ts>.txt
+- main_reports/run_<ts>/runtime_degraded_detail_<ts>.txt（如果存在，先看；这表示本轮命中了保护性降级）
 - main_reports/run_<ts>/ddl_cleanup_detail_<ts>.txt
 - main_reports/run_<ts>/missing_objects_detail_<ts>.txt
 - main_reports/run_<ts>/unsupported_objects_detail_<ts>.txt
@@ -64,6 +66,7 @@ python3 schema_diff_reconciler.py config.ini
 运行初期优先看：
 - report_<ts>.txt 里的“执行结论”和“本次建议处理顺序”
 - fixup_scripts/README_FIRST.txt（会提示哪些目录默认不要直接执行）
+- 如果主报告提示 `compare incomplete`，先去看 `runtime_degraded_detail_<ts>.txt`，别把这轮结果当最终验收口径
 - 如果看到“本次相关变化提醒”，优先花 10 秒看完；同一提醒默认只展示一次
 
 触发器补充规则：
@@ -89,6 +92,7 @@ DDL 清理补充规则：
 8. 记住三句话
 - 先跑主程序，再审 fixup_scripts，再跑 run_fixup。
 - 不要随便执行建表脚本（避免目标端空表）。
+- `dependency_chains_*.txt` / `VIEWs_chain_*.txt` 属于辅助附件；如果大图场景被跳过或截断，主报告会单独告诉你。
 - 发现异常先 git pull 更新后重跑。
 
 9. 生产快速排障（只读）

@@ -2,6 +2,29 @@
 
 本文件记录 OceanBase Comparator Toolkit 的重要变更。
 
+## [0.9.9.0] - 2026-04-08
+
+### 新增
+- 新增 `grant_generation_mode=full|structural`。默认 `full` 保持原有 Oracle 权限镜像逻辑；`structural` 只生成对象创建、编译、跨 schema 依赖闭环所需的最小授权，便于把迁移结构权限与业务访问权限拆开治理。
+- 新增 `runtime_degraded_detail_<ts>.txt`。当 `JOB_ACTION` 文本扫描、依赖链导出等保护性逻辑触发时，会把受影响范围与事件类型（`COMPARE` / `ARTIFACT`）单独输出，主报告和 run summary 同步标记 `compare incomplete` 或“仅附件降级”。
+- 新增 `sequence_sync_mode=last_number`，可按 Oracle/OB 当前 `LAST_NUMBER` 生成 `fixup_scripts/sequence_restart/`，用于补齐 sequence 当前值。
+
+### 变更
+- VIEW 依赖 remap 收敛为“只改数据来源对象”：`TABLE / VIEW / MVIEW / SYNONYM` 继续参与 rewrite；`FUNCTION / PACKAGE / PROCEDURE / SEQUENCE / TYPE` 只保留诊断，不再误改 VIEW DDL，也不再把 Oracle 内置包调用混进 unresolved warning。
+- `remap_root_closure` 继续收口：managed mapping 与 discovery-only mapping 分离；同义词依附、反向依赖、`trigger_list` 保留对象会继续进入 closure，但不再污染 operator-facing compare/fixup 范围。
+- `safe text fallback` / `JOB_ACTION` 性能保护增强：对超大文本、高扇出候选和单 job 递归深挖加入保护性上限，并在日志中输出更细的 batch/expand 进度。
+- `dependency_chains_*.txt` 导出增加大图保护：导出前不再无脑构造全量 source 依赖 pair；体量过大时可提前跳过或截断链路，而不再拖慢主 compare。
+- `gtt_table_handling_mode` 正式进入主流程：Oracle GTT 可按普通 TABLE 受管或保留原语义受管；`mview_check_fixup_mode=auto` 继续按 OB 版本动态门控。
+- `run_fixup` 并发/重放防护继续强化：同目录执行锁与状态账本保持启用，避免“执行成功但移动失败”后的重复执行。
+
+### 修复
+- 规范化默认值与单列 `IS NOT NULL` 语义 compare，降低大小写、系统命名和冗余等价约束带来的噪音。
+- VIEW grant replay 补齐 `ORA-01720` 场景：现有 VIEW 在 prerequisite grant 后需要 refresh 的场景可继续闭环。
+- report_db 建表/升级逻辑增强：`DIFF_REPORT_BLACKLIST` 等表的 `STATUS/REASON/DETAIL` 过窄列会自动扩容，降低老表结构引发的写库失败。
+
+### 文档
+- README / `readme_lite.txt` / `readme_config.txt` / `docs/*` 已同步到 `0.9.9.0`，并补入上次文档更新后新增的授权模式、运行时降级、VIEW rewrite 边界、依赖导出保护与实操提示。
+
 ## [0.9.8.9] - 2026-03-27
 
 ### 新增

@@ -1,6 +1,6 @@
 # 数据库对象对比工具设计文档
 
-> 当前版本：V0.9.8.9（截至 2026-03-27）
+> 当前版本：V0.9.9.0（截至 2026-04-08）
 > 核心模式：Dump-Once, Compare-Locally + 依赖分析 + 修补脚本生成
 
 ## 1. 设计原则
@@ -44,17 +44,22 @@
   - `master_list`（主对象检查清单）
   - `full_object_mapping`（全量映射，供依赖/DDL 使用）
 - 支持：显式 remap、依附对象跟随、依赖推导、schema 回退。
+- `remap_root_closure` 下会区分 managed mapping 与 discovery-only mapping；后者只用于诊断与审计，不直接参与 operator-facing compare/fixup。
 
 ## 6. 对比策略
 - **TABLE**：列名集合、VARCHAR 长度窗口、LONG/LONG RAW 转换。
 - **VIEW/PLSQL/TYPE/SYNONYM/JOB/SCHEDULE**：存在性检查。
 - **PACKAGE**：有效性与错误摘要。
 - **INDEX/CONSTRAINT/SEQUENCE/TRIGGER**：列组合/唯一性/触发事件/状态。
+- **VIEW rewrite**：只改写表类数据来源（TABLE/VIEW/MVIEW/SYNONYM）；callable 依赖只做诊断，不参与 DDL rewrite。
 
 ## 7. 依赖与授权
 - `DBA_DEPENDENCIES` 构建期望依赖集合，与目标端对比。
 - 缺失依赖输出 `ALTER ... COMPILE` 修补脚本。
 - 授权脚本基于依赖推导与权限元数据生成。
+- 授权生成支持两种模式：
+  - `full`：按 Oracle 对象/列级/系统/角色授权为主，叠加依赖补充
+  - `structural`：只生成对象创建、编译、跨 schema 依赖闭环所需的最小授权
 
 ## 8. DDL 生成与清洗
 - **DDL 来源**：dbcat（批量）+ DBMS_METADATA（VIEW 兜底）。
@@ -68,6 +73,7 @@
 - 报告输出到 `main_reports/`（默认 `run_<timestamp>` 分目录），脚本输出到 `fixup_scripts/`。
 - 报告索引 `report_index_<timestamp>.txt` 用于快速定位细节文件。
 - `report_sql_<timestamp>.txt` 只提供 `report_id` 与 HOW TO 入口。
+- 若运行期间命中保护性降级，会额外输出 `runtime_degraded_detail_<timestamp>.txt`；`COMPARE` 级事件表示本轮结果是 partial compare。
 - `fixup_scripts/README_FIRST.txt` 作为 fixup 根目录导航，明确默认执行边界。
 - `run_fixup.py` 支持：
   - 依赖感知排序（smart-order）
@@ -80,6 +86,8 @@
 - 生成过程支持多线程（`fixup_workers`）。
 - 扩展对象校验支持并发与批量调优（`extra_check_workers`/`extra_check_chunk_size`）。
 - dbcat 输出支持缓存复用（`dbcat_output/`）。
+- `JOB_ACTION` 与 scoped text matching 带有大文本/高扇出/递归深度保护，避免个别对象把整轮 compare 拖死。
+- `dependency_chains` 导出在大图下支持提前跳过与链路截断，避免审计附件反向拖垮主流程。
 
 ## 11. 安全与审计
 - 主程序仅执行 SELECT，不直接执行 DDL。

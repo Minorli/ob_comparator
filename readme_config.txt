@@ -1,5 +1,5 @@
 配置说明 (config.ini)
-版本：0.9.8.9（更新日期：2026-03-27）
+版本：0.9.9.0（更新日期：2026-04-08）
 本文件为完整配置说明书，覆盖所有可配置项（含最近新增功能）。
 
 通用约定
@@ -47,6 +47,7 @@
   说明：`safe` 额外支持受控 dynamic SQL（`EXECUTE IMMEDIATE`/`DBMS_SQL.PARSE`）、纯字符串拼接 SQL，以及同 schema 未带前缀的 package/procedure/function 调用；普通字符串字面量和跨 schema 未带前缀引用仍不会被猜测。
   说明：变量拼接 SQL 不会自动纳入 closure；会在 `source_scope_detail_<ts>.txt` 中以 `TEXT_REFERENCE_AMBIGUOUS` 输出，供人工复核。
   说明：`safe` 不会对全 schema 对象 DDL 做 `DBMS_METADATA` 全量 grep。
+  说明：生产大库下 `JOB_ACTION` 与 scoped text matching 带有保护性上限；若发生超大文本跳过/高扇出跳过/递归封顶，会生成 `runtime_degraded_detail_<ts>.txt` 并在主报告提示本轮 compare 是否完整。
 - scope_integrity_check：是否检查 `remap_root_closure` 下 scoped VIEW/MVIEW 的前置依赖完整性。默认：true。
   说明：仅在 `source_object_scope_mode=remap_root_closure` 下生效。
   说明：首版只对 `VIEW` / `MATERIALIZED VIEW` 输出 blocking 级诊断；`PROCEDURE/FUNCTION/PACKAGE/JOB/...` 仍按现有 compare/fixup 子系统处理。
@@ -84,11 +85,13 @@
   说明：若存在“触发器挂在临时表”场景，会额外输出 triggers_temp_table_unsupported_detail_<timestamp>.txt（不受 report_detail_mode 影响）；
   对应 DDL 仅输出到 `fixup_scripts/unsupported/trigger/`，用于人工改造参考，不进入普通 `trigger/`。
   说明：split/full 模式下还会额外输出 `fatal_error_matrix_<ts>.txt`，集中列出当前程序仍会直接终止运行的 fatal 场景、当前是否相关，以及修复建议。
+  说明：若本轮命中了性能保护或大图保护，还会额外输出 `runtime_degraded_detail_<ts>.txt`；其中 `COMPARE` 级事件代表当前结果不应直接作为最终 compare 结论。
 - report_to_db：是否将报告存储到 OceanBase（obclient 方式）。默认：true。
   说明：开启后仍会保留本地文本报告，写库失败时是否中断由 report_db_fail_abort 控制。
   说明：写库采用发布门禁；DIFF_REPORT_SUMMARY.WRITE_STATUS=READY 才表示可用于正式排查（WRITING/FAILED 为未完成或失败）。
   说明：开启后会在 run 目录输出 report_sql_<timestamp>.txt（仅写入 report_id 与 HOW TO 入口，不再内嵌 HOW TO 正文），并尝试创建只读分析视图（actions/profile/trends/pending/grant/usability）。
   说明：当 report_db_store_scope=full 时，会将 run 目录下所有 txt 逐行写入 DIFF_REPORT_ARTIFACT_LINE，实现 txt 内容 100% 可查询覆盖。
+  说明：升级到新版本时，程序会自动扩容过窄的 report_db `STATUS/REASON/DETAIL` 列，尽量避免旧表结构导致写库失败。
 - report_db_schema：报告存库 schema。默认：空（使用 OCEANBASE_TARGET 连接用户）。
   说明：非空时必须是 Oracle 普通标识符（示例：DIFF_REPORT），不支持点号/引号/分号；非法值会在启动阶段直接阻断。
 - report_retention_days：报告保留天数。默认：30；设为 0 表示不自动清理。
@@ -151,6 +154,7 @@
 - check_dependencies：是否校验依赖与生成依赖报告。默认：true。
 - print_dependency_chains：输出依赖链路拓扑（仅当 check_dependencies=true）。默认：true。
   说明：开启后生成 dependency_chains_*.txt 与 dependency_detail_*.txt。
+  说明：大图场景下会优先做体量保护；若 source/expected 依赖边过大，链路导出可能被跳过或截断，但主 compare 仍继续，并把影响写入 `runtime_degraded_detail_<ts>.txt`。
 - check_comments：是否比对表/列注释。默认：true。
   说明：依赖 DBA_TAB_COMMENTS / DBA_COL_COMMENTS。
 - check_column_order：是否校验列顺序。默认：false。
@@ -314,8 +318,15 @@
   说明：所有“未自动闭环”的授权与其他人工项，还会统一聚合到 `manual_actions_required_<ts>.txt`，避免只看 `grants_miss/` 后遗漏 unsupported/deferred/review-first 场景。
   说明：对象/列授权文件（如 `grants_all/<OWNER>.grants.sql`、`grants_miss/<OWNER>.grants.sql`）会在同一文件内按 `OBJECT_TYPE` 分段；
   其中 `OBJECT_TYPE=TABLE` 时，还会继续拆成 `TABLE_OBJECT_GRANTS` 与 `TABLE_COLUMN_GRANTS`，便于区分整表授权和列级授权。
+- grant_generation_mode：授权生成模式。默认：full。
+  可选值：full、structural。
+  `full`：保持现有逻辑，按 Oracle 对象/列级/系统/角色授权为主，叠加依赖推导授权。
+  `structural`：仅生成对象创建、编译、跨 schema 依赖闭环所需的最小授权；保留 `grants_all/`、`grants_miss/`、`grants_deferred/`、`view_prereq_grants/` 目录语义，但 `view_post_grants/` 默认不生成内容。
+  说明：`structural` 模式会刻意跳过 Oracle 业务权限镜像、列级授权、系统权限、角色授权和 `WITH GRANT OPTION`；应用访问权限需由业务或 DBA 另行补齐。
+  说明：`structural` 模式仍然会复用目标端权限能力探测、缺失过滤、延后分类和不支持授权报告，因此 `grants_miss/` 只包含当前模式下“缺失且可执行”的授权。
 - grant_tab_privs_scope：DBA_TAB_PRIVS 抽取范围。默认：owner。
   可选值：owner（仅源 schema 所拥有对象）、owner_or_grantee（兼容旧逻辑）。
+  说明：`grant_generation_mode=structural` 时，该项不影响最终授权脚本内容；程序会按 owner 范围抽取 Oracle 权限盘点。
 - grant_merge_privileges：合并同一对象的多权限授权。默认：true。
 - grant_merge_grantees：合并同一权限的多 grantee 授权。默认：true。
 - grant_supported_sys_privs：系统权限人工 override 清单（逗号分隔）。默认：空（使用本次运行授权能力标定结果）。
