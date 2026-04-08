@@ -1,8 +1,8 @@
 # Oracle → OceanBase 结构一致性校验与修复引擎
 ## 技术规格说明 (Technical Specification)
 
-**版本**：0.9.8.9  
-**日期**：2026-03-27  
+**版本**：0.9.9.0
+**日期**：2026-04-08
 **适用场景**：Oracle → OceanBase（Oracle 模式）迁移后的结构一致性校验、对象补全、DDL 兼容性修复。
 
 ---
@@ -30,6 +30,7 @@
 ### 2.3 可配置开关（核心）
 - `check_primary_types` / `check_extra_types`
 - `generate_fixup` / `generate_grants`
+- `grant_generation_mode`（`full` / `structural`）
 - `check_dependencies` / `check_comments`
 - `infer_schema_mapping` / `ddl_punct_sanitize` / `ddl_hint_policy`
 - `ddl_format_enable` / `ddl_format_types` / `sqlcl_bin`（可选格式化）
@@ -114,7 +115,10 @@
 ### 5.2 VIEW / PLSQL / TYPE / SYNONYM / JOB / SCHEDULE
 - 存在性校验
 - VIEW 兼容性分析：SYS.OBJ$ / X$ 系统对象视为不支持（用户自建 X$ 对象除外）
-- VIEW 依赖 remap 会同时处理 unquoted / quoted qualified 引用，并补充支持 `TABLE(...)`、`XMLTABLE(...)`、`JSON_TABLE(...)` 等特殊构造中的受管对象 token 重写；当同义词终点无法安全解析时，不再 fallback 到受管目标同义词对象本身，而是保留原引用并输出诊断日志，同时禁止 schema-only 盲改
+- VIEW 依赖 remap 只处理数据来源对象：`TABLE / VIEW / MATERIALIZED VIEW / SYNONYM`
+- VIEW rewrite 会同时处理 unquoted / quoted qualified 引用，并补充支持 `TABLE(...)`、`XMLTABLE(...)`、`JSON_TABLE(...)` 等特殊构造中的受管对象 token 重写
+- `FUNCTION / PACKAGE / PROCEDURE / SEQUENCE / TYPE / TYPE BODY` 只作为 callable 诊断依赖保留，不再参与 VIEW DDL rewrite，也不再作为 unresolved rewrite warning 的主要来源
+- 同义词只有终点确认是表类对象时才会参与 VIEW rewrite；若终点为 callable 或无法安全解析，则保留原引用并输出诊断日志，同时禁止 schema-only 盲改
 - 当 `source_object_scope_mode=remap_root_closure` 时，源对象范围不再按 `source_schemas` 全量纳入，而是仅从 `remap_file` 中显式 TABLE/VIEW roots 出发，按依赖、反向依赖、附属关系扩展闭包；闭包外对象整体不进入 compare/fixup/report，`trigger_list` 可作为显式 keep set 保留触发器及其父对象。注意：`missed_tables_views_for_OMS/` 与 report_db `OMS_MISSING` 默认只导出显式 remap roots，不把 closure 中的依赖 TABLE/VIEW 一起导出。
 - 当 `remap_scope_text_fallback_mode=safe` 时，结构化闭包之外的剩余对象会额外从 `DBA_SOURCE`、`DBA_VIEWS.TEXT`、`DBA_MVIEWS.QUERY`、scheduler/job 文本等受控来源做 scoped 补盲；命中的对象以 `TEXT_REFERENCE_HEURISTIC` 写入 `source_scope_detail_<ts>.txt`，随后重新进入结构化 closure 扩展。
 - `JOB_ACTION` 与 `safe text fallback` 的 scoped text matching 采用统一索引化匹配：先提取文本 token，再只对命中 token 的候选对象做精确 regex；对非标准/quoted 标识符保留保守慢路径，优先 correctness。运行日志会输出 `[PERF] ... pattern_index / scan / round` 计数，帮助判断成本主要落在 index build 还是 text scan。
@@ -150,6 +154,7 @@
   - `RISKY -> report_type='RISKY'`
 - `DIFF_REPORT_ACTIONS_V` 会把 `report_type='RISKY'` 归类到 `REVIEW`
 - 文本主报告与 `unsupported_objects_detail_*.txt` 仍保持“缺失(不支持/阻断/待确认)”聚合口径，不单独拆出主报告 `RISKY` 计数列
+- report_db 启动时会自动扩容过窄的 `STATUS/REASON/DETAIL` 列，兼容旧版本建出的表结构
 
 ### 5.3 PACKAGE / PACKAGE BODY
 - 有效性校验（`DBA_ERRORS` 摘要）
@@ -198,6 +203,11 @@
 ### 6.2 授权生成
 - 基于 `DBA_TAB_PRIVS`、`DBA_SYS_PRIVS`、`DBA_ROLE_PRIVS`
 - 支持权限合并与白名单过滤
+- 授权生成支持两种模式：
+  - `grant_generation_mode=full`：按 Oracle 对象/列级/系统/角色授权为主，叠加依赖补充
+  - `grant_generation_mode=structural`：只生成对象创建、编译、跨 schema 依赖闭环所需的最小授权
+- `structural` 模式刻意跳过列级授权、系统权限、角色授权和 `WITH GRANT OPTION`；业务访问授权由 DBA 或业务侧另行处理
+- `structural` 仍会复用 capability probe、缺失过滤、延后分类和 unsupported 报告，因此不会绕过 OB 兼容性检查
 - 视图权限拆分：依赖对象授权输出到 `view_prereq_grants/`，视图自身授权输出到 `view_post_grants/`；当目标端已有 VIEW 且 prerequisite grants 是后补的，会额外生成 `view_refresh/`
 - 视图链路要求 `WITH GRANT OPTION` 的场景会单独标注缺失
 - 依赖推导不再对 PUBLIC 生成授权，仅保留源端显式 PUBLIC 授权
@@ -284,6 +294,7 @@
 ## 9. 报告体系
 - `run_<ts>/report_<ts>.txt`：主报告
 - `run_<ts>/report_sql_<ts>.txt`：轻量入口文件，仅包含 `report_id` 与 HOW TO 手册入口
+- `run_<ts>/runtime_degraded_detail_<ts>.txt`：运行时降级明细；`COMPARE` 级事件表示当前 run 不是完整 compare，`ARTIFACT` 级事件只影响依赖链等辅助工件
 - `HOW_TO_READ_REPORTS_IN_OB_latest.txt` / 当前快照文件：数据库侧排障手册，供人工查阅
 - `run_<ts>/package_compare_<ts>.txt`：包对比明细
 - `run_<ts>/remap_conflicts_<ts>.txt`：推导冲突
@@ -304,6 +315,8 @@
 - 扁平 cache 索引漏项不会再直接导致 metadata fallback；对象文件存在时会自修复 `cache/index.json`。
 - `table_data_presence_check=auto` 对 `NUM_ROWS=0` 会做二次探针确认，降低统计信息滞后造成的误判。
 - `table_data_presence_zero_probe_workers` 控制 Oracle 零行探针并发（默认 1，最大 32）。
+- `JOB_ACTION` / scoped text matching 对超大文本、高扇出候选和递归深度带有保护性上限，避免单个 job 把整轮 compare 拖死。
+- `dependency_chains` 在大图场景下支持导出前早停和链路截断，避免“辅助附件比主 compare 更重”。
 
 ---
 

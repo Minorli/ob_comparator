@@ -10946,6 +10946,55 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             self.assertIn("object_mapping_discovery_20240101.txt", content)
             self.assertIn("discovery-only 对象映射", content)
 
+    def test_print_final_report_exports_runtime_degraded_detail(self):
+        tv_results = {
+            "missing": [], "mismatched": [], "ok": [], "skipped": [], "extraneous": [], "extra_targets": []
+        }
+        extra_results = {
+            "index_ok": [], "index_mismatched": [], "constraint_ok": [], "constraint_mismatched": [],
+            "sequence_ok": [], "sequence_mismatched": [], "trigger_ok": [], "trigger_mismatched": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            report_path = Path(tmp_dir) / "report_20240101.txt"
+            sdr.print_final_report(
+                tv_results,
+                total_checked=0,
+                extra_results=extra_results,
+                comment_results={"ok": [], "mismatched": [], "skipped_reason": "skip"},
+                dependency_report={"missing": [], "unexpected": [], "skipped": []},
+                report_file=report_path,
+                object_counts_summary=None,
+                endpoint_info=None,
+                schema_summary=None,
+                settings={
+                    "report_width": 120,
+                    "report_detail_mode": "summary",
+                    "_runtime_degraded_events": [
+                        sdr.RuntimeDegradedEvent(
+                            scope="COMPARE",
+                            stage="JOB_ACTION",
+                            code="JOB_ACTION_RECURSION_CAPPED",
+                            entity="SRC.JOB_21",
+                            detail="recursion capped at 256",
+                        )
+                    ],
+                },
+                blacklisted_missing_tables={},
+                blacklist_report_rows=[],
+                trigger_list_summary=None,
+                trigger_list_rows=None,
+                package_results=None,
+                run_summary_ctx=None,
+                filtered_grants=None,
+            )
+            content = report_path.read_text(encoding="utf-8")
+            runtime_detail_path = Path(tmp_dir) / "runtime_degraded_detail_20240101.txt"
+            index_path = Path(tmp_dir) / "report_index_20240101.txt"
+            self.assertTrue(runtime_detail_path.exists())
+            self.assertTrue(index_path.exists())
+            self.assertIn("运行时降级", content)
+            self.assertIn("runtime_degraded_detail_20240101.txt", index_path.read_text(encoding="utf-8"))
+
     def test_print_final_report_suggests_view_chain_autofix_when_view_missing(self):
         tv_results = {
             "missing": [("VIEW", "A.V1", "A.V1")],
@@ -11925,6 +11974,81 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             plan.column_grants.get("U1", set())
         )
 
+    def test_normalize_grant_generation_mode(self):
+        self.assertEqual(
+            sdr.normalize_grant_generation_mode("dependency_only"),
+            sdr.GRANT_GENERATION_MODE_STRUCTURAL,
+        )
+        self.assertEqual(
+            sdr.normalize_grant_generation_mode("FULL"),
+            sdr.GRANT_GENERATION_MODE_FULL,
+        )
+        self.assertEqual(
+            sdr.normalize_grant_generation_mode("bad_mode"),
+            sdr.GRANT_GENERATION_MODE_FULL,
+        )
+
+    def test_collect_source_grant_capability_candidates_structural_skips_oracle_source_privileges(self):
+        oracle_meta = sdr.OracleMetadata(
+            table_columns={},
+            invisible_column_supported=False,
+            identity_column_supported=False,
+            default_on_null_supported=False,
+            indexes={},
+            constraints={},
+            triggers={},
+            sequences={},
+            sequence_attrs={},
+            table_comments={},
+            column_comments={},
+            comments_complete=True,
+            blacklist_tables={},
+            object_privileges=[
+                sdr.OracleObjectPrivilege(
+                    grantee="PUBLIC",
+                    owner="S1",
+                    object_name="P1",
+                    object_type="PROCEDURE",
+                    privilege="DEBUG",
+                    grantable=False,
+                )
+            ],
+            column_privileges=[
+                sdr.OracleColumnPrivilege(
+                    grantee="U1",
+                    owner="S1",
+                    object_name="T1",
+                    column_name="C1",
+                    privilege="UPDATE",
+                    grantable=False,
+                )
+            ],
+            sys_privileges=[
+                sdr.OracleSysPrivilege(grantee="U1", privilege="CREATE SESSION", admin_option=False),
+            ],
+            role_privileges=[],
+            role_metadata={},
+            system_privilege_map={"CREATE SESSION"},
+            table_privilege_map={"DEBUG", "UPDATE"},
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False,
+            partition_key_columns={},
+            interval_partitions={},
+            privilege_family_counts=(),
+            non_table_triggers=(),
+        )
+        sys_privs, object_privs, column_privs = sdr.collect_source_grant_capability_candidates(
+            oracle_meta,
+            {"S1.P1": {"PROCEDURE"}, "S1.T1": {"TABLE"}},
+            grant_generation_mode="structural",
+        )
+        self.assertEqual(sys_privs, set())
+        self.assertEqual(column_privs, set())
+        self.assertIn(("SELECT", "TABLE"), object_privs)
+        self.assertIn(("EXECUTE", "PROCEDURE"), object_privs)
+        self.assertNotIn(("DEBUG", "PROCEDURE"), object_privs)
+
     def test_ensure_object_probe_fixture_registers_cleanup_before_multistatement_failure(self):
         names = {}
         created_types = set()
@@ -12149,6 +12273,87 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(summary["selected_missing"], 1)
         self.assertEqual(rows[0].status, "SELECTED_MISSING")
         self.assertIn("SRC.TRG_T1", rows[0].detail)
+
+    def test_export_dependency_chains_skips_when_pair_count_exceeds_cap(self):
+        expected_pairs = {
+            ("TGT.P1", "PROCEDURE", "TGT.T1", "TABLE"),
+        }
+        source_pairs = {
+            ("SRC.P1", "PROCEDURE", "SRC.T1", "TABLE"),
+            ("SRC.P2", "PROCEDURE", "SRC.T2", "TABLE"),
+        }
+        runtime_events = []
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             mock.patch.object(sdr, "MAX_DEPENDENCY_CHAIN_EXPORT_PAIRS", 2), \
+             mock.patch.object(sdr.log, "warning") as warning_mock:
+            out = sdr.export_dependency_chains(
+                expected_pairs,
+                Path(tmpdir) / "dependency_chains.txt",
+                source_pairs=source_pairs,
+                runtime_degraded_events=runtime_events,
+            )
+        self.assertIsNone(out)
+        self.assertTrue(any("依赖链路导出已跳过" in str(call.args[0]) for call in warning_mock.call_args_list))
+        self.assertEqual(len(runtime_events), 1)
+        self.assertEqual(runtime_events[0].scope, "ARTIFACT")
+        self.assertEqual(runtime_events[0].code, "DEPENDENCY_CHAIN_EXPORT_SKIPPED")
+
+    def test_to_raw_dependency_pairs_capped_allows_duplicates_within_unique_cap(self):
+        dependencies = [
+            sdr.DependencyRecord("SRC", "P1", "PROCEDURE", "SRC", "T1", "TABLE"),
+            sdr.DependencyRecord("SRC", "P1", "PROCEDURE", "SRC", "T1", "TABLE"),
+            sdr.DependencyRecord("SRC", "P1", "PROCEDURE", "SRC", "T1", "TABLE"),
+        ]
+        pairs = sdr.to_raw_dependency_pairs_capped(dependencies, 1)
+        self.assertEqual(
+            pairs,
+            {("SRC.P1", "PROCEDURE", "SRC.T1", "TABLE")},
+        )
+
+    def test_export_dependency_chains_truncates_when_chain_count_exceeds_cap(self):
+        expected_pairs = {
+            ("TGT.P1", "PROCEDURE", "TGT.B1", "VIEW"),
+            ("TGT.P1", "PROCEDURE", "TGT.B2", "VIEW"),
+            ("TGT.P1", "PROCEDURE", "TGT.B3", "VIEW"),
+            ("TGT.B1", "VIEW", "TGT.T1", "TABLE"),
+            ("TGT.B2", "VIEW", "TGT.T2", "TABLE"),
+            ("TGT.B3", "VIEW", "TGT.T3", "TABLE"),
+        }
+        runtime_events = []
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             mock.patch.object(sdr, "MAX_DEPENDENCY_CHAIN_EXPORT_CHAINS", 2), \
+             mock.patch.object(sdr.log, "warning") as warning_mock:
+            out = sdr.export_dependency_chains(
+                expected_pairs,
+                Path(tmpdir) / "dependency_chains.txt",
+                runtime_degraded_events=runtime_events,
+            )
+            self.assertIsNotNone(out)
+            content = Path(out).read_text(encoding="utf-8")
+        self.assertIn("已截断，仅展示前 2 条链路", content)
+        self.assertTrue(any("依赖链路导出已截断" in str(call.args[0]) for call in warning_mock.call_args_list))
+        self.assertEqual(len(runtime_events), 1)
+        self.assertEqual(runtime_events[0].scope, "ARTIFACT")
+        self.assertEqual(runtime_events[0].code, "DEPENDENCY_CHAIN_EXPORT_TRUNCATED")
+
+    def test_export_dependency_chains_handles_deep_chain_iteratively(self):
+        expected_pairs = set()
+        chain_depth = 1200
+        for idx in range(chain_depth):
+            dep_name = f"TGT.N{idx:04d}"
+            dep_type = "VIEW" if idx < (chain_depth - 1) else "TABLE"
+            ref_name = f"TGT.N{idx + 1:04d}"
+            ref_type = "VIEW" if idx < (chain_depth - 2) else "TABLE"
+            expected_pairs.add((dep_name, dep_type, ref_name, ref_type))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = sdr.export_dependency_chains(
+                expected_pairs,
+                Path(tmpdir) / "dependency_chains.txt",
+            )
+            self.assertIsNotNone(out)
+            content = Path(out).read_text(encoding="utf-8")
+        self.assertIn("TGT.N0000(VIEW)", content)
+        self.assertIn(f"TGT.N{chain_depth - 1:04d}(TABLE)", content)
 
     def test_dump_oracle_metadata_keeps_instead_of_view_trigger_in_scope(self):
         class FakeCursor:
@@ -13011,6 +13216,124 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn(sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "PKG1", "PACKAGE"), rows)
         self.assertIn(sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "P1", "PROCEDURE"), rows)
         self.assertIn(sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "T1", "TABLE"), rows)
+
+    def test_build_job_action_dependency_records_loader_prefers_package_body_over_spec(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "SRC.P1": {"PROCEDURE"},
+            "SRC.PKG1": {"PACKAGE", "PACKAGE BODY"},
+            "SRC.J1": {"JOB"},
+        }
+        calls = []
+        text_map = {
+            ("SRC.J1", "JOB"): "BEGIN PKG1.P; END;",
+            ("SRC.PKG1", "PACKAGE BODY"): "BEGIN P1; END;",
+            ("SRC.PKG1", "PACKAGE"): "PROCEDURE P;",
+            ("SRC.P1", "PROCEDURE"): "BEGIN EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM T1'; END;",
+        }
+
+        def fake_loader(nodes):
+            calls.append(set(nodes))
+            return {node: text_map[node] for node in nodes if node in text_map}
+
+        rows = sdr.build_job_action_dependency_records_with_loader(source_objects, fake_loader)
+
+        self.assertEqual(calls[0], {("SRC.J1", "JOB")})
+        self.assertTrue(any(("SRC.PKG1", "PACKAGE BODY") in batch for batch in calls[1:]))
+        self.assertFalse(any(("SRC.PKG1", "PACKAGE") in batch for batch in calls[1:]))
+        self.assertIn(sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "T1", "TABLE"), rows)
+
+    def test_build_job_action_dependency_records_loader_caches_shared_program_unit_matches(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "SRC.P1": {"PROCEDURE"},
+            "SRC.PKG1": {"PACKAGE", "PACKAGE BODY"},
+            "SRC.J1": {"JOB"},
+            "SRC.J2": {"JOB"},
+        }
+        text_map = {
+            ("SRC.J1", "JOB"): "BEGIN PKG1.P; END;",
+            ("SRC.J2", "JOB"): "BEGIN PKG1.P; END;",
+            ("SRC.PKG1", "PACKAGE BODY"): "BEGIN P1; END;",
+            ("SRC.P1", "PROCEDURE"): "BEGIN EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM T1'; END;",
+        }
+
+        def fake_loader(nodes):
+            return {node: text_map[node] for node in nodes if node in text_map}
+
+        original_find_matches = sdr.ScopedPatternIndex.find_matches
+        scanned_texts = []
+
+        def wrapped_find_matches(self, cleaned_text, dynamic_sql_texts, node_owner, find_first=False, text_tokens=None):
+            scanned_texts.append(cleaned_text)
+            return original_find_matches(
+                self,
+                cleaned_text,
+                dynamic_sql_texts,
+                node_owner,
+                find_first=find_first,
+                text_tokens=text_tokens,
+            )
+
+        with mock.patch.object(sdr.ScopedPatternIndex, "find_matches", new=wrapped_find_matches):
+            rows = sdr.build_job_action_dependency_records_with_loader(source_objects, fake_loader)
+
+        self.assertEqual(scanned_texts.count("BEGIN P1; END;"), 1)
+        exec_immediate_scans = [
+            item for item in scanned_texts
+            if "EXECUTE IMMEDIATE" in item and item.startswith("BEGIN ") and item.endswith("; END;")
+        ]
+        self.assertEqual(len(exec_immediate_scans), 1)
+        self.assertIn(sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "T1", "TABLE"), rows)
+        self.assertIn(sdr.DependencyRecord("SRC", "J2", "JOB", "SRC", "T1", "TABLE"), rows)
+
+    def test_build_job_action_dependency_records_loader_caps_runaway_program_units(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "SRC.P1": {"PROCEDURE"},
+            "SRC.P2": {"PROCEDURE"},
+            "SRC.P3": {"PROCEDURE"},
+            "SRC.J1": {"JOB"},
+        }
+        text_map = {
+            ("SRC.J1", "JOB"): "BEGIN P1(); END;",
+            ("SRC.P1", "PROCEDURE"): "BEGIN P2(); END;",
+            ("SRC.P2", "PROCEDURE"): "BEGIN P3(); END;",
+            ("SRC.P3", "PROCEDURE"): "BEGIN EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM T1'; END;",
+        }
+
+        def fake_loader(nodes):
+            return {node: text_map[node] for node in nodes if node in text_map}
+
+        with mock.patch.object(sdr, "MAX_JOB_ACTION_RECURSIVE_PROGRAM_UNITS", 1), \
+             mock.patch.object(sdr.log, "warning") as warning_mock:
+            rows = sdr.build_job_action_dependency_records_with_loader(source_objects, fake_loader)
+
+        self.assertIn(sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "P1", "PROCEDURE"), rows)
+        self.assertNotIn(sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "T1", "TABLE"), rows)
+        self.assertTrue(any("recursion capped" in str(call.args[0]) for call in warning_mock.call_args_list))
+
+    def test_build_job_action_dependency_records_loader_skips_oversized_program_unit_text(self):
+        source_objects = {
+            "SRC.T1": {"TABLE"},
+            "SRC.P1": {"PROCEDURE"},
+            "SRC.J1": {"JOB"},
+        }
+        text_map = {
+            ("SRC.J1", "JOB"): "BEGIN P1(); END;",
+            ("SRC.P1", "PROCEDURE"): "BEGIN EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM T1'; END;",
+        }
+
+        def fake_loader(nodes):
+            return {node: text_map[node] for node in nodes if node in text_map}
+
+        with mock.patch.object(sdr, "MAX_JOB_ACTION_SCAN_TEXT_BYTES", 20), \
+             mock.patch.object(sdr.log, "warning") as warning_mock:
+            rows = sdr.build_job_action_dependency_records_with_loader(source_objects, fake_loader)
+
+        self.assertIn(sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "P1", "PROCEDURE"), rows)
+        self.assertNotIn(sdr.DependencyRecord("SRC", "J1", "JOB", "SRC", "T1", "TABLE"), rows)
+        self.assertTrue(any("oversized text scan" in str(call.args[0]) for call in warning_mock.call_args_list))
 
     def test_extend_source_scope_result_with_text_reference_seed_rows_expands_paired_objects(self):
         source_objects = {
@@ -13922,6 +14245,44 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn("A.T1", deps)
         self.assertIn("B.T2", deps)
 
+    def test_build_view_dependency_maps_split_rewrite_and_callable_refs(self):
+        source_dependencies = {
+            ("A", "V", "VIEW", "A", "T1", "TABLE"),
+            ("A", "V", "VIEW", "A", "S1", "SYNONYM"),
+            ("A", "V", "VIEW", "A", "F1", "FUNCTION"),
+            ("A", "V", "VIEW", "SYS", "DBMS_METADATA", "PACKAGE"),
+            ("A", "P1", "PROCEDURE", "A", "T1", "TABLE"),
+        }
+        view_dep_map = sdr.build_view_dependency_map(source_dependencies)
+        callable_dep_map = sdr.build_view_callable_dep_map(source_dependencies)
+        self.assertEqual(view_dep_map, {("A", "V"): {"A.T1", "A.S1"}})
+        self.assertEqual(callable_dep_map, {("A", "V"): {"A.F1", "SYS.DBMS_METADATA"}})
+
+    def test_classify_view_unresolved_dep_system_schema(self):
+        category, candidates = sdr.classify_view_unresolved_dep("SYS.DBMS_METADATA", None)
+        self.assertEqual(category, "ORACLE_SYSTEM")
+        self.assertEqual(candidates, [])
+
+    def test_classify_view_unresolved_dep_cross_schema_ok(self):
+        ob_meta = self._make_ob_meta()._replace(
+            objects_by_type={"TABLE": {"EXT.T1", "TGT.T2"}}
+        )
+        category, candidates = sdr.classify_view_unresolved_dep("EXT.T1", ob_meta)
+        self.assertEqual(category, "CROSS_SCHEMA_OK")
+        self.assertEqual(candidates, [])
+
+    def test_classify_view_unresolved_dep_cross_schema_missing_prefers_candidates(self):
+        ob_meta = self._make_ob_meta()._replace(
+            objects_by_type={"TABLE": {"ALT.T1", "PREF.T1", "PREF.T2"}}
+        )
+        category, candidates = sdr.classify_view_unresolved_dep(
+            "EXT.T1",
+            ob_meta,
+            preferred_target_schemas=["PREF"],
+        )
+        self.assertEqual(category, "CROSS_SCHEMA_MISSING")
+        self.assertEqual(candidates[0], "PREF.T1")
+
     def test_remap_view_dependencies_rewrites_qualified_and_unqualified(self):
         ddl = (
             "CREATE OR REPLACE VIEW A.V AS\n"
@@ -14070,12 +14431,17 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         remap_rules = {
             "LIFEDATA.BENEFICIARY_INFO_DELETE": "PASDATA.BENEFICIARY_INFO_DELETE"
         }
+        full_mapping = {
+            "LIFEDATA.BENEFICIARY_INFO_DELETE": {
+                "TABLE": "PASDATA.BENEFICIARY_INFO_DELETE"
+            }
+        }
         rewritten = sdr.remap_view_dependencies(
             ddl,
             "LIFELOGTMP",
             "V1",
             remap_rules,
-            {},
+            full_mapping,
             synonym_meta=synonym_meta
         )
         self.assertIn("PASDATA.BENEFICIARY_INFO_DELETE", rewritten.upper())
@@ -14400,7 +14766,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertIn("A.SYNF", deps)
         self.assertNotIn("A.TABLE", deps)
 
-    def test_remap_view_dependencies_rewrites_table_construct_qualified(self):
+    def test_remap_view_dependencies_does_not_rewrite_table_construct_callable_qualified(self):
         ddl = (
             "CREATE OR REPLACE VIEW A.V AS\n"
             "SELECT * FROM TABLE(A.SYNF())\n"
@@ -14415,11 +14781,11 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
                 full_mapping,
             )
         upper = rewritten.upper()
-        self.assertIn("TABLE(TGT.SYNF())", upper)
+        self.assertIn("TABLE(A.SYNF())", upper)
         self.assertNotIn("A.TABLE", upper)
         self.assertFalse(m_warning.called)
 
-    def test_remap_view_dependencies_rewrites_table_construct_unqualified(self):
+    def test_remap_view_dependencies_does_not_rewrite_table_construct_callable_unqualified(self):
         ddl = (
             "CREATE OR REPLACE VIEW A.V AS\n"
             "SELECT * FROM TABLE(SYNF())\n"
@@ -14433,12 +14799,13 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             full_mapping,
         )
         upper = rewritten.upper()
-        self.assertIn("TABLE(TGT.SYNF())", upper)
-        self.assertNotIn("TABLE(SYNF())", upper)
+        self.assertIn("TABLE(SYNF())", upper)
+        self.assertNotIn("TGT.SYNF()", upper)
 
-    def test_remap_view_dependencies_rewrites_xmltable_and_json_table_tokens_from_dependency_map(self):
+    def test_remap_view_dependencies_does_not_rewrite_xmltable_and_json_table_callable_tokens(self):
         full_mapping = {"A.SYNF": {"FUNCTION": "TGT.SYNF"}}
         view_dep_map = {("A", "V"): {"A.SYNF"}}
+        view_callable_dep_map = {("A", "V"): {"A.SYNF"}}
 
         xml_ddl = (
             "CREATE OR REPLACE VIEW A.V AS\n"
@@ -14451,8 +14818,10 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             {},
             full_mapping,
             view_dependency_map=view_dep_map,
+            view_callable_dep_map=view_callable_dep_map,
         )
-        self.assertIn("PASSING TGT.SYNF()", xml_rewritten.upper())
+        self.assertIn("PASSING SYNF()", xml_rewritten.upper())
+        self.assertNotIn("TGT.SYNF()", xml_rewritten.upper())
 
         json_ddl = (
             "CREATE OR REPLACE VIEW A.V AS\n"
@@ -14465,8 +14834,52 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             {},
             full_mapping,
             view_dependency_map=view_dep_map,
+            view_callable_dep_map=view_callable_dep_map,
         )
-        self.assertIn("JSON_TABLE(TGT.SYNF()", json_rewritten.upper())
+        self.assertIn("JSON_TABLE(SYNF()", json_rewritten.upper())
+        self.assertNotIn("TGT.SYNF()", json_rewritten.upper())
+
+    def test_remap_view_dependencies_skips_callable_warning_when_callable_dep_map_marks_dep(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW A.V AS\n"
+            "SELECT * FROM TABLE(SYNF())\n"
+        )
+        with mock.patch.object(sdr.log, "warning") as m_warning:
+            rewritten = sdr.remap_view_dependencies(
+                ddl,
+                "A",
+                "V",
+                {},
+                {},
+                view_callable_dep_map={("A", "V"): {"A.SYNF"}},
+            )
+        self.assertIn("TABLE(SYNF())", rewritten.upper())
+        self.assertFalse(m_warning.called)
+
+    def test_remap_view_dependencies_preserves_synonym_to_callable_terminal_without_warning(self):
+        ddl = (
+            "CREATE OR REPLACE VIEW A.V AS\n"
+            "SELECT * FROM A.SYNF\n"
+        )
+        full_mapping = {
+            "A.SYNF": {"SYNONYM": "TGT.SYNF"},
+            "A.F1": {"FUNCTION": "TGT.F1"},
+        }
+        synonym_meta = {
+            ("A", "SYNF"): sdr.SynonymMeta("A", "SYNF", "A", "F1", None),
+        }
+        with mock.patch.object(sdr.log, "warning") as m_warning:
+            rewritten = sdr.remap_view_dependencies(
+                ddl,
+                "A",
+                "V",
+                {},
+                full_mapping,
+                synonym_meta=synonym_meta,
+            )
+        self.assertIn("FROM A.SYNF", rewritten.upper())
+        self.assertNotIn("TGT.F1", rewritten.upper())
+        self.assertFalse(m_warning.called)
 
     def test_remap_view_dependencies_table_construct_does_not_rewrite_plain_column_name(self):
         ddl = (
@@ -14485,7 +14898,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             full_mapping,
         )
         upper = rewritten.upper()
-        self.assertIn("SELECT SYNF FROM TABLE(TGT.T1())", upper)
+        self.assertIn("SELECT SYNF FROM TABLE(T1())", upper)
         self.assertNotIn("SELECT TGT.SYNF", upper)
 
     def test_remap_view_dependencies_subquery_alias_kept(self):
@@ -15813,6 +16226,166 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             grant_plan.role_privs.get("U1", set())
         )
         self.assertNotIn("MISSING", grant_plan.role_privs)
+
+    def test_build_grant_plan_structural_uses_dependency_grants_only(self):
+        oracle_meta = sdr.OracleMetadata(
+            table_columns={},
+            invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
+            indexes={},
+            constraints={},
+            triggers={},
+            sequences={},
+            sequence_attrs={},
+            table_comments={},
+            column_comments={},
+            comments_complete=True,
+            blacklist_tables={},
+            object_privileges=[
+                sdr.OracleObjectPrivilege(
+                    grantee="APP_USER",
+                    owner="APP",
+                    object_name="V1",
+                    object_type="VIEW",
+                    privilege="SELECT",
+                    grantable=True,
+                ),
+            ],
+            column_privileges=[
+                sdr.OracleColumnPrivilege(
+                    grantee="APP_USER",
+                    owner="APP",
+                    object_name="T1",
+                    column_name="C1",
+                    privilege="UPDATE",
+                    grantable=False,
+                ),
+            ],
+            sys_privileges=[
+                sdr.OracleSysPrivilege(grantee="APP_USER", privilege="CREATE SESSION", admin_option=False),
+            ],
+            role_privileges=[
+                sdr.OracleRolePrivilege(grantee="APP_USER", role="R1", admin_option=False),
+            ],
+            role_metadata={},
+            system_privilege_map={"CREATE SESSION"},
+            table_privilege_map={"SELECT", "UPDATE"},
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False,
+            partition_key_columns={},
+            interval_partitions={},
+        )
+        deps = [
+            sdr.DependencyRecord(
+                owner="APP",
+                name="V1",
+                object_type="VIEW",
+                referenced_owner="TOWNER",
+                referenced_name="T1",
+                referenced_type="TABLE",
+            ),
+        ]
+        grant_plan = sdr.build_grant_plan(
+            oracle_meta=oracle_meta,
+            full_mapping={
+                "APP.V1": {"VIEW": "APP.V1"},
+                "TOWNER.T1": {"TABLE": "TOWNER.T1"},
+            },
+            remap_rules={},
+            source_objects={
+                "APP.V1": {"VIEW"},
+                "TOWNER.T1": {"TABLE"},
+            },
+            schema_mapping={},
+            object_parent_map=None,
+            dependency_graph=None,
+            transitive_table_cache=None,
+            source_dependencies=None,
+            source_schema_set={"APP", "APP_USER", "TOWNER"},
+            remap_conflicts=None,
+            synonym_meta={},
+            ob_users={"APP", "APP_USER"},
+            dependencies=deps,
+            grant_generation_mode="structural",
+        )
+        self.assertEqual(grant_plan.grant_generation_mode, sdr.GRANT_GENERATION_MODE_STRUCTURAL)
+        self.assertIn(
+            sdr.ObjectGrantEntry("SELECT", "TOWNER.T1", False),
+            grant_plan.object_grants.get("APP", set()),
+        )
+        self.assertNotIn("APP_USER", grant_plan.object_grants)
+        self.assertEqual(grant_plan.column_grants, {})
+        self.assertEqual(grant_plan.sys_privs, {})
+        self.assertEqual(grant_plan.role_privs, {})
+        self.assertEqual(grant_plan.view_grant_targets, set())
+        self.assertEqual(grant_plan.mode_skip_counts["oracle_object_privileges"], 1)
+        self.assertEqual(grant_plan.mode_skip_counts["column_privileges"], 1)
+        self.assertEqual(grant_plan.mode_skip_counts["system_privileges"], 1)
+        self.assertEqual(grant_plan.mode_skip_counts["role_privileges"], 1)
+
+    def test_build_grant_plan_structural_skips_same_schema_dependency(self):
+        oracle_meta = sdr.OracleMetadata(
+            table_columns={},
+            invisible_column_supported=False,
+            identity_column_supported=True,
+            default_on_null_supported=True,
+            indexes={},
+            constraints={},
+            triggers={},
+            sequences={},
+            sequence_attrs={},
+            table_comments={},
+            column_comments={},
+            comments_complete=True,
+            blacklist_tables={},
+            object_privileges=[],
+            column_privileges=[],
+            sys_privileges=[],
+            role_privileges=[],
+            role_metadata={},
+            system_privilege_map=set(),
+            table_privilege_map=set(),
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False,
+            partition_key_columns={},
+            interval_partitions={},
+        )
+        grant_plan = sdr.build_grant_plan(
+            oracle_meta=oracle_meta,
+            full_mapping={
+                "APP.V1": {"VIEW": "APP.V1"},
+                "APP.T1": {"TABLE": "APP.T1"},
+            },
+            remap_rules={},
+            source_objects={
+                "APP.V1": {"VIEW"},
+                "APP.T1": {"TABLE"},
+            },
+            schema_mapping={},
+            object_parent_map=None,
+            dependency_graph=None,
+            transitive_table_cache=None,
+            source_dependencies=None,
+            source_schema_set={"APP"},
+            remap_conflicts=None,
+            synonym_meta={},
+            ob_users={"APP"},
+            dependencies=[
+                sdr.DependencyRecord(
+                    owner="APP",
+                    name="V1",
+                    object_type="VIEW",
+                    referenced_owner="APP",
+                    referenced_name="T1",
+                    referenced_type="TABLE",
+                ),
+            ],
+            grant_generation_mode="structural",
+        )
+        self.assertEqual(grant_plan.object_grants, {})
 
     def test_build_grant_plan_keeps_same_schema_view_dml_grant(self):
         oracle_meta = sdr.OracleMetadata(
@@ -20082,6 +20655,24 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(remaining, {})
         self.assertEqual(refresh_targets, {"VOWNER.V1"})
 
+    def test_split_view_grants_structural_routes_view_dependencies_to_prereq(self):
+        prereq, post, remaining, refresh_targets = sdr.split_view_grants(
+            set(),
+            {("VOWNER.V1", "VIEW", "TOWNER.T1", "TABLE")},
+            {
+                "VOWNER": {
+                    sdr.ObjectGrantEntry("SELECT", "TOWNER.T1", False),
+                }
+            },
+            grant_generation_mode="structural",
+        )
+        self.assertEqual(prereq, {
+            "VOWNER": {sdr.ObjectGrantEntry("SELECT", "TOWNER.T1", False)}
+        })
+        self.assertEqual(post, {})
+        self.assertEqual(remaining, {})
+        self.assertEqual(refresh_targets, {"VOWNER.V1"})
+
     def test_compute_required_grants_skips_trigger_reference_type(self):
         expected_pairs = {
             ("A.P1", "PROCEDURE", "B.TRG_AUDIT", "TRIGGER"),
@@ -21593,6 +22184,161 @@ class TestReportDbHelpers(unittest.TestCase):
         self.assertIn("SEQUENCE 缺失对象 2 (差异表 1)", joined)
         self.assertIn("TRIGGER 缺失对象 2 (差异表 1)", joined)
 
+    def test_build_run_summary_marks_compare_incomplete_for_runtime_degraded_events(self):
+        ctx = sdr.RunSummaryContext(
+            start_time=datetime.now(),
+            start_perf=0.0,
+            phase_durations={},
+            phase_skip_reasons={},
+            enabled_primary_types={"TABLE"},
+            enabled_extra_types=set(),
+            print_only_types=set(),
+            total_checked=1,
+            enable_dependencies_check=True,
+            enable_comment_check=False,
+            enable_grant_generation=False,
+            enable_schema_mapping_infer=False,
+            fixup_enabled=False,
+            fixup_dir="fixup_scripts",
+            dependency_chain_file=None,
+            view_chain_file=None,
+            trigger_list_summary=None,
+            report_start_perf=0.0,
+        )
+        support_summary = sdr.SupportClassificationResult(
+            support_state_map={},
+            missing_detail_rows=[],
+            unsupported_rows=[],
+            extra_missing_rows=[],
+            missing_support_counts={},
+            extra_blocked_counts={},
+            unsupported_table_keys=set(),
+            unsupported_view_keys=set(),
+            view_compat_map={},
+            view_constraint_cleaned_rows=[],
+            view_constraint_uncleanable_rows=[],
+        )
+        summary = sdr.build_run_summary(
+            ctx,
+            {"missing": [], "mismatched": [], "extra_targets": [], "skipped": [], "extraneous": []},
+            {
+                "index_mismatched": [],
+                "constraint_mismatched": [],
+                "sequence_mismatched": [],
+                "trigger_mismatched": [],
+                "index_unsupported": [],
+                "constraint_unsupported": [],
+            },
+            {"ok": [], "mismatched": [], "skipped_reason": "skip"},
+            {"missing": [], "unexpected": [], "skipped": []},
+            [],
+            [],
+            {},
+            None,
+            support_summary=support_summary,
+            runtime_degraded_events=[
+                sdr.RuntimeDegradedEvent(
+                    scope="COMPARE",
+                    stage="JOB_ACTION",
+                    code="JOB_ACTION_RECURSION_CAPPED",
+                    entity="SRC.JOB_21",
+                    detail="recursion capped at 256",
+                ),
+                sdr.RuntimeDegradedEvent(
+                    scope="ARTIFACT",
+                    stage="DEPENDENCY_EXPORT",
+                    code="DEPENDENCY_CHAIN_EXPORT_SKIPPED",
+                    entity="dependency_chains",
+                    detail="pair_count=60000",
+                ),
+            ],
+            runtime_degraded_detail_path=Path("/tmp/runtime_degraded_detail_20260408_120000.txt"),
+        )
+        self.assertTrue(any("compare incomplete" in item for item in summary.attention))
+
+    def test_build_run_summary_describes_structural_grant_mode(self):
+        ctx = sdr.RunSummaryContext(
+            start_time=datetime.now(),
+            start_perf=0.0,
+            phase_durations={},
+            phase_skip_reasons={},
+            enabled_primary_types={"TABLE"},
+            enabled_extra_types=set(),
+            print_only_types=set(),
+            total_checked=1,
+            enable_dependencies_check=False,
+            enable_comment_check=False,
+            enable_grant_generation=True,
+            enable_schema_mapping_infer=False,
+            fixup_enabled=True,
+            fixup_dir="fixup_scripts",
+            dependency_chain_file=None,
+            view_chain_file=None,
+            trigger_list_summary=None,
+            report_start_perf=0.0,
+        )
+        support_summary = sdr.SupportClassificationResult(
+            support_state_map={},
+            missing_detail_rows=[],
+            unsupported_rows=[],
+            extra_missing_rows=[],
+            missing_support_counts={},
+            extra_blocked_counts={},
+            unsupported_table_keys=set(),
+            unsupported_view_keys=set(),
+            view_compat_map={},
+            view_constraint_cleaned_rows=[],
+            view_constraint_uncleanable_rows=[],
+        )
+        grant_plan = sdr.GrantPlan(
+            object_grants={"APP": {sdr.ObjectGrantEntry("SELECT", "TOWNER.T1", False)}},
+            column_grants={},
+            sys_privs={},
+            role_privs={},
+            role_ddls=[],
+            filtered_grants=[],
+            view_grant_targets=set(),
+            object_target_types={"TOWNER.T1": "TABLE"},
+            grant_generation_mode="structural",
+            mode_skip_counts={
+                "oracle_object_privileges": 12,
+                "column_privileges": 3,
+                "system_privileges": 2,
+                "role_privileges": 1,
+            },
+            derived_dependency_pair_count=4,
+            source_dependency_record_count=9,
+        )
+        summary = sdr.build_run_summary(
+            ctx,
+            {"missing": [], "mismatched": [], "extra_targets": [], "skipped": [], "extraneous": []},
+            {
+                "index_mismatched": [],
+                "constraint_mismatched": [],
+                "sequence_mismatched": [],
+                "trigger_mismatched": [],
+                "index_unsupported": [],
+                "constraint_unsupported": [],
+            },
+            {"ok": [], "mismatched": [], "skipped_reason": "skip"},
+            {"missing": [], "unexpected": [], "skipped": []},
+            [],
+            [],
+            {},
+            None,
+            support_summary=support_summary,
+            grant_plan=grant_plan,
+        )
+        joined_actions = "\n".join(summary.actions_done)
+        joined_findings = "\n".join(summary.findings)
+        joined_attention = "\n".join(summary.attention)
+        joined_next = "\n".join(summary.next_steps)
+        self.assertIn("mode=structural", joined_actions)
+        self.assertIn("授权模式: structural", joined_findings)
+        self.assertIn("Oracle对象=12", joined_findings)
+        self.assertIn("业务权限", joined_attention)
+        self.assertIn("view_prereq_grants", joined_next)
+
     def test_build_report_usability_rows(self):
         summary = sdr.UsabilitySummary(
             total_candidates=2,
@@ -22529,6 +23275,38 @@ class TestReportDbHelpers(unittest.TestCase):
         )
         self.assertEqual(status_core, "IN_DB")
 
+    def test_export_runtime_degraded_detail_and_infer_artifact_type(self):
+        rows = [
+            sdr.RuntimeDegradedEvent(
+                scope="COMPARE",
+                stage="JOB_ACTION",
+                code="JOB_ACTION_SKIP_OVERSIZED_TEXT",
+                entity="SRC.PKG_A",
+                detail="chars=250000;prefilter_hits=12",
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = sdr.export_runtime_degraded_detail(
+                rows,
+                Path(tmpdir),
+                "20260101_120000",
+            )
+            self.assertIsNotNone(path)
+            text = (path or Path("")).read_text(encoding="utf-8")
+        self.assertIn("SCOPE|STAGE|CODE|ENTITY|DETAIL", text)
+        self.assertIn("COMPARE|JOB_ACTION|JOB_ACTION_SKIP_OVERSIZED_TEXT|SRC.PKG_A|chars=250000;prefilter_hits=12", text)
+        artifact_type = sdr._infer_report_artifact_type(
+            "run_20260101/runtime_degraded_detail_20260101_120000.txt"
+        )
+        self.assertEqual(artifact_type, "RUNTIME_DEGRADED_DETAIL")
+        status_core, _ = sdr._infer_artifact_status(
+            artifact_type,
+            "core",
+            {"missing", "mismatched", "unsupported"},
+            False,
+        )
+        self.assertEqual(status_core, "IN_DB")
+
     def test_infer_artifact_type_for_column_identity_detail(self):
         artifact_type = sdr._infer_report_artifact_type(
             "run_20260101/column_identity_detail_20260101.txt"
@@ -23272,6 +24050,116 @@ class TestReportDbHelpers(unittest.TestCase):
         )
         self.assertFalse(any("仅打印对象" in item for item in diagnostics))
 
+    def test_ensure_report_db_tables_exist_expands_blacklist_reason_and_detail(self):
+        all_tables_out = "\n".join(sorted(sdr.REPORT_DB_TABLES.values()))
+        executed_commit_sql: List[str] = []
+
+        def fake_run_sql(_cfg, sql, timeout=None):
+            sql_u = (sql or "").upper()
+            if "FROM ALL_TABLES" in sql_u:
+                return True, all_tables_out, ""
+            if "FROM ALL_CONSTRAINTS" in sql_u:
+                return True, "", ""
+            if "FROM ALL_TAB_COLUMNS" in sql_u and "TABLE_NAME = 'DIFF_REPORT_BLACKLIST'" in sql_u:
+                if "COLUMN_NAME = 'REASON'" in sql_u:
+                    return True, "512", ""
+                if "COLUMN_NAME = 'DETAIL'" in sql_u:
+                    return True, "1000", ""
+                return True, "COLUMN_EXISTS", ""
+            if "FROM ALL_TAB_COLUMNS" in sql_u and "TABLE_NAME = 'DIFF_REPORT_EXCLUDED_OBJECTS'" in sql_u:
+                if "COLUMN_NAME = 'STATUS'" in sql_u:
+                    return True, "64", ""
+                return True, "COLUMN_EXISTS", ""
+            if "FROM ALL_TAB_COLUMNS" in sql_u and "TABLE_NAME = 'DIFF_REPORT_SUMMARY'" in sql_u:
+                return True, "COLUMN_EXISTS", ""
+            if "FROM ALL_TAB_COLUMNS" in sql_u:
+                return True, "COLUMN_EXISTS", ""
+            return True, "", ""
+
+        def fake_run_sql_commit(_cfg, sql, timeout=None):
+            executed_commit_sql.append(sql or "")
+            return True, "", ""
+
+        with mock.patch.object(sdr, "obclient_run_sql", side_effect=fake_run_sql), \
+             mock.patch.object(sdr, "obclient_run_sql_commit", side_effect=fake_run_sql_commit):
+            ok, err = sdr.ensure_report_db_tables_exist({"executable": "/usr/bin/obclient"}, {"report_db_schema": ""})
+
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+        ddl_text = "\n".join(executed_commit_sql).upper()
+        self.assertIn(
+            "ALTER TABLE DIFF_REPORT_BLACKLIST MODIFY (REASON VARCHAR2(1000))".upper(),
+            ddl_text,
+        )
+        self.assertIn(
+            "ALTER TABLE DIFF_REPORT_BLACKLIST MODIFY (DETAIL VARCHAR2(2000))".upper(),
+            ddl_text,
+        )
+
+    def test_ensure_report_db_tables_exist_expands_report_status_columns(self):
+        all_tables_out = "\n".join(sorted(sdr.REPORT_DB_TABLES.values()))
+        executed_commit_sql: List[str] = []
+
+        def fake_run_sql(_cfg, sql, timeout=None):
+            sql_u = (sql or "").upper()
+            if "FROM ALL_TABLES" in sql_u:
+                return True, all_tables_out, ""
+            if "FROM ALL_CONSTRAINTS" in sql_u:
+                return True, "", ""
+            if "FROM ALL_TAB_COLUMNS" in sql_u:
+                if "TABLE_NAME = 'DIFF_REPORT_GRANT'" in sql_u and "COLUMN_NAME = 'STATUS'" in sql_u:
+                    return True, "32", ""
+                if "TABLE_NAME = 'DIFF_REPORT_USABILITY'" in sql_u and "COLUMN_NAME = 'STATUS'" in sql_u:
+                    return True, "32", ""
+                if "TABLE_NAME = 'DIFF_REPORT_PACKAGE_COMPARE'" in sql_u and "COLUMN_NAME = 'SRC_STATUS'" in sql_u:
+                    return True, "32", ""
+                if "TABLE_NAME = 'DIFF_REPORT_PACKAGE_COMPARE'" in sql_u and "COLUMN_NAME = 'TGT_STATUS'" in sql_u:
+                    return True, "32", ""
+                if "TABLE_NAME = 'DIFF_REPORT_PACKAGE_COMPARE'" in sql_u and "COLUMN_NAME = 'DIFF_STATUS'" in sql_u:
+                    return True, "32", ""
+                if "TABLE_NAME = 'DIFF_REPORT_ARTIFACT'" in sql_u and "COLUMN_NAME = 'STATUS'" in sql_u:
+                    return True, "32", ""
+                if "TABLE_NAME = 'DIFF_REPORT_DEPENDENCY'" in sql_u and "COLUMN_NAME = 'EDGE_STATUS'" in sql_u:
+                    return True, "32", ""
+                if "TABLE_NAME = 'DIFF_REPORT_VIEW_CHAIN'" in sql_u and "COLUMN_NAME = 'GRANT_STATUS'" in sql_u:
+                    return True, "32", ""
+                if "TABLE_NAME = 'DIFF_REPORT_BLACKLIST'" in sql_u and "COLUMN_NAME = 'STATUS'" in sql_u:
+                    return True, "32", ""
+                if "TABLE_NAME = 'DIFF_REPORT_RESOLUTION'" in sql_u and "COLUMN_NAME = 'RESOLUTION_STATUS'" in sql_u:
+                    return True, "32", ""
+                if "TABLE_NAME = 'DIFF_REPORT_EXCLUDED_OBJECT'" in sql_u and "COLUMN_NAME = 'STATUS'" in sql_u:
+                    return True, "64", ""
+                if "TABLE_NAME = 'DIFF_REPORT_SUMMARY'" in sql_u:
+                    return True, "COLUMN_EXISTS", ""
+                return True, "COLUMN_EXISTS", ""
+            return True, "", ""
+
+        def fake_run_sql_commit(_cfg, sql, timeout=None):
+            executed_commit_sql.append(sql or "")
+            return True, "", ""
+
+        with mock.patch.object(sdr, "obclient_run_sql", side_effect=fake_run_sql), \
+             mock.patch.object(sdr, "obclient_run_sql_commit", side_effect=fake_run_sql_commit):
+            ok, err = sdr.ensure_report_db_tables_exist({"executable": "/usr/bin/obclient"}, {"report_db_schema": ""})
+
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+        ddl_text = "\n".join(executed_commit_sql).upper()
+        expected_alters = [
+            "ALTER TABLE DIFF_REPORT_GRANT MODIFY (STATUS VARCHAR2(64))",
+            "ALTER TABLE DIFF_REPORT_USABILITY MODIFY (STATUS VARCHAR2(64))",
+            "ALTER TABLE DIFF_REPORT_PACKAGE_COMPARE MODIFY (SRC_STATUS VARCHAR2(64))",
+            "ALTER TABLE DIFF_REPORT_PACKAGE_COMPARE MODIFY (TGT_STATUS VARCHAR2(64))",
+            "ALTER TABLE DIFF_REPORT_PACKAGE_COMPARE MODIFY (DIFF_STATUS VARCHAR2(64))",
+            "ALTER TABLE DIFF_REPORT_ARTIFACT MODIFY (STATUS VARCHAR2(64))",
+            "ALTER TABLE DIFF_REPORT_DEPENDENCY MODIFY (EDGE_STATUS VARCHAR2(64))",
+            "ALTER TABLE DIFF_REPORT_VIEW_CHAIN MODIFY (GRANT_STATUS VARCHAR2(64))",
+            "ALTER TABLE DIFF_REPORT_BLACKLIST MODIFY (STATUS VARCHAR2(64))",
+            "ALTER TABLE DIFF_REPORT_RESOLUTION MODIFY (RESOLUTION_STATUS VARCHAR2(64))",
+        ]
+        for expected in expected_alters:
+            self.assertIn(expected, ddl_text)
+
     def test_apply_ob_feature_gates_auto_ob_442_plus(self):
         settings = {
             "generate_interval_partition_fixup": "auto",
@@ -23710,6 +24598,126 @@ class TestReportDbHelpers(unittest.TestCase):
         first_sql = sql_calls[0]
         self.assertIn("'WARN'", first_sql)
         self.assertIn("存在 1 个不匹配对象", first_sql)
+
+    def test_save_report_to_db_marks_warn_for_runtime_degraded_compare(self):
+        now = datetime.now()
+        run_summary = sdr.RunSummary(
+            start_time=now,
+            end_time=now,
+            total_seconds=1.0,
+            phases=[],
+            actions_done=[],
+            actions_skipped=[],
+            findings=[],
+            attention=["compare incomplete"],
+            manual_actions=[],
+            change_notices=[],
+            next_steps=[],
+        )
+        run_ctx = sdr.RunSummaryContext(
+            start_time=now,
+            start_perf=0.0,
+            phase_durations={},
+            phase_skip_reasons={},
+            enabled_primary_types={"TABLE"},
+            enabled_extra_types=set(),
+            print_only_types=set(),
+            total_checked=1,
+            enable_dependencies_check=True,
+            enable_comment_check=False,
+            enable_grant_generation=False,
+            enable_schema_mapping_infer=False,
+            fixup_enabled=False,
+            fixup_dir="fixup_scripts",
+            dependency_chain_file=None,
+            view_chain_file=None,
+            trigger_list_summary=None,
+            report_start_perf=0.0,
+        )
+        settings = {
+            "report_to_db": True,
+            "report_db_store_scope": "summary",
+            "report_db_schema_prefix": "",
+            "report_db_insert_batch": 10,
+            "report_db_detail_mode_set": set(),
+            "report_db_detail_item_enable": False,
+            "report_db_save_full_json": False,
+            "report_db_fail_abort": False,
+            "source_schemas_list": ["SRC_A"],
+            "enabled_primary_types": {"TABLE"},
+            "enabled_extra_types": set(),
+            "report_retention_days": 0,
+            "_runtime_degraded_events": [
+                sdr.RuntimeDegradedEvent(
+                    scope="COMPARE",
+                    stage="JOB_ACTION",
+                    code="JOB_ACTION_RECURSION_CAPPED",
+                    entity="SRC.JOB_21",
+                    detail="recursion capped at 256",
+                )
+            ],
+        }
+        sql_calls = []
+
+        def _fake_commit(_ob_cfg, sql):
+            sql_calls.append(sql)
+            return True, "", ""
+
+        extra_results = {
+            "index_mismatched": [],
+            "constraint_mismatched": [],
+            "sequence_mismatched": [],
+            "trigger_mismatched": [],
+            "index_unsupported": [],
+            "constraint_unsupported": [],
+        }
+
+        with mock.patch.object(sdr, "ensure_report_db_tables_exist", return_value=(True, None)), \
+             mock.patch.object(sdr, "obclient_run_sql_commit", side_effect=_fake_commit), \
+             mock.patch.object(sdr, "_insert_report_counts_rows", return_value=True), \
+             mock.patch.object(sdr, "_build_report_artifact_rows", return_value=[]), \
+             mock.patch.object(sdr, "ensure_report_db_views_exist", return_value=[]), \
+             mock.patch.object(sdr, "build_report_sql_template_file", return_value=None), \
+             mock.patch.object(
+                 sdr,
+                 "_verify_report_db_row_consistency",
+                 return_value=(True, {"summary": 1, "counts": 0}, "")
+             ):
+            ok, report_id = sdr.save_report_to_db(
+                {"executable": "/usr/bin/obclient"},
+                settings,
+                run_summary,
+                run_ctx,
+                "20260408_120000",
+                None,
+                {"missing": [], "mismatched": [], "ok": [("TABLE", "TGT.T1", "SRC.T1")], "skipped": []},
+                extra_results,
+                None,
+                {},
+                None,
+                None,
+                set(),
+                grant_plan=None,
+                usability_summary=None,
+                package_results=None,
+                trigger_status_rows=None,
+                constraint_status_rows=None,
+                dependency_report=None,
+                expected_dependency_pairs=None,
+                view_chain_file=None,
+                remap_conflicts=None,
+                full_object_mapping=None,
+                remap_rules=None,
+                blacklist_report_rows=None,
+                fixup_skip_summary=None,
+                blacklisted_table_keys=None,
+                excluded_object_rows=None,
+            )
+        self.assertTrue(ok)
+        self.assertIsNotNone(report_id)
+        first_sql = sql_calls[0]
+        self.assertIn("'WARN'", first_sql)
+        self.assertIn("compare incomplete", first_sql)
 
     def test_save_report_to_db_marks_failed_when_row_consistency_mismatch(self):
         now = datetime.now()

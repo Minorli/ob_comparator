@@ -1,17 +1,19 @@
 # OceanBase Comparator Toolkit
 
-> 当前版本：V0.9.8.9  
+> 当前版本：V0.9.9.0
 > 面向 Oracle → OceanBase (Oracle 模式) 的结构一致性校验与修补脚本生成工具  
 > 核心理念：一次转储、本地对比、脚本审计优先
 
-## 近期更新（0.9.8.9）
-- VIEW 授权依赖补强：对 `ORA-01720` 敏感的 VIEW 授权链，程序会生成 `view_prereq_grants/`；如果目标端 VIEW 已存在且 prerequisite grants 是后补的，还会额外生成 `view_refresh/`。`run_fixup` 在执行 `view_post_grants/` 命中 `ORA-01720` 时，也会先应用 prerequisite grants，必要时执行匹配的 `view_refresh/`，再重试最终 VIEW grant。
-- 黑名单表重纳管增强：`blacklist_target_existing_policy=rehydrate_if_present` 已进入正式版本；当目标端已存在人工改造后的承接表时，可恢复后续 compare/fixup，并自动保护黑名单改造列不被写回 Oracle 原始语义。
-- 触发器边界更准确：`INSTEAD OF ... ON VIEW` 触发器已纳入正常 compare/fixup；`DATABASE/SCHEMA` 级事件触发器继续保留为人工处理。
-- Oracle 派生表降噪补齐：`RUPD$_*`、`SNAP$_*` 与既有 `MLOG$_*` 一样按系统工件从 compare/fixup 中排除。
-- identity 跨 schema 授权增强：会识别 OB identity 底层 `ISEQ$$_...`，对源端已授 `INSERT` 的 identity 表额外检查目标端 sequence `SELECT` 是否缺失，并输出 `identity_sequence_grant_detail_<ts>.txt` 与 `grants_miss/` 补授权脚本。
-- `remap_root_closure + trigger_list` 收口：`trigger_list` 现在可接受源端名或 remap 后目标名；未解析条目只进入报告不再 fatal。若触发器依赖的目标表尚未创建，首轮只生成 TABLE 脚本，不生成 TRIGGER 脚本，并在 `fixup_skip_summary_<ts>.txt` 中解释跳过原因。
-- README / `readme_config.txt` / 技术文档当前版本号已同步到 `0.9.8.9`。
+## 近期更新（0.9.9.0）
+- 新增 `grant_generation_mode=full|structural`：默认 `full` 保持 Oracle 权限镜像；`structural` 只生成对象创建、编译、跨 schema 依赖闭环所需的最小授权，便于把业务权限与迁移结构权限拆开治理。
+- VIEW rewrite 收敛为“只改数据来源对象”：`TABLE / VIEW / MVIEW / SYNONYM` 继续参与 VIEW DDL 改写；`FUNCTION / PACKAGE / PROCEDURE / SEQUENCE / TYPE` 只保留诊断，不再误改 DDL，也不再把 `SYS.DBMS_METADATA` 一类调用对象混进 unresolved warning。
+- 运行时降级显式化：当 `JOB_ACTION` 文本递归、超大依赖图导出等保护逻辑触发时，会新增 `runtime_degraded_detail_<ts>.txt`，主报告与 run summary 会明确标记 `compare incomplete` 或“仅辅助产物降级”。
+- scoped text / `JOB_ACTION` 性能保护增强：`safe text fallback` 现在带有大文本跳过、高扇出跳过、递归封顶和批次进度日志，生产上更容易区分“真卡住”和“大对象还在扫描”。
+- `dependency_chains_*.txt` 大图保护增强：导出前不再无脑构造全量依赖 pair；遇到大图会提前跳过或截断链路，并把影响写入运行时降级明细，避免审计附件拖垮主 compare。
+- `remap_root_closure` 继续收口：managed mapping 与 discovery-only mapping 已分离；`trigger_list`、同义词依附、反向依赖和 related object 会继续进入 closure，但不再污染 operator-facing compare/fixup 范围。
+- 新增 `sequence_sync_mode=last_number`：可按 Oracle/OB 当前 `LAST_NUMBER` 生成 `fixup_scripts/sequence_restart/`，用于单独同步 sequence 当前值，默认仍不自动执行。
+- GTT 受管与 MVIEW 门控增强：`gtt_table_handling_mode` 支持按普通 TABLE 或保留原义受管；`mview_check_fixup_mode=auto` 会按 OB 版本动态开关校验与修补。
+- report_db 老表自迁移增强：启动时会自动扩容过窄的 `STATUS/REASON/DETAIL` 列，降低老表结构拖累新版本写库的概率。
 
 ## 核心能力
 - **对象覆盖完整**：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。
@@ -23,17 +25,19 @@
 - **Target Scope 一等公民**：目标端受管 schema 不再等同于 `source_schemas`；会按 remap/full mapping 自动推导，哪怕 remap 到全新的目标 schema，也会继续进入 compare/fixup/report。
 - **Mapping 分层可审计**：`object_mapping_<ts>.txt` 表示本轮受管 managed mapping；若 closure 内部还发现了未纳入 compare/fixup 的 related object，会额外输出 `object_mapping_discovery_<ts>.txt`。
 - **依赖与授权**：基于 DBA_DEPENDENCIES/DBA_*_PRIVS 生成缺失依赖与授权脚本。
+- **授权生成模式可切换**：`grant_generation_mode=full|structural` 可在“Oracle 全量授权镜像”和“最小结构性授权”之间切换，默认不破坏原有授权逻辑。
 - **identity sequence 授权感知**：跨 schema identity 表会额外检查 OB 侧 `ISEQ$$_...` 的 `SELECT` 授权 readiness，避免“表 grant 齐了但 INSERT 仍失败”。
 - **DDL 清洗与兼容**：VIEW DDL 走 DBMS_METADATA，PL/SQL 语法清洗与 Hint 过滤。
 - **DDL 输出格式化**：可选 SQLcl 格式化 fixup DDL（不影响校验与修补逻辑）。
 - **修补脚本执行器**：支持 smart-order、迭代重试、VIEW 链路自动修复、错误报告。
-- **报告体系**：Rich 控制台 + 纯文本快照 + 细节分拆报告（可配置）。
+- **报告体系**：Rich 控制台 + 纯文本快照 + 细节分拆报告（可配置）；若命中保护性降级，会额外输出 `runtime_degraded_detail_<ts>.txt`。
 - **空表风险识别**：可选识别“源端有数据但目标端空表”的高风险场景（不做 `COUNT(*)`）。
 - **不支持对象识别**：黑名单/依赖阻断对象单独统计与分流输出。
 
 ## 新增能力总览（按模块）
 - **报告入库**：`report_to_db` 支持 `summary/core/full` 多级落库与行化明细，支持数据库侧直接排查（含 HOW TO SQL 手册）。
   `DIFF_REPORT_DETAIL` / `DIFF_REPORT_DETAIL_ITEM` 现在会保留 `RISKY` 作为独立 `report_type`；但主报告与 `unsupported_objects_detail_<ts>.txt` 仍继续按“缺失(不支持/阻断/待确认)”汇总展示。
+- **运行时降级明示**：当 compare 因性能保护转为 partial 时，会输出 `runtime_degraded_detail_<ts>.txt`，主报告、run summary 和 report_db 结论都会显式标记当前结果不是完整 compare。
 - **迁移聚焦报告**：按“可修补缺失 vs 不支持/阻断”拆分，保留全量明细并可在主报告快速定位。
 - **可用性校验**：支持 VIEW/SYNONYM 查询可用性检查（`WHERE 1=2`）与根因输出。
 - **表数据风险校验**：`table_data_presence_check` 识别“源端有数据、目标空表”风险；`auto` 为统计口径，`on` 为严格回表。
@@ -45,6 +49,7 @@
 - **约束状态修复默认更严格**：`constraint_status_sync_mode` 默认改为 `full`，现有 `FK/CHECK` 的 `VALIDATED / NOT VALIDATED` 漂移会默认进入状态校验与状态修复脚本；`PK/UK` 的 `VALIDATED / NOT VALIDATED` 漂移也会进入状态漂移报告，但仍不生成 `ENABLE/[NO]VALIDATE` SQL。
 - **OB FK 元数据增强**：当 OceanBase `DBA_CONSTRAINTS` 退化到 basic/degraded 模式时，会对受影响 FK 定向回填 `R_OWNER/R_CONSTRAINT_NAME`，避免仅按本地列集合误判 FK 已匹配。
 - **视图兼容治理**：支持 VIEW 兼容规则、DBLINK 策略、列清单约束清洗与依赖链修复。
+- **VIEW 依赖重写降噪**：VIEW rewrite 只处理表类数据来源；callable 依赖只保留诊断，并按 `ORACLE_SYSTEM / CROSS_SCHEMA_OK / CROSS_SCHEMA_MISSING / UNKNOWN` 分类输出 unresolved。
 - **DDL 清洗与格式化**：支持 `ddl_cleanup_detail_<ts>.txt` 审计明细、全角标点清洗、hint 策略清洗、SQLcl 格式化（可按类型/体积/超时控制）；语义改写会在脚本头写 `DDL_REWRITE` 注释。
 - **黑名单与排除机制**：支持规则引擎、名称模式、显式排除清单（`exclude_objects_file`）与依赖联动过滤。
 - **版本门控**：按 OB 版本动态处理 MVIEW、interval 分区等能力差异，降低跨版本误报。
@@ -133,6 +138,7 @@ java_home = /usr/lib/jvm/java-11
 `dbcat_output/cache/` 扁平缓存以实际对象文件为准；如果 `cache/index.json` 漏项，但对应 `SCHEMA/TYPE/OBJ.sql` 存在，主程序会继续命中该缓存并自动修复索引。
 `main_reports/run_<ts>/managed_target_scope_detail_<ts>.txt` 会列出本轮实际受管的目标 schema，明确哪些 schema 是仅由 remap 导出的新目标范围。
 `main_reports/run_<ts>/object_mapping_<ts>.txt` 现在表示本轮真正参与 compare/fixup 的受管映射；若存在 closure 内部额外发现但未纳入 managed scope 的对象，会额外输出 `object_mapping_discovery_<ts>.txt` 供审计。
+若只希望生成“对象创建/编译所需”的最小授权，可把 `grant_generation_mode = structural` 写入 `[SETTINGS]`；这不会影响对象 compare/fixup，只会收窄授权脚本输出口径。
 
 ### 3) 运行对比
 ```bash
@@ -150,6 +156,8 @@ python3 run_fixup.py --smart-order --recompile
 主程序跑完后，优先看两处：
 - `main_reports/run_<ts>/manual_actions_required_<ts>.txt`
   说明：这是本次仍需人工处理/确认的统一清单，先看它，再展开其他 detail/fixup。
+- `main_reports/run_<ts>/runtime_degraded_detail_<ts>.txt`
+  说明：若存在这个文件，代表本轮命中了保护性降级。先看它，再判断当前结果是否可直接作为最终 compare 结论。
 - `main_reports/run_<ts>/oracle_privilege_family_detail_<ts>.txt`
   说明：这是 Oracle 权限族覆盖清单。`grants_miss/` 只代表当前 runnable grants，不等于全部 Oracle 权限已经闭环。
 - `report_<ts>.txt` 里的 `执行结论` 和 `本次建议处理顺序`
@@ -259,6 +267,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/source_scope_detail_<ts>.txt`：源对象范围明细（`source_object_scope_mode=remap_root_closure` 时的 roots/closure/filter 诊断，必要时追加 `INTEGRITY_CRITICAL` / `INTEGRITY_WARNING`）
 - `main_reports/run_<ts>/scope_integrity_detail_<ts>.txt`：scope 完整性明细（blocking `VIEW/MVIEW` + 可选 advisory-family `INFO`）
 - `main_reports/run_<ts>/scope_integrity_remap_candidates_<ts>.txt`：可直接补入 remap 文件的候选对象清单
+- `main_reports/run_<ts>/runtime_degraded_detail_<ts>.txt`：运行时降级明细（区分 `COMPARE` 与 `ARTIFACT`；若存在 `COMPARE`，主报告会标记 `compare incomplete`）
 - `main_reports/run_<ts>/extra_mismatch_detail_<ts>.txt`：扩展对象差异明细（report_detail_mode=split）
 - `main_reports/run_<ts>/column_nullability_detail_<ts>.txt`：现有列空值语义差异明细（含 `NOT NULL`、`NOT NULL ENABLE NOVALIDATE` 与反向漂移；其中 `ENABLE NOVALIDATE` 补位会在 `table_alter` 中默认输出可执行约束 SQL）
 - OceanBase 侧等价 `CHECK (<col> IS NOT NULL)` 识别依赖 `DBA_CONSTRAINTS` 条件文本；当前版本已改为按 chunk 保留成功的 `SEARCH_CONDITION`，并在退化时按表/约束回填，避免因个别 owner 查询失败而误生 `NOT NULL ENABLE NOVALIDATE` DDL
@@ -267,7 +276,9 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - 当目标端同一列存在多份等价单列 `IS NOT NULL` CHECK、而源端仅保留一份语义时，扩展约束 compare 会把多余约束列为 `extra mismatch`，并在 `fixup/cleanup_candidates/extra_cleanup_candidates.txt` 的 `SAFE_DUPLICATE_NOTNULL_DROP_SQL` 区域输出未注释的 `DROP CONSTRAINT` 候选，同时生成 `fixup/cleanup_safe/constraint/*.sql`；`generate_extra_cleanup` 默认开启，但 `cleanup_safe/` 默认不会被 `run_fixup` 执行，需显式 `--only-dirs cleanup_safe/constraint`
 - 当 `extra_constraint_cleanup_mode=semantic_fk_check` 时，compare 后仍判定为 target-only 的 `FK/CHECK` 会额外生成到 `fixup/cleanup_semantic/constraint/*.sql`；这类 SQL 同样属于 destructive cleanup，默认不会被 `run_fixup` 自动执行，需显式 `--only-dirs cleanup_semantic/constraint`
 - VIEW 依赖 remap 现在会处理 `FROM/JOIN` 中的带引号 qualified 引用（如 `"SRC"."T1"`），并支持 `TABLE(...)`、`XMLTABLE(...)`、`JSON_TABLE(...)` 等特殊构造中的受管对象 token 重写；当同义词终点无法安全解析时，会保留原始引用并输出诊断日志，不再 fallback 到目标同义词名，也不会做盲目的 schema-only 改写
+- VIEW rewrite 现在只对表类数据来源做改写；`FUNCTION/PACKAGE/PROCEDURE/SEQUENCE/TYPE` 一律只作为诊断依赖保留，不再参与 DDL rewrite，也不会再制造同类 unresolved warning 噪音
 - scoped text matching（`JOB_ACTION` / `safe text fallback`）已改为索引化匹配：先从文本提取标识符 token，再只对命中 token 的候选对象做精确 regex；日志会额外输出 `[PERF] ... pattern_index / scan / round` 计数，便于区分“建索引慢”还是“扫文本慢”
+- 若 `JOB_ACTION` / `dependency_chains` 命中了性能保护，本轮会生成 `runtime_degraded_detail_<ts>.txt`；其中 `COMPARE` 级事件代表结果不完整，`ARTIFACT` 级事件仅影响依赖链附件等辅助产物
 - 列默认值 compare 继续按大小写不敏感语义比较（字符串字面量除外）；并额外对数值字面量、`DATE '...'`、`-(1)` 这类负号包裹数字、以及字符串字面量外部的尾部注释做语义归一，避免 `.98/0/DATE '1990-01-01'/user` 这类目标端字典表现差异被误报成 drift。报告和 review-first fixup SQL 仍尽量保留源端显示形式，但会剥掉 `USER--更新人` 这类非语义尾注释，避免把注释残片写回 SQL
 - `main_reports/run_<ts>/column_visibility_skipped_detail_<ts>.txt`：`column_visibility_policy=auto` 且 `INVISIBLE_COLUMN` 元数据不完整时的跳过明细，说明哪些表本轮未做 INVISIBLE compare/fixup
 - OceanBase 列元数据现在联合 `DBA_TAB_COLUMNS` 与 `DBA_TAB_COLS` 取长补短；标准字段优先保留 `DBA_TAB_COLUMNS`，可选标记/缺失值由 `DBA_TAB_COLS` 补齐，降低单视图元数据不一致带来的漏检

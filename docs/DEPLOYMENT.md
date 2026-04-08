@@ -1,6 +1,6 @@
 # 数据库对象对比工具 - 跨平台打包与执行指南 (Wheelhouse 版)
 
-> 适用版本：V0.9.8.9
+> 适用版本：V0.9.9.0
 
 > 适用场景：需要在无网络或不同机器上运行本工具，且保持源码不改。  
 > 方案：wheelhouse + venv，无需 PyInstaller。
@@ -73,9 +73,13 @@ python run_fixup.py --smart-order --recompile
 提示：`run_fixup` 默认跳过 `fixup_scripts/table/`（防止误建空表）。  
 如需执行建表脚本，显式添加：`--allow-table-create`。
 
+提示：若本次只想输出“对象能创建/能编译”的最小授权，可在 `config.ini` 中设置 `grant_generation_mode=structural`。
+
 提示：默认报告输出为 `main_reports/run_<timestamp>/`，如需兼容旧流程可设置 `report_dir_layout=flat`。
 
 提示：`report_sql_<timestamp>.txt` 现在只提供 `report_id` 与 HOW TO 文档入口；如果交付包缺少 HOW TO 文件，客户无法按数据库侧剧本排查。
+
+提示：若运行后出现 `runtime_degraded_detail_<timestamp>.txt`，说明本轮命中了保护性降级；交付时应把它与主报告一起提供，避免把 partial compare 当作最终结论。
 
 ## 5. 常见问题检查清单
 - `LD_LIBRARY_PATH` 是否包含 instantclient。
@@ -102,5 +106,6 @@ python3 -m py_compile $(git ls-files '*.py')
 验收建议：
 - 生成一次主报告并确认 `main_reports/run_<ts>/report_<ts>.txt` 可读；
 - 若 `report_to_db=true`，确认 `DIFF_REPORT_SUMMARY` 出现新 `report_id`；
+- 若生成了 `runtime_degraded_detail_<ts>.txt`，确认交付说明里已明确本轮是否 `compare incomplete`；
 - 执行 `run_fixup.py --smart-order --recompile` 前先人工审核 `fixup_scripts/`。
 - 若联调测试报 `ORA-12560` 或 OB socket 错误，优先排查客户端环境/网络连通性（非程序逻辑缺陷）。

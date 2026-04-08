@@ -16,7 +16,7 @@
 
 """
 
-数据库对象对比工具 (V0.9.8.9 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
+数据库对象对比工具 (V0.9.9.0 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -33,7 +33,7 @@
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.9.8.9 核心)：
+3. 性能架构 (V0.9.9.0 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          DBA_OBJECTS
@@ -95,7 +95,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Dict, FrozenSet, Iterable, Iterator, List, NamedTuple, NoReturn, Optional, Pattern, Sequence, Set, Tuple, Union
 
-__version__ = "0.9.8.9"
+__version__ = "0.9.9.0"
 
 __author__ = "Minor Li"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
@@ -422,6 +422,92 @@ class RunSummaryContext(NamedTuple):
     hot_reload_mode: str = "off"
     hot_reload_events_count: int = 0
     hot_reload_events_file: Optional[Path] = None
+
+
+RUNTIME_DEGRADED_SCOPE_COMPARE = "COMPARE"
+RUNTIME_DEGRADED_SCOPE_ARTIFACT = "ARTIFACT"
+
+
+class RuntimeDegradedEvent(NamedTuple):
+    scope: str
+    stage: str
+    code: str
+    entity: str
+    detail: str
+
+
+def _normalize_runtime_degraded_scope(raw_value: object) -> str:
+    value = str(raw_value or "").strip().upper()
+    if value == RUNTIME_DEGRADED_SCOPE_ARTIFACT:
+        return RUNTIME_DEGRADED_SCOPE_ARTIFACT
+    return RUNTIME_DEGRADED_SCOPE_COMPARE
+
+
+def _coerce_runtime_degraded_event(item: object) -> Optional[RuntimeDegradedEvent]:
+    if isinstance(item, RuntimeDegradedEvent):
+        event = item
+    elif isinstance(item, dict):
+        event = RuntimeDegradedEvent(
+            scope=str(item.get("scope") or ""),
+            stage=str(item.get("stage") or ""),
+            code=str(item.get("code") or ""),
+            entity=str(item.get("entity") or ""),
+            detail=str(item.get("detail") or ""),
+        )
+    elif isinstance(item, (tuple, list)) and len(item) >= 5:
+        event = RuntimeDegradedEvent(
+            scope=str(item[0] or ""),
+            stage=str(item[1] or ""),
+            code=str(item[2] or ""),
+            entity=str(item[3] or ""),
+            detail=str(item[4] or ""),
+        )
+    else:
+        return None
+    return RuntimeDegradedEvent(
+        scope=_normalize_runtime_degraded_scope(event.scope),
+        stage=str(event.stage or "").strip().upper(),
+        code=str(event.code or "").strip().upper(),
+        entity=str(event.entity or "").strip(),
+        detail=str(event.detail or "").strip(),
+    )
+
+
+def normalize_runtime_degraded_events(
+    events: Optional[Sequence[object]]
+) -> List[RuntimeDegradedEvent]:
+    normalized: List[RuntimeDegradedEvent] = []
+    seen: Set[RuntimeDegradedEvent] = set()
+    for item in (events or []):
+        event = _coerce_runtime_degraded_event(item)
+        if event is None or event in seen:
+            continue
+        seen.add(event)
+        normalized.append(event)
+    return normalized
+
+
+def record_runtime_degraded_event(
+    events: Optional[List[RuntimeDegradedEvent]],
+    *,
+    scope: str,
+    stage: str,
+    code: str,
+    entity: str = "",
+    detail: str = "",
+) -> None:
+    if events is None:
+        return
+    event = _coerce_runtime_degraded_event({
+        "scope": scope,
+        "stage": stage,
+        "code": code,
+        "entity": entity,
+        "detail": detail,
+    })
+    if event is None or event in events:
+        return
+    events.append(event)
 
 
 @dataclass
@@ -1352,6 +1438,10 @@ class GrantPlan(NamedTuple):
     filtered_grants: List[FilteredGrantEntry]
     view_grant_targets: Set[str]
     object_target_types: Optional[Dict[str, str]] = None
+    grant_generation_mode: str = "full"
+    mode_skip_counts: Optional[Dict[str, int]] = None
+    derived_dependency_pair_count: int = 0
+    source_dependency_record_count: int = 0
 
 
 class IdentitySequenceGrantExpectationRow(NamedTuple):
@@ -1527,6 +1617,43 @@ MANUAL_FIXUP_SEMI_AUTO_DETAIL_TEXT = "若无法获取源端DDL，将输出草案
 SYNONYM_TARGET_OUT_OF_SCOPE_REASON_CODE = "SYNONYM_TARGET_OUT_OF_SCOPE"
 SYNONYM_TARGET_OUT_OF_SCOPE_REASON_TEXT = "同义词终点对象不在本次迁移范围"
 SYNONYM_TARGET_OUT_OF_SCOPE_ACTION_TEXT = "先纳入终点对象或跳过同义词"
+REWRITE_ELIGIBLE_DEP_TYPES: FrozenSet[str] = frozenset({
+    "TABLE",
+    "VIEW",
+    "MATERIALIZED VIEW",
+    "SYNONYM",
+})
+VIEW_REWRITE_TERMINAL_TYPES: FrozenSet[str] = frozenset({
+    "TABLE",
+    "VIEW",
+    "MATERIALIZED VIEW",
+})
+VIEW_CALLABLE_DEP_TYPES: FrozenSet[str] = frozenset({
+    "FUNCTION",
+    "PACKAGE",
+    "PROCEDURE",
+    "SEQUENCE",
+    "TYPE",
+    "TYPE BODY",
+})
+ORACLE_SYSTEM_SCHEMAS: FrozenSet[str] = frozenset({
+    "SYS",
+    "SYSTEM",
+    "MDSYS",
+    "CTXSYS",
+    "ORDSYS",
+    "XDB",
+    "WMSYS",
+    "DBSNMP",
+    "OUTLN",
+    "ORACLE_OCM",
+    "LBACSYS",
+    "EXFSYS",
+    "OLAPSYS",
+    "ORDDATA",
+    "ORDPLUGINS",
+    "SI_INFORMTN_SCHEMA",
+})
 
 OB_FEATURE_GATE_VERSION = "4.4.2"
 INTERVAL_PARTITION_FIXUP_MODE_VALUES: Set[str] = {"auto", "true", "false"}
@@ -4632,6 +4759,17 @@ SEQUENCE_REMAP_POLICY_ALIASES = {
     "dominanttable": "dominant_table",
     "table": "dominant_table",
 }
+GRANT_GENERATION_MODE_FULL = "full"
+GRANT_GENERATION_MODE_STRUCTURAL = "structural"
+GRANT_GENERATION_MODE_VALUES = {
+    GRANT_GENERATION_MODE_FULL,
+    GRANT_GENERATION_MODE_STRUCTURAL,
+}
+GRANT_GENERATION_MODE_ALIASES = {
+    "minimal": GRANT_GENERATION_MODE_STRUCTURAL,
+    "dependency_only": GRANT_GENERATION_MODE_STRUCTURAL,
+    "dependency-only": GRANT_GENERATION_MODE_STRUCTURAL,
+}
 
 
 def normalize_sequence_remap_policy(raw_value: Optional[str]) -> str:
@@ -4642,6 +4780,17 @@ def normalize_sequence_remap_policy(raw_value: Optional[str]) -> str:
     if value not in SEQUENCE_REMAP_POLICY_VALUES:
         log.warning("sequence_remap_policy=%s 不在支持范围内，将回退为 source_only。", raw_value)
         return "source_only"
+    return value
+
+
+def normalize_grant_generation_mode(raw_value: Optional[str]) -> str:
+    if not raw_value or not str(raw_value).strip():
+        return GRANT_GENERATION_MODE_FULL
+    value = str(raw_value).strip().lower()
+    value = GRANT_GENERATION_MODE_ALIASES.get(value, value)
+    if value not in GRANT_GENERATION_MODE_VALUES:
+        log.warning("grant_generation_mode=%s 不在支持范围内，将回退为 full。", raw_value)
+        return GRANT_GENERATION_MODE_FULL
     return value
 
 
@@ -6602,6 +6751,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('sequence_remap_policy', 'source_only')
         settings.setdefault('sequence_sync_mode', 'off')
         settings.setdefault('generate_grants', 'true')
+        settings.setdefault('grant_generation_mode', 'full')
         settings.setdefault('grant_tab_privs_scope', 'owner')
         settings.setdefault('grant_merge_privileges', 'true')
         settings.setdefault('grant_merge_grantees', 'true')
@@ -6695,6 +6845,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings['enable_grant_generation'] = parse_bool_flag(
             settings.get('generate_grants', 'true'),
             True
+        )
+        settings['grant_generation_mode'] = normalize_grant_generation_mode(
+            settings.get('grant_generation_mode', 'full')
         )
         settings['grant_tab_privs_scope'] = settings.get('grant_tab_privs_scope', 'owner').strip().lower()
         settings['grant_supported_sys_privs_set'] = parse_csv_set(settings.get('grant_supported_sys_privs', ''))
@@ -7407,6 +7560,14 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "仅支持 owner 或 owner_or_grantee"
 
+    def _validate_grant_generation_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = GRANT_GENERATION_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in GRANT_GENERATION_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 full 或 structural"
+
     def _validate_synonym_fixup_scope(val: str) -> Tuple[bool, str]:
         if not val.strip():
             return True, ""
@@ -7845,6 +8006,14 @@ def run_config_wizard(config_path: Path) -> None:
         "是否生成授权脚本并附加到修复 DDL (true/false)",
         default=cfg.get("SETTINGS", "generate_grants", fallback="true"),
         transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "grant_generation_mode",
+        "授权生成模式 (full/structural)",
+        default=cfg.get("SETTINGS", "grant_generation_mode", fallback="full"),
+        validator=_validate_grant_generation_mode,
+        transform=normalize_grant_generation_mode,
     )
     _prompt_field(
         "SETTINGS",
@@ -10266,6 +10435,11 @@ ORACLE_CURSOR_FETCH_TUNING: Dict[str, Tuple[int, int]] = {
     "bulk_metadata": (5000, 5000),
     "medium_metadata": (2000, 2000),
 }
+MAX_JOB_ACTION_RECURSIVE_PROGRAM_UNITS = 256
+MAX_JOB_ACTION_SCAN_TEXT_BYTES = 200000
+MAX_JOB_ACTION_PREFILTER_HITS = 2048
+MAX_DEPENDENCY_CHAIN_EXPORT_PAIRS = 50000
+MAX_DEPENDENCY_CHAIN_EXPORT_CHAINS = 200000
 
 
 def apply_oracle_cursor_fetch_tuning(cursor, profile: str = "small_lookup") -> None:
@@ -10575,6 +10749,7 @@ def _build_sorted_attached_map(
 def build_job_action_dependency_records(
     source_objects: Optional[SourceObjectMap],
     text_index: Optional[Dict[DependencyNode, str]],
+    runtime_degraded_events: Optional[List[RuntimeDegradedEvent]] = None,
 ) -> List[DependencyRecord]:
     source_objects = source_objects or {}
     text_index = text_index or {}
@@ -10597,13 +10772,86 @@ def build_job_action_dependency_records(
     def _expand_program_unit(full_u: str, type_u: str) -> List[Tuple[str, str]]:
         candidates: List[Tuple[str, str]] = []
         full_upper = (full_u or "").upper()
-        if type_u == "PACKAGE" and (full_upper, "PACKAGE BODY") in text_index:
+        available_types = {
+            (item or "").upper()
+            for item in (source_objects.get(full_upper) or set())
+            if item
+        }
+        # Prefer executable bodies; PACKAGE/TYPE specs add little value here and
+        # can be very large in production, while their structural dependencies are
+        # already covered by the regular Oracle dependency graph.
+        if type_u == "PACKAGE" and "PACKAGE BODY" in available_types and (full_upper, "PACKAGE BODY") in text_index:
             candidates.append((full_upper, "PACKAGE BODY"))
-        if type_u == "TYPE" and (full_upper, "TYPE BODY") in text_index:
+            return candidates
+        if type_u == "TYPE" and "TYPE BODY" in available_types and (full_upper, "TYPE BODY") in text_index:
             candidates.append((full_upper, "TYPE BODY"))
+            return candidates
         if (full_upper, type_u) in text_index:
             candidates.append((full_upper, type_u))
         return candidates
+
+    text_match_cache: Dict[DependencyNode, List[str]] = {}
+
+    def _resolve_matches(node_key: DependencyNode, raw_text: str, node_owner: str) -> List[str]:
+        cache_key = (((node_key[0] or "").upper()), ((node_key[1] or "").upper()))
+        cached = text_match_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+        raw_text = raw_text or ""
+        cleaned_text = mask_sql_for_scan(raw_text).upper()
+        dynamic_sql_texts_raw, _dynamic_sql_ambiguities = _extract_dynamic_sql_literals_for_scan(raw_text or "")
+        dynamic_sql_texts = [item.upper() for item in dynamic_sql_texts_raw]
+        text_tokens = pattern_index.extract_tokens(cleaned_text, dynamic_sql_texts)
+        scoped_hits, outer_hits, dynamic_hits = pattern_index.estimate_prefilter_hits(
+            text_tokens,
+            node_owner,
+        )
+        total_hits = scoped_hits + outer_hits + dynamic_hits
+        if len(raw_text) > MAX_JOB_ACTION_SCAN_TEXT_BYTES:
+            log.warning(
+                "[PERF] JOB_ACTION skip oversized text scan: node=%s, chars=%d, prefilter_hits=%d",
+                cache_key[0],
+                len(raw_text),
+                total_hits,
+            )
+            record_runtime_degraded_event(
+                runtime_degraded_events,
+                scope=RUNTIME_DEGRADED_SCOPE_COMPARE,
+                stage="JOB_ACTION",
+                code="JOB_ACTION_SKIP_OVERSIZED_TEXT",
+                entity=cache_key[0],
+                detail=f"chars={len(raw_text)};prefilter_hits={total_hits}",
+            )
+            text_match_cache[cache_key] = []
+            return []
+        if total_hits > MAX_JOB_ACTION_PREFILTER_HITS:
+            log.warning(
+                "[PERF] JOB_ACTION skip high-fanout text scan: node=%s, chars=%d, prefilter_hits=%d",
+                cache_key[0],
+                len(raw_text),
+                total_hits,
+            )
+            record_runtime_degraded_event(
+                runtime_degraded_events,
+                scope=RUNTIME_DEGRADED_SCOPE_COMPARE,
+                stage="JOB_ACTION",
+                code="JOB_ACTION_SKIP_HIGH_FANOUT_TEXT",
+                entity=cache_key[0],
+                detail=f"chars={len(raw_text)};prefilter_hits={total_hits}",
+            )
+            text_match_cache[cache_key] = []
+            return []
+        matches = [
+            target for target in pattern_index.find_matches(
+                cleaned_text,
+                dynamic_sql_texts,
+                node_owner,
+                find_first=False,
+                text_tokens=text_tokens,
+            ) if target
+        ]
+        text_match_cache[cache_key] = list(matches)
+        return matches
 
     records: Set[DependencyRecord] = set()
     for node, raw_text in sorted(text_index.items(), key=lambda item: (item[0][1], item[0][0])):
@@ -10615,17 +10863,11 @@ def build_job_action_dependency_records(
             continue
         dep_owner, dep_name = dep_full.split('.', 1)
         seen_targets: Set[str] = set()
-        cleaned_text = mask_sql_for_scan(raw_text or "").upper()
-        dynamic_sql_texts_raw, _dynamic_sql_ambiguities = _extract_dynamic_sql_literals_for_scan(raw_text or "")
-        dynamic_sql_texts = [item.upper() for item in dynamic_sql_texts_raw]
-        queue: List[Tuple[str, str]] = [
-            target for target in pattern_index.find_matches(
-                cleaned_text,
-                dynamic_sql_texts,
-                dep_full.split('.', 1)[0].upper(),
-                find_first=False,
-            ) if target
-        ]
+        queue: List[Tuple[str, str]] = _resolve_matches(
+            (dep_full, dep_type),
+            raw_text or "",
+            dep_full.split('.', 1)[0].upper(),
+        )
         frontier_program_units: List[Tuple[str, str]] = []
         for matched_full in queue:
             ref_type = _resolve_scoped_reference_dependency_type(source_objects, matched_full)
@@ -10642,17 +10884,28 @@ def build_job_action_dependency_records(
             if key in visited_program_units:
                 continue
             visited_program_units.add(key)
+            if len(visited_program_units) > MAX_JOB_ACTION_RECURSIVE_PROGRAM_UNITS:
+                log.warning(
+                    "[PERF] JOB_ACTION 递归扩展超过上限 %d，已停止继续展开: job=%s",
+                    MAX_JOB_ACTION_RECURSIVE_PROGRAM_UNITS,
+                    dep_full,
+                )
+                record_runtime_degraded_event(
+                    runtime_degraded_events,
+                    scope=RUNTIME_DEGRADED_SCOPE_COMPARE,
+                    stage="JOB_ACTION",
+                    code="JOB_ACTION_RECURSION_CAPPED",
+                    entity=dep_full,
+                    detail=f"cap={MAX_JOB_ACTION_RECURSIVE_PROGRAM_UNITS}",
+                )
+                break
             current_text = text_index.get(key)
             if not current_text:
                 continue
-            current_cleaned = mask_sql_for_scan(current_text or "").upper()
-            current_dynamic_raw, _dynamic_sql_ambiguities = _extract_dynamic_sql_literals_for_scan(current_text or "")
-            current_dynamic = [item.upper() for item in current_dynamic_raw]
-            for matched_full in pattern_index.find_matches(
-                current_cleaned,
-                current_dynamic,
+            for matched_full in _resolve_matches(
+                key,
+                current_text or "",
                 current_full.split('.', 1)[0].upper() if '.' in current_full else "",
-                find_first=False,
             ):
                 ref_type = _resolve_scoped_reference_dependency_type(source_objects, matched_full)
                 if not ref_type or "." not in matched_full:
@@ -10681,6 +10934,7 @@ def collect_job_action_candidate_nodes(
 def build_job_action_dependency_records_with_loader(
     source_objects: Optional[SourceObjectMap],
     load_text_index,
+    runtime_degraded_events: Optional[List[RuntimeDegradedEvent]] = None,
 ) -> List[DependencyRecord]:
     source_objects = source_objects or {}
     job_nodes = collect_job_action_candidate_nodes(source_objects)
@@ -10702,14 +10956,101 @@ def build_job_action_dependency_records_with_loader(
     )
 
     def _expand_program_unit_candidates(full_u: str, type_u: str) -> Set[DependencyNode]:
-        candidates: Set[DependencyNode] = {(full_u, type_u)}
-        if type_u == "PACKAGE":
-            candidates.add((full_u, "PACKAGE BODY"))
-        if type_u == "TYPE":
-            candidates.add((full_u, "TYPE BODY"))
-        return candidates
+        available_types = {
+            (item or "").upper()
+            for item in (source_objects.get((full_u or "").upper()) or set())
+            if item
+        }
+        if type_u == "PACKAGE" and "PACKAGE BODY" in available_types:
+            return {(full_u, "PACKAGE BODY")}
+        if type_u == "TYPE" and "TYPE BODY" in available_types:
+            return {(full_u, "TYPE BODY")}
+        return {(full_u, type_u)}
 
     text_index = dict(load_text_index(set(job_nodes)) or {})
+    text_match_cache: Dict[DependencyNode, List[str]] = {}
+
+    def _resolve_matches(
+        node_key: DependencyNode,
+        raw_text: str,
+        node_owner: str,
+        *,
+        log_progress: bool = False,
+        idx: int = 0,
+        total: int = 0,
+        dep_owner: str = "",
+    ) -> List[str]:
+        cache_key = (((node_key[0] or "").upper()), ((node_key[1] or "").upper()))
+        cached = text_match_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+        raw_text = raw_text or ""
+        cleaned_text = mask_sql_for_scan(raw_text).upper()
+        dynamic_sql_texts_raw, _dynamic_sql_ambiguities = _extract_dynamic_sql_literals_for_scan(raw_text or "")
+        dynamic_sql_texts = [item.upper() for item in dynamic_sql_texts_raw]
+        text_tokens = pattern_index.extract_tokens(cleaned_text, dynamic_sql_texts)
+        scoped_hits, outer_hits, dynamic_hits = pattern_index.estimate_prefilter_hits(
+            text_tokens,
+            node_owner,
+        )
+        total_hits = scoped_hits + outer_hits + dynamic_hits
+        if log_progress:
+            log.info(
+                '[PERF] JOB_ACTION scan %d/%d: owner=%s, tokens=%d, scoped_hits=%d, outer_hits=%d, dynamic_hits=%d',
+                idx,
+                total,
+                dep_owner,
+                len(text_tokens),
+                scoped_hits,
+                outer_hits,
+                dynamic_hits,
+            )
+        if len(raw_text) > MAX_JOB_ACTION_SCAN_TEXT_BYTES:
+            log.warning(
+                '[PERF] JOB_ACTION skip oversized text scan: node=%s, chars=%d, prefilter_hits=%d',
+                cache_key[0],
+                len(raw_text),
+                total_hits,
+            )
+            record_runtime_degraded_event(
+                runtime_degraded_events,
+                scope=RUNTIME_DEGRADED_SCOPE_COMPARE,
+                stage="JOB_ACTION",
+                code="JOB_ACTION_SKIP_OVERSIZED_TEXT",
+                entity=cache_key[0],
+                detail=f"chars={len(raw_text)};prefilter_hits={total_hits}",
+            )
+            text_match_cache[cache_key] = []
+            return []
+        if total_hits > MAX_JOB_ACTION_PREFILTER_HITS:
+            log.warning(
+                '[PERF] JOB_ACTION skip high-fanout text scan: node=%s, chars=%d, prefilter_hits=%d',
+                cache_key[0],
+                len(raw_text),
+                total_hits,
+            )
+            record_runtime_degraded_event(
+                runtime_degraded_events,
+                scope=RUNTIME_DEGRADED_SCOPE_COMPARE,
+                stage="JOB_ACTION",
+                code="JOB_ACTION_SKIP_HIGH_FANOUT_TEXT",
+                entity=cache_key[0],
+                detail=f"chars={len(raw_text)};prefilter_hits={total_hits}",
+            )
+            text_match_cache[cache_key] = []
+            return []
+        matches = [
+            target for target in pattern_index.find_matches(
+                cleaned_text,
+                dynamic_sql_texts,
+                node_owner,
+                find_first=False,
+                text_tokens=text_tokens,
+            ) if target
+        ]
+        text_match_cache[cache_key] = list(matches)
+        return matches
+
     records: Set[DependencyRecord] = set()
     total_job_texts = len([node for node in text_index.keys() if node in job_nodes])
     for idx, (node, raw_text) in enumerate(sorted(text_index.items(), key=lambda item: (item[0][1], item[0][0])), start=1):
@@ -10722,34 +11063,15 @@ def build_job_action_dependency_records_with_loader(
         dep_owner, dep_name = dep_full.split('.', 1)
         seen_targets: Set[str] = set()
         frontier_program_units: List[Tuple[str, str]] = []
-        cleaned_text = mask_sql_for_scan(raw_text or "").upper()
-        dynamic_sql_texts_raw, _dynamic_sql_ambiguities = _extract_dynamic_sql_literals_for_scan(raw_text or "")
-        dynamic_sql_texts = [item.upper() for item in dynamic_sql_texts_raw]
-        text_tokens = pattern_index.extract_tokens(cleaned_text, dynamic_sql_texts)
-        if idx == 1 or idx % 50 == 0 or idx == total_job_texts:
-            scoped_hits, outer_hits, dynamic_hits = pattern_index.estimate_prefilter_hits(
-                text_tokens,
-                dep_full.split('.', 1)[0].upper(),
-            )
-            log.info(
-                '[PERF] JOB_ACTION scan %d/%d: owner=%s, tokens=%d, scoped_hits=%d, outer_hits=%d, dynamic_hits=%d',
-                idx,
-                total_job_texts,
-                dep_owner,
-                len(text_tokens),
-                scoped_hits,
-                outer_hits,
-                dynamic_hits,
-            )
-        for matched_full in [
-            target for target in pattern_index.find_matches(
-                cleaned_text,
-                dynamic_sql_texts,
-                dep_full.split('.', 1)[0].upper(),
-                find_first=False,
-                text_tokens=text_tokens,
-            ) if target
-        ]:
+        for matched_full in _resolve_matches(
+            (dep_full, dep_type),
+            raw_text or "",
+            dep_full.split('.', 1)[0].upper(),
+            log_progress=(idx == 1 or idx % 50 == 0 or idx == total_job_texts),
+            idx=idx,
+            total=total_job_texts,
+            dep_owner=dep_owner,
+        ):
             ref_type = _resolve_scoped_reference_dependency_type(source_objects, matched_full)
             if ref_type and "." in matched_full:
                 ref_owner, ref_name = matched_full.split('.', 1)
@@ -10767,24 +11089,44 @@ def build_job_action_dependency_records_with_loader(
                 if key in visited_program_units:
                     continue
                 visited_program_units.add(key)
+                if len(visited_program_units) > MAX_JOB_ACTION_RECURSIVE_PROGRAM_UNITS:
+                    log.warning(
+                        '[PERF] JOB_ACTION expand %d/%d: recursion capped at %d for job=%s',
+                        idx,
+                        total_job_texts,
+                        MAX_JOB_ACTION_RECURSIVE_PROGRAM_UNITS,
+                        dep_full,
+                    )
+                    record_runtime_degraded_event(
+                        runtime_degraded_events,
+                        scope=RUNTIME_DEGRADED_SCOPE_COMPARE,
+                        stage="JOB_ACTION",
+                        code="JOB_ACTION_RECURSION_CAPPED",
+                        entity=dep_full,
+                        detail=f"cap={MAX_JOB_ACTION_RECURSIVE_PROGRAM_UNITS}",
+                    )
+                    batch_to_load = set()
+                    frontier_program_units = []
+                    break
                 batch_to_load.update(_expand_program_unit_candidates(current_full, current_type))
             missing_nodes = {key for key in batch_to_load if key not in text_index}
             if missing_nodes:
+                log.info(
+                    '[PERF] JOB_ACTION expand %d/%d: load_missing=%d, frontier_batch=%d',
+                    idx,
+                    total_job_texts,
+                    len(missing_nodes),
+                    len(batch_to_load),
+                )
                 text_index.update(load_text_index(missing_nodes) or {})
             for current_full, current_type in sorted(batch_to_load, key=lambda item: (item[1], item[0])):
                 current_text = text_index.get((current_full, current_type))
                 if not current_text:
                     continue
-                current_cleaned = mask_sql_for_scan(current_text or "").upper()
-                current_dynamic_raw, _dynamic_sql_ambiguities = _extract_dynamic_sql_literals_for_scan(current_text or "")
-                current_dynamic = [item.upper() for item in current_dynamic_raw]
-                current_tokens = pattern_index.extract_tokens(current_cleaned, current_dynamic)
-                for matched_full in pattern_index.find_matches(
-                    current_cleaned,
-                    current_dynamic,
+                for matched_full in _resolve_matches(
+                    (current_full, current_type),
+                    current_text or "",
                     current_full.split('.', 1)[0].upper() if '.' in current_full else "",
-                    find_first=False,
-                    text_tokens=current_tokens,
                 ):
                     ref_type = _resolve_scoped_reference_dependency_type(source_objects, matched_full)
                     if not ref_type or "." not in matched_full:
@@ -10802,6 +11144,7 @@ def build_job_action_dependency_records_with_loader(
 def load_oracle_job_action_dependency_records(
     ora_cfg: OraConfig,
     source_objects: Optional[SourceObjectMap],
+    runtime_degraded_events: Optional[List[RuntimeDegradedEvent]] = None,
 ) -> List[DependencyRecord]:
     source_objects = source_objects or {}
     job_nodes = collect_job_action_candidate_nodes(source_objects)
@@ -10813,7 +11156,11 @@ def load_oracle_job_action_dependency_records(
     def _loader(candidate_nodes: Set[DependencyNode]) -> Dict[DependencyNode, str]:
         return load_oracle_scoped_text_reference_index(ora_cfg, candidate_nodes)
 
-    rows = build_job_action_dependency_records_with_loader(source_objects, _loader)
+    rows = build_job_action_dependency_records_with_loader(
+        source_objects,
+        _loader,
+        runtime_degraded_events=runtime_degraded_events,
+    )
     if rows:
         log.info('[SOURCE_SCOPE] 已从 JOB_ACTION 补充 JOB 依赖 %d 条。', len(rows))
     return rows
@@ -11075,6 +11422,7 @@ def classify_missing_objects(
     synonym_meta_map: Dict[Tuple[str, str], SynonymMeta],
     remap_rules: Optional[RemapRules] = None,
     view_dependency_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
+    view_callable_dep_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
     ob_version: Optional[str] = None,
     manual_trigger_table_keys: Optional[Set[Tuple[str, str]]] = None,
     gtt_handling_state: Optional[GttHandlingState] = None,
@@ -11099,6 +11447,8 @@ def classify_missing_objects(
     invalid_full_types: Dict[str, Set[str]] = defaultdict(set)
     remap_rules = remap_rules or {}
     view_dependency_map = view_dependency_map or {}
+    view_callable_dep_map = view_callable_dep_map or {}
+    preferred_target_schemas = sorted(collect_ob_schema_names(ob_meta))
 
     view_rules = settings.get("view_compat_rules") or {}
     dblink_policy = settings.get("view_dblink_policy", "block")
@@ -11419,7 +11769,10 @@ def classify_missing_objects(
                             remap_rules,
                             full_object_mapping,
                             synonym_meta=synonym_meta_map,
-                            view_dependency_map=view_dependency_map
+                            view_dependency_map=view_dependency_map,
+                            view_callable_dep_map=view_callable_dep_map,
+                            ob_meta=ob_meta,
+                            preferred_target_schemas=preferred_target_schemas,
                         )
                         final_ddl = adjust_ddl_for_object(
                             remapped_ddl,
@@ -13490,15 +13843,25 @@ def build_view_dependency_map(
     预计算 VIEW -> 依赖对象集合，用于 VIEW DDL 重写的 fallback。
     返回 {(VIEW_OWNER, VIEW_NAME): {REF_OWNER.REF_NAME, ...}}
     """
+    return _build_view_dependency_map_with_allowed_refs(
+        source_dependencies,
+        REWRITE_ELIGIBLE_DEP_TYPES,
+    )
+
+
+def _build_view_dependency_map_with_allowed_refs(
+    source_dependencies: Optional[SourceDependencySet],
+    allowed_refs: Set[str],
+) -> Dict[Tuple[str, str], Set[str]]:
     if not source_dependencies:
         return {}
-    allowed_refs = {"TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM", "FUNCTION", "PACKAGE"}
+    allowed_refs_u = {(item or "").upper() for item in (allowed_refs or set()) if item}
     view_map: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
     for dep_owner, dep_name, dep_type, ref_owner, ref_name, ref_type in source_dependencies:
         if (dep_type or "").upper() != "VIEW":
             continue
         ref_type_u = (ref_type or "").upper()
-        if ref_type_u not in allowed_refs:
+        if ref_type_u not in allowed_refs_u:
             continue
         owner_u = (dep_owner or "").upper()
         name_u = (dep_name or "").upper()
@@ -13508,6 +13871,73 @@ def build_view_dependency_map(
             continue
         view_map[(owner_u, name_u)].add(f"{ref_owner_u}.{ref_name_u}")
     return dict(view_map)
+
+
+def build_view_callable_dep_map(
+    source_dependencies: Optional[SourceDependencySet]
+) -> Dict[Tuple[str, str], Set[str]]:
+    """
+    预计算 VIEW -> callable/diagnostic-only 依赖对象集合。
+    这些依赖不会进入 VIEW DDL rewrite，但可用于 suppress callable 噪音。
+    """
+    return _build_view_dependency_map_with_allowed_refs(
+        source_dependencies,
+        VIEW_CALLABLE_DEP_TYPES,
+    )
+
+
+def collect_ob_schema_names(ob_meta: Optional["ObMetadata"]) -> Set[str]:
+    schemas: Set[str] = set()
+    if not ob_meta or not ob_meta.objects_by_type:
+        return schemas
+    for obj_set in (ob_meta.objects_by_type or {}).values():
+        for full_name in (obj_set or set()):
+            full_u = (full_name or "").upper()
+            if "." not in full_u:
+                continue
+            schemas.add(full_u.split(".", 1)[0])
+    return schemas
+
+
+def classify_view_unresolved_dep(
+    dep_u: str,
+    ob_meta: Optional["ObMetadata"],
+    preferred_target_schemas: Optional[List[str]] = None,
+) -> Tuple[str, List[str]]:
+    """
+    将无法 rewrite 的 VIEW 依赖分成可行动和非可行动类别。
+    """
+    dep_full = (dep_u or "").upper().strip()
+    if not dep_full:
+        return "UNKNOWN", []
+    dep_schema = dep_full.split(".", 1)[0] if "." in dep_full else ""
+    dep_obj = dep_full.split(".", 1)[1] if "." in dep_full else dep_full
+
+    if dep_schema in ORACLE_SYSTEM_SCHEMAS:
+        return "ORACLE_SYSTEM", []
+
+    if ob_meta and dep_schema:
+        ob_schema_names = collect_ob_schema_names(ob_meta)
+        if dep_schema in ob_schema_names:
+            return "CROSS_SCHEMA_OK", []
+        candidates: List[str] = []
+        seen: Set[str] = set()
+        for obj_set in (ob_meta.objects_by_type or {}).values():
+            for full_name in (obj_set or set()):
+                full_u = (full_name or "").upper()
+                if "." not in full_u:
+                    continue
+                if full_u.split(".", 1)[1] != dep_obj:
+                    continue
+                if full_u in seen:
+                    continue
+                seen.add(full_u)
+                candidates.append(full_u)
+        preferred_set = {str(item or "").upper() for item in (preferred_target_schemas or []) if item}
+        candidates.sort(key=lambda item: (0 if item.split(".", 1)[0] in preferred_set else 1, item))
+        return "CROSS_SCHEMA_MISSING", candidates[:5]
+
+    return "UNKNOWN", []
 
 
 def precompute_transitive_table_cache(
@@ -18050,6 +18480,7 @@ def build_grant_capability_library(
     source_objects: Optional[SourceObjectMap],
     supported_sys_override: Optional[Set[str]] = None,
     supported_object_override: Optional[Set[str]] = None,
+    grant_generation_mode: str = GRANT_GENERATION_MODE_FULL,
 ) -> GrantCapabilityLibrary:
     """
     基于当前源端实际权限 + OB 运行期实测，生成本次运行的动态授权能力库。
@@ -18061,6 +18492,7 @@ def build_grant_capability_library(
     sys_priv_candidates, object_priv_candidates, column_priv_candidates = collect_source_grant_capability_candidates(
         oracle_meta,
         source_objects,
+        grant_generation_mode=grant_generation_mode,
     )
     known_logical_object_privileges: Set[str] = {
         (name or "").strip().upper()
@@ -21290,6 +21722,17 @@ def dump_oracle_metadata(
 
             if include_privileges:
                 try:
+                    grant_generation_mode = normalize_grant_generation_mode(
+                        settings.get('grant_generation_mode', 'full')
+                    )
+                    grant_priv_scope = settings.get('grant_tab_privs_scope', 'owner')
+                    if grant_generation_mode == GRANT_GENERATION_MODE_STRUCTURAL:
+                        if str(grant_priv_scope or '').strip().lower() != 'owner':
+                            log.info(
+                                "[GRANT] structural 模式下 grant_tab_privs_scope=%s 不影响授权生成，Oracle 抽取范围回退为 owner。",
+                                grant_priv_scope
+                            )
+                        grant_priv_scope = 'owner'
                     base_grantees = set(source_schema_set)
                     role_privileges, role_names = load_oracle_role_privileges(ora_conn, base_grantees)
                     grantee_scope = set(base_grantees) | set(role_names) | {"PUBLIC"}
@@ -21298,13 +21741,13 @@ def dump_oracle_metadata(
                         ora_conn,
                         privilege_owners,
                         grantee_scope,
-                        settings.get('grant_tab_privs_scope', 'owner')
+                        grant_priv_scope
                     )
                     column_privileges = load_oracle_col_privileges(
                         ora_conn,
                         privilege_owners,
                         grantee_scope,
-                        settings.get('grant_tab_privs_scope', 'owner')
+                        grant_priv_scope
                     )
                     role_metadata = load_oracle_roles(ora_conn)
                     system_privilege_map = load_oracle_system_privilege_map(ora_conn)
@@ -21314,7 +21757,7 @@ def dump_oracle_metadata(
                         source_schema_set,
                         privilege_owners,
                         grantee_scope,
-                        settings.get('grant_tab_privs_scope', 'owner')
+                        grant_priv_scope
                     )
                     log.info(
                         "Oracle 权限元数据加载完成：对象权限=%d, 列级权限=%d, 系统权限=%d, 角色授权=%d, 角色数=%d, scope=%s",
@@ -21323,7 +21766,7 @@ def dump_oracle_metadata(
                         len(sys_privileges),
                         len(role_privileges),
                         len(role_names),
-                        settings.get('grant_tab_privs_scope', 'owner')
+                        grant_priv_scope
                     )
                 except oracledb.Error as e:
                     log.warning("读取 Oracle 权限元数据失败，将跳过授权生成：%s", e)
@@ -21714,10 +22157,31 @@ def to_raw_dependency_pairs(
     return raw_pairs
 
 
+def to_raw_dependency_pairs_capped(
+    dependencies: List[DependencyRecord],
+    max_pairs: int,
+) -> Optional[Set[Tuple[str, str, str, str]]]:
+    """
+    增量转换源端依赖；一旦唯一 pair 数超过上限，立即返回 None，
+    避免在大库场景中为 dependency_chains 无意义地构造超大 set。
+    """
+    if max_pairs < 0:
+        return None
+    raw_pairs: Set[Tuple[str, str, str, str]] = set()
+    for dep in dependencies:
+        dep_key = f"{dep.owner}.{dep.name}".upper()
+        ref_key = f"{dep.referenced_owner}.{dep.referenced_name}".upper()
+        raw_pairs.add((dep_key, dep.object_type.upper(), ref_key, dep.referenced_type.upper()))
+        if len(raw_pairs) > max_pairs:
+            return None
+    return raw_pairs
+
+
 def export_dependency_chains(
     expected_pairs: Set[Tuple[str, str, str, str]],
     output_path: Path,
-    source_pairs: Optional[Set[Tuple[str, str, str, str]]] = None
+    source_pairs: Optional[Set[Tuple[str, str, str, str]]] = None,
+    runtime_degraded_events: Optional[List[RuntimeDegradedEvent]] = None,
 ) -> Optional[Path]:
     """
     输出依赖链，支持：
@@ -21725,12 +22189,29 @@ def export_dependency_chains(
       - 目标端（Remap 后）依赖链
     依赖链会“下探”直到终点（无进一步依赖或 TABLE/MVIEW），并打印每条路径。
     """
+    source_pairs = source_pairs or set()
+    total_pairs = len(expected_pairs) + len(source_pairs)
     if not expected_pairs and not source_pairs:
         return None
+    if total_pairs > MAX_DEPENDENCY_CHAIN_EXPORT_PAIRS:
+        log.warning(
+            "[DEPENDENCY] 依赖链路导出已跳过: pair_count=%d 超过上限 %d",
+            total_pairs,
+            MAX_DEPENDENCY_CHAIN_EXPORT_PAIRS,
+        )
+        record_runtime_degraded_event(
+            runtime_degraded_events,
+            scope=RUNTIME_DEGRADED_SCOPE_ARTIFACT,
+            stage="DEPENDENCY_EXPORT",
+            code="DEPENDENCY_CHAIN_EXPORT_SKIPPED",
+            entity=(output_path.name if output_path else "dependency_chains"),
+            detail=f"pair_count={total_pairs};max_pairs={MAX_DEPENDENCY_CHAIN_EXPORT_PAIRS}",
+        )
+        return None
 
-    def _build_chains(pairs: Set[Tuple[str, str, str, str]], label: str) -> Tuple[List[str], List[str]]:
+    def _build_chains(pairs: Set[Tuple[str, str, str, str]], label: str) -> Tuple[List[str], List[str], bool]:
         if not pairs:
-            return [], []
+            return [], [], False
         graph: Dict[str, Set[str]] = defaultdict(set)  # dependent -> {referenced}
         type_map: Dict[str, str] = {}
         reverse_refs: Dict[str, Set[str]] = defaultdict(set)
@@ -21747,39 +22228,98 @@ def export_dependency_chains(
         roots = [n for n in type_map.keys() if n not in reverse_refs]
         if not roots:
             roots = sorted(type_map.keys())
+        sorted_refs_map: Dict[str, Tuple[str, ...]] = {
+            node: tuple(sorted(refs))
+            for node, refs in graph.items()
+        }
 
         chains: List[str] = []
         cycles: List[str] = []
-
-        def dfs(node: str, path: List[Tuple[str, str]], seen: Set[str]) -> None:
-            node_u = node.upper()
-            obj_type = type_map.get(node_u, "UNKNOWN")
-            if node_u in seen:
-                cycle_path = " -> ".join([f"{n}({t})" for n, t in path] + [f"{node_u}(CYCLE)"])
-                cycles.append(cycle_path)
-                return
-            path_next = path + [(node_u, obj_type)]
-            refs = sorted(graph.get(node_u, set()))
-            # 终点条件：无引用或到达 TABLE/MATERIALIZED VIEW
-            if not refs or obj_type in ("TABLE", "MATERIALIZED VIEW"):
-                chains.append(" -> ".join(f"{n}({t})" for n, t in path_next))
-                return
-            for ref in refs:
-                dfs(ref, path_next, seen | {node_u})
+        truncated = False
 
         for root in sorted(roots):
-            dfs(root, [], set())
+            if truncated:
+                break
+            current_path: List[Tuple[str, str]] = []
+            current_seen: Set[str] = set()
+            stack: List[Tuple[str, int]] = [((root or "").upper(), -1)]
+            while stack and not truncated:
+                node_u, ref_idx = stack[-1]
+                obj_type = type_map.get(node_u, "UNKNOWN")
+                if ref_idx == -1:
+                    if node_u in current_seen:
+                        cycle_path = " -> ".join(
+                            [f"{n}({t})" for n, t in current_path] + [f"{node_u}(CYCLE)"]
+                        )
+                        cycles.append(cycle_path)
+                        stack.pop()
+                        continue
+                    current_seen.add(node_u)
+                    current_path.append((node_u, obj_type))
+                    refs = sorted_refs_map.get(node_u, tuple())
+                    if not refs or obj_type in ("TABLE", "MATERIALIZED VIEW"):
+                        chains.append(" -> ".join(f"{n}({t})" for n, t in current_path))
+                        if len(chains) >= MAX_DEPENDENCY_CHAIN_EXPORT_CHAINS:
+                            truncated = True
+                        current_path.pop()
+                        current_seen.remove(node_u)
+                        stack.pop()
+                        continue
+                    stack[-1] = (node_u, 0)
+                    continue
 
-        return chains, cycles
+                refs = sorted_refs_map.get(node_u, tuple())
+                if ref_idx >= len(refs):
+                    current_path.pop()
+                    current_seen.remove(node_u)
+                    stack.pop()
+                    continue
 
-    target_chains, target_cycles = _build_chains(expected_pairs, "TARGET")
-    source_chains, source_cycles = _build_chains(source_pairs or set(), "SOURCE") if source_pairs else ([], [])
+                ref_u = refs[ref_idx].upper()
+                stack[-1] = (node_u, ref_idx + 1)
+                if ref_u in current_seen:
+                    cycle_path = " -> ".join(
+                        [f"{n}({t})" for n, t in current_path] + [f"{ref_u}(CYCLE)"]
+                    )
+                    cycles.append(cycle_path)
+                    continue
+                stack.append((ref_u, -1))
+
+        if truncated:
+            chains.append(f"... (已截断，仅展示前 {MAX_DEPENDENCY_CHAIN_EXPORT_CHAINS} 条链路)")
+
+        return chains, cycles, truncated
+
+    target_chains, target_cycles, target_truncated = _build_chains(expected_pairs, "TARGET")
+    source_chains, source_cycles, source_truncated = _build_chains(source_pairs, "SOURCE") if source_pairs else ([], [], False)
+    if source_truncated or target_truncated:
+        truncated_labels = []
+        if source_truncated:
+            truncated_labels.append("SOURCE")
+        if target_truncated:
+            truncated_labels.append("TARGET")
+        log.warning(
+            "[DEPENDENCY] 依赖链路导出已截断: sections=%s, max_chains=%d",
+            ",".join(truncated_labels),
+            MAX_DEPENDENCY_CHAIN_EXPORT_CHAINS,
+        )
+        record_runtime_degraded_event(
+            runtime_degraded_events,
+            scope=RUNTIME_DEGRADED_SCOPE_ARTIFACT,
+            stage="DEPENDENCY_EXPORT",
+            code="DEPENDENCY_CHAIN_EXPORT_TRUNCATED",
+            entity=(output_path.name if output_path else "dependency_chains"),
+            detail="sections={0};max_chains={1}".format(
+                ",".join(truncated_labels),
+                MAX_DEPENDENCY_CHAIN_EXPORT_CHAINS,
+            ),
+        )
 
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open('w', encoding='utf-8') as f:
             f.write("# 依赖链下探（终点为 TABLE/MVIEW 或无进一步依赖）\n")
-            f.write(f"# 目标端依赖数: {len(expected_pairs)}, 源端依赖数: {len(source_pairs or [])}\n\n")
+            f.write(f"# 目标端依赖数: {len(expected_pairs)}, 源端依赖数: {len(source_pairs)}\n\n")
 
             if source_chains:
                 f.write("[SOURCE - ORACLE] 依赖链:\n")
@@ -22948,7 +23488,8 @@ def defer_missing_target_column_grants(
 def split_view_grants(
     view_targets: Set[str],
     expected_dependency_pairs: Optional[Set[Tuple[str, str, str, str]]],
-    object_grants_missing_by_grantee: Dict[str, Set[ObjectGrantEntry]]
+    object_grants_missing_by_grantee: Dict[str, Set[ObjectGrantEntry]],
+    grant_generation_mode: str = GRANT_GENERATION_MODE_FULL,
 ) -> Tuple[
     Dict[str, Set[ObjectGrantEntry]],
     Dict[str, Set[ObjectGrantEntry]],
@@ -22961,6 +23502,8 @@ def split_view_grants(
       - view_post_grants: 视图创建后授权（源端视图权限同步）
       - remaining: 其余授权
     """
+    grant_generation_mode = normalize_grant_generation_mode(grant_generation_mode)
+    structural_mode = grant_generation_mode == GRANT_GENERATION_MODE_STRUCTURAL
     view_targets_u = {v.upper() for v in (view_targets or set()) if v}
     downstream_privs_by_view: Dict[str, Set[str]] = defaultdict(set)
     for grantee, entries in (object_grants_missing_by_grantee or {}).items():
@@ -23008,6 +23551,24 @@ def split_view_grants(
                     required_privs.add(privilege.upper())
             for privilege in required_privs:
                 prereq_needed[(dep_schema, privilege.upper(), ref_full_u)].add(dep_full_u)
+    if structural_mode and expected_dependency_pairs:
+        for dep_full, dep_type, ref_full, ref_type in expected_dependency_pairs:
+            dep_full_u = (dep_full or "").upper()
+            dep_type_u = (dep_type or "").upper()
+            ref_full_u = (ref_full or "").upper()
+            ref_type_u = normalize_privilege_object_type(ref_type)
+            if dep_type_u not in {"VIEW", "MATERIALIZED VIEW"}:
+                continue
+            if not dep_full_u or not ref_full_u or "." not in dep_full_u or "." not in ref_full_u:
+                continue
+            dep_schema = dep_full_u.split(".", 1)[0]
+            ref_schema = ref_full_u.split(".", 1)[0]
+            if dep_schema == ref_schema or dep_schema == "PUBLIC":
+                continue
+            privilege = GRANT_PRIVILEGE_BY_TYPE.get(ref_type_u)
+            if not privilege:
+                continue
+            prereq_needed[(dep_schema, privilege.upper(), ref_full_u)].add(dep_full_u)
 
     view_prereq: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
     view_post: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
@@ -23332,29 +23893,32 @@ def _query_ob_catalog_column_privileges(
 
 def collect_source_grant_capability_candidates(
     oracle_meta: OracleMetadata,
-    source_objects: Optional[SourceObjectMap]
+    source_objects: Optional[SourceObjectMap],
+    grant_generation_mode: str = GRANT_GENERATION_MODE_FULL,
 ) -> Tuple[Set[str], Set[Tuple[str, str]], Set[Tuple[str, str]]]:
+    grant_generation_mode = normalize_grant_generation_mode(grant_generation_mode)
     sys_privs: Set[str] = set()
     object_privs: Set[Tuple[str, str]] = set()
     column_privs: Set[Tuple[str, str]] = set()
-    for item in (oracle_meta.sys_privileges or []):
-        priv_u = (item.privilege or "").strip().upper()
-        if priv_u:
-            sys_privs.add(priv_u)
-    for item in (oracle_meta.object_privileges or []):
-        priv_u = (item.privilege or "").strip().upper()
-        obj_type_u = normalize_privilege_object_type(item.object_type)
-        if not obj_type_u:
+    if grant_generation_mode == GRANT_GENERATION_MODE_FULL:
+        for item in (oracle_meta.sys_privileges or []):
+            priv_u = (item.privilege or "").strip().upper()
+            if priv_u:
+                sys_privs.add(priv_u)
+        for item in (oracle_meta.object_privileges or []):
+            priv_u = (item.privilege or "").strip().upper()
+            obj_type_u = normalize_privilege_object_type(item.object_type)
+            if not obj_type_u:
+                src_full = f"{(item.owner or '').upper()}.{(item.object_name or '').upper()}".strip(".")
+                obj_type_u = infer_privilege_object_type(src_full, source_objects) or ""
+            if priv_u and obj_type_u:
+                object_privs.add((priv_u, obj_type_u))
+        for item in (oracle_meta.column_privileges or []):
+            priv_u = (item.privilege or "").strip().upper()
             src_full = f"{(item.owner or '').upper()}.{(item.object_name or '').upper()}".strip(".")
             obj_type_u = infer_privilege_object_type(src_full, source_objects) or ""
-        if priv_u and obj_type_u:
-            object_privs.add((priv_u, obj_type_u))
-    for item in (oracle_meta.column_privileges or []):
-        priv_u = (item.privilege or "").strip().upper()
-        src_full = f"{(item.owner or '').upper()}.{(item.object_name or '').upper()}".strip(".")
-        obj_type_u = infer_privilege_object_type(src_full, source_objects) or ""
-        if priv_u and obj_type_u:
-            column_privs.add((priv_u, obj_type_u))
+            if priv_u and obj_type_u:
+                column_privs.add((priv_u, obj_type_u))
     for obj_type_u, privilege_u in (GRANT_PRIVILEGE_BY_TYPE or {}).items():
         norm_type = normalize_privilege_object_type(obj_type_u)
         priv_norm = (privilege_u or "").strip().upper()
@@ -23818,14 +24382,18 @@ def build_grant_plan(
     include_oracle_maintained_roles: bool = False,
     dependencies: Optional[List[DependencyRecord]] = None,
     progress_interval: float = 10.0,
-    sequence_remap_policy: str = "source_only"
+    sequence_remap_policy: str = "source_only",
+    grant_generation_mode: str = GRANT_GENERATION_MODE_FULL,
 ) -> GrantPlan:
+    grant_generation_mode = normalize_grant_generation_mode(grant_generation_mode)
+    structural_mode = grant_generation_mode == GRANT_GENERATION_MODE_STRUCTURAL
     object_grants: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
     column_grants: Dict[str, Set[ColumnGrantEntry]] = defaultdict(set)
     sys_privs: Dict[str, Set[SystemGrantEntry]] = defaultdict(set)
     role_privs: Dict[str, Set[RoleGrantEntry]] = defaultdict(set)
     role_ddls: List[str] = []
     filtered_grants: List[FilteredGrantEntry] = []
+    mode_skip_counts: Dict[str, int] = {}
 
     schema_mapping = schema_mapping or {}
     role_names = build_role_name_set(oracle_meta.role_privileges, source_schema_set)
@@ -23892,7 +24460,7 @@ def build_grant_plan(
         return target
 
     view_grant_targets: Set[str] = set()
-    if oracle_meta.object_privileges:
+    if oracle_meta.object_privileges and not structural_mode:
         view_types = {"VIEW", "MATERIALIZED VIEW"}
         for item in oracle_meta.object_privileges:
             owner_u = (item.owner or "").upper()
@@ -24070,147 +24638,158 @@ def build_grant_plan(
 
     # 1) Source object grants (DBA_TAB_PRIVS)
     total_obj = len(oracle_meta.object_privileges)
-    if total_obj:
-        log.info("[GRANT] 正在处理对象权限 %d 条...", total_obj)
-        if total_obj >= GRANT_WARN_THRESHOLD:
-            log.warning(
-                "[GRANT] 检测到对象授权规模较大（%d 条），授权规划可能耗时较久，请耐心等待。",
-                total_obj
-            )
     last_log = time.time()
     progress_interval = max(1.0, progress_interval)
+    if not structural_mode:
+        if total_obj:
+            log.info("[GRANT] 正在处理对象权限 %d 条...", total_obj)
+            if total_obj >= GRANT_WARN_THRESHOLD:
+                log.warning(
+                    "[GRANT] 检测到对象授权规模较大（%d 条），授权规划可能耗时较久，请耐心等待。",
+                    total_obj
+                )
 
-    for idx, item in enumerate(oracle_meta.object_privileges, 1):
-        grantee_u = map_grantee(item.grantee)
-        if not grantee_exists(grantee_u):
-            skipped_missing_grants += 1
-            continue
-        owner_u = (item.owner or "").upper()
-        src_full = f"{owner_u}.{(item.object_name or '').upper()}".strip(".")
-        priv_u = (item.privilege or "").upper()
-        obj_type = normalize_privilege_object_type(item.object_type)
-        if not obj_type:
-            obj_type = obj_type_cache.get(src_full, "")
+        for idx, item in enumerate(oracle_meta.object_privileges, 1):
+            grantee_u = map_grantee(item.grantee)
+            if not grantee_exists(grantee_u):
+                skipped_missing_grants += 1
+                continue
+            owner_u = (item.owner or "").upper()
+            src_full = f"{owner_u}.{(item.object_name or '').upper()}".strip(".")
+            priv_u = (item.privilege or "").upper()
+            obj_type = normalize_privilege_object_type(item.object_type)
             if not obj_type:
-                obj_type = infer_privilege_object_type(src_full, source_objects) or ""
-                obj_type_cache[src_full] = obj_type
-        ok, reason = is_supported_object_priv(priv_u, obj_type)
-        if not ok:
-            record_filtered("OBJECT", grantee_u, priv_u, src_full, reason or "UNSUPPORTED_OBJECT_PRIV")
-            if total_obj and (idx == total_obj or (time.time() - last_log) >= progress_interval):
-                pct = idx * 100.0 / total_obj if total_obj else 100.0
-                log.info("[GRANT] 对象权限进度 %d/%d (%.1f%%)。", idx, total_obj, pct)
-                last_log = time.time()
-            continue
-        if (
-            obj_type.upper() in {"VIEW", "MATERIALIZED VIEW"}
-            and priv_u in {"INSERT", "UPDATE", "DELETE"}
-            and grantee_u != owner_u
-        ):
-            proved = can_prove_cross_schema_view_dml_grant(
-                view_full=src_full,
-                view_type=obj_type,
-                view_owner=owner_u,
-                privilege=priv_u,
-                dependency_graph=source_dependency_graph,
-                source_grantable_index=source_grantable_index,
-                synonym_meta=synonym_meta,
-                source_objects=source_objects,
-            )
-            if not proved:
-                record_filtered("OBJECT", grantee_u, priv_u, src_full, VIEW_DML_GRANT_PREREQ_UNVERIFIED)
+                obj_type = obj_type_cache.get(src_full, "")
+                if not obj_type:
+                    obj_type = infer_privilege_object_type(src_full, source_objects) or ""
+                    obj_type_cache[src_full] = obj_type
+            ok, reason = is_supported_object_priv(priv_u, obj_type)
+            if not ok:
+                record_filtered("OBJECT", grantee_u, priv_u, src_full, reason or "UNSUPPORTED_OBJECT_PRIV")
                 if total_obj and (idx == total_obj or (time.time() - last_log) >= progress_interval):
                     pct = idx * 100.0 / total_obj if total_obj else 100.0
                     log.info("[GRANT] 对象权限进度 %d/%d (%.1f%%)。", idx, total_obj, pct)
                     last_log = time.time()
                 continue
-        target = resolve_target_cached(src_full, obj_type)
-        if not target:
-            skipped_object_privs += 1
-            continue
-        remember_object_target_type(object_target_types, target.upper(), obj_type)
-        add_object_grant_entry(grantee_u, priv_u, target.upper(), bool(item.grantable))
-        if total_obj and (idx == total_obj or (time.time() - last_log) >= progress_interval):
-            pct = idx * 100.0 / total_obj if total_obj else 100.0
-            log.info("[GRANT] 对象权限进度 %d/%d (%.1f%%)。", idx, total_obj, pct)
-            last_log = time.time()
+            if (
+                obj_type.upper() in {"VIEW", "MATERIALIZED VIEW"}
+                and priv_u in {"INSERT", "UPDATE", "DELETE"}
+                and grantee_u != owner_u
+            ):
+                proved = can_prove_cross_schema_view_dml_grant(
+                    view_full=src_full,
+                    view_type=obj_type,
+                    view_owner=owner_u,
+                    privilege=priv_u,
+                    dependency_graph=source_dependency_graph,
+                    source_grantable_index=source_grantable_index,
+                    synonym_meta=synonym_meta,
+                    source_objects=source_objects,
+                )
+                if not proved:
+                    record_filtered("OBJECT", grantee_u, priv_u, src_full, VIEW_DML_GRANT_PREREQ_UNVERIFIED)
+                    if total_obj and (idx == total_obj or (time.time() - last_log) >= progress_interval):
+                        pct = idx * 100.0 / total_obj if total_obj else 100.0
+                        log.info("[GRANT] 对象权限进度 %d/%d (%.1f%%)。", idx, total_obj, pct)
+                        last_log = time.time()
+                    continue
+            target = resolve_target_cached(src_full, obj_type)
+            if not target:
+                skipped_object_privs += 1
+                continue
+            remember_object_target_type(object_target_types, target.upper(), obj_type)
+            add_object_grant_entry(grantee_u, priv_u, target.upper(), bool(item.grantable))
+            if total_obj and (idx == total_obj or (time.time() - last_log) >= progress_interval):
+                pct = idx * 100.0 / total_obj if total_obj else 100.0
+                log.info("[GRANT] 对象权限进度 %d/%d (%.1f%%)。", idx, total_obj, pct)
+                last_log = time.time()
 
-    if skipped_object_privs:
-        log.warning("[GRANT] 已跳过 %d 条无法映射的对象授权。", skipped_object_privs)
+        if skipped_object_privs:
+            log.warning("[GRANT] 已跳过 %d 条无法映射的对象授权。", skipped_object_privs)
+    else:
+        mode_skip_counts["oracle_object_privileges"] = total_obj
 
     total_col = len(oracle_meta.column_privileges)
     skipped_column_privs = 0
-    if total_col:
-        log.info("[GRANT] 正在处理列级权限 %d 条...", total_col)
-    for idx, item in enumerate(oracle_meta.column_privileges, 1):
-        grantee_u = map_grantee(item.grantee)
-        if not grantee_exists(grantee_u):
-            skipped_missing_grants += 1
-            continue
-        owner_u = (item.owner or "").upper()
-        obj_name_u = (item.object_name or "").upper()
-        src_full = f"{owner_u}.{obj_name_u}".strip(".")
-        column_u = (item.column_name or "").upper()
-        priv_u = (item.privilege or "").upper()
-        obj_type = obj_type_cache.get(src_full, "")
-        if not obj_type:
-            obj_type = infer_privilege_object_type(src_full, source_objects) or ""
-            obj_type_cache[src_full] = obj_type
-        ok, reason = is_supported_column_priv(priv_u, obj_type)
-        if not ok:
-            record_filtered("COLUMN", grantee_u, priv_u, f"{src_full}({column_u})", reason or "UNSUPPORTED_COLUMN_PRIV")
-            continue
-        target = resolve_target_cached(src_full, obj_type)
-        if not target:
-            skipped_column_privs += 1
-            continue
-        remember_object_target_type(object_target_types, target.upper(), obj_type)
-        add_column_grant_entry(grantee_u, priv_u, target.upper(), column_u, bool(item.grantable))
-        if total_col and (idx == total_col or (time.time() - last_log) >= progress_interval):
-            pct = idx * 100.0 / total_col if total_col else 100.0
-            log.info("[GRANT] 列级权限进度 %d/%d (%.1f%%)。", idx, total_col, pct)
-            last_log = time.time()
+    if not structural_mode:
+        if total_col:
+            log.info("[GRANT] 正在处理列级权限 %d 条...", total_col)
+        for idx, item in enumerate(oracle_meta.column_privileges, 1):
+            grantee_u = map_grantee(item.grantee)
+            if not grantee_exists(grantee_u):
+                skipped_missing_grants += 1
+                continue
+            owner_u = (item.owner or "").upper()
+            obj_name_u = (item.object_name or "").upper()
+            src_full = f"{owner_u}.{obj_name_u}".strip(".")
+            column_u = (item.column_name or "").upper()
+            priv_u = (item.privilege or "").upper()
+            obj_type = obj_type_cache.get(src_full, "")
+            if not obj_type:
+                obj_type = infer_privilege_object_type(src_full, source_objects) or ""
+                obj_type_cache[src_full] = obj_type
+            ok, reason = is_supported_column_priv(priv_u, obj_type)
+            if not ok:
+                record_filtered("COLUMN", grantee_u, priv_u, f"{src_full}({column_u})", reason or "UNSUPPORTED_COLUMN_PRIV")
+                continue
+            target = resolve_target_cached(src_full, obj_type)
+            if not target:
+                skipped_column_privs += 1
+                continue
+            remember_object_target_type(object_target_types, target.upper(), obj_type)
+            add_column_grant_entry(grantee_u, priv_u, target.upper(), column_u, bool(item.grantable))
+            if total_col and (idx == total_col or (time.time() - last_log) >= progress_interval):
+                pct = idx * 100.0 / total_col if total_col else 100.0
+                log.info("[GRANT] 列级权限进度 %d/%d (%.1f%%)。", idx, total_col, pct)
+                last_log = time.time()
 
-    if skipped_column_privs:
-        log.warning("[GRANT] 已跳过 %d 条无法映射的列级授权。", skipped_column_privs)
+        if skipped_column_privs:
+            log.warning("[GRANT] 已跳过 %d 条无法映射的列级授权。", skipped_column_privs)
+    else:
+        mode_skip_counts["column_privileges"] = total_col
 
     # 2) System and role grants
-    if oracle_meta.sys_privileges:
-        log.info("[GRANT] 正在处理系统权限 %d 条...", len(oracle_meta.sys_privileges))
-    for item in oracle_meta.sys_privileges:
-        grantee_u = map_grantee(item.grantee)
-        if not grantee_u:
-            continue
-        if not grantee_exists(grantee_u):
-            skipped_missing_grants += 1
-            continue
-        priv_u = (item.privilege or "").upper()
-        ok, reason = is_supported_sys_priv(priv_u)
-        if not ok:
-            record_filtered("SYSTEM", grantee_u, priv_u, "", reason or "UNSUPPORTED_SYS_PRIV")
-            continue
-        sys_privs[grantee_u].add(SystemGrantEntry(priv_u, bool(item.admin_option)))
+    if not structural_mode:
+        if oracle_meta.sys_privileges:
+            log.info("[GRANT] 正在处理系统权限 %d 条...", len(oracle_meta.sys_privileges))
+        for item in oracle_meta.sys_privileges:
+            grantee_u = map_grantee(item.grantee)
+            if not grantee_u:
+                continue
+            if not grantee_exists(grantee_u):
+                skipped_missing_grants += 1
+                continue
+            priv_u = (item.privilege or "").upper()
+            ok, reason = is_supported_sys_priv(priv_u)
+            if not ok:
+                record_filtered("SYSTEM", grantee_u, priv_u, "", reason or "UNSUPPORTED_SYS_PRIV")
+                continue
+            sys_privs[grantee_u].add(SystemGrantEntry(priv_u, bool(item.admin_option)))
 
-    if oracle_meta.role_privileges:
-        log.info("[GRANT] 正在处理角色授权 %d 条...", len(oracle_meta.role_privileges))
-    for item in oracle_meta.role_privileges:
-        grantee_u = map_grantee(item.grantee)
-        if not grantee_u or not item.role:
-            continue
-        if not grantee_exists(grantee_u):
-            skipped_missing_grants += 1
-            continue
-        target_role_u = remap_grant_role_alias(item.role)
-        if not target_role_u:
-            continue
-        role_filter_reason = role_grant_filter_reason(target_role_u)
-        if role_filter_reason:
-            record_filtered("ROLE", grantee_u, target_role_u, target_role_u, role_filter_reason)
-            continue
-        role_privs[grantee_u].add(RoleGrantEntry(target_role_u, bool(item.admin_option)))
+        if oracle_meta.role_privileges:
+            log.info("[GRANT] 正在处理角色授权 %d 条...", len(oracle_meta.role_privileges))
+        for item in oracle_meta.role_privileges:
+            grantee_u = map_grantee(item.grantee)
+            if not grantee_u or not item.role:
+                continue
+            if not grantee_exists(grantee_u):
+                skipped_missing_grants += 1
+                continue
+            target_role_u = remap_grant_role_alias(item.role)
+            if not target_role_u:
+                continue
+            role_filter_reason = role_grant_filter_reason(target_role_u)
+            if role_filter_reason:
+                record_filtered("ROLE", grantee_u, target_role_u, target_role_u, role_filter_reason)
+                continue
+            role_privs[grantee_u].add(RoleGrantEntry(target_role_u, bool(item.admin_option)))
+    else:
+        mode_skip_counts["system_privileges"] = len(oracle_meta.sys_privileges)
+        mode_skip_counts["role_privileges"] = len(oracle_meta.role_privileges)
 
     # 3) Dependency-derived grants
     dep_records = dependencies or []
+    expected_pairs: Set[Tuple[str, str, str, str]] = set()
     if dep_records:
         expected_pairs = build_dependency_pairs_for_grants(
             dep_records,
@@ -24240,7 +24819,11 @@ def build_grant_plan(
             if not grantee_exists(dep_schema):
                 skipped_missing_grants += 1
                 continue
-            grantable_for_view = dep_full in view_grant_targets and dep_type.upper() in {"VIEW", "MATERIALIZED VIEW"}
+            grantable_for_view = (
+                not structural_mode
+                and dep_full in view_grant_targets
+                and dep_type.upper() in {"VIEW", "MATERIALIZED VIEW"}
+            )
             ref_type_u = normalize_privilege_object_type(ref_type)
             privilege = GRANT_PRIVILEGE_BY_TYPE.get(ref_type_u)
             if privilege:
@@ -24257,6 +24840,11 @@ def build_grant_plan(
                     add_object_grant_entry(dep_schema, "REFERENCES", ref_full.upper(), False)
                 else:
                     record_filtered("OBJECT", dep_schema, "REFERENCES", ref_full.upper(), reason or "UNSUPPORTED_OBJECT_PRIV")
+    elif structural_mode:
+        log.warning("[GRANT] structural 模式未加载到依赖记录，当前不会生成结构性授权。")
+
+    if structural_mode and dep_records and not expected_pairs:
+        log.warning("[GRANT] structural 模式未推导出可用依赖边，当前不会生成结构性授权。")
 
     if missing_user_grantees:
         log.warning(
@@ -24277,67 +24865,68 @@ def build_grant_plan(
         )
 
     # 4) Role DDL (user-defined roles referenced by grants)
-    referenced_roles: Set[str] = set()
-    known_roles: Set[str] = {remap_grant_role_alias(r) for r in oracle_roles.keys()}
-    referenced_roles.update({remap_grant_role_alias(item.role) for item in oracle_meta.role_privileges if item.role})
-    if not known_roles:
-        known_roles = set(referenced_roles)
-    if known_roles:
-        for item in oracle_meta.role_privileges:
-            grantee = remap_grant_role_alias(item.grantee)
-            if grantee in known_roles:
-                referenced_roles.add(grantee)
-        for item in oracle_meta.sys_privileges:
-            grantee = remap_grant_role_alias(item.grantee)
-            if grantee in known_roles:
-                referenced_roles.add(grantee)
-        for item in oracle_meta.object_privileges:
-            grantee = remap_grant_role_alias(item.grantee)
-            if grantee in known_roles:
-                referenced_roles.add(grantee)
+    if not structural_mode:
+        referenced_roles: Set[str] = set()
+        known_roles: Set[str] = {remap_grant_role_alias(r) for r in oracle_roles.keys()}
+        referenced_roles.update({remap_grant_role_alias(item.role) for item in oracle_meta.role_privileges if item.role})
+        if not known_roles:
+            known_roles = set(referenced_roles)
+        if known_roles:
+            for item in oracle_meta.role_privileges:
+                grantee = remap_grant_role_alias(item.grantee)
+                if grantee in known_roles:
+                    referenced_roles.add(grantee)
+            for item in oracle_meta.sys_privileges:
+                grantee = remap_grant_role_alias(item.grantee)
+                if grantee in known_roles:
+                    referenced_roles.add(grantee)
+            for item in oracle_meta.object_privileges:
+                grantee = remap_grant_role_alias(item.grantee)
+                if grantee in known_roles:
+                    referenced_roles.add(grantee)
 
-    skipped_existing: Set[str] = set()
-    skipped_oracle_maintained: Set[str] = set()
-    role_warnings: List[str] = []
-    for role in sorted(referenced_roles):
-        role_u = (role or "").upper()
-        if not role_u or role_u == "PUBLIC":
-            continue
-        info = oracle_roles.get(role_u)
-        if not info:
-            source_role_u = GRANT_ROLE_ALIAS_REVERSE_MAP.get(role_u, role_u)
-            info = oracle_roles.get(source_role_u)
-        if info and info.oracle_maintained and not include_oracle_maintained_roles:
-            skipped_oracle_maintained.add(role_u)
-            continue
-        if role_u in ob_roles:
-            skipped_existing.add(role_u)
-            continue
-        ddl_lines: List[str] = []
-        if info:
-            meta = [
-                f"AUTHENTICATION_TYPE={info.authentication_type or '-'}",
-                f"PASSWORD_REQUIRED={'YES' if info.password_required else 'NO'}"
-            ]
-            if info.oracle_maintained is not None:
-                meta.append(f"ORACLE_MAINTAINED={'Y' if info.oracle_maintained else 'N'}")
-            ddl_lines.append(f"-- ROLE: {role_u} ({', '.join(meta)})")
-            if info.authentication_type in ROLE_AUTH_WARN_TYPES or info.password_required:
-                role_warnings.append(role_u)
-                ddl_lines.append("-- NOTE: 该角色需要密码/外部认证，已生成 NOT IDENTIFIED，需人工补充。")
-        else:
-            ddl_lines.append(f"-- ROLE: {role_u} (metadata unavailable)")
-        ddl_lines.append(f"CREATE ROLE {role_u};")
-        role_ddls.extend(ddl_lines)
+        skipped_existing: Set[str] = set()
+        skipped_oracle_maintained: Set[str] = set()
+        role_warnings: List[str] = []
+        for role in sorted(referenced_roles):
+            role_u = (role or "").upper()
+            if not role_u or role_u == "PUBLIC":
+                continue
+            info = oracle_roles.get(role_u)
+            if not info:
+                source_role_u = GRANT_ROLE_ALIAS_REVERSE_MAP.get(role_u, role_u)
+                info = oracle_roles.get(source_role_u)
+            if info and info.oracle_maintained and not include_oracle_maintained_roles:
+                skipped_oracle_maintained.add(role_u)
+                continue
+            if role_u in ob_roles:
+                skipped_existing.add(role_u)
+                continue
+            ddl_lines: List[str] = []
+            if info:
+                meta = [
+                    f"AUTHENTICATION_TYPE={info.authentication_type or '-'}",
+                    f"PASSWORD_REQUIRED={'YES' if info.password_required else 'NO'}"
+                ]
+                if info.oracle_maintained is not None:
+                    meta.append(f"ORACLE_MAINTAINED={'Y' if info.oracle_maintained else 'N'}")
+                ddl_lines.append(f"-- ROLE: {role_u} ({', '.join(meta)})")
+                if info.authentication_type in ROLE_AUTH_WARN_TYPES or info.password_required:
+                    role_warnings.append(role_u)
+                    ddl_lines.append("-- NOTE: 该角色需要密码/外部认证，已生成 NOT IDENTIFIED，需人工补充。")
+            else:
+                ddl_lines.append(f"-- ROLE: {role_u} (metadata unavailable)")
+            ddl_lines.append(f"CREATE ROLE {role_u};")
+            role_ddls.extend(ddl_lines)
 
-    if role_ddls:
-        log.info("[GRANT] 需生成角色 DDL %d 条。", sum(1 for line in role_ddls if line.startswith("CREATE ROLE ")))
-    if skipped_existing:
-        log.info("[GRANT] 已存在于 OB 的角色（跳过创建）: %s", ", ".join(sorted(skipped_existing)))
-    if skipped_oracle_maintained:
-        log.info("[GRANT] Oracle 维护角色已跳过创建: %s", ", ".join(sorted(skipped_oracle_maintained)))
-    if role_warnings:
-        log.warning("[GRANT] 以下角色需要密码/外部认证，请人工处理: %s", ", ".join(sorted(set(role_warnings))))
+        if role_ddls:
+            log.info("[GRANT] 需生成角色 DDL %d 条。", sum(1 for line in role_ddls if line.startswith("CREATE ROLE ")))
+        if skipped_existing:
+            log.info("[GRANT] 已存在于 OB 的角色（跳过创建）: %s", ", ".join(sorted(skipped_existing)))
+        if skipped_oracle_maintained:
+            log.info("[GRANT] Oracle 维护角色已跳过创建: %s", ", ".join(sorted(skipped_oracle_maintained)))
+        if role_warnings:
+            log.warning("[GRANT] 以下角色需要密码/外部认证，请人工处理: %s", ", ".join(sorted(set(role_warnings))))
 
     return GrantPlan(
         object_grants=object_grants,
@@ -24348,6 +24937,10 @@ def build_grant_plan(
         filtered_grants=filtered_grants,
         view_grant_targets=view_grant_targets,
         object_target_types=object_target_types,
+        grant_generation_mode=grant_generation_mode,
+        mode_skip_counts=mode_skip_counts or None,
+        derived_dependency_pair_count=len(expected_pairs),
+        source_dependency_record_count=len(dep_records),
     )
 
 
@@ -24443,6 +25036,10 @@ def augment_grant_plan_with_identity_sequence_grants(
         filtered_grants=list(grant_plan.filtered_grants or []),
         view_grant_targets=set(grant_plan.view_grant_targets or set()),
         object_target_types=object_target_types,
+        grant_generation_mode=grant_plan.grant_generation_mode,
+        mode_skip_counts=dict(grant_plan.mode_skip_counts or {}) or None,
+        derived_dependency_pair_count=int(grant_plan.derived_dependency_pair_count or 0),
+        source_dependency_record_count=int(grant_plan.source_dependency_record_count or 0),
     )
     return updated_plan, expectation_rows
 
@@ -24920,6 +25517,10 @@ def filter_grant_plan_unsupported_targets(
         filtered_grants=filtered_entries,
         view_grant_targets=set(grant_plan.view_grant_targets or set()),
         object_target_types=dict(grant_plan.object_target_types or {}),
+        grant_generation_mode=grant_plan.grant_generation_mode,
+        mode_skip_counts=dict(grant_plan.mode_skip_counts or {}) or None,
+        derived_dependency_pair_count=int(grant_plan.derived_dependency_pair_count or 0),
+        source_dependency_record_count=int(grant_plan.source_dependency_record_count or 0),
     )
     return updated_plan, skipped
 
@@ -32550,7 +33151,10 @@ def remap_view_dependencies(
     remap_rules: RemapRules,
     full_object_mapping: FullObjectMapping,
     synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]] = None,
-    view_dependency_map: Optional[Dict[Tuple[str, str], Set[str]]] = None
+    view_dependency_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
+    view_callable_dep_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
+    ob_meta: Optional[ObMetadata] = None,
+    preferred_target_schemas: Optional[List[str]] = None,
 ) -> str:
     """
     根据remap规则重写VIEW DDL中的依赖对象引用
@@ -32564,11 +33168,16 @@ def remap_view_dependencies(
     
     # 提取依赖对象（无 schema 的引用按 view_schema 兜底）
     dependencies = extract_view_dependencies(ddl, default_schema=view_schema, max_depth=5)
+    dep_key = ((view_schema or "").upper(), (view_name or "").upper())
     if view_dependency_map:
-        dep_key = ((view_schema or "").upper(), (view_name or "").upper())
         fallback_deps = view_dependency_map.get(dep_key)
         if fallback_deps:
             dependencies |= {d.upper() for d in fallback_deps}
+    callable_deps = {
+        (item or "").upper()
+        for item in ((view_callable_dep_map or {}).get(dep_key) or set())
+        if (item or "").strip()
+    }
 
     # 构建替换映射（全名与无前缀引用分别处理）
     replacements_qualified: Dict[str, str] = {}
@@ -32576,36 +33185,40 @@ def remap_view_dependencies(
     view_schema_u = (view_schema or "").upper()
     view_name_u = (view_name or "").upper()
     synonym_meta = synonym_meta or {}
-    preferred_types = ("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM", "FUNCTION")
+    preferred_types = ("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM")
     unresolved_dependencies: List[str] = []
-    preserved_synonym_dependencies: List[str] = []
+    suppressed_callable_dependencies: List[str] = []
 
-    def _get_managed_synonym_object(owner: str, dep_obj: str) -> Optional[str]:
-        owner_u = (owner or "").upper()
-        dep_obj_u = (dep_obj or "").upper()
-        if not owner_u or not dep_obj_u:
-            return None
-        mapped = get_mapped_target(full_object_mapping, f"{owner_u}.{dep_obj_u}", "SYNONYM")
-        return mapped.upper() if mapped else None
-
-    def _resolve_synonym(owner: str, dep_obj: str) -> Optional[str]:
+    def _resolve_synonym_for_table_only(owner: str, dep_obj: str) -> Tuple[Optional[str], str]:
         terminal_source = resolve_synonym_terminal_source(owner, dep_obj, synonym_meta, full_object_mapping)
         if not terminal_source:
-            return None
+            return None, "UNRESOLVED"
+        terminal_type_map = dict(full_object_mapping.get(terminal_source.upper()) or {})
+        terminal_types = {
+            (obj_type or "").upper()
+            for obj_type in terminal_type_map.keys()
+            if obj_type
+        }
+        if terminal_types and not (terminal_types & VIEW_REWRITE_TERMINAL_TYPES):
+            return None, "NON_TABLELIKE"
+        if not terminal_types:
+            return None, "UNRESOLVED"
         mapped = find_mapped_target_any_type(
             full_object_mapping,
             terminal_source,
-            preferred_types=preferred_types
+            preferred_types=("TABLE", "VIEW", "MATERIALIZED VIEW")
         )
         explicit = remap_rules.get(terminal_source)
-        # 显式 remap 规则始终优先于自动映射，避免类型歧义导致误替换。
         if explicit:
             mapped = explicit
-        return (mapped or terminal_source).upper()
+        return (mapped or terminal_source).upper(), "TABLELIKE"
 
     for dep in dependencies:
         dep_u = dep.upper()
         if not dep_u:
+            continue
+        if dep_u in callable_deps:
+            suppressed_callable_dependencies.append(dep_u)
             continue
         dep_schema = view_schema_u
         dep_obj = dep_u
@@ -32613,17 +33226,25 @@ def remap_view_dependencies(
             dep_schema, dep_obj = dep_u.split('.', 1)
 
         mapped_target: Optional[str] = None
-        explicit_dep_target = remap_rules.get(dep_u)
         resolved_by_synonym = False
-        preserve_original_for_unresolved_synonym = False
         dep_type_map = dict(full_object_mapping.get(dep_u, {}) or {})
+        dep_types = {
+            (obj_type or "").upper()
+            for obj_type in dep_type_map.keys()
+            if obj_type
+        }
+        if dep_types and not (dep_types & REWRITE_ELIGIBLE_DEP_TYPES):
+            suppressed_callable_dependencies.append(dep_u)
+            continue
+        explicit_dep_target = remap_rules.get(dep_u)
         has_direct_non_synonym = any(
             (obj_type or "").upper() != "SYNONYM"
             for obj_type in dep_type_map.keys()
         )
+        is_synonym_only = bool(dep_types) and dep_types <= {"SYNONYM"}
         # 显式 remap 对该依赖对象拥有最高优先级（包括存在同名同义词时），
         # 避免同义词链把本应映射到 TABLE 的对象误改为 *_VW 等终点对象名。
-        if explicit_dep_target:
+        if explicit_dep_target and not is_synonym_only:
             mapped_target = explicit_dep_target
         elif has_direct_non_synonym:
             # 若源端该标识符本身存在非同义词对象映射（TABLE/VIEW/...），
@@ -32635,35 +33256,29 @@ def remap_view_dependencies(
             )
         else:
             if dep_schema == "PUBLIC":
-                mapped_target = _resolve_synonym("PUBLIC", dep_obj)
+                mapped_target, synonym_state = _resolve_synonym_for_table_only("PUBLIC", dep_obj)
+                if synonym_state == "NON_TABLELIKE":
+                    suppressed_callable_dependencies.append(dep_u)
+                    continue
                 if mapped_target:
                     resolved_by_synonym = True
-                else:
-                    managed_synonym_target = _get_managed_synonym_object("PUBLIC", dep_obj)
-                    if managed_synonym_target:
-                        preserve_original_for_unresolved_synonym = True
-                        preserved_synonym_dependencies.append(f"PUBLIC.{dep_obj}->{managed_synonym_target}")
             else:
                 # 同义词依赖优先解析为终点对象，再做 remap，避免停留在目标同义词名。
-                mapped_target = _resolve_synonym(dep_schema, dep_obj)
+                mapped_target, synonym_state = _resolve_synonym_for_table_only(dep_schema, dep_obj)
+                if synonym_state == "NON_TABLELIKE":
+                    suppressed_callable_dependencies.append(dep_u)
+                    continue
                 if mapped_target:
                     resolved_by_synonym = True
-                else:
-                    managed_synonym_target = _get_managed_synonym_object(dep_schema, dep_obj)
-                    if managed_synonym_target:
-                        preserve_original_for_unresolved_synonym = True
-                        preserved_synonym_dependencies.append(f"{dep_schema}.{dep_obj}->{managed_synonym_target}")
                 if not mapped_target and dep_schema == view_schema_u:
-                    mapped_target = _resolve_synonym("PUBLIC", dep_obj)
+                    mapped_target, public_synonym_state = _resolve_synonym_for_table_only("PUBLIC", dep_obj)
+                    if public_synonym_state == "NON_TABLELIKE":
+                        suppressed_callable_dependencies.append(dep_u)
+                        continue
                     if mapped_target:
                         resolved_by_synonym = True
-                    else:
-                        managed_public_synonym_target = _get_managed_synonym_object("PUBLIC", dep_obj)
-                        if managed_public_synonym_target:
-                            preserve_original_for_unresolved_synonym = True
-                            preserved_synonym_dependencies.append(f"PUBLIC.{dep_obj}->{managed_public_synonym_target}")
 
-            if not mapped_target and not preserve_original_for_unresolved_synonym:
+            if not mapped_target:
                 mapped_target = find_mapped_target_any_type(
                     full_object_mapping,
                     dep_u,
@@ -32671,12 +33286,18 @@ def remap_view_dependencies(
                 )
                 # 若直接映射缺失，或落在 identity 映射，尝试同 schema 私有同义词
                 if (not mapped_target) or (mapped_target.upper() == dep_u):
-                    mapped_syn = _resolve_synonym(dep_schema, dep_obj)
+                    mapped_syn, synonym_state = _resolve_synonym_for_table_only(dep_schema, dep_obj)
+                    if synonym_state == "NON_TABLELIKE":
+                        suppressed_callable_dependencies.append(dep_u)
+                        continue
                     if mapped_syn:
                         mapped_target = mapped_syn
                 # 对当前 VIEW schema 的裸名引用，继续兜底 PUBLIC 同义词
                 if ((not mapped_target) or (mapped_target.upper() == dep_u)) and dep_schema == view_schema_u:
-                    mapped_public = _resolve_synonym("PUBLIC", dep_obj)
+                    mapped_public, public_synonym_state = _resolve_synonym_for_table_only("PUBLIC", dep_obj)
+                    if public_synonym_state == "NON_TABLELIKE":
+                        suppressed_callable_dependencies.append(dep_u)
+                        continue
                     if mapped_public:
                         mapped_target = mapped_public
         if not mapped_target:
@@ -32699,27 +33320,83 @@ def remap_view_dependencies(
             # 无前缀引用也替换为全名(或目标名)，避免跨 schema 迁移后失效
             replacements_unqualified.setdefault(dep_obj.upper(), tgt_u)
 
-    if preserved_synonym_dependencies:
-        preview = ", ".join(sorted(dict.fromkeys(preserved_synonym_dependencies))[:10])
-        log.warning(
-            "[VIEW] %s.%s 有 %d 条同义词依赖终点无法安全解析，已保留原引用而未使用目标同义词 fallback: %s",
+    if suppressed_callable_dependencies:
+        preview = ", ".join(sorted(dict.fromkeys(suppressed_callable_dependencies))[:10])
+        suffix = " ..." if len(set(suppressed_callable_dependencies)) > 10 else ""
+        log.debug(
+            "[VIEW] %s.%s callable/system-style 依赖不进入 rewrite: %s%s",
             view_schema_u,
             view_name_u,
-            len(preserved_synonym_dependencies),
-            preview,
-        )
-    if unresolved_dependencies:
-        unresolved_sorted = sorted(dict.fromkeys(unresolved_dependencies))
-        preview = ", ".join(unresolved_sorted[:10])
-        suffix = " ..." if len(unresolved_sorted) > 10 else ""
-        log.warning(
-            "[VIEW] %s.%s 有 %d 条依赖无法安全 remap，保留原引用: %s%s",
-            view_schema_u,
-            view_name_u,
-            len(unresolved_sorted),
             preview,
             suffix,
         )
+    if unresolved_dependencies:
+        unresolved_sorted = sorted(dict.fromkeys(unresolved_dependencies))
+        oracle_system: List[str] = []
+        cross_ok: List[str] = []
+        cross_missing: List[Tuple[str, List[str]]] = []
+        unknown: List[str] = []
+        for dep in unresolved_sorted:
+            category, candidates = classify_view_unresolved_dep(
+                dep,
+                ob_meta,
+                preferred_target_schemas,
+            )
+            if category == "ORACLE_SYSTEM":
+                oracle_system.append(dep)
+            elif category == "CROSS_SCHEMA_OK":
+                cross_ok.append(dep)
+            elif category == "CROSS_SCHEMA_MISSING":
+                cross_missing.append((dep, candidates))
+            else:
+                unknown.append(dep)
+
+        if cross_missing:
+            log.warning(
+                "[VIEW] %s.%s 有 %d 条跨 schema 依赖在 OB 端找不到对应 schema，VIEW 可能无法编译：",
+                view_schema_u,
+                view_name_u,
+                len(cross_missing),
+            )
+            for dep, candidates in cross_missing:
+                if candidates:
+                    log.warning(
+                        "  [缺失] %s → OB 端未找到该 schema。同名对象候选: %s",
+                        dep,
+                        ", ".join(candidates),
+                    )
+                else:
+                    log.warning(
+                        "  [缺失] %s → OB 端未找到该 schema，也未发现同名对象",
+                        dep,
+                    )
+
+        if unknown:
+            preview = ", ".join(unknown[:10])
+            suffix = " ..." if len(unknown) > 10 else ""
+            log.warning(
+                "[VIEW] %s.%s 有 %d 条依赖无法解析（可能是 scope 外对象或映射缺失），保留原引用: %s%s",
+                view_schema_u,
+                view_name_u,
+                len(unknown),
+                preview,
+                suffix,
+            )
+
+        if cross_ok:
+            log.debug(
+                "[VIEW] %s.%s 跨 schema 引用(OB 端 schema 已存在，保留原引用): %s",
+                view_schema_u,
+                view_name_u,
+                ", ".join(cross_ok[:5]),
+            )
+        if oracle_system:
+            log.debug(
+                "[VIEW] %s.%s Oracle 系统对象依赖(忽略 rewrite/warning): %s",
+                view_schema_u,
+                view_name_u,
+                ", ".join(oracle_system[:5]),
+            )
     if not replacements_qualified and not replacements_unqualified:
         return ddl
 
@@ -38234,6 +38911,7 @@ def generate_fixup_scripts(
     managed_target_scope: Optional[ManagedTargetScope] = None,
     view_compat_map: Optional[Dict[Tuple[str, str], ViewCompatResult]] = None,
     view_dependency_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
+    view_callable_dep_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
     trigger_status_rows: Optional[List[TriggerStatusReportRow]] = None,
     constraint_status_rows: Optional[List[ConstraintStatusDriftRow]] = None,
 ):
@@ -38259,6 +38937,7 @@ def generate_fixup_scripts(
     progress_log_interval = max(1.0, progress_log_interval)
     synonym_meta_map = synonym_metadata or {}
     view_dependency_map = view_dependency_map or {}
+    view_callable_dep_map = view_callable_dep_map or {}
     trigger_status_rows = trigger_status_rows or []
     constraint_status_rows = constraint_status_rows or []
     missing_table_constraint_status_rows: List[MissingTableConstraintStatusRow] = []
@@ -39003,6 +39682,7 @@ def generate_fixup_scripts(
             filtered_grants=[],
             view_grant_targets=set(),
             object_target_types={},
+            grant_generation_mode=normalize_grant_generation_mode(settings.get("grant_generation_mode", "full")),
         )
     if not grant_enabled:
         grant_plan = GrantPlan(
@@ -39014,6 +39694,7 @@ def generate_fixup_scripts(
             filtered_grants=[],
             view_grant_targets=set(),
             object_target_types={},
+            grant_generation_mode=normalize_grant_generation_mode(settings.get("grant_generation_mode", "full")),
         )
 
     object_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]] = defaultdict(set)
@@ -40061,10 +40742,15 @@ def generate_fixup_scripts(
         for item in ((grant_plan.view_grant_targets or set()) if grant_plan else set())
         if item
     }
+    grant_mode = normalize_grant_generation_mode(
+        grant_plan.grant_generation_mode if grant_plan else settings.get("grant_generation_mode", "full")
+    )
     view_prereq_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]] = {}
     view_post_grants_by_grantee: Dict[str, Set[ObjectGrantEntry]] = {}
     views_with_missing_prereq: Set[str] = set()
-    if grant_enabled and object_grants_missing_by_grantee and view_target_set:
+    if grant_enabled and object_grants_missing_by_grantee and (
+        view_target_set or grant_mode == GRANT_GENERATION_MODE_STRUCTURAL
+    ):
         (
             view_prereq_grants_by_grantee,
             view_post_grants_by_grantee,
@@ -40073,7 +40759,8 @@ def generate_fixup_scripts(
         ) = split_view_grants(
             view_target_set,
             expected_dependency_pairs,
-            object_grants_missing_by_grantee
+            object_grants_missing_by_grantee,
+            grant_generation_mode=grant_mode,
         )
     view_grants_split_enabled = bool(view_prereq_grants_by_grantee or view_post_grants_by_grantee)
     if grant_enabled:
@@ -40815,6 +41502,7 @@ def generate_fixup_scripts(
         log.warning("[VIEW] 无法获取OceanBase版本，将使用保守的DDL清理策略")
 
     log.info("[FIXUP] (4/9) 正在生成 VIEW / MATERIALIZED VIEW / 其他对象脚本...")
+    preferred_view_target_schemas = sorted(collect_ob_schema_names(ob_meta))
 
     def get_view_cached_ddl(
         schema: str,
@@ -40856,7 +41544,10 @@ def generate_fixup_scripts(
             remap_rules,
             full_object_mapping,
             synonym_meta=synonym_meta_map,
-            view_dependency_map=view_dependency_map
+            view_dependency_map=view_dependency_map,
+            view_callable_dep_map=view_callable_dep_map,
+            ob_meta=ob_meta,
+            preferred_target_schemas=preferred_view_target_schemas,
         )
         final_ddl = adjust_ddl_for_object(
             remapped_ddl,
@@ -41136,7 +41827,10 @@ def generate_fixup_scripts(
                     remap_rules,
                     full_object_mapping,
                     synonym_meta=synonym_meta_map,
-                    view_dependency_map=view_dependency_map
+                    view_dependency_map=view_dependency_map,
+                    view_callable_dep_map=view_callable_dep_map,
+                    ob_meta=ob_meta,
+                    preferred_target_schemas=preferred_view_target_schemas,
                 )
                 final_ddl = adjust_ddl_for_object(
                     remapped_ddl,
@@ -43055,6 +43749,8 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "列空值语义差异明细"
     if name.startswith("column_visibility_skipped_detail_"):
         return "DETAIL", "列可见性(INVISIBLE)跳过明细"
+    if name.startswith("runtime_degraded_detail_"):
+        return "DETAIL", "运行时降级明细"
     if name.startswith("column_default_detail_"):
         return "DETAIL", "列默认值差异明细"
     if name.startswith("column_default_on_null_detail_"):
@@ -44723,6 +45419,29 @@ def export_noise_suppressed_detail(
         for row in rows
     ]
     return write_pipe_report("降噪明细", header_fields, data_rows, output_path)
+
+
+def export_runtime_degraded_detail(
+    rows: List[RuntimeDegradedEvent],
+    report_dir: Path,
+    report_timestamp: Optional[str]
+) -> Optional[Path]:
+    normalized_rows = normalize_runtime_degraded_events(rows)
+    if not report_dir or not normalized_rows or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"runtime_degraded_detail_{report_timestamp}.txt"
+    header_fields = ["SCOPE", "STAGE", "CODE", "ENTITY", "DETAIL"]
+    data_rows = [
+        [
+            item.scope,
+            item.stage,
+            item.code,
+            item.entity or "-",
+            item.detail or "-",
+        ]
+        for item in normalized_rows
+    ]
+    return write_pipe_report("运行时降级明细", header_fields, data_rows, output_path)
 
 
 def export_dependency_detail(
@@ -47638,7 +48357,7 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['grants']} (
     TARGET_NAME         VARCHAR2(128),
     TARGET_TYPE         VARCHAR2(32),
     WITH_GRANT_OPTION   NUMBER(1) DEFAULT 0,
-    STATUS              VARCHAR2(32),
+    STATUS              VARCHAR2(64),
     FILTER_REASON       VARCHAR2(256),
     CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP,
     CONSTRAINT PK_DIFF_REPORT_GRANT PRIMARY KEY (GRANT_ID)
@@ -47666,7 +48385,7 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['usability']} (
     SCHEMA_NAME         VARCHAR2(128),
     OBJECT_NAME         VARCHAR2(256),
     USABLE              NUMBER(1),
-    STATUS              VARCHAR2(32),
+    STATUS              VARCHAR2(64),
     REASON              VARCHAR2(1024),
     DETAIL_JSON         CLOB,
     CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP
@@ -47694,9 +48413,9 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['package_compare']} (
     SCHEMA_NAME         VARCHAR2(128),
     OBJECT_NAME         VARCHAR2(256),
     OBJECT_TYPE         VARCHAR2(32),
-    SRC_STATUS          VARCHAR2(32),
-    TGT_STATUS          VARCHAR2(32),
-    DIFF_STATUS         VARCHAR2(32),
+    SRC_STATUS          VARCHAR2(64),
+    TGT_STATUS          VARCHAR2(64),
+    DIFF_STATUS         VARCHAR2(64),
     DIFF_HASH           VARCHAR2(64),
     DIFF_SUMMARY        VARCHAR2(4000),
     DIFF_PATH           VARCHAR2(512),
@@ -47727,7 +48446,7 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['artifact']} (
     FILE_HASH           VARCHAR2(64),
     ROW_COUNT           NUMBER DEFAULT 0,
     FIELD_LIST          VARCHAR2(2000),
-    STATUS              VARCHAR2(32),
+    STATUS              VARCHAR2(64),
     NOTE                VARCHAR2(1000),
     CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP
 )
@@ -47751,7 +48470,7 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['dependency']} (
     REF_SCHEMA          VARCHAR2(128),
     REF_NAME            VARCHAR2(256),
     REF_TYPE            VARCHAR2(32),
-    EDGE_STATUS         VARCHAR2(32),
+    EDGE_STATUS         VARCHAR2(64),
     REASON              VARCHAR2(2000),
     CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP
 )
@@ -47767,7 +48486,7 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['view_chain']} (
     NODE_NAME           VARCHAR2(256),
     NODE_TYPE           VARCHAR2(32),
     NODE_EXISTS         VARCHAR2(16),
-    GRANT_STATUS        VARCHAR2(32),
+    GRANT_STATUS        VARCHAR2(64),
     CYCLE_FLAG          NUMBER(1) DEFAULT 0,
     CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP
 )
@@ -47802,7 +48521,7 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['blacklist']} (
     TABLE_NAME          VARCHAR2(256),
     BLACK_TYPE          VARCHAR2(64),
     DATA_TYPE           VARCHAR2(128),
-    STATUS              VARCHAR2(32),
+    STATUS              VARCHAR2(64),
     REASON              VARCHAR2(1000),
     DETAIL              VARCHAR2(2000),
     CREATED_AT          TIMESTAMP DEFAULT SYSTIMESTAMP
@@ -47862,7 +48581,7 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['resolution']} (
     SCHEMA_NAME         VARCHAR2(128) NOT NULL,
     OBJECT_NAME         VARCHAR2(256) NOT NULL,
     ACTION_TYPE         VARCHAR2(64) NOT NULL,
-    RESOLUTION_STATUS   VARCHAR2(32) DEFAULT 'OPEN',
+    RESOLUTION_STATUS   VARCHAR2(64) DEFAULT 'OPEN',
     RESOLVED_BY         VARCHAR2(128),
     RESOLVED_AT         TIMESTAMP,
     NOTE                VARCHAR2(1000),
@@ -48114,6 +48833,28 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['resolution']} (
     )
     if not ok_len_mig:
         return False, err_len_mig
+
+    for table_name, column_name, min_len in [
+        (REPORT_DB_TABLES["grants"], "STATUS", 64),
+        (REPORT_DB_TABLES["usability"], "STATUS", 64),
+        (REPORT_DB_TABLES["package_compare"], "SRC_STATUS", 64),
+        (REPORT_DB_TABLES["package_compare"], "TGT_STATUS", 64),
+        (REPORT_DB_TABLES["package_compare"], "DIFF_STATUS", 64),
+        (REPORT_DB_TABLES["artifact"], "STATUS", 64),
+        (REPORT_DB_TABLES["dependency"], "EDGE_STATUS", 64),
+        (REPORT_DB_TABLES["view_chain"], "GRANT_STATUS", 64),
+        (REPORT_DB_TABLES["blacklist"], "STATUS", 64),
+        (REPORT_DB_TABLES["blacklist"], "REASON", 1000),
+        (REPORT_DB_TABLES["blacklist"], "DETAIL", 2000),
+        (REPORT_DB_TABLES["resolution"], "RESOLUTION_STATUS", 64),
+    ]:
+        ok_len_mig, err_len_mig = _ensure_varchar2_column_min_len(
+            table_name,
+            column_name,
+            min_len,
+        )
+        if not ok_len_mig:
+            return False, err_len_mig
 
     if not to_create:
         return True, ""
@@ -49105,6 +49846,8 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "COLUMN_NULLABILITY_DETAIL"
     if name.startswith("column_visibility_skipped_detail_"):
         return "COLUMN_VISIBILITY_SKIPPED_DETAIL"
+    if name.startswith("runtime_degraded_detail_"):
+        return "RUNTIME_DEGRADED_DETAIL"
     if name.startswith("column_default_detail_"):
         return "COLUMN_DEFAULT_DETAIL"
     if name.startswith("column_default_on_null_detail_"):
@@ -49205,6 +49948,7 @@ def _infer_artifact_status(
         "TRIGGER_NON_TABLE_DETAIL",
         "COLUMN_NULLABILITY_DETAIL",
         "COLUMN_VISIBILITY_SKIPPED_DETAIL",
+        "RUNTIME_DEGRADED_DETAIL",
         "COLUMN_IDENTITY_DETAIL",
         "COLUMN_IDENTITY_OPTION_DETAIL",
         "COLUMN_DEFAULT_ON_NULL_DETAIL",
@@ -50347,6 +51091,9 @@ def _insert_report_blacklist_rows(
     for batch in chunk_list(rows, batch_size):
         values_sql: List[str] = []
         for row in batch:
+            reason = (row.get("reason") or "")
+            if len(reason) > 1000:
+                reason = reason[:997] + "..."
             detail = (row.get("detail") or "")
             if len(detail) > 2000:
                 detail = detail[:1997] + "..."
@@ -50360,7 +51107,7 @@ def _insert_report_blacklist_rows(
                     black_type=sql_quote_literal(row.get("black_type")) if row.get("black_type") else "NULL",
                     data_type=sql_quote_literal(row.get("data_type")) if row.get("data_type") else "NULL",
                     status=sql_quote_literal(row.get("status")) if row.get("status") else "NULL",
-                    reason=sql_quote_literal(row.get("reason")) if row.get("reason") else "NULL",
+                    reason=sql_quote_literal(reason) if reason else "NULL",
                     detail=sql_quote_literal(detail) if detail else "NULL",
                 )
             )
@@ -51174,6 +51921,15 @@ def save_report_to_db(
         detail_item_enable = False
     detail_item_max_rows = int(settings.get("report_db_detail_item_max_rows", 0) or 0)
     case_sensitive_findings = list(settings.get("_case_sensitive_findings") or [])
+    runtime_degraded_events = normalize_runtime_degraded_events(settings.get("_runtime_degraded_events") or [])
+    runtime_compare_events = [
+        item for item in runtime_degraded_events
+        if item.scope == RUNTIME_DEGRADED_SCOPE_COMPARE
+    ]
+    runtime_artifact_events = [
+        item for item in runtime_degraded_events
+        if item.scope == RUNTIME_DEGRADED_SCOPE_ARTIFACT
+    ]
 
     # 兼容两种形态：
     # 1) 嵌套结构: {"oracle": {...}, "oceanbase": {...}}
@@ -51300,6 +52056,13 @@ def save_report_to_db(
     else:
         conclusion = "WARN"
         conclusion_detail = f"存在 {actionable_mismatch_total} 个不匹配对象"
+
+    if runtime_compare_events:
+        if conclusion == "PASS":
+            conclusion = "WARN"
+        conclusion_detail = f"{conclusion_detail}; compare incomplete ({len(runtime_compare_events)})"
+    elif runtime_artifact_events:
+        conclusion_detail = f"{conclusion_detail}; artifact degraded ({len(runtime_artifact_events)})"
 
     if store_scope in {"core", "full"}:
         detail_rows, detail_truncated, detail_truncated_count = _build_report_detail_rows(
@@ -51976,6 +52739,9 @@ def build_run_summary(
     ddl_cleanup_report_path: Optional[Path] = None,
     manual_action_rows: Optional[List[OperatorActionRow]] = None,
     manual_actions_path: Optional[Path] = None,
+    runtime_degraded_events: Optional[List[RuntimeDegradedEvent]] = None,
+    runtime_degraded_detail_path: Optional[Path] = None,
+    grant_plan: Optional[GrantPlan] = None,
 ) -> RunSummary:
     end_time = datetime.now()
     total_seconds = time.perf_counter() - ctx.start_perf
@@ -51990,6 +52756,12 @@ def build_run_summary(
 
     actions_done: List[str] = []
     actions_skipped: List[str] = []
+    grant_mode = normalize_grant_generation_mode(
+        grant_plan.grant_generation_mode if grant_plan else GRANT_GENERATION_MODE_FULL
+    )
+    grant_mode_skip_counts = dict(grant_plan.mode_skip_counts or {}) if grant_plan else {}
+    structural_pair_count = int(grant_plan.derived_dependency_pair_count or 0) if grant_plan else 0
+    structural_record_count = int(grant_plan.source_dependency_record_count or 0) if grant_plan else 0
 
     if ctx.total_checked > 0:
         actions_done.append(
@@ -52057,12 +52829,20 @@ def build_run_summary(
     if ctx.enable_grant_generation:
         if ctx.fixup_enabled:
             actions_done.append(
-                "授权脚本生成: 启用 (目录 {miss}, {deferred}, {all})".format(
+                "授权脚本生成: 启用, mode={mode} (目录 {miss}, {deferred}, {all})".format(
+                    mode=grant_mode,
                     miss=Path(ctx.fixup_dir) / 'grants_miss',
                     deferred=Path(ctx.fixup_dir) / 'grants_deferred',
                     all=Path(ctx.fixup_dir) / 'grants_all'
                 )
             )
+            if grant_mode == GRANT_GENERATION_MODE_STRUCTURAL:
+                actions_done.append(
+                    "授权模式说明: structural，仅生成结构性授权（依赖记录 {records}，推导边 {pairs}）".format(
+                        records=structural_record_count,
+                        pairs=structural_pair_count,
+                    )
+                )
         else:
             actions_skipped.append("授权脚本生成: generate_fixup=false")
     else:
@@ -52128,6 +52908,15 @@ def build_run_summary(
     ddl_cleanup_preserved_rows = int(ddl_cleanup_summary.get("preserved_rows", 0) or 0)
     ddl_cleanup_semantic_rows = int(ddl_cleanup_summary.get("semantic_rewrite_rows", 0) or 0)
     manual_action_rows = list(manual_action_rows or [])
+    runtime_degraded_rows = normalize_runtime_degraded_events(runtime_degraded_events)
+    runtime_compare_events = [
+        item for item in runtime_degraded_rows
+        if item.scope == RUNTIME_DEGRADED_SCOPE_COMPARE
+    ]
+    runtime_artifact_events = [
+        item for item in runtime_degraded_rows
+        if item.scope == RUNTIME_DEGRADED_SCOPE_ARTIFACT
+    ]
     findings: List[str] = [
         f"主对象: 缺失 {missing_count}, 不匹配 {mismatched_count}, 多余 {extra_target_cnt}, 仅打印 {skipped_count}"
     ]
@@ -52191,6 +52980,18 @@ def build_run_summary(
             findings.append(f"权限兼容过滤: {filtered_grants_count} 条 (见 {filtered_grants_path})")
         else:
             findings.append(f"权限兼容过滤: {filtered_grants_count} 条")
+    if ctx.enable_grant_generation and grant_mode == GRANT_GENERATION_MODE_STRUCTURAL:
+        findings.append(
+            "授权模式: structural，仅输出对象创建/编译所需的最小跨 schema 授权"
+        )
+        findings.append(
+            "授权按模式跳过: Oracle对象={obj}, 列级={col}, 系统={sys}, 角色={role}".format(
+                obj=int(grant_mode_skip_counts.get("oracle_object_privileges", 0) or 0),
+                col=int(grant_mode_skip_counts.get("column_privileges", 0) or 0),
+                sys=int(grant_mode_skip_counts.get("system_privileges", 0) or 0),
+                role=int(grant_mode_skip_counts.get("role_privileges", 0) or 0),
+            )
+        )
     if extra_object_grant_count:
         if extra_grant_detail_path:
             findings.append(
@@ -52238,6 +53039,17 @@ def build_run_summary(
         findings.append(f"触发器视图引用提醒: {trigger_view_reference_count} 条")
     if trigger_literal_alert_count:
         findings.append(f"触发器对象路径字符串提醒: {trigger_literal_alert_count} 条")
+    if runtime_degraded_rows:
+        findings.append(
+            "运行时降级: compare={compare}, artifact={artifact}{suffix}".format(
+                compare=len(runtime_compare_events),
+                artifact=len(runtime_artifact_events),
+                suffix=(
+                    f" (见 {runtime_degraded_detail_path})"
+                    if runtime_degraded_detail_path else ""
+                ),
+            )
+        )
 
     attention: List[str] = []
     if missing_count or mismatched_count or extra_target_cnt:
@@ -52264,6 +53076,12 @@ def build_run_summary(
         attention.append("授权脚本生成已关闭，权限调整需人工确认。")
     elif ctx.enable_grant_generation and not ctx.fixup_enabled:
         attention.append("授权脚本生成依赖 generate_fixup=true，当前未输出授权脚本。")
+    elif grant_mode == GRANT_GENERATION_MODE_STRUCTURAL:
+        attention.append("当前未生成 Oracle 业务权限镜像；应用访问权限、列级/系统/角色授权需业务或 DBA 另行处理。")
+        if structural_record_count <= 0:
+            attention.append("structural 授权未加载到依赖记录，当前结果不会补齐结构性授权。")
+        elif structural_pair_count <= 0:
+            attention.append("structural 授权未推导出可用依赖边，当前结果不会补齐结构性授权。")
     if extra_public_grant_count:
         attention.append("检测到目标端存在源端未声明的 PUBLIC 对象授权，存在扩大授权风险。")
     if trigger_literal_alert_count:
@@ -52272,6 +53090,12 @@ def build_run_summary(
         attention.append("本次 fixup 中存在 DDL 语义改写，请优先复核 ddl_cleanup_detail 明细和脚本头注释。")
     if ddl_cleanup_preserved_rows:
         attention.append("部分 Oracle 子句已改为默认保留策略，需结合目标环境确认是否仍需人工精简。")
+    if runtime_compare_events:
+        attention.append(
+            "本次运行存在 compare incomplete 级运行时降级，当前结果不是完整 compare。"
+        )
+    if runtime_artifact_events:
+        attention.append("本次运行存在辅助产物降级，请关注相关导出是否缺失。")
     if config_diagnostics:
         attention.append(f"配置诊断提示 {len(config_diagnostics)} 项（详见报告）。")
     manual_actions = summarize_operator_action_rows(manual_action_rows, manual_actions_path)
@@ -52311,14 +53135,25 @@ def build_run_summary(
     if comment_mis_cnt:
         _append_unique_guide_step(next_steps, "如业务要求注释一致，再确认 comment mismatch 明细。")
     if ctx.enable_grant_generation and ctx.fixup_enabled:
-        _append_unique_guide_step(
-            next_steps,
-            "授权目录建议先看 {miss}，对象补齐后再看 {deferred}，全量参考在 {all}。".format(
-                miss=Path(ctx.fixup_dir) / 'grants_miss',
-                deferred=Path(ctx.fixup_dir) / 'grants_deferred',
-                all=Path(ctx.fixup_dir) / 'grants_all'
+        if grant_mode == GRANT_GENERATION_MODE_STRUCTURAL:
+            _append_unique_guide_step(
+                next_steps,
+                "structural 模式下先执行 {prereq} 与 {miss}，对象补齐后再看 {deferred}；{all} 仅作 structural 审计参考。".format(
+                    prereq=Path(ctx.fixup_dir) / 'view_prereq_grants',
+                    miss=Path(ctx.fixup_dir) / 'grants_miss',
+                    deferred=Path(ctx.fixup_dir) / 'grants_deferred',
+                    all=Path(ctx.fixup_dir) / 'grants_all'
+                )
             )
-        )
+        else:
+            _append_unique_guide_step(
+                next_steps,
+                "授权目录建议先看 {miss}，对象补齐后再看 {deferred}，全量参考在 {all}。".format(
+                    miss=Path(ctx.fixup_dir) / 'grants_miss',
+                    deferred=Path(ctx.fixup_dir) / 'grants_deferred',
+                    all=Path(ctx.fixup_dir) / 'grants_all'
+                )
+            )
     if fixup_skip_summary and any(fixup_skip_summary.get(obj_type) for obj_type in ("INDEX", "TRIGGER", "SYNONYM", "SEQUENCE_RESTART")):
         if report_file:
             report_parent = Path(report_file).parent
@@ -52338,6 +53173,11 @@ def build_run_summary(
         _append_unique_guide_step(
             next_steps,
             f"脚本头出现 DDL_REWRITE 注释时，请同步核对 {ddl_cleanup_report_path} 中的语义改写明细。"
+        )
+    if runtime_degraded_rows and runtime_degraded_detail_path:
+        _append_unique_guide_step(
+            next_steps,
+            f"若需确认本轮降级范围，请先查看 {runtime_degraded_detail_path}。"
         )
 
     return RunSummary(
@@ -52477,6 +53317,7 @@ def print_final_report(
     scope_integrity_issues: Optional[List[ScopeIntegrityIssue]] = None,
     scope_integrity_detail_path: Optional[Path] = None,
     scope_integrity_candidate_path: Optional[Path] = None,
+    grant_plan: Optional[GrantPlan] = None,
 ):
     custom_theme = Theme({
         "ok": "green",
@@ -52519,6 +53360,24 @@ def print_final_report(
         else None
     )
     grant_capability_summary = dict((settings.get("_grant_capability_summary") or {}) if settings else {})
+    runtime_degraded_events = normalize_runtime_degraded_events(
+        (settings.get("_runtime_degraded_events") or []) if settings else []
+    )
+    runtime_compare_events = [
+        item for item in runtime_degraded_events
+        if item.scope == RUNTIME_DEGRADED_SCOPE_COMPARE
+    ]
+    runtime_artifact_events = [
+        item for item in runtime_degraded_events
+        if item.scope == RUNTIME_DEGRADED_SCOPE_ARTIFACT
+    ]
+    runtime_degraded_detail_path: Optional[Path] = None
+    if runtime_degraded_events and report_file and report_ts:
+        runtime_degraded_detail_path = export_runtime_degraded_detail(
+            runtime_degraded_events,
+            Path(report_file).parent,
+            report_ts,
+        )
 
     if extra_results is None:
         extra_results = {
@@ -52912,6 +53771,10 @@ def print_final_report(
                 f"unknown {table_presence_unknown_cnt}, "
                 f"跳过 {table_presence_skipped_cnt} (mode={table_presence_mode})"
             )
+        if runtime_compare_events:
+            lines.append(f"运行时降级: compare incomplete {len(runtime_compare_events)} 项")
+        if runtime_artifact_events:
+            lines.append(f"辅助产物降级: {len(runtime_artifact_events)} 项")
         if missing_supported_cnt or unsupported_blocked_cnt:
             lines.append(
                 f"迁移聚焦: 缺失可修补 {missing_supported_cnt}, 不兼容/阻断/待确认 {unsupported_blocked_cnt}"
@@ -53070,6 +53933,17 @@ def print_final_report(
         focus_text.append("\n详见: ", style="info")
         focus_text.append(f"migration_focus_{report_ts}.txt", style="info")
     summary_table.add_row("[bold]迁移聚焦[/bold]", focus_text)
+
+    if runtime_degraded_events:
+        runtime_text = Text()
+        runtime_text.append("compare incomplete: ", style="mismatch")
+        runtime_text.append(str(len(runtime_compare_events)), style="mismatch")
+        runtime_text.append("\n辅助产物降级: ", style="info")
+        runtime_text.append(str(len(runtime_artifact_events)), style="info")
+        if runtime_degraded_detail_path:
+            runtime_text.append("\n详见: ", style="info")
+            runtime_text.append(runtime_degraded_detail_path.name, style="info")
+        summary_table.add_row("[bold]运行时降级[/bold]", runtime_text)
 
     if ddl_cleanup_summary:
         cleanup_text = Text()
@@ -53389,6 +54263,8 @@ def print_final_report(
                     detail_hint_lines.append(f"列空值语义差异明细: column_nullability_detail_{report_ts}.txt")
                 if visibility_skipped_cnt:
                     detail_hint_lines.append(f"列可见性(INVISIBLE)跳过明细: column_visibility_skipped_detail_{report_ts}.txt")
+                if runtime_degraded_detail_path:
+                    detail_hint_lines.append(f"运行时降级明细: {runtime_degraded_detail_path.name}")
                 if column_identity_issue_cnt:
                     detail_hint_lines.append(f"列 identity 差异明细: column_identity_detail_{report_ts}.txt")
                 if column_identity_option_issue_cnt:
@@ -53958,6 +54834,14 @@ def print_final_report(
         interval_fixup_line = (
             "fixup_scripts/table_alter/interval_add_<cutoff> : interval 分区补齐脚本（当前门控关闭）\n\n"
         )
+    grant_mode = normalize_grant_generation_mode((settings or {}).get("grant_generation_mode", "full"))
+    view_post_grant_line = "fixup_scripts/view_post_grants : VIEW 创建/刷新后授权 (同步源端权限)\n"
+    grants_miss_line = "fixup_scripts/grants_miss   : 缺失授权脚本 (对象/角色/系统)\n"
+    grants_all_line = "fixup_scripts/grants_all    : 全量授权脚本 (对象/角色/系统)\n"
+    if grant_mode == GRANT_GENERATION_MODE_STRUCTURAL:
+        view_post_grant_line = "fixup_scripts/view_post_grants : VIEW 创建/刷新后授权 (structural 模式默认不生成)\n"
+        grants_miss_line = "fixup_scripts/grants_miss   : 缺失 structural 授权脚本 (最小对象创建/编译权限)\n"
+        grants_all_line = "fixup_scripts/grants_all    : structural 全量授权审计脚本\n"
 
     # --- 提示 ---
     fixup_panel = Panel.fit(
@@ -53968,7 +54852,7 @@ def print_final_report(
         "fixup_scripts/view_prereq_grants : VIEW 前置授权 (依赖对象)\n"
         "fixup_scripts/view          : 缺失 VIEW 的 CREATE 脚本\n"
         "fixup_scripts/view_refresh  : 已有 VIEW 刷新脚本 (后补 prerequisite grants 后用于收敛授权链)\n"
-        "fixup_scripts/view_post_grants : VIEW 创建/刷新后授权 (同步源端权限)\n"
+        + view_post_grant_line
         + mview_fixup_line +
         "fixup_scripts/procedure     : 缺失 PROCEDURE 的 CREATE 脚本\n"
         "fixup_scripts/function      : 缺失 FUNCTION 的 CREATE 脚本\n"
@@ -53988,9 +54872,9 @@ def print_final_report(
         "fixup_scripts/constraint_validate_later : 约束后置 VALIDATE 脚本（脏数据清理后执行）\n"
         "fixup_scripts/unsupported/* : 不支持/阻断对象 DDL (默认不执行)\n"
         "fixup_scripts/compile       : 依赖重编译脚本 (ALTER ... COMPILE)\n"
-        "fixup_scripts/grants_miss   : 缺失授权脚本 (对象/角色/系统)\n"
+        + grants_miss_line +
         "fixup_scripts/grants_deferred: 延后授权脚本 (对象补齐后执行)\n"
-        "fixup_scripts/grants_all    : 全量授权脚本 (对象/角色/系统)\n"
+        + grants_all_line +
         "fixup_scripts/grants_revoke : 目标端额外 PUBLIC 授权回收建议\n"
         "fixup_scripts/table_alter   : 列不匹配 TABLE 的 ALTER 修补脚本\n"
         + interval_fixup_line +
@@ -54057,6 +54941,9 @@ def print_final_report(
             ),
             manual_action_rows=manual_action_rows,
             manual_actions_path=manual_actions_preview_path,
+            runtime_degraded_events=runtime_degraded_events,
+            runtime_degraded_detail_path=runtime_degraded_detail_path,
+            grant_plan=grant_plan,
         )
         notice_state_path, notice_state = load_notice_state(settings.get("config_dir") if settings else None)
         runtime_notices = build_runtime_change_notices(
@@ -54091,6 +54978,12 @@ def print_final_report(
 
         _add_index_entry("REPORT", report_path, None, "主报告")
         _add_index_entry("DETAIL", source_scope_detail_path, None, "源对象范围明细")
+        _add_index_entry(
+            "DETAIL",
+            runtime_degraded_detail_path,
+            len(runtime_degraded_events) if runtime_degraded_detail_path else None,
+            "运行时降级明细"
+        )
         _add_index_entry("DETAIL", discovery_mapping_path, None, "discovery-only 对象映射")
         _add_index_entry("DETAIL", scope_integrity_detail_path, len(scope_integrity_issues) if scope_integrity_detail_path else None, "scope 完整性明细")
         candidate_rows = build_scope_integrity_remap_candidate_rows(scope_integrity_issues)
@@ -54850,6 +55743,8 @@ def print_final_report(
                 log.info("列空值语义差异明细已输出到: %s", column_nullability_detail_path)
             if column_visibility_skipped_detail_path:
                 log.info("列可见性(INVISIBLE)跳过明细已输出到: %s", column_visibility_skipped_detail_path)
+            if runtime_degraded_detail_path:
+                log.info("运行时降级明细已输出到: %s", runtime_degraded_detail_path)
             if column_identity_detail_path:
                 log.info("列 identity 差异明细已输出到: %s", column_identity_detail_path)
             if column_identity_option_detail_path:
@@ -55011,6 +55906,7 @@ def parse_cli_args() -> argparse.Namespace:
             table_data_presence_obclient_timeout OB 批量探测超时（秒，默认沿用 obclient_timeout）
             table_data_presence_zero_probe_workers Oracle 零行探针并发数（默认 1，最大 32）
             generate_grants         true/false 控制授权脚本生成
+            grant_generation_mode   full/structural 控制授权生成来源（Oracle 全量/最小结构性）
             grant_tab_privs_scope   owner/owner_or_grantee 控制 DBA_TAB_PRIVS 抽取范围
             grant_merge_privileges  true/false 合并同对象多权限授权
             grant_merge_grantees    true/false 合并同权限多 grantee 授权
@@ -55084,6 +55980,7 @@ def main():
     # 1) 加载配置 + 初始化
     with phase_timer("加载配置与初始化", phase_durations):
         ora_cfg, ob_cfg, settings = load_config(str(config_path))
+        settings["_runtime_degraded_events"] = []
         # 为本次运行初始化日志文件（尽量早，以便记录后续步骤）
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         setup_run_logging(settings, timestamp)
@@ -55412,7 +56309,11 @@ def main():
             supplemental_dependency_records.extend(default_sequence_dependency_records)
             if remap_scope_text_fallback_mode == "off":
                 supplemental_dependency_records.extend(
-                    load_oracle_job_action_dependency_records(ora_cfg, source_objects)
+                    load_oracle_job_action_dependency_records(
+                        ora_cfg,
+                        source_objects,
+                        runtime_degraded_events=settings.get("_runtime_degraded_events"),
+                    )
                 )
             if supplemental_dependency_records:
                 oracle_dependencies_internal.extend(supplemental_dependency_records)
@@ -55442,6 +56343,9 @@ def main():
         view_dependency_map: Dict[Tuple[str, str], Set[str]] = build_view_dependency_map(
             source_dependencies_set
         ) if source_dependencies_set else {}
+        view_callable_dep_map: Dict[Tuple[str, str], Set[str]] = build_view_callable_dep_map(
+            source_dependencies_set
+        ) if source_dependencies_set else {}
         if object_created_after_cutoff_nodes:
             source_dependencies_set = filter_source_dependencies_by_nodes(
                 source_dependencies_set,
@@ -55462,6 +56366,7 @@ def main():
             ) or {}
             dependency_graph = build_dependency_graph(source_dependencies_set) if source_dependencies_set else {}
             view_dependency_map = build_view_dependency_map(source_dependencies_set) if source_dependencies_set else {}
+            view_callable_dep_map = build_view_callable_dep_map(source_dependencies_set) if source_dependencies_set else {}
             log.info(
                 "[CUTOFF] 已同步更新依赖/父对象图，移除截止后对象节点=%d。",
                 len(object_created_after_cutoff_nodes)
@@ -55617,6 +56522,7 @@ def main():
             }
             dependency_graph = build_dependency_graph(source_dependencies_set) if source_dependencies_set else {}
             view_dependency_map = build_view_dependency_map(source_dependencies_set) if source_dependencies_set else {}
+            view_callable_dep_map = build_view_callable_dep_map(source_dependencies_set) if source_dependencies_set else {}
 
             log.info(
                 "[SOURCE_SCOPE] remap_root_closure 生效: roots=%d, explicit_triggers=%d, included_nodes=%d, filtered_nodes=%d, source_objects=%d->%d, deps=%d->%d, parent_links=%d->%d, remap_conflicts=%d->%d, remap_rules=%d。",
@@ -56267,8 +57173,13 @@ def main():
 
             dependency_graph = build_dependency_graph(source_dependencies_set) if source_dependencies_set else {}
             view_dependency_map = build_view_dependency_map(source_dependencies_set) if source_dependencies_set else {}
+            view_callable_dep_map = build_view_callable_dep_map(source_dependencies_set) if source_dependencies_set else {}
             view_dependency_map = filter_view_dependency_map_by_nodes(
                 view_dependency_map,
+                excluded_nodes
+            ) or {}
+            view_callable_dep_map = filter_view_dependency_map_by_nodes(
+                view_callable_dep_map,
                 excluded_nodes
             ) or {}
             if settings.get("enable_schema_mapping_infer") and dependency_graph:
@@ -56700,6 +57611,7 @@ def main():
         synonym_meta,
         remap_rules=remap_rules,
         view_dependency_map=view_dependency_map,
+        view_callable_dep_map=view_callable_dep_map,
         ob_version=settings.get("ob_version"),
         manual_trigger_table_keys=(
             blacklist_rehydration_state.manual_trigger_table_keys
@@ -56807,10 +57719,21 @@ def main():
         full_object_mapping,
         source_objects=source_objects,
     )
+    if settings["_non_table_trigger_rows"]:
+        log.info(
+            "[TRIGGER] 非 TABLE 触发器明细已构建: rows=%d",
+            len(settings["_non_table_trigger_rows"]),
+        )
 
     if enable_dependencies_check:
         apply_config_hot_reload_at_phase(hot_reload_runtime, "依赖/授权校验", settings, ora_cfg, ob_cfg)
         with phase_timer("依赖/授权校验", phase_durations):
+            log.info(
+                "[DEPENDENCY] 开始依赖校验: expected=%d, actual=%d, skipped=%d",
+                len(expected_dependency_pairs or set()),
+                len(ob_dependencies or set()),
+                len(skipped_dependency_pairs or []),
+            )
             dependency_grant_catalog: Optional[ObGrantCatalog] = None
             if expected_dependency_pairs:
                 dependency_grantees: Set[str] = set()
@@ -56836,17 +57759,70 @@ def main():
                 ob_grant_catalog=dependency_grant_catalog,
                 managed_target_objects=build_managed_target_object_set(full_object_mapping) if settings.get("source_object_scope_mode") == "remap_root_closure" else None,
             )
+            log.info(
+                "[DEPENDENCY] 依赖校验完成: missing=%d, unexpected=%d, skipped=%d",
+                len(dependency_report.get("missing", [])),
+                len(dependency_report.get("unexpected", [])),
+                len(dependency_report.get("skipped", [])),
+            )
             if settings.get("print_dependency_chains", True):
                 dep_chain_path = report_dir / f"dependency_chains_{timestamp}.txt"
-                source_dep_pairs = (
-                    to_raw_dependency_pairs(oracle_dependencies_internal)
-                    if oracle_dependencies_internal else set()
-                )
-                dependency_chain_file = export_dependency_chains(
-                    expected_dependency_pairs,
-                    dep_chain_path,
-                    source_pairs=source_dep_pairs
-                )
+                expected_pair_count = len(expected_dependency_pairs or set())
+                source_record_count = len(oracle_dependencies_internal or [])
+                source_dep_pairs: Set[Tuple[str, str, str, str]] = set()
+                if expected_pair_count > MAX_DEPENDENCY_CHAIN_EXPORT_PAIRS:
+                    log.warning(
+                        "[DEPENDENCY] 依赖链路导出已跳过: expected=%d 超过上限 %d",
+                        expected_pair_count,
+                        MAX_DEPENDENCY_CHAIN_EXPORT_PAIRS,
+                    )
+                    record_runtime_degraded_event(
+                        settings.get("_runtime_degraded_events"),
+                        scope=RUNTIME_DEGRADED_SCOPE_ARTIFACT,
+                        stage="DEPENDENCY_EXPORT",
+                        code="DEPENDENCY_CHAIN_EXPORT_SKIPPED",
+                        entity=dep_chain_path.name,
+                        detail=f"expected={expected_pair_count};source_records={source_record_count};max_pairs={MAX_DEPENDENCY_CHAIN_EXPORT_PAIRS}",
+                    )
+                    dependency_chain_file = None
+                else:
+                    remaining_pair_budget = MAX_DEPENDENCY_CHAIN_EXPORT_PAIRS - expected_pair_count
+                    capped_source_pairs = (
+                        to_raw_dependency_pairs_capped(
+                            oracle_dependencies_internal,
+                            remaining_pair_budget,
+                        )
+                        if oracle_dependencies_internal else set()
+                    )
+                    if capped_source_pairs is None:
+                        log.warning(
+                            "[DEPENDENCY] 依赖链路导出已跳过: expected=%d + source_unique>%d 超过上限 %d",
+                            expected_pair_count,
+                            remaining_pair_budget,
+                            MAX_DEPENDENCY_CHAIN_EXPORT_PAIRS,
+                        )
+                        record_runtime_degraded_event(
+                            settings.get("_runtime_degraded_events"),
+                            scope=RUNTIME_DEGRADED_SCOPE_ARTIFACT,
+                            stage="DEPENDENCY_EXPORT",
+                            code="DEPENDENCY_CHAIN_EXPORT_SKIPPED",
+                            entity=dep_chain_path.name,
+                            detail=f"expected={expected_pair_count};source_records={source_record_count};max_pairs={MAX_DEPENDENCY_CHAIN_EXPORT_PAIRS}",
+                        )
+                        dependency_chain_file = None
+                    else:
+                        source_dep_pairs = capped_source_pairs
+                        log.info(
+                            "[DEPENDENCY] 开始导出依赖链路: expected=%d, source=%d",
+                            expected_pair_count,
+                            len(source_dep_pairs),
+                        )
+                        dependency_chain_file = export_dependency_chains(
+                            expected_dependency_pairs,
+                            dep_chain_path,
+                            source_pairs=source_dep_pairs,
+                            runtime_degraded_events=settings.get("_runtime_degraded_events"),
+                        )
                 if dependency_chain_file:
                     log.info("依赖链路已输出: %s", dependency_chain_file)
                 else:
@@ -56897,6 +57873,7 @@ def main():
                     source_objects,
                     supported_sys_override=supported_sys_privs,
                     supported_object_override=supported_object_privs,
+                    grant_generation_mode=settings.get('grant_generation_mode', 'full'),
                 )
                 settings["_grant_capability_library"] = grant_capability_library
                 settings["_grant_capability_detail_rows"] = list(grant_capability_library.detail_rows or [])
@@ -56929,7 +57906,8 @@ def main():
                         non_runnable_families
                     )
                 log.info(
-                    "[GRANT] 开始生成授权计划：对象权限=%d, 列级权限=%d, 系统权限=%d, 角色授权=%d, 依赖记录=%d。",
+                    "[GRANT] 开始生成授权计划：mode=%s, 对象权限=%d, 列级权限=%d, 系统权限=%d, 角色授权=%d, 依赖记录=%d。",
+                    settings.get('grant_generation_mode', 'full'),
                     len(oracle_meta.object_privileges),
                     len(oracle_meta.column_privileges),
                     len(oracle_meta.sys_privileges),
@@ -56960,7 +57938,8 @@ def main():
                     include_oracle_maintained_roles=include_oracle_maintained_roles,
                     dependencies=oracle_dependencies_for_grants,
                     progress_interval=grant_progress_interval,
-                    sequence_remap_policy=sequence_policy
+                    sequence_remap_policy=sequence_policy,
+                    grant_generation_mode=settings.get('grant_generation_mode', 'full'),
                 )
                 grant_plan, identity_sequence_expectation_rows = augment_grant_plan_with_identity_sequence_grants(
                     grant_plan,
@@ -56989,7 +57968,8 @@ def main():
                 sys_grant_cnt = sum(len(v) for v in grant_plan.sys_privs.values())
                 role_grant_cnt = sum(len(v) for v in grant_plan.role_privs.values())
                 log.info(
-                    "[GRANT] 授权计划生成完成：对象权限=%d, 列级权限=%d, 系统权限=%d, 角色授权=%d",
+                    "[GRANT] 授权计划生成完成：mode=%s, 对象权限=%d, 列级权限=%d, 系统权限=%d, 角色授权=%d",
+                    grant_plan.grant_generation_mode,
                     object_grant_cnt,
                     column_grant_cnt,
                     sys_grant_cnt,
@@ -57078,7 +58058,8 @@ def main():
                 unsupported_table_keys=support_summary.unsupported_table_keys,
                 managed_target_scope=managed_target_scope,
                 view_compat_map=support_summary.view_compat_map,
-                view_dependency_map=view_dependency_map
+                view_dependency_map=view_dependency_map,
+                view_callable_dep_map=view_callable_dep_map,
             )
             deferred_filtered_grants = list(settings.get("_deferred_filtered_grants") or [])
             if grant_plan and deferred_filtered_grants:
@@ -57111,6 +58092,10 @@ def main():
                     ),
                     view_grant_targets=set(grant_plan.view_grant_targets or set()),
                     object_target_types=dict(grant_plan.object_target_types or {}),
+                    grant_generation_mode=grant_plan.grant_generation_mode,
+                    mode_skip_counts=dict(grant_plan.mode_skip_counts or {}) or None,
+                    derived_dependency_pair_count=int(grant_plan.derived_dependency_pair_count or 0),
+                    source_dependency_record_count=int(grant_plan.source_dependency_record_count or 0),
                 )
     else:
         log.info('已根据配置跳过修补脚本生成，仅打印对比报告。')
@@ -57202,6 +58187,7 @@ def main():
         discovery_mapping_path=discovery_mapping_path,
         scope_integrity_detail_path=scope_integrity_detail_path,
         scope_integrity_candidate_path=scope_integrity_candidate_path,
+        grant_plan=grant_plan,
     )
     if run_summary:
         log_run_summary(run_summary)
