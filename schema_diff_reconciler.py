@@ -16,7 +16,7 @@
 
 """
 
-数据库对象对比工具 (V0.9.9.0 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
+数据库对象对比工具 (V0.9.9.1 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -33,7 +33,7 @@
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.9.9.0 核心)：
+3. 性能架构 (V0.9.9.1 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          DBA_OBJECTS
@@ -95,7 +95,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Dict, FrozenSet, Iterable, Iterator, List, NamedTuple, NoReturn, Optional, Pattern, Sequence, Set, Tuple, Union
 
-__version__ = "0.9.9.0"
+__version__ = "0.9.9.1"
 
 __author__ = "Minor Li"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
@@ -9117,10 +9117,12 @@ def build_trigger_list_report(
         "enabled": True,
         "path": str(trigger_list_path),
         "total_lines": total_lines,
+        "compare_missing_total": 0,
         "valid_entries": len(entries),
         "invalid_entries": len(invalid_entries),
         "duplicate_entries": len(duplicate_entries),
         "selected_missing": 0,
+        "filtered_missing": 0,
         "missing_not_listed": 0,
         "not_found": 0,
         "not_missing": 0,
@@ -9136,7 +9138,9 @@ def build_trigger_list_report(
         summary["fallback_full"] = True
         summary["fallback_reason"] = "read_error"
         _, _, total_missing = collect_missing_trigger_mappings(extra_results)
+        summary["compare_missing_total"] = int(total_missing or 0)
         summary["missing_not_listed"] = total_missing
+        summary["filtered_missing"] = int(total_missing or 0)
         rows.append(TriggerListReportRow(
             entry=str(trigger_list_path),
             status="ERROR",
@@ -9171,7 +9175,9 @@ def build_trigger_list_report(
         summary["fallback_full"] = True
         summary["fallback_reason"] = "empty_list"
         _, _, total_missing = collect_missing_trigger_mappings(extra_results)
+        summary["compare_missing_total"] = int(total_missing or 0)
         summary["missing_not_listed"] = total_missing
+        summary["filtered_missing"] = int(total_missing or 0)
         rows.append(TriggerListReportRow(
             entry=str(trigger_list_path),
             status="EMPTY",
@@ -9180,6 +9186,7 @@ def build_trigger_list_report(
         return rows, summary
 
     src_to_tgt, missing_targets, total_missing = collect_missing_trigger_mappings(extra_results)
+    summary["compare_missing_total"] = int(total_missing or 0)
     missing_src_set = set(src_to_tgt.keys())
     missing_by_tgt = {tgt: src for src, tgt in src_to_tgt.items()}
     source_triggers = build_trigger_full_set(oracle_meta.triggers or {})
@@ -9276,6 +9283,7 @@ def build_trigger_list_report(
 
     summary["selected_missing"] = len(selected_missing_targets)
     summary["missing_not_listed"] = max(0, total_missing - len(selected_missing_targets))
+    summary["filtered_missing"] = int(summary["missing_not_listed"] or 0)
     summary["not_found"] = not_found
     summary["not_missing"] = not_missing
     summary["non_table"] = non_table
@@ -38914,6 +38922,7 @@ def generate_fixup_scripts(
     view_callable_dep_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
     trigger_status_rows: Optional[List[TriggerStatusReportRow]] = None,
     constraint_status_rows: Optional[List[ConstraintStatusDriftRow]] = None,
+    manual_trigger_table_keys: Optional[Set[Tuple[str, str]]] = None,
 ):
     """
     基于校验结果生成 fixup_scripts DDL 脚本，并按依赖顺序排列：
@@ -38980,6 +38989,13 @@ def generate_fixup_scripts(
     trigger_filter_set = {t.upper() for t in (trigger_filter_entries or set())}
     support_state_map = support_state_map or {}
     table_target_map = build_table_target_map(master_list)
+    extra_results = filter_trigger_results_for_unsupported_tables(
+        extra_results,
+        unsupported_table_keys,
+        table_target_map,
+        support_state_map=support_state_map,
+        manual_trigger_table_keys=manual_trigger_table_keys,
+    )
     blacklist_missing_grant_rows = build_blacklist_missing_grant_target_rows(
         oracle_meta.blacklist_tables,
         table_target_map,
@@ -40397,15 +40413,16 @@ def generate_fixup_scripts(
                     trigger_skip_counts["schema_filter"] += 1
                     continue
                 if support_row and support_row.support_state != SUPPORT_STATE_SUPPORTED:
+                    reason_token = normalize_filtered_grant_reason_token(
+                        support_row.reason_code or support_row.support_state or "unsupported"
+                    ).lower() or "unsupported"
                     if support_row.reason_code == TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON_CODE:
                         queue_request(src_schema_u, 'TRIGGER', src_trg)
                         unsupported_trigger_tasks.append(
                             (src_schema_u, src_trg, tgt_schema_final, tgt_obj, src_table, tgt_schema, tgt_table, support_row)
                         )
+                        trigger_skip_counts[f"support_{reason_token}"] += 1
                     else:
-                        reason_token = normalize_filtered_grant_reason_token(
-                            support_row.reason_code or support_row.support_state or "unsupported"
-                        ).lower() or "unsupported"
                         trigger_skip_counts[f"support_{reason_token}"] += 1
                     continue
                 if src_table_key in unsupported_table_keys:
@@ -40438,15 +40455,16 @@ def generate_fixup_scripts(
                     trigger_skip_counts["schema_filter"] += 1
                     continue
                 if support_row and support_row.support_state != SUPPORT_STATE_SUPPORTED:
+                    reason_token = normalize_filtered_grant_reason_token(
+                        support_row.reason_code or support_row.support_state or "unsupported"
+                    ).lower() or "unsupported"
                     if support_row.reason_code == TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON_CODE:
                         queue_request(src_owner_u, 'TRIGGER', src_trg_u)
                         unsupported_trigger_tasks.append(
                             (src_owner_u, src_trg_u, tgt_schema_final, tgt_obj, src_table, tgt_schema, tgt_table, support_row)
                         )
+                        trigger_skip_counts[f"support_{reason_token}"] += 1
                     else:
-                        reason_token = normalize_filtered_grant_reason_token(
-                            support_row.reason_code or support_row.support_state or "unsupported"
-                        ).lower() or "unsupported"
                         trigger_skip_counts[f"support_{reason_token}"] += 1
                     continue
                 if src_table_key in unsupported_table_keys:
@@ -46288,12 +46306,13 @@ def export_trigger_status_report(
         notes = [
             f"trigger_list: {summary.get('path', '')}",
             (
-                "汇总: total_lines={total_lines}, valid={valid_entries}, invalid={invalid_entries}, "
-                "duplicate={duplicate_entries}, selected_missing={selected_missing}, "
+                "汇总: total_lines={total_lines}, compare_missing_total={compare_missing_total}, "
+                "valid={valid_entries}, invalid={invalid_entries}, duplicate={duplicate_entries}, "
+                "selected_missing={selected_missing}, filtered_missing={filtered_missing}, "
                 "missing_not_listed={missing_not_listed}, not_found={not_found}, not_missing={not_missing}, non_table={non_table}"
             ).format(**{k: summary.get(k, 0) for k in [
-                "total_lines", "valid_entries", "invalid_entries", "duplicate_entries",
-                "selected_missing", "missing_not_listed", "not_found", "not_missing", "non_table"
+                "total_lines", "compare_missing_total", "valid_entries", "invalid_entries", "duplicate_entries",
+                "selected_missing", "filtered_missing", "missing_not_listed", "not_found", "not_missing", "non_table"
             ]})
         ]
         if summary.get("error"):
@@ -48003,12 +48022,23 @@ def export_fixup_skip_summary(
         f"# timestamp={report_timestamp}",
     ]
     for obj_type, data in sorted(summary.items()):
-        missing_total = int(data.get("missing_total", 0) or 0)
-        task_total = int(data.get("task_total", 0) or 0)
-        generated = int(data.get("generated", 0) or 0)
+        layers = build_fixup_count_layers(data)
         skipped = data.get("skipped", {}) or {}
         lines.append("")
-        lines.append(f"[{obj_type}] missing_total={missing_total} task_total={task_total} generated={generated}")
+        lines.append(
+            "[{obj_type}] missing_total={missing_total} selected_total={selected_total} "
+            "task_total={task_total} generated={generated_total} blocked_total={blocked_total} "
+            "filtered_total={filtered_total} generation_failed_total={generation_failed_total}".format(
+                obj_type=obj_type,
+                missing_total=layers["compare_missing_total"],
+                selected_total=layers["selected_total"],
+                task_total=layers["runnable_total"],
+                generated_total=layers["generated_total"],
+                blocked_total=layers["blocked_total"],
+                filtered_total=layers["filtered_total"],
+                generation_failed_total=layers["generation_failed_total"],
+            )
+        )
         if skipped:
             for reason, count in sorted(skipped.items()):
                 lines.append(f"  - {reason}: {count}")
@@ -48022,6 +48052,65 @@ def export_fixup_skip_summary(
     except OSError as exc:
         log.warning("写入 fixup 跳过汇总失败 %s: %s", output_path, exc)
         return None
+
+
+FIXUP_SKIP_REASON_CLASS_FILTERED = "FILTERED"
+FIXUP_SKIP_REASON_CLASS_BLOCKED = "BLOCKED"
+FIXUP_SKIP_REASON_CLASS_GENERATION_FAILED = "GENERATION_FAILED"
+
+FIXUP_SKIP_FILTER_REASON_KEYS: FrozenSet[str] = frozenset({
+    "schema_filter",
+    "trigger_list_filtered",
+})
+FIXUP_SKIP_GENERATION_FAILED_REASON_KEYS: FrozenSet[str] = frozenset({
+    "ddl_missing",
+    "meta_missing",
+    "meta_incomplete",
+})
+
+
+def classify_fixup_skip_reason(reason: Optional[str]) -> str:
+    token = str(reason or "").strip().lower()
+    if not token:
+        return FIXUP_SKIP_REASON_CLASS_BLOCKED
+    if token in FIXUP_SKIP_FILTER_REASON_KEYS:
+        return FIXUP_SKIP_REASON_CLASS_FILTERED
+    if token in FIXUP_SKIP_GENERATION_FAILED_REASON_KEYS:
+        return FIXUP_SKIP_REASON_CLASS_GENERATION_FAILED
+    return FIXUP_SKIP_REASON_CLASS_BLOCKED
+
+
+def build_fixup_count_layers(summary: Optional[Dict[str, object]]) -> Dict[str, int]:
+    summary = dict(summary or {})
+    compare_missing_total = max(0, int(summary.get("missing_total", 0) or 0))
+    runnable_total = max(0, int(summary.get("task_total", 0) or 0))
+    generated_total = max(0, int(summary.get("generated", 0) or 0))
+    skipped = summary.get("skipped", {}) or {}
+
+    filtered_total = 0
+    generation_failed_total = 0
+    for reason, count in skipped.items():
+        count_val = max(0, int(count or 0))
+        reason_class = classify_fixup_skip_reason(reason)
+        if reason_class == FIXUP_SKIP_REASON_CLASS_FILTERED:
+            filtered_total += count_val
+        elif reason_class == FIXUP_SKIP_REASON_CLASS_GENERATION_FAILED:
+            generation_failed_total += count_val
+
+    selected_total = max(0, compare_missing_total - filtered_total)
+    blocked_total = max(0, selected_total - runnable_total)
+    skipped_total = sum(max(0, int(v or 0)) for v in skipped.values())
+
+    return {
+        "compare_missing_total": compare_missing_total,
+        "selected_total": selected_total,
+        "filtered_total": filtered_total,
+        "blocked_total": blocked_total,
+        "runnable_total": runnable_total,
+        "generated_total": generated_total,
+        "generation_failed_total": generation_failed_total,
+        "skipped_total": skipped_total,
+    }
 
 
 REPORT_DB_TABLES = {
@@ -48544,6 +48633,9 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['fixup_skip']} (
     REPORT_ID           VARCHAR2(64) NOT NULL,
     OBJECT_TYPE         VARCHAR2(32),
     MISSING_TOTAL       NUMBER DEFAULT 0,
+    SELECTED_TOTAL      NUMBER DEFAULT 0,
+    FILTERED_TOTAL      NUMBER DEFAULT 0,
+    BLOCKED_TOTAL       NUMBER DEFAULT 0,
     TASK_TOTAL          NUMBER DEFAULT 0,
     GENERATED_TOTAL     NUMBER DEFAULT 0,
     SKIP_REASON         VARCHAR2(128),
@@ -48821,6 +48913,9 @@ CREATE TABLE {schema_prefix}{REPORT_DB_TABLES['resolution']} (
         (REPORT_DB_TABLES["summary"], "WRITE_CHECKED_AT", "TIMESTAMP"),
         (REPORT_DB_TABLES["counts"], "EXCLUDED_COUNT", "NUMBER DEFAULT 0"),
         (REPORT_DB_TABLES["counts"], "MISSING_FIXABLE_COUNT", "NUMBER DEFAULT 0"),
+        (REPORT_DB_TABLES["fixup_skip"], "SELECTED_TOTAL", "NUMBER DEFAULT 0"),
+        (REPORT_DB_TABLES["fixup_skip"], "FILTERED_TOTAL", "NUMBER DEFAULT 0"),
+        (REPORT_DB_TABLES["fixup_skip"], "BLOCKED_TOTAL", "NUMBER DEFAULT 0"),
     ]:
         ok_mig, err_mig = _ensure_column_if_missing(table_name, col_name, col_ddl)
         if not ok_mig:
@@ -50321,16 +50416,17 @@ def _build_report_fixup_skip_rows(
         return [], False, 0
     rows: List[Dict[str, object]] = []
     for obj_type, summary in fixup_skip_summary.items():
-        missing_total = int(summary.get("missing_total", 0) or 0)
-        task_total = int(summary.get("task_total", 0) or 0)
-        generated = int(summary.get("generated", 0) or 0)
+        layers = build_fixup_count_layers(summary)
         skipped = summary.get("skipped", {}) or {}
         if not skipped:
             rows.append({
                 "object_type": obj_type,
-                "missing_total": missing_total,
-                "task_total": task_total,
-                "generated_total": generated,
+                "missing_total": layers["compare_missing_total"],
+                "selected_total": layers["selected_total"],
+                "filtered_total": layers["filtered_total"],
+                "blocked_total": layers["blocked_total"],
+                "task_total": layers["runnable_total"],
+                "generated_total": layers["generated_total"],
                 "skip_reason": "",
                 "skip_count": 0
             })
@@ -50338,9 +50434,12 @@ def _build_report_fixup_skip_rows(
             for reason, count in skipped.items():
                 rows.append({
                     "object_type": obj_type,
-                    "missing_total": missing_total,
-                    "task_total": task_total,
-                    "generated_total": generated,
+                    "missing_total": layers["compare_missing_total"],
+                    "selected_total": layers["selected_total"],
+                    "filtered_total": layers["filtered_total"],
+                    "blocked_total": layers["blocked_total"],
+                    "task_total": layers["runnable_total"],
+                    "generated_total": layers["generated_total"],
                     "skip_reason": str(reason),
                     "skip_count": int(count or 0)
                 })
@@ -51186,12 +51285,17 @@ def _insert_report_fixup_skip_rows(
         values_sql: List[str] = []
         for row in batch:
             values_sql.append(
-                "INTO {table} (REPORT_ID, OBJECT_TYPE, MISSING_TOTAL, TASK_TOTAL, GENERATED_TOTAL, SKIP_REASON, SKIP_COUNT) "
-                "VALUES ({report_id}, {object_type}, {missing_total}, {task_total}, {generated_total}, {skip_reason}, {skip_count})".format(
+                "INTO {table} (REPORT_ID, OBJECT_TYPE, MISSING_TOTAL, SELECTED_TOTAL, FILTERED_TOTAL, BLOCKED_TOTAL, "
+                "TASK_TOTAL, GENERATED_TOTAL, SKIP_REASON, SKIP_COUNT) "
+                "VALUES ({report_id}, {object_type}, {missing_total}, {selected_total}, {filtered_total}, {blocked_total}, "
+                "{task_total}, {generated_total}, {skip_reason}, {skip_count})".format(
                     table=f"{schema_prefix}{REPORT_DB_TABLES['fixup_skip']}",
                     report_id=sql_quote_literal(report_id),
                     object_type=sql_quote_literal(row.get("object_type")) if row.get("object_type") else "NULL",
                     missing_total=int(row.get("missing_total", 0) or 0),
+                    selected_total=int(row.get("selected_total", 0) or 0),
+                    filtered_total=int(row.get("filtered_total", 0) or 0),
+                    blocked_total=int(row.get("blocked_total", 0) or 0),
                     task_total=int(row.get("task_total", 0) or 0),
                     generated_total=int(row.get("generated_total", 0) or 0),
                     skip_reason=sql_quote_literal(row.get("skip_reason")) if row.get("skip_reason") else "NULL",
@@ -52742,6 +52846,7 @@ def build_run_summary(
     runtime_degraded_events: Optional[List[RuntimeDegradedEvent]] = None,
     runtime_degraded_detail_path: Optional[Path] = None,
     grant_plan: Optional[GrantPlan] = None,
+    object_counts_summary: Optional[ObjectCountSummary] = None,
 ) -> RunSummary:
     end_time = datetime.now()
     total_seconds = time.perf_counter() - ctx.start_perf
@@ -52858,9 +52963,11 @@ def build_run_summary(
             actions_done.append("触发器清单: 为空或无有效条目，已回退全量触发器")
         else:
             actions_done.append(
-                "触发器清单: 生效 (列表 {valid_entries}, 命中缺失 {selected_missing})".format(
+                "触发器清单: 生效 (compare缺失 {compare_missing_total}, 命中缺失 {selected_missing}, 过滤 {filtered_missing})".format(
+                    compare_missing_total=trigger_summary.get("compare_missing_total", 0),
                     valid_entries=trigger_summary.get("valid_entries", 0),
-                    selected_missing=trigger_summary.get("selected_missing", 0)
+                    selected_missing=trigger_summary.get("selected_missing", 0),
+                    filtered_missing=trigger_summary.get("filtered_missing", trigger_summary.get("missing_not_listed", 0)),
                 )
             )
     else:
@@ -52900,7 +53007,14 @@ def build_run_summary(
     table_presence_risk_cnt = int((table_presence_summary.total_risk if table_presence_summary else 0) or 0)
     table_presence_unknown_cnt = int((table_presence_summary.total_unknown if table_presence_summary else 0) or 0)
     table_presence_skipped_cnt = int((table_presence_summary.total_skipped if table_presence_summary else 0) or 0)
-    unsupported_by_type: Dict[str, int] = build_unsupported_summary_counts(support_summary, extra_results)
+    if object_counts_summary:
+        _missing_total_counts, unsupported_by_type, _fixable_missing_counts = build_missing_breakdown_counts(
+            object_counts_summary,
+            support_summary,
+            extra_results,
+        )
+    else:
+        unsupported_by_type = build_unsupported_summary_counts(support_summary, extra_results)
     unsupported_total = sum(int(v or 0) for v in unsupported_by_type.values())
     excluded_by_type: Dict[str, int] = build_excluded_summary_counts(excluded_object_rows)
     ddl_cleanup_summary = dict(ddl_cleanup_summary or {})
@@ -53006,14 +53120,16 @@ def build_run_summary(
             obj_summary = fixup_skip_summary.get(obj_type) or {}
             if not obj_summary:
                 continue
-            skipped_map = obj_summary.get("skipped", {}) or {}
-            skipped_total = sum(int(v or 0) for v in skipped_map.values())
+            layers = build_fixup_count_layers(obj_summary)
             findings.append(
-                "{obj_type} 修补: 缺失 {missing}, 生成 {generated}, 跳过 {skipped}".format(
+                "{obj_type} 修补: compare缺失 {missing}, 选中 {selected}, 可生成 {runnable}, 已生成 {generated}, 被过滤 {filtered}, 被阻断 {blocked}".format(
                     obj_type=obj_type,
-                    missing=obj_summary.get("missing_total", 0),
-                    generated=obj_summary.get("generated", 0),
-                    skipped=skipped_total
+                    missing=layers["compare_missing_total"],
+                    selected=layers["selected_total"],
+                    runnable=layers["runnable_total"],
+                    generated=layers["generated_total"],
+                    filtered=layers["filtered_total"],
+                    blocked=layers["blocked_total"],
                 )
             )
 
@@ -53026,11 +53142,12 @@ def build_run_summary(
             )
         elif not trigger_summary.get("error"):
             findings.append(
-                "触发器清单: 列表 {valid_entries}, 命中缺失 {selected_missing}, 未列出缺失 {missing_not_listed}, "
+                "触发器清单: 列表 {valid_entries}, compare缺失 {compare_missing_total}, 命中缺失 {selected_missing}, 过滤 {filtered_missing}, "
                 "无效 {invalid_entries}, 未找到 {not_found}".format(
                     valid_entries=trigger_summary.get("valid_entries", 0),
+                    compare_missing_total=trigger_summary.get("compare_missing_total", 0),
                     selected_missing=trigger_summary.get("selected_missing", 0),
-                    missing_not_listed=trigger_summary.get("missing_not_listed", 0),
+                    filtered_missing=trigger_summary.get("filtered_missing", trigger_summary.get("missing_not_listed", 0)),
                     invalid_entries=trigger_summary.get("invalid_entries", 0),
                     not_found=trigger_summary.get("not_found", 0)
                 )
@@ -53552,11 +53669,9 @@ def print_final_report(
     package_tgt_invalid_cnt = int(package_summary.get("TARGET_INVALID", 0) or 0)
     package_status_mismatch_cnt = int(package_summary.get("STATUS_MISMATCH", 0) or 0)
     package_missing_support_rows = build_package_missing_support_rows(package_results)
-    support_counts = dict(support_summary.missing_support_counts) if support_summary else {}
     unsupported_rows = list(support_summary.unsupported_rows) if support_summary else []
     missing_detail_rows = list(support_summary.missing_detail_rows) if support_summary else []
     extra_missing_rows = list(support_summary.extra_missing_rows) if support_summary else []
-    extra_blocked_counts = dict(support_summary.extra_blocked_counts) if support_summary else {}
     view_constraint_cleaned_rows = list(support_summary.view_constraint_cleaned_rows) if support_summary else []
     view_constraint_uncleanable_rows = list(support_summary.view_constraint_uncleanable_rows) if support_summary else []
     extra_constraint_unsupported = list(extra_results.get("constraint_unsupported") or [])
@@ -53588,17 +53703,12 @@ def print_final_report(
     if package_missing_support_rows:
         combined_missing_rows.extend(package_missing_support_rows)
         missing_supported_rows.extend(package_missing_support_rows)
-    missing_supported_cnt = len(missing_supported_rows)
     missing_count_from_counts = sum_primary_missing_count(
         object_counts_summary,
         set(PRIMARY_OBJECT_TYPES) if settings.get("enabled_primary_types") is None else set(settings.get("enabled_primary_types"))
     )
     if missing_count_from_counts is not None:
         missing_count = int(missing_count_from_counts)
-    unsupported_blocked_cnt = len([
-        row for row in unsupported_rows
-        if row.support_state in {SUPPORT_STATE_UNSUPPORTED, SUPPORT_STATE_BLOCKED, SUPPORT_STATE_RISKY}
-    ])
     missing_view_cnt = sum(
         1 for obj_type, _tgt_name, _src_name in (tv_results.get("missing", []) or [])
         if (obj_type or "").upper() == "VIEW"
@@ -53607,24 +53717,12 @@ def print_final_report(
         1 for row in unsupported_rows
         if (row.obj_type or "").upper() == "VIEW"
     )
-    unsupported_total = 0
-    if support_counts:
-        for data in support_counts.values():
-            unsupported_total += int(data.get("unsupported", 0) or 0)
-            unsupported_total += int(data.get("blocked", 0) or 0)
-            unsupported_total += int(data.get("risky", 0) or 0)
-    idx_blocked_cnt = extra_blocked_counts.get("INDEX", 0)
-    cons_blocked_cnt = extra_blocked_counts.get("CONSTRAINT", 0)
-    trg_blocked_cnt = extra_blocked_counts.get("TRIGGER", 0)
-    cons_unsupported_cnt = len(extra_results.get("constraint_unsupported", []) or [])
-    blocked_total = (
-        unsupported_total
-        + idx_blocked_cnt
-        + idx_unsupported_cnt
-        + cons_blocked_cnt
-        + cons_unsupported_cnt
-        + trg_blocked_cnt
-    )
+    unsupported_total = sum(int(v or 0) for v in unsupported_summary_counts.values())
+    fixable_missing_total = sum(int(v or 0) for v in fixable_missing_counts.values())
+    idx_blocked_cnt = int(unsupported_summary_counts.get("INDEX", 0) or 0)
+    cons_blocked_cnt = int(unsupported_summary_counts.get("CONSTRAINT", 0) or 0)
+    trg_blocked_cnt = int(unsupported_summary_counts.get("TRIGGER", 0) or 0)
+    blocked_total = unsupported_total
     unsupported_grant_count = sum(
         1 for item in (filtered_grants or [])
         if not (item.reason or "").upper().startswith("DEFERRED_")
@@ -53775,9 +53873,9 @@ def print_final_report(
             lines.append(f"运行时降级: compare incomplete {len(runtime_compare_events)} 项")
         if runtime_artifact_events:
             lines.append(f"辅助产物降级: {len(runtime_artifact_events)} 项")
-        if missing_supported_cnt or unsupported_blocked_cnt:
+        if fixable_missing_total or unsupported_total:
             lines.append(
-                f"迁移聚焦: 缺失可修补 {missing_supported_cnt}, 不兼容/阻断/待确认 {unsupported_blocked_cnt}"
+                f"迁移聚焦: 缺失可修补 {fixable_missing_total}, 不兼容/阻断/待确认 {unsupported_total}"
             )
         if sys_c_force_candidate_count:
             if sys_c_force_enabled:
@@ -53926,9 +54024,9 @@ def print_final_report(
 
     focus_text = Text()
     focus_text.append("缺失可修补: ", style="missing")
-    focus_text.append(f"{missing_supported_cnt}")
+    focus_text.append(f"{fixable_missing_total}")
     focus_text.append("\n不兼容/阻断/待确认: ", style="mismatch")
-    focus_text.append(f"{unsupported_blocked_cnt}")
+    focus_text.append(f"{unsupported_total}")
     if report_ts:
         focus_text.append("\n详见: ", style="info")
         focus_text.append(f"migration_focus_{report_ts}.txt", style="info")
@@ -54053,21 +54151,15 @@ def print_final_report(
     ext_text.append(f"一致表 {idx_ok_cnt} / ", style="ok")
     ext_text.append(f"缺失对象 {idx_missing_cnt}", style="mismatch")
     ext_text.append(f" (差异表 {idx_mis_cnt})", style="info")
-    if idx_blocked_cnt or idx_unsupported_cnt:
-        ext_text.append(
-            f" (不支持/阻断 {idx_blocked_cnt + idx_unsupported_cnt})",
-            style="mismatch"
-        )
+    if idx_blocked_cnt:
+        ext_text.append(f" (不支持/阻断 {idx_blocked_cnt})", style="mismatch")
     ext_text.append("\n")
     ext_text.append("约束: ", style="info")
     ext_text.append(f"一致表 {cons_ok_cnt} / ", style="ok")
     ext_text.append(f"缺失对象 {cons_missing_cnt}", style="mismatch")
     ext_text.append(f" (差异表 {cons_mis_cnt})", style="info")
-    if cons_blocked_cnt or cons_unsupported_cnt:
-        ext_text.append(
-            f" (不支持/阻断 {cons_blocked_cnt + cons_unsupported_cnt})",
-            style="mismatch"
-        )
+    if cons_blocked_cnt:
+        ext_text.append(f" (不支持/阻断 {cons_blocked_cnt})", style="mismatch")
     ext_text.append("\n")
     ext_text.append("序列: ", style="info")
     ext_text.append(f"一致 schema {seq_ok_cnt} / ", style="ok")
@@ -54126,12 +54218,14 @@ def print_final_report(
         elif trigger_list_summary.get("fallback_full"):
             filter_text.append("清单为空或无有效条目，已回退全量触发器。", style="info")
         else:
-            filter_text.append("列表: ", style="info")
+            filter_text.append("compare缺失: ", style="info")
+            filter_text.append(str(trigger_list_summary.get("compare_missing_total", 0)))
+            filter_text.append("  列表: ", style="info")
             filter_text.append(str(trigger_list_summary.get("valid_entries", 0)))
             filter_text.append("  命中缺失: ", style="info")
             filter_text.append(str(trigger_list_summary.get("selected_missing", 0)), style="ok")
-            filter_text.append("  未列出缺失: ", style="info")
-            filter_text.append(str(trigger_list_summary.get("missing_not_listed", 0)), style="mismatch")
+            filter_text.append("  过滤: ", style="info")
+            filter_text.append(str(trigger_list_summary.get("filtered_missing", trigger_list_summary.get("missing_not_listed", 0))), style="mismatch")
             invalid_cnt = trigger_list_summary.get("invalid_entries", 0) or 0
             not_found_cnt = trigger_list_summary.get("not_found", 0) or 0
             not_missing_cnt = trigger_list_summary.get("not_missing", 0) or 0
@@ -54408,12 +54502,6 @@ def print_final_report(
             addition_counts["SEQUENCE"] += len(item.missing_sequences)
         for item in extra_results.get("trigger_mismatched", []):
             addition_counts["TRIGGER"] += len(item.missing_triggers)
-        trigger_fixup_summary = (fixup_skip_summary or {}).get("TRIGGER") or {}
-        if trigger_fixup_summary:
-            addition_counts["TRIGGER"] = int(trigger_fixup_summary.get("task_total", 0) or 0)
-        elif trigger_list_summary and trigger_list_summary.get("enabled"):
-            if not trigger_list_summary.get("fallback_full") and not trigger_list_summary.get("error"):
-                addition_counts["TRIGGER"] = int(trigger_list_summary.get("selected_missing", 0) or 0)
 
         def format_block(title: str, data: OrderedDict) -> str:
             lines = [f"[bold]{title}[/bold]"]
@@ -54435,9 +54523,34 @@ def print_final_report(
                     lines.append(f"  - {k}: {v}")
             return "\n".join(lines)
 
+        fixup_plan_lines = ["[bold]本轮 fixup 计划[/bold]"]
+        plan_entries = []
+        for obj_type in ("INDEX", "TRIGGER", "SYNONYM"):
+            obj_summary = (fixup_skip_summary or {}).get(obj_type) or {}
+            if not obj_summary:
+                continue
+            layers = build_fixup_count_layers(obj_summary)
+            plan_entries.append(
+                "  - {obj_type}: compare缺失 {missing}, 选中 {selected}, 可生成 {runnable}, 已生成 {generated}, "
+                "被过滤 {filtered}, 被阻断 {blocked}".format(
+                    obj_type=obj_type,
+                    missing=layers["compare_missing_total"],
+                    selected=layers["selected_total"],
+                    runnable=layers["runnable_total"],
+                    generated=layers["generated_total"],
+                    filtered=layers["filtered_total"],
+                    blocked=layers["blocked_total"],
+                )
+            )
+        if plan_entries:
+            fixup_plan_lines.extend(plan_entries)
+        else:
+            fixup_plan_lines.append("  - 无")
+
         text = "\n\n".join([
             format_block("需要在目标端修改的对象", modify_counts),
-            format_add_block("需要在目标端新增的对象", addition_counts)
+            format_add_block("需要在目标端新增的对象（compare口径）", addition_counts),
+            "\n".join(fixup_plan_lines),
         ])
         return Panel.fit(text, title="[info]执行摘要", border_style="info", width=section_width)
 
@@ -54944,6 +55057,7 @@ def print_final_report(
             runtime_degraded_events=runtime_degraded_events,
             runtime_degraded_detail_path=runtime_degraded_detail_path,
             grant_plan=grant_plan,
+            object_counts_summary=object_counts_summary,
         )
         notice_state_path, notice_state = load_notice_state(settings.get("config_dir") if settings else None)
         runtime_notices = build_runtime_change_notices(
@@ -55331,7 +55445,7 @@ def print_final_report(
         _add_index_entry(
             "DETAIL",
             migration_focus_path,
-            (missing_supported_cnt + unsupported_blocked_cnt),
+            (fixable_missing_total + unsupported_total),
             "迁移聚焦清单"
         )
         index_unsupported_path = export_indexes_unsupported_detail(
@@ -56826,8 +56940,10 @@ def main():
             trigger_summary_stub = {
                 "enabled": True,
                 "path": trigger_list_path,
+                "compare_missing_total": 0,
                 "valid_entries": 0,
                 "selected_missing": 0,
+                "filtered_missing": 0,
                 "missing_not_listed": 0,
                 "invalid_entries": 0,
                 "not_found": 0,
@@ -57709,10 +57825,11 @@ def main():
         else:
             trigger_filter_enabled = True
             log.info(
-                "trigger_list 生效: 列表=%d, 命中缺失=%d, 未列出缺失=%d。",
+                "trigger_list 生效: 列表=%d, compare缺失=%d, 命中缺失=%d, 过滤=%d。",
                 trigger_list_summary.get("valid_entries", 0),
+                trigger_list_summary.get("compare_missing_total", 0),
                 trigger_list_summary.get("selected_missing", 0),
-                trigger_list_summary.get("missing_not_listed", 0)
+                trigger_list_summary.get("filtered_missing", 0)
             )
     settings["_non_table_trigger_rows"] = build_non_table_trigger_detail_rows(
         oracle_meta,
@@ -58060,6 +58177,7 @@ def main():
                 view_compat_map=support_summary.view_compat_map,
                 view_dependency_map=view_dependency_map,
                 view_callable_dep_map=view_callable_dep_map,
+                manual_trigger_table_keys=manual_trigger_blacklist_table_keys,
             )
             deferred_filtered_grants = list(settings.get("_deferred_filtered_grants") or [])
             if grant_plan and deferred_filtered_grants:

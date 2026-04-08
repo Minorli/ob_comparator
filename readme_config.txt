@@ -1,5 +1,5 @@
 配置说明 (config.ini)
-版本：0.9.9.0（更新日期：2026-04-08）
+版本：0.9.9.1（更新日期：2026-04-08）
 本文件为完整配置说明书，覆盖所有可配置项（含最近新增功能）。
 
 通用约定
@@ -379,6 +379,8 @@
   说明：若清单中的触发器属于非表触发器（如 `BEFORE DROP ON DATABASE` 或 `INSTEAD OF ... ON VIEW`），程序不会生成普通 trigger DDL，
   对 `DATABASE/SCHEMA` 级事件触发器，会在 `trigger_status_report.txt` 中标成 `NON_TABLE_SOURCE_TRIGGER`，并额外输出 `triggers_non_table_detail_<ts>.txt` 与人工处理清单；`INSTEAD OF ... ON VIEW` 会按普通触发器参与 compare/fixup。
   说明：若清单命中的缺失触发器依赖的目标 TABLE/VIEW 仍不存在，本轮不会生成 trigger DDL；会在 `fixup_skip_summary_<ts>.txt` 中记录 `base_table_missing` 或同类跳过原因，待依赖对象补齐后 rerun 再生成 trigger 脚本。
+  说明：trigger 相关统计口径已分层统一：`trigger_status_report.txt` / 主报告中的 `compare_missing_total / selected_missing / filtered_missing` 表示 compare+清单层；`fixup_skip_summary_<ts>.txt` 中的 `missing_total / selected_total / task_total / blocked_total / filtered_total` 表示 fixup 计划层。
+  说明：若 TRIGGER/INDEX/CONSTRAINT 的父 TABLE 已在 compare 阶段被判定为缺失、黑名单人工处理或不支持，这些扩展对象会先从 fixup compare scope 中剔除；主报告、`fixup_skip_summary_<ts>.txt` 与 `report_db` 将保持同一统计口径。
 - trigger_qualify_schema：触发器 DDL 是否强制补全 schema 前缀。默认：true。
   说明：开启后会在触发器体内 DML 位点补全 schema，并把同义词引用优先解析到终点对象（如 TABLE/VIEW）后再重写；
   对未限定 schema 的序列 `NEXTVAL/CURRVAL` 也会补全为 `schema.sequence`，减少跨 schema 误绑定。

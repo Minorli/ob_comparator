@@ -2,6 +2,20 @@
 
 本文件记录 OceanBase Comparator Toolkit 的重要变更。
 
+## [0.9.9.1] - 2026-04-08
+
+### 变更
+- 统一 compare/fixup 统计口径：`检查汇总`、Rich 主报告、`fixup_skip_summary_<ts>.txt`、`trigger_status_report.txt` 与 report_db 的 `DIFF_REPORT_COUNTS / DIFF_REPORT_FIXUP_SKIP` 现统一按同一组 compare/fixup 分层字段表达，不再混用“原始阻断集”和“最终 compare 结果”。
+- fixup 入口与报告入口统一收口：父 `TABLE/VIEW` 已缺失、人工处理或不支持时，对应 `INDEX / CONSTRAINT / TRIGGER` 会先从 fixup compare scope 中剔除，保留诊断明细，但不再重复污染 fixup 计划数量。
+- TRIGGER patch 统计重命名固定：`compare_missing_total / selected_missing / filtered_missing` 用于 compare+清单层；`missing_total / selected_total / task_total / blocked_total / filtered_total` 用于 fixup 计划层，主报告与客户排障说明可直接对照。
+
+### 修复
+- 修复同一轮运行内 `TRIGGER` 在 `0.b 检查汇总`、`fixup_skip_summary` 与 `DIFF_REPORT_FIXUP_SKIP` 之间可能出现数量分叉的问题。
+- 修复 Rich 报告“迁移聚焦 / 执行结论 / 扩展对象”面板仍引用旧 blocked 口径，导致主摘要偏大的问题。
+
+### 文档
+- README / `readme_config.txt` / `docs/ADVANCED_USAGE.md` 已补充新的 compare/fixup 分层统计定义和触发器生产排障口径。
+
 ## [0.9.9.0] - 2026-04-08
 
 ### 新增
