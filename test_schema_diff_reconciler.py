@@ -4645,6 +4645,85 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         self.assertEqual(filtered["constraint_ok"], [])
         self.assertEqual(filtered["trigger_ok"], [])
 
+    def test_generate_fixup_filters_blocked_table_trigger_results_before_skip_summary(self):
+        tv_results = {
+            "missing": [("TABLE", "TGT.T1", "SRC.T1")],
+            "mismatched": [],
+            "ok": [],
+            "skipped": [],
+            "extraneous": [],
+            "extra_targets": [],
+            "remap_conflicts": [],
+        }
+        extra_results = {
+            "index_ok": [],
+            "index_mismatched": [],
+            "constraint_ok": [],
+            "constraint_mismatched": [],
+            "sequence_ok": [],
+            "sequence_mismatched": [],
+            "trigger_ok": [],
+            "trigger_mismatched": [
+                sdr.TriggerMismatch("TGT.T1", {"TR1"}, set(), [], None),
+            ],
+        }
+        settings = {
+            "fixup_dir": "",
+            "fixup_workers": 1,
+            "progress_log_interval": 999,
+            "fixup_type_set": {"TRIGGER"},
+            "fixup_schema_list": {"SRC"},
+            "name_collision_mode": "off",
+            "generate_fixup": "true",
+        }
+        support_state_map = {
+            ("TABLE", "SRC.T1"): sdr.ObjectSupportReportRow(
+                obj_type="TABLE",
+                src_full="SRC.T1",
+                tgt_full="TGT.T1",
+                support_state=sdr.SUPPORT_STATE_BLOCKED,
+                reason_code="MISSING_TARGET",
+                reason="目标缺失",
+                dependency="-",
+                action="先补表",
+                detail="TABLE",
+            )
+        }
+        fixup_skip_summary: Dict[str, Dict[str, object]] = {}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings["fixup_dir"] = tmp_dir
+            with mock.patch.object(sdr, "fetch_dbcat_schema_objects", return_value=({}, {})):
+                sdr.generate_fixup_scripts(
+                    {"user": "u", "password": "p", "dsn": "d"},
+                    {"executable": "obclient", "host": "h", "port": "1", "user_string": "u", "password": "p"},
+                    settings,
+                    tv_results,
+                    extra_results,
+                    [("SRC.T1", "TGT.T1", "TABLE")],
+                    self._make_oracle_meta(),
+                    {"SRC.T1": {"TABLE": "TGT.T1"}},
+                    {},
+                    grant_plan=None,
+                    enable_grant_generation=False,
+                    dependency_report={"missing": [], "unexpected": [], "skipped": []},
+                    ob_meta=self._make_ob_meta(),
+                    expected_dependency_pairs=set(),
+                    synonym_metadata={},
+                    trigger_filter_entries=None,
+                    trigger_filter_enabled=False,
+                    package_results=None,
+                    report_dir=None,
+                    report_timestamp=None,
+                    fixup_skip_summary=fixup_skip_summary,
+                    support_state_map=support_state_map,
+                    unsupported_table_keys=set(),
+                    view_compat_map={},
+                    trigger_status_rows=[],
+                    constraint_status_rows=[],
+                )
+            self.assertNotIn("TRIGGER", fixup_skip_summary)
+            self.assertFalse((Path(tmp_dir) / "trigger").exists())
+
     def test_collect_trigger_status_rows_skips_unsupported_tables(self):
         oracle_meta = self._make_oracle_meta(triggers={
             ("SRC", "T1"): {
@@ -22256,6 +22335,69 @@ class TestReportDbHelpers(unittest.TestCase):
         )
         self.assertTrue(any("compare incomplete" in item for item in summary.attention))
 
+    def test_build_run_summary_uses_object_count_aligned_unsupported_counts(self):
+        ctx = sdr.RunSummaryContext(
+            start_time=datetime.now(),
+            start_perf=0.0,
+            phase_durations={},
+            phase_skip_reasons={},
+            enabled_primary_types={"TABLE"},
+            enabled_extra_types={"TRIGGER"},
+            print_only_types=set(),
+            total_checked=1,
+            enable_dependencies_check=False,
+            enable_comment_check=False,
+            enable_grant_generation=False,
+            enable_schema_mapping_infer=False,
+            fixup_enabled=True,
+            fixup_dir="fixup_scripts",
+            dependency_chain_file=None,
+            view_chain_file=None,
+            trigger_list_summary=None,
+            report_start_perf=0.0,
+        )
+        support_summary = sdr.SupportClassificationResult(
+            support_state_map={},
+            missing_detail_rows=[],
+            unsupported_rows=[],
+            extra_missing_rows=[],
+            missing_support_counts={},
+            extra_blocked_counts={"TRIGGER": 6},
+            unsupported_table_keys=set(),
+            unsupported_view_keys=set(),
+            view_compat_map={},
+            view_constraint_cleaned_rows=[],
+            view_constraint_uncleanable_rows=[],
+        )
+        summary = sdr.build_run_summary(
+            ctx,
+            {"missing": [], "mismatched": [], "extra_targets": [], "skipped": [], "extraneous": []},
+            {
+                "index_mismatched": [],
+                "constraint_mismatched": [],
+                "sequence_mismatched": [],
+                "trigger_mismatched": [sdr.TriggerMismatch("T.T1", {"TR1"}, set(), [], None)],
+                "index_unsupported": [],
+                "constraint_unsupported": [],
+            },
+            {"ok": [], "mismatched": [], "skipped_reason": "skip"},
+            {"missing": [], "unexpected": [], "skipped": []},
+            [],
+            [],
+            {},
+            None,
+            support_summary=support_summary,
+            object_counts_summary={
+                "oracle": {"TRIGGER": 8},
+                "oceanbase": {"TRIGGER": 7},
+                "missing": {"TRIGGER": 1},
+                "extra": {"TRIGGER": 0},
+            },
+        )
+        joined_findings = "\n".join(summary.findings)
+        self.assertIn("TRIGGER=1", joined_findings)
+        self.assertNotIn("TRIGGER=6", joined_findings)
+
     def test_build_run_summary_describes_structural_grant_mode(self):
         ctx = sdr.RunSummaryContext(
             start_time=datetime.now(),
@@ -23861,6 +24003,125 @@ class TestReportDbHelpers(unittest.TestCase):
         )
         self.assertEqual(mismatches, [])
 
+    def test_build_fixup_count_layers_distinguishes_compare_selected_and_blocked(self):
+        layers = sdr.build_fixup_count_layers({
+            "missing_total": 4,
+            "task_total": 0,
+            "generated": 0,
+            "skipped": {
+                "trigger_list_filtered": 3,
+                "support_dependency_target_table_missing": 1,
+            },
+        })
+        self.assertEqual(layers["compare_missing_total"], 4)
+        self.assertEqual(layers["selected_total"], 1)
+        self.assertEqual(layers["filtered_total"], 3)
+        self.assertEqual(layers["blocked_total"], 1)
+        self.assertEqual(layers["runnable_total"], 0)
+        self.assertEqual(layers["generated_total"], 0)
+
+    def test_build_report_fixup_skip_rows_include_canonical_count_layers(self):
+        rows, truncated, truncated_count = sdr._build_report_fixup_skip_rows(
+            {
+                "TRIGGER": {
+                    "missing_total": 4,
+                    "task_total": 0,
+                    "generated": 0,
+                    "skipped": {
+                        "trigger_list_filtered": 3,
+                        "support_dependency_target_table_missing": 1,
+                    },
+                }
+            },
+            0,
+        )
+        self.assertFalse(truncated)
+        self.assertEqual(truncated_count, 0)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row["selected_total"] == 1 for row in rows))
+        self.assertTrue(all(row["filtered_total"] == 3 for row in rows))
+        self.assertTrue(all(row["blocked_total"] == 1 for row in rows))
+
+    def test_build_run_summary_reports_canonical_trigger_fixup_layers(self):
+        ctx = sdr.RunSummaryContext(
+            start_time=datetime.now(),
+            start_perf=0.0,
+            phase_durations={},
+            phase_skip_reasons={},
+            enabled_primary_types={"TABLE"},
+            enabled_extra_types={"TRIGGER"},
+            print_only_types=set(),
+            total_checked=1,
+            enable_dependencies_check=False,
+            enable_comment_check=False,
+            enable_grant_generation=False,
+            enable_schema_mapping_infer=False,
+            fixup_enabled=True,
+            fixup_dir="fixup_scripts",
+            dependency_chain_file=None,
+            view_chain_file=None,
+            trigger_list_summary={
+                "enabled": True,
+                "valid_entries": 5,
+                "compare_missing_total": 4,
+                "selected_missing": 1,
+                "filtered_missing": 3,
+                "missing_not_listed": 3,
+                "invalid_entries": 0,
+                "not_found": 0,
+                "error": "",
+                "fallback_full": False,
+            },
+            report_start_perf=0.0,
+        )
+        support_summary = sdr.SupportClassificationResult(
+            support_state_map={},
+            missing_detail_rows=[],
+            unsupported_rows=[],
+            extra_missing_rows=[],
+            missing_support_counts={},
+            extra_blocked_counts={},
+            unsupported_table_keys=set(),
+            unsupported_view_keys=set(),
+            view_compat_map={},
+            view_constraint_cleaned_rows=[],
+            view_constraint_uncleanable_rows=[],
+        )
+        summary = sdr.build_run_summary(
+            ctx,
+            {"missing": [], "mismatched": [], "extra_targets": [], "skipped": [], "extraneous": []},
+            {
+                "index_mismatched": [],
+                "constraint_mismatched": [],
+                "sequence_mismatched": [],
+                "trigger_mismatched": [sdr.TriggerMismatch("T.T1", {"TR1", "TR2", "TR3", "TR4"}, set(), [], None)],
+                "index_unsupported": [],
+                "constraint_unsupported": [],
+            },
+            {"ok": [], "mismatched": [], "skipped_reason": "skip"},
+            {"missing": [], "unexpected": [], "skipped": []},
+            [],
+            [],
+            {},
+            None,
+            support_summary=support_summary,
+            fixup_skip_summary={
+                "TRIGGER": {
+                    "missing_total": 4,
+                    "task_total": 0,
+                    "generated": 0,
+                    "skipped": {
+                        "trigger_list_filtered": 3,
+                        "support_dependency_target_table_missing": 1,
+                    },
+                }
+            },
+        )
+        joined_findings = "\n".join(summary.findings)
+        joined_actions = "\n".join(summary.actions_done)
+        self.assertIn("触发器清单: 生效 (compare缺失 4, 命中缺失 1, 过滤 3)", joined_actions)
+        self.assertIn("TRIGGER 修补: compare缺失 4, 选中 1, 可生成 0, 已生成 0, 被过滤 3, 被阻断 1", joined_findings)
+
     def test_build_report_detail_item_rows_includes_extra_missing_rows(self):
         extra_missing = sdr.ObjectSupportReportRow(
             obj_type="INDEX",
@@ -24159,6 +24420,43 @@ class TestReportDbHelpers(unittest.TestCase):
         ]
         for expected in expected_alters:
             self.assertIn(expected, ddl_text)
+
+    def test_ensure_report_db_tables_exist_adds_fixup_skip_count_columns(self):
+        all_tables_out = "\n".join(sorted(sdr.REPORT_DB_TABLES.values()))
+        executed_commit_sql: List[str] = []
+
+        def fake_run_sql(_cfg, sql, timeout=None):
+            sql_u = (sql or "").upper()
+            if "FROM ALL_TABLES" in sql_u:
+                return True, all_tables_out, ""
+            if "FROM ALL_CONSTRAINTS" in sql_u:
+                return True, "", ""
+            if "FROM ALL_TAB_COLUMNS" in sql_u and "TABLE_NAME = 'DIFF_REPORT_FIXUP_SKIP'" in sql_u:
+                if "COLUMN_NAME = 'SELECTED_TOTAL'" in sql_u:
+                    return True, "", ""
+                if "COLUMN_NAME = 'FILTERED_TOTAL'" in sql_u:
+                    return True, "", ""
+                if "COLUMN_NAME = 'BLOCKED_TOTAL'" in sql_u:
+                    return True, "", ""
+                return True, "COLUMN_EXISTS", ""
+            if "FROM ALL_TAB_COLUMNS" in sql_u:
+                return True, "COLUMN_EXISTS", ""
+            return True, "", ""
+
+        def fake_run_sql_commit(_cfg, sql, timeout=None):
+            executed_commit_sql.append(sql or "")
+            return True, "", ""
+
+        with mock.patch.object(sdr, "obclient_run_sql", side_effect=fake_run_sql), \
+             mock.patch.object(sdr, "obclient_run_sql_commit", side_effect=fake_run_sql_commit):
+            ok, err = sdr.ensure_report_db_tables_exist({"executable": "/usr/bin/obclient"}, {"report_db_schema": ""})
+
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+        ddl_text = "\n".join(executed_commit_sql).upper()
+        self.assertIn("ALTER TABLE DIFF_REPORT_FIXUP_SKIP ADD (SELECTED_TOTAL NUMBER DEFAULT 0)", ddl_text)
+        self.assertIn("ALTER TABLE DIFF_REPORT_FIXUP_SKIP ADD (FILTERED_TOTAL NUMBER DEFAULT 0)", ddl_text)
+        self.assertIn("ALTER TABLE DIFF_REPORT_FIXUP_SKIP ADD (BLOCKED_TOTAL NUMBER DEFAULT 0)", ddl_text)
 
     def test_apply_ob_feature_gates_auto_ob_442_plus(self):
         settings = {

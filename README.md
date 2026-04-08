@@ -1,19 +1,13 @@
 # OceanBase Comparator Toolkit
 
-> 当前版本：V0.9.9.0
+> 当前版本：V0.9.9.1
 > 面向 Oracle → OceanBase (Oracle 模式) 的结构一致性校验与修补脚本生成工具  
 > 核心理念：一次转储、本地对比、脚本审计优先
 
-## 近期更新（0.9.9.0）
-- 新增 `grant_generation_mode=full|structural`：默认 `full` 保持 Oracle 权限镜像；`structural` 只生成对象创建、编译、跨 schema 依赖闭环所需的最小授权，便于把业务权限与迁移结构权限拆开治理。
-- VIEW rewrite 收敛为“只改数据来源对象”：`TABLE / VIEW / MVIEW / SYNONYM` 继续参与 VIEW DDL 改写；`FUNCTION / PACKAGE / PROCEDURE / SEQUENCE / TYPE` 只保留诊断，不再误改 DDL，也不再把 `SYS.DBMS_METADATA` 一类调用对象混进 unresolved warning。
-- 运行时降级显式化：当 `JOB_ACTION` 文本递归、超大依赖图导出等保护逻辑触发时，会新增 `runtime_degraded_detail_<ts>.txt`，主报告与 run summary 会明确标记 `compare incomplete` 或“仅辅助产物降级”。
-- scoped text / `JOB_ACTION` 性能保护增强：`safe text fallback` 现在带有大文本跳过、高扇出跳过、递归封顶和批次进度日志，生产上更容易区分“真卡住”和“大对象还在扫描”。
-- `dependency_chains_*.txt` 大图保护增强：导出前不再无脑构造全量依赖 pair；遇到大图会提前跳过或截断链路，并把影响写入运行时降级明细，避免审计附件拖垮主 compare。
-- `remap_root_closure` 继续收口：managed mapping 与 discovery-only mapping 已分离；`trigger_list`、同义词依附、反向依赖和 related object 会继续进入 closure，但不再污染 operator-facing compare/fixup 范围。
-- 新增 `sequence_sync_mode=last_number`：可按 Oracle/OB 当前 `LAST_NUMBER` 生成 `fixup_scripts/sequence_restart/`，用于单独同步 sequence 当前值，默认仍不自动执行。
-- GTT 受管与 MVIEW 门控增强：`gtt_table_handling_mode` 支持按普通 TABLE 或保留原义受管；`mview_check_fixup_mode=auto` 会按 OB 版本动态开关校验与修补。
-- report_db 老表自迁移增强：启动时会自动扩容过窄的 `STATUS/REASON/DETAIL` 列，降低老表结构拖累新版本写库的概率。
+## 近期更新（0.9.9.1）
+- 统计口径统一：`0.b 检查汇总`、Rich 主报告、`fixup_skip_summary_<ts>.txt`、`trigger_status_report.txt` 与 report_db 现在统一使用同一套 compare/fixup 分层口径，不再出现“报告缺失 1、fixup 跳过 6”这类分叉。
+- fixup 入口收口：对父 `TABLE/VIEW` 已缺失、已转人工或已判定不支持的 `INDEX / CONSTRAINT / TRIGGER`，会先按与主报告一致的 compare scope 过滤，保留诊断明细，但不再重复污染 fixup 计划统计。
+- 触发器口径可审计：`trigger_list` 场景下，`compare_missing_total / selected_missing / filtered_missing` 与 `missing_total / selected_total / task_total / blocked_total` 的层级关系已在主报告、明细和文档中明确固定，便于生产排障和客户解释。
 
 ## 核心能力
 - **对象覆盖完整**：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。
@@ -254,6 +248,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/unsupported_grant_detail_<ts>.txt`：不进入 runnable grant 闭环的授权明细（含 Oracle 维护角色在目标端不存在、目标角色目录不可确认、OB 不支持权限等）
 - `main_reports/run_<ts>/ddl_cleanup_detail_<ts>.txt`：DDL 清理/改写明细（区分 `format_only / syntax_compat / environment_detach / semantic_rewrite`，并标记 `evidence_level`）
 - `main_reports/run_<ts>/trigger_status_report.txt`：触发器清单/状态差异报告
+- `main_reports/run_<ts>/fixup_skip_summary_<ts>.txt`：fixup 计划与跳过原因汇总；`missing_total` 表示 compare 缺失总数，`selected_total` 表示清单/过滤后仍纳入 fixup 评估的数量，`task_total` 表示最终 runnable 数量
 - `main_reports/run_<ts>/triggers_non_table_detail_<ts>.txt`：源端非表触发器明细（如 `BEFORE DROP ON DATABASE`）；`DATABASE/SCHEMA` 级事件触发器不会按普通 `trigger/` DDL 自动生成
 - `main_reports/run_<ts>/triggers_temp_table_unsupported_detail_<ts>.txt`：临时表触发器不支持明细（`TRIGGER_ON_TEMP_TABLE_UNSUPPORTED`）；对应 DDL 仅输出到 `fixup_scripts/unsupported/trigger/` 供人工改造参考，不进入普通 `trigger/`
 - `main_reports/run_<ts>/triggers_view_reference_detail_<ts>.txt`：触发器中引用视图的提醒明细（保留视图语义，不改写为表）
@@ -319,6 +314,8 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - 如果源端触发器是 `DATABASE/SCHEMA` 级事件触发器（例如 `BEFORE DROP ON DATABASE`），程序不会再静默漏掉；会输出到 `triggers_non_table_detail_<ts>.txt`，并在 `manual_actions_required_<ts>.txt` 中显式提醒。`INSTEAD OF ... ON VIEW` 会按普通受管触发器参与 compare/fixup。
 - 当 `source_object_scope_mode=remap_root_closure` 且配置了 `trigger_list` 时，`trigger_list` 支持填写源端名或 remap 后目标名；若条目无法在源端或显式 remap 规则中解析，只会写入 `source_scope_detail_<ts>.txt` / `trigger_status_report.txt`，不会再中止整轮运行。
 - 在 scoped trigger 场景下，如果触发器依赖的目标 TABLE/VIEW 尚未创建，首轮只会生成依赖对象脚本；TRIGGER 自身会在 `fixup_skip_summary_<ts>.txt` 中标记为 `base_table_missing` 或同类跳过原因，待依赖补齐后 rerun 再生成 trigger DDL。
+- 若配置了 `trigger_list`，`trigger_status_report.txt` 与运行总结中的 `compare缺失 / 命中缺失 / 过滤` 使用同一套 trigger list 口径；`fixup_skip_summary_<ts>.txt` 则继续在此基础上区分 `selected_total / task_total / blocked_total`，避免把“清单命中”误读成“已可生成脚本”。
+- 对 `TABLE/VIEW` 前置依赖已缺失、或已被纳入人工/不支持处理的 `INDEX / CONSTRAINT / TRIGGER`，fixup 入口会先按与主报告相同的 compare scope 过滤，不再出现“检查汇总已剔除、fixup_skip_summary 仍重复计数”的分叉。
 - 对 `view_post_grants/` 中的 `GRANT SELECT/INSERT/UPDATE/DELETE ON <view> TO <grantee>`，若目标端因缺少底层 `WITH GRANT OPTION` 命中 `ORA-01720`，`run_fixup` 会按失败语句里的真实 privilege 自动补底层依赖授权；若 fixup 目录存在匹配的 `view_refresh/`，会先刷新 VIEW 再重试最终 VIEW grant，不再只把它记成普通权限不足。
 - `grants_miss/` 现在会继续剔除明显不可执行的授权：目标对象当前不存在且本轮不会创建，或目标对象当前已是 `INVALID` 的授权，不再混进 runnable grants；这类会转入 `grants_deferred/` / `unsupported_grant_detail_<ts>.txt`。
 - 触发器中的 `PRAGMA AUTONOMOUS_TRANSACTION` 现在会保留，不再被清洗掉。
