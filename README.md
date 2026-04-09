@@ -223,16 +223,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 ## 额外工具
 - `init_users_roles.py`：以 Oracle 为准创建用户/角色并同步系统权限与角色授权。
 > 注意：`init_users_roles.py` 运行时会交互输入用户初始密码，不再在脚本中写死明文初始密码。
-- `prod_diagnose.py`：生产排障只读诊断器，优先定位“误报/口径漂移/fixup 失败根因”。
-  - 自动取最新报告：
-    `python3 prod_diagnose.py config.ini`
-  - 指定 report_id：
-    `python3 prod_diagnose.py config.ini --report-id <report_id>`
-  - 单对象深挖（映射/依赖/可用性/授权/fixup失败）：
-    `python3 prod_diagnose.py config.ini --report-id <report_id> --focus-object VIEW:SCHEMA.OBJ --deep`
-  - 输出文件：
-    `triage_summary_*.txt` / `triage_detail_*.txt` / `triage_fixup_failures_*.txt` / `triage_false_positive_candidates_*.txt`
-    （`--deep` 时增加 `triage_focus_deep_*.txt`）
+- 本地团队可按内部排障流程使用只读诊断脚本，对最新 `report_id` 做聚焦复核；该能力不作为 GitHub 公开交付物的一部分。
 
 ## 主要输出
 - `main_reports/run_<ts>/report_<ts>.txt`：完整对比报告（默认 per_run）
