@@ -1,6 +1,6 @@
 # 数据库对象对比工具设计文档
 
-> 当前版本：V0.9.9.1（截至 2026-04-08）
+> 当前版本：V0.9.9.2（截至 2026-04-09）
 > 核心模式：Dump-Once, Compare-Locally + 依赖分析 + 修补脚本生成
 
 ## 1. 设计原则
@@ -80,12 +80,14 @@
   - 迭代重试（iterative）
   - VIEW 链路自动修复（view-chain）
   - 错误报告（errors 目录）
+  - timeout-stop 保护（单脚本超时后停止后续语句）
 
 ## 10. 可靠性与性能
 - 可配置超时：`obclient_timeout`、`cli_timeout`、`fixup_cli_timeout`。
 - 生成过程支持多线程（`fixup_workers`）。
 - 扩展对象校验支持并发与批量调优（`extra_check_workers`/`extra_check_chunk_size`）。
 - dbcat 输出支持缓存复用（`dbcat_output/`）。
+- `run_fixup` 拓扑排序已改为非递归实现，深依赖链不再受 Python 递归栈限制。
 - `JOB_ACTION` 与 scoped text matching 带有大文本/高扇出/递归深度保护，避免个别对象把整轮 compare 拖死。
 - `dependency_chains` 导出在大图下支持提前跳过与链路截断，避免审计附件反向拖垮主流程。
 

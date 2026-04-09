@@ -1,13 +1,16 @@
 # OceanBase Comparator Toolkit
 
-> 当前版本：V0.9.9.1
+> 当前版本：V0.9.9.2
 > 面向 Oracle → OceanBase (Oracle 模式) 的结构一致性校验与修补脚本生成工具  
 > 核心理念：一次转储、本地对比、脚本审计优先
 
-## 近期更新（0.9.9.1）
-- 统计口径统一：`0.b 检查汇总`、Rich 主报告、`fixup_skip_summary_<ts>.txt`、`trigger_status_report.txt` 与 report_db 现在统一使用同一套 compare/fixup 分层口径，不再出现“报告缺失 1、fixup 跳过 6”这类分叉。
-- fixup 入口收口：对父 `TABLE/VIEW` 已缺失、已转人工或已判定不支持的 `INDEX / CONSTRAINT / TRIGGER`，会先按与主报告一致的 compare scope 过滤，保留诊断明细，但不再重复污染 fixup 计划统计。
-- 触发器口径可审计：`trigger_list` 场景下，`compare_missing_total / selected_missing / filtered_missing` 与 `missing_total / selected_total / task_total / blocked_total` 的层级关系已在主报告、明细和文档中明确固定，便于生产排障和客户解释。
+## 近期更新（0.9.9.2）
+- 审计问题整轮加固：本版集中落地最近一轮综合审计中确认成立的 18 项问题，覆盖 compare 正确性、fixup 执行安全、辅助诊断工具可信度与测试基线卫生。
+- `run_fixup` 安全性增强：修复 Oracle Q-quote 场景下单独一行 `/` 误切分、语句超时后仍继续执行后续 SQL、深链拓扑排序递归爆栈，以及 grant rewrite 临时文件残留/固定 `.tmp` 竞态问题。
+- compare 结果更保守也更准确：`INDEX/CONSTRAINT` 在父 TABLE 无法映射时不再错误套用 generic schema fallback；`SYS_NC` / expression-equivalent 索引 compare 改为按多重集匹配，降低 `2:1` 假阳性。
+- scoped/runtime 成本收口：`scope_integrity_dependency_graph_raw` 改为按需构建，不再在非 scope-integrity 路径无条件建全图。
+- 辅助工具可信度修复：`collect_source_object_stats.py` 现在把 CHECK 约束算进 CONSTRAINT 总量，百分位计算改为有界；`expert_swarm.py` 不再因单个专家失败丢全局结果，也不再只保留最后一条消息。
+- 安全与测试基线加固：`init_test.py` 不再把 OB 密码暴露在 argv；伪测试脚本改成 probe，版本断言与文案断言改为语义型校验，减少“看起来有测试、实际没覆盖”的假稳定。
 
 ## 核心能力
 - **对象覆盖完整**：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。

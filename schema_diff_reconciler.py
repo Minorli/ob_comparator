@@ -16,7 +16,7 @@
 
 """
 
-数据库对象对比工具 (V0.9.9.1 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
+数据库对象对比工具 (V0.9.9.2 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -33,7 +33,7 @@
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.9.9.1 核心)：
+3. 性能架构 (V0.9.9.2 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          DBA_OBJECTS
@@ -95,7 +95,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Dict, FrozenSet, Iterable, Iterator, List, NamedTuple, NoReturn, Optional, Pattern, Sequence, Set, Tuple, Union
 
-__version__ = "0.9.9.1"
+__version__ = "0.9.9.2"
 
 __author__ = "Minor Li"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
@@ -10193,6 +10193,21 @@ def build_dependency_graph_from_records(
     return {key: set(value) for key, value in graph.items()}
 
 
+def build_scope_integrity_dependency_graph(
+    dependency_records: Optional[Sequence[DependencyRecord]],
+    *,
+    enabled: bool,
+    allowed_nodes: Optional[Set[DependencyNode]] = None,
+) -> DependencyGraph:
+    """Build scope-integrity graph only for paths that explicitly require it."""
+    if not enabled or not dependency_records:
+        return {}
+    return build_dependency_graph_from_records(
+        dependency_records,
+        allowed_nodes=allowed_nodes,
+    )
+
+
 def build_reverse_dependency_map(
     dependency_graph: Optional[DependencyGraph]
 ) -> Dict[DependencyNode, Set[DependencyNode]]:
@@ -14238,6 +14253,8 @@ def resolve_remap_target(
                     tgt_schema = parent_target.split('.', 1)[0].upper()
                     src_obj = src_name.split('.', 1)[1]
                     return f"{tgt_schema}.{src_obj}"
+        if '.' in src_name and obj_type_u in ('INDEX', 'CONSTRAINT'):
+            return src_name_u
 
         # 对于 SEQUENCE，优先根据依赖对象的 remap 结果推导
         if '.' in src_name and obj_type_u == 'SEQUENCE' and sequence_policy == "infer":
@@ -26762,24 +26779,44 @@ def compare_index_maps(
                 normalized.append(col)
         return tuple(normalized)
 
-    def is_sys_nc_only_diff(src_cols: Tuple[str, ...], tgt_cols: Tuple[str, ...]) -> bool:
-        return normalize_sys_nc_columns(src_cols) == normalize_sys_nc_columns(tgt_cols)
-
     def has_sys_nc(cols: Tuple[str, ...]) -> bool:
         return any(re.match(r'^SYS_NC', col) or col == 'SYS_NC$' for col in cols)
 
     def has_expression(cols: Tuple[str, ...]) -> bool:
         return any(is_index_expression_token(col) for col in cols)
 
-    def is_expr_sys_nc_match(src_cols: Tuple[str, ...], tgt_cols: Tuple[str, ...]) -> bool:
-        return (has_expression(src_cols) and has_sys_nc(tgt_cols)) or (has_expression(tgt_cols) and has_sys_nc(src_cols))
+    def normalized_special_key(cols: Tuple[str, ...]) -> Tuple[str, ...]:
+        normalized: List[str] = []
+        for col in cols:
+            if is_index_expression_token(col) or re.match(r'^SYS_NC\d+\$', col) or re.match(r'^SYS_NC_[A-Z_]+\$', col):
+                normalized.append('__EXPR_SYS_NC__')
+            else:
+                normalized.append(col)
+        return tuple(normalized)
 
-    for src_cols in list(missing_cols):
-        for tgt_cols in list(extra_cols):
-            if is_sys_nc_only_diff(src_cols, tgt_cols) or is_expr_sys_nc_match(src_cols, tgt_cols):
-                missing_cols.discard(src_cols)
-                extra_cols.discard(tgt_cols)
-                break
+    def can_use_normalized_bucket(cols: Tuple[str, ...]) -> bool:
+        return has_sys_nc(cols) or has_expression(cols)
+
+    def sort_cols_for_matching(entry_map: Dict[Tuple[str, ...], Dict[str, Set[str]]], cols: Tuple[str, ...]) -> Tuple[str, Tuple[str, ...]]:
+        return rep_name(entry_map, cols), cols
+
+    src_special_groups: Dict[Tuple[str, ...], List[Tuple[str, ...]]] = defaultdict(list)
+    tgt_special_groups: Dict[Tuple[str, ...], List[Tuple[str, ...]]] = defaultdict(list)
+    for cols in list(missing_cols):
+        if can_use_normalized_bucket(cols):
+            src_special_groups[normalized_special_key(cols)].append(cols)
+    for cols in list(extra_cols):
+        if can_use_normalized_bucket(cols):
+            tgt_special_groups[normalized_special_key(cols)].append(cols)
+
+    for key in sorted(set(src_special_groups.keys()) | set(tgt_special_groups.keys())):
+        src_group = sorted(src_special_groups.get(key, []), key=lambda cols: sort_cols_for_matching(src_map, cols))
+        tgt_group = sorted(tgt_special_groups.get(key, []), key=lambda cols: sort_cols_for_matching(tgt_map, cols))
+        matched = min(len(src_group), len(tgt_group))
+        for cols in src_group[:matched]:
+            missing_cols.discard(cols)
+        for cols in tgt_group[:matched]:
+            extra_cols.discard(cols)
 
     detail_mismatch: List[str] = []
 
@@ -56443,17 +56480,7 @@ def main():
                     source_dependencies_set = set()
                 source_dependencies_set.update(supplemental_dependency_set)
         dependency_graph: DependencyGraph = build_dependency_graph(source_dependencies_set) if source_dependencies_set else {}
-        scope_integrity_dependency_graph_raw: DependencyGraph = build_dependency_graph({
-            (
-                dep.owner.upper(),
-                dep.name.upper(),
-                dep.object_type.upper(),
-                dep.referenced_owner.upper(),
-                dep.referenced_name.upper(),
-                dep.referenced_type.upper(),
-            )
-            for dep in (oracle_dependencies_for_grants or [])
-        }) if oracle_dependencies_for_grants else {}
+        scope_integrity_dependency_graph_raw: DependencyGraph = {}
         view_dependency_map: Dict[Tuple[str, str], Set[str]] = build_view_dependency_map(
             source_dependencies_set
         ) if source_dependencies_set else {}
@@ -57491,8 +57518,9 @@ def main():
                 if (full or '').strip() and (obj_type or '').strip()
             }
             log.info('[PERF] 开始构建 scope_integrity raw graph: input_records=%d, allowed_nodes=%d', len(oracle_dependencies_for_grants), len(allowed_integrity_nodes))
-            scope_integrity_dependency_graph_raw = build_dependency_graph_from_records(
+            scope_integrity_dependency_graph_raw = build_scope_integrity_dependency_graph(
                 oracle_dependencies_for_grants,
+                enabled=True,
                 allowed_nodes=allowed_integrity_nodes,
             )
             log.info('[PERF] scope_integrity raw graph 完成，nodes=%d，开始 build_source_scope_closure...', len(scope_integrity_dependency_graph_raw))

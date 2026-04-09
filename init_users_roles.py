@@ -36,7 +36,7 @@ import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-__version__ = "0.9.9.1"
+__version__ = "0.9.9.2"
 
 try:
     import oracledb
@@ -58,6 +58,32 @@ LOG_FILE_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
 
 IDENT_SIMPLE_RE = re.compile(r"^[A-Z][A-Z0-9_$#]*$")
 _SECURE_CREDENTIAL_FILES: Set[Path] = set()
+FALLBACK_SYSTEM_ROLE_NAMES: Set[str] = {
+    "AQ_ADMINISTRATOR_ROLE",
+    "AQ_USER_ROLE",
+    "CONNECT",
+    "CTXAPP",
+    "DATAPUMP_EXP_FULL_DATABASE",
+    "DATAPUMP_IMP_FULL_DATABASE",
+    "DBA",
+    "DELETE_CATALOG_ROLE",
+    "EXECUTE_CATALOG_ROLE",
+    "EXP_FULL_DATABASE",
+    "GATHER_SYSTEM_STATISTICS",
+    "HS_ADMIN_EXECUTE_ROLE",
+    "HS_ADMIN_ROLE",
+    "HS_ADMIN_SELECT_ROLE",
+    "IMP_FULL_DATABASE",
+    "JAVAIDPRIV",
+    "JAVASYSPRIV",
+    "JAVAUSERPRIV",
+    "OEM_ADVISOR",
+    "OEM_MONITOR",
+    "RECOVERY_CATALOG_OWNER",
+    "RESOURCE",
+    "SCHEDULER_ADMIN",
+    "SELECT_CATALOG_ROLE",
+}
 
 
 def _cleanup_secure_credential_files() -> None:
@@ -94,6 +120,10 @@ def _create_obclient_defaults_file(password: str) -> Path:
         pass
     _SECURE_CREDENTIAL_FILES.add(tmp_path)
     return tmp_path
+
+
+def is_fallback_system_role(role_name: str) -> bool:
+    return (role_name or "").strip().upper() in FALLBACK_SYSTEM_ROLE_NAMES
 
 
 def init_console_logging(level: int) -> None:
@@ -381,7 +411,11 @@ def fetch_oracle_roles_fallback(conn: "oracledb.Connection") -> List[str]:
     """
     with conn.cursor() as cursor:
         cursor.execute(sql)
-        return [row[0] for row in cursor.fetchall() if row and row[0]]
+        return [
+            row[0]
+            for row in cursor.fetchall()
+            if row and row[0] and not is_fallback_system_role(row[0])
+        ]
 
 
 def fetch_oracle_role_grants(
@@ -649,7 +683,7 @@ def main() -> int:
             if has_maintained_roles:
                 roles = fetch_oracle_roles(conn)
             else:
-                log.warning("DBA_ROLES missing ORACLE_MAINTAINED, roles are unfiltered.")
+                log.warning("DBA_ROLES missing ORACLE_MAINTAINED, using fallback system-role filter.")
                 roles = fetch_oracle_roles_fallback(conn)
 
             users_map = {name.upper(): name for name in users}

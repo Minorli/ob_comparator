@@ -11377,6 +11377,38 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertEqual(target, "PUBLIC.SYN1")
 
+    def test_resolve_remap_target_index_without_parent_mapping_keeps_source_schema(self):
+        target = sdr.resolve_remap_target(
+            "SRC.IDX_A",
+            "INDEX",
+            remap_rules={},
+            source_objects={"SRC.IDX_A": {"INDEX"}},
+            schema_mapping={"SRC": "TGT"},
+            object_parent_map={},
+            dependency_graph=None,
+            transitive_table_cache=None,
+            source_dependencies=None,
+            remap_conflicts={},
+            sequence_remap_policy="source_only",
+        )
+        self.assertEqual(target, "SRC.IDX_A")
+
+    def test_resolve_remap_target_constraint_without_parent_mapping_keeps_source_schema(self):
+        target = sdr.resolve_remap_target(
+            "SRC.CK_A",
+            "CONSTRAINT",
+            remap_rules={},
+            source_objects={"SRC.CK_A": {"CONSTRAINT"}},
+            schema_mapping={"SRC": "TGT"},
+            object_parent_map={},
+            dependency_graph=None,
+            transitive_table_cache=None,
+            source_dependencies=None,
+            remap_conflicts={},
+            sequence_remap_policy="source_only",
+        )
+        self.assertEqual(target, "SRC.CK_A")
+
     def test_normalize_ob_public_owner(self):
         meta = self._make_ob_meta()
         meta = meta._replace(
@@ -11551,7 +11583,7 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             self.assertIsNotNone(output)
             content = Path(output).read_text(encoding="utf-8")
             self.assertIn("# report_id=RID123", content)
-            self.assertIn("# report_sql_template_version=20260313_12", content)
+            self.assertRegex(content, r"# report_sql_template_version=\d{8}_\d+")
             self.assertIn("本文件仅提供 report_id 与 HOW TO 入口", content)
             self.assertIn("HOW_TO_READ_REPORTS_IN_OB_latest.txt", content)
             self.assertIn("HOW_TO_READ_REPORTS_IN_OB_20260313_12_sqls.txt", content)
@@ -14097,6 +14129,21 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
             records,
             allowed_nodes={("SRC.V1", "VIEW")},
         )
+        self.assertEqual(graph, {})
+
+    def test_build_scope_integrity_dependency_graph_skips_when_disabled(self):
+        records = [
+            sdr.DependencyRecord("SRC", "V1", "VIEW", "SRC", "T1", "TABLE"),
+        ]
+        with mock.patch.object(
+            sdr,
+            "build_dependency_graph_from_records",
+            side_effect=AssertionError("should not build"),
+        ):
+            graph = sdr.build_scope_integrity_dependency_graph(
+                records,
+                enabled=False,
+            )
         self.assertEqual(graph, {})
 
     def test_build_scope_integrity_detail_rows_for_scope_detail_includes_info(self):
@@ -19207,6 +19254,28 @@ class TestSchemaDiffReconcilerPureFunctions(unittest.TestCase):
         )
         self.assertTrue(ok)
         self.assertIsNone(mismatch)
+
+    def test_compare_index_maps_sys_nc_multiplicity_is_deterministic(self):
+        src_map = {
+            ("SYS_NC00001$",): {"names": {"IDX_A"}, "uniq": {"NONUNIQUE"}},
+            ("SYS_NC00002$",): {"names": {"IDX_B"}, "uniq": {"NONUNIQUE"}},
+        }
+        tgt_map = {
+            ("SYS_NC00009$",): {"names": {"IDX_T"}, "uniq": {"NONUNIQUE"}},
+        }
+
+        ok, mismatch = sdr.compare_index_maps(
+            src_map,
+            tgt_map,
+            constraint_index_cols=set(),
+            tgt_schema="TGT",
+            tgt_table="T1",
+        )
+
+        self.assertFalse(ok)
+        self.assertIsNotNone(mismatch)
+        self.assertEqual(mismatch.missing_indexes, {"IDX_B"})
+        self.assertEqual(mismatch.extra_indexes, set())
 
     def test_compare_indexes_expression_sys_nc_name_mismatch(self):
         oracle_indexes = {

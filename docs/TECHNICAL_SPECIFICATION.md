@@ -1,8 +1,8 @@
 # Oracle → OceanBase 结构一致性校验与修复引擎
 ## 技术规格说明 (Technical Specification)
 
-**版本**：0.9.9.1
-**日期**：2026-04-08
+**版本**：0.9.9.2
+**日期**：2026-04-09
 **适用场景**：Oracle → OceanBase（Oracle 模式）迁移后的结构一致性校验、对象补全、DDL 兼容性修复。
 
 ---
@@ -284,10 +284,13 @@
 - `fixup_max_sql_file_mb` 限制单个 SQL 文件读取大小，超限脚本会被跳过并记录错误。
 - `fixup_dir_allow_outside_repo=false` 时，run_fixup 不允许 fixup_dir 指向项目外目录。
 - 成功执行脚本移动到 `done/` 前会尝试备份同名文件；备份失败会阻断覆盖，避免历史结果被冲掉。
+- `split_sql_statements()` 对 Oracle Q-quote 保持字面量安全，Q-quote 内部单独一行 `/` 不再提前终止 PL/SQL block。
+- 语句级执行模式下，若某条语句因 timeout 失败，该脚本内后续语句不会继续执行；普通语法/对象级失败仍按原有逐语句继续策略保留。
 - 自动补权限缓存支持 `fixup_auto_grant_cache_limit` 控制，避免长时间运行内存膨胀。
 - 默认跳过 `fixup_scripts/table/`，防止误创建空表；需要显式 `--allow-table-create` 才可执行建表脚本。
 - `run_fixup` 采用 `.run_fixup.lock` 防止同目录并发重入。
 - `run_fixup` 采用 `.fixup_state_ledger.json` 防止“已执行但移动失败”脚本被重复执行。
+- grant rewrite 临时文件采用唯一临时名并在失败路径清理，避免残留 `.tmp` 文件污染后续执行。
 
 ---
 
@@ -317,6 +320,7 @@
 - `table_data_presence_zero_probe_workers` 控制 Oracle 零行探针并发（默认 1，最大 32）。
 - `JOB_ACTION` / scoped text matching 对超大文本、高扇出候选和递归深度带有保护性上限，避免单个 job 把整轮 compare 拖死。
 - `dependency_chains` 在大图场景下支持导出前早停和链路截断，避免“辅助附件比主 compare 更重”。
+- `scope_integrity_dependency_graph_raw` 仅在 scope-integrity 检查实际启用时才构建，避免非相关路径承担全量建图成本。
 
 ---
 
