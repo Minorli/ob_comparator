@@ -56,13 +56,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 try:
     import fcntl
 except Exception:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 
-__version__ = "0.9.9.1"
+__version__ = "0.9.9.2"
 
 CONFIG_DEFAULT_PATH = "config.ini"
 DEFAULT_FIXUP_DIR = "fixup_scripts"
@@ -2872,28 +2872,37 @@ def topo_sort_nodes(
     nodes: Set[Tuple[str, str]],
     edges: Dict[Tuple[str, str], Set[Tuple[str, str]]]
 ) -> Tuple[List[Tuple[str, str]], List[List[Tuple[str, str]]]]:
-    visited: Set[Tuple[str, str]] = set()
-    visiting: Set[Tuple[str, str]] = set()
     order: List[Tuple[str, str]] = []
     cycles: List[List[Tuple[str, str]]] = []
-
-    def dfs(node: Tuple[str, str], stack: List[Tuple[str, str]]) -> None:
-        if node in visiting:
-            cycle_start = stack.index(node) if node in stack else 0
-            cycles.append(stack[cycle_start:] + [node])
-            return
-        if node in visited:
-            return
-        visiting.add(node)
-        for ref in sorted(edges.get(node, set())):
-            dfs(ref, stack + [node])
-        visiting.remove(node)
-        visited.add(node)
-        order.append(node)
-
+    visited: Set[Tuple[str, str]] = set()
     for node in sorted(nodes):
-        if node not in visited:
-            dfs(node, [])
+        if node in visited:
+            continue
+        visiting: Set[Tuple[str, str]] = {node}
+        stack: List[Tuple[Tuple[str, str], Any, List[Tuple[str, str]]]] = [
+            (node, iter(sorted(edges.get(node, set()))), [node])
+        ]
+        while stack:
+            current, refs_iter, path = stack[-1]
+            try:
+                ref = next(refs_iter)
+            except StopIteration:
+                stack.pop()
+                visiting.discard(current)
+                if current not in visited:
+                    visited.add(current)
+                    order.append(current)
+                continue
+
+            if ref in visited:
+                continue
+            if ref in visiting:
+                cycle_start = path.index(ref) if ref in path else 0
+                cycles.append(path[cycle_start:] + [ref])
+                continue
+
+            visiting.add(ref)
+            stack.append((ref, iter(sorted(edges.get(ref, set()))), path + [ref]))
     return order, cycles
 
 
@@ -3855,9 +3864,10 @@ def split_sql_statements(sql_text: str) -> List[str]:
             slash_block = True
             slash_block_end_name = _extract_block_header_end_name(line)
         stripped = line.strip()
-        if not in_single and not in_double and block_comment_depth == 0 and stripped == "/":
-            buffer.append(line)
-            flush_buffer()
+        if not in_single and not in_double and not in_q_quote and block_comment_depth == 0 and stripped == "/":
+            if buffer:
+                buffer.append(line)
+                flush_buffer()
             slash_block = False
             slash_block_end_name = ""
             continue
@@ -4092,7 +4102,7 @@ def execute_sql_statements(
         except subprocess.TimeoutExpired:
             timeout_label = "no-timeout" if timeout is None else f"> {timeout} 秒"
             failures.append(StatementFailure(idx, f"执行超时 ({timeout_label})", statement_to_run))
-            continue
+            break
 
         error_msg = extract_execution_error(result)
         if error_msg:
@@ -5040,10 +5050,19 @@ def execute_grant_file_with_prune(
 
     # Rewrite file with remaining statements (non-grants + failed grants)
     rewritten = "\n\n".join(stmt.strip() for stmt in kept_statements if stmt.strip()).rstrip()
+    tmp_path: Optional[Path] = None
     try:
-        tmp_path = sql_path.with_suffix(sql_path.suffix + ".tmp")
-        tmp_path.write_text(rewritten + "\n", encoding="utf-8")
-        tmp_path.replace(sql_path)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(sql_path.parent),
+            prefix=f"{sql_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp_fp:
+            tmp_fp.write(rewritten + "\n")
+            tmp_path = Path(tmp_fp.name)
+        os.replace(str(tmp_path), str(sql_path))
         log.info(
             "%s %s -> FAIL (%d/%d statements), 保留失败语句 %d 条, 已清理授权 %d 条",
             label_prefix,
@@ -5055,6 +5074,11 @@ def execute_grant_file_with_prune(
         )
     except Exception as exc:
         log.warning("%s %s -> 重写失败: %s", label_prefix, relative_path, str(exc)[:200])
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
 
     first_error = failures[0].error if failures else "执行失败"
     return ScriptResult(relative_path, "FAILED", first_error, layer), summary, removed_count, len(kept_statements), truncated

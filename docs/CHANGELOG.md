@@ -2,6 +2,29 @@
 
 本文件记录 OceanBase Comparator Toolkit 的重要变更。
 
+## [0.9.9.2] - 2026-04-09
+
+### 变更
+- 落地最近一轮综合审计中确认成立的 18 项问题，覆盖主 compare、`run_fixup`、辅助诊断工具和测试基线。
+- `scope_integrity_dependency_graph_raw` 改为按需构建，非 scope-integrity 路径不再无条件构建全量依赖图。
+- `run_fixup` 的脚本执行语义收紧：单脚本内某条语句若命中 timeout，会停止后续语句执行；普通非 timeout 失败仍保持原有逐语句继续策略。
+- `INDEX/CONSTRAINT` 在缺失父 TABLE 映射时改为保守保留源 schema，不再套用 generic schema fallback。
+- `SYS_NC` / expression-equivalent 索引 compare 改为 multiplicity-aware 匹配，减少当前已知 `2:1` 假阳性。
+- `collect_source_object_stats.py` 现在将 CHECK 纳入 CONSTRAINT 统计，并改用有界百分位计算。
+- `expert_swarm.py` 改为失败隔离 + 聚合全部 assistant 消息，Unicode 输出保持原样。
+- `init_test.py` 改为安全凭据文件方式，不再把 OB 密码放进命令行参数。
+
+### 修复
+- 修复 Oracle Q-quote 字面量中单独一行 `/` 被 `split_sql_statements()` 误判为 PL/SQL 终止符的问题。
+- 修复 `run_fixup` 语句级 timeout 后仍继续执行同文件后续 SQL 的问题。
+- 修复深依赖链 `topo_sort_nodes()` 递归爆栈风险。
+- 修复 grant rewrite 失败时临时文件残留和固定 `.tmp` 名称带来的竞态问题。
+- 修复 fallback role 枚举缺少系统角色过滤的问题。
+- 修复硬编码版本串/措辞耦合测试导致的非语义性测试脆弱问题。
+
+### 文档
+- README / `readme_lite.txt` / `readme_config.txt` / `docs/*` 已同步到 `0.9.9.2`，并补充本版执行安全、compare 保守性和测试基线变化。
+
 ## [0.9.9.1] - 2026-04-08
 
 ### 变更

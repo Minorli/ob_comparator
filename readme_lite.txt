@@ -1,5 +1,5 @@
 OceanBase 对比工具极简手册（现场版）
-当前版本：V0.9.9.1
+当前版本：V0.9.9.2
 
 0. 先更新版本
 - 项目地址：https://github.com/Minorli/ob_comparator
@@ -82,6 +82,8 @@ DDL 清理补充规则：
 7. 执行修复（run_fixup）
 - 默认安全执行（不会跑 table/ 建表脚本）：
   python3 run_fixup.py config.ini --smart-order --recompile
+- 如果某条 SQL 语句超时，这个脚本后面的语句现在会停止继续执行；先看 `fixup_scripts/errors/`，不要假设“后面可能已经跑了一部分”。
+- PL/SQL / package body / trigger 脚本里的 Q-quote 字面量，单独一行 `/` 不会再被误当成块终止符。
 
 - 视图链路自动修复：
   python3 run_fixup.py config.ini --view-chain-autofix

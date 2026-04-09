@@ -3,6 +3,7 @@ import tempfile
 import logging
 import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List
@@ -41,6 +42,23 @@ class TestViewChainParsing(unittest.TestCase):
         self.assertLess(order.index(("C.T1", "TABLE")), order.index(("B.V2", "VIEW")))
         self.assertLess(order.index(("B.V2", "VIEW")), order.index(("A.V1", "VIEW")))
         self.assertLess(order.index(("D.T2", "TABLE")), order.index(("A.V1", "VIEW")))
+
+    def test_topo_sort_nodes_handles_deep_chain_without_recursion_error(self):
+        nodes = set()
+        edges = {}
+        prev = None
+        for idx in range(1205):
+            node = (f"A.V{idx}", "VIEW")
+            nodes.add(node)
+            if prev is not None:
+                edges.setdefault(prev, set()).add(node)
+            prev = node
+
+        order, cycles = rf.topo_sort_nodes(nodes, edges)
+
+        self.assertEqual(cycles, [])
+        self.assertEqual(len(order), 1205)
+        self.assertLess(order.index(("A.V1204", "VIEW")), order.index(("A.V0", "VIEW")))
 
 
 class TestRunFixupConfig(unittest.TestCase):
@@ -430,6 +448,47 @@ class TestCurrentSchemaExecution(unittest.TestCase):
         self.assertEqual(len(captured), 1)
         self.assertIn("ALTER SESSION SET NLS_DATE_FORMAT", captured[0].upper())
         self.assertIn("CREATE TABLE T1", captured[0].upper())
+
+    def test_execute_sql_statements_timeout_stops_later_statements(self):
+        sql_text = "\n".join([
+            "SELECT 1 FROM DUAL;",
+            "SELECT 2 FROM DUAL;",
+        ])
+        captured = []
+
+        def fake_run_sql(_cmd, sql, _timeout):
+            captured.append(sql.strip())
+            if len(captured) == 1:
+                raise subprocess.TimeoutExpired(cmd="obclient", timeout=_timeout)
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+        with mock.patch.object(rf, "run_sql", side_effect=fake_run_sql):
+            summary = rf.execute_sql_statements([], sql_text, timeout=1)
+
+        self.assertEqual(summary.statements, 2)
+        self.assertEqual(len(summary.failures), 1)
+        self.assertIn("执行超时", summary.failures[0].error)
+        self.assertEqual(captured, ["SELECT 1 FROM DUAL;"])
+
+    def test_execute_sql_statements_non_timeout_failure_still_continues(self):
+        sql_text = "\n".join([
+            "SELECT 1 FROM DUAL;",
+            "SELECT 2 FROM DUAL;",
+        ])
+        captured = []
+
+        def fake_run_sql(_cmd, sql, _timeout):
+            captured.append(sql.strip())
+            if len(captured) == 1:
+                return SimpleNamespace(returncode=0, stderr="ORA-00900: invalid SQL statement", stdout="")
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+        with mock.patch.object(rf, "run_sql", side_effect=fake_run_sql):
+            summary = rf.execute_sql_statements([], sql_text, timeout=1)
+
+        self.assertEqual(summary.statements, 2)
+        self.assertEqual(len(summary.failures), 1)
+        self.assertEqual(captured, ["SELECT 1 FROM DUAL;", "SELECT 2 FROM DUAL;"])
 
     def test_detect_session_sensitive_reason_ignores_current_schema_only(self):
         sql_text = "\n".join([
@@ -1784,6 +1843,22 @@ class TestSqlParsing(unittest.TestCase):
         self.assertIn("END IF;", statements[0])
         self.assertTrue(statements[1].strip().startswith("GRANT SELECT ON A.T1 TO U1"))
 
+    def test_split_sql_keeps_q_quote_slash_line_inside_block(self):
+        sql = (
+            "CREATE FUNCTION F RETURN VARCHAR2 IS\n"
+            "  v VARCHAR2(100) := q'[some\n"
+            "/\n"
+            "content]';\n"
+            "BEGIN\n"
+            "  RETURN v;\n"
+            "END;\n"
+            "/\n"
+        )
+        statements = rf.split_sql_statements(sql)
+        self.assertEqual(len(statements), 1)
+        self.assertIn("content]';", statements[0])
+        self.assertIn("RETURN v;", statements[0])
+
     def test_is_comment_only_statement_with_string_literal(self):
         stmt = "SELECT '--not comment' AS C1 FROM DUAL;"
         self.assertFalse(rf.is_comment_only_statement(stmt))
@@ -1966,6 +2041,45 @@ class TestGrantExecution(unittest.TestCase):
             self.assertFalse(truncated)
             self.assertEqual(len(executed_sqls), 1)
             self.assertIn("GRANT INSERT (ID) ON A.T1 TO PUBLIC;", executed_sqls[0].upper())
+
+    def test_execute_grant_file_with_prune_cleans_temp_file_on_rewrite_failure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_root = root
+            sql_path = root / "fixup_scripts" / "grants_miss" / "A.grants.sql"
+            sql_path.parent.mkdir(parents=True)
+            sql_path.write_text("GRANT SELECT ON A.T1 TO B;\n", encoding="utf-8")
+            done_dir = root / "fixup_scripts" / "done"
+            done_dir.mkdir(parents=True)
+            errors = []
+
+            def fake_run_sql(_cmd, _sql, _timeout):
+                return SimpleNamespace(returncode=1, stderr="ORA-01031: insufficient privileges", stdout="")
+
+            def fake_replace(_src, _dst):
+                raise OSError("replace failed")
+
+            with mock.patch.object(rf, "run_sql", side_effect=fake_run_sql), \
+                 mock.patch.object(rf.os, "replace", side_effect=fake_replace):
+                result, summary, removed, kept, truncated = rf.execute_grant_file_with_prune(
+                    [],
+                    sql_path,
+                    repo_root,
+                    done_dir,
+                    timeout=1,
+                    layer=0,
+                    label_prefix="[TEST]",
+                    error_entries=errors,
+                    error_limit=10,
+                    max_sql_file_bytes=None,
+                )
+
+            self.assertEqual(result.status, "FAILED")
+            self.assertEqual(summary.statements, 1)
+            self.assertEqual(removed, 0)
+            self.assertEqual(kept, 1)
+            self.assertFalse(truncated)
+            self.assertEqual(list(sql_path.parent.glob("*.tmp")), [])
 
 
 class TestPriorityOrder(unittest.TestCase):
