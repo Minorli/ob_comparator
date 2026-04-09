@@ -1258,6 +1258,12 @@ class OracleMetadata(NamedTuple):
     identity_modes: Dict[Tuple[str, str], Dict[str, str]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: IDENTITY_MODE}
     default_on_null_columns: Dict[Tuple[str, str], Tuple[str, ...]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> (COLUMN_NAME, ...)
     identity_options: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: {OPTION: VALUE}}
+    nested_table_storage_tables: Dict[Tuple[str, str], "NestedTableStorageInfo"] = MappingProxyType({})  # (OWNER, STORAGE_TABLE_NAME) -> parent table/column
+
+
+class NestedTableStorageInfo(NamedTuple):
+    parent_table_name: str
+    parent_table_column: str
 
 
 class NotnullCheckEntry(NamedTuple):
@@ -1276,6 +1282,54 @@ class DependencyRecord(NamedTuple):
     referenced_owner: str
     referenced_name: str
     referenced_type: str
+
+
+def build_nested_table_storage_map(
+    rows: Iterable[Tuple[object, object, object, object]],
+    allowed_pairs: Optional[Set[Tuple[str, str]]] = None,
+) -> Dict[Tuple[str, str], NestedTableStorageInfo]:
+    result: Dict[Tuple[str, str], NestedTableStorageInfo] = {}
+    allowed_pairs_u: Optional[Set[Tuple[str, str]]] = None
+    if allowed_pairs is not None:
+        allowed_pairs_u = {
+            (str(owner).upper(), str(table).upper())
+            for owner, table in allowed_pairs
+        }
+    for row in rows or ():
+        if len(row) < 4:
+            continue
+        owner = str(row[0] or "").strip().upper()
+        table_name = str(row[1] or "").strip().upper()
+        parent_table_name = str(row[2] or "").strip().upper()
+        parent_table_column = str(row[3] or "").strip().upper()
+        if not owner or not table_name:
+            continue
+        key = (owner, table_name)
+        if allowed_pairs_u is not None and key not in allowed_pairs_u:
+            continue
+        result[key] = NestedTableStorageInfo(
+            parent_table_name=parent_table_name,
+            parent_table_column=parent_table_column,
+        )
+    return result
+
+
+def format_nested_table_storage_detail(
+    owner: str,
+    table_name: str,
+    info: Optional[NestedTableStorageInfo],
+) -> str:
+    owner_u = str(owner or "").strip().upper()
+    table_u = str(table_name or "").strip().upper()
+    if not info:
+        return f"STORAGE_TABLE={owner_u}.{table_u}"
+    parent_table = f"{owner_u}.{(info.parent_table_name or '').strip().upper()}".rstrip(".")
+    parent_column = (info.parent_table_column or "").strip().upper() or "-"
+    return (
+        f"STORAGE_TABLE={owner_u}.{table_u}; "
+        f"PARENT_TABLE={parent_table}; "
+        f"PARENT_COLUMN={parent_column}"
+    )
 
 
 class DependencyIssue(NamedTuple):
@@ -1752,6 +1806,9 @@ EXCLUDED_STATUS_FILTERED_BY_MISSING_CREATED = "FILTERED_BY_MISSING_CREATED"
 TEMP_TABLE_BLACKLIST_TYPES: Set[str] = {"TEMP_TABLE", "TEMPORARY_TABLE"}
 TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON_CODE = "TRIGGER_ON_TEMP_TABLE_UNSUPPORTED"
 TRIGGER_TEMP_TABLE_UNSUPPORTED_REASON = "OB 不支持在临时表上创建 DML 触发器（实测 ORA-00600/-4007）"
+NESTED_TABLE_STORAGE_REASON_CODE = "NESTED_TABLE_STORAGE"
+NESTED_TABLE_STORAGE_REASON = "Oracle nested table storage table，不能作为普通 TABLE 单独迁移"
+NESTED_TABLE_STORAGE_ACTION = "按父表 nested column 人工评估/改造"
 BLACKLIST_MODES: Set[str] = {"auto", "table_only", "rules_only", "disabled"}
 DEFAULT_BLACKLIST_RULES_PATH = str(Path(__file__).resolve().parent / "blacklist_rules.json")
 BLACKLIST_TARGET_EXISTING_POLICY_VALUES: Set[str] = {"keep_blocked", "rehydrate_if_present"}
@@ -6690,7 +6747,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('report_dir', 'main_reports')
         settings.setdefault('report_dir_layout', 'per_run')
         settings.setdefault('report_detail_mode', 'split')
-        settings.setdefault('report_to_db', 'true')
+        settings.setdefault('report_to_db', 'false')
         settings.setdefault('report_db_schema', '')
         settings.setdefault('report_retention_days', '30')
         settings.setdefault('report_db_fail_abort', 'false')
@@ -7118,8 +7175,8 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             settings.get('report_detail_mode', 'split')
         )
         settings['report_to_db'] = parse_bool_flag(
-            settings.get('report_to_db', 'true'),
-            True
+            settings.get('report_to_db', 'false'),
+            False
         )
         settings['report_db_schema'] = normalize_report_db_schema(
             settings.get('report_db_schema', '')
@@ -8594,8 +8651,8 @@ def run_config_wizard(config_path: Path) -> None:
     _prompt_field(
         "SETTINGS",
         "report_to_db",
-        "是否将报告存储到 OceanBase (true/false，默认 true)",
-        default=cfg.get("SETTINGS", "report_to_db", fallback="true"),
+        "是否将报告存储到 OceanBase (true/false，默认 false)",
+        default=cfg.get("SETTINGS", "report_to_db", fallback="false"),
         transform=_bool_transform,
     )
     _prompt_field(
@@ -11443,6 +11500,7 @@ def classify_missing_objects(
     object_parent_map: Optional["ObjectParentMap"],
     table_target_map: Dict[Tuple[str, str], Tuple[str, str]],
     synonym_meta_map: Dict[Tuple[str, str], SynonymMeta],
+    source_objects_full_scope: Optional[SourceObjectMap] = None,
     remap_rules: Optional[RemapRules] = None,
     view_dependency_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
     view_callable_dep_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
@@ -11616,6 +11674,10 @@ def classify_missing_objects(
         (str(owner).upper(), str(table).upper())
         for owner, table in (getattr(oracle_meta, "temporary_tables", set()) or set())
     }
+    source_nested_table_storage_map: Dict[Tuple[str, str], NestedTableStorageInfo] = {
+        (str(owner).upper(), str(table).upper()): info
+        for (owner, table), info in (getattr(oracle_meta, "nested_table_storage_tables", {}) or {}).items()
+    }
     gtt_rewrite_to_normal_keys: Set[Tuple[str, str]] = {
         (str(owner).upper(), str(table).upper())
         for owner, table in ((gtt_handling_state.rewrite_to_normal_table_keys if gtt_handling_state else set()) or set())
@@ -11656,6 +11718,21 @@ def classify_missing_objects(
         black_type, reason, detail = summarize_blacklist_entries(entries)
         unsupported_nodes.add((full, "TABLE"))
         unsupported_table_map[full] = (black_type, reason, detail)
+        unsupported_table_keys.add((schema_u, table_u))
+
+    for (schema, table), info in source_nested_table_storage_map.items():
+        schema_u = (schema or "").upper()
+        table_u = (table or "").upper()
+        if not schema_u or not table_u:
+            continue
+        full = f"{schema_u}.{table_u}"
+        detail = format_nested_table_storage_detail(schema_u, table_u, info)
+        unsupported_nodes.add((full, "TABLE"))
+        unsupported_table_map[full] = (
+            NESTED_TABLE_STORAGE_REASON_CODE,
+            NESTED_TABLE_STORAGE_REASON,
+            detail,
+        )
         unsupported_table_keys.add((schema_u, table_u))
 
     for (schema, view_name), compat in view_compat_map.items():
@@ -11755,8 +11832,23 @@ def classify_missing_objects(
                 detail = "仅校验存在性，需人工导出 DDL 后执行"
             root_cause = f"{src_full}({MANUAL_FIXUP_REASON_CODE})"
         elif obj_type_u == "TABLE":
+            nested_storage_info = source_nested_table_storage_map.get((src_schema, src_obj))
             entries = oracle_meta.blacklist_tables.get((src_schema, src_obj))
-            if entries:
+            if nested_storage_info:
+                support_state = SUPPORT_STATE_UNSUPPORTED
+                reason_code = NESTED_TABLE_STORAGE_REASON_CODE
+                reason = NESTED_TABLE_STORAGE_REASON
+                dependency = "-"
+                action = NESTED_TABLE_STORAGE_ACTION
+                detail = format_nested_table_storage_detail(src_schema, src_obj, nested_storage_info)
+                log.info(
+                    "[SUPPORT] TABLE %s.%s 识别为 nested table storage，parent=%s.%s，改为 UNSUPPORTED。",
+                    src_schema,
+                    src_obj,
+                    src_schema,
+                    nested_storage_info.parent_table_name or "-",
+                )
+            elif entries:
                 black_type, reason, detail = summarize_blacklist_entries(entries)
                 if is_non_blocking_blacklist(entries):
                     if has_lob_oversize_blacklist(entries):
@@ -11792,6 +11884,7 @@ def classify_missing_objects(
                             remap_rules,
                             full_object_mapping,
                             synonym_meta=synonym_meta_map,
+                            source_objects_full_scope=source_objects_full_scope,
                             view_dependency_map=view_dependency_map,
                             view_callable_dep_map=view_callable_dep_map,
                             ob_meta=ob_meta,
@@ -20684,6 +20777,7 @@ def dump_oracle_metadata(
             privilege_family_counts=(),
             non_table_triggers=(),
             temporary_tables=set(),
+            nested_table_storage_tables={},
         )
 
     log.info("正在批量加载 Oracle 元数据 (DBA_TAB_COLUMNS/DBA_INDEXES/DBA_CONSTRAINTS/DBA_TRIGGERS/DBA_SEQUENCES)...")
@@ -20713,6 +20807,7 @@ def dump_oracle_metadata(
     partition_key_columns: Dict[Tuple[str, str], List[str]] = {}
     interval_partitions: Dict[Tuple[str, str], IntervalPartitionInfo] = {}
     temporary_tables: Set[Tuple[str, str]] = set()
+    nested_table_storage_tables: Dict[Tuple[str, str], NestedTableStorageInfo] = {}
     invisible_column_supported = False
     identity_column_supported = False
     default_on_null_supported = False
@@ -21745,6 +21840,31 @@ def dump_oracle_metadata(
             except oracledb.Error as e:
                 log.warning("读取 Oracle DBA_TABLES.TEMPORARY 失败，临时表触发器兼容性分类将保守退化: %s", e)
 
+            sql_nested_tpl = """
+                SELECT OWNER, TABLE_NAME, PARENT_TABLE_NAME, PARENT_TABLE_COLUMN
+                FROM DBA_NESTED_TABLES
+                WHERE OWNER IN ({owners_clause})
+            """
+            try:
+                with ora_conn.cursor() as cursor:
+                    collected_rows: List[Tuple[object, object, object, object]] = []
+                    for owner_chunk in owner_chunks:
+                        owners_clause = build_bind_placeholders(len(owner_chunk))
+                        sql_nested = sql_nested_tpl.format(owners_clause=owners_clause)
+                        cursor.execute(sql_nested, owner_chunk)
+                        collected_rows.extend(list(cursor))
+                    nested_table_storage_tables = build_nested_table_storage_map(
+                        collected_rows,
+                        allowed_pairs=table_pairs,
+                    )
+                    if nested_table_storage_tables:
+                        log.info(
+                            "Oracle nested table storage 对象识别完成：%d 个。",
+                            len(nested_table_storage_tables)
+                        )
+            except oracledb.Error as e:
+                log.warning("读取 Oracle DBA_NESTED_TABLES 失败，nested table storage 分类将保守退化: %s", e)
+
             if include_privileges:
                 try:
                     grant_generation_mode = normalize_grant_generation_mode(
@@ -21843,7 +21963,7 @@ def dump_oracle_metadata(
         abort_run()
 
     log.info(
-        "Oracle 元数据加载完成：列=%d, 索引表=%d, 约束表=%d, 触发器表=%d, 非表触发器=%d, 序列schema=%d, 注释表=%d, 黑名单表=%d",
+        "Oracle 元数据加载完成：列=%d, 索引表=%d, 约束表=%d, 触发器表=%d, 非表触发器=%d, 序列schema=%d, 注释表=%d, 黑名单表=%d, nested storage=%d",
         len(table_columns),
         len(indexes),
         len(constraints),
@@ -21851,7 +21971,8 @@ def dump_oracle_metadata(
         len(non_table_triggers),
         len(sequences),
         len(table_comments),
-        len(blacklist_tables)
+        len(blacklist_tables),
+        len(nested_table_storage_tables)
     )
 
     if table_columns:
@@ -21913,6 +22034,7 @@ def dump_oracle_metadata(
     loaded_schema_set.update(owner for owner, _name, _err_type in package_errors.keys())
     loaded_schema_set.update(owner for owner, _table in partition_key_columns.keys())
     loaded_schema_set.update(owner for owner, _table in interval_partitions.keys())
+    loaded_schema_set.update(owner for owner, _table in nested_table_storage_tables.keys())
 
     return OracleMetadata(
         table_columns=table_columns,
@@ -21947,6 +22069,7 @@ def dump_oracle_metadata(
         identity_modes=identity_modes,
         default_on_null_columns=default_on_null_columns,
         identity_options=identity_options,
+        nested_table_storage_tables=nested_table_storage_tables,
     )
 
 
@@ -33196,6 +33319,7 @@ def remap_view_dependencies(
     remap_rules: RemapRules,
     full_object_mapping: FullObjectMapping,
     synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]] = None,
+    source_objects_full_scope: Optional[SourceObjectMap] = None,
     view_dependency_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
     view_callable_dep_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
     ob_meta: Optional[ObMetadata] = None,
@@ -33230,9 +33354,42 @@ def remap_view_dependencies(
     view_schema_u = (view_schema or "").upper()
     view_name_u = (view_name or "").upper()
     synonym_meta = synonym_meta or {}
+    source_objects_full_scope = source_objects_full_scope or {}
     preferred_types = ("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM")
     unresolved_dependencies: List[str] = []
     suppressed_callable_dependencies: List[str] = []
+
+    def _classify_local_unqualified_shadow(dep_obj: str) -> Tuple[str, Optional[str]]:
+        dep_obj_u = (dep_obj or "").upper()
+        if not dep_obj_u or not view_schema_u:
+            return "NONE", None
+        local_full = f"{view_schema_u}.{dep_obj_u}"
+        local_type_map = dict(full_object_mapping.get(local_full, {}) or {})
+        local_declared_types = {
+            (obj_type or "").upper()
+            for obj_type in (source_objects_full_scope.get(local_full) or set())
+            if obj_type
+        }
+        local_declared_types.update(
+            (obj_type or "").upper()
+            for obj_type in local_type_map.keys()
+            if obj_type
+        )
+        has_local_non_synonym = any(
+            (obj_type or "").upper() != "SYNONYM"
+            for obj_type in local_declared_types
+        )
+        if has_local_non_synonym:
+            return "LOCAL_NON_SYNONYM", None
+        if "SYNONYM" in local_declared_types or (view_schema_u, dep_obj_u) in synonym_meta:
+            mapped_local_syn, local_syn_state = _resolve_synonym_for_table_only(view_schema_u, dep_obj_u)
+            if mapped_local_syn:
+                return "LOCAL_PRIVATE_SYNONYM_RESOLVED", mapped_local_syn.upper()
+            if local_syn_state in {"UNRESOLVED", "NON_TABLELIKE"}:
+                return "LOCAL_PRIVATE_SYNONYM_BLOCKED", None
+        if local_declared_types:
+            return "LOCAL_PRIVATE_SYNONYM_BLOCKED", None
+        return "NONE", None
 
     def _resolve_synonym_for_table_only(owner: str, dep_obj: str) -> Tuple[Optional[str], str]:
         terminal_source = resolve_synonym_terminal_source(owner, dep_obj, synonym_meta, full_object_mapping)
@@ -33364,6 +33521,16 @@ def remap_view_dependencies(
         if dep_schema == view_schema_u:
             # 无前缀引用也替换为全名(或目标名)，避免跨 schema 迁移后失效
             replacements_unqualified.setdefault(dep_obj.upper(), tgt_u)
+        elif dep_schema == "PUBLIC" and resolved_by_synonym:
+            local_shadow_state, local_shadow_target = _classify_local_unqualified_shadow(dep_obj)
+            if local_shadow_state == "LOCAL_PRIVATE_SYNONYM_RESOLVED" and local_shadow_target:
+                replacements_unqualified.setdefault(dep_obj.upper(), local_shadow_target)
+            elif local_shadow_state in {"LOCAL_NON_SYNONYM", "LOCAL_PRIVATE_SYNONYM_BLOCKED"}:
+                pass
+            else:
+                # SQL parser 若漏抓了裸名依赖，fallback 可能只给出 PUBLIC synonym。
+                # 在没有本地对象/私有同义词遮蔽的前提下，允许把裸名补入 rewrite。
+                replacements_unqualified.setdefault(dep_obj.upper(), tgt_u)
 
     if suppressed_callable_dependencies:
         preview = ", ".join(sorted(dict.fromkeys(suppressed_callable_dependencies))[:10])
@@ -38960,6 +39127,7 @@ def generate_fixup_scripts(
     trigger_status_rows: Optional[List[TriggerStatusReportRow]] = None,
     constraint_status_rows: Optional[List[ConstraintStatusDriftRow]] = None,
     manual_trigger_table_keys: Optional[Set[Tuple[str, str]]] = None,
+    source_objects_full_scope: Optional[SourceObjectMap] = None,
 ):
     """
     基于校验结果生成 fixup_scripts DDL 脚本，并按依赖顺序排列：
@@ -39472,6 +39640,32 @@ def generate_fixup_scripts(
             f"action: {row.action or '-'}",
             f"detail: {row.detail or '-'}",
         ]
+
+    def build_unsupported_object_placeholder_sql(
+        obj_type: str,
+        src_schema: str,
+        src_obj: str,
+        tgt_schema: str,
+        tgt_obj: str,
+        row: Optional[ObjectSupportReportRow],
+    ) -> str:
+        src_full = f"{src_schema}.{src_obj}".upper()
+        tgt_full = f"{tgt_schema}.{tgt_obj}".upper()
+        lines = [
+            f"-- {obj_type.upper()} 不支持，未生成可执行 DDL。",
+            f"-- source: {src_full}",
+            f"-- target: {tgt_full}",
+        ]
+        if row:
+            lines.extend([
+                f"-- support_state: {row.support_state or '-'}",
+                f"-- reason_code: {row.reason_code or '-'}",
+                f"-- reason: {row.reason or '-'}",
+                f"-- dependency: {row.dependency or '-'}",
+                f"-- action: {row.action or '-'}",
+                f"-- detail: {row.detail or '-'}",
+            ])
+        return "\n".join(lines)
 
     def build_job_schedule_semi_auto_draft_sql(
         obj_type: str,
@@ -40189,6 +40383,7 @@ def generate_fixup_scripts(
     other_missing_unsupported: List[Tuple[str, str, str, str, str, ObjectSupportReportRow]] = []
     missing_total_by_type: Dict[str, int] = defaultdict(int)
     missing_allowed_by_type: Dict[str, int] = defaultdict(int)
+    table_skip_counts: Dict[str, int] = defaultdict(int)
     synonym_scope_skipped = 0
     other_skip_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
     index_missing_total = sum(len(item.missing_indexes) for item in extra_results.get('index_mismatched', []))
@@ -40224,6 +40419,8 @@ def generate_fixup_scripts(
         if not allow_fixup(obj_type_u, tgt_schema, src_schema):
             reason = classify_fixup_skip(obj_type_u, tgt_schema, src_schema) or "filtered"
             other_skip_counts[obj_type_u][reason] += 1
+            if obj_type_u == 'TABLE':
+                table_skip_counts[reason] += 1
             continue
         if obj_type_u == 'SYNONYM' and not allow_synonym_scope(src_schema, tgt_schema):
             synonym_scope_skipped += 1
@@ -40236,6 +40433,10 @@ def generate_fixup_scripts(
                 missing_tables_supported.append((src_schema, src_obj, tgt_schema, tgt_obj))
             else:
                 missing_tables_unsupported.append((src_schema, src_obj, tgt_schema, tgt_obj, support_row))
+                reason_token = normalize_filtered_grant_reason_token(
+                    (support_row.reason_code if support_row else "") or support_state or "unsupported"
+                ).lower() or "unsupported"
+                table_skip_counts[reason_token] += 1
         else:
             if support_state == SUPPORT_STATE_SUPPORTED:
                 other_missing_supported.append((obj_type_u, src_schema, src_obj, tgt_schema, tgt_obj))
@@ -41245,6 +41446,7 @@ def generate_fixup_scripts(
     log.info("[FIXUP] (2/9) 正在生成缺失的 TABLE CREATE 脚本...")
     table_jobs: List[Callable[[], None]] = []
     table_total = len(missing_tables)
+    table_runtime = {"generated": 0}
     table_progress_tick = build_progress_tracker(table_total, "[FIXUP] (2/9) TABLE")
     table_counts: Dict[str, int] = defaultdict(int)
     table_progress = {"done": 0}
@@ -41269,6 +41471,8 @@ def generate_fixup_scripts(
                 if not ddl:
                     log.warning("[FIXUP] 未找到 TABLE %s.%s 的 dbcat DDL。", ss, st)
                     mark_source('TABLE', 'missing')
+                    with table_lock:
+                        table_skip_counts["ddl_missing"] += 1
                     progress_label = "missing"
                     return
                 # 如果 dbcat 返回 unsupported，尝试 DBMS_METADATA 兜底，直接暴露给用户
@@ -41353,6 +41557,8 @@ def generate_fixup_scripts(
                     grants_to_add=grants_for_table if grants_for_table else None,
                     extra_comments=(list(table_extra_comments) + list(cleanup_comments or [])) or None,
                 )
+                with table_lock:
+                    table_runtime["generated"] += 1
                 progress_label = ddl_source_label.lower()
             finally:
                 _record_table_progress(progress_label)
@@ -41369,14 +41575,63 @@ def generate_fixup_scripts(
         for src_schema, src_table, tgt_schema, tgt_table, support_row in missing_tables_unsupported:
             def _job(ss=src_schema, st=src_table, ts=tgt_schema, tt=tgt_table, sr=support_row):
                 try:
+                    if (sr.reason_code or "").upper() == NESTED_TABLE_STORAGE_REASON_CODE:
+                        ddl_adj = build_unsupported_object_placeholder_sql(
+                            "TABLE",
+                            ss,
+                            st,
+                            ts,
+                            tt,
+                            sr,
+                        )
+                        filename = f"{ts}.{tt}.sql"
+                        header = f"不支持 TABLE 占位说明 {ts}.{tt} (源: {ss}.{st})"
+                        log.info(
+                            "[FIXUP] TABLE %s.%s 为 nested table storage，不生成普通 TABLE DDL，改写入 unsupported 占位文件。",
+                            ss,
+                            st,
+                        )
+                        write_fixup_file(
+                            base_dir,
+                            "tables_unsupported",
+                            filename,
+                            ddl_adj,
+                            header,
+                            extra_comments=build_support_comments(sr),
+                        )
+                        return
                     fetch_result = fetch_ddl_with_timing(ss, 'TABLE', st)
                     if len(fetch_result) != 3:
                         log.error("[FIXUP] TABLE fetch_ddl_with_timing 返回了 %d 个值，期望 3 个: %s", len(fetch_result), fetch_result)
                         return
                     ddl, ddl_source_label, _elapsed = fetch_result
                     if not ddl:
-                        log.warning("[FIXUP] 未找到 TABLE %s.%s 的 dbcat DDL。", ss, st)
+                        log.info(
+                            "[FIXUP] 不支持 TABLE %s.%s 无可用 DDL，改写入 unsupported 占位文件（reason_code=%s）。",
+                            ss,
+                            st,
+                            sr.reason_code or "-",
+                        )
                         mark_source('TABLE', 'missing')
+                        ddl_adj = build_unsupported_object_placeholder_sql(
+                            "TABLE",
+                            ss,
+                            st,
+                            ts,
+                            tt,
+                            sr,
+                        )
+                        filename = f"{ts}.{tt}.sql"
+                        header = f"不支持 TABLE 占位说明 {ts}.{tt} (源: {ss}.{st})"
+                        subdir = "tables_unsupported/temporary" if is_temporary_support_row(sr) else "tables_unsupported"
+                        write_fixup_file(
+                            base_dir,
+                            subdir,
+                            filename,
+                            ddl_adj,
+                            header,
+                            extra_comments=build_support_comments(sr),
+                        )
                         return
                     if _is_dbcat_unsupported_table(ddl):
                         fallback_ddl, fallback_label = get_fallback_ddl(ss, 'TABLE', st)
@@ -41447,6 +41702,18 @@ def generate_fixup_scripts(
                     table_unsup_progress()
             table_unsup_jobs.append(_job)
         run_tasks(table_unsup_jobs, "TABLE_UNSUPPORTED")
+    if fixup_skip_summary is not None and (
+        missing_total_by_type.get("TABLE", 0)
+        or table_total
+        or table_runtime["generated"]
+        or table_skip_counts
+    ):
+        fixup_skip_summary["TABLE"] = {
+            "missing_total": int(missing_total_by_type.get("TABLE", 0) or 0),
+            "task_total": int(table_total or 0),
+            "generated": int(table_runtime["generated"] or 0),
+            "skipped": dict(table_skip_counts),
+        }
 
     log.info("[FIXUP] (3/9) 正在生成 TABLE ALTER 脚本...")
     sys_c_force_candidates: List[SysCForceCandidateRow] = []
@@ -41599,6 +41866,7 @@ def generate_fixup_scripts(
             remap_rules,
             full_object_mapping,
             synonym_meta=synonym_meta_map,
+            source_objects_full_scope=source_objects_full_scope,
             view_dependency_map=view_dependency_map,
             view_callable_dep_map=view_callable_dep_map,
             ob_meta=ob_meta,
@@ -41882,6 +42150,7 @@ def generate_fixup_scripts(
                     remap_rules,
                     full_object_mapping,
                     synonym_meta=synonym_meta_map,
+                    source_objects_full_scope=source_objects_full_scope,
                     view_dependency_map=view_dependency_map,
                     view_callable_dep_map=view_callable_dep_map,
                     ob_meta=ob_meta,
@@ -47461,7 +47730,7 @@ def build_fatal_error_matrix_rows(settings: Optional[Dict]) -> List[FatalErrorMa
         settings.get("object_created_before_missing_created_policy", "strict")
     )
     generate_fixup_enabled = parse_bool_flag(settings.get("generate_fixup", "true"), True)
-    report_to_db = parse_bool_flag(settings.get("report_to_db", "true"), True)
+    report_to_db = parse_bool_flag(settings.get("report_to_db", "false"), False)
     report_db_fail_abort = parse_bool_flag(settings.get("report_db_fail_abort", "false"), False)
     hot_reload_fail_policy = normalize_config_hot_reload_fail_policy(
         settings.get("config_hot_reload_fail_policy", "keep_last_good")
@@ -53153,7 +53422,7 @@ def build_run_summary(
                 f"目标端额外对象授权: {extra_object_grant_count} 条 (PUBLIC={extra_public_grant_count})"
             )
     if fixup_skip_summary:
-        for obj_type in ("INDEX", "TRIGGER", "SYNONYM"):
+        for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM"):
             obj_summary = fixup_skip_summary.get(obj_type) or {}
             if not obj_summary:
                 continue
@@ -53308,7 +53577,7 @@ def build_run_summary(
                     all=Path(ctx.fixup_dir) / 'grants_all'
                 )
             )
-    if fixup_skip_summary and any(fixup_skip_summary.get(obj_type) for obj_type in ("INDEX", "TRIGGER", "SYNONYM", "SEQUENCE_RESTART")):
+    if fixup_skip_summary and any(fixup_skip_summary.get(obj_type) for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM", "SEQUENCE_RESTART")):
         if report_file:
             report_parent = Path(report_file).parent
             _append_unique_guide_step(next_steps, f"如脚本数量和预期不符，再看 {report_parent}/fixup_skip_summary_*.txt。")
@@ -54503,18 +54772,24 @@ def print_final_report(
         console.print(diag_table)
         console.print("")
 
-    if fixup_skip_summary and any(fixup_skip_summary.get(obj_type) for obj_type in ("INDEX", "TRIGGER", "SYNONYM", "SEQUENCE_RESTART")):
+    if fixup_skip_summary and any(fixup_skip_summary.get(obj_type) for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM", "SEQUENCE_RESTART")):
         skip_table = Table(title="[header]0.e Fixup 跳过汇总[/header]", width=section_width)
         skip_table.add_column("对象类型", style="info", width=12)
         skip_table.add_column("指标", style="info", width=28)
         skip_table.add_column("数量", justify="right")
-        for obj_type in ("INDEX", "TRIGGER", "SYNONYM"):
+        for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM"):
             obj_summary = fixup_skip_summary.get(obj_type) or {}
             if not obj_summary:
                 continue
-            skip_table.add_row(obj_type, "缺失总数", str(obj_summary.get("missing_total", 0)))
-            skip_table.add_row(obj_type, "进入生成任务", str(obj_summary.get("task_total", 0)))
-            skip_table.add_row(obj_type, "实际生成脚本", str(obj_summary.get("generated", 0)))
+            layers = build_fixup_count_layers(obj_summary)
+            skip_table.add_row(obj_type, "compare缺失", str(layers["compare_missing_total"]))
+            skip_table.add_row(obj_type, "选中", str(layers["selected_total"]))
+            skip_table.add_row(obj_type, "可生成", str(layers["runnable_total"]))
+            skip_table.add_row(obj_type, "已生成", str(layers["generated_total"]))
+            skip_table.add_row(obj_type, "被过滤", str(layers["filtered_total"]))
+            skip_table.add_row(obj_type, "被阻断", str(layers["blocked_total"]))
+            if layers["generation_failed_total"]:
+                skip_table.add_row(obj_type, "生成失败", str(layers["generation_failed_total"]))
             skipped_map = obj_summary.get("skipped", {}) or {}
             if skipped_map:
                 for reason, count in sorted(skipped_map.items()):
@@ -54562,7 +54837,7 @@ def print_final_report(
 
         fixup_plan_lines = ["[bold]本轮 fixup 计划[/bold]"]
         plan_entries = []
-        for obj_type in ("INDEX", "TRIGGER", "SYNONYM"):
+        for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM"):
             obj_summary = (fixup_skip_summary or {}).get(obj_type) or {}
             if not obj_summary:
                 continue
@@ -57753,6 +58028,7 @@ def main():
         object_parent_map,
         table_target_map,
         synonym_meta,
+        source_objects_full_scope=source_objects_full_scope,
         remap_rules=remap_rules,
         view_dependency_map=view_dependency_map,
         view_callable_dep_map=view_callable_dep_map,
@@ -58206,6 +58482,7 @@ def main():
                 view_dependency_map=view_dependency_map,
                 view_callable_dep_map=view_callable_dep_map,
                 manual_trigger_table_keys=manual_trigger_blacklist_table_keys,
+                source_objects_full_scope=source_objects_full_scope,
             )
             deferred_filtered_grants = list(settings.get("_deferred_filtered_grants") or [])
             if grant_plan and deferred_filtered_grants:
