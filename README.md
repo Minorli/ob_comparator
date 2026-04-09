@@ -9,8 +9,8 @@
 - `run_fixup` 安全性增强：修复 Oracle Q-quote 场景下单独一行 `/` 误切分、语句超时后仍继续执行后续 SQL、深链拓扑排序递归爆栈，以及 grant rewrite 临时文件残留/固定 `.tmp` 竞态问题。
 - compare 结果更保守也更准确：`INDEX/CONSTRAINT` 在父 TABLE 无法映射时不再错误套用 generic schema fallback；`SYS_NC` / expression-equivalent 索引 compare 改为按多重集匹配，降低 `2:1` 假阳性。
 - scoped/runtime 成本收口：`scope_integrity_dependency_graph_raw` 改为按需构建，不再在非 scope-integrity 路径无条件建全图。
-- 辅助工具可信度修复：`collect_source_object_stats.py` 现在把 CHECK 约束算进 CONSTRAINT 总量，百分位计算改为有界；`expert_swarm.py` 不再因单个专家失败丢全局结果，也不再只保留最后一条消息。
-- 安全与测试基线加固：`init_test.py` 不再把 OB 密码暴露在 argv；伪测试脚本改成 probe，版本断言与文案断言改为语义型校验，减少“看起来有测试、实际没覆盖”的假稳定。
+- 辅助工具可信度修复：本地辅助统计/分析脚本已补齐 CHECK 口径、失败隔离、完整消息聚合与 Unicode 输出等问题，减少辅助结论误导主流程判断。
+- 安全与测试基线加固：本地初始化/探针脚本不再把 OB 密码暴露在 argv；伪测试已改为本地 probe，版本断言与文案断言改为语义型校验，减少“看起来有测试、实际没覆盖”的假稳定。
 
 ## 核心能力
 - **对象覆盖完整**：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。
