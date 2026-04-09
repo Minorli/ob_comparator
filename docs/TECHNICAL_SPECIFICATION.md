@@ -154,6 +154,8 @@
   - `RISKY -> report_type='RISKY'`
 - `DIFF_REPORT_ACTIONS_V` 会把 `report_type='RISKY'` 归类到 `REVIEW`
 - 文本主报告与 `unsupported_objects_detail_*.txt` 仍保持“缺失(不支持/阻断/待确认)”聚合口径，不单独拆出主报告 `RISKY` 计数列
+- Oracle `DBA_NESTED_TABLES` 命中的 nested table storage table 会按 `NESTED_TABLE_STORAGE` 归类为不支持对象；其表本体不再进入普通 TABLE fixup，而是写入 unsupported 明细与 `tables_unsupported/`
+- `TABLE` fixup 也采用 canonical layered count：`compare_missing_total / selected_total / runnable_total / generated_total / filtered_total / blocked_total / generation_failed_total`，与 `fixup_skip_summary_<ts>.txt` 和 report_db `DIFF_REPORT_FIXUP_SKIP` 保持一致
 - report_db 启动时会自动扩容过窄的 `STATUS/REASON/DETAIL` 列，兼容旧版本建出的表结构
 
 ### 5.3 PACKAGE / PACKAGE BODY

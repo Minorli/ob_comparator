@@ -86,7 +86,7 @@
   对应 DDL 仅输出到 `fixup_scripts/unsupported/trigger/`，用于人工改造参考，不进入普通 `trigger/`。
   说明：split/full 模式下还会额外输出 `fatal_error_matrix_<ts>.txt`，集中列出当前程序仍会直接终止运行的 fatal 场景、当前是否相关，以及修复建议。
   说明：若本轮命中了性能保护或大图保护，还会额外输出 `runtime_degraded_detail_<ts>.txt`；其中 `COMPARE` 级事件代表当前结果不应直接作为最终 compare 结论。
-- report_to_db：是否将报告存储到 OceanBase（obclient 方式）。默认：true。
+- report_to_db：是否将报告存储到 OceanBase（obclient 方式）。默认：false。
   说明：开启后仍会保留本地文本报告，写库失败时是否中断由 report_db_fail_abort 控制。
   说明：写库采用发布门禁；DIFF_REPORT_SUMMARY.WRITE_STATUS=READY 才表示可用于正式排查（WRITING/FAILED 为未完成或失败）。
   说明：开启后会在 run 目录输出 report_sql_<timestamp>.txt（仅写入 report_id 与 HOW TO 入口，不再内嵌 HOW TO 正文），并尝试创建只读分析视图（actions/profile/trends/pending/grant/usability）。
@@ -381,6 +381,8 @@
   说明：若清单命中的缺失触发器依赖的目标 TABLE/VIEW 仍不存在，本轮不会生成 trigger DDL；会在 `fixup_skip_summary_<ts>.txt` 中记录 `base_table_missing` 或同类跳过原因，待依赖对象补齐后 rerun 再生成 trigger 脚本。
   说明：trigger 相关统计口径已分层统一：`trigger_status_report.txt` / 主报告中的 `compare_missing_total / selected_missing / filtered_missing` 表示 compare+清单层；`fixup_skip_summary_<ts>.txt` 中的 `missing_total / selected_total / task_total / blocked_total / filtered_total` 表示 fixup 计划层。
   说明：若 TRIGGER/INDEX/CONSTRAINT 的父 TABLE 已在 compare 阶段被判定为缺失、黑名单人工处理或不支持，这些扩展对象会先从 fixup compare scope 中剔除；主报告、`fixup_skip_summary_<ts>.txt` 与 `report_db` 将保持同一统计口径。
+  说明：TABLE 现在也写入同一套 layered fixup 统计；如果 compare 缺失 TABLE 中存在 nested table storage、其他不支持对象或 DDL 缺失，主报告 / `fixup_skip_summary_<ts>.txt` / `report_db` 会按同一口径显示 `可修补`、`不支持/阻断` 与 `生成失败`。
+  说明：Oracle nested table storage table（`DBA_NESTED_TABLES` 命中）会直接归类为 `NESTED_TABLE_STORAGE`，写入不支持明细与 `tables_unsupported/`，不会再进入普通 `fixup_scripts/table/`。
 - trigger_qualify_schema：触发器 DDL 是否强制补全 schema 前缀。默认：true。
   说明：开启后会在触发器体内 DML 位点补全 schema，并把同义词引用优先解析到终点对象（如 TABLE/VIEW）后再重写；
   对未限定 schema 的序列 `NEXTVAL/CURRVAL` 也会补全为 `schema.sequence`，减少跨 schema 误绑定。

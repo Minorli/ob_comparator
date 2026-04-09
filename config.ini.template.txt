@@ -96,7 +96,7 @@ report_dir_layout       = per_run
 #   split  -> 主报告仅概要，细节拆分到多个 *_detail_*.txt（默认）
 #   summary-> 仅输出概要，不生成细节文件
 report_detail_mode      = split
-# 报告存库（默认开启）
+# 报告存库（默认关闭，按需开启）
 # report_to_db: 是否写入 OceanBase（obclient 方式）
 # report_db_schema: 存储 schema（留空使用目标连接用户）
 #   非空时必须是 Oracle 普通标识符，例如 DIFF_REPORT（不允许点号/引号/分号）
@@ -113,7 +113,7 @@ report_detail_mode      = split
 # report_db_insert_batch: INSERT ALL 批量大小
 # report_db_save_full_json: 是否保存完整 JSON（可能很大）
 # 说明：启动时会自动扩容 report_db 中过窄的 STATUS/REASON/DETAIL 列，兼容旧版本建出的表
-report_to_db            = true
+report_to_db            = false
 report_db_schema        =
 report_retention_days   = 30
 report_db_fail_abort    = false

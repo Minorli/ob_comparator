@@ -32,7 +32,7 @@
 - **不支持对象识别**：黑名单/依赖阻断对象单独统计与分流输出。
 
 ## 新增能力总览（按模块）
-- **报告入库**：`report_to_db` 支持 `summary/core/full` 多级落库与行化明细，支持数据库侧直接排查（含 HOW TO SQL 手册）。
+- **报告入库**：`report_to_db` 控制是否启用落库，`report_db_store_scope=summary|core|full` 控制写库范围，支持数据库侧直接排查（含 HOW TO SQL 手册）。
   `DIFF_REPORT_DETAIL` / `DIFF_REPORT_DETAIL_ITEM` 现在会保留 `RISKY` 作为独立 `report_type`；但主报告与 `unsupported_objects_detail_<ts>.txt` 仍继续按“缺失(不支持/阻断/待确认)”汇总展示。
 - **运行时降级明示**：当 compare 因性能保护转为 partial 时，会输出 `runtime_degraded_detail_<ts>.txt`，主报告、run summary 和 report_db 结论都会显式标记当前结果不是完整 compare。
 - **迁移聚焦报告**：按“可修补缺失 vs 不支持/阻断”拆分，保留全量明细并可在主报告快速定位。
@@ -116,7 +116,7 @@ sequence_remap_policy = source_only
 trigger_qualify_schema = true
 report_dir_layout = per_run
 report_detail_mode = split
-report_to_db = true
+report_to_db = false
 table_data_presence_check = auto
 object_created_before =
 object_created_before_missing_created_policy = strict
@@ -243,6 +243,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/ddl_cleanup_detail_<ts>.txt`：DDL 清理/改写明细（区分 `format_only / syntax_compat / environment_detach / semantic_rewrite`，并标记 `evidence_level`）
 - `main_reports/run_<ts>/trigger_status_report.txt`：触发器清单/状态差异报告
 - `main_reports/run_<ts>/fixup_skip_summary_<ts>.txt`：fixup 计划与跳过原因汇总；`missing_total` 表示 compare 缺失总数，`selected_total` 表示清单/过滤后仍纳入 fixup 评估的数量，`task_total` 表示最终 runnable 数量
+- `TABLE` 现也使用同一套 layered fixup 口径；若 compare 缺失 TABLE 中包含 nested table storage / 不支持对象 / DDL 缺失对象，`fixup_skip_summary_<ts>.txt` 与主报告会明确区分 `compare缺失 / 选中 / 可生成 / 已生成 / 被阻断 / 生成失败`
 - `main_reports/run_<ts>/triggers_non_table_detail_<ts>.txt`：源端非表触发器明细（如 `BEFORE DROP ON DATABASE`）；`DATABASE/SCHEMA` 级事件触发器不会按普通 `trigger/` DDL 自动生成
 - `main_reports/run_<ts>/triggers_temp_table_unsupported_detail_<ts>.txt`：临时表触发器不支持明细（`TRIGGER_ON_TEMP_TABLE_UNSUPPORTED`）；对应 DDL 仅输出到 `fixup_scripts/unsupported/trigger/` 供人工改造参考，不进入普通 `trigger/`
 - `main_reports/run_<ts>/triggers_view_reference_detail_<ts>.txt`：触发器中引用视图的提醒明细（保留视图语义，不改写为表）
@@ -292,6 +293,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - 如果当前运行拿不到目标端 `DBA_ROLES`，Oracle 维护角色授权会统一降级成 report/manual，不会回退成默认放行
 - `sequence_sync_mode=last_number` 开启后，会额外生成 `fixup_scripts/sequence_restart/`；脚本使用 `ALTER SEQUENCE ... RESTART START WITH <oracle_last_number>`，不采用固定 `+100` 偏移，并默认由 `run_fixup` 跳过。若本轮缺失 sequence 的 `CREATE SEQUENCE` 脚本已自带正确 `START WITH`，则不会重复生成 restart
 - `fixup_scripts/tables_unsupported/`：不支持 TABLE 的 DDL（默认不执行）
+- Oracle nested table storage table 会按 `NESTED_TABLE_STORAGE` 归入 `tables_unsupported/` 与 `unsupported_objects_detail_<ts>.txt`，不会再当作普通 TABLE fixup 候选
 - `fixup_scripts/unsupported/`：不支持/阻断对象 DDL（默认不执行）
 - `fixup_scripts/view_chain_plans/`：VIEW 链路修复计划
 - `fixup_scripts/errors/`：run_fixup 错误报告

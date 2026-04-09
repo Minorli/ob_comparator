@@ -641,3 +641,6 @@
 
 - **MAJOR**: 重大架构变更或不兼容更新
 - **MINOR**: 新功能添加或重要bug修复
+- nested table storage 兼容收口：Oracle `DBA_NESTED_TABLES` 命中的 storage table 不再被当作普通可修补 TABLE；主报告归入“不支持/阻断/待确认”，fixup 改走 unsupported/manual 路径，并显式标记 `NESTED_TABLE_STORAGE`。
+- TABLE fixup 统计分层补齐：`fixup_skip_summary_<ts>.txt`、主报告和 report_db 现在也会对 TABLE 显示 `compare / selected / runnable / generated / filtered / blocked / generation_failed`，避免“检查汇总一个数、TABLE 脚本目录另一个数”。
+- 默认关闭 report_db：`report_to_db` 的默认值从 `true` 调整为 `false`，本地文本报告继续默认生成；需要数据库侧落库时再显式开启，避免大批量运行被 report_db 入库拖慢。
