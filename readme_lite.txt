@@ -98,13 +98,5 @@ DDL 清理补充规则：
 - 发现异常先 git pull 更新后重跑。
 
 9. 生产快速排障（只读）
-- 自动读取最新 report_id 并输出诊断报告：
-  python3 prod_diagnose.py config.ini
-- 聚焦单对象深挖（推荐用户反馈“某对象不对/没生成/schema错/语法错”时）：
-  python3 prod_diagnose.py config.ini --report-id <report_id> --focus-object VIEW:SCHEMA.OBJ --deep
-- 主要看 4 个文件：
-  triage_summary_*.txt（口径是否漂移）
-  triage_detail_*.txt（每条差异的根因/建议）
-  triage_fixup_failures_*.txt（fixup 失败归因）
-  triage_false_positive_candidates_*.txt（疑似误报）
-  （--deep 时还会生成 triage_focus_deep_*.txt）
+- 优先看主报告、`report_index_*.txt`、`fixup_skip_summary_*.txt`、`unsupported_objects_detail_*.txt`。
+- 如需进一步做只读深挖，按团队内部排障流程使用本地诊断脚本，不作为 GitHub 公开交付内容。
