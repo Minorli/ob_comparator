@@ -39622,6 +39622,9 @@ def generate_fixup_scripts(
     fixup_type_filter: Set[str] = set(settings.get('fixup_type_set', []))
     fixup_schema_used_source_match = False
     synonym_fixup_scope = settings.get('synonym_fixup_scope', 'public_only')
+    source_scope_mode_u = normalize_source_object_scope_mode(
+        settings.get("source_object_scope_mode", "full_source")
+    )
     if synonym_fixup_scope == "public_only":
         log.info("[FIXUP] synonym_fixup_scope=public_only，仅生成 PUBLIC 同义词脚本。")
 
@@ -40536,25 +40539,26 @@ def generate_fixup_scripts(
                     support_row.dependency or "-"
                 )
                 continue
-            live_terminal_target, live_scope_state, live_scope_detail = resolve_synonym_scope_status(
-                src_schema_u,
-                src_obj_u,
-                synonym_meta_map,
-                full_object_mapping,
-                remap_rules=remap_rules,
-            )
-            if live_scope_state != "in_scope":
-                skip_reason = "terminal_out_of_scope" if live_scope_state == "out_of_scope" else "terminal_unresolved"
-                other_skip_counts[obj_type_u][skip_reason] += 1
-                log.info(
-                    "[FIXUP] 跳过同义词 %s.%s（live terminal scope=%s, target=%s, detail=%s）。",
-                    src_schema,
-                    src_obj,
-                    live_scope_state,
-                    live_terminal_target or "-",
-                    live_scope_detail or "-",
+            if source_scope_mode_u == "remap_root_closure":
+                live_terminal_target, live_scope_state, live_scope_detail = resolve_synonym_scope_status(
+                    src_schema_u,
+                    src_obj_u,
+                    synonym_meta_map,
+                    full_object_mapping,
+                    remap_rules=remap_rules,
                 )
-                continue
+                if live_scope_state != "in_scope":
+                    skip_reason = "terminal_out_of_scope" if live_scope_state == "out_of_scope" else "terminal_unresolved"
+                    other_skip_counts[obj_type_u][skip_reason] += 1
+                    log.info(
+                        "[FIXUP] 跳过同义词 %s.%s（live terminal scope=%s, target=%s, detail=%s）。",
+                        src_schema,
+                        src_obj,
+                        live_scope_state,
+                        live_terminal_target or "-",
+                        live_scope_detail or "-",
+                    )
+                    continue
         missing_total_by_type[obj_type_u] += 1
         support_row = support_state_map.get((obj_type_u, f"{src_schema.upper()}.{src_obj.upper()}"))
         support_state = support_row.support_state if support_row else SUPPORT_STATE_SUPPORTED
