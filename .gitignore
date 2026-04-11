@@ -11,6 +11,7 @@ __pycache__/
 config.ini
 ob_lens.py
 ob_lens/
+tests_synonym_terminal_wave2.py
 
 # Only track these docs; ignore the rest under docs/
 docs/*
