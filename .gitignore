@@ -9,6 +9,8 @@ logs/
 venv/
 __pycache__/
 config.ini
+ob_lens.py
+ob_lens/
 
 # Only track these docs; ignore the rest under docs/
 docs/*
