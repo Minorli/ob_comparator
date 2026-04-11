@@ -73,6 +73,18 @@
 - 新能力、高风险修复、兼容性策略变化建议使用 `issue + branch + PR`。
 - 小范围低风险维护仍可直接提交，但应继续使用 `Refs #N` 关联已有 area issue，保留 GitHub 历史。
 
+## 推荐 Git 工作流
+
+1. `main` 只做同步，不做本地实验提交。进入开发前先执行 `git switch main && git pull --ff-only`。
+2. 每次正式修改都从最新 `main` 切新分支，分支只承载一个主题，例如 `fix/view-synonym-terminal`、`chore/remove-local-asset`。
+3. 本地专用工具、探针、一次性测试不要放仓库根目录；优先放仓库外目录，或放到明确的本地目录并通过 `.gitignore` 忽略。
+4. 共享规则写进仓库级 `.gitignore`；只有纯个人、临时性的忽略项才放 `.git/info/exclude`。
+5. 提交前先看 `git status --short`，确认只包含本次要交付的文件，不要把本地诊断资产、临时报告、实验脚本混进 PR。
+6. 需要保留在本机但不能进仓库的文件，先做本地备份，再从 Git 跟踪中移除，最后恢复为本地忽略状态。
+7. `pytest` / pre-push hook 会扫描仓库内测试；本地专用测试不要放在默认测试发现路径下。
+8. PR 合并后立刻收尾：`git switch main`、`git pull --ff-only`、`git branch -d <feature-branch>`，保持本地主线和远端一致。
+9. 如果本地 `main` 出现 `ahead/behind` 同时存在，优先先解释“分支头”和“工作区文件内容”是否一致，再决定是否 reset，避免误判代码回退。
+
 ## 快速开始
 
 ### 1) 安装依赖
