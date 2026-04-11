@@ -1677,11 +1677,12 @@ REWRITE_ELIGIBLE_DEP_TYPES: FrozenSet[str] = frozenset({
     "MATERIALIZED VIEW",
     "SYNONYM",
 })
-VIEW_REWRITE_TERMINAL_TYPES: FrozenSet[str] = frozenset({
+SYNONYM_TABLELIKE_TERMINAL_TYPES: FrozenSet[str] = frozenset({
     "TABLE",
     "VIEW",
     "MATERIALIZED VIEW",
 })
+VIEW_REWRITE_TERMINAL_TYPES: FrozenSet[str] = SYNONYM_TABLELIKE_TERMINAL_TYPES
 VIEW_CALLABLE_DEP_TYPES: FrozenSet[str] = frozenset({
     "FUNCTION",
     "PACKAGE",
@@ -10493,67 +10494,6 @@ def build_source_scope_closure(
     )
 
 
-def enforce_scoped_synonym_terminal_scope(
-    scope_result: Optional[ScopedSourceScopeResult],
-    source_objects: Optional[SourceObjectMap],
-    object_parent_map: Optional["ObjectParentMap"],
-) -> Tuple[Optional[ScopedSourceScopeResult], int]:
-    if not scope_result:
-        return scope_result, 0
-    if normalize_source_object_scope_mode(scope_result.mode) != "remap_root_closure":
-        return scope_result, 0
-    source_objects = source_objects or {}
-    object_parent_map = object_parent_map or {}
-
-    included_nodes: Set[DependencyNode] = set(scope_result.included_nodes or frozenset())
-    excluded_nodes: Set[DependencyNode] = set(scope_result.excluded_nodes or frozenset())
-    pruned_detail: Dict[DependencyNode, str] = {}
-
-    for full_u, type_u in sorted(included_nodes, key=lambda item: (item[1], item[0])):
-        if (type_u or "").upper() != "SYNONYM":
-            continue
-        terminal_full = (object_parent_map.get((full_u or "").upper()) or "").upper()
-        if not terminal_full:
-            continue
-        terminal_types = {
-            (obj_type or "").upper()
-            for obj_type in (source_objects.get(terminal_full) or set())
-            if (obj_type or "").upper() and (obj_type or "").upper() != "SYNONYM"
-        }
-        if not terminal_types:
-            continue
-        if any((terminal_full, terminal_type) in included_nodes for terminal_type in terminal_types):
-            continue
-        pruned_detail[(full_u, "SYNONYM")] = (
-            f"{SYNONYM_TERMINAL_OUTSIDE_REMAP_ROOT_CLOSURE_PREFIX}{terminal_full}"
-        )
-
-    if not pruned_detail:
-        return scope_result, 0
-
-    pruned_nodes = set(pruned_detail.keys())
-    included_nodes.difference_update(pruned_nodes)
-    excluded_nodes.update(pruned_nodes)
-
-    detail_rows: List[Tuple[str, str, str, str]] = []
-    for status, obj_type, full_name, detail in (scope_result.detail_rows or ()):
-        key = ((full_name or "").upper(), (obj_type or "").upper())
-        if key in pruned_nodes:
-            continue
-        detail_rows.append((status, obj_type, full_name, detail))
-    for (full_u, type_u), detail in sorted(pruned_detail.items(), key=lambda item: (item[0][1], item[0][0])):
-        detail_rows.append(("FILTERED_OUT", type_u, full_u, detail))
-
-    return (
-        scope_result._replace(
-            included_nodes=frozenset(included_nodes),
-            excluded_nodes=frozenset(excluded_nodes),
-            detail_rows=tuple(detail_rows),
-        ),
-        len(pruned_nodes),
-    )
-
-
 SCOPED_REFERENCE_DEP_PREFERRED_TYPES: Tuple[str, ...] = (
     "TABLE",
     "VIEW",
@@ -11549,6 +11489,63 @@ def apply_scoped_text_reference_fallback(
     return scope_result, total_added
 
 
+def enforce_scoped_synonym_terminal_scope(
+    scope_result: ScopedSourceScopeResult,
+    source_objects: SourceObjectMap,
+    object_parent_map: Optional["ObjectParentMap"],
+) -> Tuple[ScopedSourceScopeResult, int]:
+    """
+    在 remap_root_closure 模式下，对 SYNONYM 施加额外终点范围检查：
+    若同义词的终点对象（通过 object_parent_map 解析）属于 excluded_nodes，
+    则将该同义词从 included_nodes 移至 excluded_nodes，并更新 detail_rows。
+    返回 (更新后的结果, 被过滤的同义词数量)。
+    """
+    if not object_parent_map:
+        return scope_result, 0
+    excluded_full_set = {
+        (full_u or "").upper()
+        for full_u, _obj_type in scope_result.excluded_nodes
+    }
+    pruned_nodes: Set[Tuple[str, str]] = set()
+    for node_full, node_type in scope_result.included_nodes:
+        if (node_type or "").upper() != "SYNONYM":
+            continue
+        node_full_u = (node_full or "").upper()
+        terminal = (object_parent_map.get(node_full_u) or "").upper()
+        if not terminal:
+            continue
+        if terminal in excluded_full_set:
+            pruned_nodes.add((node_full, node_type))
+    if not pruned_nodes:
+        return scope_result, 0
+    pruned_key_set = {
+        ((full_u or "").upper(), (obj_type or "").upper())
+        for full_u, obj_type in pruned_nodes
+    }
+    new_detail = [
+        row for row in scope_result.detail_rows
+        if (
+            ((row[2] or "").upper(), (row[1] or "").upper()) not in pruned_key_set
+        )
+    ]
+    for node_full, node_type in sorted(pruned_nodes):
+        node_full_u = (node_full or "").upper()
+        terminal = (object_parent_map.get(node_full_u) or "").upper()
+        new_detail.append((
+            "FILTERED_OUT",
+            node_type,
+            node_full_u,
+            f"{SYNONYM_TERMINAL_OUTSIDE_REMAP_ROOT_CLOSURE_PREFIX}{terminal}",
+        ))
+    new_included = scope_result.included_nodes - frozenset(pruned_nodes)
+    new_excluded = scope_result.excluded_nodes | frozenset(pruned_nodes)
+    return scope_result._replace(
+        included_nodes=new_included,
+        excluded_nodes=new_excluded,
+        detail_rows=tuple(new_detail),
+    ), len(pruned_nodes)
+
+
 def classify_missing_objects(
     ora_cfg: OraConfig,
     settings: Dict,
@@ -11947,6 +11944,7 @@ def classify_missing_objects(
                             full_object_mapping,
                             synonym_meta=synonym_meta_map,
                             source_objects_full_scope=source_objects_full_scope,
+                            source_objects_managed_scope=source_objects,
                             object_parent_map=object_parent_map,
                             view_dependency_map=view_dependency_map,
                             view_callable_dep_map=view_callable_dep_map,
@@ -13238,14 +13236,14 @@ def build_synonym_parent_map(
                     reason = "DBLINK"
                 diagnostic_rows.append(("SYNONYM_TERMINAL_SKIPPED", "SYNONYM", syn_full, reason))
             continue
-        terminal_types = {
-            (obj_type or "").upper()
-            for obj_type in (known_source_types or {}).get((terminal_full or "").upper(), set())
-            if obj_type
-        }
+        terminal_types = get_known_object_types(known_source_types, terminal_full)
         if terminal_types and terminal_types <= {"SYNONYM"}:
             if diagnostic_rows is not None:
                 diagnostic_rows.append(("SYNONYM_TERMINAL_SKIPPED", "SYNONYM", syn_full, f"TERMINAL_ONLY_SYNONYM:{terminal_full.upper()}"))
+            continue
+        if terminal_types and not (terminal_types & SYNONYM_TABLELIKE_TERMINAL_TYPES):
+            if diagnostic_rows is not None:
+                diagnostic_rows.append(("SYNONYM_TERMINAL_SKIPPED", "SYNONYM", syn_full, f"TERMINAL_NON_TABLELIKE:{terminal_full.upper()}"))
             continue
         if not terminal_types and diagnostic_rows is not None:
             diagnostic_rows.append(("SYNONYM_TERMINAL_SKIPPED", "SYNONYM", syn_full, f"TERMINAL_OUT_OF_SCOPE:{terminal_full.upper()}"))
@@ -13435,6 +13433,7 @@ def resolve_synonym_terminal_source_with_chain(
     if (owner_u, name_u) not in synonym_meta:
         return None, ()
 
+    origin_owner_u = owner_u
     visited: Set[Tuple[str, str]] = set()
     chain: List[Tuple[str, str]] = []
     for _ in range(max_depth):
@@ -13460,13 +13459,75 @@ def resolve_synonym_terminal_source_with_chain(
         public_key = ("PUBLIC", next_name)
         if public_key in synonym_meta:
             exact_types = _known_types_for(f"{next_owner}.{next_name}")
-            if not exact_types or exact_types == {"SYNONYM"}:
+            should_follow_public = exact_types == {"SYNONYM"}
+            if (
+                not should_follow_public
+                and not exact_types
+                and public_key != key
+                and (owner_u == "PUBLIC" or next_owner == origin_owner_u)
+            ):
+                should_follow_public = True
+            if should_follow_public:
+                # 仅当 PUBLIC 链尚未访问时才继续沿 PUBLIC 同义词展开。
+                # 若 public_key 已在 visited 中，说明会回跳到已访问链路
+                # （例如 PUBLIC.X -> SCHEMA.X -> PUBLIC.X）或终点仅因 closure
+                # 过滤而“看起来”无类型；这类场景必须保持 unresolved。
+                if public_key in visited:
+                    return None, tuple(chain)
                 owner_u, name_u = public_key
                 continue
 
         return f"{next_owner}.{next_name}", tuple(chain)
 
     return None, tuple(chain)
+
+
+def get_known_object_types(
+    known_source_types: Optional[Dict[str, object]],
+    full_name: Optional[str],
+) -> FrozenSet[str]:
+    if not known_source_types:
+        return frozenset()
+    full_u = (full_name or "").upper()
+    if not full_u:
+        return frozenset()
+    entry = known_source_types.get(full_u)
+    if not entry:
+        return frozenset()
+    if isinstance(entry, dict):
+        iterable = entry.keys()
+    else:
+        iterable = entry
+    return frozenset(str(item).upper() for item in iterable if item)
+
+
+def resolve_synonym_terminal_snapshot(
+    synonym_owner: str,
+    synonym_name: str,
+    synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]],
+    known_source_types: Optional[Dict[str, object]] = None,
+    max_depth: int = 16,
+) -> Tuple[Optional[str], FrozenSet[str], Optional[str]]:
+    owner_u = (synonym_owner or "").upper()
+    name_u = (synonym_name or "").upper()
+    if not owner_u or not name_u:
+        return None, frozenset(), None
+
+    meta = synonym_meta.get((owner_u, name_u)) if synonym_meta else None
+    immediate_target = None
+    if meta and meta.table_owner and meta.table_name:
+        immediate_target = f"{meta.table_owner.upper()}.{meta.table_name.upper()}"
+
+    terminal_source = resolve_synonym_terminal_source(
+        owner_u,
+        name_u,
+        synonym_meta,
+        known_source_types=known_source_types,
+        max_depth=max_depth,
+    )
+    target_full = (terminal_source or immediate_target or "").upper() or None
+    target_types = get_known_object_types(known_source_types, target_full)
+    return target_full, target_types, (immediate_target.upper() if immediate_target else None)
 
 
 def classify_public_synonym_scope(
@@ -13494,12 +13555,8 @@ def classify_public_synonym_scope(
         terminal_u = (terminal_full or "").upper().strip()
         if not terminal_u or "." not in terminal_u:
             return False
-        if known_source_types:
-            entry = known_source_types.get(terminal_u)
-            if entry:
-                if isinstance(entry, dict):
-                    return bool(entry)
-                return bool(set(entry))
+        if get_known_object_types(known_source_types, terminal_u):
+            return True
         term_schema = terminal_u.split(".", 1)[0]
         if allowed_schemas:
             return term_schema in allowed_schemas
@@ -13551,17 +13608,15 @@ def resolve_synonym_scope_status(
         return None, "unknown", "synonym_owner_or_name_missing"
 
     src_full = f"{owner_u}.{name_u}"
-    meta = synonym_meta.get((owner_u, name_u)) if synonym_meta else None
-    immediate_target = None
-    if meta and meta.table_owner and meta.table_name:
-        immediate_target = f"{meta.table_owner.upper()}.{meta.table_name.upper()}"
-
-    terminal_source = resolve_synonym_terminal_source(owner_u, name_u, synonym_meta, source_objects)
-    target_full = (terminal_source or immediate_target or "").upper() or None
+    target_full, target_types, _immediate_target = resolve_synonym_terminal_snapshot(
+        owner_u,
+        name_u,
+        synonym_meta,
+        known_source_types=source_objects,
+    )
     if not target_full:
         return None, "unknown", "terminal_target_unresolved"
 
-    target_types = {t.upper() for t in (source_objects.get(target_full) or set()) if t}
     if target_types:
         detail_parts: List[str] = []
         if src_full in remap_rules:
@@ -13591,16 +13646,16 @@ def resolve_synonym_fixup_target(
     if not meta or not meta.table_name:
         return None
 
-    terminal_source = None
+    target_full = None
     if not meta.db_link:
-        terminal_source = resolve_synonym_terminal_source(
+        target_full, _target_types, _immediate_target = resolve_synonym_terminal_snapshot(
             owner_u,
             name_u,
             synonym_meta,
-            full_object_mapping,
+            known_source_types=full_object_mapping,
         )
-    if terminal_source:
-        terminal_u = terminal_source.upper()
+    if target_full:
+        terminal_u = target_full.upper()
         mapped = find_mapped_target_any_type(
             full_object_mapping,
             terminal_u,
@@ -15905,7 +15960,11 @@ def classify_scope_integrity_missing_dep(
             if is_scope_integrity_system_object(terminal_full, 'TABLE'):
                 return SCOPE_INTEGRITY_LOCATION_SYSTEM_OBJECT_SKIPPED, synonym_reason
             return SCOPE_INTEGRITY_LOCATION_CROSS_SCHEMA, synonym_reason
-        if synonym_reason.startswith('TERMINAL_ONLY_SYNONYM:') or synonym_reason == 'TERMINAL_UNRESOLVED':
+        if (
+            synonym_reason.startswith('TERMINAL_ONLY_SYNONYM:')
+            or synonym_reason.startswith('TERMINAL_NON_TABLELIKE:')
+            or synonym_reason == 'TERMINAL_UNRESOLVED'
+        ):
             return SCOPE_INTEGRITY_LOCATION_NOT_FOUND, synonym_reason
 
     if '@' in dep_full_u:
@@ -33161,7 +33220,6 @@ def replace_unqualified_table_refs(
     )
 
     edits: List[Tuple[int, int, str]] = []
-    qualifier_pattern_cache: Dict[str, Pattern[str]] = {}
 
     def _is_word_char(ch: str) -> bool:
         return ch.isalnum() or ch in "_$#"
@@ -33240,30 +33298,24 @@ def replace_unqualified_table_refs(
         tgt = replacements.get(norm_u)
         if not tgt:
             return
-
-        suffix_idx = k
-        while suffix_idx < part_end and masked[segment_offset + suffix_idx].isspace():
-            suffix_idx += 1
-        has_explicit_alias_or_suffix = suffix_idx < part_end
-
-        alias_sql = tgt
-        if not has_explicit_alias_or_suffix:
-            qualifier_pattern = qualifier_pattern_cache.get(norm_u)
-            if qualifier_pattern is None:
-                qualifier_pattern = re.compile(
-                    rf'(?<![A-Z0-9_\$#"\.])(?:\"{re.escape(norm_u)}\"|{re.escape(norm_u)})\s*\.',
-                    re.IGNORECASE,
-                )
-                qualifier_pattern_cache[norm_u] = qualifier_pattern
-            current_abs_start = segment_offset + j
-            current_abs_end = segment_offset + k
-            needs_alias_preservation = any(
-                match.end() <= current_abs_start or match.start() >= current_abs_end
-                for match in qualifier_pattern.finditer(masked)
-            )
-            if needs_alias_preservation:
-                alias_sql = f"{tgt} {token_raw.strip()}"
-        edits.append((segment_offset + j, segment_offset + k, alias_sql))
+        # 别名保留：当替换后的目标名（不含 schema 前缀）与原始 token 不同时
+        # （如 PUBLIC 同义词 SYN1 → TGT.T1），且该 token 之后没有显式别名，
+        # 将原始 token 保留为别名，以确保视图体中 SYN1.col 等列引用仍然有效。
+        replacement = tgt
+        if '.' in tgt:
+            tgt_unqualified = tgt.rsplit('.', 1)[1].upper()
+            if tgt_unqualified != norm_u:
+                has_following_alias = False
+                scan_pos = k
+                while scan_pos < part_end:
+                    ch = masked[segment_offset + scan_pos]
+                    if not ch.isspace() and ch not in {',', ')', ';'}:
+                        has_following_alias = True
+                        break
+                    scan_pos += 1
+                if not has_following_alias:
+                    replacement = tgt + ' ' + norm_u
+        edits.append((segment_offset + j, segment_offset + k, replacement))
 
     depth_map: List[int] = [0] * length
     current_depth = 0
@@ -33415,13 +33467,14 @@ def replace_special_construct_refs(
 
 
 def remap_view_dependencies(
-    ddl: str, 
+    ddl: str,
     view_schema: str,
     view_name: str,
     remap_rules: RemapRules,
     full_object_mapping: FullObjectMapping,
     synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]] = None,
     source_objects_full_scope: Optional[SourceObjectMap] = None,
+    source_objects_managed_scope: Optional[SourceObjectMap] = None,
     object_parent_map: Optional["ObjectParentMap"] = None,
     view_dependency_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
     view_callable_dep_map: Optional[Dict[Tuple[str, str], Set[str]]] = None,
@@ -33458,6 +33511,7 @@ def remap_view_dependencies(
     view_name_u = (view_name or "").upper()
     synonym_meta = synonym_meta or {}
     source_objects_full_scope = source_objects_full_scope or {}
+    source_objects_managed_scope = source_objects_managed_scope or {}
     object_parent_map = object_parent_map or {}
     preferred_types = ("TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM")
     unresolved_dependencies: List[str] = []
@@ -33469,11 +33523,18 @@ def remap_view_dependencies(
             return "NONE", None
         local_full = f"{view_schema_u}.{dep_obj_u}"
         local_type_map = dict(full_object_mapping.get(local_full, {}) or {})
+        managed_declared_types = {
+            (obj_type or "").upper()
+            for obj_type in (source_objects_managed_scope.get(local_full) or set())
+            if obj_type
+        }
+        has_managed_shadow = bool(local_type_map) or bool(managed_declared_types)
         local_declared_types = {
             (obj_type or "").upper()
             for obj_type in (source_objects_full_scope.get(local_full) or set())
             if obj_type
         }
+        local_declared_types.update(managed_declared_types)
         local_declared_types.update(
             (obj_type or "").upper()
             for obj_type in local_type_map.keys()
@@ -33484,15 +33545,21 @@ def remap_view_dependencies(
             for obj_type in local_declared_types
         )
         if has_local_non_synonym:
-            return "LOCAL_NON_SYNONYM", None
+            return ("LOCAL_NON_SYNONYM_MANAGED" if has_managed_shadow else "LOCAL_NON_SYNONYM_HIDDEN"), None
         if "SYNONYM" in local_declared_types or (view_schema_u, dep_obj_u) in synonym_meta:
             mapped_local_syn, local_syn_state = _resolve_synonym_for_table_only(view_schema_u, dep_obj_u)
             if mapped_local_syn:
-                return "LOCAL_PRIVATE_SYNONYM_RESOLVED", mapped_local_syn.upper()
+                return (
+                    "LOCAL_PRIVATE_SYNONYM_RESOLVED_MANAGED" if has_managed_shadow else "LOCAL_PRIVATE_SYNONYM_RESOLVED_HIDDEN",
+                    mapped_local_syn.upper(),
+                )
             if local_syn_state in {"UNRESOLVED", "NON_TABLELIKE"}:
-                return "LOCAL_PRIVATE_SYNONYM_BLOCKED", None
+                return (
+                    "LOCAL_PRIVATE_SYNONYM_BLOCKED_MANAGED" if has_managed_shadow else "LOCAL_PRIVATE_SYNONYM_BLOCKED_HIDDEN",
+                    None,
+                )
         if local_declared_types:
-            return "LOCAL_PRIVATE_SYNONYM_BLOCKED", None
+            return ("LOCAL_PRIVATE_SYNONYM_BLOCKED_MANAGED" if has_managed_shadow else "LOCAL_PRIVATE_SYNONYM_BLOCKED_HIDDEN"), None
         return "NONE", None
 
     def _resolve_synonym_terminal_for_view_rewrite(owner: str, dep_obj: str) -> Optional[str]:
@@ -33536,6 +33603,20 @@ def remap_view_dependencies(
             mapped = explicit
         return (mapped or terminal_source).upper(), "TABLELIKE"
 
+    fallback_deps_u = {
+        (dep_full or "").upper()
+        for dep_full in ((view_dependency_map or {}).get(dep_key) or set())
+        if (dep_full or "").strip()
+    }
+    explicit_public_dependency_targets: Dict[str, str] = {}
+    for dep_full_u in sorted(fallback_deps_u):
+        if not dep_full_u.startswith("PUBLIC.") or "." not in dep_full_u:
+            continue
+        dep_obj_u = dep_full_u.split(".", 1)[1]
+        mapped_public, public_state = _resolve_synonym_for_table_only("PUBLIC", dep_obj_u)
+        if public_state == "TABLELIKE" and mapped_public:
+            explicit_public_dependency_targets[dep_obj_u] = mapped_public.upper()
+
     for dep in dependencies:
         dep_u = dep.upper()
         if not dep_u:
@@ -33565,6 +33646,7 @@ def remap_view_dependencies(
             for obj_type in dep_type_map.keys()
         )
         is_synonym_only = bool(dep_types) and dep_types <= {"SYNONYM"}
+        explicit_public_target = explicit_public_dependency_targets.get(dep_obj)
         # 显式 remap 对该依赖对象拥有最高优先级（包括存在同名同义词时），
         # 避免同义词链把本应映射到 TABLE 的对象误改为 *_VW 等终点对象名。
         if explicit_dep_target and not is_synonym_only:
@@ -33577,6 +33659,11 @@ def remap_view_dependencies(
                 dep_u,
                 preferred_types=preferred_types
             )
+        elif dep_schema == view_schema_u and explicit_public_target:
+            local_shadow_state, _local_shadow_target = _classify_local_unqualified_shadow(dep_obj)
+            if not local_shadow_state.endswith("_MANAGED"):
+                mapped_target = explicit_public_target
+                resolved_by_synonym = True
         else:
             if dep_schema == "PUBLIC":
                 mapped_target, synonym_state = _resolve_synonym_for_table_only("PUBLIC", dep_obj)
@@ -33644,9 +33731,14 @@ def remap_view_dependencies(
             replacements_unqualified.setdefault(dep_obj.upper(), tgt_u)
         elif dep_schema == "PUBLIC" and resolved_by_synonym:
             local_shadow_state, local_shadow_target = _classify_local_unqualified_shadow(dep_obj)
-            if local_shadow_state == "LOCAL_PRIVATE_SYNONYM_RESOLVED" and local_shadow_target:
+            if dep_obj.upper() in explicit_public_dependency_targets and not local_shadow_state.endswith("_MANAGED"):
+                replacements_unqualified.setdefault(dep_obj.upper(), tgt_u)
+            elif local_shadow_state == "LOCAL_PRIVATE_SYNONYM_RESOLVED_MANAGED" and local_shadow_target:
                 replacements_unqualified.setdefault(dep_obj.upper(), local_shadow_target)
-            elif local_shadow_state in {"LOCAL_NON_SYNONYM", "LOCAL_PRIVATE_SYNONYM_BLOCKED"}:
+            elif local_shadow_state in {
+                "LOCAL_NON_SYNONYM_MANAGED",
+                "LOCAL_PRIVATE_SYNONYM_BLOCKED_MANAGED",
+            }:
                 pass
             else:
                 # SQL parser 若漏抓了裸名依赖，fallback 可能只给出 PUBLIC synonym。
@@ -39249,6 +39341,7 @@ def generate_fixup_scripts(
     constraint_status_rows: Optional[List[ConstraintStatusDriftRow]] = None,
     manual_trigger_table_keys: Optional[Set[Tuple[str, str]]] = None,
     source_objects_full_scope: Optional[SourceObjectMap] = None,
+    source_objects_managed_scope: Optional[SourceObjectMap] = None,
     object_parent_map: Optional["ObjectParentMap"] = None,
 ):
     """
@@ -39272,8 +39365,12 @@ def generate_fixup_scripts(
         progress_log_interval = 10.0
     progress_log_interval = max(1.0, progress_log_interval)
     synonym_meta_map = synonym_metadata or {}
+    source_objects_managed_scope = source_objects_managed_scope or {}
+    object_parent_map = object_parent_map or {}
     view_dependency_map = view_dependency_map or {}
     view_callable_dep_map = view_callable_dep_map or {}
+    scope_mode = (settings.get("source_object_scope_mode") or "").strip().lower()
+    managed_source_schemas = {(s or "").upper() for s in (settings.get("source_schemas_list") or [])}
     trigger_status_rows = trigger_status_rows or []
     constraint_status_rows = constraint_status_rows or []
     missing_table_constraint_status_rows: List[MissingTableConstraintStatusRow] = []
@@ -40531,7 +40628,6 @@ def generate_fixup_scripts(
             src_full = f"{src_schema_u}.{src_obj_u}"
             support_row = support_state_map.get((obj_type_u, src_full))
             if support_row and (support_row.reason_code or "").upper() == SYNONYM_TARGET_OUT_OF_SCOPE_REASON_CODE:
-                other_skip_counts[obj_type_u]["terminal_out_of_scope"] += 1
                 log.info(
                     "[FIXUP] 跳过同义词 %s.%s（终点对象 %s 不在本次迁移范围）。",
                     src_schema,
@@ -40559,6 +40655,21 @@ def generate_fixup_scripts(
                         live_scope_detail or "-",
                     )
                     continue
+            # 在 remap_root_closure 模式下，若同义词终点对象属于受管理源端
+            # schema 但不在 full_object_mapping 中（已被 closure 过滤），跳过生成。
+            if scope_mode == "remap_root_closure" and synonym_meta_map:
+                syn_entry = synonym_meta_map.get((src_schema_u, src_obj_u))
+                if syn_entry:
+                    terminal_schema_u = (syn_entry.table_owner or "").upper()
+                    terminal_name_u = (syn_entry.table_name or "").upper()
+                    terminal_full = f"{terminal_schema_u}.{terminal_name_u}"
+                    if terminal_schema_u in managed_source_schemas and terminal_full not in full_object_mapping:
+                        log.info(
+                            "[FIXUP] 跳过同义词 %s.%s（终点对象 %s 在受管理源端 schema 中"
+                            "但不在当前 remap_root_closure 范围内）。",
+                            src_schema, src_obj, terminal_full
+                        )
+                        continue
         missing_total_by_type[obj_type_u] += 1
         support_row = support_state_map.get((obj_type_u, f"{src_schema.upper()}.{src_obj.upper()}"))
         support_state = support_row.support_state if support_row else SUPPORT_STATE_SUPPORTED
@@ -42013,6 +42124,7 @@ def generate_fixup_scripts(
             full_object_mapping,
             synonym_meta=synonym_meta_map,
             source_objects_full_scope=source_objects_full_scope,
+            source_objects_managed_scope=source_objects_managed_scope,
             object_parent_map=object_parent_map,
             view_dependency_map=view_dependency_map,
             view_callable_dep_map=view_callable_dep_map,
@@ -42298,6 +42410,7 @@ def generate_fixup_scripts(
                     full_object_mapping,
                     synonym_meta=synonym_meta_map,
                     source_objects_full_scope=source_objects_full_scope,
+                    source_objects_managed_scope=source_objects_managed_scope,
                     object_parent_map=object_parent_map,
                     view_dependency_map=view_dependency_map,
                     view_callable_dep_map=view_callable_dep_map,
@@ -58641,6 +58754,7 @@ def main():
                 view_callable_dep_map=view_callable_dep_map,
                 manual_trigger_table_keys=manual_trigger_blacklist_table_keys,
                 source_objects_full_scope=source_objects_full_scope,
+                source_objects_managed_scope=source_objects,
                 object_parent_map=object_parent_map,
             )
             deferred_filtered_grants = list(settings.get("_deferred_filtered_grants") or [])
