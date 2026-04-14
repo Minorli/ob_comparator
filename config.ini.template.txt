@@ -293,6 +293,7 @@ fixup_idempotent_types  =
 # 同义词修补范围：
 #   all         -> 生成 PUBLIC + 私有同义词
 #   public_only -> 仅生成 PUBLIC 同义词
+# 默认：Oracle 源 public_only；OceanBase 源 all。此模板示例按 Oracle 路径保留 public_only。
 synonym_fixup_scope     = public_only
 # 约束/索引重名处理模式：
 #   off    -> 关闭
@@ -316,8 +317,9 @@ trigger_qualify_schema  = true
 #   SYNONYM, JOB, SCHEDULE, TYPE, TYPE BODY
 #   注意：MATERIALIZED VIEW 由 mview_check_fixup_mode + OB 版本共同决定
 # synonym_check_scope（同义词校验范围）可选值：
-#   public_only -> 仅将 PUBLIC 同义词纳入主校验与检查汇总（默认）
+#   public_only -> 仅将 PUBLIC 同义词纳入主校验与检查汇总
 #   all         -> PUBLIC + 私有同义词全部纳入校验
+# 默认：Oracle 源 public_only；OceanBase 源 all。此模板示例按 Oracle 路径保留 public_only。
 # check_extra_types 可选值：
 #   INDEX, CONSTRAINT, SEQUENCE, TRIGGER
 # check_status_drift_types 可选值：
