@@ -365,19 +365,34 @@ def log_subsection(title: str, fill_char: str = "-") -> None:
 init_console_logging()
 log = logging.getLogger(__name__)
 
-RUN_PHASE_ORDER: Tuple[str, ...] = (
-    "加载配置与初始化",
-    "对象映射准备",
-    "OceanBase 元数据转储",
-    "Oracle 元数据转储",
-    "主对象校验",
-    "表数据存在性校验",
-    "扩展对象校验",
-    "对象可用性校验",
-    "依赖/授权校验",
-    "修补脚本生成",
-    "报告输出",
-)
+def get_source_metadata_phase_label(source_db_mode: Optional[str]) -> str:
+    mode = normalize_source_db_mode(source_db_mode or SOURCE_DB_MODE_ORACLE)
+    if mode == SOURCE_DB_MODE_ORACLE:
+        return "Oracle 元数据转储"
+    return "源端元数据转储"
+
+
+def get_source_count_labels(source_db_mode: Optional[str]) -> Tuple[str, str]:
+    mode = normalize_source_db_mode(source_db_mode or SOURCE_DB_MODE_ORACLE)
+    if mode == SOURCE_DB_MODE_ORACLE:
+        return "Oracle (应校验)", "Oracle"
+    return "源端 (应校验)", "源端"
+
+
+def build_run_phase_order(source_db_mode: Optional[str]) -> Tuple[str, ...]:
+    return (
+        "加载配置与初始化",
+        "对象映射准备",
+        "OceanBase 元数据转储",
+        get_source_metadata_phase_label(source_db_mode),
+        "主对象校验",
+        "表数据存在性校验",
+        "扩展对象校验",
+        "对象可用性校验",
+        "依赖/授权校验",
+        "修补脚本生成",
+        "报告输出",
+    )
 
 
 class RunPhaseInfo(NamedTuple):
@@ -422,6 +437,7 @@ class RunSummaryContext(NamedTuple):
     hot_reload_mode: str = "off"
     hot_reload_events_count: int = 0
     hot_reload_events_file: Optional[Path] = None
+    source_db_mode: str = "oracle"
 
 
 RUNTIME_DEGRADED_SCOPE_COMPARE = "COMPARE"
@@ -4943,6 +4959,11 @@ def normalize_synonym_fixup_scope(raw_value: Optional[str]) -> str:
     return value
 
 
+def default_synonym_scope_for_source_mode(source_db_mode: Optional[str]) -> str:
+    mode = normalize_source_db_mode(source_db_mode or SOURCE_DB_MODE_ORACLE)
+    return "all" if mode == SOURCE_DB_MODE_OCEANBASE else "public_only"
+
+
 NAME_COLLISION_MODE_VALUES = {"off", "report", "fixup"}
 NAME_COLLISION_MODE_ALIASES = {
     "on": "fixup",
@@ -6985,8 +7006,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('fixup_exec_file_fallback', 'true')
         settings.setdefault('case_sensitive_identifier_mode', 'warn')
         settings.setdefault('metadata_load_mode', 'auto')
-        settings.setdefault('synonym_check_scope', 'public_only')
-        settings.setdefault('synonym_fixup_scope', 'public_only')
+        synonym_scope_default = default_synonym_scope_for_source_mode(source_db_mode)
+        settings.setdefault('synonym_check_scope', synonym_scope_default)
+        settings.setdefault('synonym_fixup_scope', synonym_scope_default)
         settings.setdefault('name_collision_mode', 'fixup')
         settings.setdefault('name_collision_rename_existing', 'true')
         settings.setdefault('trigger_list', '')
@@ -7118,6 +7140,14 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             if settings.get('blacklist_mode', 'auto').strip().lower() != 'disabled':
                 source_mode_diagnostics.append(
                     "source_db_mode=oceanbase：Oracle blacklist 语义已禁用，相关配置仅保留不生效。"
+                )
+            if not config.has_option("SETTINGS", "synonym_check_scope"):
+                source_mode_diagnostics.append(
+                    "source_db_mode=oceanbase：synonym_check_scope 未配置，默认按 all 处理。"
+                )
+            if not config.has_option("SETTINGS", "synonym_fixup_scope"):
+                source_mode_diagnostics.append(
+                    "source_db_mode=oceanbase：synonym_fixup_scope 未配置，默认按 all 处理。"
                 )
         settings['_source_mode_diagnostics'] = source_mode_diagnostics
 
@@ -7373,10 +7403,10 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         else:
             settings['ddl_format_type_set'] = set()
         settings['synonym_check_scope'] = normalize_synonym_check_scope(
-            settings.get('synonym_check_scope', 'public_only')
+            settings.get('synonym_check_scope', synonym_scope_default)
         )
         settings['synonym_fixup_scope'] = normalize_synonym_fixup_scope(
-            settings.get('synonym_fixup_scope', 'public_only')
+            settings.get('synonym_fixup_scope', synonym_scope_default)
         )
         settings['name_collision_mode'] = normalize_name_collision_mode(
             settings.get('name_collision_mode', 'fixup')
@@ -8438,7 +8468,11 @@ def run_config_wizard(config_path: Path) -> None:
         "SETTINGS",
         "synonym_fixup_scope",
         "同义词修补范围 (all/public_only)",
-        default=cfg.get("SETTINGS", "synonym_fixup_scope", fallback="public_only"),
+        default=cfg.get(
+            "SETTINGS",
+            "synonym_fixup_scope",
+            fallback=default_synonym_scope_for_source_mode(source_db_mode),
+        ),
         validator=_validate_synonym_fixup_scope,
         transform=normalize_synonym_fixup_scope,
     )
@@ -8718,7 +8752,11 @@ def run_config_wizard(config_path: Path) -> None:
         "SETTINGS",
         "synonym_check_scope",
         "同义词校验范围 (all/public_only)",
-        default=cfg.get("SETTINGS", "synonym_check_scope", fallback="public_only"),
+        default=cfg.get(
+            "SETTINGS",
+            "synonym_check_scope",
+            fallback=default_synonym_scope_for_source_mode(source_db_mode),
+        ),
         validator=_validate_synonym_check_scope,
         transform=normalize_synonym_check_scope,
     )
@@ -18057,7 +18095,8 @@ def obclient_query_by_owner_chunks(
     sql_tpl: str,
     owners: List[str],
     *,
-    chunk_size: int = ORACLE_IN_BATCH_SIZE
+    chunk_size: int = ORACLE_IN_BATCH_SIZE,
+    quiet_error: bool = False,
 ) -> Tuple[bool, List[str], str]:
     """
     将 OWNER IN (...) 拆分为多个 chunk 运行，避免 IN 列表过长或超过 1000 限制。
@@ -18074,7 +18113,7 @@ def obclient_query_by_owner_chunks(
     for chunk in chunk_list(owners, chunk_size):
         owners_in = ",".join(_quote_owner(s) for s in chunk)
         sql = sql_tpl.format(owners_in=owners_in)
-        ok, out, err = obclient_run_sql(ob_cfg, sql)
+        ok, out, err = obclient_run_sql(ob_cfg, sql, quiet_error=quiet_error)
         if not ok:
             return False, [], err
         if out:
@@ -18663,7 +18702,12 @@ def dump_ob_metadata(
             FROM DBA_SCHEDULER_JOBS
             WHERE OWNER IN ({owners_in})
         """
-        ok_jobs, job_lines, err_jobs = obclient_query_by_owner_chunks(ob_cfg, sql_jobs_tpl, owners_in_list)
+        ok_jobs, job_lines, err_jobs = obclient_query_by_owner_chunks(
+            ob_cfg,
+            sql_jobs_tpl,
+            owners_in_list,
+            quiet_error=True,
+        )
         if not ok_jobs:
             log.warning("读取 OB DBA_SCHEDULER_JOBS 失败，JOB 检查可能不完整: %s", err_jobs)
         elif job_lines:
@@ -18682,7 +18726,12 @@ def dump_ob_metadata(
             FROM DBA_SCHEDULER_SCHEDULES
             WHERE OWNER IN ({owners_in})
         """
-        ok_sched, sched_lines, err_sched = obclient_query_by_owner_chunks(ob_cfg, sql_sched_tpl, owners_in_list)
+        ok_sched, sched_lines, err_sched = obclient_query_by_owner_chunks(
+            ob_cfg,
+            sql_sched_tpl,
+            owners_in_list,
+            quiet_error=True,
+        )
         if not ok_sched:
             log.warning("读取 OB DBA_SCHEDULER_SCHEDULES 失败，SCHEDULE 检查可能不完整: %s", err_sched)
         elif sched_lines:
@@ -18700,6 +18749,28 @@ def dump_ob_metadata(
         "OceanBase.DBA_OBJECTS",
         case_sensitive_mode
     )
+
+    # 部分 OB 版本/兼容模式下，同义词不会稳定出现在 DBA_OBJECTS，需要补查 DBA_SYNONYMS。
+    if 'SYNONYM' in object_types_filter:
+        synonym_meta = load_ob_source_synonym_metadata(
+            ob_cfg,
+            owners_in_list,
+            allowed_terminal_source_schemas=owners_in_list,
+        )
+        if synonym_meta:
+            synonym_objects = objects_by_type.setdefault('SYNONYM', set())
+            before_count = len(synonym_objects)
+            for (owner_u, name_u), _meta in synonym_meta.items():
+                if synonym_scope == 'public_only' and owner_u != 'PUBLIC':
+                    continue
+                if owner_u and name_u:
+                    synonym_objects.add(f"{owner_u}.{name_u}")
+            added_count = len(synonym_objects) - before_count
+            if added_count:
+                log.info(
+                    "已从 OB DBA_SYNONYMS 补充 %d 个 SYNONYM 对象进入受管范围。",
+                    added_count,
+                )
 
     # 补充 DBA_TYPES (部分 OB 环境中 TYPE 不出现在 DBA_OBJECTS)
     # 注意：DBA_TYPES.TYPECODE=OBJECT 仅表示对象类型，本身不代表存在 TYPE BODY，
@@ -18883,9 +18954,16 @@ def dump_ob_metadata(
             log.warning("读取 OB DBA_TAB_COLS 失败，将仅使用 DBA_TAB_COLUMNS 已获取信息: %s", secondary_err)
             secondary_tab_columns = {}
 
+        table_objects = {
+            full_name.upper()
+            for full_name in (objects_by_type.get("TABLE", set()) or set())
+            if full_name
+        }
         if not primary_tab_columns and not secondary_tab_columns:
-            log.error("无法从 OB 读取列元数据（DBA_TAB_COLUMNS / DBA_TAB_COLS），程序退出。")
-            abort_run()
+            if table_objects:
+                log.error("无法从 OB 读取列元数据（DBA_TAB_COLUMNS / DBA_TAB_COLS），程序退出。")
+                abort_run()
+            log.info("当前受管 scope 下未发现 TABLE，对空列元数据按合法空结果处理。")
 
         tab_columns = merge_ob_tab_column_metadata(primary_tab_columns, secondary_tab_columns)
 
@@ -18964,8 +19042,21 @@ def dump_ob_metadata(
                             comment = parts[3].strip() if len(parts) >= 4 else None
                             column_comments.setdefault((owner, table), {})[column] = comment
             if comments_complete and target_pairs and not table_comments and not column_comments:
-                log.warning("OB 端注释查询未返回任何记录，可能缺少权限，注释比对将跳过。")
-                comments_complete = False
+                existing_target_tables = {
+                    (parse_full_object_name(full_name) or ("", ""))[:2]
+                    for full_name in (objects_by_type.get("TABLE", set()) or set())
+                    if full_name
+                }
+                existing_target_pairs = {
+                    ((owner or "").upper(), (table or "").upper())
+                    for owner, table in target_pairs
+                    if ((owner or "").upper(), (table or "").upper()) in existing_target_tables
+                }
+                if existing_target_pairs:
+                    log.warning("OB 端注释查询未返回任何记录，可能缺少权限，注释比对将跳过。")
+                    comments_complete = False
+                else:
+                    log.info("当前受管目标 scope 下未命中已存在 TABLE，空注释结果按合法空结果处理。")
 
     # --- 2.c Temporary table metadata (for GTT index normalization gate) ---
     sql_temp_tpl = """
@@ -29883,11 +29974,14 @@ def check_comments(
             )
             if normalize_identifier_name(col)
         }
-        ob_tables = ob_meta.objects_by_type.get("TABLE", set())
-        if ob_tables:
-            full_tgt = f"{tgt_key[0]}.{tgt_key[1]}"
-            if full_tgt not in ob_tables:
-                continue
+        ob_tables = {
+            (name or "").upper()
+            for name in (ob_meta.objects_by_type.get("TABLE", set()) or set())
+            if name
+        }
+        full_tgt = f"{tgt_key[0]}.{tgt_key[1]}"
+        if full_tgt not in ob_tables:
+            continue
 
         src_table_cmt = normalize_comment_text(oracle_meta.table_comments.get(src_key))
         tgt_table_cmt = normalize_comment_text(ob_meta.table_comments.get(tgt_key))
@@ -54864,7 +54958,7 @@ def build_run_summary(
     total_seconds = time.perf_counter() - ctx.start_perf
 
     phases: List[RunPhaseInfo] = []
-    for phase in RUN_PHASE_ORDER:
+    for phase in build_run_phase_order(ctx.source_db_mode):
         if phase in ctx.phase_durations:
             phases.append(RunPhaseInfo(phase, ctx.phase_durations[phase], "完成"))
         else:
@@ -55810,6 +55904,8 @@ def print_final_report(
     TYPE_COL_WIDTH = 16
     OBJECT_COL_WIDTH = 42
     DETAIL_COL_WIDTH = 90
+    source_engine = normalize_source_db_mode((settings or {}).get("source_db_mode", SOURCE_DB_MODE_ORACLE))
+    source_count_label, source_count_short_label = get_source_count_labels(source_engine)
 
     def format_endpoint_block(info: Dict[str, str], is_oracle: bool) -> str:
         lines: List[str] = []
@@ -55850,7 +55946,7 @@ def print_final_report(
 
     if endpoint_info:
         source_engine = normalize_source_db_mode(
-            endpoint_info.get("source_engine") or (settings or {}).get("source_db_mode", SOURCE_DB_MODE_ORACLE)
+            endpoint_info.get("source_engine") or source_engine
         )
         src_info = endpoint_info.get("source", {}) or endpoint_info.get("oracle", {})
         tgt_info = endpoint_info.get("oceanbase", {})
@@ -56607,7 +56703,7 @@ def print_final_report(
     if object_counts_summary:
         count_table = Table(title="[header]0.b 检查汇总", **count_table_kwargs)
         count_table.add_column("对象类型", style="info", width=TYPE_COL_WIDTH)
-        count_table.add_column("Oracle (应校验)", justify="right", width=18)
+        count_table.add_column(source_count_label, justify="right", width=18)
         count_table.add_column("OceanBase (命中)", justify="right", width=18)
         count_table.add_column("缺失(可修补)", justify="right", width=12)
         count_table.add_column("缺失(不支持/阻断/待确认)", justify="right", width=20)
@@ -56652,7 +56748,7 @@ def print_final_report(
         if count_invariant_mismatches:
             mismatch_lines = [
                 (
-                    f"{obj_type}: Oracle={lhs}, "
+                    f"{obj_type}: {source_count_short_label}={lhs}, "
                     f"命中={hit}, 缺失(可修补)={fixable}, "
                     f"缺失(不支持/阻断/待确认)={unsup}, 排除={excluded}"
                 )
@@ -57999,7 +58095,7 @@ def parse_cli_args() -> argparse.Namespace:
           可选开关：
             check_primary_types     限制主对象类型（默认全量）
             check_extra_types       限制扩展对象 (index,constraint,sequence,trigger)
-            synonym_check_scope     同义词校验范围 (all/public_only，默认 public_only)
+            synonym_check_scope     同义词校验范围 (all/public_only，默认 Oracle=public_only / OceanBase=all)
             extra_check_workers     扩展对象校验并发进程数（默认 16）
             extra_check_chunk_size  扩展对象校验批量表数量（默认 200）
             extra_check_progress_interval 扩展对象校验进度日志间隔（秒）
@@ -58010,7 +58106,7 @@ def parse_cli_args() -> argparse.Namespace:
             fixup_idempotent_mode   修补脚本幂等模式 (off/guard/replace/drop_create)
             fixup_idempotent_types  幂等模式作用对象类型（逗号分隔，留空用默认）
             fixup_drop_sys_c_columns 是否对目标端额外 SYS_C* 列生成 ALTER TABLE FORCE (true/false)
-            synonym_fixup_scope     同义词修补范围 (all/public_only，默认 public_only)
+            synonym_fixup_scope     同义词修补范围 (all/public_only，默认 Oracle=public_only / OceanBase=all)
             trigger_list            仅生成指定触发器清单 (每行 SCHEMA.TRIGGER_NAME)
             trigger_qualify_schema  触发器 DDL 是否强制补全 schema 前缀 (true/false)
             check_status_drift_types 状态漂移检查范围 (trigger,constraint)
@@ -58926,10 +59022,12 @@ def main():
     if objects_after_cutoff_detail_path:
         log.info("创建时间范围过滤对象明细已输出: %s", objects_after_cutoff_detail_path)
 
+    source_metadata_phase = get_source_metadata_phase_label(source_db_mode)
+
     if not master_list:
         for phase in (
             "OceanBase 元数据转储",
-            "Oracle 元数据转储",
+            source_metadata_phase,
             "主对象校验",
             "表数据存在性校验",
             "扩展对象校验",
@@ -59029,7 +59127,8 @@ def main():
             report_start_perf=report_start_perf,
             hot_reload_mode=(hot_reload_runtime.mode if hot_reload_runtime else "off"),
             hot_reload_events_count=(len(hot_reload_runtime.events) if hot_reload_runtime else 0),
-            hot_reload_events_file=hot_reload_events_file
+            hot_reload_events_file=hot_reload_events_file,
+            source_db_mode=source_db_mode,
         )
         run_summary = print_final_report(
             tv_results,
@@ -59164,8 +59263,8 @@ def main():
         )
 
     # 7) 主对象校验
-    apply_config_hot_reload_at_phase(hot_reload_runtime, "Oracle 元数据转储", settings, ora_cfg, ob_cfg)
-    with phase_timer("Oracle 元数据转储", phase_durations):
+    apply_config_hot_reload_at_phase(hot_reload_runtime, source_metadata_phase, settings, ora_cfg, ob_cfg)
+    with phase_timer(source_metadata_phase, phase_durations):
         log_subsection("源端元数据")
         oracle_meta = dump_source_metadata(
             ora_cfg,
@@ -60351,8 +60450,9 @@ def main():
         report_start_perf=report_start_perf,
         hot_reload_mode=(hot_reload_runtime.mode if hot_reload_runtime else "off"),
         hot_reload_events_count=(len(hot_reload_runtime.events) if hot_reload_runtime else 0),
-        hot_reload_events_file=hot_reload_events_file
-        )
+        hot_reload_events_file=hot_reload_events_file,
+        source_db_mode=source_db_mode,
+    )
     run_summary = print_final_report(
         tv_results,
         total_checked,

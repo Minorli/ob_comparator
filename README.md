@@ -144,6 +144,8 @@ table_data_presence_chunk_size = 500
 config_hot_reload_mode = off
 config_hot_reload_interval_sec = 5
 config_hot_reload_fail_policy = keep_last_good
+
+Note: when `source_db_mode = oceanbase` and these two keys are omitted, the runtime default becomes `all`; Oracle mode keeps `public_only`.
 oracle_client_lib_dir = /opt/instantclient_19_28
 dbcat_bin = /opt/dbcat-2.5.0-SNAPSHOT
 dbcat_output_dir = dbcat_output
