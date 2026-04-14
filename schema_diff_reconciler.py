@@ -2003,6 +2003,28 @@ ALL_TRACKED_OBJECT_TYPES: Tuple[str, ...] = tuple(
     sorted(set(PRIMARY_OBJECT_TYPES) | set(DEPENDENCY_EXTRA_OBJECT_TYPES))
 )
 
+OB_SOURCE_FIXUP_SUPPORTED_TYPES: FrozenSet[str] = frozenset({
+    'TABLE',
+    'VIEW',
+    'PROCEDURE',
+    'FUNCTION',
+    'PACKAGE',
+    'PACKAGE BODY',
+    'SYNONYM',
+    'SEQUENCE',
+    'TRIGGER',
+    'TYPE',
+    'TYPE BODY',
+    'INDEX',
+    'CONSTRAINT',
+})
+
+OB_SOURCE_FIXUP_DEFERRED_TYPES: FrozenSet[str] = frozenset({
+    'MATERIALIZED VIEW',
+    'JOB',
+    'SCHEDULE',
+})
+
 EXTRA_OBJECT_CHECK_TYPES: Tuple[str, ...] = (
     'INDEX',
     'CONSTRAINT',
@@ -4147,11 +4169,169 @@ OBJECT_COUNT_TYPES: Tuple[str, ...] = (
     'CONSTRAINT'
 )
 
+SOURCE_DB_MODE_ORACLE = "oracle"
+SOURCE_DB_MODE_OCEANBASE = "oceanbase"
+SOURCE_DB_MODE_VALUES: Set[str] = {
+    SOURCE_DB_MODE_ORACLE,
+    SOURCE_DB_MODE_OCEANBASE,
+}
+
 
 def parse_bool_flag(value: Optional[str], default: bool = True) -> bool:
     if value is None:
         return default
     return str(value).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+
+
+def normalize_source_db_mode(raw_value: Optional[str]) -> str:
+    value = (raw_value or "").strip().lower()
+    if not value:
+        return SOURCE_DB_MODE_ORACLE
+    if value not in SOURCE_DB_MODE_VALUES:
+        raise ValueError(
+            "source_db_mode 仅支持 oracle 或 oceanbase"
+        )
+    return value
+
+
+def build_source_capability_registry(source_db_mode: str) -> Dict[str, bool]:
+    mode = normalize_source_db_mode(source_db_mode)
+    if mode == SOURCE_DB_MODE_ORACLE:
+        return {
+            "requires_oracle_client": True,
+            "supports_fixup_generation": True,
+            "supports_grant_generation": True,
+            "supports_blacklist_table": True,
+            "supports_source_object_created_before": True,
+            "supports_scope_closure": True,
+            "supports_source_usability": True,
+            "supports_table_presence": True,
+            "supports_missing_classification": True,
+            "supports_source_synonym_metadata": True,
+            "supports_source_parent_map": True,
+            "supports_source_dependency_loader": True,
+        }
+    return {
+        "requires_oracle_client": False,
+        "supports_fixup_generation": True,
+        "supports_grant_generation": False,
+        "supports_blacklist_table": False,
+        "supports_source_object_created_before": False,
+        "supports_scope_closure": False,
+        "supports_source_usability": False,
+        "supports_table_presence": False,
+        "supports_missing_classification": True,
+        "supports_source_synonym_metadata": True,
+        "supports_source_parent_map": True,
+        "supports_source_dependency_loader": True,
+    }
+
+
+def summarize_ob_source_fixup_families() -> Tuple[List[str], List[str]]:
+    supported = sorted(OB_SOURCE_FIXUP_SUPPORTED_TYPES)
+    deferred = sorted(OB_SOURCE_FIXUP_DEFERRED_TYPES)
+    return supported, deferred
+
+
+def is_ob_source_fixup_supported_type(obj_type: Optional[str]) -> bool:
+    return (obj_type or "").upper() in OB_SOURCE_FIXUP_SUPPORTED_TYPES
+
+
+def is_same_ob_endpoint(source_ob_cfg: Optional[ObConfig], target_ob_cfg: Optional[ObConfig]) -> bool:
+    src = source_ob_cfg or {}
+    tgt = target_ob_cfg or {}
+    return (
+        str(src.get("host", "")).strip() == str(tgt.get("host", "")).strip()
+        and str(src.get("port", "")).strip() == str(tgt.get("port", "")).strip()
+        and str(src.get("user_string", "")).strip() == str(tgt.get("user_string", "")).strip()
+    )
+
+
+def build_source_mode_diagnostics(
+    settings: Dict,
+    source_meta: Optional[OracleMetadata] = None,
+    target_meta: Optional[ObMetadata] = None,
+    target_ob_cfg: Optional[ObConfig] = None,
+) -> List[str]:
+    mode = normalize_source_db_mode(settings.get("source_db_mode", SOURCE_DB_MODE_ORACLE))
+    caps = dict(settings.get("source_capabilities") or build_source_capability_registry(mode))
+    diagnostics: List[str] = [f"source_db_mode={mode}"]
+    if mode != SOURCE_DB_MODE_OCEANBASE:
+        return diagnostics
+
+    source_ob_cfg = settings.get("source_ob_cfg") or {}
+    if is_same_ob_endpoint(source_ob_cfg, target_ob_cfg):
+        diagnostics.append("OceanBase source/target 指向同一 endpoint：当前按顺序抽取 source/target 元数据。")
+
+    source_env_info = dict(settings.get("_source_env_info") or {})
+    target_env_info = dict(settings.get("_target_env_info") or {})
+    source_version = str(source_env_info.get("version") or "").strip()
+    target_version = str(target_env_info.get("version") or "").strip()
+    if source_version or target_version:
+        diagnostics.append(
+            "OB source/target versions: source={src}, target={tgt}".format(
+                src=source_version or "unknown",
+                tgt=target_version or "unknown",
+            )
+        )
+
+    deferred: List[str] = []
+    if not caps.get("supports_grant_generation", False):
+        deferred.append("grant_generation")
+    if not caps.get("supports_blacklist_table", False):
+        deferred.append("oracle_blacklist")
+    if not caps.get("supports_source_usability", False):
+        deferred.append("source_usability")
+    if not caps.get("supports_table_presence", False):
+        deferred.append("table_data_presence")
+    if deferred:
+        diagnostics.append("OB source deferred capabilities: " + ", ".join(deferred))
+
+    supported_fixup_types, deferred_fixup_types = summarize_ob_source_fixup_families()
+    diagnostics.append(
+        "OB source auto-fix families: " + (", ".join(supported_fixup_types) if supported_fixup_types else "<none>")
+    )
+    diagnostics.append(
+        "OB source deferred fixup families: " + (", ".join(deferred_fixup_types) if deferred_fixup_types else "<none>")
+    )
+
+    if source_meta and target_meta:
+        semantic_states: List[str] = []
+        identity_enabled = bool(getattr(source_meta, "identity_column_supported", False)) and bool(
+            getattr(target_meta, "identity_column_supported", False)
+        )
+        if not identity_enabled:
+            identity_enabled = bool(getattr(source_meta, "identity_modes", {}) or {}) or bool(
+                getattr(target_meta, "identity_modes", {}) or {}
+            )
+        semantic_states.append(f"IDENTITY={'enabled' if identity_enabled else 'deferred'}")
+
+        default_on_null_enabled = bool(getattr(source_meta, "default_on_null_supported", False)) and bool(
+            getattr(target_meta, "default_on_null_supported", False)
+        )
+        if not default_on_null_enabled:
+            default_on_null_enabled = bool(getattr(source_meta, "default_on_null_columns", {}) or {}) or bool(
+                getattr(target_meta, "default_on_null_columns", {}) or {}
+            )
+        semantic_states.append(
+            f"DEFAULT ON NULL={'enabled' if default_on_null_enabled else 'deferred'}"
+        )
+
+        invisible_enabled = bool(getattr(source_meta, "invisible_column_supported", False)) and bool(
+            getattr(target_meta, "invisible_column_supported", False)
+        )
+        semantic_states.append(f"INVISIBLE={'enabled' if invisible_enabled else 'deferred'}")
+        diagnostics.append("OB source semantic compare: " + ", ".join(semantic_states))
+
+    effective_print_only_cfg = settings.get("effective_print_only_primary_types")
+    print_only_types = sorted(
+        set(PRINT_ONLY_PRIMARY_TYPES if effective_print_only_cfg is None else effective_print_only_cfg)
+    )
+    diagnostics.append(
+        "OB source print-only primary types: "
+        + (", ".join(print_only_types) if print_only_types else "<none>")
+    )
+    return diagnostics
 
 
 def normalize_interval_partition_fixup_mode(raw_value: Optional[str]) -> str:
@@ -6715,12 +6895,29 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         abort_run()
 
     try:
-        ora_cfg = dict(config['ORACLE_SOURCE'])
         ob_cfg = dict(config['OCEANBASE_TARGET'])
         settings = dict(config['SETTINGS'])
+        source_db_mode = normalize_source_db_mode(settings.get('source_db_mode', SOURCE_DB_MODE_ORACLE))
+        source_capabilities = build_source_capability_registry(source_db_mode)
+        ora_cfg = dict(config['ORACLE_SOURCE']) if source_db_mode == SOURCE_DB_MODE_ORACLE else {}
+        source_ob_cfg = dict(config['OCEANBASE_SOURCE']) if source_db_mode == SOURCE_DB_MODE_OCEANBASE else {}
         config_path = Path(config_file).expanduser().resolve()
         settings['config_file'] = str(config_path)
         settings['config_dir'] = str(config_path.parent)
+        settings['source_db_mode'] = source_db_mode
+        settings['source_capabilities'] = source_capabilities
+        settings['source_ob_cfg'] = source_ob_cfg
+        settings['_source_mode_diagnostics'] = []
+        if source_db_mode == SOURCE_DB_MODE_OCEANBASE:
+            required_ob_source_keys = ("executable", "host", "port", "user_string", "password")
+            missing_ob_source_keys = [
+                key for key in required_ob_source_keys
+                if not str(source_ob_cfg.get(key, "")).strip()
+            ]
+            if missing_ob_source_keys:
+                raise ValueError(
+                    "OCEANBASE_SOURCE 缺少必填项: " + ", ".join(missing_ob_source_keys)
+                )
         ensure_grant_role_alias_map_integrity()
 
         schemas_raw = settings.get('source_schemas', '')
@@ -6883,6 +7080,46 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault('config_hot_reload_mode', 'off')
         settings.setdefault('config_hot_reload_interval_sec', '5')
         settings.setdefault('config_hot_reload_fail_policy', 'keep_last_good')
+        settings.setdefault('source_db_mode', source_db_mode)
+
+        source_mode_diagnostics: List[str] = list(settings.get('_source_mode_diagnostics') or [])
+        if source_db_mode == SOURCE_DB_MODE_OCEANBASE:
+            if (settings.get('object_created_before') or '').strip():
+                raise ValueError("source_db_mode=oceanbase 当前不支持 object_created_before")
+            scope_mode_raw = normalize_source_object_scope_mode(
+                settings.get('source_object_scope_mode', 'full_source')
+            )
+            if scope_mode_raw != 'full_source':
+                raise ValueError(
+                    "source_db_mode=oceanbase 当前仅支持 source_object_scope_mode=full_source"
+                )
+            if parse_bool_flag(settings.get('generate_grants', 'true'), True):
+                settings['generate_grants'] = 'false'
+                source_mode_diagnostics.append(
+                    "source_db_mode=oceanbase：当前未启用 OB 源端授权生成，已自动关闭 generate_grants。"
+                )
+            if parse_bool_flag(settings.get('generate_fixup', 'true'), True):
+                source_mode_diagnostics.append(
+                    "source_db_mode=oceanbase：已启用 OB->OB fixup；当前仅放开 certified structural/code-object families，未认证对象族会转 deferred/manual。"
+                )
+            if parse_bool_flag(settings.get('check_object_usability', 'false'), False):
+                settings['check_object_usability'] = 'false'
+                settings['check_source_usability'] = 'false'
+                source_mode_diagnostics.append(
+                    "source_db_mode=oceanbase：当前未启用 source usability 探针，已自动关闭 check_object_usability/check_source_usability。"
+                )
+            if normalize_table_data_presence_check_mode(
+                settings.get('table_data_presence_check', 'auto')
+            ) != 'off':
+                settings['table_data_presence_check'] = 'off'
+                source_mode_diagnostics.append(
+                    "source_db_mode=oceanbase：当前未启用表数据存在性风险校验，已自动关闭 table_data_presence_check。"
+                )
+            if settings.get('blacklist_mode', 'auto').strip().lower() != 'disabled':
+                source_mode_diagnostics.append(
+                    "source_db_mode=oceanbase：Oracle blacklist 语义已禁用，相关配置仅保留不生效。"
+                )
+        settings['_source_mode_diagnostics'] = source_mode_diagnostics
 
         enabled_primary_types = parse_type_list(
             settings.get('check_primary_types', ''),
@@ -7407,7 +7644,11 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         except ValueError:
             OBC_TIMEOUT = 60
 
-        log.info(f"成功加载配置，将扫描 {len(schemas_list)} 个源 schema。")
+        log.info(
+            "成功加载配置，source_db_mode=%s，将扫描 %d 个源 schema。",
+            source_db_mode,
+            len(schemas_list)
+        )
         log.info(f"obclient 超时时间: {OBC_TIMEOUT} 秒")
         log.warning(
             "注意：程序将从 DBA_* 视图读取 Oracle/OceanBase 元数据，请确保运行账号具备 DBA/SELECT ANY DICTIONARY/SELECT_CATALOG_ROLE 等等价权限，否则结果将不完整。"
@@ -7421,10 +7662,15 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         abort_run()
 
 
-def validate_runtime_paths(settings: Dict, ob_cfg: ObConfig) -> None:
+def validate_runtime_paths(
+    settings: Dict,
+    ob_cfg: ObConfig,
+    source_ob_cfg: Optional[ObConfig] = None
+) -> None:
     """在正式连接前，对关键路径和依赖做友好校验与提示。"""
     errors: List[str] = []
     warnings: List[str] = []
+    source_db_mode = normalize_source_db_mode(settings.get("source_db_mode", SOURCE_DB_MODE_ORACLE))
 
     # obclient 可执行文件
     obclient_path = Path(ob_cfg.get('executable', '')).expanduser()
@@ -7434,6 +7680,19 @@ def validate_runtime_paths(settings: Dict, ob_cfg: ObConfig) -> None:
         )
     elif not os.access(obclient_path, os.X_OK):
         warnings.append(f"obclient 路径存在但不可执行: {obclient_path}，请检查权限。")
+
+    if source_db_mode == SOURCE_DB_MODE_OCEANBASE:
+        src_ob_cfg = source_ob_cfg or settings.get("source_ob_cfg") or {}
+        source_exec_path = Path(src_ob_cfg.get('executable', '')).expanduser()
+        if not source_exec_path.exists():
+            errors.append(
+                f"未找到 OceanBase 源端 obclient 可执行文件: {source_exec_path}。"
+                "请在 config.ini 的 [OCEANBASE_SOURCE] 中配置 executable 绝对路径。"
+            )
+        elif not os.access(source_exec_path, os.X_OK):
+            warnings.append(
+                f"OceanBase 源端 obclient 路径存在但不可执行: {source_exec_path}，请检查权限。"
+            )
 
     # remap 文件
     remap_file = settings.get('remap_file', '').strip()
@@ -7465,9 +7724,9 @@ def validate_runtime_paths(settings: Dict, ob_cfg: ObConfig) -> None:
                 f"blacklist_name_patterns_file 不存在: {patterns_file}（将仅使用 blacklist_name_patterns 内联关键字）。"
             )
 
-    # dbcat / JAVA_HOME 仅在生成 fixup 时提示
+    # dbcat / JAVA_HOME 仅在 Oracle source + generate_fixup 时提示
     generate_fixup_enabled = settings.get('generate_fixup', 'true').strip().lower() in ('true', '1', 'yes')
-    if generate_fixup_enabled:
+    if generate_fixup_enabled and source_db_mode == SOURCE_DB_MODE_ORACLE:
         dbcat_bin = settings.get('dbcat_bin', '').strip()
         if not dbcat_bin:
             warnings.append("generate_fixup 已开启，但未配置 dbcat_bin；如需生成订正 SQL，请在 [SETTINGS] 中填写 dbcat 目录或 bin/dbcat 路径。")
@@ -7537,7 +7796,7 @@ def run_config_wizard(config_path: Path) -> None:
     else:
         log.warning("未找到配置文件，将创建: %s", config_path)
 
-    for section in ("ORACLE_SOURCE", "OCEANBASE_TARGET", "SETTINGS"):
+    for section in ("ORACLE_SOURCE", "OCEANBASE_SOURCE", "OCEANBASE_TARGET", "SETTINGS"):
         if not cfg.has_section(section):
             cfg[section] = {}
 
@@ -7579,6 +7838,13 @@ def run_config_wizard(config_path: Path) -> None:
             return False, "路径不存在"
         if not os.access(path, os.X_OK):
             return False, "文件不可执行"
+        return True, ""
+
+    def _validate_source_db_mode(val: str) -> Tuple[bool, str]:
+        try:
+            normalize_source_db_mode(val)
+        except ValueError:
+            return False, "仅支持 oracle 或 oceanbase"
         return True, ""
 
     def _validate_sqlcl_path(p: str) -> Tuple[bool, str]:
@@ -7947,11 +8213,39 @@ def run_config_wizard(config_path: Path) -> None:
         return val or "true"
 
     print("\n=== 交互式配置向导 (空回车使用括号内默认值) ===")
+    source_db_mode = _prompt_field(
+        "SETTINGS",
+        "source_db_mode",
+        "源端数据库类型 (oracle/oceanbase)",
+        default=cfg.get("SETTINGS", "source_db_mode", fallback=SOURCE_DB_MODE_ORACLE),
+        validator=_validate_source_db_mode,
+        required=True,
+        transform=normalize_source_db_mode,
+    )
 
-    # ORACLE_SOURCE
-    _prompt_field("ORACLE_SOURCE", "user", "Oracle 用户 (ORACLE_SOURCE.user)", required=True)
-    _prompt_field("ORACLE_SOURCE", "password", "Oracle 密码 (ORACLE_SOURCE.password)", required=True)
-    _prompt_field("ORACLE_SOURCE", "dsn", "Oracle DSN (host:port/service_name)", required=True)
+    if source_db_mode == SOURCE_DB_MODE_ORACLE:
+        _prompt_field("ORACLE_SOURCE", "user", "Oracle 用户 (ORACLE_SOURCE.user)", required=True)
+        _prompt_field("ORACLE_SOURCE", "password", "Oracle 密码 (ORACLE_SOURCE.password)", required=True)
+        _prompt_field("ORACLE_SOURCE", "dsn", "Oracle DSN (host:port/service_name)", required=True)
+    else:
+        _prompt_field(
+            "OCEANBASE_SOURCE",
+            "executable",
+            "源端 obclient 可执行文件路径",
+            validator=_validate_exec_path,
+            required=True,
+        )
+        _prompt_field("OCEANBASE_SOURCE", "host", "源端 OceanBase 主机名/IP", required=True)
+        _prompt_field(
+            "OCEANBASE_SOURCE",
+            "port",
+            "源端 OceanBase 端口",
+            default="2883",
+            validator=_validate_positive_int,
+            required=True,
+        )
+        _prompt_field("OCEANBASE_SOURCE", "user_string", "源端 -u 参数（含租户/库）", required=True)
+        _prompt_field("OCEANBASE_SOURCE", "password", "源端 OceanBase 密码", required=True)
 
     # OCEANBASE_TARGET
     _prompt_field(
@@ -7974,13 +8268,14 @@ def run_config_wizard(config_path: Path) -> None:
     _prompt_field("OCEANBASE_TARGET", "password", "OceanBase 密码", required=True)
 
     # SETTINGS (关键路径与开关)
-    _prompt_field(
-        "SETTINGS",
-        "oracle_client_lib_dir",
-        "Oracle Instant Client 目录 (libclntsh.so 所在)",
-        validator=_validate_path_exists,
-        required=True,
-    )
+    if source_db_mode == SOURCE_DB_MODE_ORACLE:
+        _prompt_field(
+            "SETTINGS",
+            "oracle_client_lib_dir",
+            "Oracle Instant Client 目录 (libclntsh.so 所在)",
+            validator=_validate_path_exists,
+            required=True,
+        )
     _prompt_field(
         "SETTINGS",
         "source_schemas",
@@ -7997,7 +8292,11 @@ def run_config_wizard(config_path: Path) -> None:
         "SETTINGS",
         "generate_fixup",
         "是否生成目标端订正 SQL (true/false)",
-        default=cfg.get("SETTINGS", "generate_fixup", fallback="true"),
+        default=cfg.get(
+            "SETTINGS",
+            "generate_fixup",
+            fallback="true"
+        ),
         transform=_bool_transform,
     )
     _prompt_field(
@@ -11570,6 +11869,13 @@ def classify_missing_objects(
     """
     对缺失对象进行支持性分类，并输出支持/不支持/被阻断的统计与明细。
     """
+    if normalize_source_db_mode(settings.get("source_db_mode", SOURCE_DB_MODE_ORACLE)) == SOURCE_DB_MODE_OCEANBASE:
+        return classify_missing_objects_ob_source_mode(
+            settings,
+            tv_results,
+            extra_results,
+        )
+
     support_state_map: Dict[Tuple[str, str], ObjectSupportReportRow] = {}
     missing_detail_rows: List[ObjectSupportReportRow] = []
     unsupported_rows: List[ObjectSupportReportRow] = []
@@ -12408,6 +12714,161 @@ def classify_missing_objects(
     )
 
 
+def classify_missing_objects_ob_source_mode(
+    settings: Dict,
+    tv_results: ReportResults,
+    extra_results: Optional[ExtraCheckResults] = None,
+) -> SupportClassificationResult:
+    """
+    OB 源端缺失对象按 certified family 与 deferred family 分类。
+    - certified family: 标记为 SUPPORT/FIXUP
+    - deferred family: 标记为 risky/manual，避免误判成可自动修补
+    """
+    support_state_map: Dict[Tuple[str, str], ObjectSupportReportRow] = {}
+    missing_detail_rows: List[ObjectSupportReportRow] = []
+    unsupported_rows: List[ObjectSupportReportRow] = []
+    extra_missing_rows: List[ObjectSupportReportRow] = []
+    missing_support_counts: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: {"supported": 0, "unsupported": 0, "blocked": 0, "risky": 0}
+    )
+    reason_code = "OB_SOURCE_FIXUP_DEFERRED"
+    reason_text = "OceanBase source mode 当前对象族尚未通过自动修补认证，已转 deferred/manual"
+    action_text = "人工处理 / 等待后续 fixup 支持"
+
+    def _build_row(
+        obj_type_u: str,
+        src_full_u: str,
+        tgt_full_u: str,
+        *,
+        dependency: str = "-",
+        detail: str = "-",
+    ) -> ObjectSupportReportRow:
+        if is_ob_source_fixup_supported_type(obj_type_u):
+            missing_support_counts[obj_type_u]["supported"] += 1
+            return ObjectSupportReportRow(
+                obj_type=obj_type_u,
+                src_full=src_full_u,
+                tgt_full=tgt_full_u,
+                support_state=SUPPORT_STATE_SUPPORTED,
+                reason_code="-",
+                reason="-",
+                dependency=dependency or "-",
+                action="FIXUP",
+                detail=detail or "-",
+                root_cause="-",
+            )
+        missing_support_counts[obj_type_u]["risky"] += 1
+        return ObjectSupportReportRow(
+            obj_type=obj_type_u,
+            src_full=src_full_u,
+            tgt_full=tgt_full_u,
+            support_state=SUPPORT_STATE_RISKY,
+            reason_code=reason_code,
+            reason=reason_text,
+            dependency=dependency or "-",
+            action=action_text,
+            detail=detail or "-",
+            root_cause=f"{src_full_u}({reason_code})",
+        )
+
+    for obj_type, tgt_full, src_full in (tv_results.get("missing", []) or []):
+        obj_type_u = (obj_type or "").upper()
+        src_full_u = (src_full or "").upper()
+        tgt_full_u = (tgt_full or "").upper()
+        if not obj_type_u or not src_full_u or not tgt_full_u:
+            continue
+        row = _build_row(obj_type_u, src_full_u, tgt_full_u)
+        support_state_map[(obj_type_u, src_full_u)] = row
+        missing_detail_rows.append(row)
+        if row.support_state != SUPPORT_STATE_SUPPORTED:
+            unsupported_rows.append(row)
+
+    for item in (extra_results or {}).get("index_mismatched", []) or []:
+        table_full = (item.table.split()[0] if item.table else "").upper()
+        if "." not in table_full:
+            continue
+        src_schema, _src_table = table_full.split(".", 1)
+        for idx_name in sorted(item.missing_indexes or set()):
+            idx_u = (idx_name or "").upper()
+            if not idx_u:
+                continue
+            src_full_u = f"{src_schema}.{idx_u}"
+            row = _build_row("INDEX", src_full_u, src_full_u, dependency=table_full, detail="INDEX")
+            extra_missing_rows.append(row)
+            if row.support_state != SUPPORT_STATE_SUPPORTED:
+                unsupported_rows.append(row)
+
+    for item in (extra_results or {}).get("constraint_mismatched", []) or []:
+        table_full = (item.table.split()[0] if item.table else "").upper()
+        if "." not in table_full:
+            continue
+        src_schema, _src_table = table_full.split(".", 1)
+        for cons_name in sorted(item.missing_constraints or set()):
+            cons_u = (cons_name or "").upper()
+            if not cons_u:
+                continue
+            src_full_u = f"{src_schema}.{cons_u}"
+            row = _build_row("CONSTRAINT", src_full_u, src_full_u, dependency=table_full, detail="CONSTRAINT")
+            extra_missing_rows.append(row)
+            if row.support_state != SUPPORT_STATE_SUPPORTED:
+                unsupported_rows.append(row)
+
+    for item in (extra_results or {}).get("sequence_mismatched", []) or []:
+        src_schema = (item.src_schema or "").upper()
+        tgt_schema = (item.tgt_schema or src_schema).upper()
+        for seq_name in sorted(item.missing_sequences or set()):
+            seq_u = (seq_name or "").upper()
+            if not seq_u:
+                continue
+            src_full_u = f"{src_schema}.{seq_u}" if src_schema else seq_u
+            tgt_full_u = f"{tgt_schema}.{seq_u}" if tgt_schema else seq_u
+            row = _build_row("SEQUENCE", src_full_u, tgt_full_u, detail="SEQUENCE")
+            extra_missing_rows.append(row)
+            if row.support_state != SUPPORT_STATE_SUPPORTED:
+                unsupported_rows.append(row)
+
+    for item in (extra_results or {}).get("trigger_mismatched", []) or []:
+        table_full = (item.table.split()[0] if item.table else "").upper()
+        if "." not in table_full:
+            continue
+        src_schema, _src_table = table_full.split(".", 1)
+        if item.missing_mappings:
+            pairs = [
+                ((src_full or "").upper(), (tgt_full or "").upper())
+                for src_full, tgt_full in (item.missing_mappings or [])
+                if src_full and tgt_full and "." in src_full and "." in tgt_full
+            ]
+        else:
+            pairs = []
+            tgt_schema = src_schema
+            for trg_name in sorted(item.missing_triggers or set()):
+                src_owner_u, src_trg_u = normalize_trigger_identity(trg_name, None, src_schema)
+                if not src_trg_u:
+                    continue
+                src_owner_u = (src_owner_u or src_schema).upper()
+                src_full_u = f"{src_owner_u}.{src_trg_u}"
+                pairs.append((src_full_u, f"{tgt_schema}.{src_trg_u}"))
+        for src_full_u, tgt_full_u in pairs:
+            row = _build_row("TRIGGER", src_full_u, tgt_full_u, dependency=table_full, detail="TRIGGER")
+            extra_missing_rows.append(row)
+            if row.support_state != SUPPORT_STATE_SUPPORTED:
+                unsupported_rows.append(row)
+
+    return SupportClassificationResult(
+        support_state_map=support_state_map,
+        missing_detail_rows=missing_detail_rows,
+        unsupported_rows=unsupported_rows,
+        extra_missing_rows=extra_missing_rows,
+        missing_support_counts=dict(missing_support_counts),
+        extra_blocked_counts={},
+        unsupported_table_keys=set(),
+        unsupported_view_keys=set(),
+        view_compat_map={},
+        view_constraint_cleaned_rows=[],
+        view_constraint_uncleanable_rows=[],
+    )
+
+
 def init_oracle_client_from_settings(settings: Dict) -> None:
     """根据配置初始化 Oracle Thick Mode 并提示环境变量设置。"""
     client_dir = settings.get('oracle_client_lib_dir', '').strip()
@@ -13089,6 +13550,492 @@ def get_source_objects(
     return dict(source_objects), case_sensitive_findings
 
 
+def build_source_object_map_from_ob_metadata(
+    ob_meta: ObMetadata,
+    object_types: Optional[Set[str]] = None
+) -> SourceObjectMap:
+    enabled_types = {t.upper() for t in (object_types or set(ALL_TRACKED_OBJECT_TYPES))}
+    if not enabled_types:
+        enabled_types = set(ALL_TRACKED_OBJECT_TYPES)
+    source_objects: SourceObjectMap = defaultdict(set)
+    for obj_type, full_names in (ob_meta.objects_by_type or {}).items():
+        obj_type_u = (obj_type or "").upper()
+        if obj_type_u not in enabled_types:
+            continue
+        for full_name in (full_names or set()):
+            full_u = (full_name or "").upper()
+            if not full_u or "." not in full_u:
+                continue
+            source_objects[full_u].add(obj_type_u)
+    return dict(source_objects)
+
+
+def get_ob_source_objects(
+    ob_cfg: ObConfig,
+    schemas_list: List[str],
+    object_types: Optional[Set[str]] = None,
+    synonym_check_scope: str = "all",
+    case_sensitive_mode: str = "warn",
+) -> Tuple[SourceObjectMap, Tuple[CaseSensitiveIdentifierFinding, ...]]:
+    enabled_types = {t.upper() for t in (object_types or set(ALL_TRACKED_OBJECT_TYPES))}
+    enabled_types &= set(ALL_TRACKED_OBJECT_TYPES)
+    if not enabled_types:
+        enabled_types = set(ALL_TRACKED_OBJECT_TYPES)
+    source_schemas = {schema.upper() for schema in (schemas_list or []) if schema}
+    ob_meta = dump_ob_metadata(
+        ob_cfg,
+        source_schemas,
+        tracked_object_types=enabled_types,
+        synonym_check_scope=synonym_check_scope,
+        case_sensitive_mode=case_sensitive_mode,
+        include_tab_columns=False,
+        include_column_order=False,
+        include_indexes=False,
+        include_constraints=False,
+        include_triggers=False,
+        include_sequences=False,
+        include_comments=False,
+        include_roles=False,
+        target_table_pairs=set(),
+    )
+    return (
+        build_source_object_map_from_ob_metadata(ob_meta, enabled_types),
+        tuple(ob_meta.case_sensitive_findings or ())
+    )
+
+
+def adapt_ob_metadata_to_source_oracle_metadata(
+    ob_meta: ObMetadata,
+    loaded_schemas: Optional[Set[str]] = None
+) -> OracleMetadata:
+    loaded_schema_set: Set[str] = {s.upper() for s in (loaded_schemas or set()) if s}
+    loaded_schema_set.update(owner for owner, _table in (ob_meta.tab_columns or {}).keys())
+    loaded_schema_set.update(owner for owner, _table in (ob_meta.indexes or {}).keys())
+    loaded_schema_set.update(owner for owner, _table in (ob_meta.constraints or {}).keys())
+    loaded_schema_set.update(owner for owner, _table in (ob_meta.triggers or {}).keys())
+    loaded_schema_set.update((owner or "").upper() for owner in (ob_meta.sequences or {}).keys())
+    loaded_schema_set.update(owner for owner, _table in (ob_meta.table_comments or {}).keys())
+    loaded_schema_set.update(owner for owner, _table in (ob_meta.column_comments or {}).keys())
+    loaded_schema_set.update(owner for owner, _name, _obj_type in (ob_meta.object_statuses or {}).keys())
+    loaded_schema_set.update(owner for owner, _name, _err_type in (ob_meta.package_errors or {}).keys())
+    loaded_schema_set.update(owner for owner, _table in (ob_meta.partition_key_columns or {}).keys())
+    return OracleMetadata(
+        table_columns=dict(ob_meta.tab_columns or {}),
+        invisible_column_supported=bool(ob_meta.invisible_column_supported),
+        identity_column_supported=bool(ob_meta.identity_column_supported),
+        default_on_null_supported=bool(ob_meta.default_on_null_supported),
+        indexes=dict(ob_meta.indexes or {}),
+        constraints=dict(ob_meta.constraints or {}),
+        triggers=dict(ob_meta.triggers or {}),
+        sequences=dict(ob_meta.sequences or {}),
+        sequence_attrs=dict(ob_meta.sequence_attrs or {}),
+        table_comments=dict(ob_meta.table_comments or {}),
+        column_comments=dict(ob_meta.column_comments or {}),
+        comments_complete=bool(ob_meta.comments_complete),
+        blacklist_tables={},
+        object_privileges=[],
+        column_privileges=[],
+        sys_privileges=[],
+        role_privileges=[],
+        role_metadata={},
+        system_privilege_map=set(),
+        table_privilege_map=set(),
+        object_statuses=dict(ob_meta.object_statuses or {}),
+        package_errors=dict(ob_meta.package_errors or {}),
+        package_errors_complete=bool(ob_meta.package_errors_complete),
+        partition_key_columns=dict(ob_meta.partition_key_columns or {}),
+        interval_partitions={},
+        loaded_schemas=frozenset(sorted(loaded_schema_set)),
+        privilege_family_counts=(),
+        non_table_triggers=(),
+        temporary_tables=frozenset(ob_meta.temporary_tables or frozenset()),
+        identity_modes=dict(getattr(ob_meta, "identity_modes", {}) or {}),
+        default_on_null_columns=dict(getattr(ob_meta, "default_on_null_columns", {}) or {}),
+        identity_options=dict(getattr(ob_meta, "identity_options", {}) or {}),
+        nested_table_storage_tables={},
+    )
+
+
+def dump_source_metadata(
+    ora_cfg: OraConfig,
+    settings: Dict,
+    master_list: MasterCheckList,
+    include_indexes: bool = False,
+    include_constraints: bool = False,
+    include_triggers: bool = False,
+    include_sequences: bool = False,
+    include_comments: bool = False,
+    include_privileges: bool = False,
+    include_interval_partitions: bool = False,
+) -> OracleMetadata:
+    source_db_mode = normalize_source_db_mode(settings.get("source_db_mode", SOURCE_DB_MODE_ORACLE))
+    if source_db_mode == SOURCE_DB_MODE_ORACLE:
+        return dump_oracle_metadata(
+            ora_cfg,
+            master_list,
+            settings,
+            include_indexes=include_indexes,
+            include_constraints=include_constraints,
+            include_triggers=include_triggers,
+            include_sequences=include_sequences,
+            include_comments=include_comments,
+            include_privileges=include_privileges,
+            include_interval_partitions=include_interval_partitions,
+        )
+
+    source_ob_cfg = settings.get("source_ob_cfg") or {}
+    source_schemas = {
+        schema.upper()
+        for schema in (settings.get("source_schemas_list") or [])
+        if schema
+    }
+    if not source_schemas and master_list:
+        for src_full, _tgt_full, _obj_type in master_list:
+            parsed = parse_full_object_name(src_full)
+            if parsed:
+                source_schemas.add(parsed[0].upper())
+    tracked_types = {
+        (obj_type or "").upper()
+        for _src_full, _tgt_full, obj_type in (master_list or [])
+        if obj_type
+    }
+    if not tracked_types:
+        tracked_types = {"TABLE"}
+    ob_meta = dump_ob_metadata(
+        source_ob_cfg,
+        source_schemas,
+        tracked_object_types=tracked_types,
+        synonym_check_scope=settings.get('synonym_check_scope', 'public_only'),
+        case_sensitive_mode=settings.get('case_sensitive_identifier_mode', 'warn'),
+        include_tab_columns='TABLE' in tracked_types,
+        include_column_order=bool(settings.get("enable_column_order_check", False)),
+        include_indexes=include_indexes,
+        include_constraints=include_constraints,
+        include_triggers=include_triggers,
+        include_sequences=include_sequences,
+        include_comments=include_comments,
+        include_roles=False,
+        target_table_pairs=collect_table_pairs(master_list, use_target=False) if include_comments else set(),
+    )
+    return adapt_ob_metadata_to_source_oracle_metadata(ob_meta, source_schemas)
+
+
+def load_source_dependencies(
+    ora_cfg: OraConfig,
+    settings: Dict,
+    schemas_list: List[str],
+    object_types: Optional[Set[str]] = None,
+    include_external_refs: bool = False
+) -> List[DependencyRecord]:
+    source_db_mode = normalize_source_db_mode(settings.get("source_db_mode", SOURCE_DB_MODE_ORACLE))
+    if source_db_mode == SOURCE_DB_MODE_ORACLE:
+        return load_oracle_dependencies(
+            ora_cfg,
+            schemas_list,
+            object_types=object_types,
+            include_external_refs=include_external_refs,
+        )
+    return load_ob_source_dependencies(
+        settings.get("source_ob_cfg") or {},
+        schemas_list,
+        object_types=object_types,
+        include_external_refs=include_external_refs,
+    )
+
+
+def load_ob_source_synonym_metadata(
+    ob_cfg: ObConfig,
+    schemas_list: List[str],
+    allowed_terminal_source_schemas: Optional[Sequence[str]] = None,
+) -> Dict[Tuple[str, str], SynonymMeta]:
+    """
+    在 OceanBase 源端读取同义词元数据。
+    语义与 load_synonym_metadata 对齐，但走 obclient / DBA_SYNONYMS。
+    """
+    if not schemas_list:
+        return {}
+
+    allowed_targets = {
+        (item or "").strip().upper()
+        for item in (allowed_terminal_source_schemas or [])
+        if (item or "").strip()
+    }
+    owners = sorted(set(s.upper() for s in schemas_list) | {"PUBLIC"})
+    private_owners = [owner for owner in owners if owner != "PUBLIC"]
+    result: Dict[Tuple[str, str], SynonymMeta] = {}
+    skipped_public = 0
+
+    sql_private_tpl = """
+        SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME, DB_LINK
+        FROM DBA_SYNONYMS
+        WHERE OWNER IN ({owners_in})
+          AND TABLE_OWNER IS NOT NULL
+          AND TABLE_NAME IS NOT NULL
+    """
+    ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_private_tpl, private_owners)
+    if not ok:
+        log.warning("读取 OceanBase 源端同义词元数据失败(私有): %s", err)
+        lines = []
+    for line in lines:
+        parts = line.split('\t')
+        if len(parts) < 4:
+            continue
+        owner = normalize_public_owner(parts[0])
+        name = (parts[1] or "").strip().upper()
+        table_owner = normalize_public_owner(parts[2])
+        table_name = (parts[3] or "").strip().upper()
+        db_link = (parts[4] or "").strip().upper() if len(parts) > 4 and parts[4] else None
+        if not owner or not name or not table_name:
+            continue
+        result[(owner, name)] = SynonymMeta(
+            owner=owner,
+            name=name,
+            table_owner=table_owner or "",
+            table_name=table_name,
+            db_link=db_link,
+        )
+
+    if "PUBLIC" in owners:
+        if allowed_targets:
+            for target_chunk in chunk_list(sorted(allowed_targets), ORACLE_IN_BATCH_SIZE):
+                target_in = ",".join(sql_quote_literal(item) for item in target_chunk)
+                public_sql = f"""
+                    SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME, DB_LINK
+                    FROM DBA_SYNONYMS
+                    WHERE UPPER(OWNER) = 'PUBLIC'
+                      AND TABLE_OWNER IS NOT NULL
+                      AND TABLE_NAME IS NOT NULL
+                      AND (UPPER(TABLE_OWNER) IN ({target_in}) OR UPPER(TABLE_OWNER) = 'PUBLIC')
+                """
+                ok, out, err = obclient_run_sql(ob_cfg, public_sql, quiet_error=True)
+                if not ok:
+                    log.warning("读取 OceanBase 源端 PUBLIC 同义词失败: %s", err)
+                    continue
+                for line in (out or "").splitlines():
+                    parts = line.split('\t')
+                    if len(parts) < 4:
+                        continue
+                    owner = normalize_public_owner(parts[0])
+                    name = (parts[1] or "").strip().upper()
+                    table_owner = normalize_public_owner(parts[2])
+                    table_name = (parts[3] or "").strip().upper()
+                    db_link = (parts[4] or "").strip().upper() if len(parts) > 4 and parts[4] else None
+                    if not owner or not name or not table_name:
+                        continue
+                    result[(owner, name)] = SynonymMeta(
+                        owner=owner,
+                        name=name,
+                        table_owner=table_owner or "",
+                        table_name=table_name,
+                        db_link=db_link,
+                    )
+        else:
+            public_sql = """
+                SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME, DB_LINK
+                FROM DBA_SYNONYMS
+                WHERE UPPER(OWNER) = 'PUBLIC'
+                  AND TABLE_OWNER IS NOT NULL
+                  AND TABLE_NAME IS NOT NULL
+            """
+            ok, out, err = obclient_run_sql(ob_cfg, public_sql, quiet_error=True)
+            if not ok:
+                log.warning("读取 OceanBase 源端 PUBLIC 同义词失败: %s", err)
+            else:
+                for line in (out or "").splitlines():
+                    parts = line.split('\t')
+                    if len(parts) < 4:
+                        continue
+                    owner = normalize_public_owner(parts[0])
+                    name = (parts[1] or "").strip().upper()
+                    table_owner = normalize_public_owner(parts[2])
+                    table_name = (parts[3] or "").strip().upper()
+                    db_link = (parts[4] or "").strip().upper() if len(parts) > 4 and parts[4] else None
+                    if not owner or not name or not table_name:
+                        continue
+                    result[(owner, name)] = SynonymMeta(
+                        owner=owner,
+                        name=name,
+                        table_owner=table_owner or "",
+                        table_name=table_name,
+                        db_link=db_link,
+                    )
+
+    if allowed_targets:
+        relevant_public_keys, closure_public_keys = classify_public_synonym_scope(
+            result,
+            allowed_terminal_source_schemas=sorted(allowed_targets),
+        )
+        filtered_result: Dict[Tuple[str, str], SynonymMeta] = {}
+        for key, meta in result.items():
+            if (key[0] or "").upper() != "PUBLIC":
+                filtered_result[key] = meta
+                continue
+            if key in closure_public_keys or key in relevant_public_keys:
+                filtered_result[key] = meta
+                continue
+            skipped_public += 1
+        result = filtered_result
+
+    target_hint = ",".join(sorted(allowed_targets)) if allowed_targets else "<ALL>"
+    log.info(
+        "已缓存 %d 个 OceanBase 源端同义词元数据（OWNER IN %s，TABLE_OWNER IN %s，过滤无关 PUBLIC %d 个）。",
+        len(result),
+        ",".join(owners),
+        target_hint,
+        skipped_public,
+    )
+    return result
+
+
+def load_source_synonym_metadata(
+    ora_cfg: OraConfig,
+    settings: Dict,
+    schemas_list: List[str],
+    allowed_terminal_source_schemas: Optional[Sequence[str]] = None,
+) -> Dict[Tuple[str, str], SynonymMeta]:
+    source_db_mode = normalize_source_db_mode(settings.get("source_db_mode", SOURCE_DB_MODE_ORACLE))
+    if source_db_mode == SOURCE_DB_MODE_ORACLE:
+        return load_synonym_metadata(
+            ora_cfg,
+            schemas_list,
+            allowed_terminal_source_schemas=allowed_terminal_source_schemas,
+        )
+    return load_ob_source_synonym_metadata(
+        settings.get("source_ob_cfg") or {},
+        schemas_list,
+        allowed_terminal_source_schemas=allowed_terminal_source_schemas,
+    )
+
+
+def load_ob_source_parent_map(
+    ob_cfg: ObConfig,
+    schemas_list: List[str],
+    enabled_object_types: Optional[Set[str]] = None,
+    known_source_types: Optional[SourceObjectMap] = None,
+    diagnostic_rows: Optional[List[Tuple[str, str, str, str]]] = None,
+    synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]] = None,
+) -> "ObjectParentMap":
+    parent_map: ObjectParentMap = {}
+    enabled_types = {t.upper() for t in (enabled_object_types or set(ALL_TRACKED_OBJECT_TYPES))}
+    include_triggers = 'TRIGGER' in enabled_types
+    include_synonyms = 'SYNONYM' in enabled_types
+    include_indexes = 'INDEX' in enabled_types
+    include_constraints = 'CONSTRAINT' in enabled_types
+    owners = sorted({(item or "").upper() for item in (schemas_list or []) if item})
+
+    if include_triggers:
+        sql_tpl = """
+            SELECT OWNER, TRIGGER_NAME, TABLE_OWNER, TABLE_NAME
+            FROM DBA_TRIGGERS
+            WHERE OWNER IN ({owners_in})
+              AND TABLE_NAME IS NOT NULL
+              AND BASE_OBJECT_TYPE IN ('TABLE', 'VIEW')
+        """
+        ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners)
+        if not ok:
+            log.warning("获取 OceanBase 源端触发器父表映射失败: %s", err)
+        else:
+            for line in lines:
+                parts = line.split('\t')
+                if len(parts) < 4:
+                    continue
+                owner = normalize_public_owner(parts[0])
+                trigger_name = (parts[1] or "").strip().upper()
+                table_owner = normalize_public_owner(parts[2])
+                table_name = (parts[3] or "").strip().upper()
+                if owner and trigger_name and table_owner and table_name:
+                    parent_map[f"{owner}.{trigger_name}"] = f"{table_owner}.{table_name}"
+
+    if include_synonyms:
+        synonym_meta_map = synonym_meta or load_ob_source_synonym_metadata(
+            ob_cfg,
+            owners,
+            allowed_terminal_source_schemas=owners,
+        )
+        parent_map.update(
+            build_synonym_parent_map(
+                synonym_meta_map,
+                known_source_types=known_source_types,
+                diagnostic_rows=diagnostic_rows,
+            )
+        )
+
+    if include_indexes:
+        sql_tpl = """
+            SELECT TABLE_OWNER, TABLE_NAME, INDEX_NAME
+            FROM DBA_INDEXES
+            WHERE TABLE_OWNER IN ({owners_in})
+              AND TABLE_OWNER IS NOT NULL
+              AND TABLE_NAME IS NOT NULL
+        """
+        ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners)
+        if not ok:
+            log.warning("获取 OceanBase 源端索引父表映射失败: %s", err)
+        else:
+            for line in lines:
+                parts = line.split('\t')
+                if len(parts) < 3:
+                    continue
+                table_owner = normalize_public_owner(parts[0])
+                table_name = (parts[1] or "").strip().upper()
+                index_name = (parts[2] or "").strip().upper()
+                if table_owner and table_name and index_name:
+                    parent_map[f"{table_owner}.{index_name}"] = f"{table_owner}.{table_name}"
+
+    if include_constraints:
+        sql_tpl = """
+            SELECT OWNER, CONSTRAINT_NAME, TABLE_NAME
+            FROM DBA_CONSTRAINTS
+            WHERE OWNER IN ({owners_in})
+              AND TABLE_NAME IS NOT NULL
+        """
+        ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners)
+        if not ok:
+            log.warning("获取 OceanBase 源端约束父表映射失败: %s", err)
+        else:
+            for line in lines:
+                parts = line.split('\t')
+                if len(parts) < 3:
+                    continue
+                owner = normalize_public_owner(parts[0])
+                cons_name = (parts[1] or "").strip().upper()
+                table_name = (parts[2] or "").strip().upper()
+                if owner and cons_name and table_name:
+                    parent_map[f"{owner}.{cons_name}"] = f"{owner}.{table_name}"
+
+    if parent_map:
+        log.info("已获取 %d 个 OceanBase 源端依附对象父表映射。", len(parent_map))
+    return parent_map
+
+
+def load_source_parent_map(
+    ora_cfg: OraConfig,
+    settings: Dict,
+    schemas_list: List[str],
+    enabled_object_types: Optional[Set[str]] = None,
+    known_source_types: Optional[SourceObjectMap] = None,
+    diagnostic_rows: Optional[List[Tuple[str, str, str, str]]] = None,
+    synonym_meta: Optional[Dict[Tuple[str, str], SynonymMeta]] = None,
+) -> "ObjectParentMap":
+    source_db_mode = normalize_source_db_mode(settings.get("source_db_mode", SOURCE_DB_MODE_ORACLE))
+    if source_db_mode == SOURCE_DB_MODE_ORACLE:
+        return get_object_parent_tables(
+            ora_cfg,
+            schemas_list,
+            enabled_object_types=enabled_object_types,
+            known_source_types=known_source_types,
+            diagnostic_rows=diagnostic_rows,
+        )
+    return load_ob_source_parent_map(
+        settings.get("source_ob_cfg") or {},
+        schemas_list,
+        enabled_object_types=enabled_object_types,
+        known_source_types=known_source_types,
+        diagnostic_rows=diagnostic_rows,
+        synonym_meta=synonym_meta,
+    )
+
+
 # 依附对象到父表的映射类型（触发器/同义词等需要跟随父表 schema）
 ObjectParentMap = Dict[str, str]  # {SCHEMA.OBJECT_NAME: SCHEMA.TABLE_NAME}
 
@@ -13726,7 +14673,7 @@ def validate_remap_rules(
     source_objects: SourceObjectMap,
     remap_file_path: Optional[str] = None
 ) -> List[str]:
-    """检查 remap 规则中的源对象是否存在于 Oracle source_objects 中，并清洗无效条目。"""
+    """检查 remap 规则中的源对象是否存在于当前 source_objects 中，并清洗无效条目。"""
     log.info("正在验证 Remap 规则...")
     remap_keys = set(remap_rules.keys())
     source_keys = set(source_objects.keys())
@@ -13741,7 +14688,7 @@ def validate_remap_rules(
 
     if extraneous_keys:
         log.warning(f"  [规则警告] 在 remap_rules.txt 中发现了 {len(extraneous_keys)} 个无效的源对象。")
-        log.warning("  (这些对象在源端 Oracle (config.ini 中配置的 schema) 中未找到)")
+        log.warning("  (这些对象在当前源端受管范围中未找到)")
         for key in extraneous_keys:
             log.warning(f"    - 无效条目: {key}")
         # 将无效规则另存，不修改原始 remap 文件
@@ -22311,6 +23258,75 @@ def load_oracle_dependencies(
     return records
 
 
+def load_ob_source_dependencies(
+    ob_cfg: ObConfig,
+    schemas_list: List[str],
+    object_types: Optional[Set[str]] = None,
+    include_external_refs: bool = False
+) -> List[DependencyRecord]:
+    """
+    从 OceanBase 源端批量读取依赖关系，输出与 Oracle loader 相同的 DependencyRecord 列表。
+    """
+    if not schemas_list:
+        return []
+
+    owners = sorted({s.upper() for s in schemas_list})
+    enabled_types = {t.upper() for t in (object_types or set(ALL_TRACKED_OBJECT_TYPES))}
+    enabled_types &= set(ALL_TRACKED_OBJECT_TYPES)
+    if not enabled_types:
+        log.info("未启用依赖分析对象类型，跳过 OceanBase 源端依赖读取。")
+        return []
+    types_clause = ",".join(f"'{t}'" for t in sorted(enabled_types))
+    records: List[DependencyRecord] = []
+
+    if include_external_refs:
+        sql_tpl = f"""
+            SELECT OWNER, NAME, TYPE, REFERENCED_OWNER, REFERENCED_NAME, REFERENCED_TYPE
+            FROM DBA_DEPENDENCIES
+            WHERE OWNER IN ({{owners_in}})
+              AND TYPE IN ({types_clause})
+              AND REFERENCED_TYPE IN ({types_clause})
+        """
+        ok, lines, err = obclient_query_by_owner_chunks(ob_cfg, sql_tpl, owners)
+    else:
+        sql_tpl = f"""
+            SELECT OWNER, NAME, TYPE, REFERENCED_OWNER, REFERENCED_NAME, REFERENCED_TYPE
+            FROM DBA_DEPENDENCIES
+            WHERE OWNER IN ({{owners_in}})
+              AND REFERENCED_OWNER IN ({{ref_owners_in}})
+              AND TYPE IN ({types_clause})
+              AND REFERENCED_TYPE IN ({types_clause})
+        """
+        ok, lines, err = obclient_query_by_owner_pairs(ob_cfg, sql_tpl, owners, owners)
+    if not ok:
+        log.error("严重错误: 加载 OceanBase 源端依赖信息失败: %s", err)
+        abort_run()
+
+    for line in (lines or []):
+        parts = line.split('\t')
+        if len(parts) < 6:
+            continue
+        owner = normalize_public_owner(parts[0])
+        name = (parts[1] or '').strip().upper()
+        obj_type = (parts[2] or '').strip().upper()
+        ref_owner = normalize_public_owner(parts[3])
+        ref_name = (parts[4] or '').strip().upper()
+        ref_type = (parts[5] or '').strip().upper()
+        if not owner or not name or not ref_owner or not ref_name:
+            continue
+        records.append(DependencyRecord(
+            owner=owner,
+            name=name,
+            object_type=obj_type,
+            referenced_owner=ref_owner,
+            referenced_name=ref_name,
+            referenced_type=ref_type
+        ))
+
+    log.info("OceanBase 源端依赖信息加载完成，共 %d 条记录。", len(records))
+    return records
+
+
 def load_ob_dependencies(
     ob_cfg: ObConfig,
     target_schemas: Set[str],
@@ -25846,6 +26862,8 @@ def check_primary_objects(
     }
     column_order_mismatched: List[ColumnOrderMismatch] = results["column_order_mismatched"]
     column_order_skipped: List[Tuple[str, str]] = results["column_order_skipped"]
+    source_db_mode = normalize_source_db_mode((settings or {}).get("source_db_mode", SOURCE_DB_MODE_ORACLE))
+    strict_ob_compare = source_db_mode == SOURCE_DB_MODE_OCEANBASE
 
     visibility_policy = normalize_column_visibility_policy(
         (settings or {}).get("column_visibility_policy", "auto")
@@ -26317,6 +27335,27 @@ def check_primary_objects(
                                 "nullability_relax"
                             )
                         )
+
+                if strict_ob_compare:
+                    src_type_literal = normalize_column_type_for_compare(
+                        src_info,
+                        source_db_mode=source_db_mode
+                    )
+                    tgt_type_literal = normalize_column_type_for_compare(
+                        tgt_info,
+                        source_db_mode=source_db_mode
+                    )
+                    if src_type_literal != tgt_type_literal:
+                        type_mismatches.append(
+                            ColumnTypeIssue(
+                                col_name,
+                                src_type_literal or "UNKNOWN",
+                                tgt_type_literal or "UNKNOWN",
+                                src_type_literal or "UNKNOWN",
+                                "type_literal_mismatch"
+                            )
+                        )
+                    continue
 
                 if is_long_type(src_dtype):
                     expected_type = map_long_type_to_ob(src_dtype)
@@ -30366,6 +31405,17 @@ def collect_oracle_env_info(ora_cfg: OraConfig) -> Dict[str, str]:
     return info
 
 
+def collect_source_env_info(
+    settings: Dict,
+    ora_cfg: OraConfig,
+    source_ob_cfg: Optional[ObConfig] = None
+) -> Tuple[str, Dict[str, str]]:
+    source_db_mode = normalize_source_db_mode(settings.get("source_db_mode", SOURCE_DB_MODE_ORACLE))
+    if source_db_mode == SOURCE_DB_MODE_OCEANBASE:
+        return SOURCE_DB_MODE_OCEANBASE, collect_ob_env_info(source_ob_cfg or settings.get("source_ob_cfg") or {})
+    return SOURCE_DB_MODE_ORACLE, collect_oracle_env_info(ora_cfg)
+
+
 def parse_ob_status_output(output: str) -> Dict[str, str]:
     """解析 obclient status 输出中的关键信息。"""
     info: Dict[str, str] = {}
@@ -34232,6 +35282,238 @@ def oracle_get_ddl_batch(
     return results
 
 
+def ob_get_ddl(
+    ob_cfg: ObConfig,
+    obj_type: str,
+    owner: str,
+    name: str,
+) -> Optional[str]:
+    obj_type_norm = DDL_OBJ_TYPE_MAPPING.get((obj_type or "").upper(), (obj_type or "").upper())
+    sql = (
+        "SELECT DBMS_METADATA.GET_DDL({obj_type}, {obj_name}, {owner_name}) FROM DUAL"
+    ).format(
+        obj_type=sql_quote_literal(obj_type_norm),
+        obj_name=sql_quote_literal((name or "").upper()),
+        owner_name=sql_quote_literal((owner or "").upper()),
+    )
+    ok, out, err = obclient_run_sql(ob_cfg, sql, quiet_error=True)
+    if not ok:
+        log.info("[DDL] 读取 OceanBase 源端 DDL 失败 %s.%s (%s): %s", owner, name, obj_type, err)
+        return None
+    ddl_text = str(out or "").strip()
+    return ddl_text or None
+
+
+def ob_get_ddl_batch(
+    ob_cfg: ObConfig,
+    objects: List[Tuple[str, str, str]],
+) -> Dict[Tuple[str, str, str], str]:
+    results: Dict[Tuple[str, str, str], str] = {}
+    for schema, obj_type, obj_name in (objects or []):
+        ddl = ob_get_ddl(ob_cfg, obj_type, schema, obj_name)
+        if ddl:
+            results[(schema.upper(), obj_type.upper(), obj_name.upper())] = ddl
+    return results
+
+
+def ob_get_view_text(
+    ob_cfg: ObConfig,
+    owner: str,
+    name: str,
+) -> Optional[Tuple[str, str, str]]:
+    owner_u = (owner or "").upper()
+    name_u = (name or "").upper()
+    sql_candidates = [
+        """
+        SELECT
+            REPLACE(REPLACE(REPLACE(TEXT, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS TEXT,
+            READ_ONLY,
+            CHECK_OPTION
+        FROM DBA_VIEWS
+        WHERE OWNER = {owner_name} AND VIEW_NAME = {view_name}
+        """,
+        """
+        SELECT
+            REPLACE(REPLACE(REPLACE(TEXT, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS TEXT,
+            READ_ONLY,
+            '' AS CHECK_OPTION
+        FROM DBA_VIEWS
+        WHERE OWNER = {owner_name} AND VIEW_NAME = {view_name}
+        """,
+    ]
+    owner_name = sql_quote_literal(owner_u)
+    view_name = sql_quote_literal(name_u)
+    for sql_tpl in sql_candidates:
+        sql = sql_tpl.format(owner_name=owner_name, view_name=view_name)
+        ok, out, err = obclient_run_sql(ob_cfg, sql, quiet_error=True)
+        if not ok:
+            continue
+        for raw in (out or "").splitlines():
+            parts = raw.split('\t')
+            if not parts or not parts[0].strip():
+                continue
+            text = str(parts[0] or "")
+            read_only = (parts[1] or "").strip().upper() if len(parts) > 1 else ""
+            check_option = (parts[2] or "").strip().upper() if len(parts) > 2 else ""
+            return text, read_only, check_option
+    return None
+
+
+def ob_get_source_text(
+    ob_cfg: ObConfig,
+    obj_type: str,
+    owner: str,
+    name: str,
+) -> Optional[str]:
+    owner_u = (owner or "").upper()
+    name_u = (name or "").upper()
+    obj_type_u = (obj_type or "").upper()
+    sql = """
+        SELECT LINE,
+               REPLACE(REPLACE(REPLACE(TEXT, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ')
+        FROM DBA_SOURCE
+        WHERE OWNER = {owner_name}
+          AND NAME = {object_name}
+          AND TYPE = {object_type}
+        ORDER BY LINE
+    """.format(
+        owner_name=sql_quote_literal(owner_u),
+        object_name=sql_quote_literal(name_u),
+        object_type=sql_quote_literal(obj_type_u),
+    )
+    ok, out, err = obclient_run_sql(ob_cfg, sql, quiet_error=True)
+    if not ok:
+        log.info("[DDL] 读取 OceanBase 源端 DBA_SOURCE 失败 %s.%s (%s): %s", owner, name, obj_type, err)
+        return None
+    lines: List[str] = []
+    for raw in (out or "").splitlines():
+        parts = raw.split('\t', 1)
+        if len(parts) < 2:
+            continue
+        text_line = str(parts[1] or "").rstrip()
+        lines.append(text_line)
+    text = "\n".join(lines).strip()
+    return text or None
+
+
+def build_source_text_object_ddl(
+    obj_type: str,
+    owner: str,
+    name: str,
+    source_text: str,
+) -> Optional[str]:
+    text = str(source_text or "").strip()
+    if not text:
+        return None
+    obj_type_u = (obj_type or "").upper()
+    normalized = text
+    if not re.match(r'^\s*CREATE\b', normalized, flags=re.IGNORECASE):
+        normalized = f"CREATE OR REPLACE {normalized}"
+    if obj_type_u in {"PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE BODY", "TRIGGER", "TYPE", "TYPE BODY"}:
+        normalized = _strip_trailing_ddl_delimiters(normalized)
+        if not normalized:
+            return None
+        return normalized.rstrip() + "\n/"
+    return _ensure_statement_terminated(normalized)
+
+
+def build_ob_source_sequence_ddl(
+    oracle_meta: OracleMetadata,
+    owner: str,
+    seq_name: str,
+) -> Optional[str]:
+    owner_u = (owner or "").upper()
+    seq_u = (seq_name or "").upper()
+    attrs = ((oracle_meta.sequence_attrs or {}).get(owner_u) or {}).get(seq_u) or {}
+    if owner_u and seq_u:
+        parts = [f"CREATE SEQUENCE {quote_qualified_parts(owner_u, seq_u)}"]
+        increment_by = attrs.get("increment_by")
+        min_value = attrs.get("min_value")
+        max_value = attrs.get("max_value")
+        cache_size = attrs.get("cache_size")
+        cycle_flag = str(attrs.get("cycle_flag") or "").upper()
+        order_flag = str(attrs.get("order_flag") or "").upper()
+        if increment_by is not None:
+            parts.append(f"INCREMENT BY {int(increment_by)}")
+        if min_value is not None:
+            parts.append(f"MINVALUE {int(min_value)}")
+        if max_value is not None:
+            parts.append(f"MAXVALUE {int(max_value)}")
+        if cache_size is not None:
+            parts.append(f"CACHE {int(cache_size)}")
+        if cycle_flag == "Y":
+            parts.append("CYCLE")
+        elif cycle_flag:
+            parts.append("NOCYCLE")
+        if order_flag == "Y":
+            parts.append("ORDER")
+        elif order_flag:
+            parts.append("NOORDER")
+        return _ensure_statement_terminated(" ".join(parts))
+    return None
+
+
+def build_ob_source_table_ddl_from_metadata(
+    oracle_meta: OracleMetadata,
+    owner: str,
+    table_name: str,
+) -> Optional[str]:
+    owner_u = (owner or "").upper()
+    table_u = (table_name or "").upper()
+    col_meta = (oracle_meta.table_columns or {}).get((owner_u, table_u)) or {}
+    if not col_meta:
+        return None
+    lines: List[str] = []
+    for col_name in sorted(
+        col_meta.keys(),
+        key=lambda item: int(col_meta[item].get("column_id") or 0) if str(col_meta[item].get("column_id") or "").isdigit() else 0
+    ):
+        info = col_meta.get(col_name) or {}
+        col_u = (col_name or "").upper()
+        if is_ignored_source_column(col_u, info):
+            continue
+        col_type = format_oracle_column_type(info, prefer_ob_varchar=True)
+        line = f"  {quote_identifier(col_u)} {col_type}"
+        default_val = info.get("data_default")
+        if default_val is not None:
+            default_str = str(default_val).strip()
+            if default_str:
+                line += f" DEFAULT {default_str}"
+        if normalize_nullable_flag(info.get("nullable")) == "N":
+            line += " NOT NULL"
+        lines.append(line)
+    if not lines:
+        return None
+    ddl = "CREATE TABLE {table_full} (\n{cols}\n)".format(
+        table_full=quote_qualified_parts(owner_u, table_u),
+        cols=",\n".join(lines),
+    )
+    return _ensure_statement_terminated(ddl)
+
+
+def fetch_ob_source_schema_objects(
+    ob_cfg: ObConfig,
+    schema_requests: Dict[str, Dict[str, Set[str]]],
+) -> Tuple[Dict[str, Dict[str, Dict[str, str]]], Dict[Tuple[str, str, str], Tuple[str, float]]]:
+    results: Dict[str, Dict[str, Dict[str, str]]] = {}
+    source_meta: Dict[Tuple[str, str, str], Tuple[str, float]] = {}
+    for schema in sorted(schema_requests.keys()):
+        type_map = schema_requests.get(schema) or {}
+        for obj_type, names in sorted(type_map.items()):
+            for obj_name in sorted(names):
+                start_time = time.time()
+                ddl = ob_get_ddl(ob_cfg, obj_type, schema, obj_name)
+                if not ddl:
+                    continue
+                elapsed = time.time() - start_time
+                schema_u = schema.upper()
+                obj_type_u = obj_type.upper()
+                obj_name_u = obj_name.upper()
+                results.setdefault(schema_u, {}).setdefault(obj_type_u, {})[obj_name_u] = ddl
+                source_meta[(schema_u, obj_type_u, obj_name_u)] = ("ob_dbms_metadata", elapsed)
+    return results, source_meta
+
+
 def adjust_ddl_for_object(
     ddl: str,
     src_schema: str,
@@ -36245,7 +37527,9 @@ def apply_ddl_cleanup_rules(ddl: str, obj_type: str) -> str:
 
 def apply_ddl_cleanup_rules_with_audit(
     ddl: str,
-    obj_type: str
+    obj_type: str,
+    *,
+    source_db_mode: str = SOURCE_DB_MODE_ORACLE,
 ) -> Tuple[str, List[DdlCleanupAction]]:
     """
     根据对象类型应用相应的DDL清理规则
@@ -36261,6 +37545,7 @@ def apply_ddl_cleanup_rules_with_audit(
         return ddl, []
     
     obj_type_upper = obj_type.upper()
+    source_db_mode_n = normalize_source_db_mode(source_db_mode)
     protected_ddl = protect_type_not_persistable_clause(ddl, obj_type_upper)
     
     # 确定使用哪套规则（先快照，避免并发修改字典导致迭代异常）
@@ -36273,6 +37558,16 @@ def apply_ddl_cleanup_rules_with_audit(
         # 如果没有匹配的规则，使用通用规则
         if not rules_to_apply:
             rules_to_apply = list(DDL_CLEANUP_RULES['GENERAL_OBJECTS']['rules'])
+
+    if source_db_mode_n == SOURCE_DB_MODE_OCEANBASE:
+        rules_to_apply = [
+            rule_func
+            for rule_func in rules_to_apply
+            if rule_func not in {
+                rewrite_unsupported_table_oracle_types,
+                clean_interval_partition_clause,
+            }
+        ]
     
     # 依次应用所有规则
     cleaned_ddl = protected_ddl
@@ -37880,6 +39175,18 @@ def format_oracle_column_type(
     return apply_varchar_pref(dt)
 
 
+def normalize_column_type_for_compare(
+    info: Dict,
+    *,
+    source_db_mode: str = SOURCE_DB_MODE_ORACLE
+) -> str:
+    prefer_ob_varchar = normalize_source_db_mode(source_db_mode) == SOURCE_DB_MODE_OCEANBASE
+    return format_oracle_column_type(
+        info,
+        prefer_ob_varchar=prefer_ob_varchar
+    ).strip().upper()
+
+
 def inflate_table_varchar_lengths(
     ddl: str,
     src_schema: str,
@@ -37963,6 +39270,7 @@ def generate_alter_for_table_columns(
     drop_sys_c_columns: bool = False,
     plain_not_null_fixup_mode: str = "runnable_if_no_nulls",
     plain_not_null_probe_results: Optional[Dict[str, Tuple[Optional[bool], str]]] = None,
+    source_db_mode: str = SOURCE_DB_MODE_ORACLE,
 ) -> Optional[str]:
     """
     为一个具体的表生成 ALTER TABLE 脚本：
@@ -38007,7 +39315,7 @@ def generate_alter_for_table_columns(
             virtual_expr = info.get("virtual_expr") if is_virtual else None
             override_len = None
             dtype = (info.get("data_type") or "").upper()
-            if dtype in ("VARCHAR2", "VARCHAR"):
+            if dtype in ("VARCHAR2", "VARCHAR") and normalize_source_db_mode(source_db_mode) == SOURCE_DB_MODE_ORACLE:
                 src_len = info.get("char_length") or info.get("data_length")
                 try:
                     src_len_int = int(src_len)
@@ -38112,7 +39420,7 @@ def generate_alter_for_table_columns(
             info = col_details.get(col_name)
             if not info:
                 continue
-            if issue_type in ("long_type", "number_precision"):
+            if issue_type in ("long_type", "number_precision", "type_literal_mismatch"):
                 lines.append(
                     f"ALTER TABLE {table_full} "
                     f"MODIFY ({col_name.upper()} {expected_type}); "
@@ -39359,6 +40667,8 @@ def generate_fixup_scripts(
 
     如果配置了 trigger_list，则仅生成清单中列出的触发器脚本。
     """
+    source_db_mode = normalize_source_db_mode(settings.get("source_db_mode", SOURCE_DB_MODE_ORACLE))
+    source_ob_cfg = settings.get("source_ob_cfg") or {}
     try:
         progress_log_interval = float(settings.get('progress_log_interval', 10))
     except (TypeError, ValueError):
@@ -39737,9 +41047,19 @@ def generate_fixup_scripts(
     ddl_source_stats: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
     ddl_source_lock = threading.Lock()
 
+    def _source_bucket(label: str) -> str:
+        label_u = (label or "").upper()
+        if label_u.startswith("DBCAT"):
+            return "dbcat"
+        if label_u.startswith("OB_"):
+            return label.lower()
+        if label_u in {"DBMS_METADATA", "DBA_VIEWS", "VIEW_CACHE", "META_SYN"}:
+            return "fallback"
+        return label.lower() if label else "missing"
+
     def mark_source(obj_type: str, source: str) -> None:
         with ddl_source_lock:
-            ddl_source_stats[obj_type.upper()][source] += 1
+            ddl_source_stats[obj_type.upper()][_source_bucket(source)] += 1
 
     ddl_clean_records: List[DdlCleanReportRow] = []
     ddl_clean_lock = threading.Lock()
@@ -39792,7 +41112,11 @@ def generate_fixup_scripts(
         seed_actions: Optional[List[DdlCleanupAction]] = None,
         sanitize_punctuation: bool = False,
     ) -> Tuple[str, Optional[List[str]], List[DdlCleanupAction]]:
-        cleaned_ddl, cleanup_actions = apply_ddl_cleanup_rules_with_audit(ddl_text, obj_type)
+        cleaned_ddl, cleanup_actions = apply_ddl_cleanup_rules_with_audit(
+            ddl_text,
+            obj_type,
+            source_db_mode=source_db_mode,
+        )
         actions = list(seed_actions or [])
         actions.extend(cleanup_actions)
         extra_comments = build_ddl_cleanup_extra_comments(actions)
@@ -40048,15 +41372,21 @@ def generate_fixup_scripts(
         if ddl:
             meta = ddl_source_meta.get(key)
             if meta:
-                source_label = "DBCAT_CACHE" if meta[0] == "cache" else "DBCAT_RUN"
-                # 对于缓存，使用实际读取耗时；对于dbcat_run，使用记录的平均耗时
-                if meta[0] == "cache":
+                meta_source = str(meta[0] or "").strip().lower()
+                if meta_source == "cache":
+                    source_label = "DBCAT_CACHE"
                     elapsed_hint = time.time() - start_time
+                elif meta_source == "dbcat_run":
+                    source_label = "DBCAT_RUN"
+                    elapsed_hint = meta[1]
+                elif meta_source == "ob_dbms_metadata":
+                    source_label = "OB_DBMS_METADATA"
+                    elapsed_hint = meta[1]
                 else:
+                    source_label = str(meta[0] or "DDL_PROVIDER").upper()
                     elapsed_hint = meta[1]
             else:
-                # DDL存在但无元数据，可能是缓存部分加载
-                source_label = "DBCAT"
+                source_label = "DBCAT" if source_db_mode == SOURCE_DB_MODE_ORACLE else "OB_DDL_PROVIDER"
                 elapsed_hint = time.time() - start_time
         else:
             ddl, fallback_source = get_fallback_ddl(schema, obj_type, obj_name)
@@ -40574,6 +41904,11 @@ def generate_fixup_scripts(
     schema_requests: Dict[str, Dict[str, Set[str]]] = defaultdict(lambda: defaultdict(set))
     unsupported_types: Set[str] = set()
     public_synonym_fallback: Set[Tuple[str, str]] = set()
+    source_request_supported_types: Set[str] = (
+        set(DBCAT_OPTION_MAP.keys())
+        if source_db_mode == SOURCE_DB_MODE_ORACLE
+        else set(BATCH_DDL_ALLOWED_TYPES)
+    )
 
     def _trigger_allowed(src_full: Optional[str], tgt_full: Optional[str]) -> bool:
         if not trigger_filter_enabled:
@@ -40594,7 +41929,7 @@ def generate_fixup_scripts(
         if schema_u == 'PUBLIC' and obj_type_u == 'SYNONYM':
             public_synonym_fallback.add((schema_u, obj_name_u))
             return
-        if obj_type_u not in DBCAT_OPTION_MAP:
+        if obj_type_u not in source_request_supported_types:
             unsupported_types.add(obj_type_u)
             return
         schema_requests[schema_u][obj_type_u].add(obj_name_u)
@@ -41407,7 +42742,10 @@ def generate_fixup_scripts(
         else:
             log.info("VIEW fixup 依赖链输出已跳过（无链路或写入失败）。")
 
-    dbcat_data, ddl_source_meta = fetch_dbcat_schema_objects(ora_cfg, settings, schema_requests)
+    if source_db_mode == SOURCE_DB_MODE_ORACLE:
+        dbcat_data, ddl_source_meta = fetch_dbcat_schema_objects(ora_cfg, settings, schema_requests)
+    else:
+        dbcat_data, ddl_source_meta = fetch_ob_source_schema_objects(source_ob_cfg, schema_requests)
 
     # 预取所有可能需要 fallback 的 DDL（dbcat 未命中的对象）
     fallback_ddl_cache: Dict[Tuple[str, str, str], str] = {}
@@ -41440,8 +42778,12 @@ def generate_fixup_scripts(
     
     # 批量预取
     if fallback_needed:
-        log.info("[FIXUP] 预取 %d 个可能需要 DBMS_METADATA 兜底的对象...", len(fallback_needed))
-        fallback_ddl_cache = oracle_get_ddl_batch(ora_cfg, fallback_needed)
+        if source_db_mode == SOURCE_DB_MODE_ORACLE:
+            log.info("[FIXUP] 预取 %d 个可能需要 DBMS_METADATA 兜底的对象...", len(fallback_needed))
+            fallback_ddl_cache = oracle_get_ddl_batch(ora_cfg, fallback_needed)
+        else:
+            log.info("[FIXUP] 预取 %d 个可能需要 OceanBase source provider 兜底的对象...", len(fallback_needed))
+            fallback_ddl_cache = ob_get_ddl_batch(source_ob_cfg, fallback_needed)
 
     oracle_conn = None
     oracle_conn_lock = threading.Lock()
@@ -41453,16 +42795,43 @@ def generate_fixup_scripts(
     def get_fallback_ddl(schema: str, obj_type: str, obj_name: str) -> Tuple[Optional[str], str]:
         """当 dbcat 缺失 DDL 时尝试使用 DBMS_METADATA 兜底，优先使用预取缓存。"""
         nonlocal oracle_conn
+        cache_key = (schema.upper(), obj_type.upper(), obj_name.upper())
+        if cache_key in fallback_ddl_cache:
+            return (
+                fallback_ddl_cache[cache_key],
+                "DBMS_METADATA" if source_db_mode == SOURCE_DB_MODE_ORACLE else "OB_DBMS_METADATA",
+            )
+
+        if source_db_mode == SOURCE_DB_MODE_OCEANBASE:
+            obj_type_u = (obj_type or "").upper()
+            if obj_type_u == "VIEW":
+                view_text = ob_get_view_text(source_ob_cfg, schema, obj_name)
+                if view_text:
+                    ddl = build_view_ddl_from_text(schema, obj_name, *view_text)
+                    if ddl:
+                        return ddl, "OB_DBA_VIEWS"
+            if obj_type_u in {'PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY', 'TRIGGER', 'TYPE', 'TYPE BODY'}:
+                source_text = ob_get_source_text(source_ob_cfg, obj_type_u, schema, obj_name)
+                ddl = build_source_text_object_ddl(obj_type_u, schema, obj_name, source_text or "")
+                if ddl:
+                    return ddl, "OB_SOURCE_TEXT"
+            if obj_type_u == "SEQUENCE":
+                ddl = build_ob_source_sequence_ddl(oracle_meta, schema, obj_name)
+                if ddl:
+                    return ddl, "OB_SEQUENCE_META"
+            if obj_type_u == "TABLE":
+                ddl = build_ob_source_table_ddl_from_metadata(oracle_meta, schema, obj_name)
+                if ddl:
+                    return ddl, "OB_TABLE_META"
+            ddl = ob_get_ddl(source_ob_cfg, obj_type_u, schema, obj_name)
+            if ddl:
+                return ddl, "OB_DBMS_METADATA"
+            return None, "MISSING"
+
         allowed_types = BATCH_DDL_ALLOWED_TYPES
         if obj_type.upper() not in allowed_types:
             return None, "MISSING"
 
-        # 优先使用预取缓存 (DBMS_METADATA)
-        cache_key = (schema.upper(), obj_type.upper(), obj_name.upper())
-        if cache_key in fallback_ddl_cache:
-            return fallback_ddl_cache[cache_key], "DBMS_METADATA"
-
-        # 缓存未命中，单独获取（兜底）
         with oracle_conn_lock:
             try:
                 if oracle_conn is None:
@@ -41570,12 +42939,7 @@ def generate_fixup_scripts(
                     log.warning("[FIXUP] 未找到 SEQUENCE %s.%s 的 dbcat DDL。", ss, sn)
                     mark_source('SEQUENCE', 'missing')
                     return
-                if ddl_source_label.startswith("DBCAT"):
-                    mark_source('SEQUENCE', 'dbcat')
-                elif ddl_source_label in ("DBMS_METADATA", "DBA_VIEWS"):
-                    mark_source('SEQUENCE', 'fallback')
-                else:
-                    mark_source('SEQUENCE', 'missing')
+                mark_source('SEQUENCE', ddl_source_label or 'missing')
                 ddl_adj = adjust_ddl_for_object(
                     ddl,
                     ss,
@@ -41733,7 +43097,7 @@ def generate_fixup_scripts(
                     progress_label = "missing"
                     return
                 # 如果 dbcat 返回 unsupported，尝试 DBMS_METADATA 兜底，直接暴露给用户
-                if _is_dbcat_unsupported_table(ddl):
+                if ddl_source_label.startswith("DBCAT") and _is_dbcat_unsupported_table(ddl):
                     fallback_ddl, fallback_label = get_fallback_ddl(ss, 'TABLE', st)
                     if fallback_ddl:
                         ddl = fallback_ddl
@@ -41742,12 +43106,7 @@ def generate_fixup_scripts(
                         log.info("[FIXUP] TABLE %s.%s 的 dbcat DDL 为 unsupported，已使用 %s 兜底。", ss, st, fallback_label)
                     else:
                         log.warning("[FIXUP] TABLE %s.%s 的 dbcat DDL 为 unsupported，DBMS_METADATA 兜底失败，仍输出原始 DDL 供人工处理。", ss, st)
-                if ddl_source_label.startswith("DBCAT"):
-                    mark_source('TABLE', 'dbcat')
-                elif ddl_source_label in ("DBMS_METADATA", "DBA_VIEWS"):
-                    mark_source('TABLE', 'fallback')
-                else:
-                    mark_source('TABLE', 'missing')
+                mark_source('TABLE', ddl_source_label or 'missing')
                 ddl_adj = adjust_ddl_for_object(
                     ddl,
                     ss,
@@ -41760,12 +43119,17 @@ def generate_fixup_scripts(
                 table_extra_comments: List[str] = []
                 src_table_key = (ss.upper(), st.upper())
                 gtt_mode = normalize_gtt_table_handling_mode(settings.get("gtt_table_handling_mode", "rewrite_to_normal"))
-                if src_table_key in {
-                    (str(owner).upper(), str(table).upper())
-                    for owner, table in (getattr(oracle_meta, "temporary_tables", set()) or set())
-                } and gtt_mode in {"rewrite_to_normal", "preserve_original"}:
+                if (
+                    source_db_mode == SOURCE_DB_MODE_ORACLE
+                    and src_table_key in {
+                        (str(owner).upper(), str(table).upper())
+                        for owner, table in (getattr(oracle_meta, "temporary_tables", set()) or set())
+                    }
+                    and gtt_mode in {"rewrite_to_normal", "preserve_original"}
+                ):
                     ddl_adj, table_extra_comments = apply_gtt_table_ddl_handling(ddl_adj, gtt_mode)
-                ddl_adj = inflate_table_varchar_lengths(ddl_adj, ss, st, oracle_meta)
+                if source_db_mode == SOURCE_DB_MODE_ORACLE:
+                    ddl_adj = inflate_table_varchar_lengths(ddl_adj, ss, st, oracle_meta)
                 ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
                 ddl_adj = prepend_set_schema(ddl_adj, ts)
                 ddl_adj = normalize_ddl_for_ob(ddl_adj)
@@ -41890,7 +43254,7 @@ def generate_fixup_scripts(
                             extra_comments=build_support_comments(sr),
                         )
                         return
-                    if _is_dbcat_unsupported_table(ddl):
+                    if ddl_source_label.startswith("DBCAT") and _is_dbcat_unsupported_table(ddl):
                         fallback_ddl, fallback_label = get_fallback_ddl(ss, 'TABLE', st)
                         if fallback_ddl:
                             ddl = fallback_ddl
@@ -41899,12 +43263,7 @@ def generate_fixup_scripts(
                             log.info("[FIXUP] TABLE %s.%s 的 dbcat DDL 为 unsupported，已使用 %s 兜底。", ss, st, fallback_label)
                         else:
                             log.warning("[FIXUP] TABLE %s.%s 的 dbcat DDL 为 unsupported，DBMS_METADATA 兜底失败，仍输出原始 DDL 供人工处理。", ss, st)
-                    if ddl_source_label.startswith("DBCAT"):
-                        mark_source('TABLE', 'dbcat')
-                    elif ddl_source_label in ("DBMS_METADATA", "DBA_VIEWS"):
-                        mark_source('TABLE', 'fallback')
-                    else:
-                        mark_source('TABLE', 'missing')
+                    mark_source('TABLE', ddl_source_label or 'missing')
                     ddl_adj = adjust_ddl_for_object(
                         ddl,
                         ss,
@@ -41914,7 +43273,8 @@ def generate_fixup_scripts(
                         extra_identifiers=get_relevant_replacements(ss),
                         obj_type='TABLE'
                     )
-                    ddl_adj = inflate_table_varchar_lengths(ddl_adj, ss, st, oracle_meta)
+                    if source_db_mode == SOURCE_DB_MODE_ORACLE:
+                        ddl_adj = inflate_table_varchar_lengths(ddl_adj, ss, st, oracle_meta)
                     ddl_adj = cleanup_dbcat_wrappers(ddl_adj)
                     ddl_adj = prepend_set_schema(ddl_adj, ts)
                     ddl_adj = normalize_ddl_for_ob(ddl_adj)
@@ -42048,6 +43408,7 @@ def generate_fixup_scripts(
             drop_sys_c_columns=bool(settings.get("fixup_drop_sys_c_columns", False)),
             plain_not_null_fixup_mode=plain_not_null_fixup_mode,
             plain_not_null_probe_results=plain_not_null_probe_results,
+            source_db_mode=source_db_mode,
         )
         if alter_sql:
             alter_sql = prepend_set_schema(alter_sql, tgt_schema)
@@ -42268,14 +43629,7 @@ def generate_fixup_scripts(
                     log.warning("[FIXUP] 未找到 VIEW %s.%s 的 DDL。", src_schema, src_obj)
                     mark_source('VIEW', 'missing')
                     continue
-                if ddl_source_label.startswith("DBCAT"):
-                    mark_source('VIEW', 'dbcat')
-                elif ddl_source_label in ("DBMS_METADATA", "DBA_VIEWS"):
-                    mark_source('VIEW', 'fallback')
-                elif ddl_source_label == "VIEW_CACHE":
-                    mark_source('VIEW', 'fallback')
-                else:
-                    mark_source('VIEW', 'missing')
+                mark_source('VIEW', ddl_source_label or 'missing')
                 
                 final_ddl = apply_fixup_idempotency(
                     final_ddl,
@@ -42389,15 +43743,26 @@ def generate_fixup_scripts(
                 if not raw_ddl:
                     log.warning("[FIXUP] 未找到 VIEW %s.%s 的 DDL。", src_schema, src_obj)
                     mark_source('VIEW', 'missing')
+                    placeholder = build_unsupported_object_placeholder_sql(
+                        "VIEW",
+                        src_schema,
+                        src_obj,
+                        tgt_schema,
+                        tgt_obj,
+                        support_row,
+                    )
+                    filename = f"{tgt_schema}.{tgt_obj}.sql"
+                    header = f"不支持 VIEW 占位说明 {tgt_schema}.{tgt_obj} (源: {src_schema}.{src_obj})"
+                    write_fixup_file(
+                        base_dir,
+                        "unsupported/view",
+                        filename,
+                        placeholder,
+                        header,
+                        extra_comments=build_support_comments(support_row),
+                    )
                     continue
-                if ddl_source_label.startswith("DBCAT"):
-                    mark_source('VIEW', 'dbcat')
-                elif ddl_source_label in ("DBMS_METADATA", "DBA_VIEWS"):
-                    mark_source('VIEW', 'fallback')
-                elif ddl_source_label == "VIEW_CACHE":
-                    mark_source('VIEW', 'fallback')
-                else:
-                    mark_source('VIEW', 'missing')
+                mark_source('VIEW', ddl_source_label or 'missing')
 
                 cleaned_ddl, view_cleanup_actions = clean_view_ddl_for_oceanbase_with_audit(raw_ddl, ob_version)
                 col_meta = oracle_meta.table_columns.get((src_schema.upper(), src_obj.upper()), {}) or {}
@@ -42513,12 +43878,7 @@ def generate_fixup_scripts(
                     mark_source(ot, 'missing')
                     other_skip_counts[(ot or "").upper()]["ddl_missing"] += 1
                     return
-                if ddl_source_label.startswith("DBCAT"):
-                    mark_source(ot, 'dbcat')
-                elif ddl_source_label in ("DBMS_METADATA", "DBA_VIEWS"):
-                    mark_source(ot, 'fallback')
-                else:
-                    mark_source(ot, 'missing')
+                mark_source(ot, ddl_source_label or 'missing')
                 ddl_adj = adjust_ddl_for_object(
                     ddl,
                     ss,
@@ -42630,16 +43990,31 @@ def generate_fixup_scripts(
                             mark_source(ot, 'missing')
                             other_skip_counts[(ot or "").upper()]["ddl_missing"] += 1
                             return
-                        log.warning("[FIXUP] 未找到 %s %s.%s 的 dbcat DDL。", ot, ss, so)
+                        log.warning("[FIXUP] 未找到 %s %s.%s 的源端 DDL。", ot, ss, so)
+                        obj_full = f"{ts}.{to}"
+                        placeholder = build_unsupported_object_placeholder_sql(
+                            ot,
+                            ss,
+                            so,
+                            ts,
+                            to,
+                            sr,
+                        )
+                        subdir = f"unsupported/{obj_type_to_dir.get(ot, ot.lower())}"
+                        filename = f"{ts}.{to}.sql"
+                        header = f"不支持对象占位说明 {obj_full} (源: {ss}.{so})"
+                        write_fixup_file(
+                            base_dir,
+                            subdir,
+                            filename,
+                            placeholder,
+                            header,
+                            extra_comments=build_support_comments(sr),
+                        )
                         mark_source(ot, 'missing')
                         other_skip_counts[(ot or "").upper()]["ddl_missing"] += 1
                         return
-                    if ddl_source_label.startswith("DBCAT"):
-                        mark_source(ot, 'dbcat')
-                    elif ddl_source_label in ("DBMS_METADATA", "DBA_VIEWS"):
-                        mark_source(ot, 'fallback')
-                    else:
-                        mark_source(ot, 'missing')
+                    mark_source(ot, ddl_source_label or 'missing')
                     ddl_adj = adjust_ddl_for_object(
                         ddl,
                         ss,
@@ -43204,16 +44579,30 @@ def generate_fixup_scripts(
                 if not ddl:
                     log.warning("[FIXUP] 未找到 TRIGGER %s.%s 的 dbcat DDL。", ss, tn)
                     mark_source('TRIGGER', 'missing')
+                    if sr:
+                        ddl_adj = build_unsupported_object_placeholder_sql(
+                            "TRIGGER",
+                            ss,
+                            tn,
+                            ts,
+                            to,
+                            sr,
+                        )
+                        filename = f"{ts}.{to}.sql"
+                        header = f"不支持 TRIGGER 占位说明 {ts}.{to} (源: {ss}.{tn})"
+                        write_fixup_file(
+                            base_dir,
+                            "unsupported/trigger",
+                            filename,
+                            ddl_adj,
+                            header,
+                            extra_comments=build_support_comments(sr),
+                        )
                     if not sr:
                         with trigger_skip_lock:
                             trigger_skip_counts["ddl_missing"] += 1
                     return
-                if ddl_source_label.startswith("DBCAT"):
-                    mark_source('TRIGGER', 'dbcat')
-                elif ddl_source_label in ("DBMS_METADATA", "DBA_VIEWS"):
-                    mark_source('TRIGGER', 'fallback')
-                else:
-                    mark_source('TRIGGER', 'missing')
+                mark_source('TRIGGER', ddl_source_label or 'missing')
                 extra_ids = get_relevant_replacements(ss)
                 if st and tt and tts:
                     extra_ids = extra_ids + [((ss.upper(), st.upper()), (tts.upper(), tt.upper()))]
@@ -43965,7 +45354,20 @@ def generate_fixup_scripts(
         summary_lines: List[str] = []
         for obj_type, src_map in sorted(ddl_source_stats.items()):
             parts = []
-            for label in ("dbcat", "fallback", "missing"):
+            ordered_labels = [
+                "dbcat",
+                "fallback",
+                "ob_dbms_metadata",
+                "ob_dba_views",
+                "ob_source_text",
+                "ob_sequence_meta",
+                "ob_table_meta",
+                "view_cache",
+                "meta_syn",
+                "missing",
+            ]
+            dynamic_labels = [label for label in sorted(src_map.keys()) if label not in ordered_labels]
+            for label in ordered_labels + dynamic_labels:
                 val = src_map.get(label, 0)
                 if val:
                     parts.append(f"{label}={val}")
@@ -46451,6 +47853,40 @@ def build_gtt_handling_state(
         preserve_original_table_keys=preserve_original_table_keys,
         oms_excluded_table_keys=oms_excluded_table_keys,
         detail_rows=detail_rows,
+    )
+
+
+def build_mode_aware_gtt_handling_state(
+    settings: Dict,
+    blacklist_tables: BlacklistTableMap,
+    table_target_map: Dict[Tuple[str, str], Tuple[str, str]],
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata,
+) -> GttHandlingState:
+    """
+    Oracle GTT rewrite / OMS exclusion 语义只允许在 Oracle source mode 生效。
+    OceanBase source mode 可以保留 temporary table metadata，
+    但不能套用 Oracle GTT 管理逻辑。
+    """
+    source_db_mode = normalize_source_db_mode(settings.get("source_db_mode", SOURCE_DB_MODE_ORACLE))
+    if source_db_mode != SOURCE_DB_MODE_ORACLE:
+        return GttHandlingState(
+            effective_blacklist_tables={
+                key: dict(entries or {})
+                for key, entries in (blacklist_tables or {}).items()
+            },
+            managed_table_keys=set(),
+            rewrite_to_normal_table_keys=set(),
+            preserve_original_table_keys=set(),
+            oms_excluded_table_keys=set(),
+            detail_rows=[],
+        )
+    return build_gtt_handling_state(
+        blacklist_tables,
+        table_target_map,
+        oracle_meta,
+        ob_meta,
+        settings.get("gtt_table_handling_mode", "rewrite_to_normal"),
     )
 
 
@@ -52623,13 +54059,14 @@ def save_report_to_db(
             return 0
 
     if isinstance(endpoint_info, dict):
-        if "oracle" in endpoint_info or "oceanbase" in endpoint_info:
-            src_info = endpoint_info.get("oracle") or {}
+        if "source" in endpoint_info or "oracle" in endpoint_info or "oceanbase" in endpoint_info:
+            src_info = endpoint_info.get("source") or endpoint_info.get("oracle") or {}
             tgt_info = endpoint_info.get("oceanbase") or {}
             endpoint_flat["source_host"] = str(src_info.get("host") or "")
             endpoint_flat["source_port"] = _safe_int(src_info.get("port"))
             endpoint_flat["source_service"] = str(
                 src_info.get("service_name")
+                or src_info.get("current_database")
                 or src_info.get("source_service")
                 or src_info.get("dsn")
                 or ""
@@ -52734,6 +54171,14 @@ def save_report_to_db(
         conclusion_detail = f"{conclusion_detail}; compare incomplete ({len(runtime_compare_events)})"
     elif runtime_artifact_events:
         conclusion_detail = f"{conclusion_detail}; artifact degraded ({len(runtime_artifact_events)})"
+
+    source_mode = normalize_source_db_mode(settings.get("source_db_mode", SOURCE_DB_MODE_ORACLE))
+    if source_mode == SOURCE_DB_MODE_OCEANBASE:
+        deferred_fixup_types = sorted(OB_SOURCE_FIXUP_DEFERRED_TYPES)
+        conclusion_detail = (
+            f"{conclusion_detail}; source_mode=oceanbase; "
+            f"fixup_deferred={','.join(deferred_fixup_types) if deferred_fixup_types else '<none>'}"
+        )
 
     if store_scope in {"core", "full"}:
         detail_rows, detail_truncated, detail_truncated_count = _build_report_detail_rows(
@@ -54404,13 +55849,17 @@ def print_final_report(
         return "\n".join([line for line in lines if line.strip()]) or "无可用信息"
 
     if endpoint_info:
-        src_info = endpoint_info.get("oracle", {})
+        source_engine = normalize_source_db_mode(
+            endpoint_info.get("source_engine") or (settings or {}).get("source_db_mode", SOURCE_DB_MODE_ORACLE)
+        )
+        src_info = endpoint_info.get("source", {}) or endpoint_info.get("oracle", {})
         tgt_info = endpoint_info.get("oceanbase", {})
+        source_label = "源 (Oracle)" if source_engine == SOURCE_DB_MODE_ORACLE else "源 (OceanBase)"
         env_table = Table(title="[header]源/目标环境", width=section_width)
-        env_table.add_column("源 (Oracle)", width=section_width // 2)
+        env_table.add_column(source_label, width=section_width // 2)
         env_table.add_column("目标 (OceanBase)", width=section_width // 2)
         env_table.add_row(
-            format_endpoint_block(src_info, True),
+            format_endpoint_block(src_info, source_engine == SOURCE_DB_MODE_ORACLE),
             format_endpoint_block(tgt_info, False)
         )
         console.print(env_table)
@@ -56543,9 +57992,10 @@ def parse_cli_args() -> argparse.Namespace:
     epilog = textwrap.dedent(
         """\
         配置提示 (config.ini):
-          [ORACLE_SOURCE] user/password/dsn (Thick Mode)
+          [ORACLE_SOURCE] user/password/dsn (Thick Mode; source_db_mode=oracle)
+          [OCEANBASE_SOURCE] executable/host/port/user_string/password (source_db_mode=oceanbase)
           [OCEANBASE_TARGET] executable/host/port/user_string/password (obclient)
-          [SETTINGS] source_schemas, remap_file, oracle_client_lib_dir, dbcat_*，输出目录等
+          [SETTINGS] source_db_mode, source_schemas, remap_file, oracle_client_lib_dir, dbcat_*，输出目录等
           可选开关：
             check_primary_types     限制主对象类型（默认全量）
             check_extra_types       限制扩展对象 (index,constraint,sequence,trigger)
@@ -56667,13 +58117,16 @@ def main():
     # 1) 加载配置 + 初始化
     with phase_timer("加载配置与初始化", phase_durations):
         ora_cfg, ob_cfg, settings = load_config(str(config_path))
+        source_db_mode = normalize_source_db_mode(settings.get("source_db_mode", SOURCE_DB_MODE_ORACLE))
+        source_capabilities = dict(settings.get("source_capabilities") or build_source_capability_registry(source_db_mode))
+        source_ob_cfg = settings.get("source_ob_cfg") or {}
         settings["_runtime_degraded_events"] = []
         # 为本次运行初始化日志文件（尽量早，以便记录后续步骤）
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         setup_run_logging(settings, timestamp)
         log_section("启动与配置")
         log.info("配置文件: %s", config_path)
-        validate_runtime_paths(settings, ob_cfg)
+        validate_runtime_paths(settings, ob_cfg, source_ob_cfg)
 
         log.info("OceanBase Comparator Toolkit v%s", __version__)
         log.info("项目主页: %s (问题反馈: %s)", REPO_URL, REPO_ISSUES_URL)
@@ -56689,20 +58142,26 @@ def main():
         table_data_presence_mode: str = str(settings.get("table_data_presence_check_mode", "auto")).strip().lower()
         enable_table_presence_check: bool = table_data_presence_mode != "off"
 
-        # 初始化 Oracle Instant Client (Thick Mode)
-        init_oracle_client_from_settings(settings)
+        if source_capabilities.get("requires_oracle_client", False):
+            init_oracle_client_from_settings(settings)
 
-        oracle_env_info = collect_oracle_env_info(ora_cfg)
+        source_engine, source_env_info = collect_source_env_info(settings, ora_cfg, source_ob_cfg)
         ob_env_info = collect_ob_env_info(ob_cfg)
+        settings["_source_env_info"] = dict(source_env_info or {})
+        settings["_target_env_info"] = dict(ob_env_info or {})
         endpoint_info = {
-            "oracle": oracle_env_info,
+            "source_engine": source_engine,
+            "source": source_env_info,
+            "oracle": source_env_info if source_engine == SOURCE_DB_MODE_ORACLE else {},
             "oceanbase": ob_env_info
         }
-        if oracle_env_info.get("db_timezone") or oracle_env_info.get("session_timezone"):
+        if source_engine == SOURCE_DB_MODE_ORACLE and (
+            source_env_info.get("db_timezone") or source_env_info.get("session_timezone")
+        ):
             log.info(
                 "Oracle 时区信息: db_timezone=%s, session_timezone=%s",
-                oracle_env_info.get("db_timezone") or "-",
-                oracle_env_info.get("session_timezone") or "-"
+                source_env_info.get("db_timezone") or "-",
+                source_env_info.get("session_timezone") or "-"
             )
         ob_version = extract_ob_version_number(ob_env_info.get("version", ""))
         gate_info = apply_ob_feature_gates(settings, ob_version)
@@ -56757,6 +58216,15 @@ def main():
             enabled_primary_types,
             enabled_extra_types
         )
+        source_mode_diagnostics = list(settings.get("_source_mode_diagnostics") or [])
+        source_mode_diagnostics.extend(
+            build_source_mode_diagnostics(
+                settings,
+                target_ob_cfg=ob_cfg,
+            )
+        )
+        if source_mode_diagnostics:
+            config_diagnostics.extend(source_mode_diagnostics)
         if config_diagnostics:
             log_subsection("配置诊断")
             for item in config_diagnostics:
@@ -56819,12 +58287,20 @@ def main():
         }
 
         # 3) 加载源端主对象 (TABLE/VIEW/PROC/FUNC/PACKAGE/PACKAGE BODY/SYNONYM)
-        source_objects, source_case_sensitive_findings = get_source_objects(
-            ora_cfg,
-            settings['source_schemas_list'],
-            synonym_check_scope=settings.get('synonym_check_scope', 'public_only'),
-            case_sensitive_mode=settings.get('case_sensitive_identifier_mode', 'warn')
-        )
+        if source_db_mode == SOURCE_DB_MODE_OCEANBASE:
+            source_objects, source_case_sensitive_findings = get_ob_source_objects(
+                source_ob_cfg,
+                settings['source_schemas_list'],
+                synonym_check_scope=settings.get('synonym_check_scope', 'public_only'),
+                case_sensitive_mode=settings.get('case_sensitive_identifier_mode', 'warn')
+            )
+        else:
+            source_objects, source_case_sensitive_findings = get_source_objects(
+                ora_cfg,
+                settings['source_schemas_list'],
+                synonym_check_scope=settings.get('synonym_check_scope', 'public_only'),
+                case_sensitive_mode=settings.get('case_sensitive_identifier_mode', 'warn')
+            )
         settings["_case_sensitive_findings"] = list(source_case_sensitive_findings or [])
         source_objects_full_scope: SourceObjectMap = {
             (full_name or "").upper(): {
@@ -56937,13 +58413,7 @@ def main():
 
         # 4.1) 获取依附对象（如 TRIGGER）的父表映射，用于 one-to-many schema 拆分场景
         synonym_terminal_diagnostic_rows: List[Tuple[str, str, str, str]] = []
-        object_parent_map = get_object_parent_tables(
-            ora_cfg,
-            settings['source_schemas_list'],
-            enabled_object_types=scope_discovery_types,
-            known_source_types=source_objects_full_scope,
-            diagnostic_rows=synonym_terminal_diagnostic_rows,
-        )
+        object_parent_map = {}
         
         # 4.2) 加载源端依赖关系（用于智能推导一对多场景的目标 schema）
         oracle_dependencies_internal: List[DependencyRecord] = []
@@ -56966,8 +58436,9 @@ def main():
             include_external_refs = bool(
                 need_grant_dependencies or source_scope_mode_setting == "remap_root_closure"
             )
-            oracle_dependencies_for_grants = load_oracle_dependencies(
+            oracle_dependencies_for_grants = load_source_dependencies(
                 ora_cfg,
+                settings,
                 settings['source_schemas_list'],
                 object_types=scope_discovery_types,
                 include_external_refs=include_external_refs
@@ -56987,7 +58458,7 @@ def main():
                      dep.referenced_owner.upper(), dep.referenced_name.upper(), dep.referenced_type.upper())
                     for dep in oracle_dependencies_internal
                 }
-        if source_scope_mode_setting == "remap_root_closure":
+        if source_scope_mode_setting == "remap_root_closure" and source_db_mode == SOURCE_DB_MODE_ORACLE:
             supplemental_dependency_records: List[DependencyRecord] = []
             default_sequence_dependency_records = load_oracle_default_sequence_dependency_records(
                 ora_cfg,
@@ -57333,11 +58804,25 @@ def main():
         })
         # 4.3) 缓存同义词元数据，供 PUBLIC 等大规模同义词快速生成 DDL。
         # 这里按“源端实际受管范围”过滤 PUBLIC 终点，不再把 source_schemas 直接混作 target 口径。
-        synonym_meta = load_synonym_metadata(
-            ora_cfg,
-            settings['source_schemas_list'],
-            allowed_terminal_source_schemas=managed_source_terminal_schemas
-        )
+        if source_capabilities.get("supports_source_synonym_metadata", False):
+            synonym_meta = load_source_synonym_metadata(
+                ora_cfg,
+                settings,
+                settings['source_schemas_list'],
+                allowed_terminal_source_schemas=managed_source_terminal_schemas,
+            )
+        else:
+            synonym_meta = {}
+        if source_capabilities.get("supports_source_parent_map", False):
+            object_parent_map = load_source_parent_map(
+                ora_cfg,
+                settings,
+                settings['source_schemas_list'],
+                enabled_object_types=scope_discovery_types,
+                known_source_types=source_objects_full_scope,
+                diagnostic_rows=synonym_terminal_diagnostic_rows,
+                synonym_meta=synonym_meta,
+            )
         target_table_pairs = collect_table_pairs(master_list, use_target=True)
 
     report_dir_setting = settings.get('report_dir', 'main_reports').strip() or 'main_reports'
@@ -57681,11 +59166,11 @@ def main():
     # 7) 主对象校验
     apply_config_hot_reload_at_phase(hot_reload_runtime, "Oracle 元数据转储", settings, ora_cfg, ob_cfg)
     with phase_timer("Oracle 元数据转储", phase_durations):
-        log_subsection("Oracle 元数据")
-        oracle_meta = dump_oracle_metadata(
+        log_subsection("源端元数据")
+        oracle_meta = dump_source_metadata(
             ora_cfg,
-            master_list,
             settings,
+            master_list,
             include_indexes='INDEX' in enabled_extra_types,
             include_constraints=load_constraint_metadata,
             include_triggers='TRIGGER' in enabled_extra_types,
@@ -57696,6 +59181,27 @@ def main():
                 settings.get("generate_interval_partition_fixup", False)
             ) and generate_fixup_enabled
         )
+        if source_db_mode == SOURCE_DB_MODE_OCEANBASE:
+            if config_diagnostics is None:
+                config_diagnostics = []
+            config_diagnostics = [
+                item for item in config_diagnostics
+                if not (
+                    item.startswith("source_db_mode=")
+                    or item.startswith("OB source deferred capabilities:")
+                    or item.startswith("OB source semantic compare:")
+                    or item.startswith("OB source print-only primary types:")
+                    or item.startswith("OceanBase source/target 指向同一 endpoint：")
+                )
+            ]
+            config_diagnostics.extend(
+                build_source_mode_diagnostics(
+                    settings,
+                    source_meta=oracle_meta,
+                    target_meta=ob_meta,
+                    target_ob_cfg=ob_cfg,
+                )
+            )
 
         exclude_rules = settings.get("exclude_object_rules", []) or []
         explicit_seed_nodes: Set[DependencyNode] = set()
@@ -58002,12 +59508,12 @@ def main():
         effective_blacklist_tables = blacklist_rehydration_state.effective_blacklist_tables
         transformed_blacklist_columns_by_table = blacklist_rehydration_state.transformed_columns_by_table
         manual_trigger_blacklist_table_keys = blacklist_rehydration_state.manual_trigger_table_keys
-        gtt_handling_state = build_gtt_handling_state(
+        gtt_handling_state = build_mode_aware_gtt_handling_state(
+            settings,
             effective_blacklist_tables,
             table_target_map,
             oracle_meta,
             ob_meta,
-            settings.get("gtt_table_handling_mode", "rewrite_to_normal"),
         )
         effective_blacklist_tables = gtt_handling_state.effective_blacklist_tables
         if blacklist_rehydration_state.rehydrated_table_keys or gtt_handling_state.managed_table_keys:

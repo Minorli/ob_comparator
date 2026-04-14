@@ -10,6 +10,7 @@
 
 1) 配置段 (Sections)
 - [ORACLE_SOURCE]：源端 Oracle 连接。
+- [OCEANBASE_SOURCE]：源端 OceanBase 连接（obclient，仅 `source_db_mode=oceanbase` 使用）。
 - [OCEANBASE_TARGET]：目标端 OceanBase 连接（obclient）。
 - [SETTINGS]：对比范围、修补生成、dbcat、黑名单与性能开关等。
 
@@ -26,9 +27,22 @@
 - password：OceanBase 密码（必填）。
   说明：运行时不会把密码放进 obclient 进程参数（ps 不显示明文密码）。
 
+3.1) [OCEANBASE_SOURCE]
+- executable：源端 obclient 可执行文件路径（必填，字段契约与 OCEANBASE_TARGET 相同）。
+- host：源端 OceanBase 主机地址（必填）。
+- port：源端 OceanBase 端口（必填）。
+- user_string：源端完整的 obclient -u 参数（必填）。
+- password：源端 OceanBase 密码（必填）。
+- 说明：仅在 `source_db_mode=oceanbase` 时使用；当前已支持 compare 与 certified fixup family，grant/Oracle blacklist/source usability 等未认证能力仍会门控关闭或转 deferred/manual。
+- 说明：当前 OB source adapter 主要覆盖 table/view-based metadata；`DATABASE/SCHEMA` 级非表触发器暂不纳入 `source_db_mode=oceanbase` 的 compare/fixup。
+
 4) [SETTINGS]
 
 核心与映射
+- source_db_mode：源端数据库类型。默认：oracle。
+  可选值：oracle、oceanbase。
+  说明：`oracle` 保持现有 Oracle->OceanBase 路径；`oceanbase` 启用 OceanBase Oracle-mode source -> OceanBase target。
+  说明：`oceanbase` 模式默认保持严格 OB->OB compare，并允许 certified fixup family；`generate_grants` 仍会自动关闭，未认证 family 会在报告和 fixup 输出中显式标成 deferred/manual。
 - source_schemas：源端 schema 列表（必填）。默认：无；为空将直接退出。
   说明：逗号分隔，大小写不敏感；只扫描这些 schema 的对象与依赖。
   说明：它只定义“源端扫描范围”，不等于目标端受管 schema。
@@ -235,6 +249,8 @@
 
 修补脚本生成（Fixup）
 - generate_fixup：是否生成修补脚本。默认：true。
+  说明：在 `source_db_mode=oceanbase` 下会启用 OB source provider；当前 certified family 包含 TABLE、VIEW、PROCEDURE、FUNCTION、PACKAGE、PACKAGE BODY、SYNONYM、SEQUENCE、TRIGGER、TYPE、TYPE BODY、INDEX、CONSTRAINT。
+  说明：`source_db_mode=oceanbase` 下当前仅覆盖 table/view-based TRIGGER；schema/database 级非表触发器仍属于 deferred/manual 范围。
 - mview_check_fixup_mode：MATERIALIZED VIEW 校验/修补模式。默认：auto。
   可选值：auto（OB>=4.4.2 开启校验+修补；低版本仅打印）、on（强制开启校验+修补）、off（强制仅打印）。
   说明：当 mode=auto 且 OB 版本无法识别时，为兼容旧行为会回退为“仅打印”并在日志提示。
@@ -301,6 +317,7 @@
 授权与权限脚本
 - generate_grants：是否生成授权脚本并附加到修补 DDL。默认：true。
   注意：generate_grants 仅控制授权脚本与注入，修补脚本仍由 generate_fixup 控制。
+  说明：`source_db_mode=oceanbase` 下当前会自动关闭，并在报告中标记为 deferred。
   说明：当目标对象当前不存在且本轮不会创建时，授权会延后到 `fixup_scripts/grants_deferred/`，
   同时写入 `deferred_grants_detail_<ts>.txt`，避免误执行失败。
   说明：若延后授权因 owner 策略无法自动输出 SQL，`fixup_scripts/grants_deferred/README.txt` 仍会保留完整提醒。
@@ -447,7 +464,7 @@ dbcat 配置
 
 5) 备注
 - 如果某个键缺失，将使用程序内置默认值。
-- 仅当 generate_fixup=true 时，dbcat 与 fixup 相关配置才会生效。
+- 仅当 generate_fixup=true 且 `source_db_mode=oracle` 时，dbcat 与相关 JAVA_HOME 配置才会生效；`source_db_mode=oceanbase` 走 OB source provider，不依赖 dbcat/JAVA_HOME。
 - 仅当 check_dependencies=true 时，依赖链路相关输出才会生成。
 
 6) 交付前最小验收（建议固定执行）

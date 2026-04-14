@@ -6,6 +6,15 @@ user     = your_username
 password = your_password
 dsn      = hostname:1521/service_name
 
+[OCEANBASE_SOURCE]
+# 源端 OceanBase (obclient) 的命令行参数；仅在 [SETTINGS].source_db_mode = oceanbase 时使用
+executable  = /usr/bin/obclient
+host        = 127.0.0.1
+port        = 2883
+# 完整的 -u 参数，建议显式带租户/库
+user_string = root@sys#cluster_name
+password    = your_password
+
 [OCEANBASE_TARGET]
 # 目标端 OceanBase (obclient) 的命令行参数，确保路径/权限正确
 executable  = /usr/bin/obclient
@@ -16,6 +25,10 @@ user_string = root@sys#cluster_name
 password    = your_password
 
 [SETTINGS]
+# 源端数据库类型：
+#   oracle    -> 默认，Oracle -> OceanBase
+#   oceanbase -> OceanBase -> OceanBase（已支持 compare + certified fixup；grant/Oracle blacklist 等未认证能力会转 deferred/manual）
+source_db_mode         = oracle
 # 要扫描的所有源端 schema，用逗号分隔，可换行（大小写不敏感）
 source_schemas          = ORA_APP,ORA_FIN,ORA_BI
 # Remap 规则文件路径（迁移时需要改变 schema 的对象映射）
@@ -161,7 +174,9 @@ extra_check_progress_interval = 10
 # 建议值：100~300
 dbcat_chunk_size        = 150
 
-# 是否在对比后生成修复脚本（dbcat 抽取，VIEW 走 DBMS_METADATA）
+# 是否在对比后生成修复脚本
+# source_db_mode=oracle    -> dbcat 抽取，VIEW 走 DBMS_METADATA
+# source_db_mode=oceanbase -> 走 OB source provider（certified family 自动生成，未认证 family 转 deferred/manual）
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 generate_fixup          = true
 # MATERIALIZED VIEW 校验/修补模式（版本门控）
@@ -199,6 +214,7 @@ interval_partition_cutoff = 20280301
 # interval_partition_cutoff_numeric: 数值型 interval 分区补齐上限（仅数值分区键使用），如 100000
 interval_partition_cutoff_numeric =
 # 是否生成授权脚本并附加到修补 DDL（依赖于源端权限/依赖推导）
+# 注意：source_db_mode=oceanbase 下当前会自动门控关闭
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 generate_grants         = true
 # 授权生成模式

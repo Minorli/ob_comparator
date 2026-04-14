@@ -2050,6 +2050,7 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
         raise ConfigError(f"配置文件不存在: {config_path}")
 
     parser.read(config_path, encoding="utf-8")
+    source_db_mode = parser.get("SETTINGS", "source_db_mode", fallback="oracle").strip().lower() or "oracle"
 
     if "OCEANBASE_TARGET" not in parser:
         raise ConfigError("配置文件缺少 [OCEANBASE_TARGET] 配置段。")
@@ -2111,6 +2112,11 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
 
     if not fixup_path.exists():
         raise ConfigError(f"修补脚本目录不存在: {fixup_path}")
+
+    if source_db_mode == "oceanbase":
+        log.info(
+            "source_db_mode=oceanbase：run_fixup 执行语义保持不变；unsupported/、grants_deferred/、cleanup_safe/cleanup_semantic 仍默认不会自动执行。"
+        )
 
     report_dir = parser.get("SETTINGS", "report_dir", fallback="main_reports").strip() or "main_reports"
     report_path = (repo_root / report_dir).resolve()
