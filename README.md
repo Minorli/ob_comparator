@@ -106,6 +106,13 @@ user = scott
 password = tiger
 dsn = 127.0.0.1:1521/orclpdb1
 
+[OCEANBASE_SOURCE]
+executable = /usr/bin/obclient
+host = 127.0.0.1
+port = 2883
+user_string = app@tenant#cluster
+password = xxx
+
 [OCEANBASE_TARGET]
 executable = /usr/bin/obclient
 host = 127.0.0.1
@@ -114,6 +121,7 @@ user_string = root@sys#obcluster
 password = xxx
 
 [SETTINGS]
+source_db_mode = oracle
 source_schemas = SCOTT,HR
 remap_file = remap_rules.txt
 source_object_scope_mode = full_source
@@ -142,6 +150,11 @@ dbcat_bin = /opt/dbcat-2.5.0-SNAPSHOT
 dbcat_output_dir = dbcat_output
 java_home = /usr/lib/jvm/java-11
 ```
+说明：
+- `source_db_mode=oracle` 保持原有 Oracle -> OceanBase 行为。
+- `source_db_mode=oceanbase` 现在支持 OceanBase -> OceanBase 的严格 compare 与 certified fixup family；授权生成、Oracle blacklist/source usability 等未认证能力会显式转 deferred/manual。
+- `source_db_mode=oceanbase` 当前的 TRIGGER 覆盖范围是 table/view-based trigger；`DATABASE/SCHEMA` 级非表触发器仍按 deferred/manual 处理。
+
 完整配置说明见 `readme_config.txt`。
 
 `dbcat_output/cache/` 扁平缓存以实际对象文件为准；如果 `cache/index.json` 漏项，但对应 `SCHEMA/TYPE/OBJ.sql` 存在，主程序会继续命中该缓存并自动修复索引。
