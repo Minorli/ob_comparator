@@ -1,16 +1,15 @@
 # OceanBase Comparator Toolkit
 
-> 当前版本：V0.9.9.2
-> 面向 Oracle → OceanBase (Oracle 模式) 的结构一致性校验与修补脚本生成工具  
+> 当前版本：V0.9.9.3
+> 面向 Oracle → OceanBase 与 OceanBase → OceanBase 的结构一致性校验与修补脚本生成工具  
 > 核心理念：一次转储、本地对比、脚本审计优先
 
-## 近期更新（0.9.9.2）
-- 审计问题整轮加固：本版集中落地最近一轮综合审计中确认成立的 18 项问题，覆盖 compare 正确性、fixup 执行安全、辅助诊断工具可信度与测试基线卫生。
-- `run_fixup` 安全性增强：修复 Oracle Q-quote 场景下单独一行 `/` 误切分、语句超时后仍继续执行后续 SQL、深链拓扑排序递归爆栈，以及 grant rewrite 临时文件残留/固定 `.tmp` 竞态问题。
-- compare 结果更保守也更准确：`INDEX/CONSTRAINT` 在父 TABLE 无法映射时不再错误套用 generic schema fallback；`SYS_NC` / expression-equivalent 索引 compare 改为按多重集匹配，降低 `2:1` 假阳性。
-- scoped/runtime 成本收口：`scope_integrity_dependency_graph_raw` 改为按需构建，不再在非 scope-integrity 路径无条件建全图。
-- 辅助工具可信度修复：本地辅助统计/分析脚本已补齐 CHECK 口径、失败隔离、完整消息聚合与 Unicode 输出等问题，减少辅助结论误导主流程判断。
-- 安全与测试基线加固：本地初始化/探针脚本不再把 OB 密码暴露在 argv；伪测试已改为本地 probe，版本断言与文案断言改为语义型校验，减少“看起来有测试、实际没覆盖”的假稳定。
+## 近期更新（0.9.9.3）
+- 新增 `source_db_mode=oceanbase` 与 `[OCEANBASE_SOURCE]`，主程序现在支持 OceanBase Oracle-mode source → OceanBase target 的严格 compare 与 certified fixup family。
+- OB→OB 模式下已打通源端 metadata / dependency / DDL provider 分发，支持同 endpoint 与跨版本场景；当前 certified family 包含 TABLE、VIEW、PROCEDURE、FUNCTION、PACKAGE、PACKAGE BODY、SYNONYM、SEQUENCE、TRIGGER、TYPE、TYPE BODY、INDEX、CONSTRAINT。
+- Oracle-only 规则已完成 mode 隔离：OB→OB 不再误复用 Oracle 的 GTT rewrite、OMS exclusion、VARCHAR 长度膨胀等迁移改写；strict compare 产生的 `type_literal_mismatch` 会落成可执行 `ALTER TABLE ... MODIFY`。
+- 报告和 fixup 目录已显式暴露 source mode、source/target version、capability gate 与 deferred/manual family，避免“看起来能跑、实际上部分能力未启用”的误判。
+- Oracle→OB 默认链路保持不变，`source_db_mode=oracle` 仍是默认模式；本版全量回归通过，旧路径未被打坏。
 
 ## 核心能力
 - **对象覆盖完整**：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。

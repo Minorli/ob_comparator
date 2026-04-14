@@ -1,9 +1,10 @@
 OceanBase 对比工具极简手册（现场版）
-当前版本：V0.9.9.2
+当前版本：V0.9.9.3
 
 0. 先更新版本
 - 项目地址：https://github.com/Minorli/ob_comparator
 - 建议整仓更新，不要只替换单个脚本。
+- 当前版本同时支持 Oracle → OceanBase 与 OceanBase → OceanBase（Oracle mode source）两种校验/修补模式。
 
 1. 你需要的文件（同目录）
 - schema_diff_reconciler.py（主程序）

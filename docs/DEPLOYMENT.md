@@ -1,15 +1,15 @@
 # 数据库对象对比工具 - 跨平台打包与执行指南 (Wheelhouse 版)
 
-> 适用版本：V0.9.9.2
+> 适用版本：V0.9.9.3
 
 > 适用场景：需要在无网络或不同机器上运行本工具，且保持源码不改。  
 > 方案：wheelhouse + venv，无需 PyInstaller。
 
 ## 0. 目标机必备条件
 - Python 版本与架构匹配（建议 3.7+）。
-- Oracle Instant Client（19c+）。
+- Oracle Instant Client（19c+；仅 `source_db_mode=oracle` 必需）。
 - obclient（可连目标 OceanBase）。
-- JDK + dbcat（用于 DDL 批量提取）。
+- JDK + dbcat（Oracle source 的 DDL 批量提取时使用；`source_db_mode=oceanbase` 不依赖 dbcat 做 source-side extract）。
 - SQLcl（可选，用于 DDL 格式化）。
 - 输出目录可写（`fixup_scripts/`、`main_reports/`、`dbcat_output/`）。
 

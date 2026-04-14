@@ -62,7 +62,7 @@ try:
 except Exception:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 
-__version__ = "0.9.9.2"
+__version__ = "0.9.9.3"
 
 CONFIG_DEFAULT_PATH = "config.ini"
 DEFAULT_FIXUP_DIR = "fixup_scripts"
