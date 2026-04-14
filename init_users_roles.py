@@ -36,7 +36,7 @@ import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-__version__ = "0.9.9.2"
+__version__ = "0.9.9.3"
 
 try:
     import oracledb

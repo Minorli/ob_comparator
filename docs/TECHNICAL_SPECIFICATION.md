@@ -1,9 +1,9 @@
 # Oracle → OceanBase 结构一致性校验与修复引擎
 ## 技术规格说明 (Technical Specification)
 
-**版本**：0.9.9.2
-**日期**：2026-04-09
-**适用场景**：Oracle → OceanBase（Oracle 模式）迁移后的结构一致性校验、对象补全、DDL 兼容性修复。
+**版本**：0.9.9.3
+**日期**：2026-04-14
+**适用场景**：Oracle → OceanBase 与 OceanBase → OceanBase（Oracle mode source）结构一致性校验、对象补全、DDL 兼容性修复。
 
 ---
 
@@ -19,11 +19,12 @@
 - `config.ini`：连接信息、超时、输出目录、功能开关
 - `remap_rules.txt`：显式 remap 规则
 - `trigger_list`：触发器过滤清单（可选）
+- `source_db_mode=oracle|oceanbase`：显式选择源端引擎；`oceanbase` 模式使用 `[OCEANBASE_SOURCE]`
 
 ### 2.2 外部依赖
-- Oracle Instant Client + `oracledb` Thick Mode
+- Oracle Instant Client + `oracledb` Thick Mode（`source_db_mode=oracle` 时必需）
 - OceanBase `obclient`
-- JDK + `dbcat`
+- JDK + `dbcat`（Oracle source 的 source-side DDL 批量提取时使用）
 - SQLcl（可选，用于 DDL 格式化）
 - Python 运行时兼容基线保持 3.7，项目代码中的泛型注解使用 `typing` 兼容别名，不引入 3.9+ 内建泛型下标运行时语法
 
@@ -93,7 +94,8 @@
 
 ### 5.1 TABLE
 - 列集合对比（忽略 OMS_* 和隐藏列）
-- VARCHAR/VARCHAR2 长度窗口校验
+- Oracle source：VARCHAR/VARCHAR2 长度窗口校验
+- OceanBase source：严格 normalized type compare，不沿用 Oracle BYTE-length tolerance
 - 现有列 `NULLABLE` / `NOT NULL` 语义漂移校验（按列语义处理，不依赖系统命名 `SYS_C... IS NOT NULL` 约束名）
 - 覆盖系统命名 `SYS_C... IS NOT NULL` 且 `ENABLED + NOT VALIDATED` 的 `NOT NULL ENABLE NOVALIDATE` 语义补位；该类进入 `TABLE mismatch`，并在 `table_alter` 中默认输出可执行 `ADD CONSTRAINT ... ENABLE NOVALIDATE`，同时保留严格 `NOT NULL` 的 review-first 注释
 - OB 侧等价 `CHECK (<col> IS NOT NULL)` suppress 依赖 `DBA_CONSTRAINTS.SEARCH_CONDITION[_VC]`；元数据加载采用按 chunk 保留成功结果 + 退化 owner/table/constraint 定向回填，避免个别 chunk 失败导致整批 `SEARCH_CONDITION` 丢失
@@ -111,6 +113,7 @@
 - OB 侧 CHAR_USED 缺失时，按 NLS_LENGTH_SEMANTICS（默认 BYTE）回退，并结合 DATA_LENGTH/CHAR_LENGTH 推断 CHAR 语义
 - OB 列字典读取联合 `DBA_TAB_COLUMNS` 与 `DBA_TAB_COLS`；前者作为标准字段基线，后者补齐 `HIDDEN_COLUMN / VIRTUAL_COLUMN` 等附加元数据与缺失值
 - LONG/LONG RAW 自动映射为 CLOB/BLOB
+- strict compare 产生 `type_literal_mismatch` 时，TABLE ALTER fixup 必须生成可执行 `ALTER TABLE ... MODIFY`，不能只停留在 warning 注释
 
 ### 5.2 VIEW / PLSQL / TYPE / SYNONYM / JOB / SCHEDULE
 - 存在性校验

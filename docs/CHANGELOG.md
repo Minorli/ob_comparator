@@ -2,6 +2,25 @@
 
 本文件记录 OceanBase Comparator Toolkit 的重要变更。
 
+## [0.9.9.3] - 2026-04-14
+
+### 新增
+- 新增 `source_db_mode=oceanbase` 与 `[OCEANBASE_SOURCE]`，主程序现在支持 OceanBase Oracle-mode source → OceanBase target 的严格 compare 与 certified fixup family。
+- 新增 OceanBase source metadata / dependency / source-side DDL provider 分发层；支持同 endpoint 与跨版本场景，不再把 OceanBase source 硬塞进 Oracle loader。
+
+### 变更
+- OB→OB 默认按严格 normalized type compare 处理，`IDENTITY`、`DEFAULT ON NULL`、`INVISIBLE` 改为 capability-gated；source/target version 与 deferred/manual family 会在报告和 fixup 目录中显式标出。
+- certified OB source fixup family 扩展到 TABLE、VIEW、PROCEDURE、FUNCTION、PACKAGE、PACKAGE BODY、SYNONYM、SEQUENCE、TRIGGER、TYPE、TYPE BODY、INDEX、CONSTRAINT；未认证 family 继续转 deferred/manual。
+- 运行前校验和依赖项按 source mode 分流：`source_db_mode=oceanbase` 下不再为 source-side compare/fixup 强制要求 Oracle Thick / dbcat / JAVA_HOME。
+
+### 修复
+- 修复 OB→OB 链路误复用 Oracle-only TABLE rewrite 的问题：不再错误套用 GTT rewrite、OMS exclusion、缺表/缺列 `VARCHAR` 长度膨胀等 Oracle→OB 迁移改写。
+- 修复 OB→OB strict compare 的 `type_literal_mismatch` 只输出注释、不生成可执行 `ALTER TABLE ... MODIFY` 的问题。
+- 追加 mode-aware 回归保护，防止 Oracle→OB 和 OB→OB 在 TABLE ALTER / fixup 路径上互相回退。
+
+### 文档
+- README / `readme_lite.txt` / `readme_config.txt` / `docs/*` 已同步到 `0.9.9.3`，并补充 OB→OB 模式、当前 certified family、deferred/manual 边界和非表触发器限制说明。
+
 ## [0.9.9.2] - 2026-04-09
 
 ### 变更

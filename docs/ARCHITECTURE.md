@@ -1,6 +1,6 @@
 # 数据库对象对比工具设计文档
 
-> 当前版本：V0.9.9.2（截至 2026-04-09）
+> 当前版本：V0.9.9.3（截至 2026-04-14）
 > 核心模式：Dump-Once, Compare-Locally + 依赖分析 + 修补脚本生成
 
 ## 1. 设计原则
@@ -24,6 +24,9 @@
        -> 报告输出
 ```
 
+- 默认 `source_db_mode=oracle`，保持既有 Oracle → OceanBase 主路径。
+- `source_db_mode=oceanbase` 时，源端改走 `obclient + source adapter + capability registry`，避免误复用 Oracle-only loader / cleanup / grant 逻辑。
+
 ## 4. 元数据采集
 
 ### Oracle 侧
@@ -37,6 +40,7 @@
 ### OceanBase 侧
 - `obclient` 一次性读取 DBA 视图。
 - 结果全部缓存到内存结构 `ObMetadata`。
+- 当 `source_db_mode=oceanbase` 时，源端 OceanBase metadata 会先适配成 `OracleMetadata` 兼容 bundle，再复用现有 compare/fixup 主链。
 
 ## 5. 映射与推导
 - 解析 `remap_rules.txt` 并验证合法性。
@@ -62,12 +66,15 @@
   - `structural`：只生成对象创建、编译、跨 schema 依赖闭环所需的最小授权
 
 ## 8. DDL 生成与清洗
-- **DDL 来源**：dbcat（批量）+ DBMS_METADATA（VIEW 兜底）。
+- **DDL 来源**：
+  - Oracle source：dbcat（批量）+ DBMS_METADATA（VIEW 兜底）
+  - OceanBase source：OB source provider（metadata synthesis / source text / OB-safe exporter）
 - **清洗策略**：
   - Hint 过滤与白名单
   - PL/SQL 标点清洗
   - 证据门禁下的兼容性清洗（不再默认删除未证实不支持的 PRAGMA / STORAGE / TABLESPACE）
   - VIEW 注释吞行修复
+- Oracle-only TABLE rewrite（如 GTT rewrite、VARCHAR 长度膨胀）仅允许在 `source_db_mode=oracle` 下生效。
 
 ## 9. 输出与执行
 - 报告输出到 `main_reports/`（默认 `run_<timestamp>` 分目录），脚本输出到 `fixup_scripts/`。
