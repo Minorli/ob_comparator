@@ -158,7 +158,7 @@
 
 校验范围与依赖
 - check_primary_types：限制主对象类型。默认：空（全部主对象）。
-  可选值：TABLE, VIEW, MATERIALIZED VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, SYNONYM, JOB, SCHEDULE, TYPE, TYPE BODY。
+  可选值：TABLE, VIEW, MATERIALIZED VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, CONTEXT, SYNONYM, JOB, SCHEDULE, TYPE, TYPE BODY。
   注意：MATERIALIZED VIEW 实际行为由 `mview_check_fixup_mode` + OB 版本门控决定。
 - check_extra_types：限制扩展对象检查。默认：空（全部扩展对象）。
   可选值：INDEX, CONSTRAINT, SEQUENCE, TRIGGER。
@@ -249,8 +249,13 @@
 
 修补脚本生成（Fixup）
 - generate_fixup：是否生成修补脚本。默认：true。
-  说明：在 `source_db_mode=oceanbase` 下会启用 OB source provider；当前 certified family 包含 TABLE、VIEW、PROCEDURE、FUNCTION、PACKAGE、PACKAGE BODY、SYNONYM、SEQUENCE、TRIGGER、TYPE、TYPE BODY、INDEX、CONSTRAINT。
+  说明：在 `source_db_mode=oceanbase` 下会启用 OB source provider；当前 certified family 包含 TABLE、VIEW、PROCEDURE、FUNCTION、PACKAGE、PACKAGE BODY、CONTEXT、SYNONYM、SEQUENCE、TRIGGER、TYPE、TYPE BODY、INDEX、CONSTRAINT。
   说明：`source_db_mode=oceanbase` 下当前仅覆盖 table/view-based TRIGGER；schema/database 级非表触发器仍属于 deferred/manual 范围。
+- context_fixup_mode：CONTEXT 修补模式。默认：manual。
+  可选值：manual、safe_auto。
+  说明：`manual` 仅输出 `context_detail_<ts>.txt`、`context_reference_detail_<ts>.txt` 与 `fixup_scripts/unsupported/context/` 模板。
+  说明：`safe_auto` 仅对 `ACCESSED LOCALLY` / `ACCESSED GLOBALLY` 且 trusted package 已存在/已规划的 context 生成 `fixup_scripts/context/` runnable DDL。
+  说明：OceanBase 目标端 `ACCESSED LOCALLY` 的 DDL 语法必须省略 clause，即 `CREATE OR REPLACE CONTEXT ... USING ...;`。
 - mview_check_fixup_mode：MATERIALIZED VIEW 校验/修补模式。默认：auto。
   可选值：auto（OB>=4.4.2 开启校验+修补；低版本仅打印）、on（强制开启校验+修补）、off（强制仅打印）。
   说明：当 mode=auto 且 OB 版本无法识别时，为兼容旧行为会回退为“仅打印”并在日志提示。
@@ -294,7 +299,7 @@
 - interval_partition_cutoff_numeric：数值型 interval 分区补齐上限（仅数值分区键生效）。默认：空（不补齐数值 interval）。注意：必须为正数。
 - fixup_schemas：仅为指定目标 schema 生成修补脚本。默认：空（全量）。
 - fixup_types：仅为指定对象类型生成修补脚本。默认：空（全量）。
-  可选值：TABLE, VIEW, MATERIALIZED VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY,
+  可选值：TABLE, VIEW, MATERIALIZED VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, CONTEXT,
            SYNONYM, JOB, SCHEDULE, TYPE, TYPE BODY, SEQUENCE, TRIGGER, INDEX, CONSTRAINT。
   注意：fixup_types 包含 INDEX/CONSTRAINT/TRIGGER 时，需要 check_primary_types 含 TABLE 才能生成。
 - job_schedule_fixup_mode：JOB/SCHEDULE 修补模式。默认：manual。

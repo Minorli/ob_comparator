@@ -957,6 +957,60 @@ class ObjectSupportReportRow(NamedTuple):
     root_cause: str = ""
 
 
+class ContextMetadata(NamedTuple):
+    namespace: str
+    schema: str
+    package: str
+    type: str
+    tracking: str = ""
+    origin_con_id: str = ""
+
+
+class ContextReferenceRow(NamedTuple):
+    object_full: str
+    object_type: str
+    reference_kind: str
+    namespace: str
+    attribute: str
+    status: str
+    detail: str
+
+
+class ContextDriftDetailRow(NamedTuple):
+    namespace: str
+    source_binding: str
+    expected_target_binding: str
+    target_binding: str
+    source_mode: str
+    target_mode: str
+    status: str
+    reason_code: str
+    reason: str
+    action: str
+    detail: str
+    prerequisite: str = ""
+
+
+class ContextFixupRow(NamedTuple):
+    namespace: str
+    output_dir: str
+    sql_text: str
+    mode: str
+    reason_code: str
+    detail: str
+    prerequisite: str = ""
+
+
+class ContextCompareResults(NamedTuple):
+    missing_support_rows: List[ObjectSupportReportRow]
+    unsupported_rows: List[ObjectSupportReportRow]
+    detail_rows: List[ContextDriftDetailRow]
+    reference_rows: List[ContextReferenceRow]
+    runnable_fixups: List[ContextFixupRow]
+    manual_fixups: List[ContextFixupRow]
+    summary: Dict[str, int]
+
+
 class ViewCompatResult(NamedTuple):
     support_state: str
     reason_code: str
@@ -1236,6 +1290,7 @@ class ObMetadata(NamedTuple):
     identity_options: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: {OPTION: VALUE}}
     enabled_notnull_check_columns: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: enabled single-column IS NOT NULL check meta}
     enabled_notnull_check_groups: Dict[Tuple[str, str], Dict[str, Tuple["NotnullCheckEntry", ...]]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: (enabled single-column IS NOT NULL checks...)}
+    contexts: Dict[str, ContextMetadata] = MappingProxyType({})
 
 
 class OracleMetadata(NamedTuple):
@@ -1275,6 +1330,7 @@ class OracleMetadata(NamedTuple):
     default_on_null_columns: Dict[Tuple[str, str], Tuple[str, ...]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> (COLUMN_NAME, ...)
     identity_options: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = MappingProxyType({})  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: {OPTION: VALUE}}
     nested_table_storage_tables: Dict[Tuple[str, str], "NestedTableStorageInfo"] = MappingProxyType({})  # (OWNER, STORAGE_TABLE_NAME) -> parent table/column
+    contexts: Dict[str, ContextMetadata] = MappingProxyType({})
 
 
 class NestedTableStorageInfo(NamedTuple):
@@ -1663,6 +1719,7 @@ PRIMARY_OBJECT_TYPES: Tuple[str, ...] = (
     'FUNCTION',
     'PACKAGE',
     'PACKAGE BODY',
+    'CONTEXT',
     'SYNONYM',
     'JOB',
     'SCHEDULE',
@@ -1706,6 +1763,35 @@ VIEW_CALLABLE_DEP_TYPES: FrozenSet[str] = frozenset({
     "SEQUENCE",
     "TYPE",
     "TYPE BODY",
+})
+CONTEXT_REFERENCE_ELIGIBLE_TYPES: FrozenSet[str] = frozenset({
+    "VIEW",
+    "PROCEDURE",
+    "FUNCTION",
+    "PACKAGE",
+    "PACKAGE BODY",
+    "TRIGGER",
+    "TYPE BODY",
+})
+CONTEXT_REFERENCE_BUILTIN_NAMESPACES: FrozenSet[str] = frozenset({
+    "USERENV",
+})
+CONTEXT_FIXUP_MODE_VALUES: Set[str] = {"manual", "safe_auto"}
+CONTEXT_FIXUP_MODE_ALIASES: Dict[str, str] = {
+    "auto": "safe_auto",
+    "safe": "safe_auto",
+    "on": "safe_auto",
+    "true": "safe_auto",
+    "off": "manual",
+    "false": "manual",
+}
+CONTEXT_MODE_LOCAL = "ACCESSED LOCALLY"
+CONTEXT_MODE_GLOBAL = "ACCESSED GLOBALLY"
+CONTEXT_MODE_INITIALIZED_EXTERNALLY = "INITIALIZED EXTERNALLY"
+CONTEXT_MODE_INITIALIZED_GLOBALLY = "INITIALIZED GLOBALLY"
+CONTEXT_CERTIFIED_MODES: FrozenSet[str] = frozenset({
+    CONTEXT_MODE_LOCAL,
+    CONTEXT_MODE_GLOBAL,
 })
 ORACLE_SYSTEM_SCHEMAS: FrozenSet[str] = frozenset({
     "SYS",
@@ -2026,6 +2112,7 @@ OB_SOURCE_FIXUP_SUPPORTED_TYPES: FrozenSet[str] = frozenset({
     'FUNCTION',
     'PACKAGE',
     'PACKAGE BODY',
+    'CONTEXT',
     'SYNONYM',
     'SEQUENCE',
     'TRIGGER',
@@ -4061,6 +4148,22 @@ def normalize_ob_metadata_public_owner(meta: ObMetadata) -> ObMetadata:
         table_u = (table or "").upper()
         partition_key_columns[(owner_n, table_u)] = cols
 
+    contexts = {}
+    for namespace, info in (meta.contexts or {}).items():
+        namespace_u = normalize_identifier_name(namespace)
+        if not namespace_u:
+            continue
+        schema_n = _norm_owner(info.schema)
+        package_u = normalize_identifier_name(info.package)
+        contexts[namespace_u] = ContextMetadata(
+            namespace=namespace_u,
+            schema=schema_n or "",
+            package=package_u or "",
+            type=normalize_context_inventory_type(info.type),
+            tracking=str(info.tracking or ""),
+            origin_con_id=str(info.origin_con_id or ""),
+        )
+
     return meta._replace(
         objects_by_type=objects_by_type,
         tab_columns=_remap_owner_table_dict(meta.tab_columns or {}),
@@ -4079,6 +4182,7 @@ def normalize_ob_metadata_public_owner(meta: ObMetadata) -> ObMetadata:
         identity_options=_remap_owner_table_simple(meta.identity_options or {}),
         enabled_notnull_check_columns=_remap_owner_table_dict(meta.enabled_notnull_check_columns or {}),
         enabled_notnull_check_groups=_remap_owner_table_dict(meta.enabled_notnull_check_groups or {}),
+        contexts=contexts,
     )
 
 def is_index_expression_token(token: Optional[str]) -> bool:
@@ -4169,6 +4273,7 @@ def build_number_fixup_type(src_info: Dict, tgt_info: Dict) -> str:
 OBJECT_COUNT_TYPES: Tuple[str, ...] = (
     'TABLE',
     'VIEW',
+    'CONTEXT',
     'SYNONYM',
     'TRIGGER',
     'SEQUENCE',
@@ -4208,6 +4313,47 @@ def normalize_source_db_mode(raw_value: Optional[str]) -> str:
             "source_db_mode 仅支持 oracle 或 oceanbase"
         )
     return value
+
+
+def normalize_context_fixup_mode(raw_value: Optional[str]) -> str:
+    value = (raw_value or "").strip().lower()
+    if not value:
+        return "manual"
+    value = CONTEXT_FIXUP_MODE_ALIASES.get(value, value)
+    if value not in CONTEXT_FIXUP_MODE_VALUES:
+        raise ValueError("context_fixup_mode 仅支持 manual 或 safe_auto")
+    return value
+
+
+def normalize_context_inventory_type(raw_value: Optional[object]) -> str:
+    text = re.sub(r"\s+", " ", str(raw_value or "").strip().upper())
+    return text
+
+
+def format_context_binding(schema_name: Optional[str], package_name: Optional[str]) -> str:
+    schema_u = normalize_identifier_name(schema_name)
+    package_u = normalize_identifier_name(package_name)
+    if schema_u and package_u:
+        return f"{schema_u}.{package_u}"
+    if package_u:
+        return package_u
+    return "-"
+
+
+def build_ob_context_create_ddl(context_meta: ContextMetadata) -> Optional[str]:
+    namespace_u = normalize_identifier_name(context_meta.namespace)
+    schema_u = normalize_identifier_name(context_meta.schema)
+    package_u = normalize_identifier_name(context_meta.package)
+    mode_u = normalize_context_inventory_type(context_meta.type)
+    if not namespace_u or not package_u:
+        return None
+    using_ref = quote_qualified_parts(schema_u, package_u) if schema_u else quote_identifier(package_u)
+    base = f"CREATE OR REPLACE CONTEXT {quote_identifier(namespace_u)} USING {using_ref}"
+    if mode_u == CONTEXT_MODE_LOCAL:
+        return base + ";"
+    if mode_u == CONTEXT_MODE_GLOBAL:
+        return base + " ACCESSED GLOBALLY;"
+    return None
 
 
 def build_source_capability_registry(source_db_mode: str) -> Dict[str, bool]:
@@ -6991,6 +7137,7 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         # fixup 定向生成选项
         settings.setdefault('fixup_schemas', '')
         settings.setdefault('fixup_types', '')
+        settings.setdefault('context_fixup_mode', 'manual')
         settings.setdefault('job_schedule_fixup_mode', 'manual')
         settings.setdefault('plain_not_null_fixup_mode', 'runnable_if_no_nulls')
         settings.setdefault('fixup_idempotent_mode', 'replace')
@@ -7185,6 +7332,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         )
         settings['sequence_sync_mode'] = normalize_sequence_sync_mode(
             settings.get('sequence_sync_mode', 'off')
+        )
+        settings['context_fixup_mode'] = normalize_context_fixup_mode(
+            settings.get('context_fixup_mode', 'manual')
         )
         settings['enable_comment_check'] = parse_bool_flag(
             settings.get('check_comments', 'true'),
@@ -8036,6 +8186,14 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "仅支持 rewrite_to_normal/preserve_original/blocked"
 
+    def _validate_context_fixup_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = CONTEXT_FIXUP_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in CONTEXT_FIXUP_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 manual/safe_auto"
+
     def _validate_table_data_presence_mode(val: str) -> Tuple[bool, str]:
         if not val.strip():
             return True, ""
@@ -8328,6 +8486,14 @@ def run_config_wizard(config_path: Path) -> None:
             fallback="true"
         ),
         transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "context_fixup_mode",
+        "CONTEXT 修补模式 (manual/safe_auto)",
+        default=cfg.get("SETTINGS", "context_fixup_mode", fallback="manual"),
+        validator=_validate_context_fixup_mode,
+        transform=normalize_context_fixup_mode,
     )
     _prompt_field(
         "SETTINGS",
@@ -11686,6 +11852,603 @@ def load_oracle_scoped_text_reference_index(
     }
 
 
+def load_oracle_context_inventory(
+    ora_cfg: OraConfig,
+    allowed_schemas: Optional[Set[str]] = None,
+) -> Tuple[Dict[str, ContextMetadata], Optional[str]]:
+    contexts: Dict[str, ContextMetadata] = {}
+    schema_filter = sorted({normalize_identifier_name(item) for item in (allowed_schemas or set()) if item})
+    query_specs: Tuple[str, ...] = (
+        """
+        SELECT NAMESPACE, SCHEMA, PACKAGE, TYPE, TRACKING, ORIGIN_CON_ID
+        FROM DBA_CONTEXT
+        {where_clause}
+        """,
+        """
+        SELECT NAMESPACE, SCHEMA, PACKAGE, TYPE, '' AS TRACKING, NULL AS ORIGIN_CON_ID
+        FROM DBA_CONTEXT
+        {where_clause}
+        """,
+    )
+    try:
+        with oracledb.connect(
+            user=ora_cfg['user'],
+            password=ora_cfg['password'],
+            dsn=ora_cfg['dsn']
+        ) as connection:
+            with connection.cursor() as cursor:
+                apply_oracle_cursor_fetch_tuning(cursor, "medium_metadata")
+                for sql_tpl in query_specs:
+                    try:
+                        if schema_filter:
+                            for chunk in chunk_list(schema_filter, ORACLE_IN_BATCH_SIZE):
+                                where_clause = f"WHERE SCHEMA IN ({build_bind_placeholders(len(chunk))})"
+                                cursor.execute(sql_tpl.format(where_clause=where_clause), chunk)
+                                for row in cursor:
+                                    namespace_u = normalize_identifier_name(row[0])
+                                    if not namespace_u:
+                                        continue
+                                    contexts[namespace_u] = ContextMetadata(
+                                        namespace=namespace_u,
+                                        schema=normalize_identifier_name(row[1]) or "",
+                                        package=normalize_identifier_name(row[2]) or "",
+                                        type=normalize_context_inventory_type(row[3]),
+                                        tracking=str(row[4] or ""),
+                                        origin_con_id=str(row[5] or ""),
+                                    )
+                        else:
+                            cursor.execute(sql_tpl.format(where_clause=""))
+                            for row in cursor:
+                                namespace_u = normalize_identifier_name(row[0])
+                                if not namespace_u:
+                                    continue
+                                contexts[namespace_u] = ContextMetadata(
+                                    namespace=namespace_u,
+                                    schema=normalize_identifier_name(row[1]) or "",
+                                    package=normalize_identifier_name(row[2]) or "",
+                                    type=normalize_context_inventory_type(row[3]),
+                                    tracking=str(row[4] or ""),
+                                    origin_con_id=str(row[5] or ""),
+                                )
+                        return contexts, None
+                    except oracledb.Error:
+                        contexts.clear()
+                        continue
+    except oracledb.Error as exc:
+        return {}, normalize_error_text(exc)
+    return {}, "read_dba_context_failed"
+
+
+def load_ob_context_inventory(
+    ob_cfg: ObConfig,
+    allowed_schemas: Optional[Set[str]] = None,
+) -> Tuple[Dict[str, ContextMetadata], Optional[str]]:
+    contexts: Dict[str, ContextMetadata] = {}
+    schema_filter = sorted({normalize_identifier_name(item) for item in (allowed_schemas or set()) if item})
+    support_tracking = ob_has_dba_column(ob_cfg, "DBA_CONTEXT", "TRACKING")
+    support_origin_con_id = ob_has_dba_column(ob_cfg, "DBA_CONTEXT", "ORIGIN_CON_ID")
+    tracking_col = ", TRACKING" if support_tracking else ", '' AS TRACKING"
+    origin_col = ", ORIGIN_CON_ID" if support_origin_con_id else ", NULL AS ORIGIN_CON_ID"
+    if schema_filter:
+        sql_tpl = f"""
+            SELECT NAMESPACE, SCHEMA, PACKAGE, TYPE{tracking_col}{origin_col}
+            FROM DBA_CONTEXT
+            WHERE SCHEMA IN ({{owners_in}})
+        """
+        ok, lines, err = obclient_query_by_owner_chunks(
+            ob_cfg,
+            sql_tpl,
+            schema_filter,
+            quiet_error=True,
+        )
+        if not ok:
+            return {}, normalize_error_text(err)
+    else:
+        sql = f"""
+            SELECT NAMESPACE, SCHEMA, PACKAGE, TYPE{tracking_col}{origin_col}
+            FROM DBA_CONTEXT
+        """
+        ok, out, err = obclient_run_sql(ob_cfg, sql, quiet_error=True)
+        if not ok:
+            return {}, normalize_error_text(err)
+        lines = (out or "").splitlines()
+    for line in lines:
+        parts = line.split('\t')
+        if len(parts) < 4:
+            continue
+        namespace_u = normalize_identifier_name(parts[0])
+        if not namespace_u:
+            continue
+        contexts[namespace_u] = ContextMetadata(
+            namespace=namespace_u,
+            schema=normalize_identifier_name(parts[1]) or "",
+            package=normalize_identifier_name(parts[2]) or "",
+            type=normalize_context_inventory_type(parts[3]),
+            tracking=str(parts[4] or "") if len(parts) > 4 else "",
+            origin_con_id=str(parts[5] or "") if len(parts) > 5 else "",
+        )
+    return contexts, None
+
+
+_SYS_CONTEXT_LITERAL_RE = re.compile(
+    r"SYS_CONTEXT\s*\(\s*'((?:''|[^'])+)'\s*,\s*'((?:''|[^'])*)'",
+    flags=re.IGNORECASE,
+)
+_SYS_CONTEXT_CALL_RE = re.compile(r"SYS_CONTEXT\s*\(", flags=re.IGNORECASE)
+_SET_CONTEXT_LITERAL_RE = re.compile(
+    r"DBMS_SESSION\s*\.\s*SET_CONTEXT\s*\(\s*'((?:''|[^'])+)'\s*,\s*'((?:''|[^'])*)'",
+    flags=re.IGNORECASE,
+)
+_SET_CONTEXT_CALL_RE = re.compile(r"DBMS_SESSION\s*\.\s*SET_CONTEXT\s*\(", flags=re.IGNORECASE)
+
+
+def extract_context_reference_rows(
+    object_full: str,
+    object_type: str,
+    text: Optional[str],
+) -> List[ContextReferenceRow]:
+    sql_text = strip_sql_comments_outside_literals(text).strip()
+    if not sql_text:
+        return []
+
+    def _decode_literal(value: str) -> str:
+        return normalize_identifier_name(value.replace("''", "'")) or ""
+
+    rows: List[ContextReferenceRow] = []
+
+    def _collect(literal_re: re.Pattern, call_re: re.Pattern, reference_kind: str) -> None:
+        literal_starts: Set[int] = set()
+        for match in literal_re.finditer(sql_text):
+            literal_starts.add(match.start())
+            namespace_u = _decode_literal(match.group(1))
+            attribute_u = _decode_literal(match.group(2))
+            if not namespace_u or namespace_u in CONTEXT_REFERENCE_BUILTIN_NAMESPACES:
+                continue
+            rows.append(ContextReferenceRow(
+                object_full=(object_full or "").upper(),
+                object_type=(object_type or "").upper(),
+                reference_kind=reference_kind,
+                namespace=namespace_u,
+                attribute=attribute_u,
+                status="LITERAL",
+                detail="",
+            ))
+        for match in call_re.finditer(sql_text):
+            if match.start() in literal_starts:
+                continue
+            rows.append(ContextReferenceRow(
+                object_full=(object_full or "").upper(),
+                object_type=(object_type or "").upper(),
+                reference_kind=reference_kind,
+                namespace="<dynamic>",
+                attribute="",
+                status="UNRESOLVED",
+                detail="namespace expression is not a string literal",
+            ))
+
+    _collect(_SYS_CONTEXT_LITERAL_RE, _SYS_CONTEXT_CALL_RE, "SYS_CONTEXT")
+    _collect(_SET_CONTEXT_LITERAL_RE, _SET_CONTEXT_CALL_RE, "SET_CONTEXT")
+
+    dedup: Dict[Tuple[str, str, str, str, str, str], ContextReferenceRow] = {}
+    for row in rows:
+        key = (
+            row.object_full,
+            row.object_type,
+            row.reference_kind,
+            row.namespace,
+            row.attribute,
+            row.status,
+        )
+        dedup[key] = row
+    return sorted(
+        dedup.values(),
+        key=lambda item: (
+            item.object_full,
+            item.object_type,
+            item.reference_kind,
+            item.namespace,
+            item.attribute,
+            item.status,
+        ),
+    )
+
+
+def load_ob_scoped_text_reference_index(
+    ob_cfg: ObConfig,
+    candidate_nodes: Set[DependencyNode],
+) -> Dict[DependencyNode, str]:
+    results: Dict[DependencyNode, str] = {}
+    for full_name, obj_type in sorted(candidate_nodes, key=lambda item: (item[1], item[0])):
+        parsed = parse_full_object_name(full_name)
+        if not parsed:
+            continue
+        owner_u, name_u = parsed
+        obj_type_u = (obj_type or "").upper()
+        text_value: Optional[str] = None
+        if obj_type_u == "VIEW":
+            view_tuple = ob_get_view_text(ob_cfg, owner_u, name_u)
+            text_value = view_tuple[0] if view_tuple else None
+        elif obj_type_u in {"PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE BODY", "TRIGGER", "TYPE BODY"}:
+            text_value = ob_get_source_text(ob_cfg, obj_type_u, owner_u, name_u)
+        if text_value:
+            results[((full_name or "").upper(), obj_type_u)] = text_value
+    return results
+
+
+def load_source_context_reference_rows(
+    settings: Dict,
+    source_objects: SourceObjectMap,
+    enabled_primary_types: Optional[Set[str]],
+    ora_cfg: Optional[OraConfig] = None,
+) -> List[ContextReferenceRow]:
+    enabled_types = {t.upper() for t in (enabled_primary_types or set())}
+    candidate_types = CONTEXT_REFERENCE_ELIGIBLE_TYPES & enabled_types
+    if not candidate_types:
+        return []
+    candidate_nodes: Set[DependencyNode] = set()
+    for src_full, obj_types in (source_objects or {}).items():
+        for obj_type in (obj_types or set()):
+            obj_type_u = (obj_type or "").upper()
+            if obj_type_u in candidate_types:
+                candidate_nodes.add(((src_full or "").upper(), obj_type_u))
+    if not candidate_nodes:
+        return []
+    source_db_mode = normalize_source_db_mode(settings.get("source_db_mode", SOURCE_DB_MODE_ORACLE))
+    if source_db_mode == SOURCE_DB_MODE_ORACLE:
+        text_index = load_oracle_scoped_text_reference_index(ora_cfg, candidate_nodes) if ora_cfg else {}
+    else:
+        text_index = load_ob_scoped_text_reference_index(settings.get("source_ob_cfg") or {}, candidate_nodes)
+    rows: List[ContextReferenceRow] = []
+    for (full_name, obj_type), text in sorted(text_index.items(), key=lambda item: (item[0][1], item[0][0])):
+        rows.extend(extract_context_reference_rows(full_name, obj_type, text))
+    return rows
+
+
+def resolve_expected_context_metadata(
+    context_meta: ContextMetadata,
+    full_object_mapping: Optional[FullObjectMapping],
+) -> Tuple[ContextMetadata, bool, str]:
+    namespace_u = normalize_identifier_name(context_meta.namespace) or ""
+    schema_u = normalize_identifier_name(context_meta.schema) or ""
+    package_u = normalize_identifier_name(context_meta.package) or ""
+    source_pkg_full = f"{schema_u}.{package_u}" if schema_u and package_u else ""
+    mapped_target = (
+        find_mapped_target_any_type(full_object_mapping or {}, source_pkg_full, ("PACKAGE", "PACKAGE BODY"))
+        if source_pkg_full else None
+    )
+    if mapped_target:
+        parsed = parse_full_object_name(mapped_target)
+        if parsed:
+            return ContextMetadata(
+                namespace=namespace_u,
+                schema=parsed[0],
+                package=parsed[1],
+                type=normalize_context_inventory_type(context_meta.type),
+                tracking=str(context_meta.tracking or ""),
+                origin_con_id=str(context_meta.origin_con_id or ""),
+            ), False, source_pkg_full
+    return ContextMetadata(
+        namespace=namespace_u,
+        schema=schema_u,
+        package=package_u,
+        type=normalize_context_inventory_type(context_meta.type),
+        tracking=str(context_meta.tracking or ""),
+        origin_con_id=str(context_meta.origin_con_id or ""),
+    ), bool(source_pkg_full), source_pkg_full
+
+
+def merge_support_summary_rows(
+    support_summary: SupportClassificationResult,
+    rows: Sequence[ObjectSupportReportRow],
+) -> SupportClassificationResult:
+    if not rows:
+        return support_summary
+    support_state_map = dict(support_summary.support_state_map or {})
+    missing_detail_rows = list(support_summary.missing_detail_rows or [])
+    unsupported_rows = list(support_summary.unsupported_rows or [])
+    missing_support_counts = {
+        (obj_type or "").upper(): dict(counts or {})
+        for obj_type, counts in (support_summary.missing_support_counts or {}).items()
+    }
+    for row in rows:
+        obj_type_u = (row.obj_type or "").upper()
+        key = (obj_type_u, (row.src_full or "").upper())
+        support_state_map[key] = row
+        counter = missing_support_counts.setdefault(
+            obj_type_u,
+            {"supported": 0, "unsupported": 0, "blocked": 0, "risky": 0},
+        )
+        state_u = (row.support_state or "").upper()
+        if state_u == SUPPORT_STATE_SUPPORTED:
+            missing_detail_rows.append(row)
+            counter["supported"] = int(counter.get("supported", 0) or 0) + 1
+        else:
+            unsupported_rows.append(row)
+            bucket = state_u.lower()
+            if bucket in counter:
+                counter[bucket] = int(counter.get(bucket, 0) or 0) + 1
+    return support_summary._replace(
+        support_state_map=support_state_map,
+        missing_detail_rows=missing_detail_rows,
+        unsupported_rows=unsupported_rows,
+        missing_support_counts=missing_support_counts,
+    )
+
+
+def _build_context_manual_template(
+    source_meta: Optional[ContextMetadata],
+    expected_meta: Optional[ContextMetadata],
+    detail_row: ContextDriftDetailRow,
+) -> str:
+    lines = [
+        f"-- CONTEXT namespace: {detail_row.namespace}",
+        f"-- status: {detail_row.status}",
+        f"-- reason_code: {detail_row.reason_code}",
+        f"-- reason: {detail_row.reason}",
+        f"-- source_binding: {detail_row.source_binding}",
+        f"-- expected_target_binding: {detail_row.expected_target_binding}",
+        f"-- target_binding: {detail_row.target_binding}",
+    ]
+    if detail_row.prerequisite:
+        lines.append(f"-- prerequisite: {detail_row.prerequisite}")
+    if detail_row.detail:
+        lines.append(f"-- detail: {detail_row.detail}")
+    ddl = build_ob_context_create_ddl(expected_meta or source_meta) if (expected_meta or source_meta) else None
+    if ddl:
+        lines.extend([
+            "-- Suggested SQL (review before execution):",
+            f"-- {ddl}",
+        ])
+    else:
+        lines.append("-- manual review required;")
+    return "\n".join(lines)
+
+
+def build_context_compare_results(
+    *,
+    source_contexts: Dict[str, ContextMetadata],
+    target_contexts: Dict[str, ContextMetadata],
+    reference_rows: Sequence[ContextReferenceRow],
+    full_object_mapping: Optional[FullObjectMapping],
+    enabled_primary_types: Optional[Set[str]],
+    context_fixup_mode: str,
+    target_package_objects: Optional[Set[str]] = None,
+    planned_package_targets: Optional[Set[str]] = None,
+) -> ContextCompareResults:
+    inventory_enabled = "CONTEXT" in {t.upper() for t in (enabled_primary_types or set())}
+    literal_refs = [row for row in (reference_rows or []) if row.status == "LITERAL"]
+    unresolved_refs = [row for row in (reference_rows or []) if row.status == "UNRESOLVED"]
+    namespaces_to_check: Set[str] = {row.namespace for row in literal_refs if row.namespace and row.namespace != "<dynamic>"}
+    if inventory_enabled:
+        namespaces_to_check.update(normalize_identifier_name(name) for name in (source_contexts or {}).keys() if name)
+    target_pkg_set = {str(item or "").upper() for item in (target_package_objects or set()) if item}
+    planned_pkg_set = {str(item or "").upper() for item in (planned_package_targets or set()) if item}
+    fixup_mode = normalize_context_fixup_mode(context_fixup_mode)
+    missing_support_rows: List[ObjectSupportReportRow] = []
+    unsupported_rows: List[ObjectSupportReportRow] = []
+    detail_rows: List[ContextDriftDetailRow] = []
+    runnable_fixups: List[ContextFixupRow] = []
+    manual_fixups: List[ContextFixupRow] = []
+    namespace_status: Dict[str, Tuple[str, str, str]] = {}
+
+    source_ctx_norm = {normalize_identifier_name(k): v for k, v in (source_contexts or {}).items() if normalize_identifier_name(k)}
+    target_ctx_norm = {normalize_identifier_name(k): v for k, v in (target_contexts or {}).items() if normalize_identifier_name(k)}
+
+    for namespace_u in sorted(item for item in namespaces_to_check if item):
+        src_meta = source_ctx_norm.get(namespace_u)
+        tgt_meta = target_ctx_norm.get(namespace_u)
+        if src_meta is None:
+            detail_rows.append(ContextDriftDetailRow(
+                namespace=namespace_u,
+                source_binding="-",
+                expected_target_binding="-",
+                target_binding=format_context_binding(tgt_meta.schema, tgt_meta.package) if tgt_meta else "-",
+                source_mode="-",
+                target_mode=normalize_context_inventory_type(tgt_meta.type) if tgt_meta else "-",
+                status="SOURCE_CONTEXT_MISSING",
+                reason_code="SOURCE_CONTEXT_METADATA_MISSING",
+                reason="源端代码引用了 context，但源端 DBA_CONTEXT 未发现 namespace。",
+                action="人工确认源端 CREATE CONTEXT 定义",
+                detail="reference-driven validation only",
+            ))
+            namespace_status[namespace_u] = ("SOURCE_CONTEXT_MISSING", "SOURCE_CONTEXT_METADATA_MISSING", "人工确认源端 CREATE CONTEXT 定义")
+            continue
+
+        expected_meta, trusted_pkg_out_of_scope, source_pkg_full = resolve_expected_context_metadata(src_meta, full_object_mapping)
+        expected_binding = format_context_binding(expected_meta.schema, expected_meta.package)
+        target_binding = format_context_binding(tgt_meta.schema, tgt_meta.package) if tgt_meta else "-"
+        source_mode = normalize_context_inventory_type(src_meta.type)
+        target_mode = normalize_context_inventory_type(tgt_meta.type) if tgt_meta else "-"
+        prerequisite = ""
+        trusted_package_ready = True
+        if expected_binding != "-":
+            if expected_binding not in target_pkg_set:
+                if expected_binding in planned_pkg_set:
+                    prerequisite = f"trusted package planned: {expected_binding}"
+                else:
+                    trusted_package_ready = False
+                    prerequisite = f"trusted package missing: {expected_binding}"
+
+        if tgt_meta is None:
+            if trusted_pkg_out_of_scope and source_pkg_full:
+                support_row = ObjectSupportReportRow(
+                    obj_type="CONTEXT",
+                    src_full=namespace_u,
+                    tgt_full=namespace_u,
+                    support_state=SUPPORT_STATE_BLOCKED,
+                    reason_code="TRUSTED_PACKAGE_OUT_OF_SCOPE",
+                    reason="trusted package 不在当前受管映射范围，不能自动确定目标绑定。",
+                    dependency=source_pkg_full,
+                    action="人工确认 context 绑定并手工创建",
+                    detail=f"expected_binding={expected_binding}",
+                    root_cause=f"{namespace_u}(TRUSTED_PACKAGE_OUT_OF_SCOPE)",
+                )
+            elif source_mode not in CONTEXT_CERTIFIED_MODES:
+                support_row = ObjectSupportReportRow(
+                    obj_type="CONTEXT",
+                    src_full=namespace_u,
+                    tgt_full=namespace_u,
+                    support_state=SUPPORT_STATE_RISKY,
+                    reason_code="CONTEXT_MODE_UNCERTIFIED",
+                    reason="当前仅认证 ACCESSED LOCALLY / ACCESSED GLOBALLY 可自动落地，其余 mode 需人工处理。",
+                    dependency=expected_binding or "-",
+                    action="人工确认并手工创建",
+                    detail=f"source_mode={source_mode}",
+                    root_cause=f"{namespace_u}(CONTEXT_MODE_UNCERTIFIED)",
+                )
+            else:
+                support_row = ObjectSupportReportRow(
+                    obj_type="CONTEXT",
+                    src_full=namespace_u,
+                    tgt_full=namespace_u,
+                    support_state=SUPPORT_STATE_SUPPORTED,
+                    reason_code="CONTEXT_MISSING",
+                    reason="目标端缺失 application context。",
+                    dependency=expected_binding or "-",
+                    action="FIXUP" if fixup_mode == "safe_auto" else "MANUAL_TEMPLATE",
+                    detail=f"expected_binding={expected_binding}; source_mode={source_mode}",
+                    root_cause="",
+                )
+            missing_support_rows.append(support_row)
+            detail_row = ContextDriftDetailRow(
+                namespace=namespace_u,
+                source_binding=format_context_binding(src_meta.schema, src_meta.package),
+                expected_target_binding=expected_binding,
+                target_binding="-",
+                source_mode=source_mode,
+                target_mode="-",
+                status="MISSING",
+                reason_code=support_row.reason_code,
+                reason=support_row.reason,
+                action=support_row.action,
+                detail=support_row.detail,
+                prerequisite=prerequisite,
+            )
+            detail_rows.append(detail_row)
+            namespace_status[namespace_u] = ("MISSING", support_row.reason_code, support_row.action)
+            if support_row.support_state == SUPPORT_STATE_SUPPORTED and fixup_mode == "safe_auto" and trusted_package_ready:
+                ddl = build_ob_context_create_ddl(expected_meta)
+                if ddl:
+                    runnable_fixups.append(ContextFixupRow(namespace_u, "context", ddl, "RUNNABLE", support_row.reason_code, support_row.detail, prerequisite))
+                else:
+                    manual_fixups.append(ContextFixupRow(namespace_u, "unsupported/context", _build_context_manual_template(src_meta, expected_meta, detail_row), "MANUAL", support_row.reason_code, detail_row.detail, prerequisite))
+            else:
+                manual_fixups.append(ContextFixupRow(namespace_u, "unsupported/context", _build_context_manual_template(src_meta, expected_meta, detail_row), "MANUAL", support_row.reason_code, detail_row.detail, prerequisite))
+            continue
+
+        binding_mismatch = (
+            normalize_identifier_name(expected_meta.schema) != normalize_identifier_name(tgt_meta.schema)
+            or normalize_identifier_name(expected_meta.package) != normalize_identifier_name(tgt_meta.package)
+        )
+        mode_mismatch = source_mode != target_mode
+        if binding_mismatch or mode_mismatch:
+            reasons: List[str] = []
+            reason_code = "CONTEXT_DRIFT"
+            if binding_mismatch:
+                reasons.append("trusted package 绑定不一致")
+                reason_code = "CONTEXT_TRUSTED_PACKAGE_MISMATCH"
+            if mode_mismatch:
+                reasons.append("mode 不一致")
+                if reason_code == "CONTEXT_TRUSTED_PACKAGE_MISMATCH":
+                    reason_code = "CONTEXT_BINDING_AND_MODE_MISMATCH"
+                else:
+                    reason_code = "CONTEXT_MODE_MISMATCH"
+            if trusted_pkg_out_of_scope and source_pkg_full:
+                support_state = SUPPORT_STATE_BLOCKED
+                reason_text = "trusted package 不在当前受管映射范围，不能自动修复 context 漂移。"
+                action = "人工确认 context 绑定并手工修复"
+            else:
+                support_state = SUPPORT_STATE_RISKY
+                reason_text = "；".join(reasons)
+                action = "FIXUP" if fixup_mode == "safe_auto" and source_mode in CONTEXT_CERTIFIED_MODES and trusted_package_ready else "MANUAL_TEMPLATE"
+            detail_row = ContextDriftDetailRow(
+                namespace=namespace_u,
+                source_binding=format_context_binding(src_meta.schema, src_meta.package),
+                expected_target_binding=expected_binding,
+                target_binding=target_binding,
+                source_mode=source_mode,
+                target_mode=target_mode,
+                status="MISMATCH",
+                reason_code=reason_code,
+                reason=reason_text,
+                action=action,
+                detail=f"target_binding={target_binding}; target_mode={target_mode}",
+                prerequisite=prerequisite,
+            )
+            detail_rows.append(detail_row)
+            unsupported_rows.append(ObjectSupportReportRow(
+                obj_type="CONTEXT",
+                src_full=namespace_u,
+                tgt_full=namespace_u,
+                support_state=support_state,
+                reason_code=reason_code,
+                reason=reason_text,
+                dependency=expected_binding or "-",
+                action=action,
+                detail=detail_row.detail,
+                root_cause=f"{namespace_u}({reason_code})",
+            ))
+            namespace_status[namespace_u] = ("MISMATCH", reason_code, action)
+            if fixup_mode == "safe_auto" and source_mode in CONTEXT_CERTIFIED_MODES and not trusted_pkg_out_of_scope and trusted_package_ready:
+                ddl = build_ob_context_create_ddl(expected_meta)
+                if ddl:
+                    runnable_fixups.append(ContextFixupRow(namespace_u, "context", ddl, "RUNNABLE", reason_code, detail_row.detail, prerequisite))
+                else:
+                    manual_fixups.append(ContextFixupRow(namespace_u, "unsupported/context", _build_context_manual_template(src_meta, expected_meta, detail_row), "MANUAL", reason_code, detail_row.detail, prerequisite))
+            else:
+                manual_fixups.append(ContextFixupRow(namespace_u, "unsupported/context", _build_context_manual_template(src_meta, expected_meta, detail_row), "MANUAL", reason_code, detail_row.detail, prerequisite))
+        else:
+            detail_rows.append(ContextDriftDetailRow(
+                namespace=namespace_u,
+                source_binding=format_context_binding(src_meta.schema, src_meta.package),
+                expected_target_binding=expected_binding,
+                target_binding=target_binding,
+                source_mode=source_mode,
+                target_mode=target_mode,
+                status="OK",
+                reason_code="-",
+                reason="-",
+                action="-",
+                detail="-",
+                prerequisite=prerequisite,
+            ))
+            namespace_status[namespace_u] = ("OK", "-", "-")
+
+    reference_detail_rows: List[ContextReferenceRow] = []
+    for row in literal_refs:
+        status, reason_code, action = namespace_status.get(row.namespace, ("UNVALIDATED", "CONTEXT_NOT_CHECKED", "人工确认"))
+        reference_detail_rows.append(ContextReferenceRow(
+            object_full=row.object_full,
+            object_type=row.object_type,
+            reference_kind=row.reference_kind,
+            namespace=row.namespace,
+            attribute=row.attribute,
+            status=status,
+            detail=reason_code if reason_code != "-" else action,
+        ))
+    reference_detail_rows.extend(unresolved_refs)
+
+    summary = {
+        "source_contexts": len(source_ctx_norm),
+        "target_contexts": len(target_ctx_norm),
+        "inventory_checked": len(namespaces_to_check),
+        "missing": sum(1 for row in detail_rows if row.status == "MISSING"),
+        "mismatch": sum(1 for row in detail_rows if row.status == "MISMATCH"),
+        "unresolved": len(unresolved_refs),
+        "runnable": len(runnable_fixups),
+        "manual": len(manual_fixups),
+    }
+    return ContextCompareResults(
+        missing_support_rows=missing_support_rows,
+        unsupported_rows=unsupported_rows,
+        detail_rows=detail_rows,
+        reference_rows=reference_detail_rows,
+        runnable_fixups=runnable_fixups,
+        manual_fixups=manual_fixups,
+        summary=summary,
+    )
+
+
 def extend_source_scope_result_with_seed_rows(
     scope_result: ScopedSourceScopeResult,
     source_objects: SourceObjectMap,
@@ -13657,6 +14420,11 @@ def adapt_ob_metadata_to_source_oracle_metadata(
     loaded_schema_set.update(owner for owner, _name, _obj_type in (ob_meta.object_statuses or {}).keys())
     loaded_schema_set.update(owner for owner, _name, _err_type in (ob_meta.package_errors or {}).keys())
     loaded_schema_set.update(owner for owner, _table in (ob_meta.partition_key_columns or {}).keys())
+    loaded_schema_set.update(
+        normalize_identifier_name(info.schema)
+        for info in (ob_meta.contexts or {}).values()
+        if normalize_identifier_name(info.schema)
+    )
     return OracleMetadata(
         table_columns=dict(ob_meta.tab_columns or {}),
         invisible_column_supported=bool(ob_meta.invisible_column_supported),
@@ -13691,6 +14459,7 @@ def adapt_ob_metadata_to_source_oracle_metadata(
         default_on_null_columns=dict(getattr(ob_meta, "default_on_null_columns", {}) or {}),
         identity_options=dict(getattr(ob_meta, "identity_options", {}) or {}),
         nested_table_storage_tables={},
+        contexts=dict(getattr(ob_meta, "contexts", {}) or {}),
     )
 
 
@@ -13705,6 +14474,7 @@ def dump_source_metadata(
     include_comments: bool = False,
     include_privileges: bool = False,
     include_interval_partitions: bool = False,
+    include_contexts: bool = False,
 ) -> OracleMetadata:
     source_db_mode = normalize_source_db_mode(settings.get("source_db_mode", SOURCE_DB_MODE_ORACLE))
     if source_db_mode == SOURCE_DB_MODE_ORACLE:
@@ -13719,6 +14489,7 @@ def dump_source_metadata(
             include_comments=include_comments,
             include_privileges=include_privileges,
             include_interval_partitions=include_interval_partitions,
+            include_contexts=include_contexts,
         )
 
     source_ob_cfg = settings.get("source_ob_cfg") or {}
@@ -13754,6 +14525,7 @@ def dump_source_metadata(
         include_comments=include_comments,
         include_roles=False,
         target_table_pairs=collect_table_pairs(master_list, use_target=False) if include_comments else set(),
+        include_contexts=include_contexts,
     )
     return adapt_ob_metadata_to_source_oracle_metadata(ob_meta, source_schemas)
 
@@ -17548,6 +18320,17 @@ def compute_object_counts(
                 for cons_map in ob_meta.constraints.values()
                 for cons_name in cons_map
             }
+        elif obj_type_u == 'CONTEXT':
+            expected_set = {
+                normalize_identifier_name(name)
+                for name in (oracle_meta.contexts or {}).keys()
+                if normalize_identifier_name(name)
+            }
+            actual_set = {
+                normalize_identifier_name(name)
+                for name in (ob_meta.contexts or {}).keys()
+                if normalize_identifier_name(name)
+            }
         else:
             expected_set = expected_by_type.get(obj_type_u, set())
             actual_set = actual_by_type.get(obj_type_u, set())
@@ -18590,7 +19373,8 @@ def dump_ob_metadata(
     include_sequences: bool = True,
     include_comments: bool = True,
     include_roles: bool = False,
-    target_table_pairs: Optional[Set[Tuple[str, str]]] = None
+    target_table_pairs: Optional[Set[Tuple[str, str]]] = None,
+    include_contexts: bool = False,
 ) -> ObMetadata:
     """
     一次性从 OceanBase dump 所有需要的元数据，返回 ObMetadata。
@@ -18620,7 +19404,8 @@ def dump_ob_metadata(
             case_sensitive_findings=(),
             constraint_deferrable_supported=False,
             temporary_tables=frozenset(),
-            enabled_notnull_check_groups=MappingProxyType({})
+            enabled_notnull_check_groups=MappingProxyType({}),
+            contexts=MappingProxyType({}),
         )
 
     synonym_scope = normalize_synonym_check_scope(synonym_check_scope)
@@ -19647,6 +20432,7 @@ def dump_ob_metadata(
             default_on_null_columns = _fetch_ob_default_on_null_map(ob_cfg, default_on_null_candidate_tables)
 
     roles: Set[str] = set()
+    contexts: Dict[str, ContextMetadata] = {}
     # --- 9. DBA_ROLES ---
     if include_roles:
         sql = "SELECT ROLE FROM DBA_ROLES"
@@ -19658,6 +20444,11 @@ def dump_ob_metadata(
                 role = (line or "").strip().upper()
                 if role:
                     roles.add(role)
+
+    if include_contexts:
+        contexts, ctx_err = load_ob_context_inventory(ob_cfg, set(owners_in_list))
+        if ctx_err:
+            log.warning("读取 OB DBA_CONTEXT 失败，context compare/fixup 将保守降级: %s", ctx_err)
 
     log.info("OceanBase 元数据转储完成 (根据开关加载 DBA_OBJECTS/列/索引/约束/触发器/序列/注释)。")
     ob_meta = ObMetadata(
@@ -19687,6 +20478,7 @@ def dump_ob_metadata(
         identity_options=identity_options,
         enabled_notnull_check_columns=enabled_notnull_check_columns,
         enabled_notnull_check_groups=enabled_notnull_check_groups,
+        contexts=contexts,
     )
     ob_table_count = len(ob_meta.tab_columns)
     ob_column_count = sum(len(cols) for cols in ob_meta.tab_columns.values())
@@ -21901,7 +22693,8 @@ def dump_oracle_metadata(
     include_comments: bool = True,
     include_blacklist: bool = True,
     include_privileges: bool = True,
-    include_interval_partitions: bool = False
+    include_interval_partitions: bool = False,
+    include_contexts: bool = False,
 ) -> OracleMetadata:
     """
     预先加载 Oracle 端所需的所有元数据，避免在校验/修补阶段频繁查询。
@@ -21953,6 +22746,7 @@ def dump_oracle_metadata(
             non_table_triggers=(),
             temporary_tables=set(),
             nested_table_storage_tables={},
+            contexts={},
         )
 
     log.info("正在批量加载 Oracle 元数据 (DBA_TAB_COLUMNS/DBA_INDEXES/DBA_CONSTRAINTS/DBA_TRIGGERS/DBA_SEQUENCES)...")
@@ -21983,6 +22777,7 @@ def dump_oracle_metadata(
     interval_partitions: Dict[Tuple[str, str], IntervalPartitionInfo] = {}
     temporary_tables: Set[Tuple[str, str]] = set()
     nested_table_storage_tables: Dict[Tuple[str, str], NestedTableStorageInfo] = {}
+    contexts: Dict[str, ContextMetadata] = {}
     invisible_column_supported = False
     identity_column_supported = False
     default_on_null_supported = False
@@ -22829,6 +23624,11 @@ def dump_oracle_metadata(
                             log.warning("Oracle 端注释查询未返回任何记录，可能缺少权限，注释比对将跳过。")
                             comments_complete = False
 
+                if include_contexts:
+                    contexts, ctx_err = load_oracle_context_inventory(ora_cfg, source_schema_set)
+                    if ctx_err:
+                        log.warning("读取 Oracle DBA_CONTEXT 失败，context compare/fixup 将保守降级: %s", ctx_err)
+
                 if include_blacklist:
                     blacklist_mode = settings.get("blacklist_mode", "auto")
                     use_table = blacklist_mode in ("auto", "table_only")
@@ -23245,6 +24045,7 @@ def dump_oracle_metadata(
         default_on_null_columns=default_on_null_columns,
         identity_options=identity_options,
         nested_table_storage_tables=nested_table_storage_tables,
+        contexts=contexts,
     )
 
 
@@ -32688,6 +33489,79 @@ def _build_editionable_cleanup_samples(before: str, _after: str) -> Tuple[int, L
     return _build_keyword_cleanup_samples(before, ["EDITIONABLE", "NONEDITIONABLE"])
 
 
+PLSQL_SYSDATE_CALL_PATTERN = re.compile(r"\bSYSDATE\b\s*\(\s*\)", re.IGNORECASE)
+PLSQL_BOOLEAN_FALSE_COMPARISON_PATTERN = re.compile(r"\)\s*=\s*FALSE\b", re.IGNORECASE)
+
+
+def _find_plsql_sysdate_call_rewrite_edits(ddl: str) -> List[Tuple[int, int, str]]:
+    if not ddl:
+        return []
+    masked = mask_sql_for_scan(ddl)
+    edits: List[Tuple[int, int, str]] = []
+    for match in PLSQL_SYSDATE_CALL_PATTERN.finditer(masked):
+        source = ddl[match.start():match.end()]
+        replacement = re.sub(r"(?is)\b(SYSDATE)\b\s*\(\s*\)", r"\1", source, count=1)
+        if source == replacement:
+            continue
+        edits.append((match.start(), match.end(), replacement))
+    return edits
+
+
+def _build_plsql_sysdate_call_cleanup_samples(before: str, _after: str) -> Tuple[int, List[str]]:
+    edits = _find_plsql_sysdate_call_rewrite_edits(before)
+    samples: List[str] = []
+    for _start, _end, replacement in edits:
+        _append_unique_cleanup_sample(samples, f"SYSDATE() -> {replacement.strip()}")
+    return len(edits), samples
+
+
+def _find_plsql_boolean_false_rewrite_edits(ddl: str) -> List[Tuple[int, int, str]]:
+    if not ddl:
+        return []
+    masked = mask_sql_for_scan(ddl)
+    edits: List[Tuple[int, int, str]] = []
+    seen_ranges: Set[Tuple[int, int]] = set()
+    for match in PLSQL_BOOLEAN_FALSE_COMPARISON_PATTERN.finditer(masked):
+        close_idx = match.start()
+        depth = 0
+        open_idx: Optional[int] = None
+        for idx in range(close_idx, -1, -1):
+            ch = masked[idx]
+            if ch == ")":
+                depth += 1
+            elif ch == "(":
+                depth -= 1
+                if depth == 0:
+                    open_idx = idx
+                    break
+        if open_idx is None:
+            continue
+        prev_idx = open_idx - 1
+        if prev_idx >= 0 and re.match(r'[A-Za-z0-9_$#".]', masked[prev_idx]):
+            continue
+        range_key = (open_idx, match.end())
+        if range_key in seen_ranges:
+            continue
+        seen_ranges.add(range_key)
+        replacement = f"NOT {ddl[open_idx:close_idx + 1]}"
+        edits.append((open_idx, match.end(), replacement))
+    return edits
+
+
+def _build_plsql_boolean_false_cleanup_samples(before: str, _after: str) -> Tuple[int, List[str]]:
+    edits = _find_plsql_boolean_false_rewrite_edits(before)
+    samples: List[str] = []
+    for start, end, replacement in edits:
+        source = re.sub(r"\s+", " ", before[start:end]).strip()
+        target = re.sub(r"\s+", " ", replacement).strip()
+        if len(source) > 80:
+            source = source[:77] + "..."
+        if len(target) > 80:
+            target = target[:77] + "..."
+        _append_unique_cleanup_sample(samples, f"{source} -> {target}")
+    return len(edits), samples
+
+
 DDL_CLEAN_RULE_META: Dict[str, DdlCleanupRuleMeta] = {
     "clean_end_schema_prefix": DdlCleanupRuleMeta(
         rule_name="clean_end_schema_prefix",
@@ -32707,6 +33581,20 @@ DDL_CLEAN_RULE_META: Dict[str, DdlCleanupRuleMeta] = {
         category=DDL_CLEAN_CATEGORY_FORMAT_ONLY,
         evidence_level=DDL_CLEAN_EVIDENCE_NOT_APPLICABLE,
         note="修正集合范围中的单点拼写错误，避免生成无效的 PL/SQL。",
+    ),
+    "clean_plsql_sysdate_call": DdlCleanupRuleMeta(
+        rule_name="clean_plsql_sysdate_call",
+        category=DDL_CLEAN_CATEGORY_SYNTAX_COMPAT,
+        evidence_level=DDL_CLEAN_EVIDENCE_VERIFIED_UNSUPPORTED,
+        note="Oracle PL/SQL 中的 `SYSDATE()` 在当前 OB 上不兼容，已改写为 `SYSDATE`。",
+        sample_builder=_build_plsql_sysdate_call_cleanup_samples,
+    ),
+    "clean_plsql_boolean_false_comparison": DdlCleanupRuleMeta(
+        rule_name="clean_plsql_boolean_false_comparison",
+        category=DDL_CLEAN_CATEGORY_SYNTAX_COMPAT,
+        evidence_level=DDL_CLEAN_EVIDENCE_VERIFIED_UNSUPPORTED,
+        note="Oracle PL/SQL 中的 `(expr) = FALSE` 在当前 OB 上不兼容，已改写为 `NOT (expr)`。",
+        sample_builder=_build_plsql_boolean_false_cleanup_samples,
     ),
     "clean_plsql_ending": DdlCleanupRuleMeta(
         rule_name="clean_plsql_ending",
@@ -36054,6 +36942,38 @@ def clean_for_loop_collection_attr_range(ddl: str) -> str:
     return FOR_LOOP_COLLECTION_ATTR_PATTERN.sub(r"\1..\2", ddl)
 
 
+def clean_plsql_sysdate_call(ddl: str) -> str:
+    """
+    将 Oracle PL/SQL 中可编译、但 OB 不支持的 `SYSDATE()` 改写为 `SYSDATE`。
+    仅处理无参调用形态，且不会进入字符串/注释。
+    """
+    if not ddl:
+        return ddl
+    edits = _find_plsql_sysdate_call_rewrite_edits(ddl)
+    if not edits:
+        return ddl
+    result = ddl
+    for start, end, replacement in sorted(edits, key=lambda item: item[0], reverse=True):
+        result = result[:start] + replacement + result[end:]
+    return result
+
+
+def clean_plsql_boolean_false_comparison(ddl: str) -> str:
+    """
+    将 Oracle PL/SQL 中可编译、但 OB 不支持的 `(expr) = FALSE` 改写为 `NOT (expr)`。
+    仅处理“完整括号表达式比较 FALSE”的保守场景，避免误伤函数调用参数括号。
+    """
+    if not ddl:
+        return ddl
+    edits = _find_plsql_boolean_false_rewrite_edits(ddl)
+    if not edits:
+        return ddl
+    result = ddl
+    for start, end, replacement in sorted(edits, key=lambda item: item[0], reverse=True):
+        result = result[:start] + replacement + result[end:]
+    return result
+
+
 def clean_extra_semicolons(ddl: str) -> str:
     """
     清理多余的分号
@@ -37544,6 +38464,8 @@ DDL_CLEANUP_RULES = {
             clean_editionable_flags,
             clean_for_loop_single_dot_range,
             clean_for_loop_collection_attr_range,
+            clean_plsql_sysdate_call,
+            clean_plsql_boolean_false_comparison,
             clean_plsql_ending,
             clean_semicolon_before_slash,
             clean_xmltype_xmlschema_clause,
@@ -37561,6 +38483,8 @@ DDL_CLEANUP_RULES = {
             clean_editionable_flags,
             clean_for_loop_single_dot_range,
             clean_for_loop_collection_attr_range,
+            clean_plsql_sysdate_call,
+            clean_plsql_boolean_false_comparison,
             clean_plsql_ending,
             clean_semicolon_before_slash,
             clean_xmltype_xmlschema_clause,
@@ -37660,6 +38584,8 @@ def apply_ddl_cleanup_rules_with_audit(
             if rule_func not in {
                 rewrite_unsupported_table_oracle_types,
                 clean_interval_partition_clause,
+                clean_plsql_sysdate_call,
+                clean_plsql_boolean_false_comparison,
             }
         ]
     
@@ -38704,6 +39630,71 @@ def write_fixup_file(
     return file_path
 
 
+def generate_context_fixup_outputs(
+    base_dir: Path,
+    settings: Dict,
+    context_results: Optional[ContextCompareResults],
+    fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None,
+) -> None:
+    if not context_results:
+        return
+    fixup_type_filter: Set[str] = set(settings.get("fixup_type_set", set()) or set())
+    if fixup_type_filter and "CONTEXT" not in fixup_type_filter:
+        if fixup_skip_summary is not None:
+            actionable = len(context_results.runnable_fixups or []) + len(context_results.manual_fixups or [])
+            if actionable:
+                fixup_skip_summary["CONTEXT"] = {
+                    "missing_total": actionable,
+                    "task_total": 0,
+                    "generated": 0,
+                    "skipped": {"type_filter": actionable},
+                }
+        return
+
+    runnable_count = 0
+    manual_count = 0
+    for row in (context_results.runnable_fixups or []):
+        filename = f"{normalize_identifier_name(row.namespace) or row.namespace}.sql"
+        write_fixup_file(
+            base_dir,
+            row.output_dir,
+            filename,
+            row.sql_text,
+            "CONTEXT 自动修复脚本",
+            extra_comments=[
+                f"reason_code={row.reason_code}",
+                f"mode={row.mode}",
+                f"detail={row.detail}",
+                f"prerequisite={row.prerequisite or '-'}",
+            ],
+        )
+        runnable_count += 1
+    for row in (context_results.manual_fixups or []):
+        filename = f"{normalize_identifier_name(row.namespace) or row.namespace}.sql"
+        write_fixup_file(
+            base_dir,
+            row.output_dir,
+            filename,
+            row.sql_text,
+            "CONTEXT 人工模板/说明",
+            extra_comments=[
+                f"reason_code={row.reason_code}",
+                f"mode={row.mode}",
+                f"detail={row.detail}",
+                f"prerequisite={row.prerequisite or '-'}",
+            ],
+        )
+        manual_count += 1
+    if fixup_skip_summary is not None and (runnable_count or manual_count):
+        fixup_skip_summary["CONTEXT"] = {
+            "missing_total": runnable_count + manual_count,
+            "task_total": runnable_count,
+            "generated": runnable_count,
+            "skipped": {"manual_template": manual_count} if manual_count else {},
+        }
+    settings["_context_generated_fixup_count"] = runnable_count + manual_count
+
+
 def write_fixup_root_readme(
     base_dir: Path,
     report_dir: Optional[Path],
@@ -38777,6 +39768,7 @@ def write_fixup_root_readme(
         "function": "缺失 FUNCTION 的 CREATE 脚本。",
         "package": "缺失 PACKAGE 的 CREATE 脚本。",
         "package_body": "缺失 PACKAGE BODY 的 CREATE 脚本。",
+        "context": "CONTEXT 自动修复脚本（仅 safe_auto + 认证 mode 生成）。",
         "type": "缺失 TYPE 的 CREATE 脚本。",
         "type_body": "缺失 TYPE BODY 的 CREATE 脚本。",
         "synonym": "缺失 SYNONYM 的 CREATE 脚本。",
@@ -45030,6 +46022,16 @@ def generate_fixup_scripts(
     elif generate_status_fixup:
         log.info("[FIXUP] (7.5/9) 状态修复脚本已开启，但当前无可生成的状态差异。")
 
+    context_results = settings.get("_context_results")
+    if context_results:
+        log.info("[FIXUP] (7.6/9) 正在生成 CONTEXT 输出...")
+        generate_context_fixup_outputs(
+            base_dir,
+            settings,
+            context_results,
+            fixup_skip_summary=fixup_skip_summary,
+        )
+
     dep_report = dependency_report or {}
     compile_tasks: Dict[Tuple[str, str, str], Set[str]] = defaultdict(set)
 
@@ -46255,6 +47257,92 @@ def export_case_sensitive_identifier_detail(
         for row in rows_sorted
     ]
     return write_pipe_report("大小写敏感标识符明细", header_fields, data_rows, output_path)
+
+
+def export_context_detail(
+    rows: List[ContextDriftDetailRow],
+    report_dir: Path,
+    report_timestamp: Optional[str],
+) -> Optional[Path]:
+    if not report_dir or not rows or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"context_detail_{report_timestamp}.txt"
+    rows_sorted = sorted(rows, key=lambda item: (item.status, item.namespace))
+    header_fields = [
+        "NAMESPACE",
+        "SOURCE_BINDING",
+        "EXPECTED_TARGET_BINDING",
+        "TARGET_BINDING",
+        "SOURCE_MODE",
+        "TARGET_MODE",
+        "STATUS",
+        "REASON_CODE",
+        "REASON",
+        "ACTION",
+        "DETAIL",
+        "PREREQUISITE",
+    ]
+    data_rows = [
+        [
+            row.namespace,
+            row.source_binding,
+            row.expected_target_binding,
+            row.target_binding,
+            row.source_mode,
+            row.target_mode,
+            row.status,
+            row.reason_code,
+            row.reason,
+            row.action,
+            row.detail,
+            row.prerequisite or "-",
+        ]
+        for row in rows_sorted
+    ]
+    return write_pipe_report("CONTEXT 漂移明细", header_fields, data_rows, output_path)
+
+
+def export_context_reference_detail(
+    rows: List[ContextReferenceRow],
+    report_dir: Path,
+    report_timestamp: Optional[str],
+) -> Optional[Path]:
+    if not report_dir or not rows or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"context_reference_detail_{report_timestamp}.txt"
+    rows_sorted = sorted(
+        rows,
+        key=lambda item: (
+            item.status,
+            item.object_type,
+            item.object_full,
+            item.reference_kind,
+            item.namespace,
+            item.attribute,
+        ),
+    )
+    header_fields = [
+        "OBJECT_FULL",
+        "OBJECT_TYPE",
+        "REFERENCE_KIND",
+        "NAMESPACE",
+        "ATTRIBUTE",
+        "STATUS",
+        "DETAIL",
+    ]
+    data_rows = [
+        [
+            row.object_full,
+            row.object_type,
+            row.reference_kind,
+            row.namespace,
+            row.attribute or "-",
+            row.status,
+            row.detail or "-",
+        ]
+        for row in rows_sorted
+    ]
+    return write_pipe_report("CONTEXT 引用校验明细", header_fields, data_rows, output_path)
 
 
 def export_sys_c_force_candidates_detail(
@@ -49675,6 +50763,7 @@ OPERATOR_ACTION_CATEGORY_LABELS = {
     "DEFERRED_GRANT": "延后授权",
     "PUBLIC_REVOKE_REVIEW": "PUBLIC 扩权回收复核",
     "PRIVILEGE_FAMILY_MANUAL": "专项权限族人工处理",
+    "CONTEXT_MANUAL": "application context 漂移",
     "TRIGGER_NON_TABLE_UNSUPPORTED": "非表触发器",
     "TRIGGER_TEMP_UNSUPPORTED": "临时表触发器",
     "TRIGGER_VIEW_REVIEW": "触发器视图引用",
@@ -49733,6 +50822,7 @@ def build_operator_action_rows(
     sequence_restart_unresolved_count: int = 0,
     sys_c_force_candidate_count: int = 0,
     case_sensitive_findings_count: int = 0,
+    context_manual_count: int = 0,
     deferred_validate_count: int = 0,
     ddl_cleanup_semantic_rows: int = 0,
     fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None,
@@ -49794,6 +50884,17 @@ def build_operator_action_rows(
         related_fixup_dir="unsupported/",
         why="目标对象不支持、被阻断，或需改造后才能迁移。",
         recommended_action="先核对 unsupported 明细与对应 fixup 目录，默认不要直接执行这些对象脚本。",
+    )
+    _add(
+        priority="REVIEW",
+        stage="POST_COMPARE_REVIEW",
+        category="CONTEXT_MANUAL",
+        count=context_manual_count,
+        default_behavior="REPORT_ONLY",
+        primary_artifact=_derive_run_artifact_path(report_dir, report_timestamp, "context_detail"),
+        related_fixup_dir="context/|unsupported/context/",
+        why="application context 缺失/漂移通常不会阻断编译，但会在运行期导致 SYS_CONTEXT 返回异常值或 NULL。",
+        recommended_action="先看 context_detail/context_reference_detail，再决定执行 context/ 或人工处理 unsupported/context/。",
     )
     _add(
         priority="REVIEW",
@@ -51156,8 +52257,12 @@ def _build_report_detail_rows(
 
     if "missing" in detail_modes:
         for row in missing_supported:
-            src_schema, src_name = parse_full_object_name(row.src_full) or ("", "")
-            tgt_schema, tgt_name = parse_full_object_name(row.tgt_full) or ("", "")
+            if (row.obj_type or "").upper() == "CONTEXT":
+                src_schema, src_name = "", row.src_full
+                tgt_schema, tgt_name = "", row.tgt_full
+            else:
+                src_schema, src_name = parse_full_object_name(row.src_full) or ("", "")
+                tgt_schema, tgt_name = parse_full_object_name(row.tgt_full) or ("", "")
             _push({
                 "report_type": "MISSING",
                 "object_type": row.obj_type,
@@ -51178,8 +52283,12 @@ def _build_report_detail_rows(
 
     if "unsupported" in detail_modes:
         for row in unsupported_rows:
-            src_schema, src_name = parse_full_object_name(row.src_full) or ("", "")
-            tgt_schema, tgt_name = parse_full_object_name(row.tgt_full) or ("", "")
+            if (row.obj_type or "").upper() == "CONTEXT":
+                src_schema, src_name = "", row.src_full
+                tgt_schema, tgt_name = "", row.tgt_full
+            else:
+                src_schema, src_name = parse_full_object_name(row.src_full) or ("", "")
+                tgt_schema, tgt_name = parse_full_object_name(row.tgt_full) or ("", "")
             report_type = support_state_to_report_type(row.support_state)
             _push({
                 "report_type": report_type,
@@ -54228,6 +55337,8 @@ def save_report_to_db(
     constraint_mismatch_total = len(extra_results.get("constraint_mismatched", []))
     trigger_missing_total = int(extra_missing_counts.get("TRIGGER", 0) or 0)
     sequence_missing_total = int(extra_missing_counts.get("SEQUENCE", 0) or 0)
+    context_summary = dict((settings or {}).get("_context_summary") or {})
+    context_mismatch_total = int(context_summary.get("mismatch", 0) or 0)
 
     extra_mismatch_total = (
         index_mismatch_total
@@ -54236,6 +55347,7 @@ def save_report_to_db(
         + len(extra_results.get("trigger_mismatched", []) or [])
         + len(trigger_status_rows or [])
         + len(constraint_status_rows or [])
+        + context_mismatch_total
     )
     extra_missing_total = (
         index_missing_total
@@ -54953,6 +56065,7 @@ def build_run_summary(
     runtime_degraded_detail_path: Optional[Path] = None,
     grant_plan: Optional[GrantPlan] = None,
     object_counts_summary: Optional[ObjectCountSummary] = None,
+    context_summary: Optional[Dict[str, object]] = None,
 ) -> RunSummary:
     end_time = datetime.now()
     total_seconds = time.perf_counter() - ctx.start_perf
@@ -55127,6 +56240,12 @@ def build_run_summary(
     ddl_cleanup_applied_rows = int(ddl_cleanup_summary.get("applied_rows", 0) or 0)
     ddl_cleanup_preserved_rows = int(ddl_cleanup_summary.get("preserved_rows", 0) or 0)
     ddl_cleanup_semantic_rows = int(ddl_cleanup_summary.get("semantic_rewrite_rows", 0) or 0)
+    context_summary = dict(context_summary or {})
+    context_missing_cnt = int(context_summary.get("missing", 0) or 0)
+    context_mismatch_cnt = int(context_summary.get("mismatch", 0) or 0)
+    context_unresolved_cnt = int(context_summary.get("unresolved", 0) or 0)
+    context_manual_cnt = int(context_summary.get("manual", 0) or 0)
+    context_runnable_cnt = int(context_summary.get("runnable", 0) or 0)
     manual_action_rows = list(manual_action_rows or [])
     runtime_degraded_rows = normalize_runtime_degraded_events(runtime_degraded_events)
     runtime_compare_events = [
@@ -55146,6 +56265,16 @@ def build_run_summary(
     if unsupported_by_type:
         items = ", ".join(f"{k}={v}" for k, v in sorted(unsupported_by_type.items()))
         findings.append(f"缺失中不支持/阻断/待确认: {items}")
+    if context_missing_cnt or context_mismatch_cnt or context_unresolved_cnt:
+        findings.append(
+            "CONTEXT 漂移: 缺失 {missing}, mismatch {mismatch}, unresolved {unresolved}, runnable {runnable}, manual {manual}".format(
+                missing=context_missing_cnt,
+                mismatch=context_mismatch_cnt,
+                unresolved=context_unresolved_cnt,
+                runnable=context_runnable_cnt,
+                manual=context_manual_cnt,
+            )
+        )
     if ddl_cleanup_applied_rows or ddl_cleanup_preserved_rows:
         findings.append(
             "DDL 清理/改写: 应用 {applied}, 语义改写 {semantic}, 保留提醒 {preserved}".format(
@@ -55222,7 +56351,7 @@ def build_run_summary(
                 f"目标端额外对象授权: {extra_object_grant_count} 条 (PUBLIC={extra_public_grant_count})"
             )
     if fixup_skip_summary:
-        for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM"):
+        for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM", "CONTEXT"):
             obj_summary = fixup_skip_summary.get(obj_type) or {}
             if not obj_summary:
                 continue
@@ -55311,6 +56440,8 @@ def build_run_summary(
         attention.append("触发器中存在 SCHEMA.OBJECT.COLUMN 形式的字符串路径，程序已保守保留原文，请人工确认。")
     if ddl_cleanup_semantic_rows:
         attention.append("本次 fixup 中存在 DDL 语义改写，请优先复核 ddl_cleanup_detail 明细和脚本头注释。")
+    if context_missing_cnt or context_mismatch_cnt or context_unresolved_cnt:
+        attention.append("存在 application context 缺失/漂移/未解析引用，需复核 context_detail 与 context_reference_detail。")
     if ddl_cleanup_preserved_rows:
         attention.append("部分 Oracle 子句已改为默认保留策略，需结合目标环境确认是否仍需人工精简。")
     if runtime_compare_events:
@@ -55357,6 +56488,8 @@ def build_run_summary(
         _append_unique_guide_step(next_steps, "若依赖差异存在，请按依赖报告补齐编译或授权。")
     if comment_mis_cnt:
         _append_unique_guide_step(next_steps, "如业务要求注释一致，再确认 comment mismatch 明细。")
+    if context_missing_cnt or context_mismatch_cnt or context_unresolved_cnt:
+        _append_unique_guide_step(next_steps, "如涉及 application context，请先看 context_detail/context_reference_detail，再决定执行 context/ 或人工处理 unsupported/context/。")
     if ctx.enable_grant_generation and ctx.fixup_enabled:
         if grant_mode == GRANT_GENERATION_MODE_STRUCTURAL:
             _append_unique_guide_step(
@@ -55377,7 +56510,7 @@ def build_run_summary(
                     all=Path(ctx.fixup_dir) / 'grants_all'
                 )
             )
-    if fixup_skip_summary and any(fixup_skip_summary.get(obj_type) for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM", "SEQUENCE_RESTART")):
+    if fixup_skip_summary and any(fixup_skip_summary.get(obj_type) for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM", "CONTEXT", "SEQUENCE_RESTART")):
         if report_file:
             report_parent = Path(report_file).parent
             _append_unique_guide_step(next_steps, f"如脚本数量和预期不符，再看 {report_parent}/fixup_skip_summary_*.txt。")
@@ -55775,6 +56908,16 @@ def print_final_report(
     package_tgt_invalid_cnt = int(package_summary.get("TARGET_INVALID", 0) or 0)
     package_status_mismatch_cnt = int(package_summary.get("STATUS_MISMATCH", 0) or 0)
     package_missing_support_rows = build_package_missing_support_rows(package_results)
+    context_missing_support_rows = list((settings or {}).get("_context_missing_support_rows") or [])
+    context_unsupported_rows = list((settings or {}).get("_context_unsupported_rows") or [])
+    context_detail_rows = list((settings or {}).get("_context_detail_rows") or [])
+    context_reference_rows = list((settings or {}).get("_context_reference_rows") or [])
+    context_summary = dict((settings or {}).get("_context_summary") or {})
+    context_missing_cnt = int(context_summary.get("missing", 0) or 0)
+    context_mismatch_cnt = int(context_summary.get("mismatch", 0) or 0)
+    context_unresolved_cnt = int(context_summary.get("unresolved", 0) or 0)
+    context_manual_cnt = int(context_summary.get("manual", 0) or 0)
+    context_runnable_cnt = int(context_summary.get("runnable", 0) or 0)
     unsupported_rows = list(support_summary.unsupported_rows) if support_summary else []
     missing_detail_rows = list(support_summary.missing_detail_rows) if support_summary else []
     extra_missing_rows = list(support_summary.extra_missing_rows) if support_summary else []
@@ -55784,6 +56927,8 @@ def print_final_report(
     unsupported_detail_rows = list(unsupported_rows)
     if extra_constraint_unsupported:
         unsupported_detail_rows.extend(convert_constraint_unsupported_rows(extra_constraint_unsupported))
+    if context_unsupported_rows:
+        unsupported_detail_rows.extend(context_unsupported_rows)
     _missing_total_counts, unsupported_summary_counts, fixable_missing_counts = build_missing_breakdown_counts(
         object_counts_summary,
         support_summary,
@@ -55887,6 +57032,7 @@ def print_final_report(
         sequence_restart_unresolved_count=sequence_restart_unresolved_count,
         sys_c_force_candidate_count=sys_c_force_candidate_count,
         case_sensitive_findings_count=case_sensitive_findings_count,
+        context_manual_count=context_manual_cnt + context_unresolved_cnt + context_mismatch_cnt,
         deferred_validate_count=deferred_validate_count,
         ddl_cleanup_semantic_rows=int(ddl_cleanup_summary.get("semantic_rewrite_rows", 0) or 0),
         fixup_skip_summary=fixup_skip_summary,
@@ -56583,7 +57729,7 @@ def print_final_report(
         skip_table.add_column("对象类型", style="info", width=12)
         skip_table.add_column("指标", style="info", width=28)
         skip_table.add_column("数量", justify="right")
-        for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM"):
+        for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM", "CONTEXT"):
             obj_summary = fixup_skip_summary.get(obj_type) or {}
             if not obj_summary:
                 continue
@@ -56611,6 +57757,8 @@ def print_final_report(
         for obj_type, _, _ in tv_results.get('missing', []):
             addition_counts[obj_type.upper()] += 1
         for row in package_missing_support_rows:
+            addition_counts[row.obj_type.upper()] += 1
+        for row in context_missing_support_rows:
             addition_counts[row.obj_type.upper()] += 1
         for item in extra_results.get("index_mismatched", []):
             addition_counts["INDEX"] += len(item.missing_indexes)
@@ -56643,7 +57791,7 @@ def print_final_report(
 
         fixup_plan_lines = ["[bold]本轮 fixup 计划[/bold]"]
         plan_entries = []
-        for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM"):
+        for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM", "CONTEXT"):
             obj_summary = (fixup_skip_summary or {}).get(obj_type) or {}
             if not obj_summary:
                 continue
@@ -57089,6 +58237,7 @@ def print_final_report(
         "fixup_scripts/function      : 缺失 FUNCTION 的 CREATE 脚本\n"
         "fixup_scripts/package       : 缺失 PACKAGE 的 CREATE 脚本\n"
         "fixup_scripts/package_body  : 缺失 PACKAGE BODY 的 CREATE 脚本\n"
+        "fixup_scripts/context       : CONTEXT 自动修复脚本（仅 safe_auto + 认证 mode）\n"
         "fixup_scripts/synonym       : 缺失 SYNONYM 的 CREATE 脚本\n"
         "fixup_scripts/job           : JOB 缺失脚本（默认人工；semi_auto 可输出草案）\n"
         "fixup_scripts/schedule      : SCHEDULE 缺失脚本（默认人工；semi_auto 可输出草案）\n"
@@ -57176,6 +58325,7 @@ def print_final_report(
             runtime_degraded_detail_path=runtime_degraded_detail_path,
             grant_plan=grant_plan,
             object_counts_summary=object_counts_summary,
+            context_summary=context_summary,
         )
         notice_state_path, notice_state = load_notice_state(settings.get("config_dir") if settings else None)
         runtime_notices = build_runtime_change_notices(
@@ -57430,6 +58580,8 @@ def print_final_report(
         missing_detail_path = None
         unsupported_detail_path = None
         migration_focus_path = None
+        context_detail_path = None
+        context_reference_path = None
         view_constraint_cleaned_path = None
         view_constraint_uncleanable_path = None
         name_collision_detail_path = None
@@ -57452,6 +58604,16 @@ def print_final_report(
                 report_path.parent,
                 report_ts
             )
+            context_detail_path = export_context_detail(
+                context_detail_rows,
+                report_path.parent,
+                report_ts,
+            )
+            context_reference_path = export_context_reference_detail(
+                context_reference_rows,
+                report_path.parent,
+                report_ts,
+            )
             view_constraint_cleaned_path = export_view_constraint_cleaned_detail(
                 view_constraint_cleaned_rows,
                 report_path.parent,
@@ -57473,6 +58635,16 @@ def print_final_report(
                 report_ts
             )
         if report_ts:
+            context_detail_path = export_context_detail(
+                context_detail_rows,
+                report_path.parent,
+                report_ts,
+            )
+            context_reference_path = export_context_reference_detail(
+                context_reference_rows,
+                report_path.parent,
+                report_ts,
+            )
             case_sensitive_detail_path = export_case_sensitive_identifier_detail(
                 case_sensitive_findings,
                 report_path.parent,
@@ -57487,7 +58659,7 @@ def print_final_report(
         if report_ts:
             migration_focus_path = export_migration_focus_report(
                 combined_missing_rows,
-                unsupported_rows,
+                unsupported_detail_rows,
                 report_path.parent,
                 report_ts
             )
@@ -57502,6 +58674,18 @@ def print_final_report(
             unsupported_detail_path,
             len(unsupported_detail_rows or []),
             "不支持/阻断对象明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            context_detail_path,
+            len(context_detail_rows) if context_detail_path else None,
+            "CONTEXT 漂移明细"
+        )
+        _add_index_entry(
+            "DETAIL",
+            context_reference_path,
+            len(context_reference_rows) if context_reference_path else None,
+            "CONTEXT 引用校验明细"
         )
         _add_index_entry(
             "DETAIL",
@@ -59198,6 +60382,12 @@ def main():
         return
 
     log_section("元数据转储")
+    context_reference_enabled = bool(CONTEXT_REFERENCE_ELIGIBLE_TYPES & set(enabled_primary_types))
+    context_inventory_enabled = "CONTEXT" in enabled_primary_types
+    context_fixup_type_set = set(settings.get("fixup_type_set", set()) or set())
+    context_fixup_requested = generate_fixup_enabled and (not context_fixup_type_set or "CONTEXT" in context_fixup_type_set)
+    context_pipeline_enabled = context_reference_enabled or context_inventory_enabled or context_fixup_requested
+    settings["_context_pipeline_enabled"] = context_pipeline_enabled
     apply_config_hot_reload_at_phase(hot_reload_runtime, "OceanBase 元数据转储", settings, ora_cfg, ob_cfg)
     with phase_timer("OceanBase 元数据转储", phase_durations):
         log_subsection("OceanBase 元数据")
@@ -59226,7 +60416,8 @@ def main():
             include_sequences='SEQUENCE' in enabled_extra_types,
             include_comments=enable_comment_check,
             include_roles=enable_grant_generation,
-            target_table_pairs=target_table_pairs if enable_comment_check else set()
+            target_table_pairs=target_table_pairs if enable_comment_check else set(),
+            include_contexts=context_pipeline_enabled,
         )
         if ob_meta.case_sensitive_findings:
             merged_case_sensitive: Dict[Tuple[str, str, str, str], CaseSensitiveIdentifierFinding] = {}
@@ -59278,7 +60469,8 @@ def main():
             include_privileges=enable_grant_generation,
             include_interval_partitions=bool(
                 settings.get("generate_interval_partition_fixup", False)
-            ) and generate_fixup_enabled
+            ) and generate_fixup_enabled,
+            include_contexts=context_pipeline_enabled,
         )
         if source_db_mode == SOURCE_DB_MODE_OCEANBASE:
             if config_diagnostics is None:
@@ -59916,6 +61108,45 @@ def main():
         gtt_handling_state=gtt_handling_state,
     )
 
+    context_results: Optional[ContextCompareResults] = None
+    if context_pipeline_enabled:
+        context_reference_rows = load_source_context_reference_rows(
+            settings,
+            source_objects,
+            enabled_primary_types,
+            ora_cfg=ora_cfg if source_db_mode == SOURCE_DB_MODE_ORACLE else None,
+        )
+        planned_package_targets: Set[str] = set()
+        for row in (package_results.get("rows") or []):
+            if (row.obj_type or "").upper() != "PACKAGE":
+                continue
+            if (row.result or "").upper() == "MISSING_TARGET" and row.tgt_full:
+                planned_package_targets.add((row.tgt_full or "").upper())
+        target_package_objects = set(ob_meta.objects_by_type.get("PACKAGE", set()) or set())
+        context_results = build_context_compare_results(
+            source_contexts=dict(getattr(oracle_meta, "contexts", {}) or {}),
+            target_contexts=dict(getattr(ob_meta, "contexts", {}) or {}),
+            reference_rows=context_reference_rows,
+            full_object_mapping=full_object_mapping,
+            enabled_primary_types=enabled_primary_types,
+            context_fixup_mode=settings.get("context_fixup_mode", "manual"),
+            target_package_objects=target_package_objects,
+            planned_package_targets=planned_package_targets,
+        )
+        settings["_context_reference_rows"] = list(context_results.reference_rows or [])
+        settings["_context_detail_rows"] = list(context_results.detail_rows or [])
+        settings["_context_missing_support_rows"] = list(context_results.missing_support_rows or [])
+        settings["_context_unsupported_rows"] = list(context_results.unsupported_rows or [])
+        settings["_context_runnable_fixups"] = list(context_results.runnable_fixups or [])
+        settings["_context_manual_fixups"] = list(context_results.manual_fixups or [])
+        settings["_context_summary"] = dict(context_results.summary or {})
+        settings["_context_results"] = context_results
+        if context_results.missing_support_rows:
+            support_summary = merge_support_summary_rows(
+                support_summary,
+                context_results.missing_support_rows,
+            )
+
     usability_summary: Optional[UsabilitySummary] = None
     if enable_usability_check:
         apply_config_hot_reload_at_phase(hot_reload_runtime, "对象可用性校验", settings, ora_cfg, ob_cfg)
@@ -60428,6 +61659,8 @@ def main():
         1 for _, _, obj_type in master_list
         if obj_type.upper() in checked_primary_types
     )
+    if "CONTEXT" in checked_primary_types and context_pipeline_enabled:
+        total_checked += len(dict(getattr(oracle_meta, "contexts", {}) or {}))
     report_start_perf = time.perf_counter()
     run_summary_ctx = RunSummaryContext(
         start_time=run_start_time,

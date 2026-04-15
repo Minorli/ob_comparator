@@ -849,6 +849,7 @@ TYPE_DIR_MAP = {
     "FUNCTION": "function",
     "PACKAGE": "package",
     "PACKAGE_BODY": "package_body",
+    "CONTEXT": "context",
     "TYPE": "type",
     "TYPE_BODY": "type_body",
     "TRIGGER": "trigger",
@@ -878,10 +879,11 @@ DEPENDENCY_LAYERS = [
     ["package"],                                     # Layer 9: Package specs
     ["procedure", "function"],                       # Layer 10: Standalone routines
     ["type_body", "package_body"],                   # Layer 11: Type/package bodies
-    ["name_collision"],                              # Layer 12: Name collision remediation
-    ["constraint", "index"],                         # Layer 13: Constraints and indexes
-    ["trigger"],                                     # Layer 14: Triggers (last)
-    ["job", "schedule"],                             # Layer 15: Jobs
+    ["context"],                                     # Layer 12: Application contexts
+    ["name_collision"],                              # Layer 13: Name collision remediation
+    ["constraint", "index"],                         # Layer 14: Constraints and indexes
+    ["trigger"],                                     # Layer 15: Triggers (last)
+    ["job", "schedule"],                             # Layer 16: Jobs
 ]
 
 CORE_GRANT_DIRS_ORDER = ("grants_all", "grants_miss", "grants")
@@ -2288,7 +2290,7 @@ def collect_sql_files_by_layer(
             "sequence", "sequence_restart", "table", "table_alter", "view_prereq_grants", "grants",
             "view", "synonym", "view_post_grants", "materialized_view",
             "type", "package", "procedure", "function",
-            "type_body", "package_body", "name_collision", "constraint", "index", "trigger",
+            "type_body", "package_body", "context", "name_collision", "constraint", "index", "trigger",
             "job", "schedule",
         ]
         
