@@ -6,8 +6,9 @@
 
 ## 近期更新（0.9.9.3）
 - 新增 `source_db_mode=oceanbase` 与 `[OCEANBASE_SOURCE]`，主程序现在支持 OceanBase Oracle-mode source → OceanBase target 的严格 compare 与 certified fixup family。
-- OB→OB 模式下已打通源端 metadata / dependency / DDL provider 分发，支持同 endpoint 与跨版本场景；当前 certified family 包含 TABLE、VIEW、PROCEDURE、FUNCTION、PACKAGE、PACKAGE BODY、SYNONYM、SEQUENCE、TRIGGER、TYPE、TYPE BODY、INDEX、CONSTRAINT。
+- OB→OB 模式下已打通源端 metadata / dependency / DDL provider 分发，支持同 endpoint 与跨版本场景；当前 certified family 包含 TABLE、VIEW、PROCEDURE、FUNCTION、PACKAGE、PACKAGE BODY、CONTEXT、SYNONYM、SEQUENCE、TRIGGER、TYPE、TYPE BODY、INDEX、CONSTRAINT。
 - Oracle-only 规则已完成 mode 隔离：OB→OB 不再误复用 Oracle 的 GTT rewrite、OMS exclusion、VARCHAR 长度膨胀等迁移改写；strict compare 产生的 `type_literal_mismatch` 会落成可执行 `ALTER TABLE ... MODIFY`。
+- 新增 application context compare/fixup：可读取 `DBA_CONTEXT`，从 `VIEW/PROCEDURE/FUNCTION/PACKAGE/PACKAGE BODY/TRIGGER/TYPE BODY` 抽取字面量 `SYS_CONTEXT` / `DBMS_SESSION.SET_CONTEXT` 引用，并对 OB 目标端按语法安全方式生成 `CREATE CONTEXT`（`ACCESSED LOCALLY` 会正确映射为“省略 clause”）。
 - 报告和 fixup 目录已显式暴露 source mode、source/target version、capability gate 与 deferred/manual family，避免“看起来能跑、实际上部分能力未启用”的误判。
 - Oracle→OB 默认链路保持不变，`source_db_mode=oracle` 仍是默认模式；本版全量回归通过，旧路径未被打坏。
 

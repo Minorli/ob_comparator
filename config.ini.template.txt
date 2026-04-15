@@ -179,6 +179,11 @@ dbcat_chunk_size        = 150
 # source_db_mode=oceanbase -> 走 OB source provider（certified family 自动生成，未认证 family 转 deferred/manual）
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 generate_fixup          = true
+# CONTEXT 修补模式
+# manual    -> 仅输出 context_detail/context_reference_detail 与 unsupported/context 模板（默认）
+# safe_auto -> 对 ACCESSED LOCALLY / ACCESSED GLOBALLY 且 trusted package 已存在/已规划的 context
+#             生成 runnable CREATE CONTEXT；本地 context 不带显式 clause
+context_fixup_mode      = manual
 # MATERIALIZED VIEW 校验/修补模式（版本门控）
 # auto: OB>=4.4.2 默认开启校验+修补；低版本默认仅打印
 # on  : 强制开启校验+修补
@@ -267,7 +272,7 @@ grant_include_oracle_maintained_roles = false
 # 仅生成指定目标 schema/对象类型的修补脚本（留空为全量）
 # fixup_schemas 示例：HERO_A,HERO_B
 # fixup_types 可选值：
-#   TABLE, VIEW, MATERIALIZED VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY,
+#   TABLE, VIEW, MATERIALIZED VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, CONTEXT,
 #   SYNONYM, JOB, SCHEDULE, TYPE, TYPE BODY, SEQUENCE, TRIGGER, INDEX, CONSTRAINT
 # 示例：fixup_types=TABLE,TRIGGER
 fixup_schemas           = 
@@ -313,7 +318,7 @@ trigger_qualify_schema  = true
 
 # 可选：限制本次只检查的对象类型/模块，留空表示全量（大小写不敏感，逗号分隔）
 # check_primary_types 可选值：
-#   TABLE, VIEW, MATERIALIZED VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY,
+#   TABLE, VIEW, MATERIALIZED VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, CONTEXT,
 #   SYNONYM, JOB, SCHEDULE, TYPE, TYPE BODY
 #   注意：MATERIALIZED VIEW 由 mview_check_fixup_mode + OB 版本共同决定
 # synonym_check_scope（同义词校验范围）可选值：
