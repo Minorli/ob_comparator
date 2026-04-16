@@ -21,6 +21,3 @@ docs/*
 !docs/TECHNICAL_SPECIFICATION.md
 !docs/DEPLOYMENT.md
 !docs/CHANGELOG.md
-!docs/superpowers/
-!docs/superpowers/specs/
-!docs/superpowers/specs/*.md
