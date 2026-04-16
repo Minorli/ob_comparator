@@ -1789,6 +1789,14 @@ CONTEXT_MODE_LOCAL = "ACCESSED LOCALLY"
 CONTEXT_MODE_GLOBAL = "ACCESSED GLOBALLY"
 CONTEXT_MODE_INITIALIZED_EXTERNALLY = "INITIALIZED EXTERNALLY"
 CONTEXT_MODE_INITIALIZED_GLOBALLY = "INITIALIZED GLOBALLY"
+CONTEXT_MODE_ALIASES: Dict[str, str] = {
+    CONTEXT_MODE_LOCAL: CONTEXT_MODE_LOCAL,
+    "LOCAL": CONTEXT_MODE_LOCAL,
+    CONTEXT_MODE_GLOBAL: CONTEXT_MODE_GLOBAL,
+    "GLOBAL": CONTEXT_MODE_GLOBAL,
+    CONTEXT_MODE_INITIALIZED_EXTERNALLY: CONTEXT_MODE_INITIALIZED_EXTERNALLY,
+    CONTEXT_MODE_INITIALIZED_GLOBALLY: CONTEXT_MODE_INITIALIZED_GLOBALLY,
+}
 CONTEXT_CERTIFIED_MODES: FrozenSet[str] = frozenset({
     CONTEXT_MODE_LOCAL,
     CONTEXT_MODE_GLOBAL,
@@ -4327,7 +4335,7 @@ def normalize_context_fixup_mode(raw_value: Optional[str]) -> str:
 
 def normalize_context_inventory_type(raw_value: Optional[object]) -> str:
     text = re.sub(r"\s+", " ", str(raw_value or "").strip().upper())
-    return text
+    return CONTEXT_MODE_ALIASES.get(text, text)
 
 
 def format_context_binding(schema_name: Optional[str], package_name: Optional[str]) -> str:
@@ -11911,7 +11919,8 @@ def load_oracle_context_inventory(
                                     origin_con_id=str(row[5] or ""),
                                 )
                         return contexts, None
-                    except oracledb.Error:
+                    except oracledb.Error as exc:
+                        log.debug("load_oracle_context_inventory 降级: %s", exc)
                         contexts.clear()
                         continue
     except oracledb.Error as exc:
@@ -12233,8 +12242,9 @@ def build_context_compare_results(
 
     source_ctx_norm = {normalize_identifier_name(k): v for k, v in (source_contexts or {}).items() if normalize_identifier_name(k)}
     target_ctx_norm = {normalize_identifier_name(k): v for k, v in (target_contexts or {}).items() if normalize_identifier_name(k)}
+    checked_namespaces: Set[str] = {item for item in namespaces_to_check if item}
 
-    for namespace_u in sorted(item for item in namespaces_to_check if item):
+    for namespace_u in sorted(checked_namespaces):
         src_meta = source_ctx_norm.get(namespace_u)
         tgt_meta = target_ctx_norm.get(namespace_u)
         if src_meta is None:
@@ -12414,6 +12424,46 @@ def build_context_compare_results(
             ))
             namespace_status[namespace_u] = ("OK", "-", "-")
 
+    extra_target_namespaces: Set[str] = set()
+    if inventory_enabled:
+        extra_target_namespaces = {
+            namespace_u
+            for namespace_u in target_ctx_norm.keys()
+            if namespace_u and namespace_u not in checked_namespaces
+        }
+        for namespace_u in sorted(extra_target_namespaces):
+            tgt_meta = target_ctx_norm.get(namespace_u)
+            target_binding = format_context_binding(tgt_meta.schema, tgt_meta.package) if tgt_meta else "-"
+            target_mode = normalize_context_inventory_type(tgt_meta.type) if tgt_meta else "-"
+            detail_row = ContextDriftDetailRow(
+                namespace=namespace_u,
+                source_binding="-",
+                expected_target_binding="-",
+                target_binding=target_binding,
+                source_mode="-",
+                target_mode=target_mode,
+                status="EXTRA_TARGET",
+                reason_code="TARGET_CONTEXT_EXTRA",
+                reason="目标端存在源端未定义的 application context。",
+                action="人工确认是否需要删除目标端 context",
+                detail=f"target_binding={target_binding}; target_mode={target_mode}",
+                prerequisite="",
+            )
+            detail_rows.append(detail_row)
+            unsupported_rows.append(ObjectSupportReportRow(
+                obj_type="CONTEXT",
+                src_full="-",
+                tgt_full=namespace_u,
+                support_state=SUPPORT_STATE_RISKY,
+                reason_code=detail_row.reason_code,
+                reason=detail_row.reason,
+                dependency="-",
+                action=detail_row.action,
+                detail=detail_row.detail,
+                root_cause=f"{namespace_u}({detail_row.reason_code})",
+            ))
+            namespace_status[namespace_u] = ("EXTRA_TARGET", detail_row.reason_code, detail_row.action)
+
     reference_detail_rows: List[ContextReferenceRow] = []
     for row in literal_refs:
         status, reason_code, action = namespace_status.get(row.namespace, ("UNVALIDATED", "CONTEXT_NOT_CHECKED", "人工确认"))
@@ -12431,9 +12481,10 @@ def build_context_compare_results(
     summary = {
         "source_contexts": len(source_ctx_norm),
         "target_contexts": len(target_ctx_norm),
-        "inventory_checked": len(namespaces_to_check),
+        "inventory_checked": len(checked_namespaces) + len(extra_target_namespaces),
         "missing": sum(1 for row in detail_rows if row.status == "MISSING"),
         "mismatch": sum(1 for row in detail_rows if row.status == "MISMATCH"),
+        "extra_target": sum(1 for row in detail_rows if row.status == "EXTRA_TARGET"),
         "unresolved": len(unresolved_refs),
         "runnable": len(runnable_fixups),
         "manual": len(manual_fixups),
@@ -55339,6 +55390,7 @@ def save_report_to_db(
     sequence_missing_total = int(extra_missing_counts.get("SEQUENCE", 0) or 0)
     context_summary = dict((settings or {}).get("_context_summary") or {})
     context_mismatch_total = int(context_summary.get("mismatch", 0) or 0)
+    context_extra_target_total = int(context_summary.get("extra_target", 0) or 0)
 
     extra_mismatch_total = (
         index_mismatch_total
@@ -55348,6 +55400,7 @@ def save_report_to_db(
         + len(trigger_status_rows or [])
         + len(constraint_status_rows or [])
         + context_mismatch_total
+        + context_extra_target_total
     )
     extra_missing_total = (
         index_missing_total
@@ -56243,6 +56296,7 @@ def build_run_summary(
     context_summary = dict(context_summary or {})
     context_missing_cnt = int(context_summary.get("missing", 0) or 0)
     context_mismatch_cnt = int(context_summary.get("mismatch", 0) or 0)
+    context_extra_target_cnt = int(context_summary.get("extra_target", 0) or 0)
     context_unresolved_cnt = int(context_summary.get("unresolved", 0) or 0)
     context_manual_cnt = int(context_summary.get("manual", 0) or 0)
     context_runnable_cnt = int(context_summary.get("runnable", 0) or 0)
@@ -56265,11 +56319,12 @@ def build_run_summary(
     if unsupported_by_type:
         items = ", ".join(f"{k}={v}" for k, v in sorted(unsupported_by_type.items()))
         findings.append(f"缺失中不支持/阻断/待确认: {items}")
-    if context_missing_cnt or context_mismatch_cnt or context_unresolved_cnt:
+    if context_missing_cnt or context_mismatch_cnt or context_extra_target_cnt or context_unresolved_cnt:
         findings.append(
-            "CONTEXT 漂移: 缺失 {missing}, mismatch {mismatch}, unresolved {unresolved}, runnable {runnable}, manual {manual}".format(
+            "CONTEXT 漂移: 缺失 {missing}, mismatch {mismatch}, extra_target {extra_target}, unresolved {unresolved}, runnable {runnable}, manual {manual}".format(
                 missing=context_missing_cnt,
                 mismatch=context_mismatch_cnt,
+                extra_target=context_extra_target_cnt,
                 unresolved=context_unresolved_cnt,
                 runnable=context_runnable_cnt,
                 manual=context_manual_cnt,
@@ -56440,7 +56495,7 @@ def build_run_summary(
         attention.append("触发器中存在 SCHEMA.OBJECT.COLUMN 形式的字符串路径，程序已保守保留原文，请人工确认。")
     if ddl_cleanup_semantic_rows:
         attention.append("本次 fixup 中存在 DDL 语义改写，请优先复核 ddl_cleanup_detail 明细和脚本头注释。")
-    if context_missing_cnt or context_mismatch_cnt or context_unresolved_cnt:
+    if context_missing_cnt or context_mismatch_cnt or context_extra_target_cnt or context_unresolved_cnt:
         attention.append("存在 application context 缺失/漂移/未解析引用，需复核 context_detail 与 context_reference_detail。")
     if ddl_cleanup_preserved_rows:
         attention.append("部分 Oracle 子句已改为默认保留策略，需结合目标环境确认是否仍需人工精简。")
@@ -56488,7 +56543,7 @@ def build_run_summary(
         _append_unique_guide_step(next_steps, "若依赖差异存在，请按依赖报告补齐编译或授权。")
     if comment_mis_cnt:
         _append_unique_guide_step(next_steps, "如业务要求注释一致，再确认 comment mismatch 明细。")
-    if context_missing_cnt or context_mismatch_cnt or context_unresolved_cnt:
+    if context_missing_cnt or context_mismatch_cnt or context_extra_target_cnt or context_unresolved_cnt:
         _append_unique_guide_step(next_steps, "如涉及 application context，请先看 context_detail/context_reference_detail，再决定执行 context/ 或人工处理 unsupported/context/。")
     if ctx.enable_grant_generation and ctx.fixup_enabled:
         if grant_mode == GRANT_GENERATION_MODE_STRUCTURAL:
@@ -56915,6 +56970,7 @@ def print_final_report(
     context_summary = dict((settings or {}).get("_context_summary") or {})
     context_missing_cnt = int(context_summary.get("missing", 0) or 0)
     context_mismatch_cnt = int(context_summary.get("mismatch", 0) or 0)
+    context_extra_target_cnt = int(context_summary.get("extra_target", 0) or 0)
     context_unresolved_cnt = int(context_summary.get("unresolved", 0) or 0)
     context_manual_cnt = int(context_summary.get("manual", 0) or 0)
     context_runnable_cnt = int(context_summary.get("runnable", 0) or 0)
@@ -57032,7 +57088,7 @@ def print_final_report(
         sequence_restart_unresolved_count=sequence_restart_unresolved_count,
         sys_c_force_candidate_count=sys_c_force_candidate_count,
         case_sensitive_findings_count=case_sensitive_findings_count,
-        context_manual_count=context_manual_cnt + context_unresolved_cnt + context_mismatch_cnt,
+        context_manual_count=context_manual_cnt + context_unresolved_cnt + context_mismatch_cnt + context_extra_target_cnt,
         deferred_validate_count=deferred_validate_count,
         ddl_cleanup_semantic_rows=int(ddl_cleanup_summary.get("semantic_rewrite_rows", 0) or 0),
         fixup_skip_summary=fixup_skip_summary,

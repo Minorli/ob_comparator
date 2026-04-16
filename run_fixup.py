@@ -2288,7 +2288,7 @@ def collect_sql_files_by_layer(
         # Keep non-smart execution order aligned with dependency-aware layers.
         priority = [
             "sequence", "sequence_restart", "table", "table_alter", "view_prereq_grants", "grants",
-            "view", "synonym", "view_post_grants", "materialized_view",
+            "view", "view_refresh", "synonym", "view_post_grants", "materialized_view",
             "type", "package", "procedure", "function",
             "type_body", "package_body", "context", "name_collision", "constraint", "index", "trigger",
             "job", "schedule",
