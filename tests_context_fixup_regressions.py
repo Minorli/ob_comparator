@@ -180,3 +180,211 @@ class TestContextRegressionScenarios(unittest.TestCase):
         self.assertEqual(contexts["APP_CTX"].type, sdr.CONTEXT_MODE_LOCAL)
         debug_mock.assert_called()
         self.assertIn("load_oracle_context_inventory 降级", debug_mock.call_args[0][0])
+
+
+class TestConstraintValidatedUnknownRegressionScenarios(unittest.TestCase):
+    @staticmethod
+    def _make_oracle_meta(table_columns, constraints=None):
+        return sdr.OracleMetadata(
+            table_columns=table_columns,
+            invisible_column_supported=False,
+            identity_column_supported=False,
+            default_on_null_supported=False,
+            indexes={},
+            constraints=constraints or {},
+            triggers={},
+            sequences={},
+            sequence_attrs={},
+            table_comments={},
+            column_comments={},
+            comments_complete=False,
+            blacklist_tables={},
+            object_privileges=[],
+            column_privileges=[],
+            sys_privileges=[],
+            role_privileges=[],
+            role_metadata={},
+            system_privilege_map=set(),
+            table_privilege_map=set(),
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False,
+            partition_key_columns={},
+            interval_partitions={},
+        )
+
+    @staticmethod
+    def _make_ob_meta(objects_by_type, tab_columns, constraints=None):
+        return sdr.ObMetadata(
+            objects_by_type=objects_by_type,
+            tab_columns=tab_columns,
+            invisible_column_supported=False,
+            identity_column_supported=False,
+            default_on_null_supported=False,
+            indexes={},
+            constraints=constraints or {},
+            triggers={},
+            sequences={},
+            sequence_attrs={},
+            roles=set(),
+            table_comments={},
+            column_comments={},
+            comments_complete=False,
+            object_statuses={},
+            package_errors={},
+            package_errors_complete=False,
+            partition_key_columns={},
+        )
+
+    def test_check_primary_objects_reports_unknown_source_validated_state(self):
+        master_list = [("A.T1", "A.T1", "TABLE")]
+        oracle_meta = self._make_oracle_meta(
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "NUMBER",
+                        "data_length": None,
+                        "char_length": None,
+                        "char_used": None,
+                        "data_precision": 10,
+                        "data_scale": 0,
+                        "nullable": "Y",
+                        "data_default": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                    }
+                }
+            },
+            constraints={
+                ("A", "T1"): {
+                    "CK_NN_C1": {
+                        "type": "C",
+                        "status": "ENABLED",
+                        "validated": None,
+                        "search_condition": '"C1" IS NOT NULL',
+                        "columns": ["C1"],
+                    }
+                }
+            },
+        )
+        ob_meta = self._make_ob_meta(
+            {"TABLE": {"A.T1"}},
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "NUMBER",
+                        "data_length": None,
+                        "char_length": None,
+                        "char_used": None,
+                        "data_precision": 10,
+                        "data_scale": 0,
+                        "nullable": "Y",
+                        "data_default": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                    }
+                }
+            },
+            constraints={("A", "T1"): {}},
+        )
+
+        results = sdr.check_primary_objects(
+            master_list,
+            [],
+            ob_meta,
+            oracle_meta,
+            enabled_primary_types={"TABLE"},
+        )
+
+        self.assertEqual(len(results["mismatched"]), 1)
+        type_mismatches = results["mismatched"][0][5]
+        self.assertEqual(len(type_mismatches), 1)
+        issue = type_mismatches[0]
+        self.assertEqual(issue.issue, "nullability_unknown_source_validated")
+        self.assertEqual(issue.src_type, "NOT NULL (SOURCE VALIDATED UNKNOWN)")
+        self.assertEqual(issue.tgt_type, "NULLABLE")
+        self.assertEqual(issue.expected_type, "REVIEW SOURCE VALIDATED STATE")
+
+    def test_generate_alter_for_table_columns_keeps_unknown_source_validated_review_only(self):
+        oracle_meta = self._make_oracle_meta(
+            {
+                ("A", "T1"): {
+                    "C1": {
+                        "data_type": "NUMBER",
+                        "data_length": None,
+                        "char_length": None,
+                        "char_used": None,
+                        "data_precision": 10,
+                        "data_scale": 0,
+                        "nullable": "Y",
+                        "data_default": None,
+                        "hidden": False,
+                        "virtual": False,
+                        "virtual_expr": None,
+                    }
+                }
+            },
+            constraints={("A", "T1"): {}},
+        )
+
+        sql = sdr.generate_alter_for_table_columns(
+            oracle_meta,
+            "A",
+            "T1",
+            "A",
+            "T1",
+            missing_cols=set(),
+            extra_cols=set(),
+            length_mismatches=[],
+            type_mismatches=[
+                sdr.ColumnTypeIssue(
+                    "C1",
+                    "NOT NULL (SOURCE VALIDATED UNKNOWN)",
+                    "NULLABLE",
+                    "REVIEW SOURCE VALIDATED STATE",
+                    "nullability_unknown_source_validated",
+                )
+            ],
+        )
+
+        self.assertIsNotNone(sql)
+        self.assertIn("REVIEW-FIRST", sql)
+        self.assertIn("VALIDATED 状态未知", sql)
+        self.assertIn("UNKNOWN 默认视为匹配", sql)
+
+    def test_export_column_nullability_detail_includes_unknown_source_validated_review(self):
+        mismatched_items = [
+            (
+                "TABLE",
+                "A.T1",
+                set(),
+                set(),
+                [],
+                [
+                    sdr.ColumnTypeIssue(
+                        "C1",
+                        "NOT NULL (SOURCE VALIDATED UNKNOWN)",
+                        "NULLABLE",
+                        "REVIEW SOURCE VALIDATED STATE",
+                        "nullability_unknown_source_validated",
+                    )
+                ],
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = sdr.export_column_nullability_detail(
+                mismatched_items,
+                Path(tmp_dir),
+                "20260417_120000",
+            )
+            self.assertIsNotNone(path)
+            content = Path(path).read_text(encoding="utf-8")
+
+        self.assertIn("列空值语义差异明细", content)
+        self.assertIn(
+            "A.T1|C1|NOT NULL (SOURCE VALIDATED UNKNOWN)|NULLABLE|REVIEW SOURCE VALIDATED STATE|REVIEW_SOURCE_VALIDATED_UNKNOWN",
+            content,
+        )

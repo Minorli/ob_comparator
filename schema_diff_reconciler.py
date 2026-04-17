@@ -31056,6 +31056,24 @@ def check_primary_objects(
                                     "nullability_novalidate_relax",
                                 )
                             )
+                    else:
+                        if target_has_physical_notnull or target_notnull_validated == "VALIDATED":
+                            tgt_notnull_desc = "NOT NULL"
+                        elif target_notnull_validated == "NOT VALIDATED":
+                            tgt_notnull_desc = "NOT NULL ENABLE NOVALIDATE"
+                        elif target_has_notnull_check:
+                            tgt_notnull_desc = "NOT NULL CHECK (VALIDATED UNKNOWN)"
+                        else:
+                            tgt_notnull_desc = "NULLABLE"
+                        type_mismatches.append(
+                            ColumnTypeIssue(
+                                col_name,
+                                "NOT NULL (SOURCE VALIDATED UNKNOWN)",
+                                tgt_notnull_desc,
+                                "REVIEW SOURCE VALIDATED STATE",
+                                "nullability_unknown_source_validated",
+                            )
+                        )
                 elif src_nullable and tgt_nullable and src_nullable != tgt_nullable:
                     if src_nullable == "N":
                         type_mismatches.append(
@@ -43954,6 +43972,13 @@ def generate_alter_for_table_columns(
                 lines.append(
                     "-- 请人工确认是否需要回退到 ENABLE NOVALIDATE 语义，或保持目标端更严格约束。"
                 )
+            elif issue_type == "nullability_unknown_source_validated":
+                lines.append(
+                    f"-- REVIEW-FIRST: {col_name.upper()} 源端存在 ENABLED NOT NULL 检查，但 VALIDATED 状态未知；目标端当前为 {tgt_type}。"
+                )
+                lines.append(
+                    "-- 当前不会把 UNKNOWN 默认视为匹配，请结合源/目标约束元数据人工确认后再决定是否处理。"
+                )
             elif issue_type == "nullability_relax":
                 lines.append(
                     f"-- REVIEW-FIRST: {col_name.upper()} 源端允许 NULL，目标端当前为 NOT NULL。"
@@ -51988,6 +52013,17 @@ def export_column_nullability_detail(
                         tgt_type,
                         expected_type,
                         "REVIEW_NOT_NULL_NOVALIDATE_STRICTER_TARGET",
+                    ]
+                )
+            elif issue_type == "nullability_unknown_source_validated":
+                rows.append(
+                    [
+                        tgt_name,
+                        col,
+                        src_type,
+                        tgt_type,
+                        expected_type,
+                        "REVIEW_SOURCE_VALIDATED_UNKNOWN",
                     ]
                 )
             elif issue_type == "nullability_relax":
@@ -61331,6 +61367,7 @@ def print_final_report(
             "nullability_tighten",
             "nullability_novalidate_tighten",
             "nullability_novalidate_relax",
+            "nullability_unknown_source_validated",
             "nullability_relax",
         }
     )
@@ -62692,6 +62729,7 @@ def print_final_report(
                             "nullability_tighten",
                             "nullability_novalidate_tighten",
                             "nullability_novalidate_relax",
+                            "nullability_unknown_source_validated",
                             "nullability_relax",
                         ):
                             details.append(
