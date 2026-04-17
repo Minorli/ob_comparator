@@ -1,5 +1,5 @@
 配置说明 (config.ini)
-版本：0.9.9.3（更新日期：2026-04-14）
+版本：0.9.9.4（更新日期：2026-04-17）
 本文件为完整配置说明书，覆盖所有可配置项（含最近新增功能）。
 
 通用约定
@@ -33,7 +33,7 @@
 - port：源端 OceanBase 端口（必填）。
 - user_string：源端完整的 obclient -u 参数（必填）。
 - password：源端 OceanBase 密码（必填）。
-- 说明：仅在 `source_db_mode=oceanbase` 时使用；当前已支持 compare 与 certified fixup family，grant/Oracle blacklist/source usability 等未认证能力仍会门控关闭或转 deferred/manual。
+- 说明：仅在 `source_db_mode=oceanbase` 时使用；当前已支持 compare、grants、scope/cutoff、source usability、table presence 与 certified fixup family；Oracle blacklist 语义仅保留诊断提示，不进入 OB source 主链路。
 - 说明：当前 OB source adapter 主要覆盖 table/view-based metadata；`DATABASE/SCHEMA` 级非表触发器暂不纳入 `source_db_mode=oceanbase` 的 compare/fixup。
 
 4) [SETTINGS]
@@ -42,23 +42,26 @@
 - source_db_mode：源端数据库类型。默认：oracle。
   可选值：oracle、oceanbase。
   说明：`oracle` 保持现有 Oracle->OceanBase 路径；`oceanbase` 启用 OceanBase Oracle-mode source -> OceanBase target。
-  说明：`oceanbase` 模式默认保持严格 OB->OB compare，并允许 certified fixup family；`generate_grants` 仍会自动关闭，未认证 family 会在报告和 fixup 输出中显式标成 deferred/manual。
+  说明：`oceanbase` 模式默认保持严格 OB->OB compare，并允许 certified fixup family；`generate_grants`、`object_created_before`、`check_object_usability`、`table_data_presence_check`、`source_object_scope_mode=explicit_roots/remap_root_closure` 都按产品模式生效。
 - source_schemas：源端 schema 列表（必填）。默认：无；为空将直接退出。
   说明：逗号分隔，大小写不敏感；只扫描这些 schema 的对象与依赖。
   说明：它只定义“源端扫描范围”，不等于目标端受管 schema。
   说明：目标端实际受管范围会按 remap/full mapping 自动推导；即使 remap 到 config.ini 中未出现的新目标 schema，也会继续进入 compare/fixup/report。
 - remap_file：Remap 规则文件路径。默认：空（按 1:1 映射）。
 - source_object_scope_mode：源对象范围模式。默认：full_source。
-  可选值：full_source、remap_root_closure。
-  说明：`full_source` 保持当前行为，按 `source_schemas` 全量扫描；`remap_root_closure` 仅以 `remap_file` 中显式 TABLE/VIEW 为 root seeds，再按依赖、反向依赖、附属关系扩展闭包，不在闭包中的对象（及其相关 INDEX/CONSTRAINT/SYNONYM/SEQUENCE 等）整体忽略。
-  说明：当设置为 `remap_root_closure` 且配置了 `trigger_list` 时，`trigger_list` 中的触发器会作为显式 keep set 保留；`trigger_list` 支持填写源端触发器名，或 remap 后的目标触发器名。
-  说明：`missed_tables_views_for_OMS/` 与 report_db 的 `OMS_MISSING` 在该模式下默认只导出 `remap_file` 中显式 TABLE/VIEW roots，不再把 closure 依赖对象一起带出。
+  可选值：full_source、explicit_roots、remap_root_closure。
+  说明：`full_source` 保持当前行为，按 `source_schemas` 全量扫描。
+  说明：`explicit_roots` 仅保留 `remap_file` 中显式 TABLE/VIEW roots 及其附属对象，不做依赖闭包扩展。
+  说明：`remap_root_closure` 以 `remap_file` 中显式 TABLE/VIEW 为 root seeds，再按依赖、反向依赖、附属关系扩展闭包，不在闭包中的对象（及其相关 INDEX/CONSTRAINT/SYNONYM/SEQUENCE 等）整体忽略。
+  说明：当设置为 `explicit_roots` 或 `remap_root_closure` 且配置了 `trigger_list` 时，`trigger_list` 中的触发器会作为显式 keep set 保留；`trigger_list` 支持填写源端触发器名，或 remap 后的目标触发器名。
+  说明：`missed_tables_views_for_OMS/` 与 report_db 的 `OMS_MISSING` 在两种 scoped 模式下默认都只导出 `remap_file` 中显式 TABLE/VIEW roots，不再把依赖扩展对象一起带出。
   说明：该模式下 `object_mapping_<ts>.txt` 表示本轮 managed mapping；若 closure 内还发现了未进入 operator-facing compare/fixup 的 related object，会额外输出 `object_mapping_discovery_<ts>.txt`。
   说明：若 `trigger_list` 非法或未启用 `TRIGGER` 检查，程序会 fail-fast；若个别条目无法在源端或显式 remap 规则中解析，程序不再中止，而是把这些条目写入 `source_scope_detail_<ts>.txt` / `trigger_status_report.txt`，并从本轮 scoped closure 与 fixup 中排除。
 - remap_scope_text_fallback_mode：scoped 文本补盲模式。默认：off。
   可选值：off、safe。
   说明：`off` 仅使用结构化路径（依赖/反向依赖/附属对象/配对对象）扩展 closure；`safe` 会对结构化闭包之外的剩余对象，从 `DBA_SOURCE`、`DBA_VIEWS.TEXT`、`DBA_MVIEWS.QUERY`、scheduler/job 文本等受控来源做补盲，并以 `TEXT_REFERENCE_HEURISTIC` 写入 `source_scope_detail_<ts>.txt`。
   说明：`safe` 额外支持受控 dynamic SQL（`EXECUTE IMMEDIATE`/`DBMS_SQL.PARSE`）、纯字符串拼接 SQL，以及同 schema 未带前缀的 package/procedure/function 调用；普通字符串字面量和跨 schema 未带前缀引用仍不会被猜测。
+  说明：`safe` 还会识别源码中的静态 `DBMS_SCHEDULER.CREATE_JOB/CREATE_SCHEDULE` 名称，把命中的 JOB/SCHEDULE 纳入 closure；若 `job_name/schedule_name` 为变量或无法静态折叠，会在 `source_scope_detail_<ts>.txt` 中以 `SCHEDULER_CREATE_AMBIGUOUS` / `SCHEDULER_CREATE_TARGET_UNRESOLVED` 输出，供人工复核。
   说明：变量拼接 SQL 不会自动纳入 closure；会在 `source_scope_detail_<ts>.txt` 中以 `TEXT_REFERENCE_AMBIGUOUS` 输出，供人工复核。
   说明：`safe` 不会对全 schema 对象 DDL 做 `DBMS_METADATA` 全量 grep。
   说明：生产大库下 `JOB_ACTION` 与 scoped text matching 带有保护性上限；若发生超大文本跳过/高扇出跳过/递归封顶，会生成 `runtime_degraded_detail_<ts>.txt` 并在主报告提示本轮 compare 是否完整。
@@ -102,6 +105,7 @@
   说明：若本轮命中了性能保护或大图保护，还会额外输出 `runtime_degraded_detail_<ts>.txt`；其中 `COMPARE` 级事件代表当前结果不应直接作为最终 compare 结论。
 - report_to_db：是否将报告存储到 OceanBase（obclient 方式）。默认：false。
   说明：开启后仍会保留本地文本报告，写库失败时是否中断由 report_db_fail_abort 控制。
+  说明：若配置里省略该项，运行时会显式提示“当前按 false 处理”；依赖 report_db 的环境建议在 `config.ini` 中明确写出 `report_to_db=true/false`，避免升级歧义。
   说明：写库采用发布门禁；DIFF_REPORT_SUMMARY.WRITE_STATUS=READY 才表示可用于正式排查（WRITING/FAILED 为未完成或失败）。
   说明：开启后会在 run 目录输出 report_sql_<timestamp>.txt（仅写入 report_id 与 HOW TO 入口，不再内嵌 HOW TO 正文），并尝试创建只读分析视图（actions/profile/trends/pending/grant/usability）。
   说明：当 report_db_store_scope=full 时，会将 run 目录下所有 txt 逐行写入 DIFF_REPORT_ARTIFACT_LINE，实现 txt 内容 100% 可查询覆盖。
@@ -229,6 +233,7 @@
 黑名单（不支持表过滤）
 - blacklist_mode：黑名单来源模式。默认：auto。
   可选值：auto（TMP_BLACK_TABLE + 规则文件）、table_only、rules_only、disabled。
+  说明：该能力面向 Oracle source；`source_db_mode=oceanbase` 下仅保留诊断提示，不进入 OB source compare/fixup 主链路。
 - blacklist_rules_path：黑名单规则 JSON 路径。默认：blacklist_rules.json（内置规则）。
   注意：blacklist_mode=auto/rules_only 时需确保该文件随工具部署，否则规则将被跳过。
   规则文件说明：每条 rule 使用 `enabled`（true/false）控制是否启用；程序兼容旧 `tag`（enabled/disabled）字段。运行时还会叠加 blacklist_rules_enable / blacklist_rules_disable。
@@ -260,8 +265,10 @@
   可选值：auto（OB>=4.4.2 开启校验+修补；低版本仅打印）、on（强制开启校验+修补）、off（强制仅打印）。
   说明：当 mode=auto 且 OB 版本无法识别时，为兼容旧行为会回退为“仅打印”并在日志提示。
 - gtt_table_handling_mode：Oracle 全局临时表（GTT）处理模式。默认：rewrite_to_normal。
-  可选值：rewrite_to_normal、preserve_original、blocked。
+  可选值：rewrite_to_normal、preserve_original、blocked、auto。
   说明：`rewrite_to_normal` 会把源端 GTT 当作受管 TABLE，并在 fixup 中生成普通 TABLE DDL；`preserve_original` 仍纳入正常 compare/fixup，但保留 Oracle GTT 语义原样输出；`blocked` 保持旧行为，继续进入 unsupported/temporary 路径。
+  说明：`auto` 会按目标 OceanBase 版本自动决策：满足原生 GTT 条件时切换到 `preserve_original`，否则保守回退 `rewrite_to_normal`；若显式指定 `preserve_original` 但目标版本不支持，会在运行时降级为 `blocked` 并给出提示。
+  说明：`rewrite_to_normal` 会丢失 `ON COMMIT DELETE/PRESERVE ROWS` 的事务清理语义；主报告、运行时 notice、`manual_actions_required_<ts>.txt` 与脚本头注释都会显式提醒，需人工确认后再执行。
   说明：当 GTT 处于 `rewrite_to_normal/preserve_original` 模式时，结构会进入正常 compare/fixup，但不会进入 `missed_tables_views_for_OMS/` 或 report_db `OMS_MISSING`，因为它们属于“结构迁移、不做数据迁移”。
 - generate_extra_cleanup：是否生成“目标端多余对象”的清理候选。默认：true。
   说明：普通候选会以注释形式输出到 `fixup_scripts/cleanup_candidates/extra_cleanup_candidates.txt`，不会被 run_fixup 自动执行；用于人工审核后再处理。
@@ -305,6 +312,8 @@
 - job_schedule_fixup_mode：JOB/SCHEDULE 修补模式。默认：manual。
   可选值：manual（保持人工处理，不生成缺失脚本）、semi_auto（当源端 DDL 缺失时输出草案模板到 `fixup_scripts/unsupported/job|schedule/`）。
   说明：semi_auto 仅提供人工补录模板，不改变 JOB/SCHEDULE 的“不支持自动修补”统计口径。
+  说明：`run_fixup.py` 默认也会跳过 `fixup_scripts/job/` 与 `fixup_scripts/schedule/`；需人工核对后显式 `--only-dirs job` / `--only-dirs schedule`。
+  说明：即便显式配合 `--iterative`，JOB/SCHEDULE 失败后也只保留在 `errors/fixup_errors_<ts>.txt`，不会跨轮自动重试。
 - plain_not_null_fixup_mode：普通 `NULLABLE -> NOT NULL` 收紧输出模式。默认：runnable_if_no_nulls。
   可选值：
   review_only（保持 `table_alter` 中的 review-first 注释）、
@@ -322,7 +331,7 @@
 授权与权限脚本
 - generate_grants：是否生成授权脚本并附加到修补 DDL。默认：true。
   注意：generate_grants 仅控制授权脚本与注入，修补脚本仍由 generate_fixup 控制。
-  说明：`source_db_mode=oceanbase` 下当前会自动关闭，并在报告中标记为 deferred。
+  说明：`source_db_mode=oceanbase` 下会按 OB source inventory 正常生成 role/system/object/column privilege 缺失授权，并保留 `ADMIN OPTION` / `WITH GRANT OPTION` 语义。
   说明：当目标对象当前不存在且本轮不会创建时，授权会延后到 `fixup_scripts/grants_deferred/`，
   同时写入 `deferred_grants_detail_<ts>.txt`，避免误执行失败。
   说明：若延后授权因 owner 策略无法自动输出 SQL，`fixup_scripts/grants_deferred/README.txt` 仍会保留完整提醒。
@@ -388,8 +397,10 @@
 - synonym_check_scope：同义词校验范围。默认：Oracle 源 `public_only`，OceanBase 源 `all`。
   可选值：public_only（仅 PUBLIC 参与 missing/extra/汇总统计）、all（PUBLIC+私有全量校验）。
   说明：该开关影响“校验与统计口径”；不影响同义词 fixup 输出范围。PUBLIC 同义词仅在终点对象落入受管源范围时才会被纳入，Oracle 自带系统 PUBLIC 链路会自动过滤。
+  说明：当 `source_db_mode=oceanbase` 且配置中省略该项时，运行时会显式提示“当前默认按 all 处理”；如需锁定旧行为，建议在 `config.ini` 中明确写出。
 - synonym_fixup_scope：同义词修补范围。默认：Oracle 源 `public_only`，OceanBase 源 `all`。
   可选值：all（PUBLIC+私有）、public_only（仅 PUBLIC）。
+  说明：当 `source_db_mode=oceanbase` 且配置中省略该项时，运行时会显式提示“当前默认按 all 处理”；如需锁定旧行为，建议在 `config.ini` 中明确写出。
 - name_collision_mode：约束/索引重名处理模式。默认：fixup。
   可选值：off（关闭）、report（仅输出重名诊断，不改写脚本）、fixup（生成重名修复脚本并改写缺失 INDEX/CONSTRAINT 名称）。
 - name_collision_rename_existing：fixup 模式下是否重命名目标端已有冲突对象。默认：true。
@@ -397,7 +408,7 @@
   兼容说明：若检测到目标 OB 版本不支持 `ALTER TABLE ... RENAME CONSTRAINT`，系统会自动改用约束 `DROP + ADD` 路径，仅索引继续使用 RENAME。
 - trigger_list：触发器清单文件（每行 SCHEMA.TRIGGER_NAME）。默认：空。
   注意：配置后仅生成列表内触发器，并输出 trigger_status_report.txt 报告；清单读取失败会回退全量触发器。
-  说明：在 `source_object_scope_mode=remap_root_closure` 下，`trigger_list` 同时支持源端名和 remap 后目标名；若目标名能通过显式 remap 反查到源端触发器，会按该源端触发器继续 compare/fixup。
+  说明：在 `source_object_scope_mode=explicit_roots/remap_root_closure` 下，`trigger_list` 同时支持源端名和 remap 后目标名；若目标名能通过显式 remap 反查到源端触发器，会按该源端触发器继续 compare/fixup。
   说明：若清单中的触发器属于非表触发器（如 `BEFORE DROP ON DATABASE` 或 `INSTEAD OF ... ON VIEW`），程序不会生成普通 trigger DDL，
   对 `DATABASE/SCHEMA` 级事件触发器，会在 `trigger_status_report.txt` 中标成 `NON_TABLE_SOURCE_TRIGGER`，并额外输出 `triggers_non_table_detail_<ts>.txt` 与人工处理清单；`INSTEAD OF ... ON VIEW` 会按普通触发器参与 compare/fixup。
   说明：若清单命中的缺失触发器依赖的目标 TABLE/VIEW 仍不存在，本轮不会生成 trigger DDL；会在 `fixup_skip_summary_<ts>.txt` 中记录 `base_table_missing` 或同类跳过原因，待依赖对象补齐后 rerun 再生成 trigger 脚本。

@@ -1,22 +1,25 @@
 # OceanBase Comparator Toolkit
 
-> 当前版本：V0.9.9.3
+> 当前版本：V0.9.9.4
 > 面向 Oracle → OceanBase 与 OceanBase → OceanBase 的结构一致性校验与修补脚本生成工具  
 > 核心理念：一次转储、本地对比、脚本审计优先
 
-## 近期更新（0.9.9.3）
+## 近期更新（0.9.9.4）
 - 新增 `source_db_mode=oceanbase` 与 `[OCEANBASE_SOURCE]`，主程序现在支持 OceanBase Oracle-mode source → OceanBase target 的严格 compare 与 certified fixup family。
 - OB→OB 模式下已打通源端 metadata / dependency / DDL provider 分发，支持同 endpoint 与跨版本场景；当前 certified family 包含 TABLE、VIEW、PROCEDURE、FUNCTION、PACKAGE、PACKAGE BODY、CONTEXT、SYNONYM、SEQUENCE、TRIGGER、TYPE、TYPE BODY、INDEX、CONSTRAINT。
 - Oracle-only 规则已完成 mode 隔离：OB→OB 不再误复用 Oracle 的 GTT rewrite、OMS exclusion、VARCHAR 长度膨胀等迁移改写；strict compare 产生的 `type_literal_mismatch` 会落成可执行 `ALTER TABLE ... MODIFY`。
 - 新增 application context compare/fixup：可读取 `DBA_CONTEXT`，从 `VIEW/PROCEDURE/FUNCTION/PACKAGE/PACKAGE BODY/TRIGGER/TYPE BODY` 抽取字面量 `SYS_CONTEXT` / `DBMS_SESSION.SET_CONTEXT` 引用，并对 OB 目标端按语法安全方式生成 `CREATE CONTEXT`（`ACCESSED LOCALLY` 会正确映射为“省略 clause”）。
 - 报告和 fixup 目录已显式暴露 source mode、source/target version、capability gate 与 deferred/manual family，避免“看起来能跑、实际上部分能力未启用”的误判。
+- 兼容敏感默认值现在会显式告警：`report_to_db` 若省略会提示“当前按 false 处理”；`source_db_mode=oceanbase` 下若省略 `synonym_check_scope/synonym_fixup_scope`，会提示“当前默认按 all 处理”，不再静默切换。
+- GTT 合约已补齐 `gtt_table_handling_mode=auto` 与版本门控；`rewrite_to_normal` 的 `ON COMMIT` 语义损失会进入主报告、runtime notices、`manual_actions_required_<ts>.txt` 与脚本头注释。
+- `remap_root_closure + remap_scope_text_fallback_mode=safe` 现在可识别源码中静态 `DBMS_SCHEDULER.CREATE_JOB/CREATE_SCHEDULE` 名称，把命中的 JOB/SCHEDULE 纳入 closure；动态表达式会写入 `source_scope_detail_<ts>.txt` 供人工复核。
 - Oracle→OB 默认链路保持不变，`source_db_mode=oracle` 仍是默认模式；本版全量回归通过，旧路径未被打坏。
 
 ## 核心能力
 - **对象覆盖完整**：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。
 - **Dump-Once 架构**：Oracle Thick Mode + 少量 obclient 调用，元数据一次性落本地内存。
 - **Remap 推导**：支持显式规则、依附对象跟随、依赖推导、schema 回退策略。
-- **源范围收缩模式**：支持 `source_object_scope_mode=remap_root_closure`，仅以 `remap_file` 中显式 TABLE/VIEW 为根种子，按依赖、反向依赖、附属关系扩展闭包；闭包外对象整体忽略，`trigger_list` 可作为显式 keep set。
+- **源范围收缩模式**：支持 `source_object_scope_mode=explicit_roots|remap_root_closure`。`explicit_roots` 仅保留 `remap_file` 中显式 TABLE/VIEW roots 及其附属对象；`remap_root_closure` 再按依赖、反向依赖和附属关系扩展闭包；两种模式都支持 `trigger_list` 作为显式 keep set。
 - **scoped 文本补盲**：支持 `remap_scope_text_fallback_mode=safe`，仅从 `DBA_SOURCE` / `DBA_VIEWS.TEXT` / `DBA_MVIEWS.QUERY` / scheduler 文本等受控来源补盲；支持受控 dynamic SQL、纯字符串拼接 SQL 以及 same-schema 未带前缀调用补盲，不走全 schema DDL grep。变量拼接 SQL 仅报告，不自动纳入。
 - **黑名单表重纳管**：支持 `blacklist_target_existing_policy=rehydrate_if_present`；当源端黑名单表已在目标端被人工改造并创建为 TABLE 时，可恢复后续 compare/fixup，但会自动保护黑名单改造列，避免把 Oracle 原始类型/长度/default/nullability 再写回 OB。
 - **Target Scope 一等公民**：目标端受管 schema 不再等同于 `source_schemas`；会按 remap/full mapping 自动推导，哪怕 remap 到全新的目标 schema，也会继续进入 compare/fixup/report。
@@ -40,7 +43,7 @@
 - **表数据风险校验**：`table_data_presence_check` 识别“源端有数据、目标空表”风险；`auto` 为统计口径，`on` 为严格回表。
 - **对象时间截断**：`object_created_before` 可按 `CREATED` 截止时间冻结校验范围，支持缺失 CREATED 策略（`strict/include_missing/exclude_missing`），并输出 `objects_after_cutoff_detail_<ts>.txt` 与 report_db 对齐明细。
 - **run_fixup 增强**：支持 `--iterative`、`--view-chain-autofix`、语句级继续执行、授权修剪与错误报告。
-- **run_fixup 安全门禁**：默认跳过 `fixup_scripts/table/`，需显式 `--allow-table-create` 才执行建表脚本。
+- **run_fixup 安全门禁**：默认跳过 `fixup_scripts/table/`；`fixup_scripts/materialized_view/`、`fixup_scripts/job/`、`fixup_scripts/schedule/` 也按 manual-only family 默认跳过，需显式按目录执行；即便显式配合 `--iterative`，失败后也只保留到错误报告，不会跨轮自动重试。
 - **状态漂移修复**：支持 TRIGGER/CONSTRAINT 的状态差异检测与状态修补脚本生成。
 - **约束策略增强**：支持缺失约束的 `safe_novalidate/source/force_validate` 策略；仅当源端最终语义需要 `VALIDATED` 时，才生成后置 `validate_later` 脚本。对“缺失 TABLE 首次创建”场景，若源端 `FK/CHECK` 为 `ENABLED + NOT VALIDATED`，会同轮追加 `fixup/status/constraint/*.status.sql` 恢复 `ENABLE NOVALIDATE` 语义。
 - **约束状态修复默认更严格**：`constraint_status_sync_mode` 默认改为 `full`，现有 `FK/CHECK` 的 `VALIDATED / NOT VALIDATED` 漂移会默认进入状态校验与状态修复脚本；`PK/UK` 的 `VALIDATED / NOT VALIDATED` 漂移也会进入状态漂移报告，但仍不生成 `ENABLE/[NO]VALIDATE` SQL。
@@ -66,6 +69,12 @@
 - SQLcl（可选，用于 DDL 格式化）
 - 运行账号需具备 DBA_* 视图访问权限（Oracle 与 OB）
 - 安全说明：工具运行时不会把 OB/dbcat 密码作为明文参数暴露在 `ps` 命令中（配置文件仍按当前方式保留密码项）。
+
+## 运维提示（0.9.9.4）
+- Oracle -> OB：默认链路不变；若省略 `synonym_check_scope/synonym_fixup_scope`，仍按 `public_only` 运行。target-side `DBA_SYNONYMS` 补查不再静默扩大范围，只在明确需要的 OB source 路径启用。
+- OB -> OB：若省略 `synonym_check_scope/synonym_fixup_scope`，运行时会提示并按 `all` 处理；OB source 的多行 `DATA_DEFAULT` 会先做控制字符清理，避免错列。
+- GTT：可继续显式使用 `rewrite_to_normal/preserve_original/blocked`；也可以用 `auto` 让程序按目标 OB 版本决策。凡是落到 `rewrite_to_normal`，都要把它视为“结构可迁、事务语义需人工确认”。
+- scoped closure：`safe` 文本补盲现在支持静态 `DBMS_SCHEDULER.CREATE_JOB/CREATE_SCHEDULE`；如果 `job_name/schedule_name` 不是静态字面量，报告会提示 unresolved，而不会盲猜。
 
 ## 贡献方式
 
@@ -147,6 +156,7 @@ config_hot_reload_interval_sec = 5
 config_hot_reload_fail_policy = keep_last_good
 
 Note: when `source_db_mode = oceanbase` and these two keys are omitted, the runtime default becomes `all`; Oracle mode keeps `public_only`.
+Note: if `report_to_db` is omitted, runtime will warn that it is being treated as `false`; environments depending on report_db should set it explicitly.
 oracle_client_lib_dir = /opt/instantclient_19_28
 dbcat_bin = /opt/dbcat-2.5.0-SNAPSHOT
 dbcat_output_dir = dbcat_output
@@ -154,7 +164,7 @@ java_home = /usr/lib/jvm/java-11
 ```
 说明：
 - `source_db_mode=oracle` 保持原有 Oracle -> OceanBase 行为。
-- `source_db_mode=oceanbase` 现在支持 OceanBase -> OceanBase 的严格 compare 与 certified fixup family；授权生成、Oracle blacklist/source usability 等未认证能力会显式转 deferred/manual。
+- `source_db_mode=oceanbase` 现在支持 OceanBase -> OceanBase 的严格 compare 与 certified fixup family；`generate_grants`、`object_created_before`、`check_object_usability`、`table_data_presence_check`、`explicit_roots/remap_root_closure` 都按产品模式生效，Oracle blacklist 语义仅保留诊断提示，不进入 OB source 主链路。
 - `source_db_mode=oceanbase` 当前的 TRIGGER 覆盖范围是 table/view-based trigger；`DATABASE/SCHEMA` 级非表触发器仍按 deferred/manual 处理。
 
 完整配置说明见 `readme_config.txt`。
@@ -281,7 +291,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/sys_c_force_candidates_detail_<ts>.txt`：SYS_C* FORCE 候选表明细（用于评估是否开启 `fixup_drop_sys_c_columns`）
 - `main_reports/run_<ts>/missing_objects_detail_<ts>.txt`：缺失对象支持性明细（report_detail_mode=split）
 - `main_reports/run_<ts>/unsupported_objects_detail_<ts>.txt`：不支持/阻断对象明细（report_detail_mode=split）
-- `main_reports/run_<ts>/source_scope_detail_<ts>.txt`：源对象范围明细（`source_object_scope_mode=remap_root_closure` 时的 roots/closure/filter 诊断，必要时追加 `INTEGRITY_CRITICAL` / `INTEGRITY_WARNING`）
+- `main_reports/run_<ts>/source_scope_detail_<ts>.txt`：源对象范围明细（`source_object_scope_mode=explicit_roots|remap_root_closure` 时的 roots/filter 诊断；closure 模式下还会追加依赖扩展与 `INTEGRITY_*`）
 - `main_reports/run_<ts>/scope_integrity_detail_<ts>.txt`：scope 完整性明细（blocking `VIEW/MVIEW` + 可选 advisory-family `INFO`）
 - `main_reports/run_<ts>/scope_integrity_remap_candidates_<ts>.txt`：可直接补入 remap 文件的候选对象清单
 - `main_reports/run_<ts>/runtime_degraded_detail_<ts>.txt`：运行时降级明细（区分 `COMPARE` 与 `ARTIFACT`；若存在 `COMPARE`，主报告会标记 `compare incomplete`）
@@ -309,7 +319,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `main_reports/run_<ts>/column_default_detail_<ts>.txt`：现有列默认值差异明细（仅列级语义，不等同 `DEFAULT ON NULL`）
 - `main_reports/run_<ts>/dependency_detail_<ts>.txt`：依赖差异明细（report_detail_mode=split）
 - `*_detail_*.txt` 明细文件采用 `|` 分隔，并包含 `# total/# 字段说明` 头，格式与 `package_compare` 一致，便于 Excel 直接分隔导入。
-- `main_reports/run_<ts>/missed_tables_views_for_OMS/`：OMS 缺失 TABLE/VIEW 规则；当 `source_object_scope_mode=remap_root_closure` 时，这里默认只导出 `remap_file` 中显式 TABLE/VIEW roots，不再把 closure 中的依赖对象一起导出
+- `main_reports/run_<ts>/missed_tables_views_for_OMS/`：OMS 缺失 TABLE/VIEW 规则；当 `source_object_scope_mode=explicit_roots|remap_root_closure` 时，这里默认只导出 `remap_file` 中显式 TABLE/VIEW roots，不再把依赖扩展对象一起导出
 - `fixup_scripts/`：修补脚本输出（执行前需人工审核）
 - `fixup_scripts/README_FIRST.txt`：fixup 根目录导航，说明本次生成目录的用途与默认执行边界；若存在人工项，会先指向 `manual_actions_required_<ts>.txt`
 - `fixup_scripts/grants_miss/`：缺失授权脚本
@@ -335,7 +345,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - 如果触发器字符串字面量完整等于 `SCHEMA.OBJECT`，也会按 remap 自动改写，例如 `'LIFEBASE.T1' -> 'BASEDATA.T1'`。
 - 如果字符串字面量是 `SCHEMA.OBJECT.COLUMN` 三段式路径，程序默认不自动改写，避免把列名、协议文本或日志内容误改坏；这类情况会输出到 `triggers_literal_object_path_detail_<ts>.txt` 供人工确认。
 - 如果源端触发器是 `DATABASE/SCHEMA` 级事件触发器（例如 `BEFORE DROP ON DATABASE`），程序不会再静默漏掉；会输出到 `triggers_non_table_detail_<ts>.txt`，并在 `manual_actions_required_<ts>.txt` 中显式提醒。`INSTEAD OF ... ON VIEW` 会按普通受管触发器参与 compare/fixup。
-- 当 `source_object_scope_mode=remap_root_closure` 且配置了 `trigger_list` 时，`trigger_list` 支持填写源端名或 remap 后目标名；若条目无法在源端或显式 remap 规则中解析，只会写入 `source_scope_detail_<ts>.txt` / `trigger_status_report.txt`，不会再中止整轮运行。
+- 当 `source_object_scope_mode=explicit_roots|remap_root_closure` 且配置了 `trigger_list` 时，`trigger_list` 支持填写源端名或 remap 后目标名；若条目无法在源端或显式 remap 规则中解析，只会写入 `source_scope_detail_<ts>.txt` / `trigger_status_report.txt`，不会再中止整轮运行。
 - 在 scoped trigger 场景下，如果触发器依赖的目标 TABLE/VIEW 尚未创建，首轮只会生成依赖对象脚本；TRIGGER 自身会在 `fixup_skip_summary_<ts>.txt` 中标记为 `base_table_missing` 或同类跳过原因，待依赖补齐后 rerun 再生成 trigger DDL。
 - 若配置了 `trigger_list`，`trigger_status_report.txt` 与运行总结中的 `compare缺失 / 命中缺失 / 过滤` 使用同一套 trigger list 口径；`fixup_skip_summary_<ts>.txt` 则继续在此基础上区分 `selected_total / task_total / blocked_total`，避免把“清单命中”误读成“已可生成脚本”。
 - 对 `TABLE/VIEW` 前置依赖已缺失、或已被纳入人工/不支持处理的 `INDEX / CONSTRAINT / TRIGGER`，fixup 入口会先按与主报告相同的 compare scope 过滤，不再出现“检查汇总已剔除、fixup_skip_summary 仍重复计数”的分叉。
@@ -351,10 +361,10 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 - `TYPE ... NOT PERSISTABLE` 当前按源端语义保留，不会被默认清洗成普通 TYPE，也不会因为该子句差异额外制造 TYPE mismatch 噪声。
 
 ## 黑名单规则
-- 默认启用 `blacklist_rules.json` 规则并尝试读取 `OMS_USER.TMP_BLACK_TABLE`（`blacklist_mode=auto`）。
-- 可通过 `blacklist_mode` 切换来源（table_only/rules_only/disabled），或用 `blacklist_rules_enable/disable` 精细控制规则。
+- Oracle source 路径默认启用 `blacklist_rules.json` 规则并尝试读取 `OMS_USER.TMP_BLACK_TABLE`（`blacklist_mode=auto`）。
+- Oracle source 可通过 `blacklist_mode` 切换来源（table_only/rules_only/disabled），或用 `blacklist_rules_enable/disable` 精细控制规则。
 - LOB 体积阈值由 `blacklist_lob_max_mb` 控制（默认 512MB）。
-- 当使用 `blacklist_mode=auto` 或 `rules_only` 时，请确保 `blacklist_rules.json` 随工具部署；缺失时规则会被跳过。
+- 当使用 `blacklist_mode=auto` 或 `rules_only` 时，请确保 `blacklist_rules.json` 随工具部署；`source_db_mode=oceanbase` 下该能力仅保留诊断提示，不进入 OB source compare/fixup 主链路。
 - 推荐用 `exclude_objects_file` 维护“明确不参与校验”的对象清单（`TYPE|SCHEMA|OBJECT`）；未配置时不生效，继续原有逻辑。
 
 ## 常见配置片段

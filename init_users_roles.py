@@ -36,7 +36,7 @@ import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-__version__ = "0.9.9.3"
+__version__ = "0.9.9.4"
 
 try:
     import oracledb
@@ -59,17 +59,29 @@ LOG_FILE_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
 IDENT_SIMPLE_RE = re.compile(r"^[A-Z][A-Z0-9_$#]*$")
 _SECURE_CREDENTIAL_FILES: Set[Path] = set()
 FALLBACK_SYSTEM_ROLE_NAMES: Set[str] = {
+    "ADM_PARALLEL_EXECUTE_TASK",
     "AQ_ADMINISTRATOR_ROLE",
     "AQ_USER_ROLE",
+    "CAPTURE_ADMIN",
     "CONNECT",
     "CTXAPP",
+    "CDB_DBA",
     "DATAPUMP_EXP_FULL_DATABASE",
     "DATAPUMP_IMP_FULL_DATABASE",
+    "DATAPUMP_CLOUD_EXP",
+    "DATAPUMP_CLOUD_IMP",
     "DBA",
     "DELETE_CATALOG_ROLE",
+    "DV_ACCTMGR",
+    "DV_ADMIN",
+    "DV_MONITOR",
+    "EM_EXPRESS_ALL",
+    "EM_EXPRESS_BASIC",
     "EXECUTE_CATALOG_ROLE",
     "EXP_FULL_DATABASE",
     "GATHER_SYSTEM_STATISTICS",
+    "GGSYS_ROLE",
+    "GSMADMIN_ROLE",
     "HS_ADMIN_EXECUTE_ROLE",
     "HS_ADMIN_ROLE",
     "HS_ADMIN_SELECT_ROLE",
@@ -77,12 +89,22 @@ FALLBACK_SYSTEM_ROLE_NAMES: Set[str] = {
     "JAVAIDPRIV",
     "JAVASYSPRIV",
     "JAVAUSERPRIV",
+    "LOGSTDBY_ADMINISTRATOR",
     "OEM_ADVISOR",
     "OEM_MONITOR",
+    "OLAP_DBA",
+    "OLAP_USER",
+    "OLAP_XS_ADMIN",
+    "PDB_DBA",
     "RECOVERY_CATALOG_OWNER",
+    "RFS_ADMIN",
     "RESOURCE",
     "SCHEDULER_ADMIN",
     "SELECT_CATALOG_ROLE",
+    "SODA_APP",
+    "WM_ADMIN_ROLE",
+    "XDBADMIN",
+    "XDB_SET_INVOKER",
 }
 
 
