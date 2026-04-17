@@ -49,7 +49,9 @@ class TestRunFixupRegressionScenarios(unittest.TestCase):
 
             self.assertLess(order.index("synonym/A.S1.sql"), order.index("view_refresh/A.V1.sql"))
             self.assertLess(order.index("view_refresh/A.V1.sql"), order.index("view/A.V1.sql"))
-            self.assertLess(order.index("view_refresh/A.V1.sql"), order.index("materialized_view/A.MV1.sql"))
+            self.assertLess(
+                order.index("view_refresh/A.V1.sql"), order.index("materialized_view/A.MV1.sql")
+            )
 
 
 class TestContextRegressionScenarios(unittest.TestCase):

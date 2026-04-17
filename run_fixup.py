@@ -21,10 +21,10 @@ Features:
   - Grant execution before dependent objects
   - Multi-pass recompilation for INVALID objects
   - Maintains backward compatibility with original run_fixup.py
-  
+
 Usage:
     python3 run_fixup.py [config.ini] [options]
-    
+
     --smart-order     : Enable dependency-aware execution (recommended)
     --recompile       : Enable automatic recompilation of INVALID objects
     --max-retries N   : Maximum recompilation retries (default: 5)
@@ -36,8 +36,8 @@ Usage:
 
 from __future__ import annotations
 
-import atexit
 import argparse
+import atexit
 import configparser
 import fnmatch
 import hashlib
@@ -51,12 +51,13 @@ import sys
 import tempfile
 import textwrap
 import time
-from collections import defaultdict, OrderedDict
+from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
+
 try:
     import fcntl
 except Exception:  # pragma: no cover - non-POSIX fallback
@@ -76,7 +77,9 @@ DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC = 5
 DEFAULT_FIXUP_EXEC_MODE = "auto"
 DEFAULT_FIXUP_EXEC_FILE_FALLBACK = True
 MAX_RECOMPILE_RETRIES = 5
-STATE_LEDGER_FILENAME = os.environ.get("COMPARATOR_FIXUP_STATE_LEDGER_FILENAME", ".fixup_state_ledger.json")
+STATE_LEDGER_FILENAME = os.environ.get(
+    "COMPARATOR_FIXUP_STATE_LEDGER_FILENAME", ".fixup_state_ledger.json"
+)
 FIXUP_RUN_LOCK_FILENAME = ".run_fixup.lock"
 FIXUP_HOT_RELOAD_EVENTS_DIR = "errors"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
@@ -152,6 +155,7 @@ FIXUP_FAMILY_EXECUTION_CONTRACTS: Dict[str, Dict[str, object]] = {
     },
 }
 
+
 class RuntimeNotice(NamedTuple):
     notice_id: str
     introduced_in: str
@@ -181,7 +185,11 @@ def normalize_contract_dir_name(path_value: Union[Path, str, None]) -> str:
     if not parts:
         return normalize_dir_filter(raw.split("/", 1)[0])
     head = normalize_dir_filter(parts[0])
-    known_heads = set(FIXUP_FAMILY_EXECUTION_CONTRACTS.keys()) | set(DIR_OBJECT_TYPE_MAP.keys()) | set(GRANT_DIRS)
+    known_heads = (
+        set(FIXUP_FAMILY_EXECUTION_CONTRACTS.keys())
+        | set(DIR_OBJECT_TYPE_MAP.keys())
+        | set(GRANT_DIRS)
+    )
     if head in known_heads:
         return head
     if head in {DEFAULT_FIXUP_DIR, DONE_DIR_NAME} and len(parts) > 1:
@@ -248,9 +256,7 @@ def load_notice_state(config_dir: Optional[Union[str, Path]]) -> Tuple[Path, Dic
             if not isinstance(seen, dict):
                 seen = {}
             state["seen_notices"] = {
-                str(key): str(value)
-                for key, value in seen.items()
-                if str(key).strip()
+                str(key): str(value) for key, value in seen.items() if str(key).strip()
             }
             last_seen = payload.get("last_seen_tool_version")
             if isinstance(last_seen, str):
@@ -274,16 +280,12 @@ def load_notice_state(config_dir: Optional[Union[str, Path]]) -> Tuple[Path, Dic
 
 
 def select_unseen_notices(
-    state: Dict[str, object],
-    notices: Sequence[RuntimeNotice]
+    state: Dict[str, object], notices: Sequence[RuntimeNotice]
 ) -> List[RuntimeNotice]:
     seen_notices = state.get("seen_notices")
     if not isinstance(seen_notices, dict):
         seen_notices = {}
-    return [
-        notice for notice in notices
-        if notice.notice_id not in seen_notices
-    ]
+    return [notice for notice in notices if notice.notice_id not in seen_notices]
 
 
 def persist_seen_notices(
@@ -309,7 +311,9 @@ def persist_seen_notices(
                 }
         except Exception:
             latest_seen = {}
-    latest_seen.update({str(key): str(value) for key, value in seen_notices.items() if str(key).strip()})
+    latest_seen.update(
+        {str(key): str(value) for key, value in seen_notices.items() if str(key).strip()}
+    )
     payload = {
         "schema_version": NOTICE_STATE_SCHEMA_VERSION,
         "last_seen_tool_version": current_version,
@@ -324,7 +328,9 @@ def persist_seen_notices(
             if state_path.exists():
                 try:
                     current_payload = json.loads(state_path.read_text(encoding="utf-8"))
-                    if isinstance(current_payload, dict) and isinstance(current_payload.get("seen_notices"), dict):
+                    if isinstance(current_payload, dict) and isinstance(
+                        current_payload.get("seen_notices"), dict
+                    ):
                         merged = {
                             str(key): str(value)
                             for key, value in current_payload.get("seen_notices", {}).items()
@@ -342,7 +348,9 @@ def persist_seen_notices(
                 suffix=".tmp",
                 delete=False,
             ) as tmp_fp:
-                tmp_fp.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+                tmp_fp.write(
+                    json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+                )
                 tmp_name = tmp_fp.name
             os.replace(tmp_name, state_path)
         finally:
@@ -388,7 +396,11 @@ def load_manual_actions_report(path: Optional[Path]) -> List[ManualActionNoticeR
                     log.warning("manual_actions 报告类型不匹配，已拒绝加载: %s", path)
                     return []
                 if schema_version and schema_version != str(MANUAL_ACTION_REPORT_SCHEMA_VERSION):
-                    log.warning("manual_actions 报告 schema_version=%s 不兼容，已拒绝加载: %s", schema_version, path)
+                    log.warning(
+                        "manual_actions 报告 schema_version=%s 不兼容，已拒绝加载: %s",
+                        schema_version,
+                        path,
+                    )
                     return []
                 if line == expected_header:
                     continue
@@ -452,7 +464,9 @@ def dir_path_matches_filter(path_value: str, filter_value: str) -> bool:
 
 
 def should_scan_top_dir(dir_name: str, include_dirs: Optional[Set[str]]) -> bool:
-    include_set = {normalize_dir_filter(item) for item in (include_dirs or set()) if normalize_dir_filter(item)}
+    include_set = {
+        normalize_dir_filter(item) for item in (include_dirs or set()) if normalize_dir_filter(item)
+    }
     if not include_set:
         return True
     dir_norm = normalize_dir_filter(dir_name)
@@ -460,7 +474,9 @@ def should_scan_top_dir(dir_name: str, include_dirs: Optional[Set[str]]) -> bool
 
 
 def path_selected_by_filters(path_value: str, include_dirs: Optional[Set[str]]) -> bool:
-    include_set = {normalize_dir_filter(item) for item in (include_dirs or set()) if normalize_dir_filter(item)}
+    include_set = {
+        normalize_dir_filter(item) for item in (include_dirs or set()) if normalize_dir_filter(item)
+    }
     if not include_set:
         return True
     path_norm = normalize_dir_filter(path_value)
@@ -468,7 +484,9 @@ def path_selected_by_filters(path_value: str, include_dirs: Optional[Set[str]]) 
 
 
 def path_excluded_by_filters(path_value: str, exclude_dirs: Optional[Set[str]]) -> bool:
-    exclude_set = {normalize_dir_filter(item) for item in (exclude_dirs or set()) if normalize_dir_filter(item)}
+    exclude_set = {
+        normalize_dir_filter(item) for item in (exclude_dirs or set()) if normalize_dir_filter(item)
+    }
     if not exclude_set:
         return False
     path_norm = normalize_dir_filter(path_value)
@@ -476,10 +494,11 @@ def path_excluded_by_filters(path_value: str, exclude_dirs: Optional[Set[str]]) 
 
 
 def select_relevant_manual_actions(
-    rows: Sequence[ManualActionNoticeRow],
-    only_dirs: Sequence[str]
+    rows: Sequence[ManualActionNoticeRow], only_dirs: Sequence[str]
 ) -> List[ManualActionNoticeRow]:
-    selected_dirs = {normalize_dir_filter(item) for item in (only_dirs or []) if normalize_dir_filter(item)}
+    selected_dirs = {
+        normalize_dir_filter(item) for item in (only_dirs or []) if normalize_dir_filter(item)
+    }
     if not selected_dirs:
         return list(rows)
 
@@ -504,15 +523,15 @@ def select_relevant_manual_actions(
             continue
         related_dirs = _normalize_manual_action_related_dirs(row.related_fixup_dir)
         if related_dirs and any(
-            dir_filter_overlaps(rel, sel)
-            for rel in related_dirs
-            for sel in selected_dirs
+            dir_filter_overlaps(rel, sel) for rel in related_dirs for sel in selected_dirs
         ):
             result.append(row)
     return result
 
 
-def log_manual_action_preflight(path: Optional[Path], rows: Sequence[ManualActionNoticeRow]) -> None:
+def log_manual_action_preflight(
+    path: Optional[Path], rows: Sequence[ManualActionNoticeRow]
+) -> None:
     if not path or not rows:
         return
     log_section("执行前人工处理提醒")
@@ -531,6 +550,7 @@ def log_manual_action_preflight(path: Optional[Path], rows: Sequence[ManualActio
         )
     if len(rows) > 6:
         log.warning("其余 %d 类人工项请继续查看统一清单。", len(rows) - 6)
+
 
 CONFIG_HOT_RELOAD_MODE_VALUES = {"off", "phase", "round"}
 CONFIG_HOT_RELOAD_FAIL_POLICY_VALUES = {"keep_last_good", "abort"}
@@ -562,11 +582,7 @@ def _escape_obclient_option_value(value: str) -> str:
 
 def _create_obclient_defaults_file(password: str) -> Path:
     with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        prefix="ob_fixup_",
-        suffix=".cnf",
-        delete=False
+        mode="w", encoding="utf-8", prefix="ob_fixup_", suffix=".cnf", delete=False
     ) as tmp:
         tmp.write("[client]\n")
         tmp.write(f'password="{_escape_obclient_option_value(password)}"\n')
@@ -578,15 +594,17 @@ def _create_obclient_defaults_file(password: str) -> Path:
     _SECURE_CREDENTIAL_FILES.add(tmp_path)
     return tmp_path
 
+
 CURRENT_SCHEMA_PATTERN = re.compile(
     r'^\s*ALTER\s+SESSION\s+SET\s+CURRENT_SCHEMA\s*=\s*(?P<schema>"[^"]+"|[A-Z0-9_$#]+)\s*;?\s*$',
-    re.IGNORECASE
+    re.IGNORECASE,
 )
 
 
 def _build_console_handler(level: int) -> logging.Handler:
     try:
         from rich.logging import RichHandler
+
         handler = RichHandler(
             level=level,
             show_time=True,
@@ -594,12 +612,14 @@ def _build_console_handler(level: int) -> logging.Handler:
             show_level=True,
             show_path=False,
             rich_tracebacks=False,
-            log_time_format=LOG_TIME_FORMAT
+            log_time_format=LOG_TIME_FORMAT,
         )
         handler.setFormatter(logging.Formatter("%(message)s"))
         return handler
     except Exception as exc:
-        logging.getLogger(__name__).debug("RichHandler init failed, fallback to StreamHandler: %s", exc)
+        logging.getLogger(__name__).debug(
+            "RichHandler init failed, fallback to StreamHandler: %s", exc
+        )
         handler = logging.StreamHandler()
         handler.setLevel(level)
         handler.setFormatter(logging.Formatter(LOG_FILE_FORMAT, datefmt=LOG_TIME_FORMAT))
@@ -630,7 +650,9 @@ def resolve_console_log_level(level_name: Optional[str], *, is_tty: Optional[boo
         try:
             is_tty = sys.stdout.isatty()
         except Exception as exc:
-            logging.getLogger(__name__).debug("TTY detection failed, defaulting to non-tty: %s", exc)
+            logging.getLogger(__name__).debug(
+                "TTY detection failed, defaulting to non-tty: %s", exc
+            )
             is_tty = False
     name = (level_name or "AUTO").strip().upper()
     if name == "AUTO":
@@ -678,157 +700,168 @@ log = logging.getLogger(__name__)
 # Error classification for intelligent retry
 class FailureType:
     """Classification of SQL execution failures for retry logic."""
-    MISSING_OBJECT = "missing_object"        # Dependency object doesn't exist -> retryable
+
+    MISSING_OBJECT = "missing_object"  # Dependency object doesn't exist -> retryable
     PERMISSION_DENIED = "permission_denied"  # Insufficient privileges -> needs grants
-    SYNTAX_ERROR = "syntax_error"            # SQL syntax error -> needs DDL fix
-    DATA_CONFLICT = "data_conflict"          # Unique/constraint violation -> needs data cleanup
+    SYNTAX_ERROR = "syntax_error"  # SQL syntax error -> needs DDL fix
+    DATA_CONFLICT = "data_conflict"  # Unique/constraint violation -> needs data cleanup
     CONSTRAINT_VALIDATE_FAIL = "constraint_validate_fail"  # ORA-02298 validation failed
-    DUPLICATE_OBJECT = "duplicate_object"    # Object already exists -> can skip
-    INVALID_IDENTIFIER = "invalid_identifier" # Column/table name error -> needs DDL fix
-    NAME_IN_USE = "name_in_use"              # Name already used -> needs resolution
-    TIMEOUT = "timeout"                       # Execution timeout -> may retry
-    LOCK_TIMEOUT = "lock_timeout"             # Resource busy/locked
-    AUTH_FAILED = "auth_failed"               # Login/auth failure
-    CONNECTION_TIMEOUT = "connection_timeout" # Network timeout
-    RESOURCE_EXHAUSTED = "resource_exhausted" # Out of shared pool/memory
-    SNAPSHOT_ERROR = "snapshot_error"         # Snapshot too old
-    DEADLOCK = "deadlock"                     # Deadlock detected
-    UNKNOWN = "unknown"                       # Unknown error -> investigate
+    DUPLICATE_OBJECT = "duplicate_object"  # Object already exists -> can skip
+    INVALID_IDENTIFIER = "invalid_identifier"  # Column/table name error -> needs DDL fix
+    NAME_IN_USE = "name_in_use"  # Name already used -> needs resolution
+    TIMEOUT = "timeout"  # Execution timeout -> may retry
+    LOCK_TIMEOUT = "lock_timeout"  # Resource busy/locked
+    AUTH_FAILED = "auth_failed"  # Login/auth failure
+    CONNECTION_TIMEOUT = "connection_timeout"  # Network timeout
+    RESOURCE_EXHAUSTED = "resource_exhausted"  # Out of shared pool/memory
+    SNAPSHOT_ERROR = "snapshot_error"  # Snapshot too old
+    DEADLOCK = "deadlock"  # Deadlock detected
+    UNKNOWN = "unknown"  # Unknown error -> investigate
 
 
 def classify_sql_error(stderr: str) -> str:
     """
     Classify OceanBase/Oracle error messages for retry logic.
-    
+
     Args:
         stderr: Error message from obclient
-        
+
     Returns:
         FailureType classification string
     """
     if not stderr:
         return FailureType.UNKNOWN
-    
+
     stderr_upper = stderr.upper()
-    
+
     # Missing object errors (retryable - object may be created in later rounds)
-    if any(code in stderr_upper for code in ['ORA-00942', 'ORA-04043', 'OB-00942', 'OB-04043', 'ORA-06512']):
-        if 'TABLE OR VIEW DOES NOT EXIST' in stderr_upper or 'OBJECT DOES NOT EXIST' in stderr_upper:
+    if any(
+        code in stderr_upper
+        for code in ["ORA-00942", "ORA-04043", "OB-00942", "OB-04043", "ORA-06512"]
+    ):
+        if (
+            "TABLE OR VIEW DOES NOT EXIST" in stderr_upper
+            or "OBJECT DOES NOT EXIST" in stderr_upper
+        ):
             return FailureType.MISSING_OBJECT
     if (
-        'TABLE OR VIEW DOES NOT EXIST' in stderr_upper
-        or 'OBJECT DOES NOT EXIST' in stderr_upper
-        or 'ERROR 1146' in stderr_upper
+        "TABLE OR VIEW DOES NOT EXIST" in stderr_upper
+        or "OBJECT DOES NOT EXIST" in stderr_upper
+        or "ERROR 1146" in stderr_upper
     ):
         return FailureType.MISSING_OBJECT
-    
+
     # Permission denied (needs grant scripts)
     if (
-        'ORA-01031' in stderr_upper
-        or 'OB-01031' in stderr_upper
-        or 'ORA-01720' in stderr_upper
-        or 'INSUFFICIENT PRIVILEGES' in stderr_upper
-        or 'ERROR 1142' in stderr_upper
-        or 'ERROR 1227' in stderr_upper
+        "ORA-01031" in stderr_upper
+        or "OB-01031" in stderr_upper
+        or "ORA-01720" in stderr_upper
+        or "INSUFFICIENT PRIVILEGES" in stderr_upper
+        or "ERROR 1142" in stderr_upper
+        or "ERROR 1227" in stderr_upper
     ):
         return FailureType.PERMISSION_DENIED
 
     # Authentication failure
     if (
-        'ORA-01017' in stderr_upper
-        or 'INVALID USERNAME/PASSWORD' in stderr_upper
-        or 'ERROR 1045' in stderr_upper
+        "ORA-01017" in stderr_upper
+        or "INVALID USERNAME/PASSWORD" in stderr_upper
+        or "ERROR 1045" in stderr_upper
     ):
         return FailureType.AUTH_FAILED
 
     # Connection timeout
-    if 'ORA-12170' in stderr_upper or 'TNS:CONNECT TIMEOUT' in stderr_upper:
+    if "ORA-12170" in stderr_upper or "TNS:CONNECT TIMEOUT" in stderr_upper:
         return FailureType.CONNECTION_TIMEOUT
 
     # Lock timeout / resource busy
-    if 'ORA-00054' in stderr_upper or 'RESOURCE BUSY' in stderr_upper or 'ERROR 1205' in stderr_upper:
+    if (
+        "ORA-00054" in stderr_upper
+        or "RESOURCE BUSY" in stderr_upper
+        or "ERROR 1205" in stderr_upper
+    ):
         return FailureType.LOCK_TIMEOUT
 
     # Resource exhausted
-    if 'ORA-04031' in stderr_upper:
+    if "ORA-04031" in stderr_upper:
         return FailureType.RESOURCE_EXHAUSTED
 
     # Snapshot too old
-    if 'ORA-01555' in stderr_upper:
+    if "ORA-01555" in stderr_upper:
         return FailureType.SNAPSHOT_ERROR
 
     # Deadlock
-    if 'ORA-00060' in stderr_upper or 'ERROR 1213' in stderr_upper:
+    if "ORA-00060" in stderr_upper or "ERROR 1213" in stderr_upper:
         return FailureType.DEADLOCK
-    
+
     # Data conflict (unique constraint violation)
-    if 'ORA-00001' in stderr_upper or 'UNIQUE CONSTRAINT' in stderr_upper:
+    if "ORA-00001" in stderr_upper or "UNIQUE CONSTRAINT" in stderr_upper:
         return FailureType.DATA_CONFLICT
 
     # Constraint validate failure (target data quality issue)
-    if (
-        'ORA-02298' in stderr_upper
-        or 'CANNOT VALIDATE' in stderr_upper
-    ):
+    if "ORA-02298" in stderr_upper or "CANNOT VALIDATE" in stderr_upper:
         return FailureType.CONSTRAINT_VALIDATE_FAIL
-    
+
     # Invalid identifier (DDL needs fix)
-    if 'ORA-00904' in stderr_upper or 'ERROR 1054' in stderr_upper:
+    if "ORA-00904" in stderr_upper or "ERROR 1054" in stderr_upper:
         return FailureType.INVALID_IDENTIFIER
-    
+
     # Name already in use (object exists)
     if (
-        'ORA-00955' in stderr_upper
-        or 'OB-00955' in stderr_upper
-        or 'NAME IS ALREADY USED' in stderr_upper
-        or 'ALREADY EXISTS' in stderr_upper
-        or 'ERROR 1050' in stderr_upper
+        "ORA-00955" in stderr_upper
+        or "OB-00955" in stderr_upper
+        or "NAME IS ALREADY USED" in stderr_upper
+        or "ALREADY EXISTS" in stderr_upper
+        or "ERROR 1050" in stderr_upper
     ):
         return FailureType.NAME_IN_USE
-    
+
     # Syntax errors (DDL needs fix)
-    if any(code in stderr_upper for code in ['ORA-00900', 'ORA-00901', 'ORA-00902', 'ORA-00903', 'ERROR 1064']):
+    if any(
+        code in stderr_upper
+        for code in ["ORA-00900", "ORA-00901", "ORA-00902", "ORA-00903", "ERROR 1064"]
+    ):
         return FailureType.SYNTAX_ERROR
-    
+
     return FailureType.UNKNOWN
 
 
-def analyze_failure_patterns(results: List['ScriptResult']) -> Dict[str, List['ScriptResult']]:
+def analyze_failure_patterns(results: List["ScriptResult"]) -> Dict[str, List["ScriptResult"]]:
     """
     Analyze failure patterns and group by error type.
-    
+
     Args:
         results: List of ScriptResult objects
-        
+
     Returns:
         Dictionary mapping error types to list of failed results
     """
     failures_by_type = defaultdict(list)
-    
+
     for result in results:
         if result.status == "FAILED":
             error_type = classify_sql_error(result.message)
             failures_by_type[error_type].append(result)
-    
+
     return dict(failures_by_type)
 
 
-def log_failure_analysis(failures_by_type: Dict[str, List['ScriptResult']]) -> None:
+def log_failure_analysis(failures_by_type: Dict[str, List["ScriptResult"]]) -> None:
     """
     Log detailed failure analysis with actionable suggestions.
-    
+
     Args:
         failures_by_type: Dictionary of failures grouped by type
     """
     if not failures_by_type:
         return
-    
+
     log_subsection("失败原因分析")
-    
+
     total_failures = sum(len(items) for items in failures_by_type.values())
     log.info("总失败数: %d", total_failures)
     log.info("")
-    
+
     # Missing objects (most common in VIEW scenarios)
     if FailureType.MISSING_OBJECT in failures_by_type:
         items = failures_by_type[FailureType.MISSING_OBJECT]
@@ -837,7 +870,7 @@ def log_failure_analysis(failures_by_type: Dict[str, List['ScriptResult']]) -> N
         if len(items) <= 5:
             for item in items[:5]:
                 log.info("     - %s", item.path.name)
-    
+
     # Permission denied
     if FailureType.PERMISSION_DENIED in failures_by_type:
         items = failures_by_type[FailureType.PERMISSION_DENIED]
@@ -849,7 +882,7 @@ def log_failure_analysis(failures_by_type: Dict[str, List['ScriptResult']]) -> N
         if len(items) <= 3:
             for item in items[:3]:
                 log.info("     - %s", item.path.name)
-    
+
     # Syntax errors
     if FailureType.SYNTAX_ERROR in failures_by_type:
         items = failures_by_type[FailureType.SYNTAX_ERROR]
@@ -858,9 +891,12 @@ def log_failure_analysis(failures_by_type: Dict[str, List['ScriptResult']]) -> N
         if len(items) <= 3:
             for item in items[:3]:
                 log.info("     - %s", item.path.name)
-    
+
     # Duplicate/existing objects
-    if FailureType.DUPLICATE_OBJECT in failures_by_type or FailureType.NAME_IN_USE in failures_by_type:
+    if (
+        FailureType.DUPLICATE_OBJECT in failures_by_type
+        or FailureType.NAME_IN_USE in failures_by_type
+    ):
         dup_count = len(failures_by_type.get(FailureType.DUPLICATE_OBJECT, []))
         name_count = len(failures_by_type.get(FailureType.NAME_IN_USE, []))
         total_dup = dup_count + name_count
@@ -880,7 +916,9 @@ def log_failure_analysis(failures_by_type: Dict[str, List['ScriptResult']]) -> N
     if FailureType.CONSTRAINT_VALIDATE_FAIL in failures_by_type:
         items = failures_by_type[FailureType.CONSTRAINT_VALIDATE_FAIL]
         log.info("❌ 约束校验失败(ORA-02298): %d 个", len(items))
-        log.info("   建议: 先清理脏数据，再执行 constraint_validate_later 下的脚本完成 ENABLE VALIDATE")
+        log.info(
+            "   建议: 先清理脏数据，再执行 constraint_validate_later 下的脚本完成 ENABLE VALIDATE"
+        )
         if len(items) <= 3:
             for item in items[:3]:
                 log.info("     - %s", item.path.name)
@@ -938,7 +976,7 @@ def log_failure_analysis(failures_by_type: Dict[str, List['ScriptResult']]) -> N
         if len(items) <= 1:
             for item in items[:1]:
                 log.info("     - %s", item.path.name)
-    
+
     # Unknown errors
     if FailureType.UNKNOWN in failures_by_type:
         items = failures_by_type[FailureType.UNKNOWN]
@@ -948,7 +986,7 @@ def log_failure_analysis(failures_by_type: Dict[str, List['ScriptResult']]) -> N
             for item in items[:3]:
                 msg_preview = safe_first_line(item.message, 80, "无错误信息")
                 log.info("     - %s: %s", item.path.name, msg_preview)
-    
+
     log.info("")
 
 
@@ -984,25 +1022,25 @@ DIR_OBJECT_TYPE_MAP["table_alter"] = "TABLE"
 
 # Execution priority for dependency-aware ordering
 DEPENDENCY_LAYERS = [
-    ["sequence"],                                    # Layer 0: No dependencies
-    ["sequence_restart"],                            # Layer 1: Sequence value sync (default skipped)
-    ["table"],                                       # Layer 2: Base tables
-    ["table_alter"],                                 # Layer 3: Table modifications
-    ["view_prereq_grants", "grants"],                # Layer 4: View prereq + general grants
-    ["synonym"],                                     # Layer 5: Synonyms
-    ["view_refresh"],                                # Layer 6: Existing prerequisite views
-    ["view"],                                        # Layer 7: Missing views
-    ["view_post_grants"],                            # Layer 8: View post grants
-    ["materialized_view"],                           # Layer 9: MVIEWs
-    ["type"],                                        # Layer 10: Types (specs)
-    ["package"],                                     # Layer 11: Package specs
-    ["procedure", "function"],                       # Layer 12: Standalone routines
-    ["type_body", "package_body"],                   # Layer 13: Type/package bodies
-    ["context"],                                     # Layer 14: Application contexts
-    ["name_collision"],                              # Layer 15: Name collision remediation
-    ["constraint", "index"],                         # Layer 16: Constraints and indexes
-    ["trigger"],                                     # Layer 17: Triggers (last)
-    ["job", "schedule"],                             # Layer 18: Jobs
+    ["sequence"],  # Layer 0: No dependencies
+    ["sequence_restart"],  # Layer 1: Sequence value sync (default skipped)
+    ["table"],  # Layer 2: Base tables
+    ["table_alter"],  # Layer 3: Table modifications
+    ["view_prereq_grants", "grants"],  # Layer 4: View prereq + general grants
+    ["synonym"],  # Layer 5: Synonyms
+    ["view_refresh"],  # Layer 6: Existing prerequisite views
+    ["view"],  # Layer 7: Missing views
+    ["view_post_grants"],  # Layer 8: View post grants
+    ["materialized_view"],  # Layer 9: MVIEWs
+    ["type"],  # Layer 10: Types (specs)
+    ["package"],  # Layer 11: Package specs
+    ["procedure", "function"],  # Layer 12: Standalone routines
+    ["type_body", "package_body"],  # Layer 13: Type/package bodies
+    ["context"],  # Layer 14: Application contexts
+    ["name_collision"],  # Layer 15: Name collision remediation
+    ["constraint", "index"],  # Layer 16: Constraints and indexes
+    ["trigger"],  # Layer 17: Triggers (last)
+    ["job", "schedule"],  # Layer 18: Jobs
 ]
 
 CORE_GRANT_DIRS_ORDER = ("grants_all", "grants_miss", "grants")
@@ -1071,9 +1109,7 @@ DICTIONARY_OWNER_SCHEMAS = {"SYS", "SYSTEM"}
 
 
 def resolve_implied_sys_privileges(
-    required_priv: str,
-    target_full: Optional[str] = None,
-    target_type: Optional[str] = None
+    required_priv: str, target_full: Optional[str] = None, target_type: Optional[str] = None
 ) -> Set[str]:
     """
     Resolve system privilege implication set for a target object.
@@ -1103,7 +1139,11 @@ def resolve_implied_sys_privileges(
     elif required_u == "REFERENCES":
         implied = {"REFERENCES ANY TABLE"} if target_type_u == "TABLE" else set()
     elif required_u in {"INSERT", "UPDATE", "DELETE"}:
-        implied = {f"{required_u} ANY TABLE"} if target_type_u in {"TABLE", "VIEW", "MATERIALIZED VIEW"} else set()
+        implied = (
+            {f"{required_u} ANY TABLE"}
+            if target_type_u in {"TABLE", "VIEW", "MATERIALIZED VIEW"}
+            else set()
+        )
     else:
         implied = set(SYS_PRIV_IMPLICATIONS.get(required_u, set()))
 
@@ -1112,9 +1152,11 @@ def resolve_implied_sys_privileges(
     if not target_full:
         return implied
     schema, _ = parse_object_token(target_full)
-    if schema and schema.upper() in DICTIONARY_OWNER_SCHEMAS and target_type_u in {
-        "TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM"
-    }:
+    if (
+        schema
+        and schema.upper() in DICTIONARY_OWNER_SCHEMAS
+        and target_type_u in {"TABLE", "VIEW", "MATERIALIZED VIEW", "SYNONYM"}
+    ):
         implied.add("SELECT ANY DICTIONARY")
     return implied
 
@@ -1124,13 +1166,15 @@ def is_grant_dir(dir_name: str) -> bool:
 
 
 def resolve_grant_dirs(
-    subdirs: Dict[str, Path],
-    include_dirs: Optional[Set[str]],
-    exclude_dirs: Set[str]
+    subdirs: Dict[str, Path], include_dirs: Optional[Set[str]], exclude_dirs: Set[str]
 ) -> List[str]:
     available = set(subdirs.keys())
-    include_set = {normalize_dir_filter(d) for d in include_dirs or set() if normalize_dir_filter(d)}
-    exclude_set = {normalize_dir_filter(d) for d in exclude_dirs or set() if normalize_dir_filter(d)}
+    include_set = {
+        normalize_dir_filter(d) for d in include_dirs or set() if normalize_dir_filter(d)
+    }
+    exclude_set = {
+        normalize_dir_filter(d) for d in exclude_dirs or set() if normalize_dir_filter(d)
+    }
 
     def _included(name: str) -> bool:
         return not include_set or any(dir_filter_overlaps(name, item) for item in include_set)
@@ -1149,9 +1193,17 @@ def resolve_grant_dirs(
                 grant_dirs.append("grants_miss")
             elif "grants" in available and not _excluded("grants"):
                 grant_dirs.append("grants")
-        if _included("view_prereq_grants") and "view_prereq_grants" in available and not _excluded("view_prereq_grants"):
+        if (
+            _included("view_prereq_grants")
+            and "view_prereq_grants" in available
+            and not _excluded("view_prereq_grants")
+        ):
             grant_dirs.append("view_prereq_grants")
-        if _included("view_post_grants") and "view_post_grants" in available and not _excluded("view_post_grants"):
+        if (
+            _included("view_post_grants")
+            and "view_post_grants" in available
+            and not _excluded("view_post_grants")
+        ):
             grant_dirs.append("view_post_grants")
     else:
         if "grants_miss" in available and not _excluded("grants_miss"):
@@ -1168,18 +1220,22 @@ def resolve_grant_dirs(
 
 
 def build_run_fixup_change_notices(
-    args,
-    fixup_dir: Path,
-    only_dirs: List[str]
+    args, fixup_dir: Path, only_dirs: List[str]
 ) -> List[RuntimeNotice]:
     notices: List[RuntimeNotice] = []
-    selected_dirs = {normalize_dir_filter(item) for item in (only_dirs or []) if normalize_dir_filter(item)}
+    selected_dirs = {
+        normalize_dir_filter(item) for item in (only_dirs or []) if normalize_dir_filter(item)
+    }
     selected_all = not selected_dirs
     selected_table = any(dir_filter_overlaps("table", item) for item in selected_dirs)
     selected_view = any(dir_filter_overlaps("view", item) for item in selected_dirs)
-    selected_grants_revoke = any(dir_filter_overlaps("grants_revoke", item) for item in selected_dirs)
+    selected_grants_revoke = any(
+        dir_filter_overlaps("grants_revoke", item) for item in selected_dirs
+    )
     selected_cleanup_safe = any(dir_filter_overlaps("cleanup_safe", item) for item in selected_dirs)
-    selected_sequence_restart = any(dir_filter_overlaps("sequence_restart", item) for item in selected_dirs)
+    selected_sequence_restart = any(
+        dir_filter_overlaps("sequence_restart", item) for item in selected_dirs
+    )
     selected_manual_review = any(
         any(dir_filter_overlaps(dir_name, item) for item in selected_dirs)
         for dir_name in MANUAL_REVIEW_DIRS
@@ -1187,60 +1243,71 @@ def build_run_fixup_change_notices(
     if not getattr(args, "allow_table_create", False) and (
         selected_table or (selected_all and (fixup_dir / "table").exists())
     ):
-        notices.append(RuntimeNotice(
-            "fixup_table_safe_gate",
-            "0.9.8.7",
-            "建表脚本默认不执行",
-            "run_fixup 默认跳过 table/；确需建表请显式加 --allow-table-create。",
-        ))
+        notices.append(
+            RuntimeNotice(
+                "fixup_table_safe_gate",
+                "0.9.8.7",
+                "建表脚本默认不执行",
+                "run_fixup 默认跳过 table/；确需建表请显式加 --allow-table-create。",
+            )
+        )
     if (selected_all or selected_grants_revoke) and (fixup_dir / "grants_revoke").exists():
-        notices.append(RuntimeNotice(
-            "public_grants_revoke_audit",
-            "0.9.8.7",
-            "PUBLIC 扩权现在会单独审计",
-            "若出现 grants_revoke，请先核对源端是否声明，再决定是否回收。",
-        ))
+        notices.append(
+            RuntimeNotice(
+                "public_grants_revoke_audit",
+                "0.9.8.7",
+                "PUBLIC 扩权现在会单独审计",
+                "若出现 grants_revoke，请先核对源端是否声明，再决定是否回收。",
+            )
+        )
     if (
         (selected_all or selected_view)
         and (fixup_dir / "view").exists()
         and not getattr(args, "view_chain_autofix", False)
     ):
-        notices.append(RuntimeNotice(
-            "view_chain_autofix",
-            "0.9.8.6",
-            "视图链可自动修复",
-            "缺失 VIEW 或依赖复杂时，可尝试 python3 run_fixup.py config.ini --view-chain-autofix。",
-        ))
+        notices.append(
+            RuntimeNotice(
+                "view_chain_autofix",
+                "0.9.8.6",
+                "视图链可自动修复",
+                "缺失 VIEW 或依赖复杂时，可尝试 python3 run_fixup.py config.ini --view-chain-autofix。",
+            )
+        )
     if selected_cleanup_safe and (fixup_dir / "cleanup_safe").exists():
-        notices.append(RuntimeNotice(
-            "cleanup_safe_review",
-            "0.9.8.9",
-            "安全清理目录需要显式确认",
-            "cleanup_safe/ 下是 destructive SQL；请先审 extra_cleanup_candidates.txt，再显式按目录执行。",
-        ))
+        notices.append(
+            RuntimeNotice(
+                "cleanup_safe_review",
+                "0.9.8.9",
+                "安全清理目录需要显式确认",
+                "cleanup_safe/ 下是 destructive SQL；请先审 extra_cleanup_candidates.txt，再显式按目录执行。",
+            )
+        )
     if (selected_all or selected_sequence_restart) and (fixup_dir / "sequence_restart").exists():
-        notices.append(RuntimeNotice(
-            "sequence_restart_review",
-            "0.9.8.9",
-            "sequence_restart 默认不自动执行",
-            "sequence_restart/ 是值同步 SQL；请先核对 sequence_restart_detail 与源/目标 LAST_NUMBER，再显式按目录执行。",
-        ))
+        notices.append(
+            RuntimeNotice(
+                "sequence_restart_review",
+                "0.9.8.9",
+                "sequence_restart 默认不自动执行",
+                "sequence_restart/ 是值同步 SQL；请先核对 sequence_restart_detail 与源/目标 LAST_NUMBER，再显式按目录执行。",
+            )
+        )
     manual_dirs_present = [
-        dir_name for dir_name in MANUAL_REVIEW_DIRS
-        if (fixup_dir / dir_name).exists()
+        dir_name for dir_name in MANUAL_REVIEW_DIRS if (fixup_dir / dir_name).exists()
     ]
     if manual_dirs_present and (selected_all or selected_manual_review):
         iterative_hint = ""
         if getattr(args, "iterative", False):
             iterative_hint = " 如启用 --iterative，失败脚本也只保留到 errors 报告，不会自动重试。"
-        notices.append(RuntimeNotice(
-            "manual_only_family_review",
-            "0.9.9.4",
-            "manual-only family 默认不自动执行",
-            "、".join(manual_dirs_present)
-            + "/ 属于 manual-only family；请先核对 manual_actions_required 与源端定义，再显式按目录执行。"
-            + iterative_hint,
-        ))
+        notices.append(
+            RuntimeNotice(
+                "manual_only_family_review",
+                "0.9.9.4",
+                "manual-only family 默认不自动执行",
+                "、".join(manual_dirs_present)
+                + "/ 属于 manual-only family；请先核对 manual_actions_required 与源端定义，再显式按目录执行。"
+                + iterative_hint,
+            )
+        )
     return notices
 
 
@@ -1250,6 +1317,7 @@ def log_change_notices_block(notices: List[RuntimeNotice]) -> None:
     log_section("本次相关变化提醒")
     for idx, notice in enumerate(notices, start=1):
         log.warning("%d. %s：%s", idx, notice.title, notice.message)
+
 
 CREATE_OBJECT_DIRS = {
     "sequence",
@@ -1278,23 +1346,21 @@ RE_SINGLE_QUOTED_NAME = re.compile(r"'([A-Za-z0-9_#$]+)'")
 RE_BLOCK_START = re.compile(
     r"^\s*CREATE\s+(OR\s+REPLACE\s+)?"
     r"(PROCEDURE|FUNCTION|PACKAGE(\s+BODY)?|TYPE(\s+BODY)?|TRIGGER)\b",
-    re.IGNORECASE
+    re.IGNORECASE,
 )
 RE_ANON_BLOCK_START = re.compile(r"^\s*(DECLARE|BEGIN)\b", re.IGNORECASE)
 RE_BLOCK_HEADER_NAME = re.compile(
-    r'^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:NON)?EDITIONABLE\s+)?'
-    r'(?:PROCEDURE|FUNCTION|PACKAGE(?:\s+BODY)?|TYPE(?:\s+BODY)?|TRIGGER)\s+'
+    r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:NON)?EDITIONABLE\s+)?"
+    r"(?:PROCEDURE|FUNCTION|PACKAGE(?:\s+BODY)?|TYPE(?:\s+BODY)?|TRIGGER)\s+"
     r'(?P<name>(?:"[^"]+"|[A-Z0-9_$#]+)(?:\s*\.\s*(?:"[^"]+"|[A-Z0-9_$#]+))?)',
-    re.IGNORECASE
+    re.IGNORECASE,
 )
 RE_BLOCK_END = re.compile(
-    r'^\s*END(?:\s+(?:"(?P<quoted>[^"]+)"|(?P<name>[A-Z0-9_$#]+)))?\s*;\s*(?:--.*)?$',
-    re.IGNORECASE
+    r'^\s*END(?:\s+(?:"(?P<quoted>[^"]+)"|(?P<name>[A-Z0-9_$#]+)))?\s*;\s*(?:--.*)?$', re.IGNORECASE
 )
 PLSQL_INNER_END_KEYWORDS = {"IF", "LOOP", "CASE", "WHILE", "FOR", "REPEAT"}
 RE_CREATE_VIEW = re.compile(
-    r"^\s*CREATE\s+(OR\s+REPLACE\s+)?(FORCE\s+)?(MATERIALIZED\s+)?VIEW\b",
-    re.IGNORECASE
+    r"^\s*CREATE\s+(OR\s+REPLACE\s+)?(FORCE\s+)?(MATERIALIZED\s+)?VIEW\b", re.IGNORECASE
 )
 RE_ERROR_CODE = re.compile(r"(ORA-\d{5}|OBE?-\d+|PLS-\d{5}|SP2-\d{4})", re.IGNORECASE)
 RE_SQL_ERROR = re.compile(r"(ORA-\d{5}|OBE?-\d+|PLS-\d{5}|SP2-\d{4}|ERROR\s+\d+)", re.IGNORECASE)
@@ -1302,21 +1368,16 @@ RE_PLS_ERROR = re.compile(r"\bPLS-\d{5}\b", re.IGNORECASE)
 RE_SP2_ERROR = re.compile(r"\bSP2-\d{4}\b", re.IGNORECASE)
 RE_GENERIC_ERROR_CODE = re.compile(r"\bERROR\s+\d+\b", re.IGNORECASE)
 RE_GRANT_ON = re.compile(
-    r"^GRANT\s+.+?\s+ON\s+(?P<object>[^\s]+)\s+TO\s+(?P<grantee>[^\s;]+)",
-    re.IGNORECASE | re.DOTALL
+    r"^GRANT\s+.+?\s+ON\s+(?P<object>[^\s]+)\s+TO\s+(?P<grantee>[^\s;]+)", re.IGNORECASE | re.DOTALL
 )
 RE_GRANT_OBJECT = re.compile(
     r"^\s*GRANT\s+(?P<privs>.+?)\s+ON\s+(?P<object>.+?)\s+TO\s+(?P<grantees>.+)$",
-    re.IGNORECASE | re.DOTALL
+    re.IGNORECASE | re.DOTALL,
 )
 RE_GRANT_SIMPLE = re.compile(
-    r"^\s*GRANT\s+(?P<privs>.+?)\s+TO\s+(?P<grantees>.+)$",
-    re.IGNORECASE | re.DOTALL
+    r"^\s*GRANT\s+(?P<privs>.+?)\s+TO\s+(?P<grantees>.+)$", re.IGNORECASE | re.DOTALL
 )
-RE_WITH_OPTION = re.compile(
-    r"\s+WITH\s+GRANT\s+OPTION|\s+WITH\s+ADMIN\s+OPTION",
-    re.IGNORECASE
-)
+RE_WITH_OPTION = re.compile(r"\s+WITH\s+GRANT\s+OPTION|\s+WITH\s+ADMIN\s+OPTION", re.IGNORECASE)
 RE_CHAIN_NODE = re.compile(r"(?P<name>[^\[]+)\[(?P<meta>[^\]]+)\]")
 
 Q_QUOTE_DELIMS = {
@@ -1382,7 +1443,11 @@ class FixupStateLedger:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             if isinstance(payload, dict):
-                self._data = payload.get("completed", {}) if isinstance(payload.get("completed"), dict) else {}
+                self._data = (
+                    payload.get("completed", {})
+                    if isinstance(payload.get("completed"), dict)
+                    else {}
+                )
             else:
                 self._data = {}
         except Exception as exc:
@@ -1437,7 +1502,9 @@ class FixupStateLedger:
             self._dirty = True
 
 
-def read_sql_text_with_limit(sql_path: Path, max_bytes: Optional[int]) -> Tuple[Optional[str], Optional[bytes], Optional[str]]:
+def read_sql_text_with_limit(
+    sql_path: Path, max_bytes: Optional[int]
+) -> Tuple[Optional[str], Optional[bytes], Optional[str]]:
     """Read SQL file with optional size limit."""
     try:
         if max_bytes and max_bytes > 0:
@@ -1448,7 +1515,11 @@ def read_sql_text_with_limit(sql_path: Path, max_bytes: Optional[int]) -> Tuple[
         try:
             return raw_bytes.decode("utf-8"), raw_bytes, None
         except UnicodeDecodeError as exc:
-            return None, raw_bytes, f"文件编码不是 UTF-8，已阻断执行以避免破坏 replay/ledger 语义: {exc}"
+            return (
+                None,
+                raw_bytes,
+                f"文件编码不是 UTF-8，已阻断执行以避免破坏 replay/ledger 语义: {exc}",
+            )
     except Exception as exc:
         return None, None, f"读取文件失败: {exc}"
 
@@ -1459,7 +1530,7 @@ def extract_sql_error(output: str) -> Optional[str]:
 
     best_line: Optional[str] = None
     best_score = -1
-    best_index = 10 ** 9
+    best_index = 10**9
     for idx, raw_line in enumerate(output.splitlines()):
         score = score_execution_error_line(raw_line)
         if score is None:
@@ -1652,11 +1723,9 @@ def sanitize_view_chain_view_ddl(ddl_text: str) -> str:
     create_start = tokens[0][1]
     view_end = tokens[view_idx][2]
     mid_start = tokens[idx - 1][2] if has_or_replace else tokens[0][2]
-    mid = ddl_text[mid_start:tokens[view_idx][1]]
+    mid = ddl_text[mid_start : tokens[view_idx][1]]
     mid_clean = re.sub(
-        r"(?is)\bNO\s+FORCE\b|\bFORCE\b|\bEDITIONABLE\b|\bNONEDITIONABLE\b",
-        " ",
-        mid
+        r"(?is)\bNO\s+FORCE\b|\bFORCE\b|\bEDITIONABLE\b|\bNONEDITIONABLE\b", " ", mid
     )
     mid_clean = " ".join(mid_clean.split())
     prefix = "CREATE"
@@ -1883,8 +1952,7 @@ def normalize_config_hot_reload_mode(raw_value: Optional[str]) -> str:
     value = (raw_value or "off").strip().lower()
     if value not in CONFIG_HOT_RELOAD_MODE_VALUES:
         log.warning(
-            "config_hot_reload_mode=%s 非法，回退为 off（支持: off/phase/round）",
-            raw_value
+            "config_hot_reload_mode=%s 非法，回退为 off（支持: off/phase/round）", raw_value
         )
         return "off"
     return value
@@ -1895,7 +1963,7 @@ def normalize_config_hot_reload_fail_policy(raw_value: Optional[str]) -> str:
     if value not in CONFIG_HOT_RELOAD_FAIL_POLICY_VALUES:
         log.warning(
             "config_hot_reload_fail_policy=%s 非法，回退为 keep_last_good（支持: keep_last_good/abort）",
-            raw_value
+            raw_value,
         )
         return "keep_last_good"
     return value
@@ -1910,14 +1978,14 @@ def parse_config_hot_reload_interval(raw_value: Optional[str]) -> int:
         log.warning(
             "config_hot_reload_interval_sec=%s 非法，回退为 %d",
             raw_value,
-            DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC
+            DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC,
         )
         return DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC
     if value < 1:
         log.warning(
             "config_hot_reload_interval_sec=%s 小于 1，回退为 %d",
             raw_value,
-            DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC
+            DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC,
         )
         return DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC
     return value
@@ -1930,7 +1998,9 @@ def resolve_config_relative_path(base_dir: Path, raw_path: str) -> Path:
     return path.resolve()
 
 
-def resolve_hot_reload_watch_paths(parser: configparser.ConfigParser, config_path: Path) -> List[Path]:
+def resolve_hot_reload_watch_paths(
+    parser: configparser.ConfigParser, config_path: Path
+) -> List[Path]:
     base_dir = config_path.parent.resolve()
     watch_paths: List[Path] = [config_path.resolve()]
     settings = parser["SETTINGS"] if parser.has_section("SETTINGS") else {}
@@ -1970,7 +2040,9 @@ def build_watch_snapshot(paths: List[Path]) -> Dict[str, str]:
 def load_fixup_hot_reload_settings(parser: configparser.ConfigParser) -> FixupHotReloadSettings:
     settings = parser["SETTINGS"] if parser.has_section("SETTINGS") else {}
     mode = normalize_config_hot_reload_mode(settings.get("config_hot_reload_mode", "off"))
-    interval_sec = parse_config_hot_reload_interval(settings.get("config_hot_reload_interval_sec", "5"))
+    interval_sec = parse_config_hot_reload_interval(
+        settings.get("config_hot_reload_interval_sec", "5")
+    )
     fail_policy = normalize_config_hot_reload_fail_policy(
         settings.get("config_hot_reload_fail_policy", "keep_last_good")
     )
@@ -1996,7 +2068,7 @@ def init_fixup_hot_reload_runtime(config_path: Path) -> Optional[FixupHotReloadR
         interval_sec=hot_settings.interval_sec,
         fail_policy=hot_settings.fail_policy,
         watch_paths=watch_paths,
-        snapshot=snapshot
+        snapshot=snapshot,
     )
 
 
@@ -2006,7 +2078,7 @@ def append_fixup_hot_reload_event(
     stage: str,
     changed_files: List[str],
     changed_keys: List[str],
-    note: str
+    note: str,
 ) -> None:
     event = {
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -2014,17 +2086,15 @@ def append_fixup_hot_reload_event(
         "stage": stage,
         "changed_files": ",".join(changed_files) if changed_files else "-",
         "changed_keys": ",".join(changed_keys) if changed_keys else "-",
-        "note": note or "-"
+        "note": note or "-",
     }
     runtime.events.append(event)
-    message = (
-        "[HOT_RELOAD] {status} stage={stage} files={files} keys={keys} note={note}".format(
-            status=event["status"],
-            stage=event["stage"],
-            files=event["changed_files"],
-            keys=event["changed_keys"],
-            note=event["note"]
-        )
+    message = "[HOT_RELOAD] {status} stage={stage} files={files} keys={keys} note={note}".format(
+        status=event["status"],
+        stage=event["stage"],
+        files=event["changed_files"],
+        keys=event["changed_keys"],
+        note=event["note"],
     )
     if status in {"REJECTED", "REQUIRES_RESTART"}:
         log.warning(message)
@@ -2033,8 +2103,7 @@ def append_fixup_hot_reload_event(
 
 
 def write_fixup_hot_reload_events_report(
-    fixup_dir: Path,
-    runtime: Optional[FixupHotReloadRuntime]
+    fixup_dir: Path, runtime: Optional[FixupHotReloadRuntime]
 ) -> Optional[Path]:
     if not runtime or not runtime.events:
         return None
@@ -2045,7 +2114,7 @@ def write_fixup_hot_reload_events_report(
     lines = [
         "# config hot reload events",
         f"# mode={runtime.mode} interval_sec={runtime.interval_sec} fail_policy={runtime.fail_policy}",
-        "TS | STATUS | STAGE | CHANGED_FILES | CHANGED_KEYS | NOTE"
+        "TS | STATUS | STAGE | CHANGED_FILES | CHANGED_KEYS | NOTE",
     ]
     for event in runtime.events:
         lines.append(
@@ -2055,7 +2124,7 @@ def write_fixup_hot_reload_events_report(
                 stage=event.get("stage", "-"),
                 changed_files=event.get("changed_files", "-"),
                 changed_keys=event.get("changed_keys", "-"),
-                note=event.get("note", "-")
+                note=event.get("note", "-"),
             )
         )
     report_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
@@ -2069,7 +2138,7 @@ def apply_fixup_hot_reload_at_round(
     current_fixup_dir: Path,
     current_report_dir: Path,
     current_fixup_settings: FixupAutoGrantSettings,
-    current_max_sql_file_bytes: Optional[int]
+    current_max_sql_file_bytes: Optional[int],
 ) -> Tuple[Dict[str, str], FixupAutoGrantSettings, Optional[int], bool]:
     if not runtime or runtime.mode != "round":
         return current_ob_cfg, current_fixup_settings, current_max_sql_file_bytes, False
@@ -2081,7 +2150,8 @@ def apply_fixup_hot_reload_at_round(
 
     latest_snapshot = build_watch_snapshot(runtime.watch_paths)
     changed_files = [
-        path for path in sorted(latest_snapshot.keys())
+        path
+        for path in sorted(latest_snapshot.keys())
         if latest_snapshot.get(path) != runtime.snapshot.get(path)
     ]
     if not changed_files:
@@ -2089,9 +2159,15 @@ def apply_fixup_hot_reload_at_round(
         return current_ob_cfg, current_fixup_settings, current_max_sql_file_bytes, False
 
     try:
-        candidate_ob_cfg, candidate_fixup_dir, _repo_root, candidate_log_level, candidate_report_dir, candidate_fixup_settings, candidate_max_sql_file_bytes = load_ob_config(
-            runtime.config_path
-        )
+        (
+            candidate_ob_cfg,
+            candidate_fixup_dir,
+            _repo_root,
+            candidate_log_level,
+            candidate_report_dir,
+            candidate_fixup_settings,
+            candidate_max_sql_file_bytes,
+        ) = load_ob_config(runtime.config_path)
         parser = configparser.ConfigParser(interpolation=None)
         parser.read(runtime.config_path, encoding="utf-8")
         candidate_hot = load_fixup_hot_reload_settings(parser)
@@ -2104,7 +2180,7 @@ def apply_fixup_hot_reload_at_round(
             stage=f"round-{round_num}",
             changed_files=changed_files,
             changed_keys=[],
-            note=f"配置解析失败: {str(exc)[:240]}"
+            note=f"配置解析失败: {str(exc)[:240]}",
         )
         if runtime.fail_policy == "abort":
             raise ConfigError(f"热加载配置无效（round={round_num}）: {exc}")
@@ -2136,14 +2212,16 @@ def apply_fixup_hot_reload_at_round(
 
     if candidate_fixup_settings != current_fixup_settings:
         next_fixup_settings = candidate_fixup_settings
-        applied_keys.extend([
-            "SETTINGS.fixup_auto_grant",
-            "SETTINGS.fixup_auto_grant_types",
-            "SETTINGS.fixup_auto_grant_fallback",
-            "SETTINGS.fixup_auto_grant_cache_limit",
-            "SETTINGS.fixup_exec_mode",
-            "SETTINGS.fixup_exec_file_fallback",
-        ])
+        applied_keys.extend(
+            [
+                "SETTINGS.fixup_auto_grant",
+                "SETTINGS.fixup_auto_grant_types",
+                "SETTINGS.fixup_auto_grant_fallback",
+                "SETTINGS.fixup_auto_grant_cache_limit",
+                "SETTINGS.fixup_exec_mode",
+                "SETTINGS.fixup_exec_file_fallback",
+            ]
+        )
 
     if candidate_max_sql_file_bytes != current_max_sql_file_bytes:
         next_max_sql_file_bytes = candidate_max_sql_file_bytes
@@ -2166,7 +2244,7 @@ def apply_fixup_hot_reload_at_round(
             stage=f"round-{round_num}",
             changed_files=changed_files,
             changed_keys=immutable_keys,
-            note="存在本轮不可热加载项，需重启 run_fixup 生效"
+            note="存在本轮不可热加载项，需重启 run_fixup 生效",
         )
     elif applied_keys:
         append_fixup_hot_reload_event(
@@ -2175,7 +2253,7 @@ def apply_fixup_hot_reload_at_round(
             stage=f"round-{round_num}",
             changed_files=changed_files,
             changed_keys=sorted(set(applied_keys)),
-            note="已在轮次边界应用"
+            note="已在轮次边界应用",
         )
     else:
         append_fixup_hot_reload_event(
@@ -2184,7 +2262,7 @@ def apply_fixup_hot_reload_at_round(
             stage=f"round-{round_num}",
             changed_files=changed_files,
             changed_keys=[],
-            note="检测到文件变化，但 run_fixup 当前运行态无可热加载项"
+            note="检测到文件变化，但 run_fixup 当前运行态无可热加载项",
         )
 
     runtime.watch_paths = candidate_watch_paths
@@ -2193,14 +2271,18 @@ def apply_fixup_hot_reload_at_round(
     return next_ob_cfg, next_fixup_settings, next_max_sql_file_bytes, settings_changed
 
 
-def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, Path, FixupAutoGrantSettings, Optional[int]]:
+def load_ob_config(
+    config_path: Path,
+) -> Tuple[Dict[str, str], Path, Path, str, Path, FixupAutoGrantSettings, Optional[int]]:
     """Load OceanBase connection info and fixup directory from config.ini."""
     parser = configparser.ConfigParser(interpolation=None)
     if not config_path.exists():
         raise ConfigError(f"配置文件不存在: {config_path}")
 
     parser.read(config_path, encoding="utf-8")
-    source_db_mode = parser.get("SETTINGS", "source_db_mode", fallback="oracle").strip().lower() or "oracle"
+    source_db_mode = (
+        parser.get("SETTINGS", "source_db_mode", fallback="oracle").strip().lower() or "oracle"
+    )
 
     if "OCEANBASE_TARGET" not in parser:
         raise ConfigError("配置文件缺少 [OCEANBASE_TARGET] 配置段。")
@@ -2225,7 +2307,9 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
         if fixup_raw:
             fixup_timeout = int(fixup_raw)
         else:
-            fixup_timeout = parser.getint("SETTINGS", "obclient_timeout", fallback=DEFAULT_FIXUP_TIMEOUT)
+            fixup_timeout = parser.getint(
+                "SETTINGS", "obclient_timeout", fallback=DEFAULT_FIXUP_TIMEOUT
+            )
         if fixup_timeout is None or fixup_timeout < 0:
             fixup_timeout = DEFAULT_FIXUP_TIMEOUT
     except Exception as exc:
@@ -2237,8 +2321,12 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
     fixup_dir = parser.get("SETTINGS", "fixup_dir", fallback=DEFAULT_FIXUP_DIR).strip()
     fixup_path = (repo_root / fixup_dir).resolve()
     settings_has = parser.has_section("SETTINGS")
-    allow_key_missing = (not settings_has) or (not parser.has_option("SETTINGS", "fixup_dir_allow_outside_repo"))
-    force_clean_key_missing = (not settings_has) or (not parser.has_option("SETTINGS", "fixup_force_clean"))
+    allow_key_missing = (not settings_has) or (
+        not parser.has_option("SETTINGS", "fixup_dir_allow_outside_repo")
+    )
+    force_clean_key_missing = (not settings_has) or (
+        not parser.has_option("SETTINGS", "fixup_force_clean")
+    )
     if allow_key_missing or force_clean_key_missing:
         missing_keys: List[str] = []
         if allow_key_missing:
@@ -2247,11 +2335,10 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
             missing_keys.append("fixup_force_clean")
         log.warning(
             "[MIGRATION] 检测到配置未显式设置 %s。v0.9.8.7 默认值已调整，建议在 config.ini 中明确声明。",
-            ",".join(missing_keys)
+            ",".join(missing_keys),
         )
     allow_outside = parse_bool_flag(
-        parser.get("SETTINGS", "fixup_dir_allow_outside_repo", fallback="false"),
-        False
+        parser.get("SETTINGS", "fixup_dir_allow_outside_repo", fallback="false"), False
     )
     if not allow_outside:
         if fixup_path != repo_root and repo_root not in fixup_path.parents:
@@ -2268,25 +2355,23 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
             "source_db_mode=oceanbase：run_fixup 执行语义保持不变；unsupported/、grants_deferred/、cleanup_safe/cleanup_semantic、materialized_view/job/schedule 仍默认不会自动执行，manual-only family 即便显式配合 --iterative 也不会跨轮自动重试。"
         )
 
-    report_dir = parser.get("SETTINGS", "report_dir", fallback="main_reports").strip() or "main_reports"
+    report_dir = (
+        parser.get("SETTINGS", "report_dir", fallback="main_reports").strip() or "main_reports"
+    )
     report_path = (repo_root / report_dir).resolve()
 
     log_level = parser.get("SETTINGS", "log_level", fallback="AUTO").strip().upper() or "AUTO"
     auto_grant_enabled = parse_bool_flag(
-        parser.get("SETTINGS", "fixup_auto_grant", fallback="true"),
-        True
+        parser.get("SETTINGS", "fixup_auto_grant", fallback="true"), True
     )
     auto_grant_types = parse_fixup_auto_grant_types(
         parser.get("SETTINGS", "fixup_auto_grant_types", fallback="")
     )
     auto_grant_fallback = parse_bool_flag(
-        parser.get("SETTINGS", "fixup_auto_grant_fallback", fallback="true"),
-        True
+        parser.get("SETTINGS", "fixup_auto_grant_fallback", fallback="true"), True
     )
     auto_grant_cache_limit = parser.getint(
-        "SETTINGS",
-        "fixup_auto_grant_cache_limit",
-        fallback=DEFAULT_FIXUP_AUTO_GRANT_CACHE_LIMIT
+        "SETTINGS", "fixup_auto_grant_cache_limit", fallback=DEFAULT_FIXUP_AUTO_GRANT_CACHE_LIMIT
     )
     if auto_grant_cache_limit < 0:
         auto_grant_cache_limit = DEFAULT_FIXUP_AUTO_GRANT_CACHE_LIMIT
@@ -2297,9 +2382,9 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
         parser.get(
             "SETTINGS",
             "fixup_exec_file_fallback",
-            fallback="true" if DEFAULT_FIXUP_EXEC_FILE_FALLBACK else "false"
+            fallback="true" if DEFAULT_FIXUP_EXEC_FILE_FALLBACK else "false",
         ),
-        DEFAULT_FIXUP_EXEC_FILE_FALLBACK
+        DEFAULT_FIXUP_EXEC_FILE_FALLBACK,
     )
     fixup_settings = FixupAutoGrantSettings(
         enabled=auto_grant_enabled,
@@ -2307,12 +2392,10 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
         fallback=auto_grant_fallback,
         cache_limit=auto_grant_cache_limit,
         exec_mode=exec_mode,
-        exec_file_fallback=exec_file_fallback
+        exec_file_fallback=exec_file_fallback,
     )
     max_sql_mb = parser.getint(
-        "SETTINGS",
-        "fixup_max_sql_file_mb",
-        fallback=DEFAULT_FIXUP_MAX_SQL_FILE_MB
+        "SETTINGS", "fixup_max_sql_file_mb", fallback=DEFAULT_FIXUP_MAX_SQL_FILE_MB
     )
     max_sql_bytes = None if max_sql_mb <= 0 else max_sql_mb * 1024 * 1024
     return ob_cfg, fixup_path, repo_root, log_level, report_path, fixup_settings, max_sql_bytes
@@ -2328,10 +2411,14 @@ def build_obclient_command(ob_cfg: Dict[str, str]) -> List[str]:
     return [
         ob_cfg["executable"],
         f"{OBCLIENT_SECURE_OPT}={defaults_path}",
-        "-h", ob_cfg["host"],
-        "-P", ob_cfg["port"],
-        "-u", ob_cfg["user_string"],
-        "--prompt", "fixup>",
+        "-h",
+        ob_cfg["host"],
+        "-P",
+        ob_cfg["port"],
+        "-u",
+        ob_cfg["user_string"],
+        "--prompt",
+        "fixup>",
         "--silent",
     ]
 
@@ -2339,8 +2426,7 @@ def build_obclient_command(ob_cfg: Dict[str, str]) -> List[str]:
 def iter_sql_files_recursive(base_dir: Path) -> List[Path]:
     try:
         return sorted(
-            [path for path in base_dir.rglob("*.sql") if path.is_file()],
-            key=lambda p: str(p)
+            [path for path in base_dir.rglob("*.sql") if path.is_file()], key=lambda p: str(p)
         )
     except OSError:
         return []
@@ -2355,23 +2441,25 @@ def collect_sql_files_by_layer(
 ) -> List[Tuple[int, Path]]:
     """
     Collect SQL files with layer information for dependency-aware execution.
-    
+
     Returns:
         List of (layer_index, file_path) tuples
     """
     glob_patterns = glob_patterns or ["*.sql"]
     exclude_dirs = exclude_dirs or set()
-    
+
     subdirs = {
         p.name.lower(): p
         for p in fixup_dir.iterdir()
-        if p.is_dir() and p.name != DONE_DIR_NAME and not path_excluded_by_filters(p.name, exclude_dirs)
+        if p.is_dir()
+        and p.name != DONE_DIR_NAME
+        and not path_excluded_by_filters(p.name, exclude_dirs)
     }
     grant_dirs = resolve_grant_dirs(subdirs, include_dirs, exclude_dirs)
     core_grant_dirs = [d for d in grant_dirs if d in CORE_GRANT_DIRS_ORDER]
-    
+
     files_with_layer: List[Tuple[int, Path]] = []
-    
+
     if smart_order:
         # Use dependency layers
         for layer_idx, layer_dirs in enumerate(DEPENDENCY_LAYERS):
@@ -2384,8 +2472,10 @@ def collect_sql_files_by_layer(
                             if not sql_file.is_file():
                                 continue
                             rel_str = str(sql_file.relative_to(fixup_dir))
-                            if not any(fnmatch.fnmatch(rel_str, p) or fnmatch.fnmatch(sql_file.name, p)
-                                      for p in glob_patterns):
+                            if not any(
+                                fnmatch.fnmatch(rel_str, p) or fnmatch.fnmatch(sql_file.name, p)
+                                for p in glob_patterns
+                            ):
                                 continue
                             files_with_layer.append((layer_idx, sql_file))
                     continue
@@ -2403,11 +2493,13 @@ def collect_sql_files_by_layer(
                         continue
                     if not path_selected_by_filters(rel_parent, include_dirs):
                         continue
-                    if not any(fnmatch.fnmatch(rel_str, p) or fnmatch.fnmatch(sql_file.name, p)
-                              for p in glob_patterns):
+                    if not any(
+                        fnmatch.fnmatch(rel_str, p) or fnmatch.fnmatch(sql_file.name, p)
+                        for p in glob_patterns
+                    ):
                         continue
                     files_with_layer.append((layer_idx, sql_file))
-        
+
         # Add remaining directories not in DEPENDENCY_LAYERS
         all_layer_dirs = {d for layer in DEPENDENCY_LAYERS for d in layer}
         all_layer_dirs.update(core_grant_dirs)
@@ -2418,7 +2510,7 @@ def collect_sql_files_by_layer(
                 continue
             if not should_scan_top_dir(dir_name, include_dirs):
                 continue
-                
+
             for sql_file in iter_sql_files_recursive(subdirs[dir_name]):
                 if not sql_file.is_file():
                     continue
@@ -2428,20 +2520,41 @@ def collect_sql_files_by_layer(
                     continue
                 if not path_selected_by_filters(rel_parent, include_dirs):
                     continue
-                if not any(fnmatch.fnmatch(rel_str, p) or fnmatch.fnmatch(sql_file.name, p) 
-                          for p in glob_patterns):
+                if not any(
+                    fnmatch.fnmatch(rel_str, p) or fnmatch.fnmatch(sql_file.name, p)
+                    for p in glob_patterns
+                ):
                     continue
                 files_with_layer.append((999, sql_file))  # Unknown layer
     else:
         # Keep non-smart execution order aligned with dependency-aware layers.
         priority = [
-            "sequence", "sequence_restart", "table", "table_alter", "view_prereq_grants", "grants",
-            "synonym", "view_refresh", "view", "view_post_grants", "materialized_view",
-            "type", "package", "procedure", "function",
-            "type_body", "package_body", "context", "name_collision", "constraint", "index", "trigger",
-            "job", "schedule",
+            "sequence",
+            "sequence_restart",
+            "table",
+            "table_alter",
+            "view_prereq_grants",
+            "grants",
+            "synonym",
+            "view_refresh",
+            "view",
+            "view_post_grants",
+            "materialized_view",
+            "type",
+            "package",
+            "procedure",
+            "function",
+            "type_body",
+            "package_body",
+            "context",
+            "name_collision",
+            "constraint",
+            "index",
+            "trigger",
+            "job",
+            "schedule",
         ]
-        
+
         seen = set()
         for idx, name in enumerate(priority):
             if name == "grants":
@@ -2452,8 +2565,10 @@ def collect_sql_files_by_layer(
                         if not sql_file.is_file():
                             continue
                         rel_str = str(sql_file.relative_to(fixup_dir))
-                        if not any(fnmatch.fnmatch(rel_str, p) or fnmatch.fnmatch(sql_file.name, p)
-                                  for p in glob_patterns):
+                        if not any(
+                            fnmatch.fnmatch(rel_str, p) or fnmatch.fnmatch(sql_file.name, p)
+                            for p in glob_patterns
+                        ):
                             continue
                         files_with_layer.append((idx, sql_file))
                     seen.add(grant_dir)
@@ -2470,12 +2585,14 @@ def collect_sql_files_by_layer(
                         continue
                     if not path_selected_by_filters(rel_parent, include_dirs):
                         continue
-                    if not any(fnmatch.fnmatch(rel_str, p) or fnmatch.fnmatch(sql_file.name, p)
-                              for p in glob_patterns):
+                    if not any(
+                        fnmatch.fnmatch(rel_str, p) or fnmatch.fnmatch(sql_file.name, p)
+                        for p in glob_patterns
+                    ):
                         continue
                     files_with_layer.append((idx, sql_file))
                 seen.add(name)
-        
+
         # Remaining directories
         for name in sorted(subdirs.keys()):
             if name in seen:
@@ -2493,11 +2610,13 @@ def collect_sql_files_by_layer(
                     continue
                 if not path_selected_by_filters(rel_parent, include_dirs):
                     continue
-                if not any(fnmatch.fnmatch(rel_str, p) or fnmatch.fnmatch(sql_file.name, p) 
-                          for p in glob_patterns):
+                if not any(
+                    fnmatch.fnmatch(rel_str, p) or fnmatch.fnmatch(sql_file.name, p)
+                    for p in glob_patterns
+                ):
                     continue
                 files_with_layer.append((999, sql_file))
-    
+
     # Sort by layer, then by path
     files_with_layer.sort(key=lambda x: (x[0], str(x[1])))
     return files_with_layer
@@ -2555,7 +2674,7 @@ def normalize_fixup_exec_mode(raw_value: Optional[str]) -> str:
         log.warning(
             "fixup_exec_mode=%s 非法，回退为 %s（支持: auto/file/statement）",
             raw_value,
-            DEFAULT_FIXUP_EXEC_MODE
+            DEFAULT_FIXUP_EXEC_MODE,
         )
         return DEFAULT_FIXUP_EXEC_MODE
     return value
@@ -2782,7 +2901,9 @@ def infer_permission_retry_target(
     return normalize_full_name(object_full), obj_type, privilege_set
 
 
-def find_matching_view_refresh_script(fixup_dir: Path, object_full: str, object_type: str) -> Optional[Path]:
+def find_matching_view_refresh_script(
+    fixup_dir: Path, object_full: str, object_type: str
+) -> Optional[Path]:
     if normalize_object_type(object_type or "") != "VIEW":
         return None
     schema, name = split_full_name(object_full or "")
@@ -2803,11 +2924,11 @@ def execute_view_refresh_before_retry(
     layer: int,
     label: str,
     max_sql_file_bytes: Optional[int],
-    state_ledger: Optional['FixupStateLedger'],
+    state_ledger: Optional["FixupStateLedger"],
     exec_mode: str,
     exec_file_fallback: bool,
     exec_stats: Dict[str, int],
-) -> Optional['ScriptResult']:
+) -> Optional["ScriptResult"]:
     refresh_path = find_matching_view_refresh_script(fixup_dir, object_full, object_type)
     if not refresh_path:
         return None
@@ -2856,7 +2977,11 @@ def requires_grant_option(
         return False
     dep_type_u = (dependent_type or "").upper()
     target_type_u = target_type.upper()
-    if dep_type_u in {"VIEW", "MATERIALIZED VIEW"} and target_type_u in {"TABLE", "VIEW", "MATERIALIZED VIEW"}:
+    if dep_type_u in {"VIEW", "MATERIALIZED VIEW"} and target_type_u in {
+        "TABLE",
+        "VIEW",
+        "MATERIALIZED VIEW",
+    }:
         return True
     return target_type_u in GRANT_OPTION_TYPES
 
@@ -2891,7 +3016,12 @@ def parse_view_chain_line_meta(line: str) -> Optional[List[Tuple[str, str, Tuple
     if not line:
         return None
     stripped = line.strip()
-    if not stripped or stripped.startswith("#") or stripped.startswith("[") or stripped.startswith("-"):
+    if (
+        not stripped
+        or stripped.startswith("#")
+        or stripped.startswith("[")
+        or stripped.startswith("-")
+    ):
         return None
     if ". " in stripped:
         prefix, rest = stripped.split(". ", 1)
@@ -2909,7 +3039,9 @@ def parse_view_chain_line_meta(line: str) -> Optional[List[Tuple[str, str, Tuple
     return nodes
 
 
-def parse_view_chain_file_meta(path: Path) -> Dict[str, List[List[Tuple[str, str, Tuple[str, ...]]]]]:
+def parse_view_chain_file_meta(
+    path: Path,
+) -> Dict[str, List[List[Tuple[str, str, Tuple[str, ...]]]]]:
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
@@ -2928,7 +3060,12 @@ def parse_view_chain_line(line: str) -> Optional[List[Tuple[str, str]]]:
     if not line:
         return None
     stripped = line.strip()
-    if not stripped or stripped.startswith("#") or stripped.startswith("[") or stripped.startswith("-"):
+    if (
+        not stripped
+        or stripped.startswith("#")
+        or stripped.startswith("[")
+        or stripped.startswith("-")
+    ):
         return None
     if ". " in stripped:
         prefix, rest = stripped.split(". ", 1)
@@ -2975,7 +3112,7 @@ def object_type_to_dir(obj_type: str) -> Optional[str]:
 def select_fixup_script_for_node(
     node: Tuple[str, str],
     object_index: Dict[Tuple[str, str], List[Path]],
-    name_index: Dict[str, List[Path]]
+    name_index: Dict[str, List[Path]],
 ) -> Optional[Path]:
     full_name, obj_type = node
     schema, name = parse_object_token(full_name)
@@ -3000,7 +3137,7 @@ def select_fixup_script_for_node_with_fallback(
     object_index: Dict[Tuple[str, str], List[Path]],
     name_index: Dict[str, List[Path]],
     fallback_object_index: Dict[Tuple[str, str], List[Path]],
-    fallback_name_index: Dict[str, List[Path]]
+    fallback_name_index: Dict[str, List[Path]],
 ) -> Tuple[Optional[Path], Optional[str]]:
     primary = select_fixup_script_for_node(node, object_index, name_index)
     if primary:
@@ -3012,7 +3149,7 @@ def select_fixup_script_for_node_with_fallback(
 
 
 def build_view_dependency_graph(
-    chains: List[List[Tuple[str, str]]]
+    chains: List[List[Tuple[str, str]]],
 ) -> Tuple[Set[Tuple[str, str]], Dict[Tuple[str, str], Set[Tuple[str, str]]]]:
     """Build a dependency graph where edges point from dependent VIEW to referenced object.
 
@@ -3032,8 +3169,7 @@ def build_view_dependency_graph(
 
 
 def topo_sort_nodes(
-    nodes: Set[Tuple[str, str]],
-    edges: Dict[Tuple[str, str], Set[Tuple[str, str]]]
+    nodes: Set[Tuple[str, str]], edges: Dict[Tuple[str, str], Set[Tuple[str, str]]]
 ) -> Tuple[List[Tuple[str, str]], List[List[Tuple[str, str]]]]:
     order: List[Tuple[str, str]] = []
     cycles: List[List[Tuple[str, str]]] = []
@@ -3101,7 +3237,10 @@ def find_latest_report_file(report_dir: Path, prefix: str) -> Optional[Path]:
     except OSError:
         run_dirs = []
     # Prefer newest run directory if present.
-    run_dirs.sort(key=lambda p: run_ts_re.search(p.name).group(1) if run_ts_re.search(p.name) else "", reverse=True)
+    run_dirs.sort(
+        key=lambda p: run_ts_re.search(p.name).group(1) if run_ts_re.search(p.name) else "",
+        reverse=True,
+    )
     for run_dir in run_dirs:
         try:
             run_candidates = list(run_dir.glob(f"{prefix}_*.txt"))
@@ -3180,7 +3319,7 @@ def parse_dependency_chains_file(path: Path) -> Dict[Tuple[str, str], Set[Tuple[
 
 
 def build_dependencies_from_view_chains(
-    chains_by_view: Dict[str, List[List[Tuple[str, str]]]]
+    chains_by_view: Dict[str, List[List[Tuple[str, str]]]],
 ) -> Dict[Tuple[str, str], Set[Tuple[str, str]]]:
     deps: Dict[Tuple[str, str], Set[Tuple[str, str]]] = defaultdict(set)
     for chains in chains_by_view.values():
@@ -3205,7 +3344,7 @@ def init_auto_grant_context(
     fixup_dir: Path,
     exclude_dirs: List[str],
     obclient_cmd: List[str],
-    timeout: Optional[int]
+    timeout: Optional[int],
 ) -> Optional[AutoGrantContext]:
     if not fixup_settings.enabled:
         return None
@@ -3220,19 +3359,11 @@ def init_auto_grant_context(
     if not dep_map:
         log.warning(
             "[AUTO-GRANT] 未找到 dependency_chains/VIEWs_chain，自动补权限跳过 (report_dir=%s).",
-            report_dir
+            report_dir,
         )
         return None
-    grant_index_miss = build_grant_index(
-        fixup_dir,
-        set(exclude_dirs),
-        include_dirs={"grants_miss"}
-    )
-    grant_index_all = build_grant_index(
-        fixup_dir,
-        set(exclude_dirs),
-        include_dirs={"grants_all"}
-    )
+    grant_index_miss = build_grant_index(fixup_dir, set(exclude_dirs), include_dirs={"grants_miss"})
+    grant_index_all = build_grant_index(fixup_dir, set(exclude_dirs), include_dirs={"grants_all"})
     stats = AutoGrantStats()
     ctx = AutoGrantContext(
         settings=fixup_settings,
@@ -3251,14 +3382,14 @@ def init_auto_grant_context(
         planned_sys_privs=set(),
         applied_grants=set(),
         blocked_objects=set(),
-        stats=stats
+        stats=stats,
     )
     log.info(
         "[AUTO-GRANT] 启用: types=%s fallback=%s cache_limit=%d deps=%d",
         ",".join(sorted(fixup_settings.types)),
         "true" if fixup_settings.fallback else "false",
         fixup_settings.cache_limit,
-        sum(len(v) for v in dep_map.values())
+        sum(len(v) for v in dep_map.values()),
     )
     return ctx
 
@@ -3284,8 +3415,18 @@ def build_auto_grant_plan_for_object(
         ref_full_u = normalize_full_name(ref_full)
         ref_type_u = normalize_object_type(ref_type)
         required_privs: List[str] = []
-        if required_privileges_override and obj_type_u in {"VIEW", "MATERIALIZED VIEW"} and ref_type_u in {"TABLE", "VIEW", "MATERIALIZED VIEW"}:
-            required_privs = sorted({(item or "").upper() for item in required_privileges_override if (item or "").strip()})
+        if (
+            required_privileges_override
+            and obj_type_u in {"VIEW", "MATERIALIZED VIEW"}
+            and ref_type_u in {"TABLE", "VIEW", "MATERIALIZED VIEW"}
+        ):
+            required_privs = sorted(
+                {
+                    (item or "").upper()
+                    for item in required_privileges_override
+                    if (item or "").strip()
+                }
+            )
         else:
             required_priv = GRANT_PRIVILEGE_BY_TYPE.get(ref_type_u)
             if required_priv:
@@ -3297,28 +3438,31 @@ def build_auto_grant_plan_for_object(
             continue
         require_option = requires_grant_option(grantee_schema, ref_full_u, ref_type_u, obj_type_u)
         for required_priv in required_privs:
-            blocked = plan_object_grant_for_dependency(
-                grantee_schema,
-                ref_full_u,
-                ref_type_u,
-                required_priv,
-                require_option,
-                ctx.settings.fallback,
-                ctx.obclient_cmd,
-                ctx.timeout,
-                ctx.grant_index_miss,
-                ctx.grant_index_all,
-                ctx.roles_cache,
-                ctx.tab_privs_cache,
-                ctx.tab_privs_grantable_cache,
-                ctx.sys_privs_cache,
-                ctx.planned_statements,
-                ctx.planned_object_privs,
-                ctx.planned_object_privs_with_option,
-                ctx.planned_sys_privs,
-                plan_lines,
-                sql_lines
-            ) or blocked
+            blocked = (
+                plan_object_grant_for_dependency(
+                    grantee_schema,
+                    ref_full_u,
+                    ref_type_u,
+                    required_priv,
+                    require_option,
+                    ctx.settings.fallback,
+                    ctx.obclient_cmd,
+                    ctx.timeout,
+                    ctx.grant_index_miss,
+                    ctx.grant_index_all,
+                    ctx.roles_cache,
+                    ctx.tab_privs_cache,
+                    ctx.tab_privs_grantable_cache,
+                    ctx.sys_privs_cache,
+                    ctx.planned_statements,
+                    ctx.planned_object_privs,
+                    ctx.planned_object_privs_with_option,
+                    ctx.planned_sys_privs,
+                    plan_lines,
+                    sql_lines,
+                )
+                or blocked
+            )
     return plan_lines, sql_lines, blocked
 
 
@@ -3360,10 +3504,19 @@ def execute_auto_grant_for_object(
     summary = execute_sql_statements(ctx.obclient_cmd, sql_text, ctx.timeout)
     if summary.failures:
         ctx.stats.failed += len(summary.failures)
-        log.warning("%s [AUTO-GRANT] %s(%s) 授权失败 %d/%d", label, obj_full, obj_type_u, len(summary.failures), summary.statements)
+        log.warning(
+            "%s [AUTO-GRANT] %s(%s) 授权失败 %d/%d",
+            label,
+            obj_full,
+            obj_type_u,
+            len(summary.failures),
+            summary.statements,
+        )
     else:
         ctx.stats.executed += summary.statements
-        log.info("%s [AUTO-GRANT] %s(%s) 授权成功 %d", label, obj_full, obj_type_u, summary.statements)
+        log.info(
+            "%s [AUTO-GRANT] %s(%s) 授权成功 %d", label, obj_full, obj_type_u, summary.statements
+        )
     return summary.statements, blocked
 
 
@@ -3400,7 +3553,7 @@ def check_object_exists(
     obj_type: str,
     exists_cache: Dict[Tuple[str, str], bool],
     planned_objects: Set[Tuple[str, str]],
-    use_planned: bool = True
+    use_planned: bool = True,
 ) -> Optional[bool]:
     key = (full_name.upper(), obj_type.upper())
     if use_planned and key in planned_objects:
@@ -3425,8 +3578,7 @@ def check_object_exists(
 
 
 def invalidate_exists_cache(
-    exists_cache: Dict[Tuple[str, str], bool],
-    planned_objects: Set[Tuple[str, str]]
+    exists_cache: Dict[Tuple[str, str], bool], planned_objects: Set[Tuple[str, str]]
 ) -> int:
     removed = 0
     for full_name, obj_type in planned_objects:
@@ -3439,10 +3591,7 @@ def invalidate_exists_cache(
 
 
 def load_roles_for_grantee(
-    obclient_cmd: List[str],
-    timeout: Optional[int],
-    grantee: str,
-    roles_cache: Dict[str, Set[str]]
+    obclient_cmd: List[str], timeout: Optional[int], grantee: str, roles_cache: Dict[str, Set[str]]
 ) -> Set[str]:
     grantee_u = (grantee or "").upper()
     if not grantee_u:
@@ -3450,10 +3599,7 @@ def load_roles_for_grantee(
     cached = roles_cache.get(grantee_u)
     if cached is not None:
         return cached
-    sql = (
-        "SELECT GRANTED_ROLE FROM DBA_ROLE_PRIVS "
-        f"WHERE GRANTEE='{escape_sql_literal(grantee_u)}'"
-    )
+    sql = f"SELECT GRANTED_ROLE FROM DBA_ROLE_PRIVS WHERE GRANTEE='{escape_sql_literal(grantee_u)}'"
     roles = query_single_column(obclient_cmd, sql, timeout, "GRANTED_ROLE")
     roles_cache[grantee_u] = roles
     return roles
@@ -3465,7 +3611,7 @@ def load_tab_privs_for_identity(
     identity: str,
     owner: str,
     name: str,
-    tab_privs_cache: Dict[Tuple[str, str, str], Set[str]]
+    tab_privs_cache: Dict[Tuple[str, str, str], Set[str]],
 ) -> Set[str]:
     key = (identity.upper(), owner.upper(), name.upper())
     if key in tab_privs_cache:
@@ -3487,7 +3633,7 @@ def load_grantable_tab_privs_for_identity(
     identity: str,
     owner: str,
     name: str,
-    tab_privs_grantable_cache: Dict[Tuple[str, str, str], Set[str]]
+    tab_privs_grantable_cache: Dict[Tuple[str, str, str], Set[str]],
 ) -> Set[str]:
     key = (identity.upper(), owner.upper(), name.upper())
     if key in tab_privs_grantable_cache:
@@ -3508,7 +3654,7 @@ def load_sys_privs_for_identity(
     obclient_cmd: List[str],
     timeout: Optional[int],
     identity: str,
-    sys_privs_cache: Dict[str, Set[str]]
+    sys_privs_cache: Dict[str, Set[str]],
 ) -> Set[str]:
     identity_u = (identity or "").upper()
     if not identity_u:
@@ -3516,10 +3662,7 @@ def load_sys_privs_for_identity(
     cached = sys_privs_cache.get(identity_u)
     if cached is not None:
         return cached
-    sql = (
-        "SELECT PRIVILEGE FROM DBA_SYS_PRIVS "
-        f"WHERE GRANTEE='{escape_sql_literal(identity_u)}'"
-    )
+    sql = f"SELECT PRIVILEGE FROM DBA_SYS_PRIVS WHERE GRANTEE='{escape_sql_literal(identity_u)}'"
     privs = query_single_column(obclient_cmd, sql, timeout, "PRIVILEGE")
     sys_privs_cache[identity_u] = privs
     return privs
@@ -3539,7 +3682,7 @@ def has_required_privilege(
     planned_object_privs: Set[Tuple[str, str, str]],
     planned_object_privs_with_option: Set[Tuple[str, str, str]],
     planned_sys_privs: Set[Tuple[str, str]],
-    require_grant_option: bool = False
+    require_grant_option: bool = False,
 ) -> bool:
     grantee_u = (grantee or "").upper()
     required_u = (required_priv or "").upper()
@@ -3591,7 +3734,7 @@ def has_required_privilege(
 
 
 def resolve_synonym_target_map(
-    edges: Dict[Tuple[str, str], Set[Tuple[str, str]]]
+    edges: Dict[Tuple[str, str], Set[Tuple[str, str]]],
 ) -> Dict[Tuple[str, str], Tuple[str, str]]:
     synonym_targets: Dict[Tuple[str, str], Tuple[str, str]] = {}
     for dep, refs in edges.items():
@@ -3622,7 +3765,7 @@ def plan_object_grant_for_dependency(
     planned_object_privs_with_option: Set[Tuple[str, str, str]],
     planned_sys_privs: Set[Tuple[str, str]],
     plan_lines: List[str],
-    sql_lines: List[str]
+    sql_lines: List[str],
 ) -> bool:
     priv_label = format_privilege_label(required_priv, require_grant_option)
     if has_required_privilege(
@@ -3639,7 +3782,7 @@ def plan_object_grant_for_dependency(
         planned_object_privs,
         planned_object_privs_with_option,
         planned_sys_privs,
-        require_grant_option=require_grant_option
+        require_grant_option=require_grant_option,
     ):
         plan_lines.append(f"GRANT OK: {grantee} has {priv_label} on {target_full}")
         return False
@@ -3651,15 +3794,12 @@ def plan_object_grant_for_dependency(
         required_priv,
         grant_index_miss,
         grant_index_all,
-        require_grant_option=require_grant_option
+        require_grant_option=require_grant_option,
     )
     if not entries:
         if allow_fallback:
             auto_stmt = build_auto_grant_statement(
-                grantee,
-                target_full,
-                required_priv,
-                with_grant_option=require_grant_option
+                grantee, target_full, required_priv, with_grant_option=require_grant_option
             )
             if auto_stmt:
                 stmt_key = normalize_statement_key(auto_stmt)
@@ -3668,7 +3808,9 @@ def plan_object_grant_for_dependency(
                     plan_lines.append(f"GRANT AUTO: {priv_label} on {target_full} to {grantee}")
                     sql_lines.append("-- SOURCE: auto-generated")
                     sql_lines.append(auto_stmt.rstrip().rstrip(";") + ";")
-                    planned_object_privs.add((grantee.upper(), required_priv.upper(), target_full.upper()))
+                    planned_object_privs.add(
+                        (grantee.upper(), required_priv.upper(), target_full.upper())
+                    )
                     if require_grant_option:
                         planned_object_privs_with_option.add(
                             (grantee.upper(), required_priv.upper(), target_full.upper())
@@ -3692,7 +3834,9 @@ def plan_object_grant_for_dependency(
             for priv in entry.privileges:
                 planned_object_privs.add((entry.grantee, priv, entry.object_name.upper()))
                 if has_option:
-                    planned_object_privs_with_option.add((entry.grantee, priv, entry.object_name.upper()))
+                    planned_object_privs_with_option.add(
+                        (entry.grantee, priv, entry.object_name.upper())
+                    )
         elif entry.grant_type == "SYSTEM":
             for priv in entry.privileges:
                 planned_sys_privs.add((entry.grantee, priv))
@@ -3720,7 +3864,7 @@ def ensure_view_owner_grant_option(
     planned_sys_privs: Set[Tuple[str, str]],
     plan_lines: List[str],
     sql_lines: List[str],
-    visited_views: Set[Tuple[str, str]]
+    visited_views: Set[Tuple[str, str]],
 ) -> bool:
     node = (normalize_identifier(view_full), view_type.upper())
     if node in visited_views:
@@ -3745,40 +3889,18 @@ def ensure_view_owner_grant_option(
         target_schema, _ = split_full_name(target_full)
         if not target_schema or target_schema == view_schema:
             continue
-        blocked = plan_object_grant_for_dependency(
-            view_schema,
-            target_full,
-            target_type,
-            required_priv,
-            True,
-            allow_fallback,
-            obclient_cmd,
-            timeout,
-            grant_index_miss,
-            grant_index_all,
-            roles_cache,
-            tab_privs_cache,
-            tab_privs_grantable_cache,
-            sys_privs_cache,
-            planned_statements,
-            planned_object_privs,
-            planned_object_privs_with_option,
-            planned_sys_privs,
-            plan_lines,
-            sql_lines
-        ) or blocked
-
-        if target_type.upper() in GRANT_OPTION_TYPES:
-            blocked = ensure_view_owner_grant_option(
+        blocked = (
+            plan_object_grant_for_dependency(
+                view_schema,
                 target_full,
                 target_type,
-                edges,
-                synonym_targets,
+                required_priv,
+                True,
+                allow_fallback,
                 obclient_cmd,
                 timeout,
                 grant_index_miss,
                 grant_index_all,
-                allow_fallback,
                 roles_cache,
                 tab_privs_cache,
                 tab_privs_grantable_cache,
@@ -3789,8 +3911,36 @@ def ensure_view_owner_grant_option(
                 planned_sys_privs,
                 plan_lines,
                 sql_lines,
-                visited_views
-            ) or blocked
+            )
+            or blocked
+        )
+
+        if target_type.upper() in GRANT_OPTION_TYPES:
+            blocked = (
+                ensure_view_owner_grant_option(
+                    target_full,
+                    target_type,
+                    edges,
+                    synonym_targets,
+                    obclient_cmd,
+                    timeout,
+                    grant_index_miss,
+                    grant_index_all,
+                    allow_fallback,
+                    roles_cache,
+                    tab_privs_cache,
+                    tab_privs_grantable_cache,
+                    sys_privs_cache,
+                    planned_statements,
+                    planned_object_privs,
+                    planned_object_privs_with_option,
+                    planned_sys_privs,
+                    plan_lines,
+                    sql_lines,
+                    visited_views,
+                )
+                or blocked
+            )
 
     return blocked
 
@@ -3818,7 +3968,7 @@ def build_view_chain_plan(
     planned_object_privs_with_option: Set[Tuple[str, str, str]],
     planned_sys_privs: Set[Tuple[str, str]],
     planned_objects: Set[Tuple[str, str]],
-    max_sql_file_bytes: Optional[int]
+    max_sql_file_bytes: Optional[int],
 ) -> Tuple[List[str], List[str], bool]:
     plan_lines: List[str] = []
     sql_lines: List[str] = []
@@ -3855,16 +4005,44 @@ def build_view_chain_plan(
                 continue
             require_option = requires_grant_option(dep_schema, target_full, target_type, dep_type)
             if require_option and target_type.upper() in GRANT_OPTION_TYPES:
-                blocked = ensure_view_owner_grant_option(
+                blocked = (
+                    ensure_view_owner_grant_option(
+                        target_full,
+                        target_type,
+                        edges,
+                        synonym_targets,
+                        obclient_cmd,
+                        timeout,
+                        grant_index_miss,
+                        grant_index_all,
+                        allow_fallback,
+                        roles_cache,
+                        tab_privs_cache,
+                        tab_privs_grantable_cache,
+                        sys_privs_cache,
+                        planned_statements,
+                        planned_object_privs,
+                        planned_object_privs_with_option,
+                        planned_sys_privs,
+                        plan_lines,
+                        sql_lines,
+                        grant_option_views,
+                    )
+                    or blocked
+                )
+
+            blocked = (
+                plan_object_grant_for_dependency(
+                    dep_schema,
                     target_full,
                     target_type,
-                    edges,
-                    synonym_targets,
+                    required_priv,
+                    require_option,
+                    allow_fallback,
                     obclient_cmd,
                     timeout,
                     grant_index_miss,
                     grant_index_all,
-                    allow_fallback,
                     roles_cache,
                     tab_privs_cache,
                     tab_privs_grantable_cache,
@@ -3875,39 +4053,12 @@ def build_view_chain_plan(
                     planned_sys_privs,
                     plan_lines,
                     sql_lines,
-                    grant_option_views
-                ) or blocked
-
-            blocked = plan_object_grant_for_dependency(
-                dep_schema,
-                target_full,
-                target_type,
-                required_priv,
-                require_option,
-                allow_fallback,
-                obclient_cmd,
-                timeout,
-                grant_index_miss,
-                grant_index_all,
-                roles_cache,
-                tab_privs_cache,
-                tab_privs_grantable_cache,
-                sys_privs_cache,
-                planned_statements,
-                planned_object_privs,
-                planned_object_privs_with_option,
-                planned_sys_privs,
-                plan_lines,
-                sql_lines
-            ) or blocked
+                )
+                or blocked
+            )
 
         exists = check_object_exists(
-            obclient_cmd,
-            timeout,
-            dep_full,
-            dep_type,
-            exists_cache,
-            planned_objects
+            obclient_cmd, timeout, dep_full, dep_type, exists_cache, planned_objects
         )
         if exists is None:
             plan_lines.append(f"BLOCK: 无法确认对象是否存在 {dep_full}({dep_type})")
@@ -3919,17 +4070,10 @@ def build_view_chain_plan(
         if dep_type.upper() == "SYNONYM" and node in synonym_targets:
             target_full, target_type = synonym_targets[node]
             target_exists = check_object_exists(
-                obclient_cmd,
-                timeout,
-                target_full,
-                target_type,
-                exists_cache,
-                planned_objects
+                obclient_cmd, timeout, target_full, target_type, exists_cache, planned_objects
             )
             if target_exists is None:
-                plan_lines.append(
-                    f"BLOCK: 无法确认同义词目标是否存在 {target_full}({target_type})"
-                )
+                plan_lines.append(f"BLOCK: 无法确认同义词目标是否存在 {target_full}({target_type})")
                 blocked = True
                 continue
             if target_exists:
@@ -3938,11 +4082,7 @@ def build_view_chain_plan(
                 )
                 continue
         ddl_path, ddl_source = select_fixup_script_for_node_with_fallback(
-            node,
-            object_index,
-            name_index,
-            done_object_index,
-            done_name_index
+            node, object_index, name_index, done_object_index, done_name_index
         )
         if not ddl_path:
             plan_lines.append(f"BLOCK: 缺少 DDL for {dep_full}({dep_type})")
@@ -4027,7 +4167,13 @@ def split_sql_statements(sql_text: str) -> List[str]:
             slash_block = True
             slash_block_end_name = _extract_block_header_end_name(line)
         stripped = line.strip()
-        if not in_single and not in_double and not in_q_quote and block_comment_depth == 0 and stripped == "/":
+        if (
+            not in_single
+            and not in_double
+            and not in_q_quote
+            and block_comment_depth == 0
+            and stripped == "/"
+        ):
             if buffer:
                 buffer.append(line)
                 flush_buffer()
@@ -4127,7 +4273,9 @@ def split_sql_statements(sql_text: str) -> List[str]:
     return statements
 
 
-def run_sql(obclient_cmd: List[str], sql_text: str, timeout: Optional[int]) -> subprocess.CompletedProcess:
+def run_sql(
+    obclient_cmd: List[str], sql_text: str, timeout: Optional[int]
+) -> subprocess.CompletedProcess:
     """Execute SQL text by piping it to obclient."""
     try:
         result = subprocess.run(
@@ -4186,10 +4334,7 @@ def bump_exec_mode_stat(exec_stats: Optional[Dict[str, int]], key: str, inc: int
 
 
 def execute_sql_statements(
-    obclient_cmd: List[str],
-    sql_text: str,
-    timeout: Optional[int],
-    mode: str = "statement"
+    obclient_cmd: List[str], sql_text: str, timeout: Optional[int], mode: str = "statement"
 ) -> ExecutionSummary:
     mode = normalize_fixup_exec_mode(mode)
     if mode == "auto":
@@ -4205,23 +4350,11 @@ def execute_sql_statements(
             result = run_sql(obclient_cmd, sql_text, timeout)
         except subprocess.TimeoutExpired:
             timeout_label = "no-timeout" if timeout is None else f"> {timeout} 秒"
-            failures.append(
-                StatementFailure(
-                    1,
-                    f"执行超时 ({timeout_label})",
-                    sql_text
-                )
-            )
+            failures.append(StatementFailure(1, f"执行超时 ({timeout_label})", sql_text))
             return ExecutionSummary(statements=len(effective_statements), failures=failures)
         error_msg = extract_execution_error(result)
         if error_msg:
-            failures.append(
-                StatementFailure(
-                    1,
-                    error_msg,
-                    sql_text
-                )
-            )
+            failures.append(StatementFailure(1, error_msg, sql_text))
         return ExecutionSummary(statements=len(effective_statements), failures=failures)
 
     session_sensitive_reason = detect_session_sensitive_reason(sql_text)
@@ -4230,21 +4363,13 @@ def execute_sql_statements(
             result = run_sql(obclient_cmd, sql_text, timeout)
         except subprocess.TimeoutExpired:
             timeout_label = "no-timeout" if timeout is None else f"> {timeout} 秒"
-            failures.append(
-                StatementFailure(
-                    1,
-                    f"执行超时 ({timeout_label})",
-                    sql_text
-                )
-            )
+            failures.append(StatementFailure(1, f"执行超时 ({timeout_label})", sql_text))
             return ExecutionSummary(statements=len(effective_statements), failures=failures)
         error_msg = extract_execution_error(result)
         if error_msg:
             failures.append(
                 StatementFailure(
-                    1,
-                    f"{error_msg} [session-sensitive={session_sensitive_reason}]",
-                    sql_text
+                    1, f"{error_msg} [session-sensitive={session_sensitive_reason}]", sql_text
                 )
             )
         return ExecutionSummary(statements=len(effective_statements), failures=failures)
@@ -4263,7 +4388,9 @@ def execute_sql_statements(
         except subprocess.TimeoutExpired:
             timeout_label = "no-timeout" if timeout is None else f"> {timeout} 秒"
             failures.append(StatementFailure(idx, f"执行超时 ({timeout_label})", statement_to_run))
-            for remainder_idx, remainder_statement in enumerate(effective_statements[idx:], start=idx + 1):
+            for remainder_idx, remainder_statement in enumerate(
+                effective_statements[idx:], start=idx + 1
+            ):
                 failures.append(
                     StatementFailure(
                         remainder_idx,
@@ -4294,24 +4421,14 @@ def execute_sql_with_mode(
         mode = "statement"
     bump_exec_mode_stat(exec_stats, mode)
 
-    summary = execute_sql_statements(
-        obclient_cmd,
-        sql_text,
-        timeout,
-        mode=mode
-    )
+    summary = execute_sql_statements(obclient_cmd, sql_text, timeout, mode=mode)
     if mode == "file" and summary.failures and exec_file_fallback:
         bump_exec_mode_stat(exec_stats, "fallback_retried")
         if context_label:
             log.warning("%s FILE 模式失败，回退 statement 重试一次。", context_label)
         else:
             log.warning("FILE 模式失败，回退 statement 重试一次。")
-        fallback_summary = execute_sql_statements(
-            obclient_cmd,
-            sql_text,
-            timeout,
-            mode="statement"
-        )
+        fallback_summary = execute_sql_statements(obclient_cmd, sql_text, timeout, mode="statement")
         if fallback_summary.success:
             bump_exec_mode_stat(exec_stats, "fallback_success")
         return fallback_summary
@@ -4319,9 +4436,7 @@ def execute_sql_with_mode(
 
 
 def log_exec_mode_summary(
-    exec_stats: Dict[str, int],
-    configured_mode: str,
-    exec_file_fallback: bool
+    exec_stats: Dict[str, int], configured_mode: str, exec_file_fallback: bool
 ) -> None:
     log_subsection("执行模式统计")
     log.info("配置模式   : %s", configured_mode)
@@ -4334,8 +4449,7 @@ def log_exec_mode_summary(
 
 
 def check_obclient_connectivity(
-    obclient_cmd: List[str],
-    timeout: Optional[int]
+    obclient_cmd: List[str], timeout: Optional[int]
 ) -> Tuple[bool, str]:
     """Run a lightweight connectivity check for obclient."""
     summary = execute_sql_statements(obclient_cmd, "SELECT 1 FROM DUAL;", timeout)
@@ -4346,9 +4460,7 @@ def check_obclient_connectivity(
 
 
 def run_query_lines(
-    obclient_cmd: List[str],
-    sql_text: str,
-    timeout: Optional[int]
+    obclient_cmd: List[str], sql_text: str, timeout: Optional[int]
 ) -> Tuple[bool, List[str], str]:
     try:
         result = run_sql(obclient_cmd, sql_text, timeout)
@@ -4361,11 +4473,7 @@ def run_query_lines(
     return True, lines, ""
 
 
-def query_count(
-    obclient_cmd: List[str],
-    sql_text: str,
-    timeout: Optional[int]
-) -> Optional[int]:
+def query_count(obclient_cmd: List[str], sql_text: str, timeout: Optional[int]) -> Optional[int]:
     ok, lines, _err = run_query_lines(obclient_cmd, sql_text, timeout)
     if not ok:
         return None
@@ -4377,10 +4485,7 @@ def query_count(
 
 
 def query_single_column(
-    obclient_cmd: List[str],
-    sql_text: str,
-    timeout: Optional[int],
-    column_name: str
+    obclient_cmd: List[str], sql_text: str, timeout: Optional[int], column_name: str
 ) -> Set[str]:
     ok, lines, _err = run_query_lines(obclient_cmd, sql_text, timeout)
     if not ok:
@@ -4406,10 +4511,7 @@ def extract_login_user(user_string: str) -> str:
 
 
 def query_single_column_values(
-    obclient_cmd: List[str],
-    sql_text: str,
-    timeout: Optional[int],
-    column_name: str
+    obclient_cmd: List[str], sql_text: str, timeout: Optional[int], column_name: str
 ) -> Tuple[bool, Set[str], str]:
     ok, lines, err = run_query_lines(obclient_cmd, sql_text, timeout)
     if not ok:
@@ -4424,10 +4526,7 @@ def query_single_column_values(
     return True, values, ""
 
 
-def query_existing_schemas(
-    obclient_cmd: List[str],
-    timeout: Optional[int]
-) -> Tuple[Set[str], str]:
+def query_existing_schemas(obclient_cmd: List[str], timeout: Optional[int]) -> Tuple[Set[str], str]:
     """
     Query existing users/schemas using best-effort fallback.
     Returns (schemas, source_view).
@@ -4444,9 +4543,7 @@ def query_existing_schemas(
 
 
 def query_effective_sys_privileges(
-    obclient_cmd: List[str],
-    timeout: Optional[int],
-    login_user: str
+    obclient_cmd: List[str], timeout: Optional[int], login_user: str
 ) -> Set[str]:
     """Best-effort collection of direct + role-inherited system privileges."""
     user_u = (login_user or "").strip().upper()
@@ -4461,7 +4558,7 @@ def query_effective_sys_privileges(
         obclient_cmd,
         f"SELECT PRIVILEGE FROM DBA_SYS_PRIVS WHERE GRANTEE = '{_escape(user_u)}';",
         timeout,
-        "PRIVILEGE"
+        "PRIVILEGE",
     )
     if ok_direct:
         effective.update(direct_values)
@@ -4470,7 +4567,7 @@ def query_effective_sys_privileges(
         obclient_cmd,
         f"SELECT GRANTED_ROLE FROM DBA_ROLE_PRIVS WHERE GRANTEE = '{_escape(user_u)}';",
         timeout,
-        "GRANTED_ROLE"
+        "GRANTED_ROLE",
     )
     if ok_roles and role_values:
         role_list = sorted(r for r in role_values if r)
@@ -4479,7 +4576,7 @@ def query_effective_sys_privileges(
             obclient_cmd,
             f"SELECT PRIVILEGE FROM DBA_SYS_PRIVS WHERE GRANTEE IN ({literals});",
             timeout,
-            "PRIVILEGE"
+            "PRIVILEGE",
         )
         if ok_role_privs:
             effective.update(role_priv_values)
@@ -4502,9 +4599,7 @@ def collect_target_schemas_from_scripts(files_with_layer: List[Tuple[int, Path]]
 
 
 def infer_required_sys_privileges(
-    files_with_layer: List[Tuple[int, Path]],
-    current_user: str,
-    target_schemas: Set[str]
+    files_with_layer: List[Tuple[int, Path]], current_user: str, target_schemas: Set[str]
 ) -> Set[str]:
     """
     Infer required system privileges for cross-schema fixup.
@@ -4556,7 +4651,7 @@ def build_fixup_precheck_summary(
     ob_cfg: Dict[str, str],
     obclient_cmd: List[str],
     timeout: Optional[int],
-    files_with_layer: List[Tuple[int, Path]]
+    files_with_layer: List[Tuple[int, Path]],
 ) -> FixupPrecheckSummary:
     current_user = extract_login_user(ob_cfg.get("user_string", ""))
     target_schemas = collect_target_schemas_from_scripts(files_with_layer)
@@ -4628,7 +4723,7 @@ def log_fixup_precheck(summary: FixupPrecheckSummary, report_path: Optional[Path
         log.info(
             "目标库 schema 查询: %s (%d 个)",
             summary.schema_lookup_source,
-            len(summary.existing_schemas)
+            len(summary.existing_schemas),
         )
     else:
         log.warning("目标库 schema 查询失败，无法提前判断缺失 schema。")
@@ -4636,25 +4731,24 @@ def log_fixup_precheck(summary: FixupPrecheckSummary, report_path: Optional[Path
         log.warning(
             "前置检查发现缺失 schema (%d): %s",
             len(summary.missing_schemas),
-            ", ".join(sorted(summary.missing_schemas))
+            ", ".join(sorted(summary.missing_schemas)),
         )
     if summary.required_sys_privileges:
         log.info(
-            "跨 schema 预估需要系统权限: %s",
-            ", ".join(sorted(summary.required_sys_privileges))
+            "跨 schema 预估需要系统权限: %s", ", ".join(sorted(summary.required_sys_privileges))
         )
     if summary.missing_sys_privileges:
         log.warning(
             "前置检查发现可能缺少系统权限 (%d): %s",
             len(summary.missing_sys_privileges),
-            ", ".join(sorted(summary.missing_sys_privileges))
+            ", ".join(sorted(summary.missing_sys_privileges)),
         )
     if report_path:
         log.info("前置检查清单: %s", report_path)
 
 
 def build_fixup_object_index(
-    files_with_layer: List[Tuple[int, Path]]
+    files_with_layer: List[Tuple[int, Path]],
 ) -> Tuple[Dict[Tuple[str, str], List[Path]], Dict[str, List[Path]]]:
     by_schema_obj: Dict[Tuple[str, str], List[Path]] = defaultdict(list)
     by_name: Dict[str, List[Path]] = defaultdict(list)
@@ -4682,9 +4776,7 @@ def infer_recompile_owners(files_with_layer: List[Tuple[int, Path]]) -> Set[str]
 
 
 def collect_sql_files_from_root(
-    root_dir: Path,
-    include_dirs: Optional[Set[str]] = None,
-    exclude_dirs: Optional[Set[str]] = None
+    root_dir: Path, include_dirs: Optional[Set[str]] = None, exclude_dirs: Optional[Set[str]] = None
 ) -> List[Path]:
     files: List[Path] = []
     if not root_dir.exists():
@@ -4727,9 +4819,7 @@ class GrantIndex:
 
 
 def build_grant_index(
-    fixup_dir: Path,
-    exclude_dirs: Set[str],
-    include_dirs: Optional[Set[str]] = None
+    fixup_dir: Path, exclude_dirs: Set[str], include_dirs: Optional[Set[str]] = None
 ) -> GrantIndex:
     by_grantee_object: Dict[Tuple[str, str], List[GrantEntry]] = defaultdict(list)
     by_object: Dict[str, List[GrantEntry]] = defaultdict(list)
@@ -4768,7 +4858,7 @@ def build_grant_index(
                         object_name=object_full,
                         statement=statement.strip(),
                         source_path=grant_file,
-                        grant_type=grant_type
+                        grant_type=grant_type,
                     )
                     if grant_type == "OBJECT" and object_full:
                         by_grantee_object[(grantee, object_full)].append(entry)
@@ -4784,10 +4874,7 @@ def normalize_statement_key(statement: str) -> str:
 
 
 def build_auto_grant_statement(
-    grantee: str,
-    object_full: str,
-    required_priv: str,
-    with_grant_option: bool = False
+    grantee: str, object_full: str, required_priv: str, with_grant_option: bool = False
 ) -> Optional[str]:
     if not grantee or not object_full or not required_priv:
         return None
@@ -4823,7 +4910,9 @@ def split_grantee_list(raw: str) -> List[str]:
     return values
 
 
-def parse_grant_statement(statement: str) -> Optional[Tuple[str, Tuple[str, ...], Optional[str], List[str]]]:
+def parse_grant_statement(
+    statement: str,
+) -> Optional[Tuple[str, Tuple[str, ...], Optional[str], List[str]]]:
     if not statement:
         return None
     flat = " ".join(statement.split())
@@ -4875,7 +4964,7 @@ def select_dependency_script(
     name: str,
     view_schema: Optional[str],
     object_index: Dict[Tuple[str, str], List[Path]],
-    name_index: Dict[str, List[Path]]
+    name_index: Dict[str, List[Path]],
 ) -> Optional[Path]:
     if schema:
         candidates = object_index.get((schema, name), [])
@@ -4895,7 +4984,7 @@ def select_grant_entries(
     grantee: str,
     schema: Optional[str],
     name: str,
-    view_schema: Optional[str]
+    view_schema: Optional[str],
 ) -> List[GrantEntry]:
     entries: List[GrantEntry] = []
     if schema:
@@ -4923,7 +5012,7 @@ def select_object_grant_entries_for_priv(
     grantee: str,
     object_full: str,
     required_priv: str,
-    require_grant_option: bool = False
+    require_grant_option: bool = False,
 ) -> List[GrantEntry]:
     if not object_full:
         return []
@@ -4937,11 +5026,7 @@ def select_object_grant_entries_for_priv(
 
 
 def select_system_grant_entries_for_priv(
-    grant_index: GrantIndex,
-    grantee: str,
-    target_full: str,
-    target_type: str,
-    required_priv: str
+    grant_index: GrantIndex, grantee: str, target_full: str, target_type: str, required_priv: str
 ) -> List[GrantEntry]:
     implied = resolve_implied_sys_privileges(required_priv, target_full, target_type)
     if not implied:
@@ -4951,7 +5036,8 @@ def select_system_grant_entries_for_priv(
         return []
     implied_upper = {p.upper() for p in implied}
     return [
-        entry for entry in entries
+        entry
+        for entry in entries
         if any(priv.upper() in implied_upper for priv in entry.privileges)
     ]
 
@@ -4963,7 +5049,7 @@ def find_grant_entries_by_priority(
     required_priv: str,
     grant_index_miss: GrantIndex,
     grant_index_all: GrantIndex,
-    require_grant_option: bool = False
+    require_grant_option: bool = False,
 ) -> Tuple[List[GrantEntry], str]:
     entries = select_object_grant_entries_for_priv(
         grant_index_miss, grantee, target_full, required_priv, require_grant_option
@@ -4992,7 +5078,7 @@ def apply_grant_entries(
     obclient_cmd: List[str],
     entries: List[GrantEntry],
     timeout: Optional[int],
-    applied_grants: Set[str]
+    applied_grants: Set[str],
 ) -> Tuple[int, int]:
     applied = 0
     failed = 0
@@ -5029,10 +5115,7 @@ def resolve_timeout_value(raw_timeout: Optional[int]) -> Optional[int]:
 
 
 def classify_view_chain_status(
-    blocked: bool,
-    skipped: bool,
-    view_exists: Optional[bool],
-    failure_count: int
+    blocked: bool, skipped: bool, view_exists: Optional[bool], failure_count: int
 ) -> str:
     if skipped:
         return "SKIPPED"
@@ -5053,7 +5136,7 @@ def record_error_entry(
     relative_path: Path,
     statement_index: int,
     statement: str,
-    error_message: str
+    error_message: str,
 ) -> bool:
     if len(entries) >= limit:
         return False
@@ -5079,10 +5162,7 @@ def record_error_entry(
 
 
 def write_error_report(
-    entries: List[ErrorReportEntry],
-    fixup_dir: Path,
-    limit: int,
-    truncated: bool
+    entries: List[ErrorReportEntry], fixup_dir: Path, limit: int, truncated: bool
 ) -> Optional[Path]:
     if not entries:
         return None
@@ -5093,7 +5173,7 @@ def write_error_report(
     lines = [
         "# fixup error report",
         f"# count={len(entries)} limit={limit} truncated={'true' if truncated else 'false'}",
-        "FILE | STMT_INDEX | ERROR_CODE | OBJECT | FAMILY | SUPPORT_TIER | RETRY_POLICY | MESSAGE"
+        "FILE | STMT_INDEX | ERROR_CODE | OBJECT | FAMILY | SUPPORT_TIER | RETRY_POLICY | MESSAGE",
     ]
     for entry in entries:
         lines.append(
@@ -5141,7 +5221,7 @@ def execute_grant_file_with_prune(
     error_entries: List[ErrorReportEntry],
     error_limit: int,
     max_sql_file_bytes: Optional[int],
-    state_ledger: Optional[FixupStateLedger] = None
+    state_ledger: Optional[FixupStateLedger] = None,
 ) -> Tuple[ScriptResult, ExecutionSummary, int, int, bool]:
     relative_path = sql_path.relative_to(repo_root)
     sql_text, sql_bytes, read_error = read_sql_text_with_limit(sql_path, max_sql_file_bytes)
@@ -5149,12 +5229,24 @@ def execute_grant_file_with_prune(
         msg = read_error
         log.error("%s %s -> ERROR (%s)", label_prefix, relative_path, msg)
         failure = StatementFailure(0, msg, "")
-        return ScriptResult(relative_path, "ERROR", msg, layer), ExecutionSummary(0, [failure]), 0, 0, False
+        return (
+            ScriptResult(relative_path, "ERROR", msg, layer),
+            ExecutionSummary(0, [failure]),
+            0,
+            0,
+            False,
+        )
     fingerprint = FixupStateLedger.fingerprint(sql_bytes or b"")
     if state_ledger and state_ledger.is_completed(relative_path, fingerprint):
         msg = "状态账本命中，跳过重复执行"
         log.warning("%s %s -> SKIP (%s)", label_prefix, relative_path, msg)
-        return ScriptResult(relative_path, "SKIPPED", msg, layer), ExecutionSummary(0, []), 0, 0, False
+        return (
+            ScriptResult(relative_path, "SKIPPED", msg, layer),
+            ExecutionSummary(0, []),
+            0,
+            0,
+            False,
+        )
 
     statements = split_sql_statements(sql_text or "")
     kept_statements: List[str] = []
@@ -5206,7 +5298,7 @@ def execute_grant_file_with_prune(
             "%s %s 包含 %d 条非 GRANT 语句，已在 grant-prune 模式下跳过（不参与重试）。",
             label_prefix,
             relative_path,
-            skipped_non_grant_count
+            skipped_non_grant_count,
         )
 
     if executed_count == 0:
@@ -5220,7 +5312,13 @@ def execute_grant_file_with_prune(
                 state_ledger.mark_completed(relative_path, fingerprint, "EXECUTED_BUT_MOVE_FAILED")
             log.error("%s %s -> ERROR %s", label_prefix, relative_path, move_note)
             failure = StatementFailure(0, move_note.strip("()"), "")
-            return ScriptResult(relative_path, "ERROR", move_note.strip(), layer), ExecutionSummary(executed_count, [failure]), removed_count, 0, truncated
+            return (
+                ScriptResult(relative_path, "ERROR", move_note.strip(), layer),
+                ExecutionSummary(executed_count, [failure]),
+                removed_count,
+                0,
+                truncated,
+            )
         if state_ledger:
             state_ledger.clear(relative_path)
         log.info(
@@ -5228,9 +5326,15 @@ def execute_grant_file_with_prune(
             label_prefix,
             relative_path,
             move_note,
-            removed_count
+            removed_count,
         )
-        return ScriptResult(relative_path, "SUCCESS", move_note.strip(), layer), summary, removed_count, 0, truncated
+        return (
+            ScriptResult(relative_path, "SUCCESS", move_note.strip(), layer),
+            summary,
+            removed_count,
+            0,
+            truncated,
+        )
 
     # Rewrite file with remaining statements (non-grants + failed grants)
     rewritten = "\n\n".join(stmt.strip() for stmt in kept_statements if stmt.strip()).rstrip()
@@ -5254,7 +5358,7 @@ def execute_grant_file_with_prune(
             len(failures),
             executed_count,
             len(kept_statements),
-            removed_count
+            removed_count,
         )
     except Exception as exc:
         log.warning("%s %s -> 重写失败: %s", label_prefix, relative_path, str(exc)[:200])
@@ -5265,7 +5369,13 @@ def execute_grant_file_with_prune(
                 pass
 
     first_error = failures[0].error if failures else "执行失败"
-    return ScriptResult(relative_path, "FAILED", first_error, layer), summary, removed_count, len(kept_statements), truncated
+    return (
+        ScriptResult(relative_path, "FAILED", first_error, layer),
+        summary,
+        removed_count,
+        len(kept_statements),
+        truncated,
+    )
 
 
 def execute_script_with_summary(
@@ -5287,7 +5397,9 @@ def execute_script_with_summary(
     if read_error:
         msg = read_error
         log.error("%s %s -> ERROR (%s)", label_prefix, relative_path, msg)
-        return ScriptResult(relative_path, "ERROR", msg, layer), ExecutionSummary(0, [StatementFailure(0, msg, "")])
+        return ScriptResult(relative_path, "ERROR", msg, layer), ExecutionSummary(
+            0, [StatementFailure(0, msg, "")]
+        )
     fingerprint = FixupStateLedger.fingerprint(sql_bytes or b"")
     if state_ledger and state_ledger.is_completed(relative_path, fingerprint):
         msg = "状态账本命中，跳过重复执行"
@@ -5306,7 +5418,7 @@ def execute_script_with_summary(
         exec_mode=effective_mode,
         exec_file_fallback=exec_file_fallback,
         exec_stats=exec_stats,
-        context_label=f"{label_prefix} {relative_path}"
+        context_label=f"{label_prefix} {relative_path}",
     )
     if summary.statements == 0:
         log.warning("%s %s -> SKIP (文件无有效语句)", label_prefix, relative_path)
@@ -5319,7 +5431,9 @@ def execute_script_with_summary(
                 state_ledger.mark_completed(relative_path, fingerprint, "EXECUTED_BUT_MOVE_FAILED")
             log.error("%s %s -> ERROR %s", label_prefix, relative_path, move_note)
             failure = StatementFailure(0, move_note.strip("()"), "")
-            return ScriptResult(relative_path, "ERROR", move_note.strip(), layer), ExecutionSummary(summary.statements, [failure])
+            return ScriptResult(relative_path, "ERROR", move_note.strip(), layer), ExecutionSummary(
+                summary.statements, [failure]
+            )
         if state_ledger:
             state_ledger.clear(relative_path)
         log.info("%s %s -> OK %s [mode=%s]", label_prefix, relative_path, move_note, effective_mode)
@@ -5332,7 +5446,7 @@ def execute_script_with_summary(
         relative_path,
         len(summary.failures),
         summary.statements,
-        effective_mode
+        effective_mode,
     )
     for failure in summary.failures[:3]:
         log.warning("  [%d] %s", failure.index, safe_first_line(failure.error, 200, "执行失败"))
@@ -5340,19 +5454,19 @@ def execute_script_with_summary(
 
 
 def query_invalid_objects(
-    obclient_cmd: List[str],
-    timeout: Optional[int],
-    allowed_owners: Optional[Set[str]] = None
+    obclient_cmd: List[str], timeout: Optional[int], allowed_owners: Optional[Set[str]] = None
 ) -> List[Tuple[str, str, str]]:
     """
     Query INVALID objects from OceanBase.
-    
+
     Returns:
         List of (owner, object_name, object_type) tuples
     """
     owner_filter = ""
     if allowed_owners:
-        owners = sorted({owner.strip().upper() for owner in allowed_owners if owner and owner.strip()})
+        owners = sorted(
+            {owner.strip().upper() for owner in allowed_owners if owner and owner.strip()}
+        )
         if owners:
             owner_in = ", ".join(f"'{escape_sql_literal(owner)}'" for owner in owners)
             owner_filter = f"\n      AND OWNER IN ({owner_in})"
@@ -5364,12 +5478,12 @@ def query_invalid_objects(
       {owner_filter}
     ORDER BY OWNER, OBJECT_TYPE, OBJECT_NAME;
     """
-    
+
     try:
         result = run_sql(obclient_cmd, sql, timeout)
         if result.returncode != 0:
             return []
-        
+
         invalid_objects = []
         for raw_line in (result.stdout or "").splitlines():
             line = raw_line.strip()
@@ -5378,20 +5492,24 @@ def query_invalid_objects(
             upper = line.upper()
             if upper.startswith("WARNING:") or upper.startswith("SP2-"):
                 continue
-            parts = line.split('\t')
+            parts = line.split("\t")
             if len(parts) >= 3:
                 owner = parts[0].strip()
                 obj_name = parts[1].strip()
                 obj_type = parts[2].strip()
                 # Skip header row emitted by obclient
-                if owner.upper() == "OWNER" and obj_name.upper() == "OBJECT_NAME" and obj_type.upper() == "OBJECT_TYPE":
+                if (
+                    owner.upper() == "OWNER"
+                    and obj_name.upper() == "OBJECT_NAME"
+                    and obj_type.upper() == "OBJECT_TYPE"
+                ):
                     continue
                 if not re.fullmatch(r"[A-Z0-9_$#]+", owner.upper()):
                     continue
                 if not owner or not obj_name or not obj_type:
                     continue
                 invalid_objects.append((owner, obj_name, obj_type))
-        
+
         return invalid_objects
     except Exception as exc:
         log.warning("查询 INVALID 对象失败: %s", exc)
@@ -5406,7 +5524,7 @@ def is_object_invalid(
     obj_type: str,
     cache: Optional[Dict[Tuple[str, str, str], Optional[bool]]] = None,
 ) -> Optional[bool]:
-    key = (str(owner or '').upper(), str(obj_name or '').upper(), str(obj_type or '').upper())
+    key = (str(owner or "").upper(), str(obj_name or "").upper(), str(obj_type or "").upper())
     if cache is not None and key in cache:
         return cache[key]
     sql = (
@@ -5448,30 +5566,27 @@ def recompile_invalid_objects(
     obclient_cmd: List[str],
     timeout: Optional[int],
     max_retries: int = MAX_RECOMPILE_RETRIES,
-    allowed_owners: Optional[Set[str]] = None
+    allowed_owners: Optional[Set[str]] = None,
 ) -> RecompileSummary:
     """
     Recompile INVALID objects multiple times until all are VALID or max retries reached.
-    
+
     Returns:
         RecompileSummary(total_recompiled, remaining_invalid, recompile_failed, unsupported_types)
     """
     total_recompiled = 0
     recompile_failed = 0
     unsupported_types = 0
-    
+
     for retry in range(max_retries):
-        invalid_objects = query_invalid_objects(obclient_cmd, timeout, allowed_owners=allowed_owners)
+        invalid_objects = query_invalid_objects(
+            obclient_cmd, timeout, allowed_owners=allowed_owners
+        )
         if not invalid_objects:
             return RecompileSummary(total_recompiled, 0, recompile_failed, unsupported_types)
-        
-        log.info(
-            "重编译轮次 %d/%d, INVALID=%d",
-            retry + 1,
-            max_retries,
-            len(invalid_objects)
-        )
-        
+
+        log.info("重编译轮次 %d/%d, INVALID=%d", retry + 1, max_retries, len(invalid_objects))
+
         recompiled_this_round = 0
         failed_this_round = 0
         invalid_status_cache: Dict[Tuple[str, str, str], Optional[bool]] = {}
@@ -5485,53 +5600,57 @@ def recompile_invalid_objects(
                 result = run_sql(obclient_cmd, compile_sql, timeout)
                 error_msg = extract_execution_error(result)
                 if not error_msg:
-                    still_invalid = is_object_invalid(obclient_cmd, timeout, owner, obj_name, obj_type, cache=invalid_status_cache)
+                    still_invalid = is_object_invalid(
+                        obclient_cmd, timeout, owner, obj_name, obj_type, cache=invalid_status_cache
+                    )
                     if still_invalid is False:
                         recompiled_this_round += 1
                         log.info("  OK %s.%s (%s)", owner, obj_name, obj_type)
                     elif still_invalid is True:
                         recompile_failed += 1
                         failed_this_round += 1
-                        log.warning("  FAIL %s.%s (%s): still INVALID after COMPILE", owner, obj_name, obj_type)
+                        log.warning(
+                            "  FAIL %s.%s (%s): still INVALID after COMPILE",
+                            owner,
+                            obj_name,
+                            obj_type,
+                        )
                     else:
-                        log.warning("  WARN %s.%s (%s): 无法确认编译后状态，未计入成功", owner, obj_name, obj_type)
+                        log.warning(
+                            "  WARN %s.%s (%s): 无法确认编译后状态，未计入成功",
+                            owner,
+                            obj_name,
+                            obj_type,
+                        )
                 else:
                     recompile_failed += 1
                     failed_this_round += 1
                     log.warning(
-                        "  FAIL %s.%s (%s): %s",
-                        owner,
-                        obj_name,
-                        obj_type,
-                        str(error_msg)[:100]
+                        "  FAIL %s.%s (%s): %s", owner, obj_name, obj_type, str(error_msg)[:100]
                     )
             except Exception as e:
                 recompile_failed += 1
                 failed_this_round += 1
-                log.warning(
-                    "  FAIL %s.%s (%s): %s",
-                    owner,
-                    obj_name,
-                    obj_type,
-                    str(e)[:100]
-                )
-        
+                log.warning("  FAIL %s.%s (%s): %s", owner, obj_name, obj_type, str(e)[:100])
+
         total_recompiled += recompiled_this_round
-        
+
         if recompiled_this_round == 0 and failed_this_round == 0:
             # No success and no transient failure signal in this round, stop retrying
             break
-    
+
     # Final check
     final_invalid = query_invalid_objects(obclient_cmd, timeout, allowed_owners=allowed_owners)
-    return RecompileSummary(total_recompiled, len(final_invalid), recompile_failed, unsupported_types)
+    return RecompileSummary(
+        total_recompiled, len(final_invalid), recompile_failed, unsupported_types
+    )
 
 
 def parse_args() -> argparse.Namespace:
     desc = textwrap.dedent(
         """\
         增强版修补脚本执行器 - 支持依赖感知排序和自动重编译
-        
+
         新特性：
           --smart-order  : 启用依赖感知执行顺序（推荐）
           --recompile    : 自动重编译 INVALID 对象
@@ -5543,7 +5662,7 @@ def parse_args() -> argparse.Namespace:
           --allow-table-create : 允许执行 table/ 建表脚本（默认关闭，防止误建空表）
           注意: grants_deferred/ 默认跳过，需在补齐对象后显式执行
           注意: materialized_view/job/schedule 默认跳过，需核对后显式执行；即便显式配合 --iterative 也不会跨轮自动重试
-        
+
         保留原有功能：
           --only-dirs    : 按子目录过滤
           --only-types   : 按对象类型过滤
@@ -5555,12 +5674,12 @@ def parse_args() -> argparse.Namespace:
           版本: {version}
         """
     ).format(repo_url=REPO_URL, issues_url=REPO_ISSUES_URL, version=__version__)
-    
+
     parser = argparse.ArgumentParser(
         description=desc,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    
+
     parser.add_argument(
         "config",
         nargs="?",
@@ -5572,26 +5691,26 @@ def parse_args() -> argparse.Namespace:
         action="version",
         version=f"%(prog)s {__version__}",
     )
-    
+
     parser.add_argument(
         "--smart-order",
         action="store_true",
         help="Enable dependency-aware execution order (grants before dependent objects)",
     )
-    
+
     parser.add_argument(
         "--recompile",
         action="store_true",
         help="Automatically recompile INVALID objects after execution",
     )
-    
+
     parser.add_argument(
         "--max-retries",
         type=int,
         default=MAX_RECOMPILE_RETRIES,
         help=f"Maximum recompilation retries (default: {MAX_RECOMPILE_RETRIES})",
     )
-    
+
     parser.add_argument(
         "--iterative",
         action="store_true",
@@ -5603,39 +5722,39 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Generate per-view plans from VIEWs_chain and auto-execute them",
     )
-    
+
     parser.add_argument(
         "--max-rounds",
         type=int,
         default=10,
         help="Maximum iteration rounds for --iterative mode (default: 10)",
     )
-    
+
     parser.add_argument(
         "--min-progress",
         type=int,
         default=1,
         help="Minimum progress per round for --iterative mode (default: 1)",
     )
-    
+
     parser.add_argument(
         "--only-dirs",
         action="append",
         help="Only execute scripts under these subdirectories (comma-separated)",
     )
-    
+
     parser.add_argument(
         "--exclude-dirs",
         action="append",
         help="Skip these subdirectories (comma-separated)",
     )
-    
+
     parser.add_argument(
         "--only-types",
         action="append",
         help="Only execute specific object types (e.g. TABLE,VIEW,INDEX)",
     )
-    
+
     parser.add_argument(
         "--glob",
         dest="glob_patterns",
@@ -5648,7 +5767,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow executing fixup_scripts/table/* (disabled by default for safety)",
     )
-    
+
     return parser.parse_args()
 
 
@@ -5664,7 +5783,7 @@ def parse_csv_args(arg_list: List[str]) -> List[str]:
 def main() -> None:
     """
     Main entry point with optional iterative fixup support.
-    
+
     New --iterative flag enables multi-round execution with:
     - Automatic retry of failed scripts
     - Convergence detection
@@ -5676,12 +5795,12 @@ def main() -> None:
         log.error("参数冲突: --iterative 和 --view-chain-autofix 不能同时启用。")
         sys.exit(2)
     config_arg = Path(args.config)
-    
+
     # Parse filters
     only_dirs = parse_csv_args(args.only_dirs or [])
     exclude_dirs = parse_csv_args(args.exclude_dirs or [])
     only_types_raw = parse_csv_args(args.only_types or [])
-    
+
     # Map types to directories
     mapped_dirs: List[str] = []
     unknown_types: List[str] = []
@@ -5692,19 +5811,21 @@ def main() -> None:
             mapped_dirs.append(mapped)
         else:
             unknown_types.append(t)
-    
+
     if unknown_types:
         log.warning("未识别的对象类型: %s", ", ".join(unknown_types))
-    
+
     if mapped_dirs:
         if only_dirs:
-            merged = set(normalize_dir_filter(d) for d in only_dirs) | set(normalize_dir_filter(d) for d in mapped_dirs)
+            merged = set(normalize_dir_filter(d) for d in only_dirs) | set(
+                normalize_dir_filter(d) for d in mapped_dirs
+            )
             only_dirs = sorted(merged)
         else:
             only_dirs = [normalize_dir_filter(d) for d in mapped_dirs]
     else:
         only_dirs = [normalize_dir_filter(d) for d in only_dirs] if only_dirs else []
-    
+
     exclude_dirs = [normalize_dir_filter(d) for d in exclude_dirs]
     default_excludes = {
         "tables_unsupported",
@@ -5723,7 +5844,8 @@ def main() -> None:
     exclude_set = set(exclude_dirs) | default_excludes
     if only_dirs:
         exclude_set = {
-            item for item in exclude_set
+            item
+            for item in exclude_set
             if not any(dir_filter_overlaps(item, include_item) for include_item in only_dirs)
         }
     if not getattr(args, "allow_table_create", False):
@@ -5731,7 +5853,9 @@ def main() -> None:
         exclude_set.add("table")
     exclude_dirs = sorted(exclude_set)
 
-    if any(dir_filter_overlaps("table", item) for item in only_dirs) and not getattr(args, "allow_table_create", False):
+    if any(dir_filter_overlaps("table", item) for item in only_dirs) and not getattr(
+        args, "allow_table_create", False
+    ):
         log.warning(
             "检测到 --only-dirs/--only-types 包含 table，但默认安全策略已禁用 table 执行。"
             "如需执行建表脚本，请显式添加 --allow-table-create。"
@@ -5741,7 +5865,9 @@ def main() -> None:
     if not any(dir_filter_overlaps("grants_deferred", item) for item in only_dirs):
         log.warning("安全模式: 默认跳过 fixup_scripts/grants_deferred/（需对象补齐后再执行）。")
     if not any(dir_filter_overlaps("sequence_restart", item) for item in only_dirs):
-        log.warning("安全模式: 默认跳过 fixup_scripts/sequence_restart/（值同步 SQL 需确认 LAST_NUMBER 与执行时机后再执行）。")
+        log.warning(
+            "安全模式: 默认跳过 fixup_scripts/sequence_restart/（值同步 SQL 需确认 LAST_NUMBER 与执行时机后再执行）。"
+        )
     if not any(
         any(dir_filter_overlaps(dir_name, item) for item in only_dirs)
         for dir_name in MANUAL_REVIEW_DIRS
@@ -5750,14 +5876,18 @@ def main() -> None:
             "安全模式: 默认跳过 fixup_scripts/materialized_view|job|schedule/（manual-only family 需核对定义与人工事项后再显式执行）。"
         )
     if not any(dir_filter_overlaps("cleanup_safe", item) for item in only_dirs):
-        log.warning("安全模式: 默认跳过 fixup_scripts/cleanup_safe/（显式审核后再执行 destructive 清理 SQL）。")
+        log.warning(
+            "安全模式: 默认跳过 fixup_scripts/cleanup_safe/（显式审核后再执行 destructive 清理 SQL）。"
+        )
     if not any(dir_filter_overlaps("cleanup_semantic", item) for item in only_dirs):
-        log.warning("安全模式: 默认跳过 fixup_scripts/cleanup_semantic/（语义级 destructive 约束清理需显式审核后执行）。")
-    
+        log.warning(
+            "安全模式: 默认跳过 fixup_scripts/cleanup_semantic/（语义级 destructive 约束清理需显式审核后执行）。"
+        )
+
     # Load configuration
     try:
-        ob_cfg, fixup_dir, repo_root, log_level, report_dir, fixup_settings, max_sql_file_bytes = load_ob_config(
-            config_arg.resolve()
+        ob_cfg, fixup_dir, repo_root, log_level, report_dir, fixup_settings, max_sql_file_bytes = (
+            load_ob_config(config_arg.resolve())
         )
     except ConfigError as exc:
         log.error("配置错误: %s", exc)
@@ -5794,16 +5924,14 @@ def main() -> None:
         log_manual_action_preflight(manual_actions_report_path, manual_actions_for_run)
     except Exception as exc:
         log.debug("加载运行时提醒状态失败，已跳过: %s", exc)
-    
+
     # Check if iterative mode requested via config or args
-    iterative_mode = getattr(args, 'iterative', False)
-    max_rounds = getattr(args, 'max_rounds', 10)
-    min_progress = getattr(args, 'min_progress', 1)
+    iterative_mode = getattr(args, "iterative", False)
+    max_rounds = getattr(args, "max_rounds", 10)
+    min_progress = getattr(args, "min_progress", 1)
     hot_reload_runtime = init_fixup_hot_reload_runtime(config_arg.resolve())
     if hot_reload_runtime and hot_reload_runtime.mode == "round" and not iterative_mode:
-        log.warning(
-            "config_hot_reload_mode=round 仅在 --iterative 下生效；本次运行不会热加载。"
-        )
+        log.warning("config_hot_reload_mode=round 仅在 --iterative 下生效；本次运行不会热加载。")
 
     try:
         with acquire_fixup_run_lock(fixup_dir):
@@ -5817,23 +5945,34 @@ def main() -> None:
                     only_dirs,
                     exclude_dirs,
                     fixup_settings,
-                    max_sql_file_bytes
+                    max_sql_file_bytes,
                 )
             elif iterative_mode:
                 run_iterative_fixup(
-                    args, ob_cfg, fixup_dir, repo_root, report_dir,
-                    only_dirs, exclude_dirs,
+                    args,
+                    ob_cfg,
+                    fixup_dir,
+                    repo_root,
+                    report_dir,
+                    only_dirs,
+                    exclude_dirs,
                     fixup_settings,
                     max_sql_file_bytes,
-                    max_rounds, min_progress,
-                    hot_reload_runtime=hot_reload_runtime
+                    max_rounds,
+                    min_progress,
+                    hot_reload_runtime=hot_reload_runtime,
                 )
             else:
                 run_single_fixup(
-                    args, ob_cfg, fixup_dir, repo_root, report_dir,
-                    only_dirs, exclude_dirs,
+                    args,
+                    ob_cfg,
+                    fixup_dir,
+                    repo_root,
+                    report_dir,
+                    only_dirs,
+                    exclude_dirs,
                     fixup_settings,
-                    max_sql_file_bytes
+                    max_sql_file_bytes,
                 )
     except ConfigError as exc:
         log.error("执行失败: %s", exc)
@@ -5841,7 +5980,9 @@ def main() -> None:
     finally:
         if notice_state_path and notice_state is not None and notices_to_mark_seen:
             try:
-                persist_seen_notices(notice_state_path, notice_state, __version__, notices_to_mark_seen)
+                persist_seen_notices(
+                    notice_state_path, notice_state, __version__, notices_to_mark_seen
+                )
             except Exception as exc:
                 log.debug("持久化运行时提醒状态失败，已忽略: %s", exc)
 
@@ -5855,19 +5996,19 @@ def run_single_fixup(
     only_dirs: List[str],
     exclude_dirs: List[str],
     fixup_settings: FixupAutoGrantSettings,
-    max_sql_file_bytes: Optional[int]
+    max_sql_file_bytes: Optional[int],
 ) -> None:
     """Original single-round fixup execution (backward compatible)."""
-    
+
     log_section("修补脚本执行器")
     log.info("配置文件: %s", Path(args.config).resolve())
     log.info("日志级别: %s", logging.getLevelName(logging.getLogger().level))
     log.info("项目主页: %s (问题反馈: %s)", REPO_URL, REPO_ISSUES_URL)
-    
+
     done_dir = fixup_dir / DONE_DIR_NAME
     done_dir.mkdir(exist_ok=True)
     state_ledger = FixupStateLedger(fixup_dir)
-    
+
     # Collect SQL files
     files_with_layer = collect_sql_files_by_layer(
         fixup_dir,
@@ -5876,7 +6017,7 @@ def run_single_fixup(
         exclude_dirs=set(exclude_dirs),
         glob_patterns=args.glob_patterns or None,
     )
-    
+
     if not files_with_layer:
         log.warning("目录 %s 中未找到任何 *.sql 文件。", fixup_dir)
         return
@@ -5889,32 +6030,29 @@ def run_single_fixup(
         log.error("OBClient 连接检查失败: %s", conn_err)
         log.error("请确认网络连通性/账号权限/obclient 可用性后重试。")
         sys.exit(1)
-    precheck_summary = build_fixup_precheck_summary(ob_cfg, obclient_cmd, ob_timeout, files_with_layer)
+    precheck_summary = build_fixup_precheck_summary(
+        ob_cfg, obclient_cmd, ob_timeout, files_with_layer
+    )
     precheck_report = write_fixup_precheck_report(fixup_dir, precheck_summary)
     log_fixup_precheck(precheck_summary, precheck_report)
     auto_grant_ctx = init_auto_grant_context(
-        fixup_settings,
-        report_dir,
-        fixup_dir,
-        exclude_dirs,
-        obclient_cmd,
-        ob_timeout
+        fixup_settings, report_dir, fixup_dir, exclude_dirs, obclient_cmd, ob_timeout
     )
-    
+
     total_scripts = len(files_with_layer)
     width = len(str(total_scripts)) or 1
     results: List[ScriptResult] = []
     error_entries: List[ErrorReportEntry] = []
     error_truncated = False
     exec_stats = new_exec_mode_stats()
-    
+
     log_section("执行配置")
     log.info("目录: %s", fixup_dir)
     log.info("模式: %s", "依赖感知排序 (SMART ORDER)" if args.smart_order else "标准优先级排序")
     log.info(
         "执行粒度: mode=%s, file_fallback=%s",
         fixup_settings.exec_mode,
-        str(bool(fixup_settings.exec_file_fallback)).lower()
+        str(bool(fixup_settings.exec_file_fallback)).lower(),
     )
     if args.recompile:
         log.info("重编译: 启用 (最多 %d 次重试)", args.max_retries)
@@ -5927,7 +6065,7 @@ def run_single_fixup(
     log.info("读取 SQL 文件: %d", total_scripts)
 
     log_section("开始执行")
-    
+
     # Execute scripts
     current_layer = -1
     for idx, (layer, sql_path) in enumerate(files_with_layer, start=1):
@@ -5935,10 +6073,10 @@ def run_single_fixup(
             current_layer = layer
             layer_name = "未知层" if layer == 999 else f"第 {layer} 层"
             log_subsection(f"执行层 {layer_name}")
-        
+
         relative_path = sql_path.relative_to(repo_root)
         label = format_progress_label(idx, total_scripts, width)
-        
+
         if is_grant_dir(sql_path.parent.name):
             bump_exec_mode_stat(exec_stats, "grants_statement")
             result, summary, _removed, _kept, truncated = execute_grant_file_with_prune(
@@ -5952,7 +6090,7 @@ def run_single_fixup(
                 error_entries,
                 DEFAULT_ERROR_REPORT_LIMIT,
                 max_sql_file_bytes,
-                state_ledger=state_ledger
+                state_ledger=state_ledger,
             )
             error_truncated = error_truncated or truncated
             if result.status == "FAILED":
@@ -5960,7 +6098,9 @@ def run_single_fixup(
                 error_type = classify_sql_error(first_error)
                 retry_target = None
                 if summary.failures:
-                    retry_target = infer_permission_retry_target(summary.failures[0].statement, relative_path)
+                    retry_target = infer_permission_retry_target(
+                        summary.failures[0].statement, relative_path
+                    )
                 if auto_grant_ctx and error_type == FailureType.PERMISSION_DENIED and retry_target:
                     retry_full, retry_type, retry_privs = retry_target
                     applied, _blocked = execute_auto_grant_for_object(
@@ -5988,18 +6128,20 @@ def run_single_fixup(
                         )
                         if refresh_result:
                             results.append(refresh_result)
-                        retry_result, retry_summary, _removed2, _kept2, truncated2 = execute_grant_file_with_prune(
-                            obclient_cmd,
-                            sql_path,
-                            repo_root,
-                            done_dir,
-                            ob_timeout,
-                            layer,
-                            f"{label} (retry)",
-                            error_entries,
-                            DEFAULT_ERROR_REPORT_LIMIT,
-                            max_sql_file_bytes,
-                            state_ledger=state_ledger
+                        retry_result, retry_summary, _removed2, _kept2, truncated2 = (
+                            execute_grant_file_with_prune(
+                                obclient_cmd,
+                                sql_path,
+                                repo_root,
+                                done_dir,
+                                ob_timeout,
+                                layer,
+                                f"{label} (retry)",
+                                error_entries,
+                                DEFAULT_ERROR_REPORT_LIMIT,
+                                max_sql_file_bytes,
+                                state_ledger=state_ledger,
+                            )
                         )
                         error_truncated = error_truncated or truncated2
                         results.append(retry_result)
@@ -6008,9 +6150,7 @@ def run_single_fixup(
         else:
             obj_type = DIR_OBJECT_TYPE_MAP.get(sql_path.parent.name.lower())
             obj_schema, obj_name = parse_object_identity_from_path(sql_path)
-            obj_full = (
-                f"{obj_schema}.{obj_name}" if obj_schema and obj_name else None
-            )
+            obj_full = f"{obj_schema}.{obj_name}" if obj_schema and obj_name else None
             if auto_grant_ctx and obj_full and obj_type:
                 execute_auto_grant_for_object(auto_grant_ctx, obj_full, obj_type, label)
             result, summary = execute_script_with_summary(
@@ -6043,7 +6183,7 @@ def run_single_fixup(
                             relative_path,
                             failure.index,
                             failure.statement,
-                            failure.error
+                            failure.error,
                         )
                 continue
 
@@ -6098,7 +6238,7 @@ def run_single_fixup(
                             relative_path,
                             failure.index,
                             failure.statement,
-                            failure.error
+                            failure.error,
                         )
                 continue
 
@@ -6112,9 +6252,9 @@ def run_single_fixup(
                     relative_path,
                     failure.index,
                     failure.statement,
-                    failure.error
+                    failure.error,
                 )
-    
+
     # Recompilation phase
     total_recompiled = 0
     remaining_invalid = 0
@@ -6137,13 +6277,13 @@ def run_single_fixup(
         log.info("执行失败 : %d", auto_grant_ctx.stats.failed)
         log.info("阻断提示 : %d", auto_grant_ctx.stats.blocked)
         log.info("范围跳过 : %d", auto_grant_ctx.stats.skipped)
-    
+
     # Summary
     executed = sum(1 for r in results if r.status != "SKIPPED")
     success = sum(1 for r in results if r.status == "SUCCESS")
     failed = sum(1 for r in results if r.status in ("FAILED", "ERROR"))
     skipped = sum(1 for r in results if r.status == "SKIPPED")
-    
+
     log_section("执行结果汇总")
     log.info("扫描脚本数 : %d", total_scripts)
     log.info("实际执行数 : %d", executed)
@@ -6151,7 +6291,7 @@ def run_single_fixup(
     log.info("失败       : %d", failed)
     log.info("跳过       : %d", skipped)
     log_exec_mode_summary(exec_stats, fixup_settings.exec_mode, fixup_settings.exec_file_fallback)
-    
+
     if args.recompile:
         log_subsection("重编译统计")
         log.info("重编译成功 : %d", total_recompiled)
@@ -6160,33 +6300,33 @@ def run_single_fixup(
         log.info("仍为INVALID: %d", remaining_invalid)
         if remaining_invalid > 0:
             log.info("提示: 运行 'SELECT * FROM DBA_OBJECTS WHERE STATUS=\\'INVALID\\';' 查看详情")
-    
+
     # Analyze failures
     failures_by_type = analyze_failure_patterns(results)
     if failures_by_type:
         log_failure_analysis(failures_by_type)
-    
+
     # Detailed table
     if results:
         log_subsection("详细结果")
-        
+
         # Group by status
         by_status = defaultdict(list)
         for r in results:
             by_status[r.status].append(r)
-        
+
         for status in ["SUCCESS", "FAILED", "ERROR", "SKIPPED"]:
             items = by_status.get(status, [])
             if not items:
                 continue
-            
+
             status_label = {
                 "SUCCESS": "✓ 成功",
                 "FAILED": "✗ 失败",
                 "ERROR": "✗ 错误",
-                "SKIPPED": "○ 跳过"
+                "SKIPPED": "○ 跳过",
             }[status]
-            
+
             log.info("%s (%d)", status_label, len(items))
             for item in items[:20]:  # Limit to first 20
                 msg = safe_first_line(item.message, 100, "")
@@ -6198,17 +6338,14 @@ def run_single_fixup(
                 log.info("  ... 还有 %d 个", len(items) - 20)
 
     report_path = write_error_report(
-        error_entries,
-        fixup_dir,
-        DEFAULT_ERROR_REPORT_LIMIT,
-        error_truncated
+        error_entries, fixup_dir, DEFAULT_ERROR_REPORT_LIMIT, error_truncated
     )
     if report_path:
         log.info("错误报告已输出: %s", report_path)
     state_ledger.flush()
 
     log_section("执行结束")
-    
+
     exit_code = 0 if failed == 0 else 1
     sys.exit(exit_code)
 
@@ -6222,7 +6359,7 @@ def run_view_chain_autofix(
     only_dirs: List[str],
     exclude_dirs: List[str],
     fixup_settings: FixupAutoGrantSettings,
-    max_sql_file_bytes: Optional[int]
+    max_sql_file_bytes: Optional[int],
 ) -> None:
     log_section("VIEW 链路自动修复")
     log.info("配置文件: %s", Path(args.config).resolve())
@@ -6231,7 +6368,7 @@ def run_view_chain_autofix(
     log.info(
         "执行粒度: mode=%s, file_fallback=%s",
         fixup_settings.exec_mode,
-        str(bool(fixup_settings.exec_file_fallback)).lower()
+        str(bool(fixup_settings.exec_file_fallback)).lower(),
     )
     if only_dirs:
         log.info("子目录过滤: %s", sorted(set(only_dirs)))
@@ -6263,7 +6400,7 @@ def run_view_chain_autofix(
     done_files = collect_sql_files_from_root(
         done_dir,
         include_dirs=set(only_dirs) if only_dirs else None,
-        exclude_dirs=set(exclude_dirs) if exclude_dirs else None
+        exclude_dirs=set(exclude_dirs) if exclude_dirs else None,
     )
     if done_files:
         done_object_index, done_name_index = build_fixup_object_index(
@@ -6271,23 +6408,23 @@ def run_view_chain_autofix(
         )
 
     # 根据用户 --only-dirs 决定使用哪些 grant 目录
-    only_dirs_set = {normalize_dir_filter(item) for item in (only_dirs or []) if normalize_dir_filter(item)}
+    only_dirs_set = {
+        normalize_dir_filter(item) for item in (only_dirs or []) if normalize_dir_filter(item)
+    }
     use_grants_miss = (
         not only_dirs_set
         or any(dir_filter_overlaps("grants_miss", item) for item in only_dirs_set)
         or any(dir_filter_overlaps("grants", item) for item in only_dirs_set)
     )
-    use_grants_all = not only_dirs_set or any(dir_filter_overlaps("grants_all", item) for item in only_dirs_set)
-    
+    use_grants_all = not only_dirs_set or any(
+        dir_filter_overlaps("grants_all", item) for item in only_dirs_set
+    )
+
     grant_index_miss = build_grant_index(
-        fixup_dir,
-        set(exclude_dirs),
-        include_dirs={"grants_miss"} if use_grants_miss else set()
+        fixup_dir, set(exclude_dirs), include_dirs={"grants_miss"} if use_grants_miss else set()
     )
     grant_index_all = build_grant_index(
-        fixup_dir,
-        set(exclude_dirs),
-        include_dirs={"grants_all"} if use_grants_all else set()
+        fixup_dir, set(exclude_dirs), include_dirs={"grants_all"} if use_grants_all else set()
     )
 
     plan_dir = fixup_dir / "view_chain_plans"
@@ -6303,13 +6440,17 @@ def run_view_chain_autofix(
         log.error("OBClient 连接检查失败: %s", conn_err)
         log.error("请确认网络连通性/账号权限/obclient 可用性后重试。")
         sys.exit(1)
-    precheck_summary = build_fixup_precheck_summary(ob_cfg, obclient_cmd, ob_timeout, files_with_layer)
+    precheck_summary = build_fixup_precheck_summary(
+        ob_cfg, obclient_cmd, ob_timeout, files_with_layer
+    )
     precheck_report = write_fixup_precheck_report(fixup_dir, precheck_summary)
     log_fixup_precheck(precheck_summary, precheck_report)
 
     roles_cache: Dict[str, Set[str]] = LimitedCache(fixup_settings.cache_limit)
     tab_privs_cache: Dict[Tuple[str, str, str], Set[str]] = LimitedCache(fixup_settings.cache_limit)
-    tab_privs_grantable_cache: Dict[Tuple[str, str, str], Set[str]] = LimitedCache(fixup_settings.cache_limit)
+    tab_privs_grantable_cache: Dict[Tuple[str, str, str], Set[str]] = LimitedCache(
+        fixup_settings.cache_limit
+    )
     sys_privs_cache: Dict[str, Set[str]] = LimitedCache(fixup_settings.cache_limit)
     planned_statements: Set[str] = set()
     planned_object_privs: Set[Tuple[str, str, str]] = set()
@@ -6344,7 +6485,7 @@ def run_view_chain_autofix(
             root_type,
             exists_cache,
             planned_objects,
-            use_planned=False
+            use_planned=False,
         )
         skipped = root_exists is True
         blocked = False
@@ -6376,7 +6517,7 @@ def run_view_chain_autofix(
                 planned_object_privs_with_option,
                 planned_sys_privs,
                 planned_objects,
-                max_sql_file_bytes
+                max_sql_file_bytes,
             )
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -6403,9 +6544,12 @@ def run_view_chain_autofix(
                     display_nodes.append(f"{node_name}({node_type})")
             chain_summary.append("# - " + " -> ".join(display_nodes))
 
-        plan_content = "\n".join(
-            ["# VIEW chain autofix plan"] + chain_summary + ["", "# Steps:"] + plan_lines
-        ).rstrip() + "\n"
+        plan_content = (
+            "\n".join(
+                ["# VIEW chain autofix plan"] + chain_summary + ["", "# Steps:"] + plan_lines
+            ).rstrip()
+            + "\n"
+        )
         plan_path.write_text(plan_content, encoding="utf-8")
 
         sql_header = [
@@ -6452,10 +6596,7 @@ def run_view_chain_autofix(
             status = classify_view_chain_status(False, True, root_exists, 0)
             view_results.append((view_key, status, ["state ledger hit"]))
             log.warning(
-                "%s [VIEW_CHAIN] %s 跳过执行：状态账本命中 (%s)。",
-                label,
-                view_key,
-                relative_path
+                "%s [VIEW_CHAIN] %s 跳过执行：状态账本命中 (%s)。", label, view_key, relative_path
             )
             continue
 
@@ -6466,7 +6607,7 @@ def run_view_chain_autofix(
             exec_mode=resolve_script_exec_mode(fixup_settings.exec_mode, sql_path),
             exec_file_fallback=fixup_settings.exec_file_fallback,
             exec_stats=exec_stats,
-            context_label=f"{label} [VIEW_CHAIN] {view_key}"
+            context_label=f"{label} [VIEW_CHAIN] {view_key}",
         )
         invalidate_exists_cache(exists_cache, planned_objects | {(view_key, root_type)})
         post_exists = check_object_exists(
@@ -6476,13 +6617,13 @@ def run_view_chain_autofix(
             root_type,
             exists_cache,
             planned_objects,
-            use_planned=False
+            use_planned=False,
         )
         status = classify_view_chain_status(
             blocked=False,
             skipped=False,
             view_exists=post_exists,
-            failure_count=len(summary.failures)
+            failure_count=len(summary.failures),
         )
         reasons: List[str] = []
         for failure in summary.failures:
@@ -6498,7 +6639,9 @@ def run_view_chain_autofix(
         if status == "SUCCESS":
             state_ledger.mark_completed(relative_path, fingerprint, "VIEW_CHAIN_SUCCESS")
             executed_views += 1
-            log.info("%s [VIEW_CHAIN] %s 执行成功 (%d statements)。", label, view_key, summary.statements)
+            log.info(
+                "%s [VIEW_CHAIN] %s 执行成功 (%d statements)。", label, view_key, summary.statements
+            )
         elif status == "PARTIAL":
             partial_views += 1
             log.warning(
@@ -6506,7 +6649,7 @@ def run_view_chain_autofix(
                 label,
                 view_key,
                 len(summary.failures),
-                summary.statements
+                summary.statements,
             )
         else:
             failed_views += 1
@@ -6515,7 +6658,7 @@ def run_view_chain_autofix(
                 label,
                 view_key,
                 len(summary.failures),
-                summary.statements
+                summary.statements,
             )
 
     state_ledger.flush()
@@ -6555,14 +6698,14 @@ def run_iterative_fixup(
     max_sql_file_bytes: Optional[int],
     max_rounds: int = 10,
     min_progress: int = 1,
-    hot_reload_runtime: Optional[FixupHotReloadRuntime] = None
+    hot_reload_runtime: Optional[FixupHotReloadRuntime] = None,
 ) -> None:
     """
     Multi-round iterative fixup execution with automatic retry.
-    
+
     Solves the VIEW dependency problem where 800 DDLs fail on first run
     because dependent objects don't exist yet.
-    
+
     Args:
         args: Command line arguments
         ob_cfg: OceanBase connection config
@@ -6587,14 +6730,14 @@ def run_iterative_fixup(
     log.info(
         "  - 执行粒度: mode=%s, file_fallback=%s",
         fixup_settings.exec_mode,
-        str(bool(fixup_settings.exec_file_fallback)).lower()
+        str(bool(fixup_settings.exec_file_fallback)).lower(),
     )
     log.info("")
-    
+
     done_dir = fixup_dir / DONE_DIR_NAME
     done_dir.mkdir(exist_ok=True)
     state_ledger = FixupStateLedger(fixup_dir)
-    
+
     current_ob_cfg = dict(ob_cfg)
     current_fixup_settings = fixup_settings
     current_max_sql_file_bytes = max_sql_file_bytes
@@ -6607,37 +6750,37 @@ def run_iterative_fixup(
         log.error("请确认网络连通性/账号权限/obclient 可用性后重试。")
         sys.exit(1)
     auto_grant_ctx = init_auto_grant_context(
-        current_fixup_settings,
-        report_dir,
-        fixup_dir,
-        exclude_dirs,
-        obclient_cmd,
-        ob_timeout
+        current_fixup_settings, report_dir, fixup_dir, exclude_dirs, obclient_cmd, ob_timeout
     )
     error_entries: List[ErrorReportEntry] = []
     error_truncated = False
-    
+
     round_num = 0
     cumulative_success = 0
     cumulative_failed = 0
     active_failed_paths: Set[Path] = set()
     non_retryable_failed_paths: Set[Path] = set()
     recompile_owners: Set[str] = set()
-    
+
     all_round_results = []
     last_failure_results: List[ScriptResult] = []
     exec_stats = new_exec_mode_stats()
-    
+
     while round_num < max_rounds:
         round_num += 1
-        current_ob_cfg, current_fixup_settings, current_max_sql_file_bytes, fixup_settings_changed = apply_fixup_hot_reload_at_round(
+        (
+            current_ob_cfg,
+            current_fixup_settings,
+            current_max_sql_file_bytes,
+            fixup_settings_changed,
+        ) = apply_fixup_hot_reload_at_round(
             hot_reload_runtime,
             round_num,
             current_ob_cfg,
             fixup_dir,
             report_dir,
             current_fixup_settings,
-            current_max_sql_file_bytes
+            current_max_sql_file_bytes,
         )
         ob_timeout = resolve_timeout_value(current_ob_cfg.get("timeout"))
         if fixup_settings_changed:
@@ -6649,16 +6792,16 @@ def run_iterative_fixup(
                         fixup_dir,
                         exclude_dirs,
                         obclient_cmd,
-                        ob_timeout
+                        ob_timeout,
                     )
                 else:
                     auto_grant_ctx.settings = current_fixup_settings
             else:
                 auto_grant_ctx = None
         reset_auto_grant_round_cache(auto_grant_ctx, round_num)
-        
+
         log_section(f"第 {round_num}/{max_rounds} 轮")
-        
+
         # Collect pending SQL files (excluding done/)
         files_with_layer = collect_sql_files_by_layer(
             fixup_dir,
@@ -6672,33 +6815,35 @@ def run_iterative_fixup(
             for path in stale_failed:
                 active_failed_paths.discard(path)
             log.info("历史失败脚本已不存在，已从失败集合移除: %d", len(stale_failed))
-        
+
         if not files_with_layer:
             log.info("✓ 所有脚本已成功执行！")
             break
         if round_num == 1:
-            precheck_summary = build_fixup_precheck_summary(ob_cfg, obclient_cmd, ob_timeout, files_with_layer)
+            precheck_summary = build_fixup_precheck_summary(
+                ob_cfg, obclient_cmd, ob_timeout, files_with_layer
+            )
             precheck_report = write_fixup_precheck_report(fixup_dir, precheck_summary)
             log_fixup_precheck(precheck_summary, precheck_report)
         recompile_owners.update(infer_recompile_owners(files_with_layer))
 
         object_index, name_index = build_fixup_object_index(files_with_layer)
         pre_executed: Set[Path] = set()
-        
+
         total_scripts = len(files_with_layer)
         log.info("本轮读取 SQL 文件: %d", total_scripts)
-        
+
         round_results: List[ScriptResult] = []
         width = len(str(total_scripts)) or 1
         current_layer = -1
-        
+
         # Execute scripts for this round
         for idx, (layer, sql_path) in enumerate(files_with_layer, start=1):
             if args.smart_order and layer != current_layer:
                 current_layer = layer
                 layer_name = "未知层" if layer == 999 else f"第 {layer} 层"
                 log_subsection(f"执行层 {layer_name}")
-            
+
             relative_path = sql_path.relative_to(repo_root)
             label = format_progress_label(idx, total_scripts, width)
             normalized_path = normalize_failed_path(relative_path, repo_root)
@@ -6726,7 +6871,7 @@ def run_iterative_fixup(
                     error_entries,
                     DEFAULT_ERROR_REPORT_LIMIT,
                     current_max_sql_file_bytes,
-                    state_ledger=state_ledger
+                    state_ledger=state_ledger,
                 )
                 error_truncated = error_truncated or truncated
                 if result.status == "FAILED":
@@ -6734,8 +6879,14 @@ def run_iterative_fixup(
                     error_type = classify_sql_error(first_error)
                     retry_target = None
                     if summary.failures:
-                        retry_target = infer_permission_retry_target(summary.failures[0].statement, relative_path)
-                    if auto_grant_ctx and error_type == FailureType.PERMISSION_DENIED and retry_target:
+                        retry_target = infer_permission_retry_target(
+                            summary.failures[0].statement, relative_path
+                        )
+                    if (
+                        auto_grant_ctx
+                        and error_type == FailureType.PERMISSION_DENIED
+                        and retry_target
+                    ):
                         retry_full, retry_type, retry_privs = retry_target
                         applied, _blocked = execute_auto_grant_for_object(
                             auto_grant_ctx,
@@ -6762,24 +6913,28 @@ def run_iterative_fixup(
                             )
                             if refresh_result:
                                 round_results.append(refresh_result)
-                            retry_result, retry_summary, _removed2, _kept2, truncated2 = execute_grant_file_with_prune(
-                                obclient_cmd,
-                                sql_path,
-                                repo_root,
-                                done_dir,
-                                ob_timeout,
-                                layer,
-                                f"{label} (retry)",
-                                error_entries,
-                                DEFAULT_ERROR_REPORT_LIMIT,
-                                current_max_sql_file_bytes,
-                                state_ledger=state_ledger
+                            retry_result, retry_summary, _removed2, _kept2, truncated2 = (
+                                execute_grant_file_with_prune(
+                                    obclient_cmd,
+                                    sql_path,
+                                    repo_root,
+                                    done_dir,
+                                    ob_timeout,
+                                    layer,
+                                    f"{label} (retry)",
+                                    error_entries,
+                                    DEFAULT_ERROR_REPORT_LIMIT,
+                                    current_max_sql_file_bytes,
+                                    state_ledger=state_ledger,
+                                )
                             )
                             error_truncated = error_truncated or truncated2
                             round_results.append(retry_result)
                             continue
                 round_results.append(result)
-                if result.status in ("FAILED", "ERROR") and not bool(contract.get("iterative_retry", True)):
+                if result.status in ("FAILED", "ERROR") and not bool(
+                    contract.get("iterative_retry", True)
+                ):
                     non_retryable_failed_paths.add(normalized_path)
                     log.warning(
                         "%s %s -> 保留失败；family=%s, support_tier=%s, retry_policy=%s。",
@@ -6793,9 +6948,7 @@ def run_iterative_fixup(
 
             obj_type = DIR_OBJECT_TYPE_MAP.get(sql_path.parent.name.lower())
             obj_schema, obj_name = parse_object_identity_from_path(sql_path)
-            obj_full = (
-                f"{obj_schema}.{obj_name}" if obj_schema and obj_name else None
-            )
+            obj_full = f"{obj_schema}.{obj_name}" if obj_schema and obj_name else None
             if auto_grant_ctx and obj_full and obj_type:
                 execute_auto_grant_for_object(auto_grant_ctx, obj_full, obj_type, label)
 
@@ -6830,7 +6983,7 @@ def run_iterative_fixup(
                             relative_path,
                             failure.index,
                             failure.statement,
-                            failure.error
+                            failure.error,
                         )
                     if not bool(contract.get("iterative_retry", True)):
                         non_retryable_failed_paths.add(normalized_path)
@@ -6859,11 +7012,7 @@ def run_iterative_fixup(
                     missing_schema, missing_name = extract_object_from_error(first_error)
                     if missing_name:
                         dep_path = select_dependency_script(
-                            missing_schema,
-                            missing_name,
-                            view_schema,
-                            object_index,
-                            name_index
+                            missing_schema, missing_name, view_schema, object_index, name_index
                         )
                         if dep_path == sql_path:
                             log.warning("%s %s -> 依赖对象指向自身，跳过处理", label, relative_path)
@@ -6887,10 +7036,7 @@ def run_iterative_fixup(
                             handled = dep_result.status == "SUCCESS"
                         else:
                             log.warning(
-                                "%s %s -> 无法解析依赖对象 %s",
-                                label,
-                                relative_path,
-                                missing_name
+                                "%s %s -> 无法解析依赖对象 %s", label, relative_path, missing_name
                             )
                     else:
                         log.warning("%s %s -> 缺失对象未解析", label, relative_path)
@@ -6941,7 +7087,7 @@ def run_iterative_fixup(
                             relative_path,
                             failure.index,
                             failure.statement,
-                            failure.error
+                            failure.error,
                         )
                     if not bool(contract.get("iterative_retry", True)):
                         non_retryable_failed_paths.add(normalized_path)
@@ -6966,7 +7112,7 @@ def run_iterative_fixup(
                         relative_path,
                         failure.index,
                         failure.statement,
-                        failure.error
+                        failure.error,
                     )
                 if not bool(contract.get("iterative_retry", True)):
                     non_retryable_failed_paths.add(normalized_path)
@@ -6978,12 +7124,12 @@ def run_iterative_fixup(
                         contract.get("support_tier") or "-",
                         contract.get("retry_policy") or "-",
                     )
-        
+
         # Round summary
         round_success = sum(1 for r in round_results if r.status == "SUCCESS")
         round_failed = sum(1 for r in round_results if r.status in ("FAILED", "ERROR"))
         round_skipped = sum(1 for r in round_results if r.status == "SKIPPED")
-        
+
         cumulative_success += round_success
         for item in round_results:
             failed_path = normalize_failed_path(item.path, repo_root)
@@ -6994,10 +7140,12 @@ def run_iterative_fixup(
             else:
                 active_failed_paths.discard(failed_path)
         cumulative_failed = len(active_failed_paths)
-        current_failure_results = [item for item in round_results if item.status in ("FAILED", "ERROR")]
+        current_failure_results = [
+            item for item in round_results if item.status in ("FAILED", "ERROR")
+        ]
         if current_failure_results:
             last_failure_results = current_failure_results
-        
+
         log_subsection(f"第 {round_num} 轮结果")
         log.info("本轮成功: %d", round_success)
         log.info("本轮失败: %d", round_failed)
@@ -7005,20 +7153,24 @@ def run_iterative_fixup(
         log.info("累计成功: %d", cumulative_success)
         log.info("累计失败: %d", cumulative_failed)
         log.info("")
-        
-        all_round_results.append({
-            'round': round_num,
-            'success': round_success,
-            'failed': round_failed,
-            'results': round_results
-        })
-        
+
+        all_round_results.append(
+            {
+                "round": round_num,
+                "success": round_success,
+                "failed": round_failed,
+                "results": round_results,
+            }
+        )
+
         # Convergence check
         effective_min_progress = max(1, min_progress)
         if round_success < effective_min_progress:
             if round_success == 0:
                 log.warning("本轮无新成功脚本，停止迭代。")
-                failures_by_type = analyze_failure_patterns(current_failure_results or last_failure_results)
+                failures_by_type = analyze_failure_patterns(
+                    current_failure_results or last_failure_results
+                )
                 if failures_by_type:
                     log_failure_analysis(failures_by_type)
             else:
@@ -7028,16 +7180,19 @@ def run_iterative_fixup(
                     effective_min_progress,
                 )
             break
-        
+
         # Recompile after each round if enabled
         if args.recompile:
             log_subsection("轮次重编译")
             recomp_summary = recompile_invalid_objects(
-                obclient_cmd, ob_timeout, 2, allowed_owners=recompile_owners  # Fewer retries per round
+                obclient_cmd,
+                ob_timeout,
+                2,
+                allowed_owners=recompile_owners,  # Fewer retries per round
             )
             if recomp_summary.total_recompiled > 0:
                 log.info("重编译成功 %d 个对象", recomp_summary.total_recompiled)
-    
+
     # Final recompilation
     total_recompiled = 0
     remaining_invalid = 0
@@ -7060,49 +7215,48 @@ def run_iterative_fixup(
         log.info("执行失败 : %d", auto_grant_ctx.stats.failed)
         log.info("阻断提示 : %d", auto_grant_ctx.stats.blocked)
         log.info("范围跳过 : %d", auto_grant_ctx.stats.skipped)
-    
+
     # Final summary
     log_section("迭代执行汇总")
     log.info("执行轮次: %d", round_num)
     log.info("总计成功: %d", cumulative_success)
     log.info("总计失败: %d", cumulative_failed)
     log_exec_mode_summary(
-        exec_stats,
-        current_fixup_settings.exec_mode,
-        current_fixup_settings.exec_file_fallback
+        exec_stats, current_fixup_settings.exec_mode, current_fixup_settings.exec_file_fallback
     )
-    
+
     if args.recompile:
         log_subsection("最终重编译统计")
         log.info("重编译成功: %d", total_recompiled)
         log.info("重编译失败: %d", recompile_failed)
         log.info("不支持重编译类型: %d", unsupported_recompile_types)
         log.info("仍为INVALID: %d", remaining_invalid)
-    
+
     # Final failure analysis
     if round_num > 0 and all_round_results:
-        final_results = all_round_results[-1]['results']
-        failure_analysis_source = [item for item in final_results if item.status in ("FAILED", "ERROR")]
+        final_results = all_round_results[-1]["results"]
+        failure_analysis_source = [
+            item for item in final_results if item.status in ("FAILED", "ERROR")
+        ]
         if not failure_analysis_source:
             failure_analysis_source = last_failure_results
         failures_by_type = analyze_failure_patterns(failure_analysis_source)
         if failures_by_type:
             log_failure_analysis(failures_by_type)
-    
+
     # Per-round breakdown
     if len(all_round_results) > 1:
         log_subsection("各轮执行统计")
         for round_data in all_round_results:
-            log.info("第 %d 轮: 成功 %d, 失败 %d",
-                    round_data['round'],
-                    round_data['success'],
-                    round_data['failed'])
+            log.info(
+                "第 %d 轮: 成功 %d, 失败 %d",
+                round_data["round"],
+                round_data["success"],
+                round_data["failed"],
+            )
 
     report_path = write_error_report(
-        error_entries,
-        fixup_dir,
-        DEFAULT_ERROR_REPORT_LIMIT,
-        error_truncated
+        error_entries, fixup_dir, DEFAULT_ERROR_REPORT_LIMIT, error_truncated
     )
     if report_path:
         log.info("错误报告已输出: %s", report_path)
@@ -7112,7 +7266,7 @@ def run_iterative_fixup(
     state_ledger.flush()
 
     log_section("执行结束")
-    
+
     exit_code = 0 if len(active_failed_paths) == 0 else 1
     sys.exit(exit_code)
 
