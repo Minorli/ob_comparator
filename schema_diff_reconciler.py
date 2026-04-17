@@ -3168,6 +3168,9 @@ def _extract_single_column_is_notnull_identifier(search_condition: Optional[str]
     if not cond:
         return ""
     cond_text = cond.strip()
+    check_match = re.match(r"^CHECK\s*\((.*)\)$", cond_text, flags=re.IGNORECASE)
+    if check_match:
+        cond_text = check_match.group(1).strip()
     while cond_text.startswith("(") and cond_text.endswith(")"):
         stripped = strip_wrapping_parentheses(cond_text)
         if stripped == cond_text:
@@ -3180,7 +3183,10 @@ def _extract_single_column_is_notnull_identifier(search_condition: Optional[str]
     )
     if not match:
         return ""
-    return normalize_semantic_identifier_name(match.group("ident"))
+    ident = match.group("ident")
+    if len(ident) >= 2 and ident.startswith('"') and ident.endswith('"'):
+        return normalize_semantic_identifier_name(ident)
+    return normalize_identifier_name(ident)
 
 
 def is_notnull_check_condition(search_condition: Optional[str]) -> bool:

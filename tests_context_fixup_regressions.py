@@ -388,3 +388,83 @@ class TestConstraintValidatedUnknownRegressionScenarios(unittest.TestCase):
             "A.T1|C1|NOT NULL (SOURCE VALIDATED UNKNOWN)|NULLABLE|REVIEW SOURCE VALIDATED STATE|REVIEW_SOURCE_VALIDATED_UNKNOWN",
             content,
         )
+
+    def test_extract_single_column_is_notnull_identifier_supports_check_wrapper_and_sql_case(self):
+        self.assertEqual(
+            sdr._extract_single_column_is_notnull_identifier(
+                "CHECK (id_busi_vat_invoice is not null)"
+            ),
+            "ID_BUSI_VAT_INVOICE",
+        )
+        self.assertTrue(
+            sdr.is_ob_notnull_constraint(
+                "T1_OBCHECK_001",
+                'CHECK (("ID_BUSI_VAT_INVOICE" IS NOT NULL))',
+            )
+        )
+
+    def test_compare_constraints_suppresses_source_notnull_check_when_target_has_obnotnull(self):
+        oracle_meta = self._make_oracle_meta(
+            table_columns={},
+            constraints={
+                ("SRC", "T1"): {
+                    "CK_SRC": {
+                        "type": "C",
+                        "status": "ENABLED",
+                        "validated": "VALIDATED",
+                        "columns": ["ID_BUSI_VAT_INVOICE"],
+                        "search_condition": "id_busi_vat_invoice is not null",
+                        "index_name": None,
+                        "r_owner": None,
+                        "r_constraint": None,
+                        "delete_rule": None,
+                        "update_rule": None,
+                        "deferrable": None,
+                        "deferred": None,
+                    }
+                }
+            },
+        )
+        target_constraints = {
+            ("TGT", "T1"): {
+                "T1_OBNOTNULL_1": {
+                    "type": "C",
+                    "status": "ENABLED",
+                    "validated": "VALIDATED",
+                    "columns": ["ID_BUSI_VAT_INVOICE"],
+                    "search_condition": '"ID_BUSI_VAT_INVOICE" IS NOT NULL',
+                    "index_name": None,
+                    "r_owner": None,
+                    "r_constraint": None,
+                    "delete_rule": None,
+                    "update_rule": None,
+                    "deferrable": None,
+                    "deferred": None,
+                    "ref_metadata_complete": None,
+                }
+            }
+        }
+        ob_meta = self._make_ob_meta(
+            objects_by_type={},
+            tab_columns={},
+            constraints=target_constraints,
+        )._replace(
+            enabled_notnull_check_groups={
+                ("TGT", "T1"): sdr.build_enabled_notnull_check_group_map(
+                    target_constraints[("TGT", "T1")]
+                )
+            }
+        )
+
+        ok, mismatch = sdr.compare_constraints_for_table(
+            oracle_meta,
+            ob_meta,
+            "SRC",
+            "T1",
+            "TGT",
+            "T1",
+            {},
+        )
+
+        self.assertTrue(ok)
+        self.assertIsNone(mismatch)
