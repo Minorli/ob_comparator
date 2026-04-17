@@ -27,7 +27,7 @@ password    = your_password
 [SETTINGS]
 # 源端数据库类型：
 #   oracle    -> 默认，Oracle -> OceanBase
-#   oceanbase -> OceanBase -> OceanBase（已支持 compare + certified fixup；grant/Oracle blacklist 等未认证能力会转 deferred/manual）
+#   oceanbase -> OceanBase -> OceanBase（已支持 compare + certified fixup；grants/source usability/table presence/cutoff/product-mode scope 可直接启用；Oracle blacklist 仅保留诊断提示）
 source_db_mode         = oracle
 # 要扫描的所有源端 schema，用逗号分隔，可换行（大小写不敏感）
 source_schemas          = ORA_APP,ORA_FIN,ORA_BI
@@ -36,13 +36,16 @@ source_schemas          = ORA_APP,ORA_FIN,ORA_BI
 remap_file              = remap_rules.txt
 # 源对象范围模式：
 #   full_source        -> 当前默认行为：基于 source_schemas 全量扫描
-#   remap_root_closure -> 仅以 remap_file 中显式 TABLE/VIEW 为根种子，按依赖/附属关系扩展闭包
-#                         trigger_list 中显式列出的触发器会作为额外 keep set 保留
+#   explicit_roots     -> 仅保留 remap_file 中显式 TABLE/VIEW roots 及其附属对象
+#   remap_root_closure -> 以 remap_file 中显式 TABLE/VIEW 为根种子，按依赖/附属关系扩展闭包
+#                         两种 scoped 模式下，trigger_list 中显式列出的触发器都会作为额外 keep set 保留
 source_object_scope_mode = full_source
 # remap_scope_text_fallback_mode：scoped 文本补盲模式
 #   off  -> 关闭（默认）
 #   safe -> 仅从 DBA_SOURCE/DBA_VIEWS/DBA_MVIEWS/DBA_SCHEDULER_* 等受控文本来源补盲
 #           不做全 schema DBMS_METADATA 全量 grep
+#           额外支持静态 DBMS_SCHEDULER.CREATE_JOB/CREATE_SCHEDULE 名称补盲；
+#           动态 job_name/schedule_name 会写入 source_scope_detail_<ts>.txt 供人工复核
 remap_scope_text_fallback_mode = off
 # scope_integrity_check：是否检查 remap_root_closure 下 scoped VIEW/MVIEW 的前置依赖完整性
 #   true  -> 输出 blocking prerequisite 诊断（默认）
@@ -111,6 +114,7 @@ report_dir_layout       = per_run
 report_detail_mode      = split
 # 报告存库（默认关闭，按需开启）
 # report_to_db: 是否写入 OceanBase（obclient 方式）
+#   备注：若省略该项，运行时会显式提示“当前按 false 处理”；依赖 report_db 的环境建议明确写出 true/false
 # report_db_schema: 存储 schema（留空使用目标连接用户）
 #   非空时必须是 Oracle 普通标识符，例如 DIFF_REPORT（不允许点号/引号/分号）
 # report_retention_days: 历史保留天数（0 表示不清理）
@@ -193,6 +197,9 @@ mview_check_fixup_mode  = auto
 # rewrite_to_normal : 将 Oracle GTT 生成成普通 TABLE DDL（默认）
 # preserve_original : 保留 Oracle GTT 语义原样输出
 # blocked           : 保持旧行为，继续走 unsupported/temporary 路径
+# auto              : 按目标 OB 版本自动在 preserve_original / rewrite_to_normal 之间选择
+#                     若显式 preserve_original 但目标版本不支持，会自动降级为 blocked
+# 注意：rewrite_to_normal 会丢失 ON COMMIT 事务清理语义，主报告和 manual_actions_required 会显式提示
 gtt_table_handling_mode = rewrite_to_normal
 # 是否生成目标端“多余对象”清理候选
 # 普通候选仍以注释形式输出；若识别到“目标端重复的单列 IS NOT NULL 语义 CHECK”，
@@ -219,7 +226,7 @@ interval_partition_cutoff = 20280301
 # interval_partition_cutoff_numeric: 数值型 interval 分区补齐上限（仅数值分区键使用），如 100000
 interval_partition_cutoff_numeric =
 # 是否生成授权脚本并附加到修补 DDL（依赖于源端权限/依赖推导）
-# 注意：source_db_mode=oceanbase 下当前会自动门控关闭
+# source_db_mode=oceanbase 下会按 OB source inventory 正常生成 role/system/object/column privilege 缺失授权
 # 可选值：true/false/1/0/yes/no（大小写不敏感）
 generate_grants         = true
 # 授权生成模式
@@ -280,6 +287,8 @@ fixup_types             =
 # JOB/SCHEDULE 修补模式：
 #   manual    -> 仅标记不支持，不生成脚本（默认）
 #   semi_auto -> 当源端 DDL 缺失时，生成草案模板到 fixup_scripts/unsupported/job|schedule/
+# 说明：run_fixup 默认跳过 fixup_scripts/job/ 与 fixup_scripts/schedule/，需显式 --only-dirs job|schedule
+# 说明：即便显式配合 --iterative，JOB/SCHEDULE 失败后也只写入 errors/fixup_errors_<ts>.txt，不会跨轮自动重试
 job_schedule_fixup_mode = manual
 # 普通 NOT NULL 收紧输出模式：
 #   review_only         -> 保持 review-first 注释
@@ -299,6 +308,7 @@ fixup_idempotent_types  =
 #   all         -> 生成 PUBLIC + 私有同义词
 #   public_only -> 仅生成 PUBLIC 同义词
 # 默认：Oracle 源 public_only；OceanBase 源 all。此模板示例按 Oracle 路径保留 public_only。
+# 提示：OceanBase 源若省略该项，运行时会显式提示“当前默认按 all 处理”。
 synonym_fixup_scope     = public_only
 # 约束/索引重名处理模式：
 #   off    -> 关闭
@@ -325,6 +335,7 @@ trigger_qualify_schema  = true
 #   public_only -> 仅将 PUBLIC 同义词纳入主校验与检查汇总
 #   all         -> PUBLIC + 私有同义词全部纳入校验
 # 默认：Oracle 源 public_only；OceanBase 源 all。此模板示例按 Oracle 路径保留 public_only。
+# 提示：OceanBase 源若省略该项，运行时会显式提示“当前默认按 all 处理”。
 # check_extra_types 可选值：
 #   INDEX, CONSTRAINT, SEQUENCE, TRIGGER
 # check_status_drift_types 可选值：
@@ -419,6 +430,7 @@ column_visibility_policy = auto
 #   table_only -> 仅使用 TMP_BLACK_TABLE
 #   rules_only -> 仅使用规则文件
 #   disabled   -> 关闭黑名单过滤
+# 说明：该能力面向 Oracle source；source_db_mode=oceanbase 下仅保留诊断提示，不进入 OB source compare/fixup 主链路
 blacklist_mode          = auto
 # 黑名单规则文件（JSON），留空使用内置默认
 # 注意：blacklist_mode=auto/rules_only 时需保证该文件随工具一同部署，否则规则会被跳过

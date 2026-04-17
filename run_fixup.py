@@ -62,7 +62,7 @@ try:
 except Exception:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 
-__version__ = "0.9.9.3"
+__version__ = "0.9.9.4"
 
 CONFIG_DEFAULT_PATH = "config.ini"
 DEFAULT_FIXUP_DIR = "fixup_scripts"
@@ -86,6 +86,71 @@ NOTICE_STATE_FILENAME = ".comparator_notice_state.json"
 NOTICE_STATE_SCHEMA_VERSION = 1
 MANUAL_ACTION_REPORT_KIND = "MANUAL_ACTION_REQUIRED"
 MANUAL_ACTION_REPORT_SCHEMA_VERSION = 1
+MANUAL_REVIEW_DIRS = ("materialized_view", "job", "schedule")
+FIXUP_SUPPORT_TIER_CERTIFIED = "certified"
+FIXUP_SUPPORT_TIER_PREVIEW = "preview"
+FIXUP_SUPPORT_TIER_MANUAL_ONLY = "manual-only"
+FIXUP_SUPPORT_TIER_UNSUPPORTED = "unsupported"
+FIXUP_RETRY_POLICY_ITERATIVE = "iterative-retry"
+FIXUP_RETRY_POLICY_NO_ITERATIVE = "no-iterative-retry"
+FIXUP_FAMILY_EXECUTION_CONTRACTS: Dict[str, Dict[str, object]] = {
+    "materialized_view": {
+        "family": "MATERIALIZED VIEW",
+        "support_tier": FIXUP_SUPPORT_TIER_MANUAL_ONLY,
+        "retry_policy": FIXUP_RETRY_POLICY_NO_ITERATIVE,
+        "iterative_retry": False,
+        "note": "manual-only family，需人工核对后单次执行。",
+    },
+    "job": {
+        "family": "JOB",
+        "support_tier": FIXUP_SUPPORT_TIER_MANUAL_ONLY,
+        "retry_policy": FIXUP_RETRY_POLICY_NO_ITERATIVE,
+        "iterative_retry": False,
+        "note": "manual-only family，需人工核对后单次执行。",
+    },
+    "schedule": {
+        "family": "SCHEDULE",
+        "support_tier": FIXUP_SUPPORT_TIER_MANUAL_ONLY,
+        "retry_policy": FIXUP_RETRY_POLICY_NO_ITERATIVE,
+        "iterative_retry": False,
+        "note": "manual-only family，需人工核对后单次执行。",
+    },
+    "sequence_restart": {
+        "family": "SEQUENCE RESTART",
+        "support_tier": FIXUP_SUPPORT_TIER_MANUAL_ONLY,
+        "retry_policy": FIXUP_RETRY_POLICY_NO_ITERATIVE,
+        "iterative_retry": False,
+        "note": "值同步 SQL，失败后应先核对源/目标 LAST_NUMBER。",
+    },
+    "cleanup_safe": {
+        "family": "CLEANUP SAFE",
+        "support_tier": FIXUP_SUPPORT_TIER_MANUAL_ONLY,
+        "retry_policy": FIXUP_RETRY_POLICY_NO_ITERATIVE,
+        "iterative_retry": False,
+        "note": "destructive 清理 SQL，失败后需人工确认。",
+    },
+    "cleanup_semantic": {
+        "family": "CLEANUP SEMANTIC",
+        "support_tier": FIXUP_SUPPORT_TIER_MANUAL_ONLY,
+        "retry_policy": FIXUP_RETRY_POLICY_NO_ITERATIVE,
+        "iterative_retry": False,
+        "note": "语义级 destructive 清理 SQL，失败后需人工确认。",
+    },
+    "tables_unsupported": {
+        "family": "TABLE",
+        "support_tier": FIXUP_SUPPORT_TIER_UNSUPPORTED,
+        "retry_policy": FIXUP_RETRY_POLICY_NO_ITERATIVE,
+        "iterative_retry": False,
+        "note": "缺少高保真 DDL，仅输出占位脚本。",
+    },
+    "unsupported": {
+        "family": "UNSUPPORTED",
+        "support_tier": FIXUP_SUPPORT_TIER_UNSUPPORTED,
+        "retry_policy": FIXUP_RETRY_POLICY_NO_ITERATIVE,
+        "iterative_retry": False,
+        "note": "仅输出 unsupported 草案，不纳入自动重试。",
+    },
+}
 
 class RuntimeNotice(NamedTuple):
     notice_id: str
@@ -104,6 +169,58 @@ class ManualActionNoticeRow(NamedTuple):
     related_fixup_dir: str
     why: str
     recommended_action: str
+
+
+def normalize_contract_dir_name(path_value: Union[Path, str, None]) -> str:
+    if path_value is None:
+        return ""
+    raw = str(path_value).strip()
+    if not raw:
+        return ""
+    parts = Path(raw).parts
+    if not parts:
+        return normalize_dir_filter(raw.split("/", 1)[0])
+    head = normalize_dir_filter(parts[0])
+    known_heads = set(FIXUP_FAMILY_EXECUTION_CONTRACTS.keys()) | set(DIR_OBJECT_TYPE_MAP.keys()) | set(GRANT_DIRS)
+    if head in known_heads:
+        return head
+    if head in {DEFAULT_FIXUP_DIR, DONE_DIR_NAME} and len(parts) > 1:
+        return normalize_dir_filter(parts[1])
+    if len(parts) > 1:
+        second = normalize_dir_filter(parts[1])
+        if second:
+            return second
+    return head
+
+
+def build_default_family_label(dir_name: str) -> str:
+    if not dir_name:
+        return "-"
+    mapped = DIR_OBJECT_TYPE_MAP.get(dir_name)
+    if mapped:
+        return mapped
+    return dir_name.replace("_", " ").upper()
+
+
+def get_fixup_execution_contract(path_value: Union[Path, str, None]) -> Dict[str, object]:
+    dir_name = normalize_contract_dir_name(path_value)
+    contract = FIXUP_FAMILY_EXECUTION_CONTRACTS.get(dir_name)
+    if contract is not None:
+        resolved = dict(contract)
+        resolved.setdefault("family", build_default_family_label(dir_name))
+        resolved.setdefault("support_tier", FIXUP_SUPPORT_TIER_CERTIFIED)
+        resolved.setdefault("retry_policy", FIXUP_RETRY_POLICY_ITERATIVE)
+        resolved.setdefault("iterative_retry", True)
+        resolved["dir_name"] = dir_name
+        return resolved
+    return {
+        "dir_name": dir_name,
+        "family": build_default_family_label(dir_name),
+        "support_tier": FIXUP_SUPPORT_TIER_CERTIFIED if dir_name else "-",
+        "retry_policy": FIXUP_RETRY_POLICY_ITERATIVE if dir_name else "-",
+        "iterative_retry": True,
+        "note": "",
+    }
 
 
 def resolve_notice_state_path(config_dir: Optional[Union[str, Path]]) -> Path:
@@ -872,18 +989,20 @@ DEPENDENCY_LAYERS = [
     ["table"],                                       # Layer 2: Base tables
     ["table_alter"],                                 # Layer 3: Table modifications
     ["view_prereq_grants", "grants"],                # Layer 4: View prereq + general grants
-    ["view", "view_refresh", "synonym"],             # Layer 5: View create/refresh + simple dependent objects
-    ["view_post_grants"],                            # Layer 6: View post grants
-    ["materialized_view"],                           # Layer 7: MVIEWs
-    ["type"],                                        # Layer 8: Types (specs)
-    ["package"],                                     # Layer 9: Package specs
-    ["procedure", "function"],                       # Layer 10: Standalone routines
-    ["type_body", "package_body"],                   # Layer 11: Type/package bodies
-    ["context"],                                     # Layer 12: Application contexts
-    ["name_collision"],                              # Layer 13: Name collision remediation
-    ["constraint", "index"],                         # Layer 14: Constraints and indexes
-    ["trigger"],                                     # Layer 15: Triggers (last)
-    ["job", "schedule"],                             # Layer 16: Jobs
+    ["synonym"],                                     # Layer 5: Synonyms
+    ["view_refresh"],                                # Layer 6: Existing prerequisite views
+    ["view"],                                        # Layer 7: Missing views
+    ["view_post_grants"],                            # Layer 8: View post grants
+    ["materialized_view"],                           # Layer 9: MVIEWs
+    ["type"],                                        # Layer 10: Types (specs)
+    ["package"],                                     # Layer 11: Package specs
+    ["procedure", "function"],                       # Layer 12: Standalone routines
+    ["type_body", "package_body"],                   # Layer 13: Type/package bodies
+    ["context"],                                     # Layer 14: Application contexts
+    ["name_collision"],                              # Layer 15: Name collision remediation
+    ["constraint", "index"],                         # Layer 16: Constraints and indexes
+    ["trigger"],                                     # Layer 17: Triggers (last)
+    ["job", "schedule"],                             # Layer 18: Jobs
 ]
 
 CORE_GRANT_DIRS_ORDER = ("grants_all", "grants_miss", "grants")
@@ -1061,6 +1180,10 @@ def build_run_fixup_change_notices(
     selected_grants_revoke = any(dir_filter_overlaps("grants_revoke", item) for item in selected_dirs)
     selected_cleanup_safe = any(dir_filter_overlaps("cleanup_safe", item) for item in selected_dirs)
     selected_sequence_restart = any(dir_filter_overlaps("sequence_restart", item) for item in selected_dirs)
+    selected_manual_review = any(
+        any(dir_filter_overlaps(dir_name, item) for item in selected_dirs)
+        for dir_name in MANUAL_REVIEW_DIRS
+    )
     if not getattr(args, "allow_table_create", False) and (
         selected_table or (selected_all and (fixup_dir / "table").exists())
     ):
@@ -1101,6 +1224,22 @@ def build_run_fixup_change_notices(
             "0.9.8.9",
             "sequence_restart 默认不自动执行",
             "sequence_restart/ 是值同步 SQL；请先核对 sequence_restart_detail 与源/目标 LAST_NUMBER，再显式按目录执行。",
+        ))
+    manual_dirs_present = [
+        dir_name for dir_name in MANUAL_REVIEW_DIRS
+        if (fixup_dir / dir_name).exists()
+    ]
+    if manual_dirs_present and (selected_all or selected_manual_review):
+        iterative_hint = ""
+        if getattr(args, "iterative", False):
+            iterative_hint = " 如启用 --iterative，失败脚本也只保留到 errors 报告，不会自动重试。"
+        notices.append(RuntimeNotice(
+            "manual_only_family_review",
+            "0.9.9.4",
+            "manual-only family 默认不自动执行",
+            "、".join(manual_dirs_present)
+            + "/ 属于 manual-only family；请先核对 manual_actions_required 与源端定义，再显式按目录执行。"
+            + iterative_hint,
         ))
     return notices
 
@@ -1231,8 +1370,10 @@ class FixupStateLedger:
         self._load()
 
     @staticmethod
-    def fingerprint(sql_text: str) -> str:
-        return hashlib.sha1((sql_text or "").encode("utf-8")).hexdigest()
+    def fingerprint(sql_payload: Union[str, bytes]) -> str:
+        if isinstance(sql_payload, bytes):
+            return hashlib.sha1(sql_payload).hexdigest()
+        return hashlib.sha1((sql_payload or "").encode("utf-8")).hexdigest()
 
     def _load(self) -> None:
         if not self.path.exists():
@@ -1296,16 +1437,20 @@ class FixupStateLedger:
             self._dirty = True
 
 
-def read_sql_text_with_limit(sql_path: Path, max_bytes: Optional[int]) -> Tuple[Optional[str], Optional[str]]:
+def read_sql_text_with_limit(sql_path: Path, max_bytes: Optional[int]) -> Tuple[Optional[str], Optional[bytes], Optional[str]]:
     """Read SQL file with optional size limit."""
     try:
         if max_bytes and max_bytes > 0:
             size = sql_path.stat().st_size
             if size > max_bytes:
-                return None, f"文件过大 ({size} bytes) 超过限制 {max_bytes} bytes"
-        return sql_path.read_text(encoding="utf-8", errors="replace"), None
+                return None, None, f"文件过大 ({size} bytes) 超过限制 {max_bytes} bytes"
+        raw_bytes = sql_path.read_bytes()
+        try:
+            return raw_bytes.decode("utf-8"), raw_bytes, None
+        except UnicodeDecodeError as exc:
+            return None, raw_bytes, f"文件编码不是 UTF-8，已阻断执行以避免破坏 replay/ledger 语义: {exc}"
     except Exception as exc:
-        return None, f"读取文件失败: {exc}"
+        return None, None, f"读取文件失败: {exc}"
 
 
 def extract_sql_error(output: str) -> Optional[str]:
@@ -1624,6 +1769,9 @@ class ErrorReportEntry:
     error_code: str
     object_name: str
     message: str
+    family: str = "-"
+    support_tier: str = "-"
+    retry_policy: str = "-"
 
 
 @dataclass
@@ -2117,7 +2265,7 @@ def load_ob_config(config_path: Path) -> Tuple[Dict[str, str], Path, Path, str, 
 
     if source_db_mode == "oceanbase":
         log.info(
-            "source_db_mode=oceanbase：run_fixup 执行语义保持不变；unsupported/、grants_deferred/、cleanup_safe/cleanup_semantic 仍默认不会自动执行。"
+            "source_db_mode=oceanbase：run_fixup 执行语义保持不变；unsupported/、grants_deferred/、cleanup_safe/cleanup_semantic、materialized_view/job/schedule 仍默认不会自动执行，manual-only family 即便显式配合 --iterative 也不会跨轮自动重试。"
         )
 
     report_dir = parser.get("SETTINGS", "report_dir", fallback="main_reports").strip() or "main_reports"
@@ -2288,7 +2436,7 @@ def collect_sql_files_by_layer(
         # Keep non-smart execution order aligned with dependency-aware layers.
         priority = [
             "sequence", "sequence_restart", "table", "table_alter", "view_prereq_grants", "grants",
-            "view", "view_refresh", "synonym", "view_post_grants", "materialized_view",
+            "synonym", "view_refresh", "view", "view_post_grants", "materialized_view",
             "type", "package", "procedure", "function",
             "type_body", "package_body", "context", "name_collision", "constraint", "index", "trigger",
             "job", "schedule",
@@ -2565,6 +2713,13 @@ def extract_execution_error(result: subprocess.CompletedProcess) -> Optional[str
     if stdout_error:
         return stdout_error
     if result.returncode != 0:
+        combined_lines = [
+            line.strip()
+            for line in ((result.stderr or "") + "\n" + (result.stdout or "")).splitlines()
+            if line.strip()
+        ]
+        if combined_lines:
+            return combined_lines[-1]
         stderr = (result.stderr or "").strip()
         return stderr or "执行失败"
     return None
@@ -3793,7 +3948,7 @@ def build_view_chain_plan(
             plan_lines.append(f"BLOCK: 缺少 DDL for {dep_full}({dep_type})")
             blocked = True
             continue
-        ddl_text, ddl_error = read_sql_text_with_limit(ddl_path, max_sql_file_bytes)
+        ddl_text, _ddl_bytes, ddl_error = read_sql_text_with_limit(ddl_path, max_sql_file_bytes)
         if ddl_error:
             plan_lines.append(f"BLOCK: 读取 DDL 失败 {ddl_path} ({ddl_error})")
             blocked = True
@@ -4096,9 +4251,7 @@ def execute_sql_statements(
 
     current_schema: Optional[str] = None
 
-    for idx, statement in enumerate(statements, start=1):
-        if not statement.strip():
-            continue
+    for idx, statement in enumerate(effective_statements, start=1):
         match = CURRENT_SCHEMA_PATTERN.match(statement.strip())
         if match:
             current_schema = match.group("schema")
@@ -4110,6 +4263,14 @@ def execute_sql_statements(
         except subprocess.TimeoutExpired:
             timeout_label = "no-timeout" if timeout is None else f"> {timeout} 秒"
             failures.append(StatementFailure(idx, f"执行超时 ({timeout_label})", statement_to_run))
+            for remainder_idx, remainder_statement in enumerate(effective_statements[idx:], start=idx + 1):
+                failures.append(
+                    StatementFailure(
+                        remainder_idx,
+                        "前置语句超时未执行",
+                        remainder_statement,
+                    )
+                )
             break
 
         error_msg = extract_execution_error(result)
@@ -4898,6 +5059,7 @@ def record_error_entry(
         return False
     error_code = parse_error_code(error_message)
     object_name = infer_error_object(statement, relative_path)
+    contract = get_fixup_execution_contract(relative_path)
     message = " ".join((error_message or "").split())
     if len(message) > 200:
         message = message[:200] + "..."
@@ -4907,7 +5069,10 @@ def record_error_entry(
             statement_index=statement_index,
             error_code=error_code,
             object_name=object_name,
-            message=message or "-"
+            message=message or "-",
+            family=str(contract.get("family") or "-"),
+            support_tier=str(contract.get("support_tier") or "-"),
+            retry_policy=str(contract.get("retry_policy") or "-"),
         )
     )
     return True
@@ -4928,11 +5093,12 @@ def write_error_report(
     lines = [
         "# fixup error report",
         f"# count={len(entries)} limit={limit} truncated={'true' if truncated else 'false'}",
-        "FILE | STMT_INDEX | ERROR_CODE | OBJECT | MESSAGE"
+        "FILE | STMT_INDEX | ERROR_CODE | OBJECT | FAMILY | SUPPORT_TIER | RETRY_POLICY | MESSAGE"
     ]
     for entry in entries:
         lines.append(
-            f"{entry.file_path} | {entry.statement_index} | {entry.error_code} | {entry.object_name} | {entry.message}"
+            f"{entry.file_path} | {entry.statement_index} | {entry.error_code} | {entry.object_name} | "
+            f"{entry.family} | {entry.support_tier} | {entry.retry_policy} | {entry.message}"
         )
     if truncated:
         lines.append("[... TRUNCATED ...]")
@@ -4954,6 +5120,16 @@ def normalize_failed_path(path: Path, repo_root: Path) -> Path:
         return repo_root / raw
 
 
+def build_non_retryable_iterative_message(relative_path: Path) -> str:
+    contract = get_fixup_execution_contract(relative_path)
+    return (
+        f"family={contract.get('family') or '-'}, "
+        f"support_tier={contract.get('support_tier') or '-'}, "
+        f"retry_policy={contract.get('retry_policy') or '-'}；"
+        "上一轮失败后本轮不自动重试"
+    )
+
+
 def execute_grant_file_with_prune(
     obclient_cmd: List[str],
     sql_path: Path,
@@ -4968,13 +5144,13 @@ def execute_grant_file_with_prune(
     state_ledger: Optional[FixupStateLedger] = None
 ) -> Tuple[ScriptResult, ExecutionSummary, int, int, bool]:
     relative_path = sql_path.relative_to(repo_root)
-    sql_text, read_error = read_sql_text_with_limit(sql_path, max_sql_file_bytes)
+    sql_text, sql_bytes, read_error = read_sql_text_with_limit(sql_path, max_sql_file_bytes)
     if read_error:
         msg = read_error
         log.error("%s %s -> ERROR (%s)", label_prefix, relative_path, msg)
         failure = StatementFailure(0, msg, "")
         return ScriptResult(relative_path, "ERROR", msg, layer), ExecutionSummary(0, [failure]), 0, 0, False
-    fingerprint = FixupStateLedger.fingerprint(sql_text or "")
+    fingerprint = FixupStateLedger.fingerprint(sql_bytes or b"")
     if state_ledger and state_ledger.is_completed(relative_path, fingerprint):
         msg = "状态账本命中，跳过重复执行"
         log.warning("%s %s -> SKIP (%s)", label_prefix, relative_path, msg)
@@ -5107,12 +5283,12 @@ def execute_script_with_summary(
     exec_stats: Optional[Dict[str, int]] = None,
 ) -> Tuple[ScriptResult, ExecutionSummary]:
     relative_path = sql_path.relative_to(repo_root)
-    sql_text, read_error = read_sql_text_with_limit(sql_path, max_sql_file_bytes)
+    sql_text, sql_bytes, read_error = read_sql_text_with_limit(sql_path, max_sql_file_bytes)
     if read_error:
         msg = read_error
         log.error("%s %s -> ERROR (%s)", label_prefix, relative_path, msg)
         return ScriptResult(relative_path, "ERROR", msg, layer), ExecutionSummary(0, [StatementFailure(0, msg, "")])
-    fingerprint = FixupStateLedger.fingerprint(sql_text or "")
+    fingerprint = FixupStateLedger.fingerprint(sql_bytes or b"")
     if state_ledger and state_ledger.is_completed(relative_path, fingerprint):
         msg = "状态账本命中，跳过重复执行"
         log.warning("%s %s -> SKIP (%s)", label_prefix, relative_path, msg)
@@ -5366,6 +5542,7 @@ def parse_args() -> argparse.Namespace:
           --view-chain-autofix : 基于 VIEW 依赖链生成/执行修复计划
           --allow-table-create : 允许执行 table/ 建表脚本（默认关闭，防止误建空表）
           注意: grants_deferred/ 默认跳过，需在补齐对象后显式执行
+          注意: materialized_view/job/schedule 默认跳过，需核对后显式执行；即便显式配合 --iterative 也不会跨轮自动重试
         
         保留原有功能：
           --only-dirs    : 按子目录过滤
@@ -5529,7 +5706,16 @@ def main() -> None:
         only_dirs = [normalize_dir_filter(d) for d in only_dirs] if only_dirs else []
     
     exclude_dirs = [normalize_dir_filter(d) for d in exclude_dirs]
-    default_excludes = {"tables_unsupported", "unsupported", "constraint_validate_later", "grants_deferred", "cleanup_safe", "cleanup_semantic", "sequence_restart"}
+    default_excludes = {
+        "tables_unsupported",
+        "unsupported",
+        "constraint_validate_later",
+        "grants_deferred",
+        "cleanup_safe",
+        "cleanup_semantic",
+        "sequence_restart",
+        *MANUAL_REVIEW_DIRS,
+    }
     if not getattr(args, "allow_table_create", False):
         # Safety first: table create scripts are risky in migration workflows
         # because they can create empty target tables if OMS data load is skipped.
@@ -5556,6 +5742,13 @@ def main() -> None:
         log.warning("安全模式: 默认跳过 fixup_scripts/grants_deferred/（需对象补齐后再执行）。")
     if not any(dir_filter_overlaps("sequence_restart", item) for item in only_dirs):
         log.warning("安全模式: 默认跳过 fixup_scripts/sequence_restart/（值同步 SQL 需确认 LAST_NUMBER 与执行时机后再执行）。")
+    if not any(
+        any(dir_filter_overlaps(dir_name, item) for item in only_dirs)
+        for dir_name in MANUAL_REVIEW_DIRS
+    ):
+        log.warning(
+            "安全模式: 默认跳过 fixup_scripts/materialized_view|job|schedule/（manual-only family 需核对定义与人工事项后再显式执行）。"
+        )
     if not any(dir_filter_overlaps("cleanup_safe", item) for item in only_dirs):
         log.warning("安全模式: 默认跳过 fixup_scripts/cleanup_safe/（显式审核后再执行 destructive 清理 SQL）。")
     if not any(dir_filter_overlaps("cleanup_semantic", item) for item in only_dirs):
@@ -6428,9 +6621,11 @@ def run_iterative_fixup(
     cumulative_success = 0
     cumulative_failed = 0
     active_failed_paths: Set[Path] = set()
+    non_retryable_failed_paths: Set[Path] = set()
     recompile_owners: Set[str] = set()
     
     all_round_results = []
+    last_failure_results: List[ScriptResult] = []
     exec_stats = new_exec_mode_stats()
     
     while round_num < max_rounds:
@@ -6506,9 +6701,16 @@ def run_iterative_fixup(
             
             relative_path = sql_path.relative_to(repo_root)
             label = format_progress_label(idx, total_scripts, width)
+            normalized_path = normalize_failed_path(relative_path, repo_root)
+            contract = get_fixup_execution_contract(relative_path)
 
             if sql_path in pre_executed:
                 log.info("%s %s -> SKIP (已由依赖解析执行)", label, relative_path)
+                continue
+            if normalized_path in non_retryable_failed_paths:
+                msg = build_non_retryable_iterative_message(relative_path)
+                log.warning("%s %s -> SKIP (%s)", label, relative_path, msg)
+                round_results.append(ScriptResult(relative_path, "SKIPPED", msg, layer))
                 continue
 
             if is_grant_dir(sql_path.parent.name):
@@ -6577,6 +6779,16 @@ def run_iterative_fixup(
                             round_results.append(retry_result)
                             continue
                 round_results.append(result)
+                if result.status in ("FAILED", "ERROR") and not bool(contract.get("iterative_retry", True)):
+                    non_retryable_failed_paths.add(normalized_path)
+                    log.warning(
+                        "%s %s -> 保留失败；family=%s, support_tier=%s, retry_policy=%s。",
+                        label,
+                        relative_path,
+                        contract.get("family") or "-",
+                        contract.get("support_tier") or "-",
+                        contract.get("retry_policy") or "-",
+                    )
                 continue
 
             obj_type = DIR_OBJECT_TYPE_MAP.get(sql_path.parent.name.lower())
@@ -6619,6 +6831,16 @@ def run_iterative_fixup(
                             failure.index,
                             failure.statement,
                             failure.error
+                        )
+                    if not bool(contract.get("iterative_retry", True)):
+                        non_retryable_failed_paths.add(normalized_path)
+                        log.warning(
+                            "%s %s -> 保留失败；family=%s, support_tier=%s, retry_policy=%s。",
+                            label,
+                            relative_path,
+                            contract.get("family") or "-",
+                            contract.get("support_tier") or "-",
+                            contract.get("retry_policy") or "-",
                         )
                 continue
 
@@ -6721,6 +6943,16 @@ def run_iterative_fixup(
                             failure.statement,
                             failure.error
                         )
+                    if not bool(contract.get("iterative_retry", True)):
+                        non_retryable_failed_paths.add(normalized_path)
+                        log.warning(
+                            "%s %s -> 保留失败；family=%s, support_tier=%s, retry_policy=%s。",
+                            label,
+                            relative_path,
+                            contract.get("family") or "-",
+                            contract.get("support_tier") or "-",
+                            contract.get("retry_policy") or "-",
+                        )
                 continue
 
             round_results.append(result)
@@ -6736,6 +6968,16 @@ def run_iterative_fixup(
                         failure.statement,
                         failure.error
                     )
+                if not bool(contract.get("iterative_retry", True)):
+                    non_retryable_failed_paths.add(normalized_path)
+                    log.warning(
+                        "%s %s -> 保留失败；family=%s, support_tier=%s, retry_policy=%s。",
+                        label,
+                        relative_path,
+                        contract.get("family") or "-",
+                        contract.get("support_tier") or "-",
+                        contract.get("retry_policy") or "-",
+                    )
         
         # Round summary
         round_success = sum(1 for r in round_results if r.status == "SUCCESS")
@@ -6747,9 +6989,14 @@ def run_iterative_fixup(
             failed_path = normalize_failed_path(item.path, repo_root)
             if item.status in ("FAILED", "ERROR"):
                 active_failed_paths.add(failed_path)
+            elif failed_path in non_retryable_failed_paths:
+                active_failed_paths.add(failed_path)
             else:
                 active_failed_paths.discard(failed_path)
         cumulative_failed = len(active_failed_paths)
+        current_failure_results = [item for item in round_results if item.status in ("FAILED", "ERROR")]
+        if current_failure_results:
+            last_failure_results = current_failure_results
         
         log_subsection(f"第 {round_num} 轮结果")
         log.info("本轮成功: %d", round_success)
@@ -6771,7 +7018,7 @@ def run_iterative_fixup(
         if round_success < effective_min_progress:
             if round_success == 0:
                 log.warning("本轮无新成功脚本，停止迭代。")
-                failures_by_type = analyze_failure_patterns(round_results)
+                failures_by_type = analyze_failure_patterns(current_failure_results or last_failure_results)
                 if failures_by_type:
                     log_failure_analysis(failures_by_type)
             else:
@@ -6835,7 +7082,10 @@ def run_iterative_fixup(
     # Final failure analysis
     if round_num > 0 and all_round_results:
         final_results = all_round_results[-1]['results']
-        failures_by_type = analyze_failure_patterns(final_results)
+        failure_analysis_source = [item for item in final_results if item.status in ("FAILED", "ERROR")]
+        if not failure_analysis_source:
+            failure_analysis_source = last_failure_results
+        failures_by_type = analyze_failure_patterns(failure_analysis_source)
         if failures_by_type:
             log_failure_analysis(failures_by_type)
     

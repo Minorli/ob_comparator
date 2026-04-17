@@ -27,7 +27,7 @@ import schema_diff_reconciler as sdr
 
 
 class TestRunFixupRegressionScenarios(unittest.TestCase):
-    def test_non_smart_order_places_view_refresh_after_view(self):
+    def test_non_smart_order_places_synonym_and_refresh_before_view(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             fixup_dir = Path(tmpdir) / "fixup"
             (fixup_dir / "view").mkdir(parents=True)
@@ -47,8 +47,8 @@ class TestRunFixupRegressionScenarios(unittest.TestCase):
             files = rf.collect_sql_files_by_layer(fixup_dir, smart_order=False)
             order = [str(path.relative_to(fixup_dir)) for _, path in files]
 
-            self.assertLess(order.index("view/A.V1.sql"), order.index("view_refresh/A.V1.sql"))
-            self.assertLess(order.index("view_refresh/A.V1.sql"), order.index("synonym/A.S1.sql"))
+            self.assertLess(order.index("synonym/A.S1.sql"), order.index("view_refresh/A.V1.sql"))
+            self.assertLess(order.index("view_refresh/A.V1.sql"), order.index("view/A.V1.sql"))
             self.assertLess(order.index("view_refresh/A.V1.sql"), order.index("materialized_view/A.MV1.sql"))
 
 
@@ -162,7 +162,7 @@ class TestContextRegressionScenarios(unittest.TestCase):
         try:
             sdr.oracledb.connect = lambda **_kwargs: FakeConnection()
             with mock.patch.object(sdr.log, "debug") as debug_mock:
-                contexts, err = sdr.load_oracle_context_inventory(
+                contexts, err, health = sdr.load_oracle_context_inventory(
                     {"user": "u", "password": "p", "dsn": "d"},
                     {"SRC"},
                 )
@@ -172,7 +172,9 @@ class TestContextRegressionScenarios(unittest.TestCase):
             else:
                 sdr.oracledb.connect = orig_connect
 
-        self.assertIsNone(err)
+        self.assertIsNotNone(err)
+        self.assertIn("fallback_to_simplified_dba_context", err)
+        self.assertEqual(health, sdr.CONTEXT_INVENTORY_HEALTH_DEGRADED)
         self.assertEqual(contexts["APP_CTX"].type, sdr.CONTEXT_MODE_LOCAL)
         debug_mock.assert_called()
         self.assertIn("load_oracle_context_inventory 降级", debug_mock.call_args[0][0])
