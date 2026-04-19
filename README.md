@@ -151,6 +151,7 @@ object_created_before =
 object_created_before_missing_created_policy = strict
 table_data_presence_auto_max_tables = 20000
 table_data_presence_chunk_size = 500
+ob_session_query_timeout_us = 3600000000
 config_hot_reload_mode = off
 config_hot_reload_interval_sec = 5
 config_hot_reload_fail_policy = keep_last_good

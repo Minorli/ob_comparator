@@ -316,6 +316,8 @@ LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOG_FILE_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
 LOG_SECTION_WIDTH = 80
 OBC_TIMEOUT = 60
+DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US = 3600000000
+OBCLIENT_SESSION_QUERY_TIMEOUT_US = DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
 OBCLIENT_SECURE_OPT = "--defaults-extra-file"
 _OBCLIENT_SECURE_FILES: Set[Path] = set()
 _OBCLIENT_SECURE_LOCK = threading.Lock()
@@ -784,6 +786,7 @@ def apply_config_hot_reload_at_phase(
         return
 
     prev_obc_timeout = OBC_TIMEOUT
+    prev_session_timeout = OBCLIENT_SESSION_QUERY_TIMEOUT_US
     try:
         ora_cfg_new, ob_cfg_new, candidate_settings = load_config(str(runtime.config_path))
     except Exception as exc:
@@ -800,8 +803,10 @@ def apply_config_hot_reload_at_phase(
             abort_run(f"配置热加载失败(phase={phase_name}): {exc}")
         return
     finally:
-        # load_config 会更新全局 OBC_TIMEOUT；热加载探测阶段不应产生隐式副作用。
+        # load_config 会更新全局 OBC_TIMEOUT / OBCLIENT_SESSION_QUERY_TIMEOUT_US；
+        # 热加载探测阶段不应产生隐式副作用。
         globals()["OBC_TIMEOUT"] = prev_obc_timeout
+        globals()["OBCLIENT_SESSION_QUERY_TIMEOUT_US"] = prev_session_timeout
 
     reloadable_keys = {
         "log_level",
@@ -1319,6 +1324,7 @@ class HintFilterResult(NamedTuple):
 
 # --- 全局 obclient timeout（秒），由配置初始化 ---
 OBC_TIMEOUT: int = 60
+OBCLIENT_SESSION_QUERY_TIMEOUT_US: int = DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
 
 
 # --- 模型定义 ---
@@ -8053,6 +8059,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault("extra_constraint_cleanup_mode", "safe_only")
         # obclient 超时时间 (秒)
         settings.setdefault("obclient_timeout", "60")
+        settings.setdefault(
+            "ob_session_query_timeout_us", str(DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US)
+        )
         # 报告输出目录
         settings.setdefault("report_dir", "main_reports")
         settings.setdefault("report_dir_layout", "per_run")
@@ -8796,6 +8805,20 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             OBC_TIMEOUT = int(settings["obclient_timeout"])
         except ValueError:
             OBC_TIMEOUT = 60
+        global OBCLIENT_SESSION_QUERY_TIMEOUT_US
+        try:
+            OBCLIENT_SESSION_QUERY_TIMEOUT_US = max(
+                0,
+                int(
+                    settings.get(
+                        "ob_session_query_timeout_us",
+                        str(DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US),
+                    )
+                ),
+            )
+        except (TypeError, ValueError):
+            OBCLIENT_SESSION_QUERY_TIMEOUT_US = DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
+        settings["ob_session_query_timeout_us"] = OBCLIENT_SESSION_QUERY_TIMEOUT_US
 
         log.info(
             "成功加载配置，source_db_mode=%s，将扫描 %d 个源 schema。",
@@ -8803,6 +8826,13 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             len(schemas_list),
         )
         log.info(f"obclient 超时时间: {OBC_TIMEOUT} 秒")
+        if OBCLIENT_SESSION_QUERY_TIMEOUT_US > 0:
+            log.info(
+                "obclient session ob_query_timeout 覆盖: %d 微秒。",
+                OBCLIENT_SESSION_QUERY_TIMEOUT_US,
+            )
+        else:
+            log.info("obclient session ob_query_timeout 覆盖已禁用，将沿用数据库默认值。")
         log.warning(
             "注意：程序将从 DBA_* 视图读取 Oracle/OceanBase 元数据，请确保运行账号具备 DBA/SELECT ANY DICTIONARY/SELECT_CATALOG_ROLE 等等价权限，否则结果将不完整。"
         )
@@ -10269,6 +10299,17 @@ def run_config_wizard(config_path: Path) -> None:
         "obclient 超时（秒）",
         default=cfg.get("SETTINGS", "obclient_timeout", fallback="60"),
         validator=_validate_positive_int,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "ob_session_query_timeout_us",
+        "obclient 会话 ob_query_timeout（微秒，0 表示沿用数据库默认）",
+        default=cfg.get(
+            "SETTINGS",
+            "ob_session_query_timeout_us",
+            fallback=str(DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US),
+        ),
+        validator=_validate_non_negative_int,
     )
     _prompt_field(
         "SETTINGS",
@@ -20755,11 +20796,7 @@ def obclient_run_sql(
 ) -> Tuple[bool, str, str]:
     """运行 obclient CLI 命令并返回 (Success, stdout, stderr)，带 timeout。"""
     timeout_val = OBC_TIMEOUT if timeout is None else max(1, int(timeout))
-    sql_payload = (sql_query or "").strip()
-    if sql_payload and not sql_payload.endswith(";"):
-        sql_payload += ";"
-    if sql_payload:
-        sql_payload += "\n"
+    sql_payload = build_obclient_sql_payload(sql_query)
     command_args = _build_obclient_command_args(ob_cfg, extra_args=["-ss"])  # Silent 模式
 
     def _extract_obclient_error(text: str) -> str:
@@ -20840,6 +20877,29 @@ def obclient_run_sql(
     except Exception as e:
         log.error(f"严重错误: 执行 subprocess 时发生未知错误: {e}")
         return False, "", str(e)
+
+
+def build_obclient_sql_payload(
+    sql_query: str, session_timeout_us: Optional[int] = None
+) -> str:
+    sql_payload = (sql_query or "").strip()
+    if sql_payload and not sql_payload.endswith(";"):
+        sql_payload += ";"
+    statements: List[str] = []
+    effective_timeout = (
+        OBCLIENT_SESSION_QUERY_TIMEOUT_US if session_timeout_us is None else session_timeout_us
+    )
+    try:
+        effective_timeout = max(0, int(effective_timeout))
+    except (TypeError, ValueError):
+        effective_timeout = DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
+    if effective_timeout > 0:
+        statements.append(f"ALTER SESSION SET ob_query_timeout = {effective_timeout};")
+    if sql_payload:
+        statements.append(sql_payload)
+    if not statements:
+        return ""
+    return "\n".join(statements) + "\n"
 
 
 def probe_target_plain_not_null_columns(
@@ -64024,6 +64084,7 @@ def parse_cli_args() -> argparse.Namespace:
             table_data_presence_auto_max_tables auto 模式候选表阈值（默认 20000）
             table_data_presence_chunk_size OB 批量探测 chunk 大小（默认 500）
             table_data_presence_obclient_timeout OB 批量探测超时（秒，默认沿用 obclient_timeout）
+            ob_session_query_timeout_us obclient 会话 ob_query_timeout（微秒，默认 3600000000；0 表示沿用数据库默认）
             table_data_presence_zero_probe_workers Oracle 零行探针并发数（默认 1，最大 32）
             generate_grants         true/false 控制授权脚本生成
             grant_generation_mode   full/structural 控制授权生成来源（Oracle 全量/最小结构性）

@@ -70,6 +70,7 @@ DEFAULT_FIXUP_DIR = "fixup_scripts"
 DONE_DIR_NAME = "done"
 DEFAULT_OBCLIENT_TIMEOUT = 60
 DEFAULT_FIXUP_TIMEOUT = 3600
+DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US = 3600000000
 DEFAULT_ERROR_REPORT_LIMIT = 200
 DEFAULT_FIXUP_MAX_SQL_FILE_MB = 50
 DEFAULT_FIXUP_AUTO_GRANT_CACHE_LIMIT = 10000
@@ -85,6 +86,7 @@ FIXUP_HOT_RELOAD_EVENTS_DIR = "errors"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
 REPO_ISSUES_URL = f"{REPO_URL}/issues"
 OBCLIENT_SECURE_OPT = "--defaults-extra-file"
+OBCLIENT_SESSION_QUERY_TIMEOUT_US = DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
 NOTICE_STATE_FILENAME = ".comparator_notice_state.json"
 NOTICE_STATE_SCHEMA_VERSION = 1
 MANUAL_ACTION_REPORT_KIND = "MANUAL_ACTION_REQUIRED"
@@ -2316,6 +2318,24 @@ def load_ob_config(
         log.warning("fixup 超时解析失败，回退默认值 %s: %s", DEFAULT_FIXUP_TIMEOUT, exc)
         fixup_timeout = DEFAULT_FIXUP_TIMEOUT
     ob_cfg["timeout"] = None if fixup_timeout == 0 else fixup_timeout
+    global OBCLIENT_SESSION_QUERY_TIMEOUT_US
+    try:
+        session_timeout_us = parser.getint(
+            "SETTINGS",
+            "ob_session_query_timeout_us",
+            fallback=DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US,
+        )
+        if session_timeout_us < 0:
+            session_timeout_us = DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
+    except Exception as exc:
+        log.warning(
+            "ob_session_query_timeout_us 解析失败，回退默认值 %s: %s",
+            DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US,
+            exc,
+        )
+        session_timeout_us = DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
+    OBCLIENT_SESSION_QUERY_TIMEOUT_US = session_timeout_us
+    ob_cfg["session_query_timeout_us"] = session_timeout_us
 
     repo_root = config_path.parent.resolve()
     fixup_dir = parser.get("SETTINGS", "fixup_dir", fallback=DEFAULT_FIXUP_DIR).strip()
@@ -4277,10 +4297,11 @@ def run_sql(
     obclient_cmd: List[str], sql_text: str, timeout: Optional[int]
 ) -> subprocess.CompletedProcess:
     """Execute SQL text by piping it to obclient."""
+    sql_payload = build_obclient_sql_payload(sql_text)
     try:
         result = subprocess.run(
             obclient_cmd,
-            input=sql_text,
+            input=sql_payload,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -4302,6 +4323,28 @@ def run_sql(
         raise ConfigError(f"obclient 权限不足: {exc}") from exc
     except OSError as exc:
         raise ConfigError(f"调用 obclient 失败: {exc}") from exc
+
+
+def build_obclient_sql_payload(sql_text: str, session_timeout_us: Optional[int] = None) -> str:
+    effective_timeout = (
+        OBCLIENT_SESSION_QUERY_TIMEOUT_US if session_timeout_us is None else session_timeout_us
+    )
+    try:
+        effective_timeout = max(0, int(effective_timeout))
+    except (TypeError, ValueError):
+        effective_timeout = DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
+    base_sql = sql_text or ""
+    statements: List[str] = []
+    if effective_timeout > 0:
+        statements.append(f"ALTER SESSION SET ob_query_timeout = {effective_timeout};")
+    if base_sql:
+        statements.append(base_sql)
+    if not statements:
+        return ""
+    payload = "\n".join(statements)
+    if not payload.endswith("\n"):
+        payload += "\n"
+    return payload
 
 
 def resolve_script_exec_mode(config_mode: str, sql_path: Path) -> str:

@@ -51,7 +51,9 @@ CONFIG_DEFAULT_PATH = "config.ini"
 DEFAULT_OUTPUT_SUBDIR = "init_users_roles"
 DEFAULT_OBCLIENT_TIMEOUT = 60
 DEFAULT_FIXUP_TIMEOUT = 3600
+DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US = 3600000000
 OBCLIENT_SECURE_OPT = "--defaults-extra-file"
+OBCLIENT_SESSION_QUERY_TIMEOUT_US = DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
 
 LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOG_FILE_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
@@ -196,6 +198,25 @@ def load_config(
         log.warning("fixup_cli_timeout 无效，回退默认值 %s: %s", DEFAULT_FIXUP_TIMEOUT, exc)
         fixup_timeout = DEFAULT_FIXUP_TIMEOUT
 
+    global OBCLIENT_SESSION_QUERY_TIMEOUT_US
+    try:
+        session_timeout_us = int(
+            settings.get(
+                "ob_session_query_timeout_us", DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
+            )
+        )
+        if session_timeout_us < 0:
+            session_timeout_us = DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
+    except (TypeError, ValueError) as exc:
+        log.warning(
+            "ob_session_query_timeout_us 无效，回退默认值 %s: %s",
+            DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US,
+            exc,
+        )
+        session_timeout_us = DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
+    OBCLIENT_SESSION_QUERY_TIMEOUT_US = session_timeout_us
+    ob_cfg["session_query_timeout_us"] = session_timeout_us
+
     ddl_timeout = None if fixup_timeout == 0 else fixup_timeout
     return ora_cfg, ob_cfg, settings, output_dir, ob_timeout, ddl_timeout
 
@@ -283,9 +304,10 @@ def run_sql(
     sql_text: str,
     timeout: Optional[int],
 ) -> subprocess.CompletedProcess:
+    sql_payload = build_obclient_sql_payload(sql_text)
     result = subprocess.run(
         list(obclient_cmd),
-        input=sql_text,
+        input=sql_payload,
         capture_output=True,
         text=True,
         check=False,
@@ -299,6 +321,24 @@ def run_sql(
                 "已阻断运行以避免回退到明文 -p。"
             )
     return result
+
+
+def build_obclient_sql_payload(sql_text: str, session_timeout_us: Optional[int] = None) -> str:
+    effective_timeout = (
+        OBCLIENT_SESSION_QUERY_TIMEOUT_US if session_timeout_us is None else session_timeout_us
+    )
+    try:
+        effective_timeout = max(0, int(effective_timeout))
+    except (TypeError, ValueError):
+        effective_timeout = DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
+    statements: List[str] = []
+    if effective_timeout > 0:
+        statements.append(f"ALTER SESSION SET ob_query_timeout = {effective_timeout};")
+    if sql_text:
+        statements.append(sql_text)
+    if not statements:
+        return ""
+    return "\n".join(statements)
 
 
 def run_query_lines(
