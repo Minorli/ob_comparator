@@ -157,6 +157,8 @@
 超时设置
 - cli_timeout：dbcat CLI 超时（秒）。默认：600。
 - obclient_timeout：obclient 超时（秒），用于元数据与 SQL 执行。默认：60。
+- ob_session_query_timeout_us：每次 obclient SQL 调用前注入的 session 级 `ob_query_timeout`，单位微秒。默认：3600000000（3600 秒）；`0` 表示不注入，沿用数据库默认值。
+  说明：该设置只影响当前 obclient session，不会修改数据库全局变量；适合避免客户库默认 `ob_query_timeout` 过小导致的元数据加载失败。
 - fixup_cli_timeout：run_fixup 执行 SQL 超时（秒）。默认：3600；0 表示不设超时。
   说明：fixup_cli_timeout 仅影响 run_fixup 执行阶段，不影响生成阶段。
 

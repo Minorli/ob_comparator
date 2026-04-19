@@ -85,6 +85,9 @@ cli_timeout             = 600
 # obclient 调用超时，单位秒；控制元数据/执行脚本超时
 # 建议值：60~600（视对象数量与网络情况而定）
 obclient_timeout        = 120
+# 每次 obclient SQL 调用前显式设置 session 级 ob_query_timeout，单位微秒；0 表示沿用数据库默认
+# 默认 3600000000 = 3600 秒，适合大规模元数据读取；不修改数据库全局变量
+ob_session_query_timeout_us = 3600000000
 # run_fixup 执行 SQL 的超时（秒）；0 表示不设超时
 # 建议值：3600（视授权/视图规模调整）
 fixup_cli_timeout       = 3600

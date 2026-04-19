@@ -24,8 +24,8 @@ Reads config.ini ([ORACLE_SOURCE], [OCEANBASE_TARGET], [SETTINGS]) and:
 
 from __future__ import annotations
 
-import atexit
 import argparse
+import atexit
 import configparser
 import getpass
 import logging
@@ -51,7 +51,9 @@ CONFIG_DEFAULT_PATH = "config.ini"
 DEFAULT_OUTPUT_SUBDIR = "init_users_roles"
 DEFAULT_OBCLIENT_TIMEOUT = 60
 DEFAULT_FIXUP_TIMEOUT = 3600
+DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US = 3600000000
 OBCLIENT_SECURE_OPT = "--defaults-extra-file"
+OBCLIENT_SESSION_QUERY_TIMEOUT_US = DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
 
 LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOG_FILE_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
@@ -127,11 +129,7 @@ def _escape_obclient_option_value(value: str) -> str:
 
 def _create_obclient_defaults_file(password: str) -> Path:
     with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        prefix="ob_init_",
-        suffix=".cnf",
-        delete=False
+        mode="w", encoding="utf-8", prefix="ob_init_", suffix=".cnf", delete=False
     ) as tmp:
         tmp.write("[client]\n")
         tmp.write(f'password="{_escape_obclient_option_value(password)}"\n')
@@ -164,7 +162,9 @@ def init_console_logging(level: int) -> None:
 log = logging.getLogger(__name__)
 
 
-def load_config(config_path: Path) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str], Path, int, Optional[int]]:
+def load_config(
+    config_path: Path,
+) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str], Path, int, Optional[int]]:
     parser = configparser.ConfigParser(interpolation=None)
     if not parser.read(config_path):
         raise ValueError(f"Config file not found or unreadable: {config_path}")
@@ -198,6 +198,25 @@ def load_config(config_path: Path) -> Tuple[Dict[str, str], Dict[str, str], Dict
         log.warning("fixup_cli_timeout 无效，回退默认值 %s: %s", DEFAULT_FIXUP_TIMEOUT, exc)
         fixup_timeout = DEFAULT_FIXUP_TIMEOUT
 
+    global OBCLIENT_SESSION_QUERY_TIMEOUT_US
+    try:
+        session_timeout_us = int(
+            settings.get(
+                "ob_session_query_timeout_us", DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
+            )
+        )
+        if session_timeout_us < 0:
+            session_timeout_us = DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
+    except (TypeError, ValueError) as exc:
+        log.warning(
+            "ob_session_query_timeout_us 无效，回退默认值 %s: %s",
+            DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US,
+            exc,
+        )
+        session_timeout_us = DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
+    OBCLIENT_SESSION_QUERY_TIMEOUT_US = session_timeout_us
+    ob_cfg["session_query_timeout_us"] = session_timeout_us
+
     ddl_timeout = None if fixup_timeout == 0 else fixup_timeout
     return ora_cfg, ob_cfg, settings, output_dir, ob_timeout, ddl_timeout
 
@@ -227,10 +246,14 @@ def build_obclient_command(ob_cfg: Dict[str, str]) -> List[str]:
     return [
         ob_cfg["executable"],
         f"{OBCLIENT_SECURE_OPT}={defaults_path}",
-        "-h", ob_cfg["host"],
-        "-P", ob_cfg["port"],
-        "-u", ob_cfg["user_string"],
-        "--prompt", "init>",
+        "-h",
+        ob_cfg["host"],
+        "-P",
+        ob_cfg["port"],
+        "-u",
+        ob_cfg["user_string"],
+        "--prompt",
+        "init>",
         "--silent",
     ]
 
@@ -281,9 +304,10 @@ def run_sql(
     sql_text: str,
     timeout: Optional[int],
 ) -> subprocess.CompletedProcess:
+    sql_payload = build_obclient_sql_payload(sql_text)
     result = subprocess.run(
         list(obclient_cmd),
-        input=sql_text,
+        input=sql_payload,
         capture_output=True,
         text=True,
         check=False,
@@ -297,6 +321,24 @@ def run_sql(
                 "已阻断运行以避免回退到明文 -p。"
             )
     return result
+
+
+def build_obclient_sql_payload(sql_text: str, session_timeout_us: Optional[int] = None) -> str:
+    effective_timeout = (
+        OBCLIENT_SESSION_QUERY_TIMEOUT_US if session_timeout_us is None else session_timeout_us
+    )
+    try:
+        effective_timeout = max(0, int(effective_timeout))
+    except (TypeError, ValueError):
+        effective_timeout = DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
+    statements: List[str] = []
+    if effective_timeout > 0:
+        statements.append(f"ALTER SESSION SET ob_query_timeout = {effective_timeout};")
+    if sql_text:
+        statements.append(sql_text)
+    if not statements:
+        return ""
+    return "\n".join(statements)
 
 
 def run_query_lines(
@@ -353,9 +395,9 @@ def query_rows(
         parts = [part.strip() for part in line.split("\t")]
         if len(parts) < len(col_upper):
             continue
-        if [p.upper() for p in parts[:len(col_upper)]] == col_upper:
+        if [p.upper() for p in parts[: len(col_upper)]] == col_upper:
             continue
-        rows.append(tuple(parts[:len(col_upper)]))
+        rows.append(tuple(parts[: len(col_upper)]))
     return rows
 
 
@@ -368,13 +410,13 @@ def format_identifier(name: str) -> str:
         return name
     if identifier_needs_quotes(name):
         escaped = name.replace('"', '""')
-        return f"\"{escaped}\""
+        return f'"{escaped}"'
     return name.upper()
 
 
 def format_password(password: str) -> str:
     escaped = password.replace('"', '""')
-    return f"\"{escaped}\""
+    return f'"{escaped}"'
 
 
 def normalize_admin_option(value: Optional[str]) -> str:
@@ -503,19 +545,47 @@ def fetch_oracle_sys_privs(
             grantee_u = grantee.upper()
             if grantee_u not in allowed_grantees:
                 continue
-            results.append((grantee_u, privilege.strip().upper(), normalize_admin_option(admin_option)))
+            results.append(
+                (grantee_u, privilege.strip().upper(), normalize_admin_option(admin_option))
+            )
     return results
 
 
 def fetch_oracle_users_fallback(conn: "oracledb.Connection") -> List[str]:
     exact_blacklist = {
-        "ANONYMOUS", "APPQOSSYS", "AUDSYS", "CTXSYS", "DBSNMP", "DIP", "DMSYS", "DVF",
-        "DVSYS", "EXFSYS", "LBACSYS", "MGMT_VIEW", "OJVMSYS", "OLAPSYS", "ORACLE_OCM",
-        "OUTLN", "OWBSYS", "SI_INFORMTN_SCHEMA", "SYS", "SYSMAN", "SYSTEM", "TSMSYS",
-        "WMSYS", "XDB", "XS$NULL",
+        "ANONYMOUS",
+        "APPQOSSYS",
+        "AUDSYS",
+        "CTXSYS",
+        "DBSNMP",
+        "DIP",
+        "DMSYS",
+        "DVF",
+        "DVSYS",
+        "EXFSYS",
+        "LBACSYS",
+        "MGMT_VIEW",
+        "OJVMSYS",
+        "OLAPSYS",
+        "ORACLE_OCM",
+        "OUTLN",
+        "OWBSYS",
+        "SI_INFORMTN_SCHEMA",
+        "SYS",
+        "SYSMAN",
+        "SYSTEM",
+        "TSMSYS",
+        "WMSYS",
+        "XDB",
+        "XS$NULL",
     }
     like_blacklist = [
-        "APEX_%", "FLOWS_%", "GSM%", "MD%", "ORD%", "WK%",
+        "APEX_%",
+        "FLOWS_%",
+        "GSM%",
+        "MD%",
+        "ORD%",
+        "WK%",
     ]
     conditions = []
     if exact_blacklist:
@@ -578,7 +648,9 @@ def load_existing_sys_privs(
     return grants
 
 
-def grant_satisfied(existing: Dict[Tuple[str, str], Set[str]], grantee: str, item: str, require_admin: bool) -> bool:
+def grant_satisfied(
+    existing: Dict[Tuple[str, str], Set[str]], grantee: str, item: str, require_admin: bool
+) -> bool:
     options = existing.get((grantee.upper(), item.upper()))
     if not options:
         return False
@@ -705,7 +777,9 @@ def main() -> int:
             if has_maintained_roles:
                 roles = fetch_oracle_roles(conn)
             else:
-                log.warning("DBA_ROLES missing ORACLE_MAINTAINED, using fallback system-role filter.")
+                log.warning(
+                    "DBA_ROLES missing ORACLE_MAINTAINED, using fallback system-role filter."
+                )
                 roles = fetch_oracle_roles_fallback(conn)
 
             users_map = {name.upper(): name for name in users}
@@ -728,7 +802,9 @@ def main() -> int:
             if source_schema_filter:
                 missing_users = sorted(source_schema_filter - set(users_map))
                 if missing_users:
-                    log.warning("source_schemas 中以下用户未在源库找到: %s", ", ".join(missing_users))
+                    log.warning(
+                        "source_schemas 中以下用户未在源库找到: %s", ", ".join(missing_users)
+                    )
                 users = [name for name in users if name.upper() in source_schema_filter]
                 if not users:
                     log.error("source_schemas 中的用户在源库均不存在，无法继续。")
@@ -742,8 +818,7 @@ def main() -> int:
                 roles = [name for name in roles if name.upper() in roles_needed]
                 roles_map = {name.upper(): name for name in roles}
                 sys_privs = [
-                    entry for entry in sys_privs_all
-                    if entry[0].upper() in required_grantees
+                    entry for entry in sys_privs_all if entry[0].upper() in required_grantees
                 ]
             else:
                 role_grants = role_grants_all
@@ -875,7 +950,9 @@ def main() -> int:
 
     write_sql_file(role_grants_file, role_grant_statements)
     write_sql_file(sys_privs_file, sys_priv_statements)
-    log.info("Role grants to apply: %d (written to %s)", len(role_grant_statements), role_grants_file)
+    log.info(
+        "Role grants to apply: %d (written to %s)", len(role_grant_statements), role_grants_file
+    )
     log.info("Sys privs to apply: %d (written to %s)", len(sys_priv_statements), sys_privs_file)
 
     if role_grant_statements:
