@@ -1,6 +1,6 @@
 # 数据库对象对比工具设计文档
 
-> 当前版本：V0.9.9.3（截至 2026-04-14）
+> 当前版本：V0.9.9.5（截至 2026-04-28）
 > 核心模式：Dump-Once, Compare-Locally + 依赖分析 + 修补脚本生成
 
 ## 1. 设计原则
@@ -51,7 +51,7 @@
 - `remap_root_closure` 下会区分 managed mapping 与 discovery-only mapping；后者只用于诊断与审计，不直接参与 operator-facing compare/fixup。
 
 ## 6. 对比策略
-- **TABLE**：列名集合、VARCHAR 长度窗口、LONG/LONG RAW 转换。
+- **TABLE**：列名集合、Oracle source VARCHAR/VARCHAR2 BYTE 扩容窗口、CHAR_USED='C' 非扩容语义、OB source strict 1:1 类型对比、LONG/LONG RAW 转换。
 - **VIEW/PLSQL/TYPE/SYNONYM/JOB/SCHEDULE**：存在性检查。
 - **PACKAGE**：有效性与错误摘要。
 - **INDEX/CONSTRAINT/SEQUENCE/TRIGGER**：列组合/唯一性/触发事件/状态。
@@ -74,7 +74,7 @@
   - PL/SQL 标点清洗
   - 证据门禁下的兼容性清洗（不再默认删除未证实不支持的 PRAGMA / STORAGE / TABLESPACE）
   - VIEW 注释吞行修复
-- Oracle-only TABLE rewrite（如 GTT rewrite、VARCHAR 长度膨胀）仅允许在 `source_db_mode=oracle` 下生效。
+- Oracle-only TABLE rewrite（如 GTT rewrite、VARCHAR/VARCHAR2 BYTE 长度膨胀）仅允许在 `source_db_mode=oracle` 下生效；`CHAR_USED='C'` 必须保持不扩容，`source_db_mode=oceanbase` 必须保持 1:1 strict compare。
 
 ## 9. 输出与执行
 - 报告输出到 `main_reports/`（默认 `run_<timestamp>` 分目录），脚本输出到 `fixup_scripts/`。

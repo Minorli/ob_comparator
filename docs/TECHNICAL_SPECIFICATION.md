@@ -1,8 +1,8 @@
 # Oracle → OceanBase 结构一致性校验与修复引擎
 ## 技术规格说明 (Technical Specification)
 
-**版本**：0.9.9.3
-**日期**：2026-04-14
+**版本**：0.9.9.5
+**日期**：2026-04-28
 **适用场景**：Oracle → OceanBase 与 OceanBase → OceanBase（Oracle mode source）结构一致性校验、对象补全、DDL 兼容性修复。
 
 ---
@@ -94,8 +94,9 @@
 
 ### 5.1 TABLE
 - 列集合对比（忽略 OMS_* 和隐藏列）
-- Oracle source：VARCHAR/VARCHAR2 长度窗口校验
-- OceanBase source：严格 normalized type compare，不沿用 Oracle BYTE-length tolerance
+- Oracle source：VARCHAR/VARCHAR2 默认 BYTE 语义下以 `DATA_LENGTH` 作为扩容窗口源长度；`CHAR_USED='C'` 明确字符语义时按 `CHAR_LENGTH` 且不触发 Oracle→OB 长度膨胀；目标端已有合理扩容时不生成回缩 ALTER
+- TABLE ALTER/ADD 的 type literal 保留源端 `VARCHAR2` / `VARCHAR` 字面量，避免 compare/fixup 渲染把 `VARCHAR2` 改成 `VARCHAR`
+- OceanBase source：严格 normalized type compare，不沿用 Oracle BYTE-length tolerance；`type_literal_mismatch` 按源端 1:1 长度生成 `ALTER TABLE ... MODIFY`，并同样保留 `VARCHAR2` 类型字面量
 - 现有列 `NULLABLE` / `NOT NULL` 语义漂移校验（按列语义处理，不依赖系统命名 `SYS_C... IS NOT NULL` 约束名）
 - 覆盖系统命名 `SYS_C... IS NOT NULL` 且 `ENABLED + NOT VALIDATED` 的 `NOT NULL ENABLE NOVALIDATE` 语义补位；该类进入 `TABLE mismatch`，并在 `table_alter` 中默认输出可执行 `ADD CONSTRAINT ... ENABLE NOVALIDATE`，同时保留严格 `NOT NULL` 的 review-first 注释
 - OB 侧等价 `CHECK (<col> IS NOT NULL)` suppress 依赖 `DBA_CONSTRAINTS.SEARCH_CONDITION[_VC]`；元数据加载采用按 chunk 保留成功结果 + 退化 owner/table/constraint 定向回填，避免个别 chunk 失败导致整批 `SEARCH_CONDITION` 丢失

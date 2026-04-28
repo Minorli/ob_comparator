@@ -2,6 +2,43 @@
 
 本文件记录 OceanBase Comparator Toolkit 的重要变更。
 
+## [0.9.9.5] - 2026-04-28
+
+### 修复
+- 修复 Oracle source 默认 BYTE 语义下 VARCHAR/VARCHAR2 长度基准误判：compare 与 TABLE ALTER 生成现在优先使用源端 `DATA_LENGTH`，避免把目标端合理扩容后的列误判为需要回缩。
+- 修复 TABLE ALTER/ADD DDL 渲染把源端 `VARCHAR2` 错误改写成 `VARCHAR` 的问题；Oracle source 与 OceanBase source 路径均保留源端类型字面量。
+- `source_db_mode=oceanbase` 的 strict compare 继续保持 1:1 源端长度生成，不再受 Oracle source BYTE 扩容窗口修复影响。
+- `CHAR_USED='C'` 保持强制不扩容；目标端已扩容且未明显超出兼容窗口时，不生成无意义的长度修补。
+- 修复 target-side 重复 `*_OBNOTNULL_*` / 等价 `IS NOT NULL` CHECK 造成的重复约束修补噪声，并继续把未知 validated nullability 漂移按 review-first 输出。
+- `run_fixup` 默认覆盖 OB session query timeout，降低长脚本执行被短 session query timeout 打断的风险。
+
+### 变更
+- 清理 Python 3.7 lint/runtime debt，保持运行时兼容基线。
+- 仓库不再跟踪本地测试文件；`test_*.py` / `tests_*.py` 默认忽略，回归探针可保留在本机但不进入交付包。
+
+### 文档
+- README / `readme_lite.txt` / `readme_config.txt` / `docs/*` 已同步到 `0.9.9.5`，并补充 Oracle BYTE/CHAR 语义、VARCHAR2 类型保留、OB source strict compare 边界和本地测试文件策略。
+
+## [0.9.9.4] - 2026-04-17
+
+### 新增
+- 新增 `source_db_mode=oceanbase` 与 `[OCEANBASE_SOURCE]`，主程序支持 OceanBase Oracle-mode source → OceanBase target 的严格 compare 与 certified fixup family。
+- 新增 application context compare/fixup，支持读取 `DBA_CONTEXT`、抽取 `SYS_CONTEXT` / `DBMS_SESSION.SET_CONTEXT` 引用并生成语法安全的 `CREATE CONTEXT`。
+- `remap_root_closure + remap_scope_text_fallback_mode=safe` 支持识别静态 `DBMS_SCHEDULER.CREATE_JOB/CREATE_SCHEDULE` 名称，并将命中 JOB/SCHEDULE 纳入 closure。
+
+### 变更
+- OB→OB 模式打通源端 metadata / dependency / DDL provider 分发；当前 certified family 包含 TABLE、VIEW、PROCEDURE、FUNCTION、PACKAGE、PACKAGE BODY、CONTEXT、SYNONYM、SEQUENCE、TRIGGER、TYPE、TYPE BODY、INDEX、CONSTRAINT。
+- 报告和 fixup 目录显式暴露 source mode、source/target version、capability gate 与 deferred/manual family。
+- GTT 合约补齐 `gtt_table_handling_mode=auto` 与版本门控，`rewrite_to_normal` 的事务语义损失会进入主报告、runtime notices、manual actions 与脚本头注释。
+
+### 修复
+- Oracle-only 规则完成 mode 隔离：OB→OB 不再误复用 Oracle 的 GTT rewrite、OMS exclusion、VARCHAR 长度膨胀等迁移改写。
+- 兼容敏感默认值显式告警：`report_to_db` 省略时提示按 false 处理；`source_db_mode=oceanbase` 下省略 synonym scope 时提示按 all 处理。
+- Oracle→OB 默认链路保持不变，`source_db_mode=oracle` 仍为默认模式。
+
+### 文档
+- README / `readme_config.txt` 已同步 `0.9.9.4` 的 OB source 模式、GTT 自动策略、context compare/fixup 与 scoped scheduler closure 说明。
+
 ## [0.9.9.3] - 2026-04-14
 
 ### 新增

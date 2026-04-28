@@ -16,7 +16,7 @@
 
 """
 
-数据库对象对比工具 (V0.9.9.4 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
+数据库对象对比工具 (V0.9.9.5 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -27,13 +27,13 @@
    - SEQUENCE, TRIGGER
 
 2. 对比规则：
-   - TABLE：校验列名集合（忽略 OMS_* 列），并检查 VARCHAR/VARCHAR2 长度是否落在 [ceil(src*1.5), ceil(src*2.5)] 区间。
+   - TABLE：校验列名集合（忽略 OMS_* 列），Oracle source BYTE 语义按 DATA_LENGTH 做 VARCHAR/VARCHAR2 扩容窗口，CHAR 语义不扩容。
    - TABLE/列注释：基于 DBA_TAB_COMMENTS / DBA_COL_COMMENTS 对比 Remap 后的表/列注释（可通过 check_comments 开关关闭）。
    - VIEW/MVIEW/PLSQL/SYNONYM/JOB/SCHEDULE/TYPE：对比是否存在。
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.9.9.4 核心)：
+3. 性能架构 (V0.9.9.5 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          DBA_OBJECTS
@@ -111,7 +111,7 @@ from typing import (
     Union,
 )
 
-__version__ = "0.9.9.4"
+__version__ = "0.9.9.5"
 
 __author__ = "Minor Li"
 REPO_URL = "https://github.com/Minorli/ob_comparator"

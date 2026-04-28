@@ -1,19 +1,18 @@
 # OceanBase Comparator Toolkit
 
-> 当前版本：V0.9.9.4
+> 当前版本：V0.9.9.5
 > 面向 Oracle → OceanBase 与 OceanBase → OceanBase 的结构一致性校验与修补脚本生成工具  
 > 核心理念：一次转储、本地对比、脚本审计优先
 
-## 近期更新（0.9.9.4）
-- 新增 `source_db_mode=oceanbase` 与 `[OCEANBASE_SOURCE]`，主程序现在支持 OceanBase Oracle-mode source → OceanBase target 的严格 compare 与 certified fixup family。
-- OB→OB 模式下已打通源端 metadata / dependency / DDL provider 分发，支持同 endpoint 与跨版本场景；当前 certified family 包含 TABLE、VIEW、PROCEDURE、FUNCTION、PACKAGE、PACKAGE BODY、CONTEXT、SYNONYM、SEQUENCE、TRIGGER、TYPE、TYPE BODY、INDEX、CONSTRAINT。
-- Oracle-only 规则已完成 mode 隔离：OB→OB 不再误复用 Oracle 的 GTT rewrite、OMS exclusion、VARCHAR 长度膨胀等迁移改写；strict compare 产生的 `type_literal_mismatch` 会落成可执行 `ALTER TABLE ... MODIFY`。
-- 新增 application context compare/fixup：可读取 `DBA_CONTEXT`，从 `VIEW/PROCEDURE/FUNCTION/PACKAGE/PACKAGE BODY/TRIGGER/TYPE BODY` 抽取字面量 `SYS_CONTEXT` / `DBMS_SESSION.SET_CONTEXT` 引用，并对 OB 目标端按语法安全方式生成 `CREATE CONTEXT`（`ACCESSED LOCALLY` 会正确映射为“省略 clause”）。
-- 报告和 fixup 目录已显式暴露 source mode、source/target version、capability gate 与 deferred/manual family，避免“看起来能跑、实际上部分能力未启用”的误判。
-- 兼容敏感默认值现在会显式告警：`report_to_db` 若省略会提示“当前按 false 处理”；`source_db_mode=oceanbase` 下若省略 `synonym_check_scope/synonym_fixup_scope`，会提示“当前默认按 all 处理”，不再静默切换。
-- GTT 合约已补齐 `gtt_table_handling_mode=auto` 与版本门控；`rewrite_to_normal` 的 `ON COMMIT` 语义损失会进入主报告、runtime notices、`manual_actions_required_<ts>.txt` 与脚本头注释。
-- `remap_root_closure + remap_scope_text_fallback_mode=safe` 现在可识别源码中静态 `DBMS_SCHEDULER.CREATE_JOB/CREATE_SCHEDULE` 名称，把命中的 JOB/SCHEDULE 纳入 closure；动态表达式会写入 `source_scope_detail_<ts>.txt` 供人工复核。
-- Oracle→OB 默认链路保持不变，`source_db_mode=oracle` 仍是默认模式；本版全量回归通过，旧路径未被打坏。
+## 近期更新（0.9.9.5）
+- 修复 Oracle source 默认 BYTE 语义下 VARCHAR/VARCHAR2 长度误判：源端长度基准现在优先使用 `DATA_LENGTH`，避免把 Oracle `VARCHAR2(100 BYTE)` 与 OB 目标端合理扩容后的 `VARCHAR2(150)` 误判为需要回缩。
+- TABLE ALTER/ADD 的 DDL 渲染会保留源端类型字面量；Oracle 源端 `VARCHAR2` 不再被错误改写成 `VARCHAR`。
+- `CHAR_USED='C'` 继续按强制需求保持不扩容；目标端已经扩容且未明显超出兼容窗口时，不生成无意义的长度修补。
+- `source_db_mode=oceanbase` 的 strict compare 保持 1:1 源端长度生成，同时保留 `VARCHAR2` 类型字面量，不再因修复 Oracle source 路径而回退。
+- 约束与空值漂移输出继续降噪：重复 target-side `*_OBNOTNULL_*` / 等价 `IS NOT NULL` CHECK 不再制造重复修补；未知 validated nullability 漂移保持 review-first。
+- `run_fixup` 默认覆盖 OB session query timeout，长脚本执行不再受过短 session query timeout 干扰；Python 3.7 兼容 lint debt 已清理。
+- 仓库不再跟踪本地测试文件；`test_*.py` / `tests_*.py` 默认忽略，现场或回归测试可保留在本机，不进入交付包。
+- 0.9.9.4 起新增的 `source_db_mode=oceanbase` 与 `[OCEANBASE_SOURCE]` 继续有效，当前 certified family 包含 TABLE、VIEW、PROCEDURE、FUNCTION、PACKAGE、PACKAGE BODY、CONTEXT、SYNONYM、SEQUENCE、TRIGGER、TYPE、TYPE BODY、INDEX、CONSTRAINT。
 
 ## 核心能力
 - **对象覆盖完整**：TABLE/VIEW/MVIEW/PLSQL/TYPE/JOB/SCHEDULE + INDEX/CONSTRAINT/SEQUENCE/TRIGGER。
@@ -70,8 +69,8 @@
 - 运行账号需具备 DBA_* 视图访问权限（Oracle 与 OB）
 - 安全说明：工具运行时不会把 OB/dbcat 密码作为明文参数暴露在 `ps` 命令中（配置文件仍按当前方式保留密码项）。
 
-## 运维提示（0.9.9.4）
-- Oracle -> OB：默认链路不变；若省略 `synonym_check_scope/synonym_fixup_scope`，仍按 `public_only` 运行。target-side `DBA_SYNONYMS` 补查不再静默扩大范围，只在明确需要的 OB source 路径启用。
+## 运维提示（0.9.9.5）
+- Oracle -> OB：默认链路不变；默认 BYTE 语义的 VARCHAR/VARCHAR2 compare/fixup 以 `DATA_LENGTH` 为准，只有 `CHAR_USED='C'` 明确字符语义时才按字符长度且不做扩容。若省略 `synonym_check_scope/synonym_fixup_scope`，仍按 `public_only` 运行。target-side `DBA_SYNONYMS` 补查不再静默扩大范围，只在明确需要的 OB source 路径启用。
 - OB -> OB：若省略 `synonym_check_scope/synonym_fixup_scope`，运行时会提示并按 `all` 处理；OB source 的多行 `DATA_DEFAULT` 会先做控制字符清理，避免错列。
 - GTT：可继续显式使用 `rewrite_to_normal/preserve_original/blocked`；也可以用 `auto` 让程序按目标 OB 版本决策。凡是落到 `rewrite_to_normal`，都要把它视为“结构可迁、事务语义需人工确认”。
 - scoped closure：`safe` 文本补盲现在支持静态 `DBMS_SCHEDULER.CREATE_JOB/CREATE_SCHEDULE`；如果 `job_name/schedule_name` 不是静态字面量，报告会提示 unresolved，而不会盲猜。
