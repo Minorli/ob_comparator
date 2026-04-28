@@ -1,6 +1,8 @@
 配置说明 (config.ini)
-版本：0.9.9.4（更新日期：2026-04-17）
+版本：0.9.9.5（更新日期：2026-04-28）
 本文件为完整配置说明书，覆盖所有可配置项（含最近新增功能）。
+
+本版重点修复 Oracle source 默认 BYTE 语义下 VARCHAR/VARCHAR2 长度基准误判：BYTE 语义按 DATA_LENGTH 对比和生成修补，CHAR_USED='C' 明确字符语义时保持不扩容；生成的 TABLE ALTER/ADD 会保留源端 VARCHAR2 类型字面量。
 
 通用约定
 - 布尔值：true/false/1/0/yes/no（大小写不敏感）。
@@ -215,6 +217,7 @@
   排障：若日志长时间停留在 TABLE_PRESENCE，可临时设为 off 跳过，或降低 table_data_presence_auto_max_tables 以减少 auto 执行范围。
 - column_visibility_policy：列可见性(INVISIBLE)处理策略。默认：auto。
   可选值：auto（元数据可用时校验并生成修补）、enforce（强制校验/修补）、ignore（跳过可见性校验）。
+- 说明：Oracle source 的 VARCHAR/VARCHAR2 默认 BYTE 语义按 DATA_LENGTH 做长度基准；只有 CHAR_USED='C' 明确字符语义时才按 CHAR_LENGTH 且不做 Oracle->OB 扩容。
 - 说明：OB 侧 CHAR_USED 缺失时默认按 BYTE 语义处理；若 DATA_LENGTH > CHAR_LENGTH 则推断为 CHAR 语义，避免长度语义误判。
 - infer_schema_mapping：是否启用 schema 推导（多对一/一对多场景）。默认：true。
   说明：用于 remap 未显式覆盖对象的目标 schema 推导。

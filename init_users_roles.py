@@ -36,7 +36,7 @@ import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-__version__ = "0.9.9.4"
+__version__ = "0.9.9.5"
 
 try:
     import oracledb
@@ -201,9 +201,7 @@ def load_config(
     global OBCLIENT_SESSION_QUERY_TIMEOUT_US
     try:
         session_timeout_us = int(
-            settings.get(
-                "ob_session_query_timeout_us", DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
-            )
+            settings.get("ob_session_query_timeout_us", DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US)
         )
         if session_timeout_us < 0:
             session_timeout_us = DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
