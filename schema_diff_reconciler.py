@@ -20879,9 +20879,7 @@ def obclient_run_sql(
         return False, "", str(e)
 
 
-def build_obclient_sql_payload(
-    sql_query: str, session_timeout_us: Optional[int] = None
-) -> str:
+def build_obclient_sql_payload(sql_query: str, session_timeout_us: Optional[int] = None) -> str:
     sql_payload = (sql_query or "").strip()
     if sql_payload and not sql_payload.endswith(";"):
         sql_payload += ";"
@@ -30828,8 +30826,8 @@ def check_primary_objects(
                         type_mismatches.append(
                             ColumnTypeIssue(
                                 col_name,
-                                format_oracle_column_type(src_info, prefer_ob_varchar=True),
-                                format_oracle_column_type(tgt_info, prefer_ob_varchar=True),
+                                format_oracle_column_type(src_info),
+                                format_oracle_column_type(tgt_info),
                                 f"VIRTUAL({src_expr_norm})" if src_expr_norm else "VIRTUAL",
                                 "virtual_missing",
                             )
@@ -30839,8 +30837,8 @@ def check_primary_objects(
                         type_mismatches.append(
                             ColumnTypeIssue(
                                 col_name,
-                                format_oracle_column_type(src_info, prefer_ob_varchar=True),
-                                format_oracle_column_type(tgt_info, prefer_ob_varchar=True),
+                                format_oracle_column_type(src_info),
+                                format_oracle_column_type(tgt_info),
                                 f"VIRTUAL({src_expr_norm})",
                                 "virtual_expr_mismatch",
                             )
@@ -30850,8 +30848,8 @@ def check_primary_objects(
                         type_mismatches.append(
                             ColumnTypeIssue(
                                 col_name,
-                                format_oracle_column_type(src_info, prefer_ob_varchar=True),
-                                format_oracle_column_type(tgt_info, prefer_ob_varchar=True),
+                                format_oracle_column_type(src_info),
+                                format_oracle_column_type(tgt_info),
                                 f"VIRTUAL({src_expr_norm})",
                                 "virtual_expr_mismatch",
                             )
@@ -31196,8 +31194,13 @@ def check_primary_objects(
                     continue
 
                 if src_dtype in ("VARCHAR2", "VARCHAR"):
-                    src_len = src_info.get("char_length") or src_info.get("data_length")
-                    tgt_len = tgt_info.get("char_length") or tgt_info.get("data_length")
+                    src_char_used = (src_info.get("char_used") or "").strip().upper()
+                    if src_char_used == "C":
+                        src_len = src_info.get("char_length") or src_info.get("data_length")
+                        tgt_len = tgt_info.get("char_length") or tgt_info.get("data_length")
+                    else:
+                        src_len = src_info.get("data_length") or src_info.get("char_length")
+                        tgt_len = tgt_info.get("data_length") or tgt_info.get("char_length")
 
                     try:
                         src_len_int = int(src_len)
@@ -31205,22 +31208,26 @@ def check_primary_objects(
                     except (TypeError, ValueError):
                         continue
 
-                    # 区分BYTE和CHAR语义：CHAR_USED='C'表示CHAR语义
-                    src_char_used = (src_info.get("char_used") or "").strip().upper()
-                    tgt_char_used = (tgt_info.get("char_used") or "").strip().upper()
-                    if not tgt_char_used:
-                        tgt_char_used = "B"
-
                     if src_char_used == "C":
-                        # CHAR语义：要求长度完全一致
-                        if tgt_char_used != "C" or tgt_len_int != src_len_int:
+                        if tgt_len_int < src_len_int:
                             length_mismatches.append(
                                 ColumnLengthIssue(
                                     col_name, src_len_int, tgt_len_int, src_len_int, "char_mismatch"
                                 )
                             )
+                        elif tgt_len_int > int(
+                            math.ceil(src_len_int * VARCHAR_LEN_OVERSIZE_MULTIPLIER)
+                        ):
+                            length_mismatches.append(
+                                ColumnLengthIssue(
+                                    col_name,
+                                    src_len_int,
+                                    tgt_len_int,
+                                    int(math.ceil(src_len_int * VARCHAR_LEN_OVERSIZE_MULTIPLIER)),
+                                    "oversize",
+                                )
+                            )
                     else:
-                        # BYTE语义：需要放大1.5倍
                         expected_min_len = int(math.ceil(src_len_int * VARCHAR_LEN_MIN_MULTIPLIER))
                         oversize_cap_len = int(
                             math.ceil(src_len_int * VARCHAR_LEN_OVERSIZE_MULTIPLIER)
@@ -31251,8 +31258,8 @@ def check_primary_objects(
                         type_mismatches.append(
                             ColumnTypeIssue(
                                 col_name,
-                                format_oracle_column_type(src_info, prefer_ob_varchar=True),
-                                format_oracle_column_type(tgt_info, prefer_ob_varchar=True),
+                                format_oracle_column_type(src_info),
+                                format_oracle_column_type(tgt_info),
                                 expected_type,
                                 "number_precision",
                             )
@@ -39786,7 +39793,7 @@ def build_ob_source_table_ddl_from_metadata(
         col_u = (col_name or "").upper()
         if is_ignored_source_column(col_u, info):
             continue
-        col_type = format_oracle_column_type(info, prefer_ob_varchar=True)
+        col_type = format_oracle_column_type(info)
         line = f"  {quote_identifier(col_u)} {col_type}"
         default_val = info.get("data_default")
         if default_val is not None:
@@ -43639,7 +43646,7 @@ def format_oracle_column_type(
 
     # VARCHAR/VARCHAR2 with length semantics (CHAR vs BYTE)
     if dt in ("VARCHAR", "VARCHAR2"):
-        ln = _pick_length(char_length if char_used == "C" else (char_length or data_length))
+        ln = _pick_length(char_length if char_used == "C" else (data_length or char_length))
         if ln is not None:
             if char_used == "C":
                 return apply_varchar_pref(f"{dt}({int(ln)} CHAR)")
@@ -43648,7 +43655,7 @@ def format_oracle_column_type(
 
     # CHAR type (separate from VARCHAR length semantics)
     if dt == "CHAR":
-        ln = _pick_length(char_length if char_used == "C" else (char_length or data_length))
+        ln = _pick_length(char_length if char_used == "C" else (data_length or char_length))
         if ln is not None:
             if char_used == "C":
                 return f"{dt}({int(ln)} CHAR)"
@@ -43682,8 +43689,7 @@ def format_oracle_column_type(
 def normalize_column_type_for_compare(
     info: Dict, *, source_db_mode: str = SOURCE_DB_MODE_ORACLE
 ) -> str:
-    prefer_ob_varchar = normalize_source_db_mode(source_db_mode) == SOURCE_DB_MODE_OCEANBASE
-    return format_oracle_column_type(info, prefer_ob_varchar=prefer_ob_varchar).strip().upper()
+    return format_oracle_column_type(info).strip().upper()
 
 
 def inflate_table_varchar_lengths(
@@ -43705,12 +43711,12 @@ def inflate_table_varchar_lengths(
         if dtype not in ("VARCHAR2", "VARCHAR"):
             continue
 
-        # 只对BYTE语义的列进行放大，CHAR语义保持原样
+        # CHAR semantics are already character-count based; do not expand them.
         char_used = (info.get("char_used") or "").strip().upper()
         if char_used == "C":
             continue
 
-        src_len = info.get("char_length") or info.get("data_length")
+        src_len = info.get("data_length") or info.get("char_length")
         try:
             src_len_int = int(src_len)
         except (TypeError, ValueError):
@@ -43733,10 +43739,6 @@ def inflate_table_varchar_lengths(
                 return match.group(0)
             inner_sem_raw = (match.group("inner_sem") or "").strip()
             outer_sem_raw = (match.group("outer_sem") or "").strip()
-            effective_sem = (inner_sem_raw or outer_sem_raw).upper()
-            # DDL 中显式 CHAR 语义时不放大，避免改变语义
-            if effective_sem == "CHAR":
-                return match.group(0)
             replacements += 1
             prefix = match.group("prefix")
             dtype_literal = match.group("dtype")
@@ -43790,6 +43792,7 @@ def generate_alter_for_table_columns(
     tgt_table_u = tgt_table.upper()
     table_full = quote_qualified_parts(tgt_schema_u, tgt_table_u)
     plain_not_null_mode = normalize_plain_not_null_fixup_mode(plain_not_null_fixup_mode)
+    normalized_source_db_mode = normalize_source_db_mode(source_db_mode)
     plain_not_null_probe_results = {
         normalize_identifier_name(col): value
         for col, value in (plain_not_null_probe_results or {}).items()
@@ -43815,17 +43818,20 @@ def generate_alter_for_table_columns(
             dtype = (info.get("data_type") or "").upper()
             if (
                 dtype in ("VARCHAR2", "VARCHAR")
-                and normalize_source_db_mode(source_db_mode) == SOURCE_DB_MODE_ORACLE
+                and normalized_source_db_mode == SOURCE_DB_MODE_ORACLE
             ):
-                src_len = info.get("char_length") or info.get("data_length")
-                try:
-                    src_len_int = int(src_len)
-                    override_len = int(math.ceil(src_len_int * VARCHAR_LEN_MIN_MULTIPLIER))
-                except (TypeError, ValueError):
-                    override_len = None
+                char_used = (info.get("char_used") or "").strip().upper()
+                if char_used != "C":
+                    src_len = info.get("data_length") or info.get("char_length")
+                    try:
+                        src_len_int = int(src_len)
+                        override_len = int(math.ceil(src_len_int * VARCHAR_LEN_MIN_MULTIPLIER))
+                    except (TypeError, ValueError):
+                        override_len = None
 
             col_type = format_oracle_column_type(
-                info, override_length=override_len, prefer_ob_varchar=True
+                info,
+                override_length=override_len,
             )
             default_clause = ""
             default_val = info.get("data_default")
@@ -43883,7 +43889,8 @@ def generate_alter_for_table_columns(
             if issue_type == "char_mismatch":
                 # CHAR语义：要求长度完全一致
                 modified_type = format_oracle_column_type(
-                    info, override_length=src_len, prefer_ob_varchar=True
+                    info,
+                    override_length=src_len,
                 )
                 lines.append(
                     f"ALTER TABLE {table_full} "
@@ -43891,14 +43898,15 @@ def generate_alter_for_table_columns(
                     f"-- CHAR语义，源长度: {src_len}, 目标长度: {tgt_len}, 要求一致"
                 )
             elif issue_type == "short":
-                # BYTE语义：放大到校验下限
+                # Oracle source VARCHAR/VARCHAR2：放大到校验窗口下限
                 modified_type = format_oracle_column_type(
-                    info, override_length=limit_len, prefer_ob_varchar=True
+                    info,
+                    override_length=limit_len,
                 )
                 lines.append(
                     f"ALTER TABLE {table_full} "
                     f"MODIFY ({col_name.upper()} {modified_type}); "
-                    f"-- BYTE语义，源长度: {src_len}, 目标长度: {tgt_len}, 期望下限: {limit_len}"
+                    f"-- VARCHAR/VARCHAR2长度窗口，源长度: {src_len}, 目标长度: {tgt_len}, 期望下限: {limit_len}"
                 )
             else:
                 lines.append(
@@ -43915,7 +43923,14 @@ def generate_alter_for_table_columns(
             info = col_details.get(col_name)
             if not info:
                 continue
-            if issue_type in ("long_type", "number_precision", "type_literal_mismatch"):
+            if issue_type == "type_literal_mismatch":
+                expected_type = format_oracle_column_type(info)
+                lines.append(
+                    f"ALTER TABLE {table_full} "
+                    f"MODIFY ({col_name.upper()} {expected_type}); "
+                    f"-- 源类型: {src_type}, 目标类型: {tgt_type}"
+                )
+            elif issue_type in ("long_type", "number_precision"):
                 lines.append(
                     f"ALTER TABLE {table_full} "
                     f"MODIFY ({col_name.upper()} {expected_type}); "
@@ -43957,7 +43972,7 @@ def generate_alter_for_table_columns(
                 )
                 lines.append("-- 请人工确认是否需要去除 DEFAULT ON NULL；当前不生成自动修复 SQL。")
             elif issue_type == "nullability_tighten":
-                review_type = format_oracle_column_type(info, prefer_ob_varchar=True)
+                review_type = format_oracle_column_type(info)
                 alter_stmt = (
                     f"ALTER TABLE {table_full} MODIFY ({col_name.upper()} {review_type} NOT NULL);"
                 )
@@ -43999,7 +44014,7 @@ def generate_alter_for_table_columns(
                     lines.append("-- 建议先确认目标端是否存在 NULL 数据，再决定是否执行：")
                     lines.append(f"-- {alter_stmt}")
             elif issue_type == "nullability_novalidate_tighten":
-                review_type = format_oracle_column_type(info, prefer_ob_varchar=True)
+                review_type = format_oracle_column_type(info)
                 novalidate_meta = src_notnull_novalidate_cols.get(
                     normalize_semantic_identifier_name(col_name),
                     {},
