@@ -21,7 +21,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from comparator_reliability import redact_sensitive_text, sanitized_config_text, utcish_now_text
 
-TOOL_VERSION = "0.9.9.6"
+TOOL_VERSION = "0.9.9.6-hotfix1"
 SECRET_RE = re.compile(
     r"(password|passwd|pwd|token|secret|private[_-]?key|credential|wallet)", re.IGNORECASE
 )

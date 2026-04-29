@@ -1,5 +1,5 @@
 配置说明 (config.ini)
-版本：0.9.9.6（更新日期：2026-04-29）
+版本：0.9.9.6-hotfix1（更新日期：2026-04-30）
 本文件为完整配置说明书，覆盖所有可配置项（含最近新增功能）。
 
 本版重点增加生产可靠性与诊断能力：release evidence 门禁、运行心跳、timeout 摘要、recovery manifest、fixup 安全分层、兼容矩阵和独立诊断包；同时保留 Oracle source 默认 BYTE 语义下 VARCHAR/VARCHAR2 长度基准修复。

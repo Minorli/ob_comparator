@@ -16,7 +16,7 @@
 
 """
 
-数据库对象对比工具 (V0.9.9.6 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
+数据库对象对比工具 (V0.9.9.6-hotfix1 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -33,7 +33,7 @@
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.9.9.6 核心)：
+3. 性能架构 (V0.9.9.6-hotfix1 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          DBA_OBJECTS
@@ -138,7 +138,7 @@ from comparator_reliability import (
     write_timeout_summary,
 )
 
-__version__ = "0.9.9.6"
+__version__ = "0.9.9.6-hotfix1"
 
 __author__ = "Minor Li"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
@@ -66289,6 +66289,7 @@ def main():
             include_roles=enable_grant_generation,
             target_table_pairs=target_table_pairs if enable_comment_check else set(),
             include_contexts=context_pipeline_enabled,
+            enable_dba_synonym_fallback=source_db_mode == SOURCE_DB_MODE_OCEANBASE,
         )
         if ob_meta.case_sensitive_findings:
             merged_case_sensitive: Dict[

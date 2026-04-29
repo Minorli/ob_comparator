@@ -1,11 +1,11 @@
 OceanBase 对比工具极简手册（现场版）
-当前版本：V0.9.9.6
+当前版本：V0.9.9.6-hotfix1
 
 0. 先更新版本
 - 项目地址：https://github.com/Minorli/ob_comparator
 - 建议整仓更新，不要只替换单个脚本。
 - 当前版本同时支持 Oracle → OceanBase 与 OceanBase → OceanBase（Oracle mode source）两种校验/修补模式。
-- 0.9.9.6 增加发布门禁、运行心跳、恢复 manifest、fixup 安全分层和独立诊断包；建议整仓更新，不要只替换单个脚本。
+- 0.9.9.6-hotfix1 修复 OB -> OB 模式目标端 SYNONYM 可能统计为 0 的问题；建议整仓更新，不要只替换单个脚本。
 - 0.9.9.5 修复 Oracle source 默认 BYTE 语义下 VARCHAR2 长度误判与 DDL 类型字面量问题；如遇到 `VARCHAR2` 被生成成 `VARCHAR` 或长度回缩，请更新到本版后重跑。
 
 1. 你需要的文件（同目录）

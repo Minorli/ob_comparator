@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [0.9.9.6-hotfix1] - 2026-04-30
+
+### 修复
+- 修复 OB -> OB 模式目标端 SYNONYM 计数可能为 0 的问题：目标端 OceanBase 元数据转储在 OB source 模式下也启用 `DBA_SYNONYMS` 补查，避免目标端同义词未出现在 `DBA_OBJECTS` 时被误判缺失。
+
 ## [0.9.9.6] - 2026-04-29
 
 ### 新增
