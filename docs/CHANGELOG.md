@@ -2,6 +2,32 @@
 
 本文件记录 OceanBase Comparator Toolkit 的重要变更。
 
+## [Unreleased]
+
+## [0.9.9.6] - 2026-04-29
+
+### 新增
+- 增加发布门禁文档与 `scripts/release_gate.py`，正式版本需要 release evidence，并要求至少一次 Oracle -> OceanBase 实库 smoke。
+- 主程序新增运行心跳与 timeout 摘要：run 目录输出 `run_heartbeat_<ts>.json` 与 `runtime_timeout_summary_<ts>.txt`。
+- `run_fixup.py` 新增执行心跳与 timeout 摘要：输出 `run_fixup_heartbeat_<ts>.json` 与 `run_fixup_timeout_summary_<ts>.txt`，file 模式明确只提供文件/进程级进度，statement 模式提供语句级进度。
+- 新增 `slow_phase_warning_sec` 与 `slow_sql_warning_sec` 配置项，配合 `progress_log_interval` 控制慢阶段/慢 SQL 告警。
+- 主程序新增 `fixup_plan_<ts>.jsonl` 与 `fixup_safety_summary_<ts>.txt`，按 `safe/review/destructive/manual` 输出 fixup 分层证据。
+- `run_fixup.py` 新增 `--safety-tiers`、`--confirm-destructive`、`--confirm-manual`、`--plan-only`，默认只执行 safe/review，destructive/manual 未显式确认时 fail closed，并支持非破坏性计划验证。
+- 新增外部 `compatibility_registry.json`，主程序每轮输出 `compatibility_matrix_<ts>.json` 与 `compatibility_summary_<ts>.txt`。
+- 新增 `difference_explanations_<ts>.jsonl` 与摘要文件，记录 mismatch/suppression/manual/fixup 的 reason code、rule id、证据、decision 与 action。
+- 新增 `recovery_manifest_<ts>.json`，按 decision/runtime 配置 hash 记录恢复证据；CLI 增加 `--resume-manifest`、`--force-resume`、`--resume-override-reason`。
+- 新增独立 `diagnostic_bundle.py`，支持 post-run 和 `--pid --hang` 采集，默认脱敏配置且不包含 SQL 正文，并支持单文件/总包体上限。
+- `run_fixup.py` 新增 `--no-resume-ledger`，默认继续使用 `.fixup_state_ledger.json` 跳过指纹匹配的已完成文件/语句，并报告跳过/指纹不匹配计数。
+
+### 修复
+- 修复 fixup 安全分层对 `DROP\nTABLE`、`ALTER TABLE ...\nDROP COLUMN` 等换行 DDL 的 destructive 识别绕过。
+- 修复诊断包对 Oracle `user/password@service`、`-p <password>`、`--password <password>` 等命令行凭据的脱敏缺口。
+- 修复诊断包 `--pid` 可采集无关进程 cmdline 的风险；现在会校验 heartbeat PID、进程 owner 与 comparator/obclient 进程身份。
+- 修复 recovery manifest 非原子写入和高频 object checkpoint 写盘导致的截断与 O(N²) IO 风险。
+- 修复诊断包 manifest 中文件 hash 指向脱敏前源文件的问题；现在记录 zip 内实际内容 hash。
+- 修复 `run_fixup.py --plan-only` 仍写 heartbeat/timeout summary 的行为，使其保持不连接、不执行、少副作用的计划验证语义。
+- 修复日志中推荐的诊断命令未 shell quote 导致路径含空格时不可复制执行的问题。
+
 ## [0.9.9.5] - 2026-04-28
 
 ### 修复

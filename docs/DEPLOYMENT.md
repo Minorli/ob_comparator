@@ -1,6 +1,6 @@
 # 数据库对象对比工具 - 跨平台打包与执行指南 (Wheelhouse 版)
 
-> 适用版本：V0.9.9.5
+> 适用版本：V0.9.9.6
 
 > 适用场景：需要在无网络或不同机器上运行本工具，且保持源码不改。  
 > 方案：wheelhouse + venv，无需 PyInstaller。
@@ -28,11 +28,14 @@ pip wheel --wheel-dir=./wheelhouse -r requirements.txt
 deployment_package/
 ├── schema_diff_reconciler.py
 ├── run_fixup.py
+├── diagnostic_bundle.py
+├── comparator_reliability.py
 ├── init_users_roles.py
 ├── requirements.txt
 ├── config.ini                 # 可保留模板
 ├── remap_rules.txt
 ├── blacklist_rules.json
+├── compatibility_registry.json
 ├── readme_config.txt
 ├── HOW_TO_READ_REPORTS_IN_OB_latest.txt
 ├── HOW_TO_READ_REPORTS_IN_OB_20260311_12_sqls.txt
@@ -73,9 +76,28 @@ python run_fixup.py --smart-order --recompile
 提示：`run_fixup` 默认跳过 `fixup_scripts/table/`（防止误建空表）。  
 如需执行建表脚本，显式添加：`--allow-table-create`。
 
+提示：`run_fixup` 默认只执行 `safe,review` safety tiers；`destructive` 需要 `--safety-tiers destructive --confirm-destructive`，`manual` 需要 `--safety-tiers manual --confirm-manual`。执行前可先运行 `python3 run_fixup.py config.ini --plan-only` 做非破坏性计划验证；仍必须审核 `fixup_plan_<timestamp>.jsonl`、`fixup_safety_summary_<timestamp>.txt` 和对应 SQL。
+
 提示：若本次只想输出“对象能创建/能编译”的最小授权，可在 `config.ini` 中设置 `grant_generation_mode=structural`。
 
 提示：默认报告输出为 `main_reports/run_<timestamp>/`，如需兼容旧流程可设置 `report_dir_layout=flat`。
+
+生产发布前必须生成 release evidence 并通过门禁：
+
+```bash
+python3 scripts/release_gate.py release_evidence_<version>.json
+```
+
+门禁要求至少一次 Oracle -> OceanBase 实库 smoke。运行时如客户反馈“不报错、不继续”，优先收集 `main_reports/run_<timestamp>/run_heartbeat_<timestamp>.json`、`runtime_timeout_summary_<timestamp>.txt`，以及 `run_fixup_heartbeat_<timestamp>.json` / `run_fixup_timeout_summary_<timestamp>.txt`（如执行过 fixup）。
+
+推荐直接生成脱敏诊断包：
+
+```bash
+python3 diagnostic_bundle.py --run-dir main_reports/run_<timestamp> --config config.ini
+python3 diagnostic_bundle.py --run-dir main_reports/run_<timestamp> --config config.ini --pid <pid> --hang
+```
+
+诊断包默认只包含 SQL 文件名、大小、hash 和摘要，不包含完整 SQL 正文；客户明确允许后才加 `--include-sql-content`。默认单文件上限 20MB、总采集上限 200MB，可用 `diagnostic_max_file_mb` / `diagnostic_max_bundle_mb` 或 CLI `--max-file-mb` / `--max-bundle-mb` 调整。
 
 提示：`report_sql_<timestamp>.txt` 现在只提供 `report_id` 与 HOW TO 文档入口；如果交付包缺少 HOW TO 文件，客户无法按数据库侧剧本排查。
 

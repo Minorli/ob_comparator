@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "version": "2026.04.29",
+  "description": "Comparator compatibility decisions for Oracle/OceanBase source modes and OceanBase targets.",
+  "entries": [
+    {
+      "source_mode": "oracle",
+      "min_ob_version": "4.0.0.0",
+      "object_family": "TABLE",
+      "operation": "compare_columns",
+      "decision": "supported",
+      "rationale": "TABLE column presence, VARCHAR/VARCHAR2 byte window, CHAR semantics exactness, defaults, nullability, identity, and visibility are supported by metadata compare.",
+      "manual_action_hint": ""
+    },
+    {
+      "source_mode": "oracle",
+      "min_ob_version": "4.0.0.0",
+      "object_family": "TABLE",
+      "operation": "alter_shape_fixup",
+      "decision": "degraded",
+      "rationale": "ALTER TABLE ADD/MODIFY/default/nullability changes may lock, rewrite, or depend on target data state.",
+      "manual_action_hint": "Review generated table_alter SQL and target data before execution."
+    },
+    {
+      "source_mode": "oracle",
+      "min_ob_version": "4.0.0.0",
+      "object_family": "VIEW",
+      "operation": "create_or_replace",
+      "decision": "degraded",
+      "rationale": "VIEW DDL is generated from source DDL with remap and compatibility cleanup; invalid dependencies or DBLINK usage can require manual intervention.",
+      "manual_action_hint": "Review view compatibility details, prerequisites, and generated grants before execution."
+    },
+    {
+      "source_mode": "oracle",
+      "min_ob_version": "4.0.0.0",
+      "object_family": "TRIGGER",
+      "operation": "create_or_replace",
+      "decision": "degraded",
+      "rationale": "Trigger DDL may contain schema references, non-table targets, temporary-table semantics, or literal object paths requiring review.",
+      "manual_action_hint": "Review trigger detail reports and generated trigger SQL."
+    },
+    {
+      "source_mode": "oracle",
+      "min_ob_version": "4.0.0.0",
+      "object_family": "GRANT",
+      "operation": "generate",
+      "decision": "degraded",
+      "rationale": "Grant compatibility depends on target privilege catalog, object availability, and source grantor semantics.",
+      "manual_action_hint": "Review grant capability and unsupported grant reports before execution."
+    },
+    {
+      "source_mode": "oracle",
+      "min_ob_version": "4.0.0.0",
+      "object_family": "JOB",
+      "operation": "fixup",
+      "decision": "manual",
+      "rationale": "Scheduler and job semantics are not certified for automatic execution in 0.9.x.",
+      "manual_action_hint": "Use generated artifacts as a conversion reference only."
+    },
+    {
+      "source_mode": "oracle",
+      "min_ob_version": "4.0.0.0",
+      "object_family": "SCHEDULE",
+      "operation": "fixup",
+      "decision": "manual",
+      "rationale": "Schedule semantics are operator-owned in 0.9.x.",
+      "manual_action_hint": "Review schedule conversion manually."
+    },
+    {
+      "source_mode": "oracle",
+      "min_ob_version": "4.0.0.0",
+      "object_family": "MATERIALIZED_VIEW",
+      "operation": "fixup",
+      "decision": "manual",
+      "rationale": "Materialized view compatibility varies by refresh mode and query features.",
+      "manual_action_hint": "Treat generated materialized view artifacts as manual review input."
+    },
+    {
+      "source_mode": "oceanbase",
+      "min_ob_version": "4.0.0.0",
+      "object_family": "TABLE",
+      "operation": "compare_columns",
+      "decision": "supported",
+      "rationale": "OB source mode uses 1:1 column type and length comparison without Oracle byte expansion.",
+      "manual_action_hint": ""
+    },
+    {
+      "source_mode": "oceanbase",
+      "min_ob_version": "4.0.0.0",
+      "object_family": "GRANT",
+      "operation": "generate",
+      "decision": "degraded",
+      "rationale": "OB source privilege extraction is supported but still depends on target catalog and runtime grantability.",
+      "manual_action_hint": "Review grant capability detail before execution."
+    },
+    {
+      "source_mode": "*",
+      "min_ob_version": "4.0.0.0",
+      "object_family": "COMPILE",
+      "operation": "execute",
+      "decision": "supported",
+      "rationale": "Existing-object ALTER COMPILE is the first-wave safe execution family.",
+      "manual_action_hint": ""
+    }
+  ]
+}
