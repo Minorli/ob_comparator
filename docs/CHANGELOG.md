@@ -7,7 +7,7 @@
 ## [0.9.9.6] - 2026-04-29
 
 ### 新增
-- 增加发布门禁文档与 `scripts/release_gate.py`，正式版本需要 release evidence，并要求至少一次 Oracle -> OceanBase 实库 smoke。
+- 增加发布门禁要求，正式版本需要 release evidence，并要求至少一次 Oracle -> OceanBase 实库 smoke；门禁工具只作为维护者本地工具保留。
 - 主程序新增运行心跳与 timeout 摘要：run 目录输出 `run_heartbeat_<ts>.json` 与 `runtime_timeout_summary_<ts>.txt`。
 - `run_fixup.py` 新增执行心跳与 timeout 摘要：输出 `run_fixup_heartbeat_<ts>.json` 与 `run_fixup_timeout_summary_<ts>.txt`，file 模式明确只提供文件/进程级进度，statement 模式提供语句级进度。
 - 新增 `slow_phase_warning_sec` 与 `slow_sql_warning_sec` 配置项，配合 `progress_log_interval` 控制慢阶段/慢 SQL 告警。

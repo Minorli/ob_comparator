@@ -15,6 +15,10 @@ tests_synonym_terminal_wave2.py
 test_*.py
 tests_*.py
 
+# Local-only planning and operator tooling
+openspec/
+scripts/
+
 # Only track these docs; ignore the rest under docs/
 docs/*
 !docs/

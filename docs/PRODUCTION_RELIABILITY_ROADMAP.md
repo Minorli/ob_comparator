@@ -37,7 +37,7 @@ Phase D depends on Phase A heartbeat, Phase B fixup plan/explanations, and Phase
 - Main program timeout table: `main_reports/run_<ts>/runtime_timeout_summary_<ts>.txt`
 - run_fixup timeout table: `<report_dir>/run_fixup_timeout_summary_<ts>.txt`
 - run_fixup execution heartbeat: `<fixup_dir>/run_fixup_heartbeat_<ts>.json` when a file or statement is executing
-- Release gate: `python3 scripts/release_gate.py <release_evidence.json>`
+- Release gate: maintainer-local gate command against `release_evidence.json`
 
 ## Current Phase B Artifacts
 

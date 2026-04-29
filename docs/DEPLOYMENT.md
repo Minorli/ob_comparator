@@ -82,11 +82,7 @@ python run_fixup.py --smart-order --recompile
 
 提示：默认报告输出为 `main_reports/run_<timestamp>/`，如需兼容旧流程可设置 `report_dir_layout=flat`。
 
-生产发布前必须生成 release evidence 并通过门禁：
-
-```bash
-python3 scripts/release_gate.py release_evidence_<version>.json
-```
+生产发布前必须生成 release evidence，并通过维护者本地 release gate 工具。
 
 门禁要求至少一次 Oracle -> OceanBase 实库 smoke。运行时如客户反馈“不报错、不继续”，优先收集 `main_reports/run_<timestamp>/run_heartbeat_<timestamp>.json`、`runtime_timeout_summary_<timestamp>.txt`，以及 `run_fixup_heartbeat_<timestamp>.json` / `run_fixup_timeout_summary_<timestamp>.txt`（如执行过 fixup）。
 
