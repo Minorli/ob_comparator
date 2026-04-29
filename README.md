@@ -181,7 +181,7 @@ java_home = /usr/lib/jvm/java-11
 - 每次生成 fixup 后会输出 `fixup_plan_<ts>.jsonl` 与 `fixup_safety_summary_<ts>.txt`；这是按 `safe/review/destructive/manual` 分层的执行证据，不替代人工审核 SQL。
 - 每次主程序运行会输出 `compatibility_matrix_<ts>.json`、`recovery_manifest_<ts>.json` 和 `difference_explanations_<ts>.jsonl`，用于解释差异、恢复校验和支持诊断。
 - 客户现场诊断包使用独立命令生成：`python3 diagnostic_bundle.py --run-dir main_reports/run_<ts> --config config.ini`；挂起时可加 `--pid <pid> --hang`。默认不包含 SQL 正文，必须显式 `--include-sql-content` 才会采集；单文件和总包体上限由 `diagnostic_max_file_mb` / `diagnostic_max_bundle_mb` 控制。
-- 正式版本发布前必须准备 release evidence 并通过 `python3 scripts/release_gate.py <evidence.json>`；门禁要求至少一次 Oracle -> OceanBase 实库 smoke。详见 `docs/RELEASE_GOVERNANCE.md`。
+- 正式版本发布前必须准备 release evidence 并通过维护者本地 release gate；门禁要求至少一次 Oracle -> OceanBase 实库 smoke。详见 `docs/RELEASE_GOVERNANCE.md`。
 
 完整配置说明见 `readme_config.txt`。
 

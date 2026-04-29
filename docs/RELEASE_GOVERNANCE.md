@@ -1,6 +1,6 @@
 # Release Governance
 
-This project uses a hard release gate for public versions. A release is not publishable until the release evidence file says it is publishable and `scripts/release_gate.py` accepts it.
+This project uses a hard release gate for public versions. A release is not publishable until the release evidence file says it is publishable and the maintainer-local release gate accepts it.
 
 ## Scope Freeze
 
@@ -63,11 +63,7 @@ The evidence file is JSON. Minimum required fields:
 }
 ```
 
-Run the gate:
-
-```bash
-python3 scripts/release_gate.py release_evidence_0.9.9.6.json
-```
+Run the maintainer-local release gate against the evidence file before publishing.
 
 The gate fails closed when required evidence is missing, when `publishable` is not `true`, or when Oracle to OceanBase real database smoke has not passed.
 
