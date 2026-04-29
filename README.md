@@ -1,10 +1,14 @@
 # OceanBase Comparator Toolkit
 
-> 当前版本：V0.9.9.5
+> 当前版本：V0.9.9.6
 > 面向 Oracle → OceanBase 与 OceanBase → OceanBase 的结构一致性校验与修补脚本生成工具  
 > 核心理念：一次转储、本地对比、脚本审计优先
 
-## 近期更新（0.9.9.5）
+## 近期更新（0.9.9.6）
+- 新增发布门禁、实库 smoke evidence、运行心跳、timeout 摘要、recovery manifest、兼容矩阵和独立诊断包，正式发版前必须通过 release gate。
+- `run_fixup.py` 新增 `safe/review/destructive/manual` 安全分层，默认只执行 safe/review，destructive/manual 必须显式确认。
+- 诊断包默认脱敏 Oracle DSN、URL 凭据和命令行密码，`--pid --hang` 采集会校验进程归属，manifest hash 对齐 zip 内实际内容。
+- `run_fixup.py --plan-only` 保持不连接数据库、不执行 SQL、不写 heartbeat/timeout summary，仅输出计划验证。
 - 修复 Oracle source 默认 BYTE 语义下 VARCHAR/VARCHAR2 长度误判：源端长度基准现在优先使用 `DATA_LENGTH`，避免把 Oracle `VARCHAR2(100 BYTE)` 与 OB 目标端合理扩容后的 `VARCHAR2(150)` 误判为需要回缩。
 - TABLE ALTER/ADD 的 DDL 渲染会保留源端类型字面量；Oracle 源端 `VARCHAR2` 不再被错误改写成 `VARCHAR`。
 - `CHAR_USED='C'` 继续按强制需求保持不扩容；目标端已经扩容且未明显超出兼容窗口时，不生成无意义的长度修补。
@@ -69,7 +73,7 @@
 - 运行账号需具备 DBA_* 视图访问权限（Oracle 与 OB）
 - 安全说明：工具运行时不会把 OB/dbcat 密码作为明文参数暴露在 `ps` 命令中（配置文件仍按当前方式保留密码项）。
 
-## 运维提示（0.9.9.5）
+## 运维提示（0.9.9.6）
 - Oracle -> OB：默认链路不变；默认 BYTE 语义的 VARCHAR/VARCHAR2 compare/fixup 以 `DATA_LENGTH` 为准，只有 `CHAR_USED='C'` 明确字符语义时才按字符长度且不做扩容。若省略 `synonym_check_scope/synonym_fixup_scope`，仍按 `public_only` 运行。target-side `DBA_SYNONYMS` 补查不再静默扩大范围，只在明确需要的 OB source 路径启用。
 - OB -> OB：若省略 `synonym_check_scope/synonym_fixup_scope`，运行时会提示并按 `all` 处理；OB source 的多行 `DATA_DEFAULT` 会先做控制字符清理，避免错列。
 - GTT：可继续显式使用 `rewrite_to_normal/preserve_original/blocked`；也可以用 `auto` 让程序按目标 OB 版本决策。凡是落到 `rewrite_to_normal`，都要把它视为“结构可迁、事务语义需人工确认”。
@@ -151,6 +155,13 @@ object_created_before_missing_created_policy = strict
 table_data_presence_auto_max_tables = 20000
 table_data_presence_chunk_size = 500
 ob_session_query_timeout_us = 3600000000
+progress_log_interval = 10
+slow_phase_warning_sec = 300
+slow_sql_warning_sec = 60
+compatibility_registry_path =
+checkpoint_enable = true
+diagnostic_include_sql_content = false
+diagnostic_redact_identifiers = false
 config_hot_reload_mode = off
 config_hot_reload_interval_sec = 5
 config_hot_reload_fail_policy = keep_last_good
@@ -166,6 +177,11 @@ java_home = /usr/lib/jvm/java-11
 - `source_db_mode=oracle` 保持原有 Oracle -> OceanBase 行为。
 - `source_db_mode=oceanbase` 现在支持 OceanBase -> OceanBase 的严格 compare 与 certified fixup family；`generate_grants`、`object_created_before`、`check_object_usability`、`table_data_presence_check`、`explicit_roots/remap_root_closure` 都按产品模式生效，Oracle blacklist 语义仅保留诊断提示，不进入 OB source 主链路。
 - `source_db_mode=oceanbase` 当前的 TRIGGER 覆盖范围是 table/view-based trigger；`DATABASE/SCHEMA` 级非表触发器仍按 deferred/manual 处理。
+- 每次主程序运行会输出 `runtime_timeout_summary_<ts>.txt` 与 `run_heartbeat_<ts>.json`；`run_fixup.py` 会输出 `run_fixup_timeout_summary_<ts>.txt` 与 `run_fixup_heartbeat_<ts>.json`，用于判断长时间运行时当前阶段、当前文件/语句和实际触发的 timeout。
+- 每次生成 fixup 后会输出 `fixup_plan_<ts>.jsonl` 与 `fixup_safety_summary_<ts>.txt`；这是按 `safe/review/destructive/manual` 分层的执行证据，不替代人工审核 SQL。
+- 每次主程序运行会输出 `compatibility_matrix_<ts>.json`、`recovery_manifest_<ts>.json` 和 `difference_explanations_<ts>.jsonl`，用于解释差异、恢复校验和支持诊断。
+- 客户现场诊断包使用独立命令生成：`python3 diagnostic_bundle.py --run-dir main_reports/run_<ts> --config config.ini`；挂起时可加 `--pid <pid> --hang`。默认不包含 SQL 正文，必须显式 `--include-sql-content` 才会采集；单文件和总包体上限由 `diagnostic_max_file_mb` / `diagnostic_max_bundle_mb` 控制。
+- 正式版本发布前必须准备 release evidence 并通过 `python3 scripts/release_gate.py <evidence.json>`；门禁要求至少一次 Oracle -> OceanBase 实库 smoke。详见 `docs/RELEASE_GOVERNANCE.md`。
 
 完整配置说明见 `readme_config.txt`。
 
@@ -212,7 +228,7 @@ python3 -m py_compile $(git ls-files '*.py')
 .venv/bin/python schema_diff_reconciler.py config.ini
 
 # 3) 修补执行器冒烟（不执行真实 SQL）
-.venv/bin/python run_fixup.py config.ini --glob "__NO_MATCH__"
+.venv/bin/python run_fixup.py config.ini --plan-only
 ```
 
 ## Remap 规则速记
@@ -257,6 +273,21 @@ python3 run_fixup.py --view-chain-autofix
 python3 run_fixup.py --smart-order --recompile --allow-table-create
 ```
 
+**按安全层选择执行**：
+```bash
+# 默认只执行 safe,review；destructive/manual 会跳过并记录
+python3 run_fixup.py --smart-order --safety-tiers safe,review
+
+# 只验证计划，不连接数据库、不执行 SQL
+python3 run_fixup.py --smart-order --plan-only
+
+# destructive/manual 必须显式选择并确认
+python3 run_fixup.py --smart-order --safety-tiers destructive --confirm-destructive --only-dirs cleanup_safe
+python3 run_fixup.py --smart-order --safety-tiers manual --confirm-manual --only-dirs materialized_view
+```
+
+说明：`safe` 是白名单，目前仅覆盖已有对象的 `ALTER ... COMPILE` 类操作；表结构变更、授权、注释、同义词、对象创建/替换、sequence restart 都至少是 `review`，清理/drop/revoke/disable 属于 `destructive`，unsupported/deferred/manual-only family 属于 `manual`。这些分层用于减少误执行风险，不代表 SQL 可跳过审核。
+
 ## 额外工具
 - `init_users_roles.py`：以 Oracle 为准创建用户/角色并同步系统权限与角色授权。
 > 注意：`init_users_roles.py` 运行时会交互输入用户初始密码，不再在脚本中写死明文初始密码。
@@ -265,6 +296,7 @@ python3 run_fixup.py --smart-order --recompile --allow-table-create
 ## 主要输出
 - `main_reports/run_<ts>/report_<ts>.txt`：完整对比报告（默认 per_run）
 - `main_reports/run_<ts>/report_index_<ts>.txt`：报告索引，包含 `GUIDE` 行，提示先看哪些文件
+- `main_reports/run_<ts>/fixup_plan_<ts>.jsonl` / `fixup_safety_summary_<ts>.txt`：fixup SQL 分层计划和安全层统计
 - `main_reports/run_<ts>/package_compare_<ts>.txt`：PACKAGE/PKG BODY 明细
 - `main_reports/run_<ts>/remap_conflicts_<ts>.txt`：Remap 冲突清单
 - `main_reports/run_<ts>/object_mapping_discovery_<ts>.txt`：discovery-only 对象映射（closure 内发现但未纳入 managed compare/fixup 的对象）

@@ -168,8 +168,28 @@ config_hot_reload_fail_policy = keep_last_good
 # 修补脚本生成相关
 # fixup_workers 控制并发生成脚本的线程数，建议 8 或 12；留空或 0 则自动取 min(12, CPU)
 fixup_workers           = 8
-# progress_log_interval 控制生成脚本时的进度日志间隔（秒，>=1）
+# progress_log_interval 控制主程序/run_fixup 心跳与进度日志间隔（秒，>=1）
 progress_log_interval   = 10
+# slow_phase_warning_sec 控制主程序阶段级慢操作告警阈值（秒，>=1）
+slow_phase_warning_sec  = 300
+# slow_sql_warning_sec 控制 run_fixup 单文件/单语句慢执行告警阈值（秒，>=1）
+slow_sql_warning_sec    = 60
+# compatibility_registry_path: 兼容矩阵 registry 路径；留空使用随工具发布的 compatibility_registry.json
+compatibility_registry_path =
+# checkpoint_enable: 是否写入 recovery_manifest_<ts>.json（默认 true）
+checkpoint_enable       = true
+# resume_manifest: 主程序恢复入口；留空表示不恢复，可用 CLI --resume-manifest 覆盖
+resume_manifest         =
+# force_resume / resume_override_reason: 决定性配置或输入 hash 不匹配时的人工旁路，默认关闭
+force_resume            = false
+resume_override_reason  =
+# diagnostic_bundle_*: 诊断包采集默认策略；主程序只输出证据和推荐命令，打包由 diagnostic_bundle.py 执行
+diagnostic_bundle_enable = true
+diagnostic_bundle_output_dir =
+diagnostic_include_sql_content = false
+diagnostic_redact_identifiers = false
+diagnostic_max_file_mb  = 20
+diagnostic_max_bundle_mb = 200
 # 扩展对象校验性能调优
 # extra_check_workers 控制并发校验进程数，建议 8 或 16；留空或 0 则自动取 min(16, CPU)
 extra_check_workers     = 16

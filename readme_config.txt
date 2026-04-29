@@ -1,8 +1,8 @@
 配置说明 (config.ini)
-版本：0.9.9.5（更新日期：2026-04-28）
+版本：0.9.9.6（更新日期：2026-04-29）
 本文件为完整配置说明书，覆盖所有可配置项（含最近新增功能）。
 
-本版重点修复 Oracle source 默认 BYTE 语义下 VARCHAR/VARCHAR2 长度基准误判：BYTE 语义按 DATA_LENGTH 对比和生成修补，CHAR_USED='C' 明确字符语义时保持不扩容；生成的 TABLE ALTER/ADD 会保留源端 VARCHAR2 类型字面量。
+本版重点增加生产可靠性与诊断能力：release evidence 门禁、运行心跳、timeout 摘要、recovery manifest、fixup 安全分层、兼容矩阵和独立诊断包；同时保留 Oracle source 默认 BYTE 语义下 VARCHAR/VARCHAR2 长度基准修复。
 
 通用约定
 - 布尔值：true/false/1/0/yes/no（大小写不敏感）。
@@ -140,6 +140,9 @@
 - fixup_max_sql_file_mb：run_fixup 单文件最大读取大小（MB）。默认：50；<=0 表示不限制。
 - run_fixup 并发保护：执行器会在 `fixup_dir` 下创建 `.run_fixup.lock`，同一目录并发执行会被拦截。
 - run_fixup 状态账本：执行器会维护 `.fixup_state_ledger.json`，用于避免“脚本已执行但 move/done 失败”后被重复执行。
+- run_fixup 安全分层：主程序会输出 `fixup_plan_<timestamp>.jsonl` 与 `fixup_safety_summary_<timestamp>.txt`；执行器默认 `--safety-tiers safe,review`，`destructive` 需 `--confirm-destructive`，`manual` 需 `--confirm-manual`。
+  说明：`safe` 是白名单，仅覆盖已有对象 `ALTER ... COMPILE` 类操作；表结构变更、授权、注释、同义词、对象创建/替换等至少是 `review`；drop/cleanup/revoke/disable 是 `destructive`；unsupported/deferred/manual-only family 是 `manual`。分层是执行入口保护，不替代人工审核 SQL。
+  说明：`python3 run_fixup.py config.ini --plan-only` 只做收集、过滤和计划验证，不连接数据库、不执行 SQL。
 - fixup_force_clean：强制清理 fixup_dir。默认：false。
 - fixup_clean_outside_repo：是否允许清理项目目录外的 fixup_dir。默认：false。
   说明：仓外目录默认只允许写入、不允许清理；如需清理仓外目录，必须同时设置
@@ -331,7 +334,20 @@
 - fixup_idempotent_types：幂等模式作用对象类型（逗号分隔）。默认：空（使用安全默认集）。
   默认集：VIEW, PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY, TRIGGER, TYPE, TYPE BODY, SYNONYM。
 - fixup_workers：修补脚本生成并发数。默认：min(12, CPU)。
-- progress_log_interval：修补生成进度日志间隔（秒）。默认：10；最小 1。
+- progress_log_interval：主程序/run_fixup 心跳与进度日志间隔（秒）。默认：10；最小 1。
+  主程序会在 run 目录写 `run_heartbeat_<timestamp>.json`，run_fixup 会在 fixup_dir 写 `run_fixup_heartbeat_<timestamp>.json`。
+- slow_phase_warning_sec：主程序阶段级慢操作告警阈值（秒）。默认：300；最小 1。
+- slow_sql_warning_sec：run_fixup 单文件/单语句慢执行告警阈值（秒）。默认：60；最小 1。
+- compatibility_registry_path：兼容矩阵 registry 路径。默认留空，加载随工具发布的 `compatibility_registry.json`；若指定文件且格式错误，主程序会在 compare 前失败。
+- checkpoint_enable：是否写入 `recovery_manifest_<timestamp>.json`。默认：true。
+- resume_manifest：主程序恢复校验入口，指向上一轮 `recovery_manifest_*.json`；也可用 CLI `--resume-manifest` 覆盖。
+  说明：恢复默认要求决定性配置、工具版本和输入工件 hash 一致；日志路径、报告路径、心跳间隔等运行态配置变化允许恢复并记录。
+- force_resume / resume_override_reason：恢复 hash 不匹配时的人工旁路。默认关闭；强制恢复必须写明原因并进入 recovery manifest 审计。
+- diagnostic_bundle_enable：是否在报告中输出诊断包入口命令。默认：true。
+- diagnostic_include_sql_content：诊断包是否默认包含完整 SQL 内容。默认：false；通常不要开启，除非客户明确允许。
+- diagnostic_redact_identifiers：诊断包是否把 schema/object/column 名做稳定 hash 脱敏。默认：false。
+- diagnostic_max_file_mb：诊断包单文件采集上限，单位 MB。默认：20。
+- diagnostic_max_bundle_mb：诊断包总采集上限，单位 MB。默认：200；超过后记录 omitted，不继续扩大 zip。
 
 授权与权限脚本
 - generate_grants：是否生成授权脚本并附加到修补 DDL。默认：true。

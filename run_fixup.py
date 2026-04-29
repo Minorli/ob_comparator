@@ -45,6 +45,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -58,12 +59,28 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
+from comparator_reliability import (
+    SAFETY_TIER_DESTRUCTIVE,
+    SAFETY_TIER_MANUAL,
+    SAFETY_TIER_REVIEW,
+    SAFETY_TIER_SAFE,
+    OperationTracker,
+    build_fixup_plan_record,
+    build_timeout_rows,
+    build_timeout_warnings,
+    classify_fixup_safety,
+    log_timeout_summary,
+    parse_float_setting,
+    parse_int_setting,
+    write_timeout_summary,
+)
+
 try:
     import fcntl
 except Exception:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 
-__version__ = "0.9.9.5"
+__version__ = "0.9.9.6"
 
 CONFIG_DEFAULT_PATH = "config.ini"
 DEFAULT_FIXUP_DIR = "fixup_scripts"
@@ -77,6 +94,13 @@ DEFAULT_FIXUP_AUTO_GRANT_CACHE_LIMIT = 10000
 DEFAULT_CONFIG_HOT_RELOAD_INTERVAL_SEC = 5
 DEFAULT_FIXUP_EXEC_MODE = "auto"
 DEFAULT_FIXUP_EXEC_FILE_FALLBACK = True
+DEFAULT_FIXUP_SAFETY_TIERS = (SAFETY_TIER_SAFE, SAFETY_TIER_REVIEW)
+FIXUP_SAFETY_TIER_VALUES = {
+    SAFETY_TIER_SAFE,
+    SAFETY_TIER_REVIEW,
+    SAFETY_TIER_DESTRUCTIVE,
+    SAFETY_TIER_MANUAL,
+}
 MAX_RECOMPILE_RETRIES = 5
 STATE_LEDGER_FILENAME = os.environ.get(
     "COMPARATOR_FIXUP_STATE_LEDGER_FILENAME", ".fixup_state_ledger.json"
@@ -697,6 +721,75 @@ def safe_first_line(text: Optional[str], limit: int = 160, default: str = "") ->
 
 init_console_logging()
 log = logging.getLogger(__name__)
+FIXUP_OPERATION_TRACKER: Optional[OperationTracker] = None
+
+
+@contextmanager
+def track_fixup_operation(phase: str, **kwargs):
+    tracker = FIXUP_OPERATION_TRACKER
+    token = None
+    status = "success"
+    if tracker is not None:
+        token = tracker.begin(phase, **kwargs)
+    try:
+        yield
+    except Exception:
+        status = "failed"
+        raise
+    finally:
+        if tracker is not None:
+            tracker.finish(token, status=status)
+
+
+def setup_fixup_runtime_observability(
+    ob_cfg: Dict[str, str],
+    fixup_dir: Path,
+    report_dir: Path,
+    fixup_settings: FixupAutoGrantSettings,
+) -> OperationTracker:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    progress_interval = parse_float_setting(
+        ob_cfg.get("progress_log_interval", 10), 10.0, minimum=1.0
+    )
+    slow_sql_warning_sec = parse_float_setting(
+        ob_cfg.get("slow_sql_warning_sec", 60), 60.0, minimum=1.0
+    )
+    state_path = Path(fixup_dir) / f"run_fixup_heartbeat_{timestamp}.json"
+    tracker = OperationTracker(
+        run_id=timestamp,
+        state_path=state_path,
+        logger=log,
+        interval_sec=progress_interval,
+        slow_warning_sec=slow_sql_warning_sec,
+        tool="run_fixup",
+    )
+    fixup_timeout = resolve_timeout_value(ob_cfg.get("timeout"))
+    session_timeout_us = parse_int_setting(
+        ob_cfg.get("session_query_timeout_us", DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US),
+        DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US,
+        minimum=0,
+    )
+    rows = build_timeout_rows(
+        fixup_cli_timeout=fixup_timeout,
+        session_query_timeout_us=session_timeout_us,
+        progress_log_interval=progress_interval,
+        slow_sql_warning_sec=slow_sql_warning_sec,
+        execution_mode=fixup_settings.exec_mode,
+        selected_safety_tiers=ob_cfg.get("selected_safety_tiers", ""),
+    )
+    warnings = build_timeout_warnings(
+        process_timeout_sec=fixup_timeout or None,
+        session_query_timeout_us=session_timeout_us or None,
+        slow_warning_sec=slow_sql_warning_sec,
+        process_name="run_fixup obclient",
+    )
+    summary_dir = Path(report_dir) if report_dir else Path(fixup_dir)
+    summary_path = summary_dir / f"run_fixup_timeout_summary_{timestamp}.txt"
+    write_timeout_summary(summary_path, rows, warnings)
+    log_timeout_summary(log, rows, warnings)
+    log.info("[HEARTBEAT] state file: %s", tracker.state_path)
+    log.info("[TIMEOUT] summary file: %s", summary_path)
+    return tracker
 
 
 # Error classification for intelligent retry
@@ -1430,6 +1523,8 @@ class FixupStateLedger:
         self.path = fixup_dir / STATE_LEDGER_FILENAME
         self._data: Dict[str, Dict[str, str]] = {}
         self._dirty = False
+        self.skipped_completed = 0
+        self.fingerprint_mismatches = 0
         self._load()
 
     @staticmethod
@@ -1486,7 +1581,26 @@ class FixupStateLedger:
     def is_completed(self, relative_path: Path, fingerprint: str) -> bool:
         key = str(relative_path).replace("\\", "/")
         item = self._data.get(key)
-        return bool(item and item.get("fingerprint") == fingerprint)
+        if not item:
+            return False
+        if item.get("fingerprint") == fingerprint:
+            self.skipped_completed += 1
+            return True
+        self.fingerprint_mismatches += 1
+        log.warning(
+            "[STATE] 已完成记录指纹不匹配，将重新执行: %s (ledger=%s current=%s)",
+            key,
+            item.get("fingerprint") or "-",
+            fingerprint or "-",
+        )
+        return False
+
+    def summary(self) -> Dict[str, int]:
+        return {
+            "ledger_records": len(self._data),
+            "skipped_completed": int(self.skipped_completed),
+            "fingerprint_mismatches": int(self.fingerprint_mismatches),
+        }
 
     def mark_completed(self, relative_path: Path, fingerprint: str, note: str) -> None:
         key = str(relative_path).replace("\\", "/")
@@ -1502,6 +1616,42 @@ class FixupStateLedger:
         if key in self._data:
             self._data.pop(key, None)
             self._dirty = True
+
+
+def _coerce_summary_int(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return default
+
+
+def log_fixup_state_ledger_summary(state_ledger: FixupStateLedger) -> None:
+    state_ledger.flush()
+    try:
+        summary = state_ledger.summary()
+    except Exception as exc:
+        log.warning("[STATE] 读取状态账本摘要失败: %s", exc)
+        return
+    if isinstance(summary, dict):
+        ledger_records = _coerce_summary_int(summary.get("ledger_records"))
+        skipped_completed = _coerce_summary_int(summary.get("skipped_completed"))
+        fingerprint_mismatches = _coerce_summary_int(summary.get("fingerprint_mismatches"))
+    else:
+        ledger_data = getattr(state_ledger, "_data", {})
+        ledger_records = len(ledger_data) if isinstance(ledger_data, dict) else 0
+        skipped_completed = _coerce_summary_int(getattr(state_ledger, "skipped_completed", 0))
+        fingerprint_mismatches = _coerce_summary_int(
+            getattr(state_ledger, "fingerprint_mismatches", 0)
+        )
+    log.info(
+        "[STATE] ledger resume summary: records=%d skipped_completed=%d fingerprint_mismatches=%d",
+        ledger_records,
+        skipped_completed,
+        fingerprint_mismatches,
+    )
 
 
 def read_sql_text_with_limit(
@@ -2336,6 +2486,13 @@ def load_ob_config(
         session_timeout_us = DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US
     OBCLIENT_SESSION_QUERY_TIMEOUT_US = session_timeout_us
     ob_cfg["session_query_timeout_us"] = session_timeout_us
+    settings_section = parser["SETTINGS"] if parser.has_section("SETTINGS") else {}
+    ob_cfg["progress_log_interval"] = str(
+        parse_float_setting(settings_section.get("progress_log_interval", "10"), 10.0, minimum=1.0)
+    )
+    ob_cfg["slow_sql_warning_sec"] = str(
+        parse_float_setting(settings_section.get("slow_sql_warning_sec", "60"), 60.0, minimum=1.0)
+    )
 
     repo_root = config_path.parent.resolve()
     fixup_dir = parser.get("SETTINGS", "fixup_dir", fallback=DEFAULT_FIXUP_DIR).strip()
@@ -4377,7 +4534,12 @@ def bump_exec_mode_stat(exec_stats: Optional[Dict[str, int]], key: str, inc: int
 
 
 def execute_sql_statements(
-    obclient_cmd: List[str], sql_text: str, timeout: Optional[int], mode: str = "statement"
+    obclient_cmd: List[str],
+    sql_text: str,
+    timeout: Optional[int],
+    mode: str = "statement",
+    context_label: str = "",
+    artifact_path: str = "",
 ) -> ExecutionSummary:
     mode = normalize_fixup_exec_mode(mode)
     if mode == "auto":
@@ -4389,12 +4551,25 @@ def execute_sql_statements(
         return ExecutionSummary(statements=0, failures=failures)
 
     if mode == "file":
-        try:
-            result = run_sql(obclient_cmd, sql_text, timeout)
-        except subprocess.TimeoutExpired:
-            timeout_label = "no-timeout" if timeout is None else f"> {timeout} 秒"
-            failures.append(StatementFailure(1, f"执行超时 ({timeout_label})", sql_text))
-            return ExecutionSummary(statements=len(effective_statements), failures=failures)
+        with track_fixup_operation(
+            "fixup_file_execution",
+            operation_id=context_label or "file-mode",
+            current=1,
+            total=1,
+            artifact_path=artifact_path,
+            detail={
+                "execution_mode": "file",
+                "statement_count": len(effective_statements),
+                "timeout_sec": timeout if timeout is not None else "none",
+                "statement_progress_available": False,
+            },
+        ):
+            try:
+                result = run_sql(obclient_cmd, sql_text, timeout)
+            except subprocess.TimeoutExpired:
+                timeout_label = "no-timeout" if timeout is None else f"> {timeout} 秒"
+                failures.append(StatementFailure(1, f"执行超时 ({timeout_label})", sql_text))
+                return ExecutionSummary(statements=len(effective_statements), failures=failures)
         error_msg = extract_execution_error(result)
         if error_msg:
             failures.append(StatementFailure(1, error_msg, sql_text))
@@ -4402,12 +4577,26 @@ def execute_sql_statements(
 
     session_sensitive_reason = detect_session_sensitive_reason(sql_text)
     if session_sensitive_reason and len(effective_statements) > 1:
-        try:
-            result = run_sql(obclient_cmd, sql_text, timeout)
-        except subprocess.TimeoutExpired:
-            timeout_label = "no-timeout" if timeout is None else f"> {timeout} 秒"
-            failures.append(StatementFailure(1, f"执行超时 ({timeout_label})", sql_text))
-            return ExecutionSummary(statements=len(effective_statements), failures=failures)
+        with track_fixup_operation(
+            "fixup_file_execution",
+            operation_id=context_label or "session-sensitive-file",
+            current=1,
+            total=1,
+            artifact_path=artifact_path,
+            detail={
+                "execution_mode": "file",
+                "statement_count": len(effective_statements),
+                "session_sensitive_reason": session_sensitive_reason,
+                "statement_progress_available": False,
+                "timeout_sec": timeout if timeout is not None else "none",
+            },
+        ):
+            try:
+                result = run_sql(obclient_cmd, sql_text, timeout)
+            except subprocess.TimeoutExpired:
+                timeout_label = "no-timeout" if timeout is None else f"> {timeout} 秒"
+                failures.append(StatementFailure(1, f"执行超时 ({timeout_label})", sql_text))
+                return ExecutionSummary(statements=len(effective_statements), failures=failures)
         error_msg = extract_execution_error(result)
         if error_msg:
             failures.append(
@@ -4426,22 +4615,36 @@ def execute_sql_statements(
         statement_to_run = statement
         if current_schema and not match:
             statement_to_run = f"ALTER SESSION SET CURRENT_SCHEMA = {current_schema};\n{statement}"
-        try:
-            result = run_sql(obclient_cmd, statement_to_run, timeout)
-        except subprocess.TimeoutExpired:
-            timeout_label = "no-timeout" if timeout is None else f"> {timeout} 秒"
-            failures.append(StatementFailure(idx, f"执行超时 ({timeout_label})", statement_to_run))
-            for remainder_idx, remainder_statement in enumerate(
-                effective_statements[idx:], start=idx + 1
-            ):
+        with track_fixup_operation(
+            "fixup_statement_execution",
+            operation_id=(context_label or "statement-mode"),
+            current=idx,
+            total=len(effective_statements),
+            artifact_path=artifact_path,
+            detail={
+                "execution_mode": "statement",
+                "timeout_sec": timeout if timeout is not None else "none",
+                "sql_preview": safe_first_line(statement_to_run, 120, "-"),
+            },
+        ):
+            try:
+                result = run_sql(obclient_cmd, statement_to_run, timeout)
+            except subprocess.TimeoutExpired:
+                timeout_label = "no-timeout" if timeout is None else f"> {timeout} 秒"
                 failures.append(
-                    StatementFailure(
-                        remainder_idx,
-                        "前置语句超时未执行",
-                        remainder_statement,
-                    )
+                    StatementFailure(idx, f"执行超时 ({timeout_label})", statement_to_run)
                 )
-            break
+                for remainder_idx, remainder_statement in enumerate(
+                    effective_statements[idx:], start=idx + 1
+                ):
+                    failures.append(
+                        StatementFailure(
+                            remainder_idx,
+                            "前置语句超时未执行",
+                            remainder_statement,
+                        )
+                    )
+                break
 
         error_msg = extract_execution_error(result)
         if error_msg:
@@ -4464,18 +4667,59 @@ def execute_sql_with_mode(
         mode = "statement"
     bump_exec_mode_stat(exec_stats, mode)
 
-    summary = execute_sql_statements(obclient_cmd, sql_text, timeout, mode=mode)
+    summary = execute_sql_statements_with_optional_context(
+        obclient_cmd,
+        sql_text,
+        timeout,
+        mode=mode,
+        context_label=context_label,
+        artifact_path=context_label,
+    )
     if mode == "file" and summary.failures and exec_file_fallback:
         bump_exec_mode_stat(exec_stats, "fallback_retried")
         if context_label:
             log.warning("%s FILE 模式失败，回退 statement 重试一次。", context_label)
         else:
             log.warning("FILE 模式失败，回退 statement 重试一次。")
-        fallback_summary = execute_sql_statements(obclient_cmd, sql_text, timeout, mode="statement")
+        fallback_summary = execute_sql_statements_with_optional_context(
+            obclient_cmd,
+            sql_text,
+            timeout,
+            mode="statement",
+            context_label=f"{context_label} fallback" if context_label else "fallback",
+            artifact_path=context_label,
+        )
         if fallback_summary.success:
             bump_exec_mode_stat(exec_stats, "fallback_success")
         return fallback_summary
     return summary
+
+
+def execute_sql_statements_with_optional_context(
+    obclient_cmd: List[str],
+    sql_text: str,
+    timeout: Optional[int],
+    *,
+    mode: str,
+    context_label: str = "",
+    artifact_path: str = "",
+) -> ExecutionSummary:
+    kwargs = {
+        "mode": mode,
+        "context_label": context_label,
+        "artifact_path": artifact_path,
+    }
+    try:
+        return execute_sql_statements(obclient_cmd, sql_text, timeout, **kwargs)
+    except TypeError as exc:
+        message = str(exc)
+        if "unexpected keyword argument" not in message or not any(
+            name in message for name in ("context_label", "artifact_path")
+        ):
+            raise
+        kwargs.pop("context_label", None)
+        kwargs.pop("artifact_path", None)
+        return execute_sql_statements(obclient_cmd, sql_text, timeout, **kwargs)
 
 
 def log_exec_mode_summary(
@@ -5310,17 +5554,29 @@ def execute_grant_file_with_prune(
             continue
         executed_count += 1
 
-        try:
-            result = run_sql(obclient_cmd, statement, timeout)
-        except subprocess.TimeoutExpired:
-            msg = "执行超时" if timeout is None else f"执行超时 (> {timeout} 秒)"
-            failures.append(StatementFailure(executed_count, msg, statement))
-            kept_statements.append(statement)
-            if not truncated:
-                truncated = not record_error_entry(
-                    error_entries, error_limit, relative_path, executed_count, statement, msg
-                )
-            continue
+        with track_fixup_operation(
+            "fixup_grant_statement",
+            operation_id=f"{label_prefix} {relative_path}",
+            current=executed_count,
+            total=len(statements),
+            artifact_path=str(relative_path),
+            detail={
+                "execution_mode": "statement",
+                "timeout_sec": timeout if timeout is not None else "none",
+                "sql_preview": safe_first_line(statement, 120, "-"),
+            },
+        ):
+            try:
+                result = run_sql(obclient_cmd, statement, timeout)
+            except subprocess.TimeoutExpired:
+                msg = "执行超时" if timeout is None else f"执行超时 (> {timeout} 秒)"
+                failures.append(StatementFailure(executed_count, msg, statement))
+                kept_statements.append(statement)
+                if not truncated:
+                    truncated = not record_error_entry(
+                        error_entries, error_limit, relative_path, executed_count, statement, msg
+                    )
+                continue
 
         error_msg = extract_execution_error(result)
         if not error_msg:
@@ -5703,6 +5959,11 @@ def parse_args() -> argparse.Namespace:
           --min-progress : 最小进展阈值（默认 1）
           --view-chain-autofix : 基于 VIEW 依赖链生成/执行修复计划
           --allow-table-create : 允许执行 table/ 建表脚本（默认关闭，防止误建空表）
+          --safety-tiers : 按 safe/review/destructive/manual 分层选择执行（默认 safe,review）
+          --plan-only    : 只验证本次会执行哪些脚本，不连接数据库、不执行 SQL
+          --no-resume-ledger : 禁用 .fixup_state_ledger.json 跳过已完成文件/语句
+          心跳输出        : run_fixup_heartbeat_<ts>.json 记录当前文件/语句、耗时和 timeout；
+                            file 模式只承诺文件/进程级进度，statement 模式才有语句级进度
           注意: grants_deferred/ 默认跳过，需在补齐对象后显式执行
           注意: materialized_view/job/schedule 默认跳过，需核对后显式执行；即便显式配合 --iterative 也不会跨轮自动重试
 
@@ -5810,6 +6071,34 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow executing fixup_scripts/table/* (disabled by default for safety)",
     )
+    parser.add_argument(
+        "--safety-tiers",
+        default=",".join(DEFAULT_FIXUP_SAFETY_TIERS),
+        help=(
+            "Comma-separated safety tiers to execute: safe,review,destructive,manual,all "
+            "(default: safe,review)"
+        ),
+    )
+    parser.add_argument(
+        "--confirm-destructive",
+        action="store_true",
+        help="Required when --safety-tiers includes destructive",
+    )
+    parser.add_argument(
+        "--confirm-manual",
+        action="store_true",
+        help="Required when --safety-tiers includes manual",
+    )
+    parser.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="Collect and safety-filter fixup scripts without connecting to DB or executing SQL",
+    )
+    parser.add_argument(
+        "--no-resume-ledger",
+        action="store_true",
+        help="Disable .fixup_state_ledger.json resume checks and execute matching pending SQL files normally",
+    )
 
     return parser.parse_args()
 
@@ -5823,6 +6112,168 @@ def parse_csv_args(arg_list: List[str]) -> List[str]:
     return values
 
 
+def format_safety_tiers(tiers: Set[str]) -> str:
+    order = [SAFETY_TIER_SAFE, SAFETY_TIER_REVIEW, SAFETY_TIER_DESTRUCTIVE, SAFETY_TIER_MANUAL]
+    return ",".join([item for item in order if item in tiers])
+
+
+def parse_safety_tiers(raw_value: str) -> Set[str]:
+    raw = (raw_value or "").strip()
+    if not raw:
+        return set(DEFAULT_FIXUP_SAFETY_TIERS)
+    tokens = {normalize_dir_filter(item) for item in raw.split(",") if normalize_dir_filter(item)}
+    if "all" in tokens:
+        return set(FIXUP_SAFETY_TIER_VALUES)
+    unknown = sorted(tokens - FIXUP_SAFETY_TIER_VALUES)
+    if unknown:
+        raise ConfigError(
+            "未知 safety tier: {items}; 支持 safe,review,destructive,manual,all".format(
+                items=", ".join(unknown)
+            )
+        )
+    if not tokens:
+        return set(DEFAULT_FIXUP_SAFETY_TIERS)
+    return set(tokens)
+
+
+def validate_safety_tier_confirmation(args: argparse.Namespace, tiers: Set[str]) -> None:
+    if SAFETY_TIER_DESTRUCTIVE in tiers and not getattr(args, "confirm_destructive", False):
+        raise ConfigError(
+            "已选择 destructive safety tier，但缺少 --confirm-destructive；"
+            "请先人工审核 SQL 后再显式确认。"
+        )
+    if SAFETY_TIER_MANUAL in tiers and not getattr(args, "confirm_manual", False):
+        raise ConfigError(
+            "已选择 manual safety tier，但缺少 --confirm-manual；"
+            "manual-only family 需要人工动作上下文确认后再执行。"
+        )
+
+
+def get_selected_safety_tiers(args: argparse.Namespace) -> Set[str]:
+    if hasattr(args, "safety_tiers_set"):
+        return set(getattr(args, "safety_tiers_set") or DEFAULT_FIXUP_SAFETY_TIERS)
+    if hasattr(args, "safety_tiers"):
+        return parse_safety_tiers(getattr(args, "safety_tiers") or "")
+    return set(FIXUP_SAFETY_TIER_VALUES)
+
+
+def resolve_sql_file_safety(
+    args: argparse.Namespace,
+    fixup_dir: Path,
+    sql_path: Path,
+) -> Tuple[str, str]:
+    cache: Dict[str, Tuple[str, str]] = getattr(args, "_fixup_safety_cache", {})
+    key = str(sql_path)
+    if key in cache:
+        return cache[key]
+    try:
+        relative_path = sql_path.relative_to(fixup_dir)
+    except ValueError:
+        relative_path = sql_path
+    try:
+        sql_text = sql_path.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        tier_reason = (
+            SAFETY_TIER_MANUAL,
+            f"unable to read SQL for safety classification: {exc}",
+        )
+        cache[key] = tier_reason
+        setattr(args, "_fixup_safety_cache", cache)
+        return tier_reason
+    tier_reason = classify_fixup_safety(relative_path, sql_text)
+    cache[key] = tier_reason
+    setattr(args, "_fixup_safety_cache", cache)
+    return tier_reason
+
+
+def filter_files_by_safety_tier(
+    args: argparse.Namespace,
+    fixup_dir: Path,
+    files_with_layer: List[Tuple[int, Path]],
+) -> List[Tuple[int, Path]]:
+    allowed_tiers = get_selected_safety_tiers(args)
+    kept: List[Tuple[int, Path]] = []
+    skipped_by_tier: Dict[str, int] = defaultdict(int)
+    kept_by_tier: Dict[str, int] = defaultdict(int)
+    for layer, sql_path in files_with_layer:
+        tier, _reason = resolve_sql_file_safety(args, fixup_dir, sql_path)
+        if tier in allowed_tiers:
+            kept.append((layer, sql_path))
+            kept_by_tier[tier] += 1
+        else:
+            skipped_by_tier[tier] += 1
+    log.info("安全分层选择: %s", format_safety_tiers(allowed_tiers))
+    if kept_by_tier:
+        log.info(
+            "安全分层保留: %s",
+            ", ".join(f"{tier}={kept_by_tier[tier]}" for tier in sorted(kept_by_tier)),
+        )
+    if skipped_by_tier:
+        log.warning(
+            "安全分层跳过: %s",
+            ", ".join(f"{tier}={skipped_by_tier[tier]}" for tier in sorted(skipped_by_tier)),
+        )
+    return kept
+
+
+def log_sql_file_safety_context(
+    args: argparse.Namespace,
+    fixup_dir: Path,
+    sql_path: Path,
+    label: str,
+) -> None:
+    tier, reason = resolve_sql_file_safety(args, fixup_dir, sql_path)
+    try:
+        rel = sql_path.relative_to(fixup_dir)
+    except ValueError:
+        rel = sql_path
+    if tier == SAFETY_TIER_MANUAL:
+        log.warning("%s %s -> safety_tier=%s, reason=%s", label, rel, tier, reason)
+    else:
+        log.info("%s %s -> safety_tier=%s, reason=%s", label, rel, tier, reason)
+
+
+def write_run_fixup_plan_validation(
+    fixup_dir: Path,
+    report_dir: Path,
+    files_with_layer: List[Tuple[int, Path]],
+    selected_tiers: Set[str],
+) -> Tuple[Path, Path]:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(report_dir) if report_dir else Path(fixup_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = output_dir / f"run_fixup_plan_validation_{timestamp}.jsonl"
+    summary_path = output_dir / f"run_fixup_plan_validation_{timestamp}.txt"
+    counts: Dict[str, int] = defaultdict(int)
+    rows: List[Dict[str, object]] = []
+    for layer, sql_path in files_with_layer:
+        record = build_fixup_plan_record(Path(fixup_dir), Path(sql_path))
+        if not record:
+            continue
+        tier = str(record.get("safety_tier") or SAFETY_TIER_REVIEW)
+        counts[tier] += 1
+        record["execution_layer"] = layer
+        record["selected_for_execution"] = tier in selected_tiers
+        rows.append(record)
+    with jsonl_path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True))
+            handle.write("\n")
+    summary_lines = [
+        "# run_fixup plan validation",
+        f"fixup_dir: {fixup_dir}",
+        f"selected_safety_tiers: {format_safety_tiers(selected_tiers)}",
+        f"selected_files: {len(rows)}",
+        "TIER | COUNT",
+    ]
+    for tier in [SAFETY_TIER_SAFE, SAFETY_TIER_REVIEW, SAFETY_TIER_DESTRUCTIVE, SAFETY_TIER_MANUAL]:
+        summary_lines.append(f"{tier} | {counts.get(tier, 0)}")
+    summary_lines.append("")
+    summary_lines.append("No database connection or SQL execution was performed.")
+    summary_path.write_text("\n".join(summary_lines).rstrip() + "\n", encoding="utf-8")
+    return jsonl_path, summary_path
+
+
 def main() -> None:
     """
     Main entry point with optional iterative fixup support.
@@ -5833,7 +6284,15 @@ def main() -> None:
     - Error pattern analysis
     - Progress tracking across rounds
     """
+    global FIXUP_OPERATION_TRACKER
     args = parse_args()
+    try:
+        args.safety_tiers_set = parse_safety_tiers(getattr(args, "safety_tiers", ""))
+        validate_safety_tier_confirmation(args, args.safety_tiers_set)
+        args._fixup_safety_cache = {}
+    except ConfigError as exc:
+        log.error("参数错误: %s", exc)
+        sys.exit(2)
     if getattr(args, "iterative", False) and getattr(args, "view_chain_autofix", False):
         log.error("参数冲突: --iterative 和 --view-chain-autofix 不能同时启用。")
         sys.exit(2)
@@ -5870,16 +6329,20 @@ def main() -> None:
         only_dirs = [normalize_dir_filter(d) for d in only_dirs] if only_dirs else []
 
     exclude_dirs = [normalize_dir_filter(d) for d in exclude_dirs]
-    default_excludes = {
-        "tables_unsupported",
-        "unsupported",
-        "constraint_validate_later",
-        "grants_deferred",
-        "cleanup_safe",
-        "cleanup_semantic",
-        "sequence_restart",
-        *MANUAL_REVIEW_DIRS,
-    }
+    allowed_safety_tiers = set(getattr(args, "safety_tiers_set", DEFAULT_FIXUP_SAFETY_TIERS))
+    default_excludes = {"constraint_validate_later"}
+    if SAFETY_TIER_MANUAL not in allowed_safety_tiers:
+        default_excludes.update(
+            {
+                "tables_unsupported",
+                "unsupported",
+                "grants_deferred",
+                "sequence_restart",
+                *MANUAL_REVIEW_DIRS,
+            }
+        )
+    if SAFETY_TIER_DESTRUCTIVE not in allowed_safety_tiers:
+        default_excludes.update({"cleanup_safe", "cleanup_semantic"})
     if not getattr(args, "allow_table_create", False):
         # Safety first: table create scripts are risky in migration workflows
         # because they can create empty target tables if OMS data load is skipped.
@@ -5905,24 +6368,32 @@ def main() -> None:
         )
     if not getattr(args, "allow_table_create", False):
         log.warning("安全模式: 默认跳过 fixup_scripts/table/（防止误建空表）。")
-    if not any(dir_filter_overlaps("grants_deferred", item) for item in only_dirs):
+    if SAFETY_TIER_MANUAL not in allowed_safety_tiers and not any(
+        dir_filter_overlaps("grants_deferred", item) for item in only_dirs
+    ):
         log.warning("安全模式: 默认跳过 fixup_scripts/grants_deferred/（需对象补齐后再执行）。")
-    if not any(dir_filter_overlaps("sequence_restart", item) for item in only_dirs):
+    if SAFETY_TIER_MANUAL not in allowed_safety_tiers and not any(
+        dir_filter_overlaps("sequence_restart", item) for item in only_dirs
+    ):
         log.warning(
             "安全模式: 默认跳过 fixup_scripts/sequence_restart/（值同步 SQL 需确认 LAST_NUMBER 与执行时机后再执行）。"
         )
-    if not any(
+    if SAFETY_TIER_MANUAL not in allowed_safety_tiers and not any(
         any(dir_filter_overlaps(dir_name, item) for item in only_dirs)
         for dir_name in MANUAL_REVIEW_DIRS
     ):
         log.warning(
             "安全模式: 默认跳过 fixup_scripts/materialized_view|job|schedule/（manual-only family 需核对定义与人工事项后再显式执行）。"
         )
-    if not any(dir_filter_overlaps("cleanup_safe", item) for item in only_dirs):
+    if SAFETY_TIER_DESTRUCTIVE not in allowed_safety_tiers and not any(
+        dir_filter_overlaps("cleanup_safe", item) for item in only_dirs
+    ):
         log.warning(
             "安全模式: 默认跳过 fixup_scripts/cleanup_safe/（显式审核后再执行 destructive 清理 SQL）。"
         )
-    if not any(dir_filter_overlaps("cleanup_semantic", item) for item in only_dirs):
+    if SAFETY_TIER_DESTRUCTIVE not in allowed_safety_tiers and not any(
+        dir_filter_overlaps("cleanup_semantic", item) for item in only_dirs
+    ):
         log.warning(
             "安全模式: 默认跳过 fixup_scripts/cleanup_semantic/（语义级 destructive 约束清理需显式审核后执行）。"
         )
@@ -5938,6 +6409,7 @@ def main() -> None:
     except Exception as exc:
         log.error("致命错误: 无法读取配置: %s", exc)
         sys.exit(1)
+    ob_cfg["selected_safety_tiers"] = format_safety_tiers(args.safety_tiers_set)
 
     level_name = (log_level or "AUTO").strip().upper()
     level = resolve_console_log_level(level_name)
@@ -5949,6 +6421,29 @@ def main() -> None:
         log.info("日志级别: console=%s", logging.getLevelName(level))
     set_console_log_level(level)
     log.info("run_fixup v%s", __version__)
+    log.info("安全分层执行: %s", format_safety_tiers(args.safety_tiers_set))
+    if SAFETY_TIER_DESTRUCTIVE in args.safety_tiers_set:
+        log.warning("已显式确认 destructive safety tier: %s", bool(args.confirm_destructive))
+    if SAFETY_TIER_MANUAL in args.safety_tiers_set:
+        log.warning("已显式确认 manual safety tier: %s", bool(args.confirm_manual))
+    if getattr(args, "plan_only", False):
+        FIXUP_OPERATION_TRACKER = None
+        log.info("--plan-only: 跳过运行心跳和 timeout summary 输出。")
+    else:
+        FIXUP_OPERATION_TRACKER = setup_fixup_runtime_observability(
+            ob_cfg, fixup_dir, report_dir, fixup_settings
+        )
+    diagnostic_parts = [
+        "python3",
+        "diagnostic_bundle.py",
+        "--run-dir",
+        str(report_dir),
+        "--config",
+        str(config_arg.resolve()),
+    ]
+    if FIXUP_OPERATION_TRACKER is not None:
+        diagnostic_parts.extend(["--pid", str(os.getpid()), "--hang"])
+    log.info("诊断包命令: %s", " ".join(shlex.quote(part) for part in diagnostic_parts))
     notice_state_path: Optional[Path] = None
     notice_state: Optional[Dict[str, object]] = None
     notices_to_mark_seen: List[RuntimeNotice] = []
@@ -5970,6 +6465,9 @@ def main() -> None:
 
     # Check if iterative mode requested via config or args
     iterative_mode = getattr(args, "iterative", False)
+    if getattr(args, "plan_only", False) and iterative_mode:
+        log.warning("--plan-only 不执行迭代轮次；本次只验证当前 fixup_scripts 选择结果。")
+        iterative_mode = False
     max_rounds = getattr(args, "max_rounds", 10)
     min_progress = getattr(args, "min_progress", 1)
     hot_reload_runtime = init_fixup_hot_reload_runtime(config_arg.resolve())
@@ -6021,6 +6519,9 @@ def main() -> None:
         log.error("执行失败: %s", exc)
         sys.exit(1)
     finally:
+        if FIXUP_OPERATION_TRACKER is not None:
+            FIXUP_OPERATION_TRACKER.close()
+            FIXUP_OPERATION_TRACKER = None
         if notice_state_path and notice_state is not None and notices_to_mark_seen:
             try:
                 persist_seen_notices(
@@ -6050,7 +6551,9 @@ def run_single_fixup(
 
     done_dir = fixup_dir / DONE_DIR_NAME
     done_dir.mkdir(exist_ok=True)
-    state_ledger = FixupStateLedger(fixup_dir)
+    state_ledger = None if getattr(args, "no_resume_ledger", False) else FixupStateLedger(fixup_dir)
+    if state_ledger is None:
+        log.warning("[STATE] 已禁用 ledger resume: --no-resume-ledger")
 
     # Collect SQL files
     files_with_layer = collect_sql_files_by_layer(
@@ -6060,6 +6563,15 @@ def run_single_fixup(
         exclude_dirs=set(exclude_dirs),
         glob_patterns=args.glob_patterns or None,
     )
+    files_with_layer = filter_files_by_safety_tier(args, fixup_dir, files_with_layer)
+
+    if getattr(args, "plan_only", False):
+        jsonl_path, summary_path = write_run_fixup_plan_validation(
+            fixup_dir, report_dir, files_with_layer, get_selected_safety_tiers(args)
+        )
+        log.info("[PLAN_ONLY] 已写入执行计划验证: %s", jsonl_path)
+        log.info("[PLAN_ONLY] 已写入执行计划摘要: %s", summary_path)
+        return
 
     if not files_with_layer:
         log.warning("目录 %s 中未找到任何 *.sql 文件。", fixup_dir)
@@ -6119,6 +6631,7 @@ def run_single_fixup(
 
         relative_path = sql_path.relative_to(repo_root)
         label = format_progress_label(idx, total_scripts, width)
+        log_sql_file_safety_context(args, fixup_dir, sql_path, label)
 
         if is_grant_dir(sql_path.parent.name):
             bump_exec_mode_stat(exec_stats, "grants_statement")
@@ -6385,7 +6898,8 @@ def run_single_fixup(
     )
     if report_path:
         log.info("错误报告已输出: %s", report_path)
-    state_ledger.flush()
+    if state_ledger:
+        log_fixup_state_ledger_summary(state_ledger)
 
     log_section("执行结束")
 
@@ -6436,6 +6950,14 @@ def run_view_chain_autofix(
         exclude_dirs=set(exclude_dirs),
         glob_patterns=args.glob_patterns or None,
     )
+    files_with_layer = filter_files_by_safety_tier(args, fixup_dir, files_with_layer)
+    if getattr(args, "plan_only", False):
+        jsonl_path, summary_path = write_run_fixup_plan_validation(
+            fixup_dir, report_dir, files_with_layer, get_selected_safety_tiers(args)
+        )
+        log.info("[PLAN_ONLY] 已写入执行计划验证: %s", jsonl_path)
+        log.info("[PLAN_ONLY] 已写入执行计划摘要: %s", summary_path)
+        return
     object_index, name_index = build_fixup_object_index(files_with_layer)
     done_dir = fixup_dir / DONE_DIR_NAME
     done_object_index: Dict[Tuple[str, str], List[Path]] = {}
@@ -6474,7 +6996,9 @@ def run_view_chain_autofix(
     sql_dir = fixup_dir / "view_chain_sql"
     plan_dir.mkdir(parents=True, exist_ok=True)
     sql_dir.mkdir(parents=True, exist_ok=True)
-    state_ledger = FixupStateLedger(fixup_dir)
+    state_ledger = None if getattr(args, "no_resume_ledger", False) else FixupStateLedger(fixup_dir)
+    if state_ledger is None:
+        log.warning("[STATE] 已禁用 ledger resume: --no-resume-ledger")
 
     obclient_cmd = build_obclient_command(ob_cfg)
     ob_timeout = resolve_timeout_value(ob_cfg.get("timeout"))
@@ -6634,7 +7158,7 @@ def run_view_chain_autofix(
         except ValueError:
             relative_path = sql_path.resolve()
         fingerprint = FixupStateLedger.fingerprint(sql_text or "")
-        if state_ledger.is_completed(relative_path, fingerprint):
+        if state_ledger and state_ledger.is_completed(relative_path, fingerprint):
             skipped_views += 1
             status = classify_view_chain_status(False, True, root_exists, 0)
             view_results.append((view_key, status, ["state ledger hit"]))
@@ -6680,7 +7204,8 @@ def run_view_chain_autofix(
         view_results.append((view_key, status, reasons))
 
         if status == "SUCCESS":
-            state_ledger.mark_completed(relative_path, fingerprint, "VIEW_CHAIN_SUCCESS")
+            if state_ledger:
+                state_ledger.mark_completed(relative_path, fingerprint, "VIEW_CHAIN_SUCCESS")
             executed_views += 1
             log.info(
                 "%s [VIEW_CHAIN] %s 执行成功 (%d statements)。", label, view_key, summary.statements
@@ -6704,7 +7229,8 @@ def run_view_chain_autofix(
                 summary.statements,
             )
 
-    state_ledger.flush()
+    if state_ledger:
+        log_fixup_state_ledger_summary(state_ledger)
     log_section("VIEW 链路修复完成")
     log.info("视图总数: %d", total_views)
     log.info("执行成功: %d", executed_views)
@@ -6779,7 +7305,9 @@ def run_iterative_fixup(
 
     done_dir = fixup_dir / DONE_DIR_NAME
     done_dir.mkdir(exist_ok=True)
-    state_ledger = FixupStateLedger(fixup_dir)
+    state_ledger = None if getattr(args, "no_resume_ledger", False) else FixupStateLedger(fixup_dir)
+    if state_ledger is None:
+        log.warning("[STATE] 已禁用 ledger resume: --no-resume-ledger")
 
     current_ob_cfg = dict(ob_cfg)
     current_fixup_settings = fixup_settings
@@ -6853,6 +7381,14 @@ def run_iterative_fixup(
             exclude_dirs=set(exclude_dirs),
             glob_patterns=args.glob_patterns or None,
         )
+        files_with_layer = filter_files_by_safety_tier(args, fixup_dir, files_with_layer)
+        if getattr(args, "plan_only", False):
+            jsonl_path, summary_path = write_run_fixup_plan_validation(
+                fixup_dir, report_dir, files_with_layer, get_selected_safety_tiers(args)
+            )
+            log.info("[PLAN_ONLY] 已写入执行计划验证: %s", jsonl_path)
+            log.info("[PLAN_ONLY] 已写入执行计划摘要: %s", summary_path)
+            return
         stale_failed = [path for path in sorted(active_failed_paths, key=str) if not path.exists()]
         if stale_failed:
             for path in stale_failed:
@@ -6889,6 +7425,7 @@ def run_iterative_fixup(
 
             relative_path = sql_path.relative_to(repo_root)
             label = format_progress_label(idx, total_scripts, width)
+            log_sql_file_safety_context(args, fixup_dir, sql_path, label)
             normalized_path = normalize_failed_path(relative_path, repo_root)
             contract = get_fixup_execution_contract(relative_path)
 
@@ -7306,7 +7843,8 @@ def run_iterative_fixup(
     reload_report_path = write_fixup_hot_reload_events_report(fixup_dir, hot_reload_runtime)
     if reload_report_path:
         log.info("配置热加载事件已输出: %s", reload_report_path)
-    state_ledger.flush()
+    if state_ledger:
+        log_fixup_state_ledger_summary(state_ledger)
 
     log_section("执行结束")
 

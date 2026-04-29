@@ -16,7 +16,7 @@
 
 """
 
-数据库对象对比工具 (V0.9.9.5 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
+数据库对象对比工具 (V0.9.9.6 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -33,7 +33,7 @@
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.9.9.5 核心)：
+3. 性能架构 (V0.9.9.6 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          DBA_OBJECTS
@@ -76,6 +76,7 @@ except Exception:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 import random
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -111,7 +112,33 @@ from typing import (
     Union,
 )
 
-__version__ = "0.9.9.5"
+from comparator_reliability import (
+    ACTION_GENERATE_FIXUP,
+    ACTION_MANUAL_REVIEW,
+    ACTION_REPORT_ONLY,
+    ACTION_SUPPRESS,
+    DECISION_MANUAL,
+    DECISION_MISMATCH,
+    DECISION_REVIEW,
+    DECISION_SUPPRESS,
+    OperationTracker,
+    RecoveryManager,
+    build_reason_record,
+    build_timeout_rows,
+    build_timeout_warnings,
+    export_compatibility_matrix,
+    export_fixup_plan,
+    export_reason_records,
+    load_compatibility_registry,
+    log_timeout_summary,
+    parse_float_setting,
+    parse_int_setting,
+    resolve_compatibility_registry_path,
+    validate_recovery_resume,
+    write_timeout_summary,
+)
+
+__version__ = "0.9.9.6"
 
 __author__ = "Minor Li"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
@@ -417,6 +444,8 @@ def log_subsection(title: str, fill_char: str = "-") -> None:
 
 init_console_logging()
 log = logging.getLogger(__name__)
+RUN_OPERATION_TRACKER: Optional[OperationTracker] = None
+RUN_RECOVERY_MANAGER: Optional[RecoveryManager] = None
 
 
 def get_source_metadata_phase_label(source_db_mode: Optional[str]) -> str:
@@ -601,10 +630,27 @@ class ConfigHotReloadRuntime:
 @contextmanager
 def phase_timer(phase: str, durations: Dict[str, float]):
     start = time.perf_counter()
+    tracker = RUN_OPERATION_TRACKER
+    recovery = RUN_RECOVERY_MANAGER
+    token = None
+    if tracker is not None:
+        token = tracker.begin(phase, operation_id=phase)
+    if recovery is not None:
+        recovery.record_phase(phase, state="started")
+    status = "success"
     try:
         yield
+    except Exception:
+        status = "failed"
+        if recovery is not None:
+            recovery.record_phase(phase, state="failed")
+        raise
     finally:
         durations[phase] = durations.get(phase, 0.0) + (time.perf_counter() - start)
+        if recovery is not None and status == "success":
+            recovery.record_phase(phase, state="completed")
+        if tracker is not None:
+            tracker.finish(token, status=status)
 
 
 def format_duration(seconds: float) -> str:
@@ -662,6 +708,74 @@ def setup_run_logging(settings: Dict, timestamp: str) -> Optional[Path]:
     except Exception as exc:
         log.warning("初始化日志文件失败，将仅输出到控制台: %s", exc)
         return None
+
+
+def setup_main_runtime_observability(
+    settings: Dict, report_dir: Path, timestamp: str
+) -> Optional[OperationTracker]:
+    progress_interval = parse_float_setting(
+        settings.get("progress_log_interval", 10), 10.0, minimum=1.0
+    )
+    slow_phase_warning_sec = parse_float_setting(
+        settings.get("slow_phase_warning_sec", 300), 300.0, minimum=1.0
+    )
+    tracker = OperationTracker(
+        run_id=timestamp,
+        state_path=Path(report_dir) / f"run_heartbeat_{timestamp}.json",
+        logger=log,
+        interval_sec=progress_interval,
+        slow_warning_sec=slow_phase_warning_sec,
+        tool="schema_diff_reconciler",
+    )
+
+    cli_timeout = parse_int_setting(settings.get("cli_timeout", 600), 600, minimum=0)
+    obclient_timeout = parse_int_setting(
+        settings.get("obclient_timeout", OBC_TIMEOUT), 60, minimum=0
+    )
+    session_timeout_us = parse_int_setting(
+        settings.get("ob_session_query_timeout_us", DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US),
+        DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_US,
+        minimum=0,
+    )
+    table_presence_timeout = parse_int_setting(
+        settings.get("table_data_presence_obclient_timeout", obclient_timeout),
+        obclient_timeout,
+        minimum=0,
+    )
+    rows = build_timeout_rows(
+        cli_timeout=cli_timeout,
+        obclient_timeout=obclient_timeout,
+        session_query_timeout_us=session_timeout_us,
+        table_presence_timeout=table_presence_timeout,
+        progress_log_interval=progress_interval,
+        slow_phase_warning_sec=slow_phase_warning_sec,
+        slow_sql_warning_sec=parse_float_setting(
+            settings.get("slow_sql_warning_sec", 60), 60.0, minimum=1.0
+        ),
+    )
+    warnings = build_timeout_warnings(
+        process_timeout_sec=obclient_timeout or None,
+        session_query_timeout_us=session_timeout_us or None,
+        slow_warning_sec=slow_phase_warning_sec,
+        process_name="main obclient",
+    )
+    warnings.extend(
+        build_timeout_warnings(
+            process_timeout_sec=cli_timeout or None,
+            session_query_timeout_us=None,
+            slow_warning_sec=slow_phase_warning_sec,
+            process_name="dbcat/main cli",
+        )
+    )
+    summary_path = write_timeout_summary(
+        Path(report_dir) / f"runtime_timeout_summary_{timestamp}.txt", rows, warnings
+    )
+    settings["_runtime_heartbeat_state_path"] = str(tracker.state_path)
+    settings["_runtime_timeout_summary_path"] = str(summary_path)
+    settings["_runtime_timeout_warnings"] = list(warnings)
+    log_timeout_summary(log, rows, warnings)
+    log.info("[HEARTBEAT] state file: %s", tracker.state_path)
+    return tracker
 
 
 def resolve_path_from_config(config_path: Path, raw_path: str) -> Path:
@@ -8192,6 +8306,19 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings.setdefault("dbcat_chunk_size", "150")
         settings.setdefault("fixup_workers", "")
         settings.setdefault("progress_log_interval", "10")
+        settings.setdefault("slow_phase_warning_sec", "300")
+        settings.setdefault("slow_sql_warning_sec", "60")
+        settings.setdefault("compatibility_registry_path", "")
+        settings.setdefault("checkpoint_enable", "true")
+        settings.setdefault("resume_manifest", "")
+        settings.setdefault("force_resume", "false")
+        settings.setdefault("resume_override_reason", "")
+        settings.setdefault("diagnostic_bundle_enable", "true")
+        settings.setdefault("diagnostic_bundle_output_dir", "")
+        settings.setdefault("diagnostic_include_sql_content", "false")
+        settings.setdefault("diagnostic_redact_identifiers", "false")
+        settings.setdefault("diagnostic_max_file_mb", "20")
+        settings.setdefault("diagnostic_max_bundle_mb", "200")
         settings.setdefault("extra_check_workers", "16")
         settings.setdefault("extra_check_chunk_size", "200")
         settings.setdefault("extra_check_progress_interval", "10")
@@ -8784,6 +8911,34 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
             settings["extra_check_progress_interval"] = 10.0
         if settings["extra_check_progress_interval"] < 1:
             settings["extra_check_progress_interval"] = 1.0
+        settings["progress_log_interval"] = parse_float_setting(
+            settings.get("progress_log_interval", "10"), 10.0, minimum=1.0
+        )
+        settings["slow_phase_warning_sec"] = parse_float_setting(
+            settings.get("slow_phase_warning_sec", "300"), 300.0, minimum=1.0
+        )
+        settings["slow_sql_warning_sec"] = parse_float_setting(
+            settings.get("slow_sql_warning_sec", "60"), 60.0, minimum=1.0
+        )
+        settings["checkpoint_enable"] = parse_bool_flag(
+            settings.get("checkpoint_enable", "true"), True
+        )
+        settings["force_resume"] = parse_bool_flag(settings.get("force_resume", "false"), False)
+        settings["diagnostic_bundle_enable"] = parse_bool_flag(
+            settings.get("diagnostic_bundle_enable", "true"), True
+        )
+        settings["diagnostic_include_sql_content"] = parse_bool_flag(
+            settings.get("diagnostic_include_sql_content", "false"), False
+        )
+        settings["diagnostic_redact_identifiers"] = parse_bool_flag(
+            settings.get("diagnostic_redact_identifiers", "false"), False
+        )
+        settings["diagnostic_max_file_mb"] = parse_int_setting(
+            settings.get("diagnostic_max_file_mb", "20"), 20, minimum=1
+        )
+        settings["diagnostic_max_bundle_mb"] = parse_int_setting(
+            settings.get("diagnostic_max_bundle_mb", "200"), 200, minimum=1
+        )
         settings["dbcat_no_cal_dep"] = parse_bool_flag(
             settings.get("dbcat_no_cal_dep", "false"), False
         )
@@ -10317,6 +10472,60 @@ def run_config_wizard(config_path: Path) -> None:
         "dbcat CLI 超时（秒）",
         default=cfg.get("SETTINGS", "cli_timeout", fallback="600"),
         validator=_validate_positive_int,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "progress_log_interval",
+        "主程序/run_fixup 心跳与进度日志间隔（秒，>=1）",
+        default=cfg.get("SETTINGS", "progress_log_interval", fallback="10"),
+        validator=_validate_positive_int,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "slow_phase_warning_sec",
+        "主程序阶段级慢操作告警阈值（秒，>=1）",
+        default=cfg.get("SETTINGS", "slow_phase_warning_sec", fallback="300"),
+        validator=_validate_positive_int,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "slow_sql_warning_sec",
+        "run_fixup 单文件/单语句慢执行告警阈值（秒，>=1）",
+        default=cfg.get("SETTINGS", "slow_sql_warning_sec", fallback="60"),
+        validator=_validate_positive_int,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "compatibility_registry_path",
+        "兼容矩阵 registry 路径（留空使用随工具发布的 compatibility_registry.json）",
+        default=cfg.get("SETTINGS", "compatibility_registry_path", fallback=""),
+    )
+    _prompt_field(
+        "SETTINGS",
+        "checkpoint_enable",
+        "是否写入 recovery manifest (true/false)",
+        default=cfg.get("SETTINGS", "checkpoint_enable", fallback="true"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "diagnostic_include_sql_content",
+        "诊断包默认是否包含 SQL 正文 (true/false，默认 false)",
+        default=cfg.get("SETTINGS", "diagnostic_include_sql_content", fallback="false"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "diagnostic_redact_identifiers",
+        "诊断包是否做标识符 hash 脱敏 (true/false，默认 false)",
+        default=cfg.get("SETTINGS", "diagnostic_redact_identifiers", fallback="false"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "diagnostic_max_bundle_mb",
+        "诊断包总采集上限 MB（默认 200）",
+        default=cfg.get("SETTINGS", "diagnostic_max_bundle_mb", fallback="200"),
     )
     _prompt_field(
         "SETTINGS",
@@ -50384,6 +50593,44 @@ def generate_fixup_scripts(
     format_report_path = format_fixup_outputs(settings, base_dir, report_dir, report_timestamp)
     if format_report_path:
         log.info("[DDL_FORMAT] DDL 格式化报告已输出: %s", format_report_path)
+    if report_dir and report_timestamp:
+        plan_path, safety_summary_path, safety_counts = export_fixup_plan(
+            base_dir, Path(report_dir), report_timestamp
+        )
+        settings["_fixup_plan_path"] = str(plan_path)
+        settings["_fixup_safety_summary_path"] = str(safety_summary_path)
+        settings["_fixup_safety_counts"] = dict(safety_counts)
+        if RUN_RECOVERY_MANAGER is not None:
+            RUN_RECOVERY_MANAGER.record_phase(
+                "修补脚本生成",
+                state="artifacts_exported",
+                output_paths=[plan_path, safety_summary_path],
+            )
+            try:
+                for raw_line in plan_path.read_text(encoding="utf-8").splitlines():
+                    if not raw_line.strip():
+                        continue
+                    record = json.loads(raw_line)
+                    RUN_RECOVERY_MANAGER.record_object(
+                        phase="修补脚本生成",
+                        object_type=str(record.get("object_type") or ""),
+                        object_identity=str(record.get("object_identity") or ""),
+                        state="artifact_generated",
+                        artifacts=[base_dir / str(record.get("file_path") or "")],
+                        source_evidence_hash=str(record.get("file_sha1") or ""),
+                        target_mapping_hash=str(record.get("compatibility_decision") or ""),
+                        detail=str(record.get("safety_tier") or ""),
+                    )
+            except Exception as exc:
+                log.debug("[RECOVERY] fixup object checkpoint export skipped: %s", exc)
+        log.info(
+            "[FIXUP] 安全分层计划已输出: %s (safe=%d, review=%d, destructive=%d, manual=%d)",
+            plan_path,
+            int(safety_counts.get("safe", 0)),
+            int(safety_counts.get("review", 0)),
+            int(safety_counts.get("destructive", 0)),
+            int(safety_counts.get("manual", 0)),
+        )
 
     if unsupported_types:
         log.warning(
@@ -50636,6 +50883,24 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "人工处理/确认统一清单"
     if name.startswith("fixup_skip_summary_"):
         return "AUX", "Fixup 跳过汇总"
+    if name.startswith("runtime_timeout_summary_"):
+        return "AUX", "运行时 timeout 生效值与风险提示"
+    if name.startswith("run_heartbeat_"):
+        return "AUX", "主程序 heartbeat 状态"
+    if name.startswith("compatibility_matrix_"):
+        return "AUX", "兼容矩阵机器可读结果"
+    if name.startswith("compatibility_summary_"):
+        return "AUX", "兼容矩阵摘要"
+    if name.startswith("recovery_manifest_"):
+        return "AUX", "恢复与重跑 checkpoint manifest"
+    if name.startswith("difference_explanations_") and name.endswith(".jsonl"):
+        return "AUX", "差异解释机器可读 JSONL"
+    if name.startswith("difference_explanations_summary_"):
+        return "AUX", "差异解释摘要"
+    if name.startswith("fixup_plan_"):
+        return "AUX", "Fixup 计划 JSONL 与 safety tier"
+    if name.startswith("fixup_safety_summary_"):
+        return "AUX", "Fixup safety tier 摘要"
     if name.startswith("ddl_format_report_"):
         return "AUX", "DDL 格式化报告"
     if name.startswith("ddl_cleanup_detail_"):
@@ -52004,6 +52269,432 @@ def export_skipped_objects_detail(
     return write_pipe_report("仅打印未校验对象明细", header_fields, rows, output_path)
 
 
+def reason_code_for_length_issue(issue_type: str) -> Tuple[str, str, str]:
+    issue = (issue_type or "").strip().lower()
+    if issue == "char_mismatch":
+        return (
+            "VARCHAR_CHAR_LENGTH_EXACT_MISMATCH",
+            "COMPARE.TABLE.COLUMN.VARCHAR_CHAR_EXACT.V1",
+            ACTION_GENERATE_FIXUP,
+        )
+    if issue == "short":
+        return (
+            "VARCHAR_BYTE_LENGTH_BELOW_WINDOW",
+            "COMPARE.TABLE.COLUMN.VARCHAR_BYTE_WINDOW.V1",
+            ACTION_GENERATE_FIXUP,
+        )
+    if issue == "oversize":
+        return (
+            "VARCHAR_LENGTH_OVERSIZE_REVIEW",
+            "COMPARE.TABLE.COLUMN.VARCHAR_OVERSIZE_CAP.V1",
+            ACTION_REPORT_ONLY,
+        )
+    return ("COLUMN_LENGTH_MISMATCH", "COMPARE.TABLE.COLUMN.LENGTH.V1", ACTION_REPORT_ONLY)
+
+
+def reason_code_for_type_issue(issue_type: str) -> Tuple[str, str, str]:
+    issue = (issue_type or "").strip().lower()
+    if issue.startswith("nullability"):
+        return (
+            "COLUMN_NULLABILITY_MISMATCH",
+            "COMPARE.TABLE.COLUMN.NULLABILITY.V1",
+            ACTION_REPORT_ONLY,
+        )
+    if issue.startswith("default_on_null"):
+        return (
+            "COLUMN_DEFAULT_ON_NULL_MISMATCH",
+            "COMPARE.TABLE.COLUMN.DEFAULT_ON_NULL.V1",
+            ACTION_REPORT_ONLY,
+        )
+    if issue.startswith("default"):
+        return ("COLUMN_DEFAULT_MISMATCH", "COMPARE.TABLE.COLUMN.DEFAULT.V1", ACTION_REPORT_ONLY)
+    if issue.startswith("identity"):
+        return ("COLUMN_IDENTITY_MISMATCH", "COMPARE.TABLE.COLUMN.IDENTITY.V1", ACTION_REPORT_ONLY)
+    if issue.startswith("visibility"):
+        return (
+            "COLUMN_VISIBILITY_MISMATCH",
+            "COMPARE.TABLE.COLUMN.VISIBILITY.V1",
+            ACTION_GENERATE_FIXUP,
+        )
+    if issue.startswith("virtual"):
+        return ("COLUMN_VIRTUAL_MISMATCH", "COMPARE.TABLE.COLUMN.VIRTUAL.V1", ACTION_MANUAL_REVIEW)
+    if issue == "type_literal_mismatch":
+        return (
+            "TYPE_LITERAL_MISMATCH",
+            "COMPARE.TABLE.COLUMN.TYPE_LITERAL.V1",
+            ACTION_GENERATE_FIXUP,
+        )
+    if issue == "long_type":
+        return (
+            "LONG_TYPE_MAPPING_REQUIRED",
+            "COMPARE.TABLE.COLUMN.LONG_TYPE.V1",
+            ACTION_GENERATE_FIXUP,
+        )
+    if issue == "number_precision":
+        return (
+            "NUMBER_PRECISION_MISMATCH",
+            "COMPARE.TABLE.COLUMN.NUMBER_PRECISION.V1",
+            ACTION_GENERATE_FIXUP,
+        )
+    return ("COLUMN_TYPE_MISMATCH", "COMPARE.TABLE.COLUMN.TYPE.V1", ACTION_REPORT_ONLY)
+
+
+def build_difference_explanation_records(
+    tv_results: ReportResults,
+    extra_results: ExtraCheckResults,
+    comment_results: Dict[str, object],
+    dependency_report: DependencyReport,
+    *,
+    support_summary: Optional[SupportClassificationResult] = None,
+    noise_suppressed_details: Optional[List[NoiseSuppressedDetail]] = None,
+    filtered_grants: Optional[List[FilteredGrantEntry]] = None,
+    trigger_status_rows: Optional[List[TriggerStatusReportRow]] = None,
+    constraint_status_rows: Optional[List[ConstraintStatusDriftRow]] = None,
+    compatibility_entries: Optional[List[Dict[str, object]]] = None,
+) -> List[Dict[str, object]]:
+    records: List[Dict[str, object]] = []
+    compatibility_by_family = {
+        str(entry.get("object_family") or "").upper().replace(" ", "_"): str(
+            entry.get("decision") or ""
+        ).lower()
+        for entry in (compatibility_entries or [])
+        if isinstance(entry, dict)
+    }
+
+    def compat_for(obj_type: str) -> str:
+        return compatibility_by_family.get((obj_type or "").upper().replace(" ", "_"), "")
+
+    for obj_type, tgt_name, src_name in tv_results.get("missing", []) or []:
+        records.append(
+            build_reason_record(
+                reason_code="TARGET_OBJECT_MISSING",
+                rule_id=f"COMPARE.{obj_type}.EXISTENCE.V1",
+                object_type=obj_type,
+                object_identity=tgt_name,
+                source_evidence=f"source_object={src_name}",
+                target_evidence="target_object_absent",
+                decision=DECISION_MISMATCH,
+                action=ACTION_GENERATE_FIXUP,
+                compatibility_decision=compat_for(obj_type),
+            )
+        )
+    for obj_type, tgt_name, src_name, reason in tv_results.get("skipped", []) or []:
+        records.append(
+            build_reason_record(
+                reason_code="COMPARE_SKIPPED_PRINT_ONLY",
+                rule_id=f"COMPARE.{obj_type}.PRINT_ONLY.V1",
+                object_type=obj_type,
+                object_identity=tgt_name,
+                source_evidence=f"source_object={src_name}",
+                target_evidence="not_checked_by_config",
+                decision=DECISION_SUPPRESS,
+                action=ACTION_SUPPRESS,
+                compatibility_decision=compat_for(obj_type),
+                detail=reason,
+            )
+        )
+    for obj_type, tgt_name in tv_results.get("extra_targets", []) or []:
+        records.append(
+            build_reason_record(
+                reason_code="TARGET_OBJECT_EXTRA",
+                rule_id=f"COMPARE.{obj_type}.EXTRA_TARGET.V1",
+                object_type=obj_type,
+                object_identity=tgt_name,
+                source_evidence="source_object_absent_or_unmanaged",
+                target_evidence=f"target_object={tgt_name}",
+                decision=DECISION_REVIEW,
+                action=ACTION_MANUAL_REVIEW,
+                compatibility_decision=compat_for(obj_type),
+            )
+        )
+    for obj_type, tgt_name, missing, extra, length_mismatches, type_mismatches in (
+        tv_results.get("mismatched", []) or []
+    ):
+        if (obj_type or "").upper() != "TABLE":
+            records.append(
+                build_reason_record(
+                    reason_code="OBJECT_MISMATCH",
+                    rule_id=f"COMPARE.{obj_type}.MISMATCH.V1",
+                    object_type=obj_type,
+                    object_identity=tgt_name,
+                    source_evidence="source_metadata",
+                    target_evidence="target_metadata",
+                    decision=DECISION_MISMATCH,
+                    action=ACTION_REPORT_ONLY,
+                    compatibility_decision=compat_for(obj_type),
+                )
+            )
+            continue
+        for col in sorted(missing or []):
+            records.append(
+                build_reason_record(
+                    reason_code="COLUMN_MISSING_IN_TARGET",
+                    rule_id="COMPARE.TABLE.COLUMN.PRESENCE.V1",
+                    object_type="TABLE",
+                    object_identity=tgt_name,
+                    item_type="COLUMN",
+                    item_key=col,
+                    source_evidence=f"source_column={col}",
+                    target_evidence="target_column_absent",
+                    decision=DECISION_MISMATCH,
+                    action=ACTION_GENERATE_FIXUP,
+                    compatibility_decision=compat_for("TABLE"),
+                )
+            )
+        for col in sorted(extra or []):
+            records.append(
+                build_reason_record(
+                    reason_code="COLUMN_EXTRA_IN_TARGET",
+                    rule_id="COMPARE.TABLE.COLUMN.PRESENCE.V1",
+                    object_type="TABLE",
+                    object_identity=tgt_name,
+                    item_type="COLUMN",
+                    item_key=col,
+                    source_evidence="source_column_absent",
+                    target_evidence=f"target_column={col}",
+                    decision=DECISION_REVIEW,
+                    action=ACTION_MANUAL_REVIEW,
+                    compatibility_decision=compat_for("TABLE"),
+                )
+            )
+        for col, src_len, tgt_len, limit_len, issue_type in length_mismatches or []:
+            reason_code, rule_id, action = reason_code_for_length_issue(issue_type)
+            records.append(
+                build_reason_record(
+                    reason_code=reason_code,
+                    rule_id=rule_id,
+                    object_type="TABLE",
+                    object_identity=tgt_name,
+                    item_type="COLUMN",
+                    item_key=col,
+                    source_evidence=f"source_length={src_len}; issue={issue_type}",
+                    target_evidence=f"target_length={tgt_len}; limit={limit_len}",
+                    decision=DECISION_MISMATCH,
+                    action=action,
+                    compatibility_decision=compat_for("TABLE"),
+                    safety_tier="review" if action == ACTION_GENERATE_FIXUP else "",
+                )
+            )
+        for col, src_type, tgt_type, expected_type, issue_type in type_mismatches or []:
+            reason_code, rule_id, action = reason_code_for_type_issue(issue_type)
+            records.append(
+                build_reason_record(
+                    reason_code=reason_code,
+                    rule_id=rule_id,
+                    object_type="TABLE",
+                    object_identity=tgt_name,
+                    item_type="COLUMN",
+                    item_key=col,
+                    source_evidence=f"source={src_type}; expected={expected_type}",
+                    target_evidence=f"target={tgt_type}; issue={issue_type}",
+                    decision=DECISION_MISMATCH,
+                    action=action,
+                    compatibility_decision=compat_for("TABLE"),
+                    safety_tier="review" if action == ACTION_GENERATE_FIXUP else "",
+                )
+            )
+    for item in comment_results.get("mismatched", []) or []:
+        records.append(
+            build_reason_record(
+                reason_code="COMMENT_MISMATCH",
+                rule_id="COMPARE.COMMENT.TEXT.V1",
+                object_type="TABLE",
+                object_identity=item.table,
+                source_evidence="source_comments",
+                target_evidence="target_comments",
+                decision=DECISION_REVIEW,
+                action=ACTION_REPORT_ONLY,
+                compatibility_decision=compat_for("TABLE"),
+            )
+        )
+    for item in extra_results.get("index_mismatched", []) or []:
+        records.append(
+            build_reason_record(
+                reason_code="INDEX_MISMATCH",
+                rule_id="COMPARE.INDEX.SIGNATURE.V1",
+                object_type="INDEX",
+                object_identity=item.table,
+                source_evidence="source_index_signature",
+                target_evidence="target_index_signature",
+                decision=DECISION_MISMATCH,
+                action=ACTION_GENERATE_FIXUP,
+                compatibility_decision=compat_for("INDEX"),
+                safety_tier="review",
+            )
+        )
+    for item in extra_results.get("constraint_mismatched", []) or []:
+        records.append(
+            build_reason_record(
+                reason_code="CONSTRAINT_MISMATCH",
+                rule_id="COMPARE.CONSTRAINT.SIGNATURE.V1",
+                object_type="CONSTRAINT",
+                object_identity=item.table,
+                source_evidence="source_constraint_signature",
+                target_evidence="target_constraint_signature",
+                decision=DECISION_MISMATCH,
+                action=ACTION_GENERATE_FIXUP,
+                compatibility_decision=compat_for("CONSTRAINT"),
+                safety_tier="review",
+            )
+        )
+    for item in extra_results.get("sequence_mismatched", []) or []:
+        records.append(
+            build_reason_record(
+                reason_code="SEQUENCE_MISMATCH",
+                rule_id="COMPARE.SEQUENCE.ATTRIBUTES.V1",
+                object_type="SEQUENCE",
+                object_identity=f"{item.src_schema}->{item.tgt_schema}",
+                source_evidence="source_sequence_metadata",
+                target_evidence="target_sequence_metadata",
+                decision=DECISION_REVIEW,
+                action=ACTION_REPORT_ONLY,
+                compatibility_decision=compat_for("SEQUENCE"),
+            )
+        )
+    for item in extra_results.get("trigger_mismatched", []) or []:
+        records.append(
+            build_reason_record(
+                reason_code="TRIGGER_MISMATCH",
+                rule_id="COMPARE.TRIGGER.SIGNATURE.V1",
+                object_type="TRIGGER",
+                object_identity=item.table,
+                source_evidence="source_trigger_metadata",
+                target_evidence="target_trigger_metadata",
+                decision=DECISION_MISMATCH,
+                action=ACTION_GENERATE_FIXUP,
+                compatibility_decision=compat_for("TRIGGER"),
+                safety_tier="review",
+            )
+        )
+    for category, issues in (dependency_report or {}).items():
+        for issue in issues or []:
+            records.append(
+                build_reason_record(
+                    reason_code=f"DEPENDENCY_{str(category).upper()}",
+                    rule_id="COMPARE.DEPENDENCY.EDGE.V1",
+                    object_type=issue.dependent_type,
+                    object_identity=issue.dependent,
+                    item_type="DEPENDENCY",
+                    item_key=issue.referenced,
+                    source_evidence=f"source_ref={issue.referenced_type}:{issue.referenced}",
+                    target_evidence=f"target_edge_status={category}",
+                    decision=DECISION_REVIEW,
+                    action=ACTION_REPORT_ONLY,
+                    compatibility_decision=compat_for(issue.dependent_type),
+                    detail=issue.reason,
+                )
+            )
+    for item in trigger_status_rows or []:
+        records.append(
+            build_reason_record(
+                reason_code="TRIGGER_STATUS_DRIFT",
+                rule_id="COMPARE.TRIGGER.STATUS.V1",
+                object_type="TRIGGER",
+                object_identity=item.trigger_full,
+                source_evidence=f"enabled={item.src_enabled}; valid={item.src_valid}",
+                target_evidence=f"enabled={item.tgt_enabled}; valid={item.tgt_valid}",
+                decision=DECISION_MISMATCH,
+                action=ACTION_GENERATE_FIXUP,
+                compatibility_decision=compat_for("TRIGGER"),
+                safety_tier="review",
+                detail=item.detail,
+            )
+        )
+    for item in constraint_status_rows or []:
+        records.append(
+            build_reason_record(
+                reason_code="CONSTRAINT_STATUS_DRIFT",
+                rule_id="COMPARE.CONSTRAINT.STATUS.V1",
+                object_type="CONSTRAINT",
+                object_identity=f"{item.table_full}.{item.tgt_constraint}",
+                source_evidence=f"enabled={item.src_status}; validated={item.src_validated}",
+                target_evidence=f"enabled={item.tgt_status}; validated={item.tgt_validated}",
+                decision=DECISION_MISMATCH,
+                action=ACTION_GENERATE_FIXUP if item.action_sql else ACTION_REPORT_ONLY,
+                compatibility_decision=compat_for("CONSTRAINT"),
+                safety_tier="review" if item.action_sql else "",
+                detail=item.detail,
+            )
+        )
+    for item in filtered_grants or []:
+        records.append(
+            build_reason_record(
+                reason_code=str(item.reason or "GRANT_FILTERED").upper(),
+                rule_id="COMPARE.GRANT.CAPABILITY.V1",
+                object_type="GRANT",
+                object_identity=f"{item.grantee}:{item.object_full}",
+                source_evidence=f"source_privilege={item.privilege}",
+                target_evidence=f"category={item.category}; object={item.object_full}",
+                decision=DECISION_MANUAL,
+                action=ACTION_MANUAL_REVIEW,
+                compatibility_decision=compat_for("GRANT"),
+                detail=item.reason,
+            )
+        )
+    for row in noise_suppressed_details or []:
+        records.append(
+            build_reason_record(
+                reason_code=f"SUPPRESSED_{row.reason}",
+                rule_id=f"COMPARE.NOISE.{row.category}.V1",
+                object_type=row.category,
+                object_identity=row.scope,
+                item_type="SUPPRESSED",
+                item_key=row.identifiers,
+                source_evidence=row.detail,
+                target_evidence=row.detail,
+                decision=DECISION_SUPPRESS,
+                action=ACTION_SUPPRESS,
+                detail=row.reason,
+            )
+        )
+    if support_summary:
+        for row in list(support_summary.unsupported_rows or []) + list(
+            support_summary.extra_missing_rows or []
+        ):
+            decision = DECISION_MANUAL
+            records.append(
+                build_reason_record(
+                    reason_code=row.reason_code,
+                    rule_id=f"COMPARE.{row.obj_type}.SUPPORT.V1",
+                    object_type=row.obj_type,
+                    object_identity=row.tgt_full or row.src_full,
+                    source_evidence=row.src_full,
+                    target_evidence=row.tgt_full,
+                    decision=decision,
+                    action=ACTION_MANUAL_REVIEW,
+                    compatibility_decision=compat_for(row.obj_type),
+                    detail=row.reason,
+                )
+            )
+    return records
+
+
+def format_table_mismatch_reason_fields(
+    length_mismatches: List[Tuple[str, int, int, int, str]],
+    type_mismatches: List[Tuple[str, str, str, str, str]],
+) -> Tuple[str, str, str, str]:
+    reason_codes: List[str] = []
+    rule_ids: List[str] = []
+    actions: List[str] = []
+    for _col, _src_len, _tgt_len, _limit_len, issue_type in length_mismatches or []:
+        reason_code, rule_id, action = reason_code_for_length_issue(issue_type)
+        reason_codes.append(reason_code)
+        rule_ids.append(rule_id)
+        actions.append(action)
+    for _col, _src_type, _tgt_type, _expected_type, issue_type in type_mismatches or []:
+        reason_code, rule_id, action = reason_code_for_type_issue(issue_type)
+        reason_codes.append(reason_code)
+        rule_ids.append(rule_id)
+        actions.append(action)
+    decision = DECISION_MISMATCH if reason_codes else "-"
+    return (
+        ",".join(dedupe_preserve_order(reason_codes)) if reason_codes else "-",
+        ",".join(dedupe_preserve_order(rule_ids)) if rule_ids else "-",
+        decision,
+        ",".join(dedupe_preserve_order(actions)) if actions else "-",
+    )
+
+
 def export_mismatched_tables_detail(
     mismatched_items: List[
         Tuple[
@@ -52021,13 +52712,35 @@ def export_mismatched_tables_detail(
     if not report_dir or not mismatched_items or not report_timestamp:
         return None
     output_path = Path(report_dir) / f"mismatched_tables_detail_{report_timestamp}.txt"
-    header_fields = ["TABLE", "MISSING_COLS", "EXTRA_COLS", "LENGTH_MISMATCHES", "TYPE_MISMATCHES"]
+    header_fields = [
+        "TABLE",
+        "MISSING_COLS",
+        "EXTRA_COLS",
+        "LENGTH_MISMATCHES",
+        "TYPE_MISMATCHES",
+        "REASON_CODES",
+        "RULE_IDS",
+        "DECISION",
+        "ACTION",
+    ]
     rows: List[List[str]] = []
     for obj_type, tgt_name, missing, extra, length_mismatches, type_mismatches in mismatched_items:
         if (obj_type or "").upper() != "TABLE":
             continue
         if "获取失败" in tgt_name:
-            rows.append([tgt_name, "SOURCE_META_FAILED", "-", "-", "-"])
+            rows.append(
+                [
+                    tgt_name,
+                    "SOURCE_META_FAILED",
+                    "-",
+                    "-",
+                    "-",
+                    "SOURCE_COLUMN_METADATA_UNAVAILABLE",
+                    "COMPARE.TABLE.COLUMN.METADATA.V1",
+                    DECISION_REVIEW,
+                    ACTION_MANUAL_REVIEW,
+                ]
+            )
             continue
         length_parts = []
         for col, src_len, tgt_len, limit_len, issue_type in length_mismatches:
@@ -52035,6 +52748,19 @@ def export_mismatched_tables_detail(
         type_parts = []
         for col, src_type, tgt_type, expected_type, issue_type in type_mismatches:
             type_parts.append(f"{col}:{src_type}->{tgt_type}({issue_type}:{expected_type})")
+        reason_codes, rule_ids, decision, action = format_table_mismatch_reason_fields(
+            length_mismatches, type_mismatches
+        )
+        if missing and reason_codes == "-":
+            reason_codes = "COLUMN_MISSING_IN_TARGET"
+            rule_ids = "COMPARE.TABLE.COLUMN.PRESENCE.V1"
+            decision = DECISION_MISMATCH
+            action = ACTION_GENERATE_FIXUP
+        if extra and reason_codes == "-":
+            reason_codes = "COLUMN_EXTRA_IN_TARGET"
+            rule_ids = "COMPARE.TABLE.COLUMN.PRESENCE.V1"
+            decision = DECISION_REVIEW
+            action = ACTION_MANUAL_REVIEW
         rows.append(
             [
                 tgt_name,
@@ -52042,6 +52768,10 @@ def export_mismatched_tables_detail(
                 ",".join(sorted(extra)) if extra else "-",
                 ";".join(length_parts) if length_parts else "-",
                 ";".join(type_parts) if type_parts else "-",
+                reason_codes,
+                rule_ids,
+                decision,
+                action,
             ]
         )
     return write_pipe_report("表列不匹配明细", header_fields, rows, output_path)
@@ -57540,6 +58270,24 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "REPORT_SQL_TEMPLATE"
     if name.startswith("report_"):
         return "REPORT_MAIN"
+    if name.startswith("run_heartbeat_"):
+        return "HEARTBEAT_STATE"
+    if name.startswith("runtime_timeout_summary_"):
+        return "TIMEOUT_SUMMARY"
+    if name.startswith("compatibility_matrix_"):
+        return "COMPATIBILITY_MATRIX"
+    if name.startswith("compatibility_summary_"):
+        return "COMPATIBILITY_SUMMARY"
+    if name.startswith("recovery_manifest_"):
+        return "RECOVERY_MANIFEST"
+    if name.startswith("difference_explanations_") and name.endswith(".jsonl"):
+        return "DIFFERENCE_EXPLANATIONS"
+    if name.startswith("difference_explanations_summary_"):
+        return "DIFFERENCE_EXPLANATIONS_SUMMARY"
+    if name.startswith("fixup_plan_"):
+        return "FIXUP_PLAN"
+    if name.startswith("fixup_safety_summary_"):
+        return "FIXUP_SAFETY_SUMMARY"
     if name.startswith("missing_objects_detail_"):
         return "MISSING_DETAIL"
     if name.startswith("unsupported_objects_detail_"):
@@ -57685,6 +58433,15 @@ def _infer_artifact_status(
         "GRANT_CAPABILITY_DETAIL",
         "MANUAL_ACTION_REQUIRED",
         "DDL_CLEANUP_DETAIL",
+        "HEARTBEAT_STATE",
+        "TIMEOUT_SUMMARY",
+        "COMPATIBILITY_MATRIX",
+        "COMPATIBILITY_SUMMARY",
+        "RECOVERY_MANIFEST",
+        "DIFFERENCE_EXPLANATIONS",
+        "DIFFERENCE_EXPLANATIONS_SUMMARY",
+        "FIXUP_PLAN",
+        "FIXUP_SAFETY_SUMMARY",
     }:
         return ("IN_DB", "") if store_scope in {"core", "full"} else ("TXT_ONLY", "")
     if artifact_type == "NAME_COLLISION_DETAIL":
@@ -57714,8 +58471,10 @@ def _build_report_artifact_rows(
     if not report_dir or not report_dir.exists():
         return []
     rows: List[Dict[str, object]] = []
-    for path in sorted(report_dir.rglob("*.txt")):
+    for path in sorted(report_dir.rglob("*")):
         if not path.is_file():
+            continue
+        if path.suffix.lower() not in {".txt", ".json", ".jsonl"}:
             continue
         rel = _report_index_relpath(report_dir, path)
         artifact_type = _infer_report_artifact_type(rel)
@@ -60748,6 +61507,9 @@ def build_run_summary(
 
     if report_file:
         actions_done.append(f"报告输出: {Path(report_file).resolve()}")
+    diagnostic_command = str((settings or {}).get("_diagnostic_bundle_command") or "").strip()
+    if diagnostic_command:
+        actions_done.append(f"诊断包入口: {diagnostic_command}")
 
     missing_count = len(tv_results.get("missing", []))
     mismatched_count = len(tv_results.get("mismatched", []))
@@ -61184,6 +61946,8 @@ def build_run_summary(
         _append_unique_guide_step(
             next_steps, f"若需确认本轮降级范围，请先查看 {runtime_degraded_detail_path}。"
         )
+    if diagnostic_command:
+        _append_unique_guide_step(next_steps, f"如需提交支持证据，请运行: {diagnostic_command}")
 
     return RunSummary(
         start_time=ctx.start_time,
@@ -63684,6 +64448,8 @@ def print_final_report(
         extra_mismatch_path = None
         dependency_detail_path = None
         noise_suppressed_path = None
+        explanation_jsonl_path = None
+        explanation_summary_path = None
         if usability_summary and report_ts:
             usability_detail_path = export_usability_check_detail(
                 usability_summary, report_path.parent, report_ts
@@ -63735,6 +64501,31 @@ def print_final_report(
             noise_suppressed_path = export_noise_suppressed_detail(
                 noise_suppressed_details, report_path.parent, report_ts
             )
+        if report_ts:
+            explanation_records = list(
+                (settings or {}).get("_difference_explanation_records") or []
+            )
+            if not explanation_records:
+                explanation_records = build_difference_explanation_records(
+                    tv_results,
+                    extra_results,
+                    comment_results,
+                    dependency_report,
+                    support_summary=support_summary,
+                    noise_suppressed_details=noise_suppressed_details,
+                    filtered_grants=filtered_grants,
+                    trigger_status_rows=trigger_status_rows,
+                    constraint_status_rows=constraint_status_rows,
+                    compatibility_entries=list(
+                        (settings or {}).get("_compatibility_matrix_entries") or []
+                    ),
+                )
+            explanation_jsonl_path, explanation_summary_path = export_reason_records(
+                explanation_records, report_path.parent, report_ts
+            )
+            if settings is not None:
+                settings["_difference_explanations_path"] = str(explanation_jsonl_path)
+                settings["_difference_explanations_summary_path"] = str(explanation_summary_path)
         _add_index_entry(
             "DETAIL",
             extra_targets_path,
@@ -63821,6 +64612,18 @@ def print_final_report(
         _add_index_entry("DETAIL", dependency_detail_path, dep_detail_count, "依赖关系差异明细")
         _add_index_entry(
             "DETAIL", noise_suppressed_path, len(noise_suppressed_details or []), "降噪明细"
+        )
+        _add_index_entry(
+            "MACHINE",
+            explanation_jsonl_path,
+            None,
+            "差异解释记录(JSONL)",
+        )
+        _add_index_entry(
+            "DETAIL",
+            explanation_summary_path,
+            None,
+            "差异解释摘要",
         )
         if report_ts:
             mapping_path = report_path.parent / f"object_mapping_{report_ts}.txt"
@@ -63950,6 +64753,10 @@ def print_final_report(
                 log.info("降噪明细已输出到: %s", noise_suppressed_path)
             if dependency_detail_path:
                 log.info("依赖关系差异明细已输出到: %s", dependency_detail_path)
+            if explanation_jsonl_path:
+                log.info("差异解释 JSONL 已输出到: %s", explanation_jsonl_path)
+            if explanation_summary_path:
+                log.info("差异解释摘要已输出到: %s", explanation_summary_path)
             existing_paths = {entry.path for entry in index_entries}
             for item in report_path.parent.iterdir():
                 rel_path = _report_index_relpath(report_path.parent, item)
@@ -64100,6 +64907,15 @@ def parse_cli_args() -> argparse.Namespace:
             table_data_presence_chunk_size OB 批量探测 chunk 大小（默认 500）
             table_data_presence_obclient_timeout OB 批量探测超时（秒，默认沿用 obclient_timeout）
             ob_session_query_timeout_us obclient 会话 ob_query_timeout（微秒，默认 3600000000；0 表示沿用数据库默认）
+            progress_log_interval 主程序/run_fixup 心跳与进度日志间隔（秒，默认 10）
+            slow_phase_warning_sec 主程序阶段级慢操作告警阈值（秒，默认 300）
+            slow_sql_warning_sec run_fixup 单文件/单语句慢执行告警阈值（秒，默认 60）
+            compatibility_registry_path 兼容矩阵 registry 路径（留空使用随工具发布的 compatibility_registry.json）
+            checkpoint_enable     true/false 控制 recovery_manifest_<ts>.json 输出
+            diagnostic_include_sql_content true/false 控制诊断包是否默认包含 SQL 正文（默认 false）
+            diagnostic_redact_identifiers true/false 控制诊断包标识符脱敏
+            diagnostic_max_file_mb 诊断包单文件采集上限 MB（默认 20）
+            diagnostic_max_bundle_mb 诊断包总采集上限 MB（默认 200）
             table_data_presence_zero_probe_workers Oracle 零行探针并发数（默认 1，最大 32）
             generate_grants         true/false 控制授权脚本生成
             grant_generation_mode   full/structural 控制授权生成来源（Oracle 全量/最小结构性）
@@ -64155,11 +64971,27 @@ def parse_cli_args() -> argparse.Namespace:
         action="store_true",
         help="启动交互式配置向导：缺失/无效项时提示输入并写回配置，然后继续运行主流程。",
     )
+    parser.add_argument(
+        "--resume-manifest",
+        default="",
+        help="从 recovery_manifest_*.json 恢复时使用的上一轮 manifest 路径；默认不恢复。",
+    )
+    parser.add_argument(
+        "--force-resume",
+        action="store_true",
+        help="当 decision/input/tool 版本不匹配时仍强制恢复；必须同时提供 --resume-override-reason。",
+    )
+    parser.add_argument(
+        "--resume-override-reason",
+        default="",
+        help="强制恢复的人工审计原因；仅与 --force-resume 一起使用。",
+    )
     return parser.parse_args()
 
 
 def main():
     """主执行函数"""
+    global RUN_OPERATION_TRACKER, RUN_RECOVERY_MANAGER
     build_qualified_rewrite_specs.cache_clear()
     args = parse_cli_args()
     config_file = args.config
@@ -65036,6 +65868,104 @@ def main():
     settings["report_dir_effective"] = str(report_dir)
     report_path = report_dir / f"report_{timestamp}.txt"
     log.info(f"本次报告将输出到: {report_path}")
+    RUN_OPERATION_TRACKER = setup_main_runtime_observability(settings, report_dir, timestamp)
+    compatibility_registry_path = resolve_compatibility_registry_path(settings, config_path.parent)
+    try:
+        compatibility_registry = load_compatibility_registry(compatibility_registry_path)
+    except Exception as exc:
+        log.error("兼容矩阵 registry 无效: %s (%s)", compatibility_registry_path, exc)
+        abort_run()
+    compatibility_matrix_path, compatibility_summary_path, compatibility_entries = (
+        export_compatibility_matrix(
+            compatibility_registry,
+            report_dir,
+            timestamp,
+            source_mode=source_db_mode,
+            ob_version=ob_version,
+            object_families=enabled_object_types | {"COMPILE", "GRANT"},
+        )
+    )
+    settings["_compatibility_registry_path"] = str(compatibility_registry_path)
+    settings["_compatibility_registry_sha1"] = str(compatibility_registry.get("_sha1") or "")
+    settings["_compatibility_matrix_path"] = str(compatibility_matrix_path)
+    settings["_compatibility_summary_path"] = str(compatibility_summary_path)
+    settings["_compatibility_matrix_entries"] = list(compatibility_entries)
+    log.info("兼容矩阵已输出: %s", compatibility_matrix_path)
+    if settings.get("checkpoint_enable", True):
+        recovery_inputs = [config_path, compatibility_registry_path]
+        remap_file_raw = str(settings.get("remap_file") or "").strip()
+        if remap_file_raw:
+            recovery_inputs.append(resolve_path_from_config(config_path, remap_file_raw))
+        RUN_RECOVERY_MANAGER = RecoveryManager(
+            run_id=timestamp,
+            report_dir=report_dir,
+            tool_version=__version__,
+            settings=settings,
+            input_paths=recovery_inputs,
+            code_version=__version__,
+        )
+        RUN_RECOVERY_MANAGER.write_manifest()
+        settings["_recovery_manifest_path"] = str(RUN_RECOVERY_MANAGER.manifest_path)
+        resume_manifest_raw = (
+            str(args.resume_manifest or "").strip()
+            or str(settings.get("resume_manifest") or "").strip()
+        )
+        if resume_manifest_raw:
+            resume_manifest_path = resolve_path_from_config(config_path, resume_manifest_raw)
+            try:
+                previous_manifest = json.loads(resume_manifest_path.read_text(encoding="utf-8"))
+                allow_resume, resume_errors, resume_detail = validate_recovery_resume(
+                    previous_manifest,
+                    settings=settings,
+                    input_artifact_hash=RUN_RECOVERY_MANAGER.input_artifact_hash,
+                    tool_version=__version__,
+                    force_resume=bool(args.force_resume or settings.get("force_resume")),
+                    override_reason=(
+                        str(args.resume_override_reason or "").strip()
+                        or str(settings.get("resume_override_reason") or "").strip()
+                    ),
+                )
+            except Exception as exc:
+                log.error("恢复 manifest 读取失败: %s (%s)", resume_manifest_path, exc)
+                abort_run()
+            if not allow_resume:
+                log.error("恢复被拒绝: %s", "; ".join(resume_errors))
+                abort_run()
+            RUN_RECOVERY_MANAGER.record_phase(
+                "resume_validation",
+                state="accepted",
+                detail=json.dumps(resume_detail, ensure_ascii=False, sort_keys=True),
+            )
+    if config_diagnostics is None:
+        config_diagnostics = []
+    config_diagnostics.append(
+        "运行心跳状态: {path}".format(path=settings.get("_runtime_heartbeat_state_path", "-"))
+    )
+    config_diagnostics.append(
+        "兼容矩阵: {path}".format(path=settings.get("_compatibility_matrix_path", "-"))
+    )
+    if settings.get("_recovery_manifest_path"):
+        config_diagnostics.append(
+            "恢复 manifest: {path}".format(path=settings.get("_recovery_manifest_path", "-"))
+        )
+    config_diagnostics.append(
+        "Timeout 摘要: {path}".format(path=settings.get("_runtime_timeout_summary_path", "-"))
+    )
+    diagnostic_command = " ".join(
+        shlex.quote(part)
+        for part in [
+            "python3",
+            "diagnostic_bundle.py",
+            "--run-dir",
+            str(report_dir),
+            "--config",
+            str(config_path),
+        ]
+    )
+    settings["_diagnostic_bundle_command"] = diagnostic_command
+    config_diagnostics.append(f"诊断包命令: {diagnostic_command}")
+    for item in settings.get("_runtime_timeout_warnings") or []:
+        config_diagnostics.append(f"Timeout 警告: {item}")
     managed_target_scope_detail_path = export_managed_target_scope_detail(
         managed_target_scope, report_dir, timestamp
     )
@@ -66726,6 +67656,18 @@ def main():
             config_diagnostics.append(f"配置热加载明细: {hot_reload_events_file}")
 
     # 10) 输出最终报告
+    settings["_difference_explanation_records"] = build_difference_explanation_records(
+        tv_results,
+        extra_results_for_report,
+        comment_results,
+        dependency_report,
+        support_summary=support_summary,
+        noise_suppressed_details=noise_suppressed_details,
+        filtered_grants=(grant_plan.filtered_grants if grant_plan else None),
+        trigger_status_rows=trigger_status_rows,
+        constraint_status_rows=constraint_status_rows,
+        compatibility_entries=list(settings.get("_compatibility_matrix_entries") or []),
+    )
     total_checked = sum(
         1 for _, _, obj_type in master_list if obj_type.upper() in checked_primary_types
     )
@@ -66756,79 +67698,89 @@ def main():
         hot_reload_events_file=hot_reload_events_file,
         source_db_mode=source_db_mode,
     )
-    run_summary = print_final_report(
-        tv_results,
-        total_checked,
-        extra_results_for_report,
-        comment_results,
-        dependency_report,
-        report_path,
-        object_counts_summary,
-        endpoint_info,
-        schema_summary,
-        settings,
-        blacklisted_missing_tables,
-        blacklist_report_rows,
-        trigger_list_summary,
-        trigger_list_rows,
-        trigger_status_rows,
-        constraint_status_rows,
-        package_results=package_results,
-        run_summary_ctx=run_summary_ctx,
-        filtered_grants=(grant_plan.filtered_grants if grant_plan else None),
-        extra_object_grant_rows=list(settings.get("_extra_object_grant_rows") or []),
-        config_diagnostics=config_diagnostics,
-        fixup_skip_summary=fixup_skip_summary,
-        support_summary=support_summary,
-        unsupported_grant_target_rows=unsupported_grant_target_extra_rows,
-        noise_suppressed_details=noise_suppressed_details,
-        usability_summary=usability_summary,
-        table_presence_summary=table_presence_summary,
-        excluded_object_rows=excluded_object_report_rows,
-        blacklist_rehydration_state=blacklist_rehydration_state,
-        blacklist_rehydrated_detail_path=blacklist_rehydrated_detail_path,
-        source_scope_detail_path=source_scope_detail_path,
-        scope_integrity_issues=scope_integrity_issues,
-        discovery_mapping_path=discovery_mapping_path,
-        scope_integrity_detail_path=scope_integrity_detail_path,
-        scope_integrity_candidate_path=scope_integrity_candidate_path,
-        grant_plan=grant_plan,
-    )
-    if run_summary:
-        log_run_summary(run_summary)
-        db_ok, _ = save_report_to_db(
-            ob_cfg,
-            settings,
-            run_summary,
-            run_summary_ctx,
-            timestamp,
-            report_dir,
+    with phase_timer("报告导出", phase_durations):
+        run_summary = print_final_report(
             tv_results,
+            total_checked,
             extra_results_for_report,
-            support_summary,
-            endpoint_info,
+            comment_results,
+            dependency_report,
+            report_path,
             object_counts_summary,
-            table_target_map,
-            target_schemas,
-            grant_plan=grant_plan,
+            endpoint_info,
+            schema_summary,
+            settings,
+            blacklisted_missing_tables,
+            blacklist_report_rows,
+            trigger_list_summary,
+            trigger_list_rows,
+            trigger_status_rows,
+            constraint_status_rows,
+            package_results=package_results,
+            run_summary_ctx=run_summary_ctx,
+            filtered_grants=(grant_plan.filtered_grants if grant_plan else None),
+            extra_object_grant_rows=list(settings.get("_extra_object_grant_rows") or []),
+            config_diagnostics=config_diagnostics,
+            fixup_skip_summary=fixup_skip_summary,
+            support_summary=support_summary,
+            unsupported_grant_target_rows=unsupported_grant_target_extra_rows,
+            noise_suppressed_details=noise_suppressed_details,
             usability_summary=usability_summary,
             table_presence_summary=table_presence_summary,
-            package_results=package_results,
-            trigger_status_rows=trigger_status_rows,
-            constraint_status_rows=constraint_status_rows,
-            dependency_report=dependency_report,
-            expected_dependency_pairs=expected_dependency_pairs,
-            view_chain_file=view_chain_file,
-            remap_conflicts=remap_conflict_items,
-            full_object_mapping=full_object_mapping,
-            remap_rules=remap_rules,
-            blacklist_report_rows=blacklist_report_rows,
-            fixup_skip_summary=fixup_skip_summary,
-            blacklisted_table_keys=blacklisted_table_keys,
             excluded_object_rows=excluded_object_report_rows,
+            blacklist_rehydration_state=blacklist_rehydration_state,
+            blacklist_rehydrated_detail_path=blacklist_rehydrated_detail_path,
+            source_scope_detail_path=source_scope_detail_path,
+            scope_integrity_issues=scope_integrity_issues,
+            discovery_mapping_path=discovery_mapping_path,
+            scope_integrity_detail_path=scope_integrity_detail_path,
+            scope_integrity_candidate_path=scope_integrity_candidate_path,
+            grant_plan=grant_plan,
         )
-        if not db_ok:
-            abort_run()
+        if run_summary:
+            log_run_summary(run_summary)
+            db_ok, _ = save_report_to_db(
+                ob_cfg,
+                settings,
+                run_summary,
+                run_summary_ctx,
+                timestamp,
+                report_dir,
+                tv_results,
+                extra_results_for_report,
+                support_summary,
+                endpoint_info,
+                object_counts_summary,
+                table_target_map,
+                target_schemas,
+                grant_plan=grant_plan,
+                usability_summary=usability_summary,
+                table_presence_summary=table_presence_summary,
+                package_results=package_results,
+                trigger_status_rows=trigger_status_rows,
+                constraint_status_rows=constraint_status_rows,
+                dependency_report=dependency_report,
+                expected_dependency_pairs=expected_dependency_pairs,
+                view_chain_file=view_chain_file,
+                remap_conflicts=remap_conflict_items,
+                full_object_mapping=full_object_mapping,
+                remap_rules=remap_rules,
+                blacklist_report_rows=blacklist_report_rows,
+                fixup_skip_summary=fixup_skip_summary,
+                blacklisted_table_keys=blacklisted_table_keys,
+                excluded_object_rows=excluded_object_report_rows,
+            )
+            if not db_ok:
+                abort_run()
+    if RUN_OPERATION_TRACKER is not None:
+        RUN_OPERATION_TRACKER.close()
+        RUN_OPERATION_TRACKER = None
+    if RUN_RECOVERY_MANAGER is not None:
+        try:
+            RUN_RECOVERY_MANAGER.flush()
+        except Exception as exc:
+            log.warning("[RECOVERY] manifest flush failed: %s", exc)
+    RUN_RECOVERY_MANAGER = None
 
 
 if __name__ == "__main__":
@@ -66840,3 +67792,14 @@ if __name__ == "__main__":
         except Exception:
             print(f"运行终止: {exc}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        if RUN_OPERATION_TRACKER is not None:
+            try:
+                RUN_OPERATION_TRACKER.close()
+            except Exception:
+                pass
+        if RUN_RECOVERY_MANAGER is not None:
+            try:
+                RUN_RECOVERY_MANAGER.flush()
+            except Exception:
+                pass
