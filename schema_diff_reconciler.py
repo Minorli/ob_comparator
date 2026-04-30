@@ -16,7 +16,7 @@
 
 """
 
-数据库对象对比工具 (V0.9.9.6-hotfix2 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
+数据库对象对比工具 (V0.9.9.6-hotfix3 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -33,7 +33,7 @@
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.9.9.6-hotfix2 核心)：
+3. 性能架构 (V0.9.9.6-hotfix3 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          DBA_OBJECTS
@@ -152,7 +152,7 @@ except ModuleNotFoundError as exc:
         raise SystemExit(2) from exc
     raise
 
-__version__ = "0.9.9.6-hotfix2"
+__version__ = "0.9.9.6-hotfix3"
 
 __author__ = "Minor Li"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
@@ -10511,7 +10511,7 @@ def run_config_wizard(config_path: Path) -> None:
     _prompt_field(
         "SETTINGS",
         "compatibility_registry_path",
-        "兼容矩阵 registry 路径（留空使用随工具发布的 compatibility_registry.json）",
+        "兼容矩阵 registry 路径（留空优先使用随工具发布的 compatibility_registry.json，漏拷时使用内置默认 registry）",
         default=cfg.get("SETTINGS", "compatibility_registry_path", fallback=""),
     )
     _prompt_field(
@@ -64924,7 +64924,7 @@ def parse_cli_args() -> argparse.Namespace:
             progress_log_interval 主程序/run_fixup 心跳与进度日志间隔（秒，默认 10）
             slow_phase_warning_sec 主程序阶段级慢操作告警阈值（秒，默认 300）
             slow_sql_warning_sec run_fixup 单文件/单语句慢执行告警阈值（秒，默认 60）
-            compatibility_registry_path 兼容矩阵 registry 路径（留空使用随工具发布的 compatibility_registry.json）
+            compatibility_registry_path 兼容矩阵 registry 路径（留空优先使用随工具发布的 compatibility_registry.json，漏拷时用内置默认 registry）
             checkpoint_enable     true/false 控制 recovery_manifest_<ts>.json 输出
             diagnostic_include_sql_content true/false 控制诊断包是否默认包含 SQL 正文（默认 false）
             diagnostic_redact_identifiers true/false 控制诊断包标识符脱敏
@@ -65884,8 +65884,14 @@ def main():
     log.info(f"本次报告将输出到: {report_path}")
     RUN_OPERATION_TRACKER = setup_main_runtime_observability(settings, report_dir, timestamp)
     compatibility_registry_path = resolve_compatibility_registry_path(settings, config_path.parent)
+    compatibility_registry_custom = bool(
+        str(settings.get("compatibility_registry_path") or "").strip()
+    )
     try:
-        compatibility_registry = load_compatibility_registry(compatibility_registry_path)
+        compatibility_registry = load_compatibility_registry(
+            compatibility_registry_path,
+            allow_builtin_fallback=not compatibility_registry_custom,
+        )
     except Exception as exc:
         log.error("兼容矩阵 registry 无效: %s (%s)", compatibility_registry_path, exc)
         abort_run()
@@ -65899,14 +65905,16 @@ def main():
             object_families=enabled_object_types | {"COMPILE", "GRANT"},
         )
     )
-    settings["_compatibility_registry_path"] = str(compatibility_registry_path)
+    settings["_compatibility_registry_path"] = str(compatibility_registry.get("_path") or "")
     settings["_compatibility_registry_sha1"] = str(compatibility_registry.get("_sha1") or "")
     settings["_compatibility_matrix_path"] = str(compatibility_matrix_path)
     settings["_compatibility_summary_path"] = str(compatibility_summary_path)
     settings["_compatibility_matrix_entries"] = list(compatibility_entries)
     log.info("兼容矩阵已输出: %s", compatibility_matrix_path)
     if settings.get("checkpoint_enable", True):
-        recovery_inputs = [config_path, compatibility_registry_path]
+        recovery_inputs = [config_path]
+        if Path(compatibility_registry_path).exists():
+            recovery_inputs.append(compatibility_registry_path)
         remap_file_raw = str(settings.get("remap_file") or "").strip()
         if remap_file_raw:
             recovery_inputs.append(resolve_path_from_config(config_path, remap_file_raw))

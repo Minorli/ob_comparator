@@ -1,10 +1,10 @@
 配置说明 (config.ini)
-版本：0.9.9.6-hotfix2（更新日期：2026-04-30）
+版本：0.9.9.6-hotfix3（更新日期：2026-04-30）
 本文件为完整配置说明书，覆盖所有可配置项（含最近新增功能）。
 
 本版重点增加生产可靠性与诊断能力：release evidence 门禁、运行心跳、timeout 摘要、recovery manifest、fixup 安全分层、兼容矩阵和独立诊断包；同时保留 Oracle source 默认 BYTE 语义下 VARCHAR/VARCHAR2 长度基准修复。
 
-部署约束：0.9.9.6+ 需要使用完整 toolkit 目录或整仓更新。`schema_diff_reconciler.py`、`run_fixup.py`、`diagnostic_bundle.py` 都依赖同目录内的内部文件 `comparator_reliability.py`；这不是 pip 包，不需要也不能通过 `pip install comparator_reliability` 解决。
+部署约束：0.9.9.6+ 需要使用完整 toolkit 目录或整仓更新。`schema_diff_reconciler.py`、`run_fixup.py`、`diagnostic_bundle.py` 都依赖同目录内的内部文件 `comparator_reliability.py`；这不是 pip 包，不需要也不能通过 `pip install comparator_reliability` 解决。`compatibility_registry.json` 建议随包保留用于审计；0.9.9.6-hotfix3 起默认路径漏拷时会使用内置默认 registry，不再阻断运行。
 
 通用约定
 - 布尔值：true/false/1/0/yes/no（大小写不敏感）。
@@ -340,7 +340,7 @@
   主程序会在 run 目录写 `run_heartbeat_<timestamp>.json`，run_fixup 会在 fixup_dir 写 `run_fixup_heartbeat_<timestamp>.json`。
 - slow_phase_warning_sec：主程序阶段级慢操作告警阈值（秒）。默认：300；最小 1。
 - slow_sql_warning_sec：run_fixup 单文件/单语句慢执行告警阈值（秒）。默认：60；最小 1。
-- compatibility_registry_path：兼容矩阵 registry 路径。默认留空，加载随工具发布的 `compatibility_registry.json`；若指定文件且格式错误，主程序会在 compare 前失败。
+- compatibility_registry_path：兼容矩阵 registry 路径。默认留空，优先加载随工具发布的 `compatibility_registry.json`；若默认文件漏拷，使用程序内置默认 registry 并继续运行。若显式指定自定义路径且文件缺失或格式错误，主程序会在 compare 前失败。
 - checkpoint_enable：是否写入 `recovery_manifest_<timestamp>.json`。默认：true。
 - resume_manifest：主程序恢复校验入口，指向上一轮 `recovery_manifest_*.json`；也可用 CLI `--resume-manifest` 覆盖。
   说明：恢复默认要求决定性配置、工具版本和输入工件 hash 一致；日志路径、报告路径、心跳间隔等运行态配置变化允许恢复并记录。
@@ -510,4 +510,4 @@ dbcat 配置
 - 语法检查：`python3 -m py_compile $(git ls-files '*.py')`
 - 单元测试：`.venv/bin/python -m unittest discover -v`
 - 可选联调（需真实 Oracle/OB）：`schema_diff_reconciler.py config.ini` 后执行 `run_fixup.py config.ini --glob "__NO_MATCH__"` 做链路冒烟验证。
-- 建议保留并随包分发：`blacklist_rules.json`（blacklist_mode=auto/rules_only 时需要）
+- 建议保留并随包分发：`blacklist_rules.json`（blacklist_mode=auto/rules_only 时需要）、`compatibility_registry.json`（用于审计；漏拷时有内置默认兜底）

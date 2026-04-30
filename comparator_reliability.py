@@ -43,6 +43,135 @@ COMPAT_DECISION_MANUAL = "manual"
 COMPAT_DECISION_UNSUPPORTED = "unsupported"
 
 DEFAULT_COMPATIBILITY_REGISTRY = "compatibility_registry.json"
+BUILTIN_COMPATIBILITY_REGISTRY = {
+    "schema_version": 1,
+    "version": "2026.04.29",
+    "description": (
+        "Comparator compatibility decisions for Oracle/OceanBase source modes "
+        "and OceanBase targets."
+    ),
+    "entries": [
+        {
+            "source_mode": "oracle",
+            "min_ob_version": "4.0.0.0",
+            "object_family": "TABLE",
+            "operation": "compare_columns",
+            "decision": "supported",
+            "rationale": (
+                "TABLE column presence, VARCHAR/VARCHAR2 byte window, CHAR semantics "
+                "exactness, defaults, nullability, identity, and visibility are "
+                "supported by metadata compare."
+            ),
+            "manual_action_hint": "",
+        },
+        {
+            "source_mode": "oracle",
+            "min_ob_version": "4.0.0.0",
+            "object_family": "TABLE",
+            "operation": "alter_shape_fixup",
+            "decision": "degraded",
+            "rationale": (
+                "ALTER TABLE ADD/MODIFY/default/nullability changes may lock, "
+                "rewrite, or depend on target data state."
+            ),
+            "manual_action_hint": "Review generated table_alter SQL and target data before execution.",
+        },
+        {
+            "source_mode": "oracle",
+            "min_ob_version": "4.0.0.0",
+            "object_family": "VIEW",
+            "operation": "create_or_replace",
+            "decision": "degraded",
+            "rationale": (
+                "VIEW DDL is generated from source DDL with remap and compatibility "
+                "cleanup; invalid dependencies or DBLINK usage can require manual "
+                "intervention."
+            ),
+            "manual_action_hint": "Review view compatibility details, prerequisites, and generated grants before execution.",
+        },
+        {
+            "source_mode": "oracle",
+            "min_ob_version": "4.0.0.0",
+            "object_family": "TRIGGER",
+            "operation": "create_or_replace",
+            "decision": "degraded",
+            "rationale": (
+                "Trigger DDL may contain schema references, non-table targets, "
+                "temporary-table semantics, or literal object paths requiring review."
+            ),
+            "manual_action_hint": "Review trigger detail reports and generated trigger SQL.",
+        },
+        {
+            "source_mode": "oracle",
+            "min_ob_version": "4.0.0.0",
+            "object_family": "GRANT",
+            "operation": "generate",
+            "decision": "degraded",
+            "rationale": (
+                "Grant compatibility depends on target privilege catalog, object "
+                "availability, and source grantor semantics."
+            ),
+            "manual_action_hint": "Review grant capability and unsupported grant reports before execution.",
+        },
+        {
+            "source_mode": "oracle",
+            "min_ob_version": "4.0.0.0",
+            "object_family": "JOB",
+            "operation": "fixup",
+            "decision": "manual",
+            "rationale": "Scheduler and job semantics are not certified for automatic execution in 0.9.x.",
+            "manual_action_hint": "Use generated artifacts as a conversion reference only.",
+        },
+        {
+            "source_mode": "oracle",
+            "min_ob_version": "4.0.0.0",
+            "object_family": "SCHEDULE",
+            "operation": "fixup",
+            "decision": "manual",
+            "rationale": "Schedule semantics are operator-owned in 0.9.x.",
+            "manual_action_hint": "Review schedule conversion manually.",
+        },
+        {
+            "source_mode": "oracle",
+            "min_ob_version": "4.0.0.0",
+            "object_family": "MATERIALIZED_VIEW",
+            "operation": "fixup",
+            "decision": "manual",
+            "rationale": "Materialized view compatibility varies by refresh mode and query features.",
+            "manual_action_hint": "Treat generated materialized view artifacts as manual review input.",
+        },
+        {
+            "source_mode": "oceanbase",
+            "min_ob_version": "4.0.0.0",
+            "object_family": "TABLE",
+            "operation": "compare_columns",
+            "decision": "supported",
+            "rationale": "OB source mode uses 1:1 column type and length comparison without Oracle byte expansion.",
+            "manual_action_hint": "",
+        },
+        {
+            "source_mode": "oceanbase",
+            "min_ob_version": "4.0.0.0",
+            "object_family": "GRANT",
+            "operation": "generate",
+            "decision": "degraded",
+            "rationale": (
+                "OB source privilege extraction is supported but still depends on "
+                "target catalog and runtime grantability."
+            ),
+            "manual_action_hint": "Review grant capability detail before execution.",
+        },
+        {
+            "source_mode": "*",
+            "min_ob_version": "4.0.0.0",
+            "object_family": "COMPILE",
+            "operation": "execute",
+            "decision": "supported",
+            "rationale": "Existing-object ALTER COMPILE is the first-wave safe execution family.",
+            "manual_action_hint": "",
+        },
+    ],
+}
 DECISION_CONFIG_KEYS = {
     "source_db_mode",
     "source_schemas",
@@ -691,9 +820,18 @@ def resolve_compatibility_registry_path(settings: Dict[str, object], base_dir: P
     return path.resolve()
 
 
-def load_compatibility_registry(path: Path) -> Dict[str, object]:
-    path = Path(path)
-    data = json.loads(path.read_text(encoding="utf-8"))
+def _copy_builtin_compatibility_registry() -> Dict[str, object]:
+    return {
+        "schema_version": BUILTIN_COMPATIBILITY_REGISTRY["schema_version"],
+        "version": BUILTIN_COMPATIBILITY_REGISTRY["version"],
+        "description": BUILTIN_COMPATIBILITY_REGISTRY["description"],
+        "entries": [dict(entry) for entry in BUILTIN_COMPATIBILITY_REGISTRY["entries"]],
+    }
+
+
+def _finalize_compatibility_registry(
+    data: Dict[str, object], *, registry_path: str, registry_sha1: str
+) -> Dict[str, object]:
     if not isinstance(data, dict):
         raise ValueError("compatibility registry must be a JSON object")
     version = data.get("version")
@@ -721,9 +859,33 @@ def load_compatibility_registry(path: Path) -> Dict[str, object]:
             raise ValueError(
                 f"compatibility registry entry {idx} has unsupported decision: {decision}"
             )
-    data["_path"] = str(path)
-    data["_sha1"] = file_sha1(path)
+    data["_path"] = registry_path
+    data["_sha1"] = registry_sha1
     return data
+
+
+def load_compatibility_registry(
+    path: Path, *, allow_builtin_fallback: bool = False
+) -> Dict[str, object]:
+    path = Path(path)
+    if path.exists():
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return _finalize_compatibility_registry(
+            data, registry_path=str(path), registry_sha1=file_sha1(path)
+        )
+    if allow_builtin_fallback:
+        data = _copy_builtin_compatibility_registry()
+        logging.getLogger(__name__).warning(
+            "未找到默认 compatibility_registry.json: %s；已使用程序内置默认兼容矩阵继续运行。"
+            "交付客户时仍建议使用完整 toolkit zip，便于审计 registry 内容。",
+            path,
+        )
+        return _finalize_compatibility_registry(
+            data,
+            registry_path=f"builtin:{DEFAULT_COMPATIBILITY_REGISTRY}",
+            registry_sha1=stable_json_hash(data),
+        )
+    raise FileNotFoundError(f"compatibility registry not found: {path}")
 
 
 def _version_tokens(value: str) -> Tuple[int, ...]:

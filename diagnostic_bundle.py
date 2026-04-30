@@ -35,7 +35,7 @@ except ModuleNotFoundError as exc:
         raise SystemExit(2) from exc
     raise
 
-TOOL_VERSION = "0.9.9.6-hotfix2"
+TOOL_VERSION = "0.9.9.6-hotfix3"
 SECRET_RE = re.compile(
     r"(password|passwd|pwd|token|secret|private[_-]?key|credential|wallet)", re.IGNORECASE
 )
