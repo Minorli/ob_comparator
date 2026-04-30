@@ -16,7 +16,7 @@
 
 """
 
-数据库对象对比工具 (V0.9.9.6-hotfix1 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
+数据库对象对比工具 (V0.9.9.6-hotfix2 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -33,7 +33,7 @@
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.9.9.6-hotfix1 核心)：
+3. 性能架构 (V0.9.9.6-hotfix2 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          DBA_OBJECTS
@@ -112,33 +112,47 @@ from typing import (
     Union,
 )
 
-from comparator_reliability import (
-    ACTION_GENERATE_FIXUP,
-    ACTION_MANUAL_REVIEW,
-    ACTION_REPORT_ONLY,
-    ACTION_SUPPRESS,
-    DECISION_MANUAL,
-    DECISION_MISMATCH,
-    DECISION_REVIEW,
-    DECISION_SUPPRESS,
-    OperationTracker,
-    RecoveryManager,
-    build_reason_record,
-    build_timeout_rows,
-    build_timeout_warnings,
-    export_compatibility_matrix,
-    export_fixup_plan,
-    export_reason_records,
-    load_compatibility_registry,
-    log_timeout_summary,
-    parse_float_setting,
-    parse_int_setting,
-    resolve_compatibility_registry_path,
-    validate_recovery_resume,
-    write_timeout_summary,
-)
+try:
+    from comparator_reliability import (
+        ACTION_GENERATE_FIXUP,
+        ACTION_MANUAL_REVIEW,
+        ACTION_REPORT_ONLY,
+        ACTION_SUPPRESS,
+        DECISION_MANUAL,
+        DECISION_MISMATCH,
+        DECISION_REVIEW,
+        DECISION_SUPPRESS,
+        OperationTracker,
+        RecoveryManager,
+        build_reason_record,
+        build_timeout_rows,
+        build_timeout_warnings,
+        export_compatibility_matrix,
+        export_fixup_plan,
+        export_reason_records,
+        load_compatibility_registry,
+        log_timeout_summary,
+        parse_float_setting,
+        parse_int_setting,
+        resolve_compatibility_registry_path,
+        validate_recovery_resume,
+        write_timeout_summary,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name == "comparator_reliability":
+        print(
+            "ERROR: missing local file comparator_reliability.py.\n"
+            "Comparator 0.9.9.6+ must be deployed from the full toolkit directory; "
+            "do not copy only schema_diff_reconciler.py.\n"
+            "Download the ob_comparator toolkit zip or copy comparator_reliability.py "
+            "next to this script.\n"
+            "This is an internal project file, not a pip package.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from exc
+    raise
 
-__version__ = "0.9.9.6-hotfix1"
+__version__ = "0.9.9.6-hotfix2"
 
 __author__ = "Minor Li"
 REPO_URL = "https://github.com/Minorli/ob_comparator"

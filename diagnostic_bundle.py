@@ -19,9 +19,23 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from comparator_reliability import redact_sensitive_text, sanitized_config_text, utcish_now_text
+try:
+    from comparator_reliability import redact_sensitive_text, sanitized_config_text, utcish_now_text
+except ModuleNotFoundError as exc:
+    if exc.name == "comparator_reliability":
+        print(
+            "ERROR: missing local file comparator_reliability.py.\n"
+            "Comparator 0.9.9.6+ must be deployed from the full toolkit directory; "
+            "do not copy only diagnostic_bundle.py.\n"
+            "Download the ob_comparator toolkit zip or copy comparator_reliability.py "
+            "next to this script.\n"
+            "This is an internal project file, not a pip package.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from exc
+    raise
 
-TOOL_VERSION = "0.9.9.6-hotfix1"
+TOOL_VERSION = "0.9.9.6-hotfix2"
 SECRET_RE = re.compile(
     r"(password|passwd|pwd|token|secret|private[_-]?key|credential|wallet)", re.IGNORECASE
 )
