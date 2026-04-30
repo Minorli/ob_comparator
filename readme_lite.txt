@@ -1,10 +1,11 @@
 OceanBase 对比工具极简手册（现场版）
-当前版本：V0.9.9.6-hotfix2
+当前版本：V0.9.9.6-hotfix3
 
 0. 先更新版本
 - 项目地址：https://github.com/Minorli/ob_comparator
 - 建议整仓更新，不要只替换单个脚本。
 - 当前版本同时支持 Oracle → OceanBase 与 OceanBase → OceanBase（Oracle mode source）两种校验/修补模式。
+- 0.9.9.6-hotfix3 将默认兼容矩阵内置；漏拷 compatibility_registry.json 不再阻断运行，但完整交付包仍会带该文件用于审计。
 - 0.9.9.6-hotfix2 补齐交付包约束：主程序、修复执行器和诊断包都需要同目录内的 comparator_reliability.py；它是项目内部文件，不是 pip 包。
 - 0.9.9.6-hotfix1 修复 OB -> OB 模式目标端 SYNONYM 可能统计为 0 的问题；建议整仓更新，不要只替换单个脚本。
 - 0.9.9.5 修复 Oracle source 默认 BYTE 语义下 VARCHAR2 长度误判与 DDL 类型字面量问题；如遇到 `VARCHAR2` 被生成成 `VARCHAR` 或长度回缩，请更新到本版后重跑。
@@ -17,7 +18,7 @@ OceanBase 对比工具极简手册（现场版）
 - config.ini（由 config.ini.template.txt 复制）
 - remap_rules.txt（remap 规则）
 - blacklist_rules.json（黑名单规则）
-- compatibility_registry.json（兼容矩阵规则）
+- compatibility_registry.json（建议随包保留；漏拷时使用内置默认规则）
 - exclude_objects.txt（可选：手工排除对象）
 - trigger_list.txt（可选：触发器白名单，config.ini 里 trigger_list= 指向它）
 

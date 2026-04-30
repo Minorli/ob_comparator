@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.9.9.6-hotfix3] - 2026-04-30
+
+### 修复
+- 内置默认兼容矩阵 registry，默认 `compatibility_registry.json` 漏拷时不再阻断主程序运行；显式配置自定义 `compatibility_registry_path` 时仍保持严格校验。
+- 同步交付文档，明确 `comparator_reliability.py` 是必须同目录的内部模块，`compatibility_registry.json` 为建议随包保留的审计文件，`blacklist_rules.json` 为黑名单规则条件依赖。
+
 ## [0.9.9.6-hotfix2] - 2026-04-30
 
 ### 修复

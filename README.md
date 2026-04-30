@@ -1,10 +1,11 @@
 # OceanBase Comparator Toolkit
 
-> 当前版本：V0.9.9.6-hotfix2
+> 当前版本：V0.9.9.6-hotfix3
 > 面向 Oracle → OceanBase 与 OceanBase → OceanBase 的结构一致性校验与修补脚本生成工具  
 > 核心理念：一次转储、本地对比、脚本审计优先
 
-## 近期更新（0.9.9.6-hotfix2）
+## 近期更新（0.9.9.6-hotfix3）
+- Hotfix：`compatibility_registry.json` 不再是默认路径下的硬阻断文件；若客户漏拷该文件，主程序会使用内置默认兼容矩阵继续运行并给出 warning。只有显式配置了自定义 `compatibility_registry_path` 时，文件缺失或格式错误才会 fail-fast。
 - Hotfix：补齐 0.9.9.6+ 的交付包约束和启动期缺文件提示；`schema_diff_reconciler.py`、`run_fixup.py`、`diagnostic_bundle.py` 需要同目录内的内部模块 `comparator_reliability.py`，请使用 toolkit zip 或整仓更新，不要只替换单个脚本。
 - Hotfix：修复 OB -> OB 模式下目标端 SYNONYM 可能统计为 0 的问题；目标端 OceanBase 元数据转储现在会在 OB source 模式下补查 `DBA_SYNONYMS`。
 - 新增发布门禁、实库 smoke evidence、运行心跳、timeout 摘要、recovery manifest、兼容矩阵和独立诊断包，正式发版前必须通过 release gate。
@@ -75,11 +76,12 @@
 - 运行账号需具备 DBA_* 视图访问权限（Oracle 与 OB）
 - 安全说明：工具运行时不会把 OB/dbcat 密码作为明文参数暴露在 `ps` 命令中（配置文件仍按当前方式保留密码项）。
 
-## 运维提示（0.9.9.6-hotfix2）
+## 运维提示（0.9.9.6-hotfix3）
 - Oracle -> OB：默认链路不变；默认 BYTE 语义的 VARCHAR/VARCHAR2 compare/fixup 以 `DATA_LENGTH` 为准，只有 `CHAR_USED='C'` 明确字符语义时才按字符长度且不做扩容。若省略 `synonym_check_scope/synonym_fixup_scope`，仍按 `public_only` 运行。target-side `DBA_SYNONYMS` 补查不再静默扩大 Oracle 源默认范围；OB -> OB 路径会对源端和目标端同时启用补查。
 - OB -> OB：若省略 `synonym_check_scope/synonym_fixup_scope`，运行时会提示并按 `all` 处理；OB source 的多行 `DATA_DEFAULT` 会先做控制字符清理，避免错列。
 - GTT：可继续显式使用 `rewrite_to_normal/preserve_original/blocked`；也可以用 `auto` 让程序按目标 OB 版本决策。凡是落到 `rewrite_to_normal`，都要把它视为“结构可迁、事务语义需人工确认”。
 - scoped closure：`safe` 文本补盲现在支持静态 `DBMS_SCHEDULER.CREATE_JOB/CREATE_SCHEDULE`；如果 `job_name/schedule_name` 不是静态字面量，报告会提示 unresolved，而不会盲猜。
+- 交付文件最小边界：主程序必须与 `comparator_reliability.py` 同目录；`compatibility_registry.json` 和 `blacklist_rules.json` 建议随 toolkit 一起交付用于审计和黑名单规则，但默认 `compatibility_registry.json` 漏拷不再阻断运行。
 
 ## 贡献方式
 
