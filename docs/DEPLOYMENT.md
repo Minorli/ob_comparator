@@ -1,6 +1,6 @@
 # 数据库对象对比工具 - 跨平台打包与执行指南 (Wheelhouse 版)
 
-> 适用版本：V0.9.9.6-hotfix1
+> 适用版本：V0.9.9.6-hotfix2
 
 > 适用场景：需要在无网络或不同机器上运行本工具，且保持源码不改。  
 > 方案：wheelhouse + venv，无需 PyInstaller。
@@ -24,6 +24,8 @@ pip wheel --wheel-dir=./wheelhouse -r requirements.txt
 若需为其他平台或 Python 小版本打包，需使用对应平台标签。
 
 ## 2. 打包部署目录建议
+0.9.9.6+ 请按完整目录交付，不要只替换单个 `schema_diff_reconciler.py`。`comparator_reliability.py` 是项目内部公共模块，必须与主程序、`run_fixup.py`、`diagnostic_bundle.py` 放在同一目录；它不是 pip 包。
+
 ```
 deployment_package/
 ├── schema_diff_reconciler.py

@@ -1,8 +1,10 @@
 配置说明 (config.ini)
-版本：0.9.9.6-hotfix1（更新日期：2026-04-30）
+版本：0.9.9.6-hotfix2（更新日期：2026-04-30）
 本文件为完整配置说明书，覆盖所有可配置项（含最近新增功能）。
 
 本版重点增加生产可靠性与诊断能力：release evidence 门禁、运行心跳、timeout 摘要、recovery manifest、fixup 安全分层、兼容矩阵和独立诊断包；同时保留 Oracle source 默认 BYTE 语义下 VARCHAR/VARCHAR2 长度基准修复。
+
+部署约束：0.9.9.6+ 需要使用完整 toolkit 目录或整仓更新。`schema_diff_reconciler.py`、`run_fixup.py`、`diagnostic_bundle.py` 都依赖同目录内的内部文件 `comparator_reliability.py`；这不是 pip 包，不需要也不能通过 `pip install comparator_reliability` 解决。
 
 通用约定
 - 布尔值：true/false/1/0/yes/no（大小写不敏感）。

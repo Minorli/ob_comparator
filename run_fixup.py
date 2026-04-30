@@ -59,28 +59,42 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
-from comparator_reliability import (
-    SAFETY_TIER_DESTRUCTIVE,
-    SAFETY_TIER_MANUAL,
-    SAFETY_TIER_REVIEW,
-    SAFETY_TIER_SAFE,
-    OperationTracker,
-    build_fixup_plan_record,
-    build_timeout_rows,
-    build_timeout_warnings,
-    classify_fixup_safety,
-    log_timeout_summary,
-    parse_float_setting,
-    parse_int_setting,
-    write_timeout_summary,
-)
+try:
+    from comparator_reliability import (
+        SAFETY_TIER_DESTRUCTIVE,
+        SAFETY_TIER_MANUAL,
+        SAFETY_TIER_REVIEW,
+        SAFETY_TIER_SAFE,
+        OperationTracker,
+        build_fixup_plan_record,
+        build_timeout_rows,
+        build_timeout_warnings,
+        classify_fixup_safety,
+        log_timeout_summary,
+        parse_float_setting,
+        parse_int_setting,
+        write_timeout_summary,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name == "comparator_reliability":
+        print(
+            "ERROR: missing local file comparator_reliability.py.\n"
+            "Comparator 0.9.9.6+ must be deployed from the full toolkit directory; "
+            "do not copy only run_fixup.py.\n"
+            "Download the ob_comparator toolkit zip or copy comparator_reliability.py "
+            "next to this script.\n"
+            "This is an internal project file, not a pip package.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from exc
+    raise
 
 try:
     import fcntl
 except Exception:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 
-__version__ = "0.9.9.6-hotfix1"
+__version__ = "0.9.9.6-hotfix2"
 
 CONFIG_DEFAULT_PATH = "config.ini"
 DEFAULT_FIXUP_DIR = "fixup_scripts"
