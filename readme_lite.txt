@@ -1,10 +1,12 @@
 OceanBase 对比工具极简手册（现场版）
-当前版本：V0.9.9.6-hotfix3
+当前版本：V0.9.9.6-hotfix5
 
 0. 先更新版本
 - 项目地址：https://github.com/Minorli/ob_comparator
 - 建议整仓更新，不要只替换单个脚本。
 - 当前版本同时支持 Oracle → OceanBase 与 OceanBase → OceanBase（Oracle mode source）两种校验/修补模式。
+- 0.9.9.6-hotfix5 修复定义级 SYNONYM fixup scope 与 PUBLIC target owner 防护；建议整仓更新，不要只替换单个脚本。
+- 0.9.9.6-hotfix4 修复 TRIGGER DDL 清洗中序列调用被误替换的问题，并补齐定义级差异 compare/fixup。
 - 0.9.9.6-hotfix3 将默认兼容矩阵内置；漏拷 compatibility_registry.json 不再阻断运行，但完整交付包仍会带该文件用于审计。
 - 0.9.9.6-hotfix2 补齐交付包约束：主程序、修复执行器和诊断包都需要同目录内的 comparator_reliability.py；它是项目内部文件，不是 pip 包。
 - 0.9.9.6-hotfix1 修复 OB -> OB 模式目标端 SYNONYM 可能统计为 0 的问题；建议整仓更新，不要只替换单个脚本。

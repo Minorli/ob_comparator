@@ -1,5 +1,5 @@
 配置说明 (config.ini)
-版本：0.9.9.6-hotfix4（更新日期：2026-05-07）
+版本：0.9.9.6-hotfix5（更新日期：2026-05-07）
 本文件为完整配置说明书，覆盖所有可配置项（含最近新增功能）。
 
 本版重点增加 TRIGGER 序列调用替换边界修复，以及 OB -> OB / 显式 Oracle -> OB 的同义词与分区表定义级差异 compare；同时保留生产可靠性与诊断能力、Oracle source 默认 BYTE 语义下 VARCHAR/VARCHAR2 长度基准修复。
@@ -431,7 +431,7 @@
   可选值：auto（仅 OceanBase 源自动启用）、true、false。
   说明：OB->OB 在 auto 下自动启用；Oracle->OB 为保守默认，必须显式设置 true 才启用。在表存在且列比较通过后，继续比对分区类型、子分区类型、分区键顺序、interval 表达式、分区数量/顺序/high value 与子分区定义。明细输出 `partition_definition_mismatch_detail_<ts>.txt`。
 - synonym_definition_fixup：是否为安全同义词定义漂移生成替换脚本。默认：false。
-  说明：OB->OB 与显式启用的 Oracle->OB 均支持；仅当漂移项被分类为 `RUNNABLE`（本地目标、无 DBLINK、无 PUBLIC/private 边界风险、源目标可解析）时才输出 `fixup_scripts/synonym/*__definition.sql`。分区定义漂移固定 manual-only，不生成可执行 repartition SQL。
+  说明：OB->OB 与显式启用的 Oracle->OB 均支持；仅当漂移项被分类为 `RUNNABLE`（本地目标、无 DBLINK、无 PUBLIC/private 边界风险、源目标可解析）且通过 `synonym_fixup_scope` 时才输出 `fixup_scripts/synonym/*__definition.sql`。分区定义漂移固定 manual-only，不生成可执行 repartition SQL。
 - name_collision_mode：约束/索引重名处理模式。默认：fixup。
   可选值：off（关闭）、report（仅输出重名诊断，不改写脚本）、fixup（生成重名修复脚本并改写缺失 INDEX/CONSTRAINT 名称）。
 - name_collision_rename_existing：fixup 模式下是否重命名目标端已有冲突对象。默认：true。

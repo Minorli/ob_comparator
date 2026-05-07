@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+## [0.9.9.6-hotfix5] - 2026-05-07
+
+### 修复
+- 定义级 SYNONYM 漂移修复脚本生成现在与传统缺失同义词修复一致遵守 `synonym_fixup_scope`；`public_only` 下私有同义词定义漂移只进入报告，不再生成自动替换脚本。
+- 当源同义词直接目标 owner 为 `PUBLIC` 时，将定义级修复分类为 `MANUAL_ONLY`，避免生成 `FOR "PUBLIC"."..."` 这类在 OceanBase 端语义不确定的替换 SQL。
+- 清理 definition compare 显式开关的冗余 source gate；`auto` 仍仅 OceanBase 源自动启用，Oracle 源仍需显式 `true`。
+- `run_fixup.py` 显式补齐 `OBE-00942`、`OBE-04043`、`OBE-01031`、`OBE-00955` 的错误分类，避免无英文错误文本时降级为 unknown。
+
 ## [0.9.9.6-hotfix3] - 2026-04-30
 
 ### 修复

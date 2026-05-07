@@ -336,7 +336,7 @@ synonym_fixup_scope     = public_only
 # 定义级比对（OB->OB auto 启用；Oracle->OB 需显式 true）：
 #   synonym_definition_compare   = auto/true/false，同名 SYNONYM 已存在时比对直接目标/DBLINK/PUBLIC 边界；auto 仅 OceanBase 源启用，Oracle 源 explicit true 才启用
 #   partition_definition_compare = auto/true/false，同名 TABLE 已存在且列一致时继续比对分区类型、分区键、interval、分区边界、子分区定义；auto 仅 OceanBase 源启用，Oracle 源 explicit true 才启用
-#   synonym_definition_fixup     = true/false，仅为安全分类 RUNNABLE 的本地同义词目标漂移生成 CREATE OR REPLACE SYNONYM；分区定义漂移固定 manual-only；Oracle->OB 同样要求显式 true
+#   synonym_definition_fixup     = true/false，仅为安全分类 RUNNABLE 且通过 synonym_fixup_scope 的本地同义词目标漂移生成 CREATE OR REPLACE SYNONYM；分区定义漂移固定 manual-only；Oracle->OB 同样要求显式 true
 synonym_definition_compare   = auto
 partition_definition_compare = auto
 synonym_definition_fixup     = false

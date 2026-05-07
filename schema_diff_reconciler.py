@@ -16,7 +16,7 @@
 
 """
 
-数据库对象对比工具 (V0.9.9.6-hotfix4 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
+数据库对象对比工具 (V0.9.9.6-hotfix5 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -33,7 +33,7 @@
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.9.9.6-hotfix4 核心)：
+3. 性能架构 (V0.9.9.6-hotfix5 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          DBA_OBJECTS
@@ -152,7 +152,7 @@ except ModuleNotFoundError as exc:
         raise SystemExit(2) from exc
     raise
 
-__version__ = "0.9.9.6-hotfix4"
+__version__ = "0.9.9.6-hotfix5"
 
 __author__ = "Minor Li"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
@@ -4778,7 +4778,8 @@ def resolve_definition_compare_enabled(raw_value: Optional[str], source_db_mode:
     mode = normalize_definition_compare_mode(raw_value)
     source_mode = normalize_source_db_mode(source_db_mode)
     if mode == "true":
-        return source_mode in SOURCE_DB_MODE_VALUES
+        # Explicit true is an operator override for both source modes; auto remains OB-only.
+        return True
     if mode == "false":
         return False
     return source_mode == SOURCE_DB_MODE_OCEANBASE
@@ -17377,8 +17378,6 @@ def load_ob_partition_definition_metadata(
         )
     if diagnostics and result:
         capabilities.setdefault("partition_definitions", "DEGRADED")
-    elif result:
-        capabilities.setdefault("partition_definitions", "READY")
     else:
         capabilities.setdefault("partition_definitions", "READY")
     log.info(
@@ -17821,9 +17820,10 @@ def load_synonym_metadata(
             result = filtered_result
     except oracledb.Error as exc:
         if capabilities is not None:
-            capabilities["synonym_definitions"] = "UNAVAILABLE"
+            capabilities["synonym_definitions"] = "DEGRADED" if result else "UNAVAILABLE"
         if diagnostics is not None:
-            diagnostics.append(f"DBA_SYNONYMS unavailable: {normalize_error_text(str(exc))}")
+            status = "degraded" if result else "unavailable"
+            diagnostics.append(f"DBA_SYNONYMS {status}: {normalize_error_text(str(exc))}")
         log.warning("读取同义词元数据失败，将回退 DBMS_METADATA：%s", exc)
 
     if capabilities is not None and "synonym_definitions" not in capabilities:
@@ -18451,6 +18451,9 @@ def classify_synonym_definition_fixup(
         return "MANUAL_ONLY", "MANUAL_REVIEW", "target_dblink_requires_manual_review"
     if not source_target_display or "." not in source_target_display:
         return "MANUAL_ONLY", "MANUAL_REVIEW", "source_target_unresolved"
+    source_target_owner = (source_target_display.split(".", 1)[0] or "").strip().upper()
+    if source_target_owner == "PUBLIC":
+        return "MANUAL_ONLY", "MANUAL_REVIEW", "source_target_public_owner_requires_manual_review"
     if (src_meta.owner or "").upper() == "PUBLIC" and (tgt_meta.owner or "").upper() != "PUBLIC":
         return "MANUAL_ONLY", "MANUAL_REVIEW", "public_private_boundary_mismatch"
     if (src_meta.owner or "").upper() != "PUBLIC" and (tgt_meta.owner or "").upper() == "PUBLIC":
@@ -18467,6 +18470,8 @@ def build_synonym_definition_fixup_sql(row: SynonymDefinitionDriftRow) -> str:
         return ""
     syn_owner, syn_name = target_syn.split(".", 1)
     target_owner, target_name = source_target.split(".", 1)
+    if target_owner == "PUBLIC":
+        return ""
     target_sql = quote_qualified_parts(target_owner, target_name)
     if syn_owner == "PUBLIC":
         return f"CREATE OR REPLACE PUBLIC SYNONYM {quote_identifier(syn_name)} FOR {target_sql};"
@@ -31969,14 +31974,13 @@ def check_primary_objects(
     )
     strict_ob_compare = source_db_mode == SOURCE_DB_MODE_OCEANBASE
     full_object_mapping = full_object_mapping or {}
-    definition_compare_source_supported = source_db_mode in SOURCE_DB_MODE_VALUES
-    synonym_definition_compare_enabled = definition_compare_source_supported and bool(
+    synonym_definition_compare_enabled = bool(
         (settings or {}).get("synonym_definition_compare_enabled", False)
     )
-    partition_definition_compare_enabled = definition_compare_source_supported and bool(
+    partition_definition_compare_enabled = bool(
         (settings or {}).get("partition_definition_compare_enabled", False)
     )
-    synonym_definition_fixup_enabled = definition_compare_source_supported and bool(
+    synonym_definition_fixup_enabled = bool(
         (settings or {}).get("synonym_definition_fixup_enabled", False)
     )
 
@@ -50273,7 +50277,7 @@ def generate_fixup_scripts(
     synonym_definition_rows = list(tv_results.get("synonym_definition_mismatched", []) or [])
     if synonym_definition_rows:
         log.info(
-            "[FIXUP] SYNONYM 定义级漂移 %d 条；仅 RUNNABLE 且 synonym_definition_fixup=true 的项会生成替换脚本。",
+            "[FIXUP] SYNONYM 定义级漂移 %d 条；仅 RUNNABLE、synonym_definition_fixup=true 且通过 synonym_fixup_scope 的项会生成替换脚本。",
             len(synonym_definition_rows),
         )
     for row in synonym_definition_rows:
@@ -50291,6 +50295,9 @@ def generate_fixup_scripts(
         if not allow_fixup("SYNONYM", tgt_schema, src_schema):
             skip_reason = classify_fixup_skip("SYNONYM", tgt_schema, src_schema) or "filtered"
             synonym_definition_skip_counts[skip_reason] += 1
+            continue
+        if not allow_synonym_scope(src_schema, tgt_schema):
+            synonym_definition_skip_counts["synonym_scope"] += 1
             continue
         synonym_definition_task_total += 1
         filename = build_synonym_definition_fixup_filename(row.target_synonym)

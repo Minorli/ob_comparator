@@ -94,7 +94,7 @@ try:
 except Exception:  # pragma: no cover - non-POSIX fallback
     fcntl = None
 
-__version__ = "0.9.9.6-hotfix4"
+__version__ = "0.9.9.6-hotfix5"
 
 CONFIG_DEFAULT_PATH = "config.ini"
 DEFAULT_FIXUP_DIR = "fixup_scripts"
@@ -846,7 +846,15 @@ def classify_sql_error(stderr: str) -> str:
     # Missing object errors (retryable - object may be created in later rounds)
     if any(
         code in stderr_upper
-        for code in ["ORA-00942", "ORA-04043", "OB-00942", "OB-04043", "ORA-06512"]
+        for code in [
+            "ORA-00942",
+            "ORA-04043",
+            "OB-00942",
+            "OB-04043",
+            "OBE-00942",
+            "OBE-04043",
+            "ORA-06512",
+        ]
     ):
         if (
             "TABLE OR VIEW DOES NOT EXIST" in stderr_upper
@@ -864,6 +872,7 @@ def classify_sql_error(stderr: str) -> str:
     if (
         "ORA-01031" in stderr_upper
         or "OB-01031" in stderr_upper
+        or "OBE-01031" in stderr_upper
         or "ORA-01720" in stderr_upper
         or "INSUFFICIENT PRIVILEGES" in stderr_upper
         or "ERROR 1142" in stderr_upper
@@ -919,6 +928,7 @@ def classify_sql_error(stderr: str) -> str:
     if (
         "ORA-00955" in stderr_upper
         or "OB-00955" in stderr_upper
+        or "OBE-00955" in stderr_upper
         or "NAME IS ALREADY USED" in stderr_upper
         or "ALREADY EXISTS" in stderr_upper
         or "ERROR 1050" in stderr_upper
