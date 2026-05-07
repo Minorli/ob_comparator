@@ -333,6 +333,13 @@ fixup_idempotent_types  =
 # 默认：Oracle 源 public_only；OceanBase 源 all。此模板示例按 Oracle 路径保留 public_only。
 # 提示：OceanBase 源若省略该项，运行时会显式提示“当前默认按 all 处理”。
 synonym_fixup_scope     = public_only
+# 定义级比对（OB->OB auto 启用；Oracle->OB 需显式 true）：
+#   synonym_definition_compare   = auto/true/false，同名 SYNONYM 已存在时比对直接目标/DBLINK/PUBLIC 边界；auto 仅 OceanBase 源启用，Oracle 源 explicit true 才启用
+#   partition_definition_compare = auto/true/false，同名 TABLE 已存在且列一致时继续比对分区类型、分区键、interval、分区边界、子分区定义；auto 仅 OceanBase 源启用，Oracle 源 explicit true 才启用
+#   synonym_definition_fixup     = true/false，仅为安全分类 RUNNABLE 的本地同义词目标漂移生成 CREATE OR REPLACE SYNONYM；分区定义漂移固定 manual-only；Oracle->OB 同样要求显式 true
+synonym_definition_compare   = auto
+partition_definition_compare = auto
+synonym_definition_fixup     = false
 # 约束/索引重名处理模式：
 #   off    -> 关闭
 #   report -> 仅输出重名诊断，不改写脚本

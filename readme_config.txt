@@ -1,10 +1,10 @@
 配置说明 (config.ini)
-版本：0.9.9.6-hotfix3（更新日期：2026-04-30）
+版本：0.9.9.6-hotfix4（更新日期：2026-05-07）
 本文件为完整配置说明书，覆盖所有可配置项（含最近新增功能）。
 
-本版重点增加生产可靠性与诊断能力：release evidence 门禁、运行心跳、timeout 摘要、recovery manifest、fixup 安全分层、兼容矩阵和独立诊断包；同时保留 Oracle source 默认 BYTE 语义下 VARCHAR/VARCHAR2 长度基准修复。
+本版重点增加 TRIGGER 序列调用替换边界修复，以及 OB -> OB / 显式 Oracle -> OB 的同义词与分区表定义级差异 compare；同时保留生产可靠性与诊断能力、Oracle source 默认 BYTE 语义下 VARCHAR/VARCHAR2 长度基准修复。
 
-部署约束：0.9.9.6+ 需要使用完整 toolkit 目录或整仓更新。`schema_diff_reconciler.py`、`run_fixup.py`、`diagnostic_bundle.py` 都依赖同目录内的内部文件 `comparator_reliability.py`；这不是 pip 包，不需要也不能通过 `pip install comparator_reliability` 解决。`compatibility_registry.json` 建议随包保留用于审计；0.9.9.6-hotfix3 起默认路径漏拷时会使用内置默认 registry，不再阻断运行。
+部署约束：0.9.9.6+ 需要使用完整 toolkit 目录或整仓更新。`schema_diff_reconciler.py`、`run_fixup.py`、`diagnostic_bundle.py` 都依赖同目录内的内部文件 `comparator_reliability.py`；这不是 pip 包，不需要也不能通过 `pip install comparator_reliability` 解决。`compatibility_registry.json` 建议随包保留用于审计；0.9.9.6-hotfix3+ 起默认路径漏拷时会使用内置默认 registry，不再阻断运行。
 
 通用约定
 - 布尔值：true/false/1/0/yes/no（大小写不敏感）。
@@ -424,6 +424,14 @@
 - synonym_fixup_scope：同义词修补范围。默认：Oracle 源 `public_only`，OceanBase 源 `all`。
   可选值：all（PUBLIC+私有）、public_only（仅 PUBLIC）。
   说明：当 `source_db_mode=oceanbase` 且配置中省略该项时，运行时会显式提示“当前默认按 all 处理”；如需锁定旧行为，建议在 `config.ini` 中明确写出。
+- synonym_definition_compare：同名 SYNONYM 定义级比对。默认：auto。
+  可选值：auto（仅 OceanBase 源自动启用）、true、false。
+  说明：OB->OB 在 auto 下自动启用；Oracle->OB 为保守默认，必须显式设置 true 才启用。比对直接目标、DBLINK 与 PUBLIC/private 边界；直接定义不同即报告，即使当前终点对象可能暂时相同。明细输出 `synonym_definition_mismatch_detail_<ts>.txt`，report_db 中状态为 `DEFINITION_DRIFT`。
+- partition_definition_compare：同名 TABLE 分区定义级比对。默认：auto。
+  可选值：auto（仅 OceanBase 源自动启用）、true、false。
+  说明：OB->OB 在 auto 下自动启用；Oracle->OB 为保守默认，必须显式设置 true 才启用。在表存在且列比较通过后，继续比对分区类型、子分区类型、分区键顺序、interval 表达式、分区数量/顺序/high value 与子分区定义。明细输出 `partition_definition_mismatch_detail_<ts>.txt`。
+- synonym_definition_fixup：是否为安全同义词定义漂移生成替换脚本。默认：false。
+  说明：OB->OB 与显式启用的 Oracle->OB 均支持；仅当漂移项被分类为 `RUNNABLE`（本地目标、无 DBLINK、无 PUBLIC/private 边界风险、源目标可解析）时才输出 `fixup_scripts/synonym/*__definition.sql`。分区定义漂移固定 manual-only，不生成可执行 repartition SQL。
 - name_collision_mode：约束/索引重名处理模式。默认：fixup。
   可选值：off（关闭）、report（仅输出重名诊断，不改写脚本）、fixup（生成重名修复脚本并改写缺失 INDEX/CONSTRAINT 名称）。
 - name_collision_rename_existing：fixup 模式下是否重命名目标端已有冲突对象。默认：true。

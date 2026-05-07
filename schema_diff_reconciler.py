@@ -16,7 +16,7 @@
 
 """
 
-数据库对象对比工具 (V0.9.9.6-hotfix3 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
+数据库对象对比工具 (V0.9.9.6-hotfix4 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -33,7 +33,7 @@
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.9.9.6-hotfix3 核心)：
+3. 性能架构 (V0.9.9.6-hotfix4 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          DBA_OBJECTS
@@ -152,7 +152,7 @@ except ModuleNotFoundError as exc:
         raise SystemExit(2) from exc
     raise
 
-__version__ = "0.9.9.6-hotfix3"
+__version__ = "0.9.9.6-hotfix4"
 
 __author__ = "Minor Li"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
@@ -1456,6 +1456,51 @@ OBCLIENT_SESSION_QUERY_TIMEOUT_US: int = DEFAULT_OBCLIENT_SESSION_QUERY_TIMEOUT_
 
 
 # --- 模型定义 ---
+class SynonymMeta(NamedTuple):
+    owner: str
+    name: str
+    table_owner: str
+    table_name: str
+    db_link: Optional[str]
+
+
+class PartitionDefinition(NamedTuple):
+    owner: str
+    table_name: str
+    partitioning_type: str
+    subpartitioning_type: str
+    partition_keys: Tuple[str, ...] = ()
+    subpartition_keys: Tuple[str, ...] = ()
+    interval_expr: str = ""
+    partitions: Tuple[Tuple[str, int, str], ...] = ()
+    subpartitions: Tuple[Tuple[str, str, int, str], ...] = ()
+
+
+class SynonymDefinitionDriftRow(NamedTuple):
+    source_synonym: str
+    target_synonym: str
+    source_target: str
+    target_target: str
+    source_terminal: str
+    target_terminal: str
+    reason_code: str
+    detail: str
+    fixup_status: str
+    action: str
+    fixup_sql: str = ""
+
+
+class PartitionDefinitionDriftRow(NamedTuple):
+    source_table: str
+    target_table: str
+    reason_code: str
+    source_signature: str
+    target_signature: str
+    source_detail: str
+    target_detail: str
+    action: str
+
+
 class ObMetadata(NamedTuple):
     """
     一次性从 OceanBase dump 出来的元数据，用于本地对比。
@@ -1493,6 +1538,16 @@ class ObMetadata(NamedTuple):
     partition_key_columns: Dict[
         Tuple[str, str], List[str]
     ]  # (OWNER, TABLE_NAME) -> [PARTITION_COLS...]
+    synonym_definitions: Dict[Tuple[str, str], SynonymMeta] = MappingProxyType(
+        {}
+    )  # (OWNER, SYNONYM_NAME) -> direct synonym target metadata
+    partition_definitions: Dict[Tuple[str, str], PartitionDefinition] = MappingProxyType(
+        {}
+    )  # (OWNER, TABLE_NAME) -> structured partition definition metadata
+    definition_capabilities: Dict[str, str] = MappingProxyType(
+        {}
+    )  # metadata family -> READY / UNAVAILABLE / DEGRADED
+    definition_diagnostics: Tuple[str, ...] = ()  # definition metadata load diagnostics
     case_sensitive_findings: Tuple[
         CaseSensitiveIdentifierFinding, ...
     ] = ()  # case-sensitive 标识符发现
@@ -1562,6 +1617,16 @@ class OracleMetadata(NamedTuple):
     interval_partitions: Dict[
         Tuple[str, str], IntervalPartitionInfo
     ]  # (OWNER, TABLE) -> interval info
+    synonym_definitions: Dict[Tuple[str, str], SynonymMeta] = MappingProxyType(
+        {}
+    )  # OB source mode: (OWNER, SYNONYM_NAME) -> direct synonym target metadata
+    partition_definitions: Dict[Tuple[str, str], PartitionDefinition] = MappingProxyType(
+        {}
+    )  # OB source mode: (OWNER, TABLE_NAME) -> structured partition definition metadata
+    definition_capabilities: Dict[str, str] = MappingProxyType(
+        {}
+    )  # OB source mode metadata family capability states
+    definition_diagnostics: Tuple[str, ...] = ()  # OB source mode definition metadata diagnostics
     loaded_schemas: FrozenSet[str] = frozenset()  # 已加载到任一 Oracle 元数据片段中的 schema
     privilege_family_counts: Tuple["OraclePrivilegeFamilyCount", ...] = ()
     non_table_triggers: Tuple["NonTableTriggerInfo", ...] = ()
@@ -1661,14 +1726,6 @@ class DependencyIssue(NamedTuple):
     referenced: str
     referenced_type: str
     reason: str
-
-
-class SynonymMeta(NamedTuple):
-    owner: str
-    name: str
-    table_owner: str
-    table_name: str
-    db_link: Optional[str]
 
 
 class ManagedTargetScope(NamedTuple):
@@ -4674,6 +4731,22 @@ SOURCE_DB_MODE_VALUES: Set[str] = {
     SOURCE_DB_MODE_OCEANBASE,
 }
 
+DEFINITION_COMPARE_MODE_VALUES = {"auto", "true", "false"}
+DEFINITION_COMPARE_MODE_ALIASES = {
+    "on": "true",
+    "yes": "true",
+    "y": "true",
+    "1": "true",
+    "enable": "true",
+    "enabled": "true",
+    "off": "false",
+    "no": "false",
+    "n": "false",
+    "0": "false",
+    "disable": "false",
+    "disabled": "false",
+}
+
 
 def parse_bool_flag(value: Optional[str], default: bool = True) -> bool:
     if value is None:
@@ -4688,6 +4761,27 @@ def normalize_source_db_mode(raw_value: Optional[str]) -> str:
     if value not in SOURCE_DB_MODE_VALUES:
         raise ValueError("source_db_mode 仅支持 oracle 或 oceanbase")
     return value
+
+
+def normalize_definition_compare_mode(raw_value: Optional[str]) -> str:
+    value = (raw_value or "").strip().lower()
+    if not value:
+        return "auto"
+    value = DEFINITION_COMPARE_MODE_ALIASES.get(value, value)
+    if value not in DEFINITION_COMPARE_MODE_VALUES:
+        log.warning("definition compare mode=%s 不在支持范围内，将回退为 auto。", raw_value)
+        return "auto"
+    return value
+
+
+def resolve_definition_compare_enabled(raw_value: Optional[str], source_db_mode: str) -> bool:
+    mode = normalize_definition_compare_mode(raw_value)
+    source_mode = normalize_source_db_mode(source_db_mode)
+    if mode == "true":
+        return source_mode in SOURCE_DB_MODE_VALUES
+    if mode == "false":
+        return False
+    return source_mode == SOURCE_DB_MODE_OCEANBASE
 
 
 def normalize_context_fixup_mode(raw_value: Optional[str]) -> str:
@@ -5013,6 +5107,9 @@ def build_source_capability_registry(source_db_mode: str) -> Dict[str, bool]:
             "supports_table_presence": True,
             "supports_missing_classification": True,
             "supports_source_synonym_metadata": True,
+            "supports_synonym_definition_compare": True,
+            "supports_partition_definition_compare": True,
+            "supports_synonym_definition_fixup": True,
             "supports_source_parent_map": True,
             "supports_source_dependency_loader": True,
         }
@@ -5027,6 +5124,9 @@ def build_source_capability_registry(source_db_mode: str) -> Dict[str, bool]:
         "supports_table_presence": True,
         "supports_missing_classification": True,
         "supports_source_synonym_metadata": True,
+        "supports_synonym_definition_compare": True,
+        "supports_partition_definition_compare": True,
+        "supports_synonym_definition_fixup": True,
         "supports_source_parent_map": True,
         "supports_source_dependency_loader": True,
     }
@@ -5140,7 +5240,50 @@ def build_source_mode_diagnostics(
     mode = normalize_source_db_mode(settings.get("source_db_mode", SOURCE_DB_MODE_ORACLE))
     caps = dict(settings.get("source_capabilities") or build_source_capability_registry(mode))
     diagnostics: List[str] = [f"source_db_mode={mode}"]
+
+    def _append_definition_diagnostics(prefix: str) -> None:
+        source_definition_caps = dict(getattr(source_meta, "definition_capabilities", {}) or {})
+        target_definition_caps = dict(getattr(target_meta, "definition_capabilities", {}) or {})
+        source_definition_diags = tuple(getattr(source_meta, "definition_diagnostics", ()) or ())
+        target_definition_diags = tuple(getattr(target_meta, "definition_diagnostics", ()) or ())
+        if not (
+            settings.get("synonym_definition_compare_enabled")
+            or settings.get("partition_definition_compare_enabled")
+            or settings.get("synonym_definition_fixup_enabled")
+            or source_definition_caps
+            or target_definition_caps
+            or source_definition_diags
+            or target_definition_diags
+        ):
+            return
+        diagnostics.append(
+            f"{prefix} definition compare gates: "
+            f"synonym={settings.get('synonym_definition_compare_mode', settings.get('synonym_definition_compare', 'auto'))}"
+            f"/{'enabled' if settings.get('synonym_definition_compare_enabled') else 'disabled'}, "
+            f"partition={settings.get('partition_definition_compare_mode', settings.get('partition_definition_compare', 'auto'))}"
+            f"/{'enabled' if settings.get('partition_definition_compare_enabled') else 'disabled'}, "
+            f"synonym_fixup={'enabled' if settings.get('synonym_definition_fixup_enabled') else 'disabled'}"
+        )
+        if source_definition_caps or target_definition_caps:
+            diagnostics.append(
+                f"{prefix} definition metadata capabilities: source={{src}}; target={{tgt}}".format(
+                    src=", ".join(
+                        f"{key}={value}" for key, value in sorted(source_definition_caps.items())
+                    )
+                    or "<none>",
+                    tgt=", ".join(
+                        f"{key}={value}" for key, value in sorted(target_definition_caps.items())
+                    )
+                    or "<none>",
+                )
+            )
+        for diag in source_definition_diags:
+            diagnostics.append(f"{prefix} source definition metadata: {diag}")
+        for diag in target_definition_diags:
+            diagnostics.append(f"{prefix} target definition metadata: {diag}")
+
     if mode != SOURCE_DB_MODE_OCEANBASE:
+        _append_definition_diagnostics("source")
         return diagnostics
 
     source_ob_cfg = settings.get("source_ob_cfg") or {}
@@ -5230,6 +5373,8 @@ def build_source_mode_diagnostics(
         ) and bool(getattr(target_meta, "invisible_column_supported", False))
         semantic_states.append(f"INVISIBLE={'enabled' if invisible_enabled else 'deferred'}")
         diagnostics.append("OB source semantic compare: " + ", ".join(semantic_states))
+
+        _append_definition_diagnostics("OB source")
 
     effective_print_only_cfg = settings.get("effective_print_only_primary_types")
     print_only_types = sorted(
@@ -8237,6 +8382,9 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         synonym_scope_default = default_synonym_scope_for_source_mode(source_db_mode)
         settings.setdefault("synonym_check_scope", synonym_scope_default)
         settings.setdefault("synonym_fixup_scope", synonym_scope_default)
+        settings.setdefault("synonym_definition_compare", "auto")
+        settings.setdefault("partition_definition_compare", "auto")
+        settings.setdefault("synonym_definition_fixup", "false")
         settings.setdefault("name_collision_mode", "fixup")
         settings.setdefault("name_collision_rename_existing", "true")
         settings.setdefault("trigger_list", "")
@@ -8410,6 +8558,14 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
                 source_mode_diagnostics.append(
                     "source_db_mode=oceanbase：synonym_fixup_scope 未配置，默认按 all 处理。"
                 )
+            if not config.has_option("SETTINGS", "synonym_definition_compare"):
+                source_mode_diagnostics.append(
+                    "source_db_mode=oceanbase：synonym_definition_compare 未配置，默认按 auto 启用定义级比对。"
+                )
+            if not config.has_option("SETTINGS", "partition_definition_compare"):
+                source_mode_diagnostics.append(
+                    "source_db_mode=oceanbase：partition_definition_compare 未配置，默认按 auto 启用定义级比对。"
+                )
         settings["_source_mode_diagnostics"] = source_mode_diagnostics
         settings["_compatibility_default_diagnostics"] = dedupe_preserve_order(
             compatibility_default_diagnostics
@@ -8433,6 +8589,56 @@ def load_config(config_file: str) -> Tuple[OraConfig, ObConfig, Dict]:
         settings["enable_grant_generation"] = parse_bool_flag(
             settings.get("generate_grants", "true"), True
         )
+        settings["synonym_definition_compare_mode"] = normalize_definition_compare_mode(
+            settings.get("synonym_definition_compare", "auto")
+        )
+        settings["partition_definition_compare_mode"] = normalize_definition_compare_mode(
+            settings.get("partition_definition_compare", "auto")
+        )
+        settings["synonym_definition_compare_enabled"] = resolve_definition_compare_enabled(
+            settings.get("synonym_definition_compare", "auto"), source_db_mode
+        )
+        settings["partition_definition_compare_enabled"] = resolve_definition_compare_enabled(
+            settings.get("partition_definition_compare", "auto"), source_db_mode
+        )
+        settings["synonym_definition_fixup_enabled"] = (
+            parse_bool_flag(settings.get("synonym_definition_fixup", "false"), False)
+            and source_db_mode in SOURCE_DB_MODE_VALUES
+        )
+        if source_db_mode == SOURCE_DB_MODE_OCEANBASE:
+            if settings["synonym_definition_compare_enabled"]:
+                source_mode_diagnostics.append(
+                    "source_db_mode=oceanbase：已启用 SYNONYM 直接目标定义级比对。"
+                )
+            if settings["partition_definition_compare_enabled"]:
+                source_mode_diagnostics.append(
+                    "source_db_mode=oceanbase：已启用 TABLE 分区定义级比对。"
+                )
+            if settings["synonym_definition_fixup_enabled"]:
+                source_mode_diagnostics.append(
+                    "source_db_mode=oceanbase：synonym_definition_fixup 已开启；仅安全分类为 RUNNABLE 的同义词定义漂移会生成替换脚本。"
+                )
+        if source_db_mode == SOURCE_DB_MODE_ORACLE:
+            if settings["synonym_definition_compare_mode"] == "auto":
+                source_mode_diagnostics.append(
+                    "source_db_mode=oracle：synonym_definition_compare=auto 保守关闭；如需 Oracle->OB 同义词直接目标定义级比对，请显式设置为 true。"
+                )
+            if settings["partition_definition_compare_mode"] == "auto":
+                source_mode_diagnostics.append(
+                    "source_db_mode=oracle：partition_definition_compare=auto 保守关闭；如需 Oracle->OB 分区定义级比对，请显式设置为 true。"
+                )
+            if settings["synonym_definition_compare_mode"] == "true":
+                source_mode_diagnostics.append(
+                    "source_db_mode=oracle：已显式启用 Oracle->OB SYNONYM 直接目标定义级比对。"
+                )
+            if settings["partition_definition_compare_mode"] == "true":
+                source_mode_diagnostics.append(
+                    "source_db_mode=oracle：已显式启用 Oracle->OB TABLE 分区定义级比对。"
+                )
+            if settings["synonym_definition_fixup_enabled"]:
+                source_mode_diagnostics.append(
+                    "source_db_mode=oracle：synonym_definition_fixup 已开启；仅安全分类为 RUNNABLE 的 Oracle->OB 同义词定义漂移会生成替换脚本。"
+                )
         settings["grant_generation_mode"] = normalize_grant_generation_mode(
             settings.get("grant_generation_mode", "full")
         )
@@ -9390,6 +9596,14 @@ def run_config_wizard(config_path: Path) -> None:
             return True, ""
         return False, "仅支持 off/auto/on"
 
+    def _validate_definition_compare_mode(val: str) -> Tuple[bool, str]:
+        if not val.strip():
+            return True, ""
+        normalized = DEFINITION_COMPARE_MODE_ALIASES.get(val.strip().lower(), val.strip().lower())
+        if normalized in DEFINITION_COMPARE_MODE_VALUES:
+            return True, ""
+        return False, "仅支持 auto/true/false"
+
     def _validate_object_created_before(val: str) -> Tuple[bool, str]:
         raw = (val or "").strip()
         if not raw:
@@ -9986,6 +10200,29 @@ def run_config_wizard(config_path: Path) -> None:
         "check_column_order",
         "是否校验列顺序 (true/false，默认 false)",
         default=cfg.get("SETTINGS", "check_column_order", fallback="false"),
+        transform=_bool_transform,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "synonym_definition_compare",
+        "同义词直接目标定义比对 (auto/true/false；auto 仅 OceanBase 源自动启用，Oracle 源需显式 true)",
+        default=cfg.get("SETTINGS", "synonym_definition_compare", fallback="auto"),
+        validator=_validate_definition_compare_mode,
+        transform=normalize_definition_compare_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "partition_definition_compare",
+        "分区表定义比对 (auto/true/false；auto 仅 OceanBase 源自动启用，Oracle 源需显式 true)",
+        default=cfg.get("SETTINGS", "partition_definition_compare", fallback="auto"),
+        validator=_validate_definition_compare_mode,
+        transform=normalize_definition_compare_mode,
+    )
+    _prompt_field(
+        "SETTINGS",
+        "synonym_definition_fixup",
+        "是否为安全的同义词定义漂移生成替换脚本 (true/false，默认 false)",
+        default=cfg.get("SETTINGS", "synonym_definition_fixup", fallback="false"),
         transform=_bool_transform,
     )
     _prompt_field(
@@ -16563,6 +16800,10 @@ def adapt_ob_metadata_to_source_oracle_metadata(
         package_errors_complete=bool(ob_meta.package_errors_complete),
         partition_key_columns=dict(ob_meta.partition_key_columns or {}),
         interval_partitions={},
+        synonym_definitions=dict(getattr(ob_meta, "synonym_definitions", {}) or {}),
+        partition_definitions=dict(getattr(ob_meta, "partition_definitions", {}) or {}),
+        definition_capabilities=dict(getattr(ob_meta, "definition_capabilities", {}) or {}),
+        definition_diagnostics=tuple(getattr(ob_meta, "definition_diagnostics", ()) or ()),
         loaded_schemas=frozenset(sorted(loaded_schema_set)),
         privilege_family_counts=(),
         non_table_triggers=(),
@@ -16589,8 +16830,34 @@ def dump_source_metadata(
     include_contexts: bool = False,
 ) -> OracleMetadata:
     source_db_mode = normalize_source_db_mode(settings.get("source_db_mode", SOURCE_DB_MODE_ORACLE))
+    source_schema_set = {
+        schema.upper() for schema in (settings.get("source_schemas_list") or []) if schema
+    }
+    if not source_schema_set and master_list:
+        for src_full, _tgt_full, _obj_type in master_list:
+            parsed = parse_full_object_name(src_full)
+            if parsed:
+                source_schema_set.add(parsed[0].upper())
+    source_schemas = sorted(source_schema_set)
+    tracked_types = {
+        (obj_type or "").upper()
+        for _src_full, _tgt_full, obj_type in (master_list or [])
+        if obj_type
+    }
+    if not tracked_types:
+        tracked_types = {"TABLE"}
+    include_synonym_definitions = (
+        bool(
+            settings.get("synonym_definition_compare_enabled")
+            or settings.get("synonym_definition_fixup_enabled")
+        )
+        and "SYNONYM" in tracked_types
+    )
+    include_partition_definitions = (
+        bool(settings.get("partition_definition_compare_enabled")) and "TABLE" in tracked_types
+    )
     if source_db_mode == SOURCE_DB_MODE_ORACLE:
-        return dump_oracle_metadata(
+        oracle_meta = dump_oracle_metadata(
             ora_cfg,
             master_list,
             settings,
@@ -16603,26 +16870,56 @@ def dump_source_metadata(
             include_interval_partitions=include_interval_partitions,
             include_contexts=include_contexts,
         )
+        definition_capabilities = dict(getattr(oracle_meta, "definition_capabilities", {}) or {})
+        definition_diagnostics = list(getattr(oracle_meta, "definition_diagnostics", ()) or ())
+        synonym_definitions = dict(getattr(oracle_meta, "synonym_definitions", {}) or {})
+        partition_definitions = dict(getattr(oracle_meta, "partition_definitions", {}) or {})
+
+        if include_synonym_definitions:
+            try:
+                synonym_definitions = load_synonym_metadata(
+                    ora_cfg,
+                    source_schemas,
+                    allowed_terminal_source_schemas=source_schemas,
+                    capabilities=definition_capabilities,
+                    diagnostics=definition_diagnostics,
+                )
+                definition_capabilities.setdefault("synonym_definitions", "READY")
+            except Exception as exc:
+                definition_capabilities["synonym_definitions"] = "UNAVAILABLE"
+                definition_diagnostics.append(
+                    f"DBA_SYNONYMS unavailable: {normalize_error_text(str(exc))}"
+                )
+                log.warning("读取 Oracle 源端同义词定义元数据失败: %s", exc)
+        elif bool(
+            settings.get("synonym_definition_compare_enabled")
+            or settings.get("synonym_definition_fixup_enabled")
+        ):
+            definition_capabilities.setdefault("synonym_definitions", "SKIPPED")
+
+        if include_partition_definitions:
+            part_defs, part_caps, part_diags = load_oracle_partition_definition_metadata(
+                ora_cfg,
+                source_schemas,
+                collect_table_pairs(master_list, use_target=False),
+            )
+            partition_definitions = dict(part_defs)
+            definition_capabilities.update(part_caps)
+            definition_diagnostics.extend(part_diags)
+        elif bool(settings.get("partition_definition_compare_enabled")):
+            definition_capabilities.setdefault("oracle_partition_definitions", "SKIPPED")
+
+        return oracle_meta._replace(
+            synonym_definitions=synonym_definitions,
+            partition_definitions=partition_definitions,
+            definition_capabilities=definition_capabilities,
+            definition_diagnostics=tuple(definition_diagnostics),
+        )
 
     source_ob_cfg = settings.get("source_ob_cfg") or {}
-    source_schemas = {
-        schema.upper() for schema in (settings.get("source_schemas_list") or []) if schema
-    }
-    if not source_schemas and master_list:
-        for src_full, _tgt_full, _obj_type in master_list:
-            parsed = parse_full_object_name(src_full)
-            if parsed:
-                source_schemas.add(parsed[0].upper())
-    tracked_types = {
-        (obj_type or "").upper()
-        for _src_full, _tgt_full, obj_type in (master_list or [])
-        if obj_type
-    }
-    if not tracked_types:
-        tracked_types = {"TABLE"}
     ob_meta = dump_ob_metadata(
         source_ob_cfg,
-        source_schemas,
+        source_schema_set,
         tracked_object_types=tracked_types,
         synonym_check_scope=settings.get("synonym_check_scope", "public_only"),
         case_sensitive_mode=settings.get("case_sensitive_identifier_mode", "warn"),
@@ -16635,10 +16932,12 @@ def dump_source_metadata(
         include_comments=include_comments,
         include_roles=False,
         target_table_pairs=collect_table_pairs(master_list, use_target=False)
-        if include_comments
+        if (include_comments or include_partition_definitions)
         else set(),
         include_contexts=include_contexts,
         enable_dba_synonym_fallback=True,
+        include_synonym_definitions=include_synonym_definitions,
+        include_partition_definitions=include_partition_definitions,
     )
     oracle_meta = adapt_ob_metadata_to_source_oracle_metadata(ob_meta, source_schemas)
     if include_privileges:
@@ -16886,6 +17185,208 @@ def load_source_synonym_metadata(
         schemas_list,
         allowed_terminal_source_schemas=allowed_terminal_source_schemas,
     )
+
+
+def load_ob_partition_definition_metadata(
+    ob_cfg: ObConfig,
+    owners: Sequence[str],
+    table_pairs: Optional[Set[Tuple[str, str]]] = None,
+) -> Tuple[Dict[Tuple[str, str], PartitionDefinition], Dict[str, str], Tuple[str, ...]]:
+    owners_u = sorted({(owner or "").upper() for owner in owners or [] if owner})
+    if not owners_u:
+        return {}, {}, ()
+    allowed_pairs = {
+        ((owner or "").upper(), (table or "").upper())
+        for owner, table in (table_pairs or set())
+        if (owner or "").strip() and (table or "").strip()
+    }
+    capabilities: Dict[str, str] = {}
+    diagnostics: List[str] = []
+    table_meta: Dict[Tuple[str, str], Dict[str, str]] = {}
+    part_keys: Dict[Tuple[str, str], List[Tuple[int, str]]] = defaultdict(list)
+    subpart_keys: Dict[Tuple[str, str], List[Tuple[int, str]]] = defaultdict(list)
+    partitions: Dict[Tuple[str, str], List[Tuple[str, int, str]]] = defaultdict(list)
+    subpartitions: Dict[Tuple[str, str], List[Tuple[str, str, int, str]]] = defaultdict(list)
+
+    def _pair_allowed(key: Tuple[str, str]) -> bool:
+        return not allowed_pairs or key in allowed_pairs
+
+    sql_part_tables_rich = """
+        SELECT OWNER, TABLE_NAME, PARTITIONING_TYPE, SUBPARTITIONING_TYPE, INTERVAL
+        FROM DBA_PART_TABLES
+        WHERE OWNER IN ({owners_in})
+    """
+    sql_part_tables_basic = """
+        SELECT OWNER, TABLE_NAME, PARTITIONING_TYPE, SUBPARTITIONING_TYPE
+        FROM DBA_PART_TABLES
+        WHERE OWNER IN ({owners_in})
+    """
+    ok, rows, err = obclient_query_by_owner_chunks_best_effort(
+        ob_cfg,
+        (("rich", sql_part_tables_rich), ("basic", sql_part_tables_basic)),
+        owners_u,
+    )
+    if not ok:
+        capabilities["partition_tables"] = "UNAVAILABLE"
+        diagnostics.append(f"DBA_PART_TABLES unavailable: {normalize_error_text(err)}")
+        return {}, capabilities, tuple(diagnostics)
+    capabilities["partition_tables"] = "READY"
+    for mode, line in rows:
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        owner = (parts[0] or "").strip().upper()
+        table = (parts[1] or "").strip().upper()
+        key = (owner, table)
+        if not owner or not table or not _pair_allowed(key):
+            continue
+        table_meta[key] = {
+            "partitioning_type": (parts[2] or "").strip().upper(),
+            "subpartitioning_type": (parts[3] or "").strip().upper(),
+            "interval": _normalize_definition_text(
+                parts[4] if mode == "rich" and len(parts) > 4 else ""
+            ),
+        }
+
+    def _load_key_columns(
+        view_name: str, target: Dict[Tuple[str, str], List[Tuple[int, str]]]
+    ) -> None:
+        sql_with_type = f"""
+            SELECT OWNER, NAME, COLUMN_NAME, COLUMN_POSITION
+            FROM {view_name}
+            WHERE OWNER IN ({{owners_in}})
+              AND OBJECT_TYPE = 'TABLE'
+            ORDER BY OWNER, NAME, COLUMN_POSITION
+        """
+        sql_basic = f"""
+            SELECT OWNER, NAME, COLUMN_NAME, COLUMN_POSITION
+            FROM {view_name}
+            WHERE OWNER IN ({{owners_in}})
+            ORDER BY OWNER, NAME, COLUMN_POSITION
+        """
+        ok_keys, key_rows, key_err = obclient_query_by_owner_chunks_best_effort(
+            ob_cfg, (("with_type", sql_with_type), ("basic", sql_basic)), owners_u
+        )
+        if not ok_keys:
+            capabilities[view_name.lower()] = "UNAVAILABLE"
+            diagnostics.append(f"{view_name} unavailable: {normalize_error_text(key_err)}")
+            return
+        capabilities[view_name.lower()] = "READY"
+        for _mode, line in key_rows:
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            owner = (parts[0] or "").strip().upper()
+            table = (parts[1] or "").strip().upper()
+            column = (parts[2] or "").strip().upper()
+            try:
+                pos = int((parts[3] if len(parts) > 3 else "") or 0)
+            except (TypeError, ValueError):
+                pos = 0
+            key = (owner, table)
+            if owner and table and column and _pair_allowed(key):
+                target[key].append((pos, column))
+
+    _load_key_columns("DBA_PART_KEY_COLUMNS", part_keys)
+    _load_key_columns("DBA_SUBPART_KEY_COLUMNS", subpart_keys)
+
+    sql_partitions = """
+        SELECT TABLE_OWNER, TABLE_NAME, PARTITION_NAME, PARTITION_POSITION,
+               REPLACE(REPLACE(REPLACE(HIGH_VALUE, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS HIGH_VALUE
+        FROM DBA_TAB_PARTITIONS
+        WHERE TABLE_OWNER IN ({owners_in})
+        ORDER BY TABLE_OWNER, TABLE_NAME, PARTITION_POSITION
+    """
+    ok_parts, part_rows, part_err = obclient_query_by_owner_chunks(
+        ob_cfg, sql_partitions, owners_u, quiet_error=True
+    )
+    if not ok_parts:
+        capabilities["dba_tab_partitions"] = "UNAVAILABLE"
+        diagnostics.append(f"DBA_TAB_PARTITIONS unavailable: {normalize_error_text(part_err)}")
+    else:
+        capabilities["dba_tab_partitions"] = "READY"
+        for line in part_rows:
+            parts = line.split("\t", 4)
+            if len(parts) < 4:
+                continue
+            owner = (parts[0] or "").strip().upper()
+            table = (parts[1] or "").strip().upper()
+            part_name = (parts[2] or "").strip().upper()
+            try:
+                pos = int((parts[3] or "0").strip() or 0)
+            except (TypeError, ValueError):
+                pos = 0
+            high_value = _normalize_definition_text(parts[4] if len(parts) > 4 else "")
+            key = (owner, table)
+            if owner and table and part_name and _pair_allowed(key):
+                partitions[key].append((part_name, pos, high_value))
+
+    sql_subpartitions = """
+        SELECT TABLE_OWNER, TABLE_NAME, PARTITION_NAME, SUBPARTITION_NAME, SUBPARTITION_POSITION,
+               REPLACE(REPLACE(REPLACE(HIGH_VALUE, CHR(10), ' '), CHR(13), ' '), CHR(9), ' ') AS HIGH_VALUE
+        FROM DBA_TAB_SUBPARTITIONS
+        WHERE TABLE_OWNER IN ({owners_in})
+        ORDER BY TABLE_OWNER, TABLE_NAME, PARTITION_NAME, SUBPARTITION_POSITION
+    """
+    ok_subparts, subpart_rows, subpart_err = obclient_query_by_owner_chunks(
+        ob_cfg, sql_subpartitions, owners_u, quiet_error=True
+    )
+    if not ok_subparts:
+        capabilities["dba_tab_subpartitions"] = "UNAVAILABLE"
+        diagnostics.append(
+            f"DBA_TAB_SUBPARTITIONS unavailable: {normalize_error_text(subpart_err)}"
+        )
+    else:
+        capabilities["dba_tab_subpartitions"] = "READY"
+        for line in subpart_rows:
+            parts = line.split("\t", 5)
+            if len(parts) < 5:
+                continue
+            owner = (parts[0] or "").strip().upper()
+            table = (parts[1] or "").strip().upper()
+            part_name = (parts[2] or "").strip().upper()
+            subpart_name = (parts[3] or "").strip().upper()
+            try:
+                pos = int((parts[4] or "0").strip() or 0)
+            except (TypeError, ValueError):
+                pos = 0
+            high_value = _normalize_definition_text(parts[5] if len(parts) > 5 else "")
+            key = (owner, table)
+            if owner and table and part_name and subpart_name and _pair_allowed(key):
+                subpartitions[key].append((part_name, subpart_name, pos, high_value))
+
+    result: Dict[Tuple[str, str], PartitionDefinition] = {}
+    for key, meta in sorted(table_meta.items()):
+        result[key] = PartitionDefinition(
+            owner=key[0],
+            table_name=key[1],
+            partitioning_type=meta.get("partitioning_type", ""),
+            subpartitioning_type=meta.get("subpartitioning_type", ""),
+            partition_keys=tuple(col for _pos, col in sorted(part_keys.get(key, []))),
+            subpartition_keys=tuple(col for _pos, col in sorted(subpart_keys.get(key, []))),
+            interval_expr=meta.get("interval", ""),
+            partitions=tuple(
+                sorted(partitions.get(key, []), key=lambda item: (int(item[1] or 0), item[0]))
+            ),
+            subpartitions=tuple(
+                sorted(
+                    subpartitions.get(key, []),
+                    key=lambda item: (item[0], int(item[2] or 0), item[1]),
+                )
+            ),
+        )
+    if diagnostics and result:
+        capabilities.setdefault("partition_definitions", "DEGRADED")
+    elif result:
+        capabilities.setdefault("partition_definitions", "READY")
+    else:
+        capabilities.setdefault("partition_definitions", "READY")
+    log.info(
+        "已缓存 %d 个 OB 分区表定义元数据（owners=%s）。",
+        len(result),
+        ",".join(owners_u),
+    )
+    return result, capabilities, tuple(diagnostics)
 
 
 def load_ob_source_parent_map(
@@ -17204,6 +17705,8 @@ def load_synonym_metadata(
     ora_cfg: OraConfig,
     schemas_list: List[str],
     allowed_terminal_source_schemas: Optional[Sequence[str]] = None,
+    capabilities: Optional[Dict[str, str]] = None,
+    diagnostics: Optional[List[str]] = None,
 ) -> Dict[Tuple[str, str], SynonymMeta]:
     """
     快速读取同义词定义，避免逐个 DBMS_METADATA 调用。
@@ -17317,8 +17820,14 @@ def load_synonym_metadata(
                 skipped_public += 1
             result = filtered_result
     except oracledb.Error as exc:
+        if capabilities is not None:
+            capabilities["synonym_definitions"] = "UNAVAILABLE"
+        if diagnostics is not None:
+            diagnostics.append(f"DBA_SYNONYMS unavailable: {normalize_error_text(str(exc))}")
         log.warning("读取同义词元数据失败，将回退 DBMS_METADATA：%s", exc)
 
+    if capabilities is not None and "synonym_definitions" not in capabilities:
+        capabilities["synonym_definitions"] = "READY"
     target_hint = ",".join(sorted(allowed_targets)) if allowed_targets else "<ALL>"
     log.info(
         "已缓存 %d 个同义词元数据（OWNER IN %s，TABLE_OWNER IN %s，过滤无关 PUBLIC %d 个）。",
@@ -17328,6 +17837,298 @@ def load_synonym_metadata(
         skipped_public,
     )
     return result
+
+
+def load_oracle_partition_definition_metadata(
+    ora_cfg: OraConfig,
+    owners: Sequence[str],
+    table_pairs: Optional[Set[Tuple[str, str]]] = None,
+) -> Tuple[Dict[Tuple[str, str], PartitionDefinition], Dict[str, str], Tuple[str, ...]]:
+    owners_u = sorted({(owner or "").strip().upper() for owner in owners or [] if owner})
+    if not owners_u:
+        return {}, {}, ()
+
+    allowed_pairs = {
+        ((owner or "").strip().upper(), (table or "").strip().upper())
+        for owner, table in (table_pairs or set())
+        if (owner or "").strip() and (table or "").strip()
+    }
+    capabilities: Dict[str, str] = {}
+    diagnostics: List[str] = []
+    table_meta: Dict[Tuple[str, str], Dict[str, str]] = {}
+    part_keys: Dict[Tuple[str, str], List[Tuple[int, str]]] = defaultdict(list)
+    subpart_keys: Dict[Tuple[str, str], List[Tuple[int, str]]] = defaultdict(list)
+    partitions: Dict[Tuple[str, str], List[Tuple[str, int, str]]] = defaultdict(list)
+    subpartitions: Dict[Tuple[str, str], List[Tuple[str, str, int, str]]] = defaultdict(list)
+
+    def _pair_allowed(key: Tuple[str, str]) -> bool:
+        return not allowed_pairs or key in allowed_pairs
+
+    def _safe_upper(value: Optional[object]) -> str:
+        return normalize_identifier_name(str(value)) if value is not None else ""
+
+    def _parse_int(value: Optional[object]) -> int:
+        try:
+            return int(value) if value is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def _query_rows(connection, sql_template: str) -> List[Tuple[object, ...]]:
+        rows: List[Tuple[object, ...]] = []
+        with connection.cursor() as cursor:
+            apply_oracle_cursor_fetch_tuning(cursor, "bulk_metadata")
+            try:
+                cursor.longfetchsize = max(int(getattr(cursor, "longfetchsize", 0) or 0), 1000000)
+            except Exception:
+                try:
+                    cursor.longfetchsize = 1000000
+                except Exception:
+                    pass
+            for owner_chunk in chunk_list(owners_u, ORACLE_IN_BATCH_SIZE):
+                owners_clause = build_bind_placeholders(len(owner_chunk))
+                sql = sql_template.format(owners_clause=owners_clause)
+                cursor.execute(sql, owner_chunk)
+                rows.extend(tuple(row) for row in cursor)
+        return rows
+
+    try:
+        with oracledb.connect(
+            user=ora_cfg["user"], password=ora_cfg["password"], dsn=ora_cfg["dsn"]
+        ) as connection:
+            sql_part_tables_rich = """
+                SELECT OWNER, TABLE_NAME, PARTITIONING_TYPE, SUBPARTITIONING_TYPE, INTERVAL
+                FROM DBA_PART_TABLES
+                WHERE OWNER IN ({owners_clause})
+            """
+            sql_part_tables_basic = """
+                SELECT OWNER, TABLE_NAME, PARTITIONING_TYPE, SUBPARTITIONING_TYPE
+                FROM DBA_PART_TABLES
+                WHERE OWNER IN ({owners_clause})
+            """
+            try:
+                part_table_rows = _query_rows(connection, sql_part_tables_rich)
+                part_table_mode = "rich"
+                capabilities["oracle_partition_tables"] = "READY"
+            except oracledb.Error as exc:
+                diagnostics.append(
+                    "DBA_PART_TABLES.INTERVAL unavailable: " + normalize_error_text(str(exc))
+                )
+                try:
+                    part_table_rows = _query_rows(connection, sql_part_tables_basic)
+                    part_table_mode = "basic"
+                    capabilities["oracle_partition_tables"] = "DEGRADED"
+                except oracledb.Error as fallback_exc:
+                    capabilities["oracle_partition_tables"] = "UNAVAILABLE"
+                    capabilities["oracle_partition_definitions"] = "UNAVAILABLE"
+                    diagnostics.append(
+                        "DBA_PART_TABLES unavailable: " + normalize_error_text(str(fallback_exc))
+                    )
+                    return {}, capabilities, tuple(diagnostics)
+
+            for row in part_table_rows:
+                if len(row) < 4:
+                    continue
+                owner = _safe_upper(row[0])
+                table = _safe_upper(row[1])
+                key = (owner, table)
+                if not owner or not table or not _pair_allowed(key):
+                    continue
+                interval_expr = (
+                    _normalize_definition_text(row[4])
+                    if part_table_mode == "rich" and len(row) > 4
+                    else ""
+                )
+                table_meta[key] = {
+                    "partitioning_type": _safe_upper(row[2]),
+                    "subpartitioning_type": _safe_upper(row[3]),
+                    "interval": interval_expr,
+                }
+
+            def _load_key_columns(
+                view_name: str,
+                target: Dict[Tuple[str, str], List[Tuple[int, str]]],
+            ) -> None:
+                sql_with_type = f"""
+                    SELECT OWNER, NAME, COLUMN_NAME, COLUMN_POSITION
+                    FROM {view_name}
+                    WHERE OWNER IN ({{owners_clause}})
+                      AND OBJECT_TYPE = 'TABLE'
+                    ORDER BY OWNER, NAME, COLUMN_POSITION
+                """
+                sql_basic = f"""
+                    SELECT OWNER, NAME, COLUMN_NAME, COLUMN_POSITION
+                    FROM {view_name}
+                    WHERE OWNER IN ({{owners_clause}})
+                    ORDER BY OWNER, NAME, COLUMN_POSITION
+                """
+                cap_key = f"oracle_{view_name.lower()}"
+                try:
+                    key_rows = _query_rows(connection, sql_with_type)
+                    capabilities[cap_key] = "READY"
+                except oracledb.Error as exc:
+                    diagnostics.append(
+                        f"{view_name}.OBJECT_TYPE unavailable: {normalize_error_text(str(exc))}"
+                    )
+                    try:
+                        key_rows = _query_rows(connection, sql_basic)
+                        capabilities[cap_key] = "DEGRADED"
+                    except oracledb.Error as fallback_exc:
+                        capabilities[cap_key] = "UNAVAILABLE"
+                        diagnostics.append(
+                            f"{view_name} unavailable: {normalize_error_text(str(fallback_exc))}"
+                        )
+                        return
+                for row in key_rows:
+                    if len(row) < 3:
+                        continue
+                    owner = _safe_upper(row[0])
+                    table = _safe_upper(row[1])
+                    column = _safe_upper(row[2])
+                    pos = _parse_int(row[3] if len(row) > 3 else None)
+                    key = (owner, table)
+                    if owner and table and column and _pair_allowed(key):
+                        target[key].append((pos, column))
+
+            _load_key_columns("DBA_PART_KEY_COLUMNS", part_keys)
+            _load_key_columns("DBA_SUBPART_KEY_COLUMNS", subpart_keys)
+
+            sql_partitions_rich = """
+                SELECT TABLE_OWNER, TABLE_NAME, PARTITION_NAME, PARTITION_POSITION, HIGH_VALUE
+                FROM DBA_TAB_PARTITIONS
+                WHERE TABLE_OWNER IN ({owners_clause})
+                ORDER BY TABLE_OWNER, TABLE_NAME, PARTITION_POSITION
+            """
+            sql_partitions_basic = """
+                SELECT TABLE_OWNER, TABLE_NAME, PARTITION_NAME, PARTITION_POSITION
+                FROM DBA_TAB_PARTITIONS
+                WHERE TABLE_OWNER IN ({owners_clause})
+                ORDER BY TABLE_OWNER, TABLE_NAME, PARTITION_POSITION
+            """
+            try:
+                partition_rows = _query_rows(connection, sql_partitions_rich)
+                capabilities["oracle_dba_tab_partitions"] = "READY"
+                partition_high_values_available = True
+            except oracledb.Error as exc:
+                diagnostics.append(
+                    f"DBA_TAB_PARTITIONS.HIGH_VALUE unavailable: {normalize_error_text(str(exc))}"
+                )
+                try:
+                    partition_rows = _query_rows(connection, sql_partitions_basic)
+                    capabilities["oracle_dba_tab_partitions"] = "DEGRADED"
+                    partition_high_values_available = False
+                except oracledb.Error as fallback_exc:
+                    capabilities["oracle_dba_tab_partitions"] = "UNAVAILABLE"
+                    diagnostics.append(
+                        f"DBA_TAB_PARTITIONS unavailable: {normalize_error_text(str(fallback_exc))}"
+                    )
+                    partition_rows = []
+                    partition_high_values_available = False
+            for row in partition_rows:
+                if len(row) < 4:
+                    continue
+                owner = _safe_upper(row[0])
+                table = _safe_upper(row[1])
+                part_name = _safe_upper(row[2])
+                pos = _parse_int(row[3])
+                high_value = (
+                    _normalize_definition_text(row[4])
+                    if partition_high_values_available and len(row) > 4
+                    else ""
+                )
+                key = (owner, table)
+                if owner and table and part_name and _pair_allowed(key):
+                    partitions[key].append((part_name, pos, high_value))
+
+            sql_subpartitions_rich = """
+                SELECT TABLE_OWNER, TABLE_NAME, PARTITION_NAME, SUBPARTITION_NAME,
+                       SUBPARTITION_POSITION, HIGH_VALUE
+                FROM DBA_TAB_SUBPARTITIONS
+                WHERE TABLE_OWNER IN ({owners_clause})
+                ORDER BY TABLE_OWNER, TABLE_NAME, PARTITION_NAME, SUBPARTITION_POSITION
+            """
+            sql_subpartitions_basic = """
+                SELECT TABLE_OWNER, TABLE_NAME, PARTITION_NAME, SUBPARTITION_NAME,
+                       SUBPARTITION_POSITION
+                FROM DBA_TAB_SUBPARTITIONS
+                WHERE TABLE_OWNER IN ({owners_clause})
+                ORDER BY TABLE_OWNER, TABLE_NAME, PARTITION_NAME, SUBPARTITION_POSITION
+            """
+            try:
+                subpartition_rows = _query_rows(connection, sql_subpartitions_rich)
+                capabilities["oracle_dba_tab_subpartitions"] = "READY"
+                subpartition_high_values_available = True
+            except oracledb.Error as exc:
+                diagnostics.append(
+                    "DBA_TAB_SUBPARTITIONS.HIGH_VALUE unavailable: "
+                    + normalize_error_text(str(exc))
+                )
+                try:
+                    subpartition_rows = _query_rows(connection, sql_subpartitions_basic)
+                    capabilities["oracle_dba_tab_subpartitions"] = "DEGRADED"
+                    subpartition_high_values_available = False
+                except oracledb.Error as fallback_exc:
+                    capabilities["oracle_dba_tab_subpartitions"] = "UNAVAILABLE"
+                    diagnostics.append(
+                        "DBA_TAB_SUBPARTITIONS unavailable: "
+                        + normalize_error_text(str(fallback_exc))
+                    )
+                    subpartition_rows = []
+                    subpartition_high_values_available = False
+            for row in subpartition_rows:
+                if len(row) < 5:
+                    continue
+                owner = _safe_upper(row[0])
+                table = _safe_upper(row[1])
+                part_name = _safe_upper(row[2])
+                subpart_name = _safe_upper(row[3])
+                pos = _parse_int(row[4])
+                high_value = (
+                    _normalize_definition_text(row[5])
+                    if subpartition_high_values_available and len(row) > 5
+                    else ""
+                )
+                key = (owner, table)
+                if owner and table and part_name and subpart_name and _pair_allowed(key):
+                    subpartitions[key].append((part_name, subpart_name, pos, high_value))
+    except oracledb.Error as exc:
+        capabilities["oracle_partition_definitions"] = "UNAVAILABLE"
+        diagnostics.append(
+            f"Oracle partition metadata unavailable: {normalize_error_text(str(exc))}"
+        )
+        log.warning("读取 Oracle 分区定义元数据失败: %s", exc)
+        return {}, capabilities, tuple(diagnostics)
+
+    result: Dict[Tuple[str, str], PartitionDefinition] = {}
+    for key, meta in sorted(table_meta.items()):
+        result[key] = PartitionDefinition(
+            owner=key[0],
+            table_name=key[1],
+            partitioning_type=meta.get("partitioning_type", ""),
+            subpartitioning_type=meta.get("subpartitioning_type", ""),
+            partition_keys=tuple(col for _pos, col in sorted(part_keys.get(key, []))),
+            subpartition_keys=tuple(col for _pos, col in sorted(subpart_keys.get(key, []))),
+            interval_expr=meta.get("interval", ""),
+            partitions=tuple(
+                sorted(partitions.get(key, []), key=lambda item: (int(item[1] or 0), item[0]))
+            ),
+            subpartitions=tuple(
+                sorted(
+                    subpartitions.get(key, []),
+                    key=lambda item: (item[0], int(item[2] or 0), item[1]),
+                )
+            ),
+        )
+
+    if diagnostics and result:
+        capabilities.setdefault("oracle_partition_definitions", "DEGRADED")
+    else:
+        capabilities.setdefault("oracle_partition_definitions", "READY")
+    log.info(
+        "已缓存 %d 个 Oracle 分区表定义元数据（owners=%s）。",
+        len(result),
+        ",".join(owners_u),
+    )
+    return result, capabilities, tuple(diagnostics)
 
 
 def resolve_synonym_terminal_source(
@@ -17580,6 +18381,295 @@ def resolve_synonym_scope_status(
     return target_full, "out_of_scope", "terminal_target_not_in_source_scope"
 
 
+SYNONYM_TARGET_PREFERRED_TYPES = (
+    "TABLE",
+    "VIEW",
+    "MATERIALIZED VIEW",
+    "SEQUENCE",
+    "SYNONYM",
+    "PACKAGE",
+    "PACKAGE BODY",
+    "PROCEDURE",
+    "FUNCTION",
+    "TYPE",
+    "TYPE BODY",
+)
+
+
+def _normalize_definition_text(value: Optional[object]) -> str:
+    text = normalize_obclient_nullable_text(value, upper=False)
+    if text is None:
+        return ""
+    return " ".join(str(text).replace("\r", " ").replace("\n", " ").replace("\t", " ").split())
+
+
+def _normalize_definition_expr(value: Optional[object]) -> str:
+    text = _normalize_definition_text(value)
+    return text.upper() if text else ""
+
+
+def build_synonym_direct_target_display(
+    meta: Optional[SynonymMeta],
+    full_object_mapping: Optional[FullObjectMapping] = None,
+    *,
+    is_source: bool = False,
+) -> str:
+    if not meta:
+        return ""
+    owner_u = normalize_public_owner(meta.table_owner)
+    name_u = normalize_identifier_name(meta.table_name)
+    dblink_u = normalize_identifier_name(meta.db_link)
+    target_full = f"{owner_u}.{name_u}".strip(".") if owner_u else name_u
+    if is_source and full_object_mapping and owner_u and name_u:
+        mapped = find_mapped_target_any_type(
+            full_object_mapping,
+            f"{owner_u}.{name_u}",
+            preferred_types=SYNONYM_TARGET_PREFERRED_TYPES,
+        )
+        if mapped:
+            target_full = mapped.upper()
+    if dblink_u:
+        target_full = f"{target_full}@{dblink_u}"
+    return target_full.upper()
+
+
+def classify_synonym_definition_fixup(
+    src_meta: Optional[SynonymMeta],
+    tgt_meta: Optional[SynonymMeta],
+    *,
+    source_target_display: str,
+    target_synonym: str,
+    fixup_enabled: bool,
+) -> Tuple[str, str, str]:
+    if not fixup_enabled:
+        return "MANUAL_ONLY", "MANUAL_REVIEW", "synonym_definition_fixup_disabled"
+    if not src_meta or not tgt_meta:
+        return "MANUAL_ONLY", "MANUAL_REVIEW", "synonym_metadata_incomplete"
+    if src_meta.db_link:
+        return "MANUAL_ONLY", "MANUAL_REVIEW", "source_dblink_requires_manual_review"
+    if tgt_meta.db_link:
+        return "MANUAL_ONLY", "MANUAL_REVIEW", "target_dblink_requires_manual_review"
+    if not source_target_display or "." not in source_target_display:
+        return "MANUAL_ONLY", "MANUAL_REVIEW", "source_target_unresolved"
+    if (src_meta.owner or "").upper() == "PUBLIC" and (tgt_meta.owner or "").upper() != "PUBLIC":
+        return "MANUAL_ONLY", "MANUAL_REVIEW", "public_private_boundary_mismatch"
+    if (src_meta.owner or "").upper() != "PUBLIC" and (tgt_meta.owner or "").upper() == "PUBLIC":
+        return "MANUAL_ONLY", "MANUAL_REVIEW", "public_private_boundary_mismatch"
+    return "RUNNABLE", "GENERATE_REPLACE_SYNONYM", "safe_direct_local_target"
+
+
+def build_synonym_definition_fixup_sql(row: SynonymDefinitionDriftRow) -> str:
+    if row.fixup_status != "RUNNABLE":
+        return ""
+    target_syn = (row.target_synonym or "").upper()
+    source_target = (row.source_target or "").upper()
+    if "." not in target_syn or "." not in source_target or "@" in source_target:
+        return ""
+    syn_owner, syn_name = target_syn.split(".", 1)
+    target_owner, target_name = source_target.split(".", 1)
+    target_sql = quote_qualified_parts(target_owner, target_name)
+    if syn_owner == "PUBLIC":
+        return f"CREATE OR REPLACE PUBLIC SYNONYM {quote_identifier(syn_name)} FOR {target_sql};"
+    return (
+        f"CREATE OR REPLACE SYNONYM {quote_qualified_parts(syn_owner, syn_name)} FOR {target_sql};"
+    )
+
+
+def compare_synonym_definition(
+    src_full: str,
+    tgt_full: str,
+    src_meta: Optional[SynonymMeta],
+    tgt_meta: Optional[SynonymMeta],
+    full_object_mapping: Optional[FullObjectMapping],
+    *,
+    fixup_enabled: bool = False,
+) -> Optional[SynonymDefinitionDriftRow]:
+    src_display = build_synonym_direct_target_display(src_meta, full_object_mapping, is_source=True)
+    tgt_display = build_synonym_direct_target_display(tgt_meta, None, is_source=False)
+    if not src_meta:
+        reason = "source_synonym_metadata_missing"
+    elif not tgt_meta:
+        reason = "target_synonym_metadata_missing"
+    elif src_display == tgt_display:
+        return None
+    elif normalize_identifier_name(src_meta.db_link) != normalize_identifier_name(tgt_meta.db_link):
+        reason = "synonym_dblink_mismatch"
+    else:
+        reason = "synonym_target_mismatch"
+    fixup_status, action, safety_reason = classify_synonym_definition_fixup(
+        src_meta,
+        tgt_meta,
+        source_target_display=src_display,
+        target_synonym=tgt_full,
+        fixup_enabled=fixup_enabled,
+    )
+    row = SynonymDefinitionDriftRow(
+        source_synonym=src_full.upper(),
+        target_synonym=tgt_full.upper(),
+        source_target=src_display or "-",
+        target_target=tgt_display or "-",
+        source_terminal="-",
+        target_terminal="-",
+        reason_code=reason,
+        detail=f"{reason}; safety={safety_reason}",
+        fixup_status=fixup_status,
+        action=action,
+    )
+    return row._replace(fixup_sql=build_synonym_definition_fixup_sql(row))
+
+
+def build_partition_definition_signature(defn: Optional[PartitionDefinition]) -> str:
+    if not defn:
+        return ""
+    parts = [
+        f"PARTITIONING={_normalize_definition_expr(defn.partitioning_type) or 'NONE'}",
+        f"SUBPARTITIONING={_normalize_definition_expr(defn.subpartitioning_type) or 'NONE'}",
+        "KEYS=" + ",".join(normalize_identifier_name(col) for col in defn.partition_keys),
+        "SUBKEYS=" + ",".join(normalize_identifier_name(col) for col in defn.subpartition_keys),
+        f"INTERVAL={_normalize_definition_expr(defn.interval_expr)}",
+        "PARTS="
+        + ";".join(
+            f"{normalize_identifier_name(name)}:{int(pos or 0)}:{_normalize_definition_expr(high)}"
+            for name, pos, high in defn.partitions
+        ),
+        "SUBPARTS="
+        + ";".join(
+            f"{normalize_identifier_name(part)}.{normalize_identifier_name(sub)}:{int(pos or 0)}:{_normalize_definition_expr(high)}"
+            for part, sub, pos, high in defn.subpartitions
+        ),
+    ]
+    return "|".join(parts)
+
+
+def describe_partition_definition(defn: Optional[PartitionDefinition]) -> str:
+    if not defn:
+        return "-"
+    part_preview = ",".join(
+        f"{name}:{pos}:{_normalize_definition_text(high)}"
+        for name, pos, high in list(defn.partitions)[:5]
+    )
+    subpart_preview = ",".join(
+        f"{part}.{sub}:{pos}:{_normalize_definition_text(high)}"
+        for part, sub, pos, high in list(defn.subpartitions)[:5]
+    )
+    return (
+        f"partitioning={defn.partitioning_type or 'NONE'}; "
+        f"subpartitioning={defn.subpartitioning_type or 'NONE'}; "
+        f"keys={','.join(defn.partition_keys) or '-'}; "
+        f"subkeys={','.join(defn.subpartition_keys) or '-'}; "
+        f"interval={_normalize_definition_text(defn.interval_expr) or '-'}; "
+        f"partitions={part_preview or '-'}; "
+        f"subpartitions={subpart_preview or '-'}"
+    )
+
+
+def compare_partition_definition_components(
+    src_def: Optional[PartitionDefinition],
+    tgt_def: Optional[PartitionDefinition],
+) -> Tuple[Optional[str], str]:
+    if not src_def and not tgt_def:
+        return None, ""
+    if src_def and not tgt_def:
+        return (
+            "target_not_partitioned",
+            "source is partitioned but target has no partition metadata",
+        )
+    if not src_def and tgt_def:
+        return (
+            "target_unexpected_partitioned",
+            "target is partitioned but source has no partition metadata",
+        )
+    assert src_def is not None and tgt_def is not None
+    checks = (
+        (
+            "partitioning_type_mismatch",
+            _normalize_definition_expr(src_def.partitioning_type),
+            _normalize_definition_expr(tgt_def.partitioning_type),
+        ),
+        (
+            "subpartitioning_type_mismatch",
+            _normalize_definition_expr(src_def.subpartitioning_type),
+            _normalize_definition_expr(tgt_def.subpartitioning_type),
+        ),
+        (
+            "partition_key_mismatch",
+            tuple(normalize_identifier_name(col) for col in src_def.partition_keys),
+            tuple(normalize_identifier_name(col) for col in tgt_def.partition_keys),
+        ),
+        (
+            "subpartition_key_mismatch",
+            tuple(normalize_identifier_name(col) for col in src_def.subpartition_keys),
+            tuple(normalize_identifier_name(col) for col in tgt_def.subpartition_keys),
+        ),
+        (
+            "interval_expression_mismatch",
+            _normalize_definition_expr(src_def.interval_expr),
+            _normalize_definition_expr(tgt_def.interval_expr),
+        ),
+    )
+    for reason, src_val, tgt_val in checks:
+        if src_val != tgt_val:
+            return reason, f"source={src_val or '-'}; target={tgt_val or '-'}"
+    src_parts = tuple(
+        (normalize_identifier_name(name), int(pos or 0), _normalize_definition_expr(high))
+        for name, pos, high in src_def.partitions
+    )
+    tgt_parts = tuple(
+        (normalize_identifier_name(name), int(pos or 0), _normalize_definition_expr(high))
+        for name, pos, high in tgt_def.partitions
+    )
+    if len(src_parts) != len(tgt_parts):
+        return "partition_count_mismatch", f"source={len(src_parts)}; target={len(tgt_parts)}"
+    if tuple((name, pos) for name, pos, _high in src_parts) != tuple(
+        (name, pos) for name, pos, _high in tgt_parts
+    ):
+        return "partition_name_or_order_mismatch", "partition name/order differs"
+    if src_parts != tgt_parts:
+        return "partition_high_value_mismatch", "partition high value differs"
+    src_subparts = tuple(
+        (
+            normalize_identifier_name(part),
+            normalize_identifier_name(sub),
+            int(pos or 0),
+            _normalize_definition_expr(high),
+        )
+        for part, sub, pos, high in src_def.subpartitions
+    )
+    tgt_subparts = tuple(
+        (
+            normalize_identifier_name(part),
+            normalize_identifier_name(sub),
+            int(pos or 0),
+            _normalize_definition_expr(high),
+        )
+        for part, sub, pos, high in tgt_def.subpartitions
+    )
+    if src_subparts != tgt_subparts:
+        return "subpartition_definition_mismatch", "subpartition definition differs"
+    return None, ""
+
+
+def compare_partition_definition(
+    src_full: str,
+    tgt_full: str,
+    src_def: Optional[PartitionDefinition],
+    tgt_def: Optional[PartitionDefinition],
+) -> Optional[PartitionDefinitionDriftRow]:
+    reason, detail = compare_partition_definition_components(src_def, tgt_def)
+    if not reason:
+        return None
+    return PartitionDefinitionDriftRow(
+        source_table=src_full.upper(),
+        target_table=tgt_full.upper(),
+        reason_code=reason,
+        source_signature=build_partition_definition_signature(src_def) or "-",
+        target_signature=build_partition_definition_signature(tgt_def) or "-",
+        source_detail=describe_partition_definition(src_def),
+        target_detail=describe_partition_definition(tgt_def),
+        action=f"MANUAL_REVIEW: {detail}",
+    )
+
+
 def resolve_synonym_fixup_target(
     synonym_owner: str,
     synonym_name: str,
@@ -17637,6 +18727,11 @@ def resolve_synonym_fixup_target(
     if meta.db_link:
         target = "{0}@{1}".format(target, meta.db_link)
     return target or None
+
+
+def build_synonym_definition_fixup_filename(target_synonym: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_$#.-]+", "_", (target_synonym or "").strip().upper())
+    return f"{text or 'SYNONYM'}__definition.sql"
 
 
 def load_oracle_view_like_object_keys(ora_cfg: OraConfig, schemas_list: List[str]) -> Set[str]:
@@ -21859,6 +22954,8 @@ def dump_ob_metadata(
     target_table_pairs: Optional[Set[Tuple[str, str]]] = None,
     include_contexts: bool = False,
     enable_dba_synonym_fallback: bool = False,
+    include_synonym_definitions: bool = False,
+    include_partition_definitions: bool = False,
 ) -> ObMetadata:
     """
     一次性从 OceanBase dump 所有需要的元数据，返回 ObMetadata。
@@ -21885,6 +22982,10 @@ def dump_ob_metadata(
             package_errors={},
             package_errors_complete=False,
             partition_key_columns={},
+            synonym_definitions={},
+            partition_definitions={},
+            definition_capabilities={},
+            definition_diagnostics=(),
             case_sensitive_findings=(),
             constraint_deferrable_supported=False,
             temporary_tables=frozenset(),
@@ -21922,6 +23023,9 @@ def dump_ob_metadata(
     # --- 1. DBA_OBJECTS ---
     objects_by_type: Dict[str, Set[str]] = {}
     object_statuses: Dict[Tuple[str, str, str], str] = {}
+    synonym_definitions: Dict[Tuple[str, str], SynonymMeta] = {}
+    definition_capabilities: Dict[str, str] = {}
+    definition_diagnostics: List[str] = []
     case_sensitive_issues: Set[Tuple[str, str, str]] = set()
     object_types_filter = tracked_object_types or set(ALL_TRACKED_OBJECT_TYPES)
     if not object_types_filter:
@@ -22023,6 +23127,9 @@ def dump_ob_metadata(
             owners_in_list,
             allowed_terminal_source_schemas=owners_in_list,
         )
+        if include_synonym_definitions:
+            synonym_definitions = dict(synonym_meta)
+            definition_capabilities["synonym_definitions"] = "READY"
         if synonym_meta:
             synonym_objects = objects_by_type.setdefault("SYNONYM", set())
             before_count = len(synonym_objects)
@@ -22037,6 +23144,15 @@ def dump_ob_metadata(
                     "已从 OB DBA_SYNONYMS 补充 %d 个 SYNONYM 对象进入受管范围。",
                     added_count,
                 )
+    elif include_synonym_definitions and "SYNONYM" in object_types_filter:
+        synonym_definitions = load_ob_source_synonym_metadata(
+            ob_cfg,
+            owners_in_list,
+            allowed_terminal_source_schemas=owners_in_list,
+        )
+        definition_capabilities["synonym_definitions"] = "READY"
+    elif include_synonym_definitions:
+        definition_capabilities["synonym_definitions"] = "SKIPPED"
 
     # 补充 DBA_TYPES (部分 OB 环境中 TYPE 不出现在 DBA_OBJECTS)
     # 注意：DBA_TYPES.TYPECODE=OBJECT 仅表示对象类型，本身不代表存在 TYPE BODY，
@@ -22917,6 +24033,16 @@ def dump_ob_metadata(
                 ob_cfg, default_on_null_candidate_tables
             )
 
+    partition_definitions: Dict[Tuple[str, str], PartitionDefinition] = {}
+    if include_partition_definitions:
+        partition_definitions, part_caps, part_diags = load_ob_partition_definition_metadata(
+            ob_cfg,
+            owners_in_list,
+            target_table_pairs,
+        )
+        definition_capabilities.update(part_caps)
+        definition_diagnostics.extend(part_diags)
+
     roles: Set[str] = set()
     contexts: Dict[str, ContextMetadata] = {}
     context_inventory_error = ""
@@ -22961,6 +24087,10 @@ def dump_ob_metadata(
         package_errors=package_errors,
         package_errors_complete=package_errors_complete,
         partition_key_columns=partition_key_columns,
+        synonym_definitions=synonym_definitions,
+        partition_definitions=partition_definitions,
+        definition_capabilities=definition_capabilities,
+        definition_diagnostics=tuple(definition_diagnostics),
         case_sensitive_findings=case_sensitive_findings,
         constraint_deferrable_supported=constraint_deferrable_supported,
         temporary_tables=temporary_tables,
@@ -30803,6 +31933,7 @@ def check_primary_objects(
     suppress_unmanaged_target_extras: bool = False,
     managed_target_objects: Optional[Set[str]] = None,
     transformed_blacklist_columns_by_table: Optional[Dict[Tuple[str, str], Set[str]]] = None,
+    full_object_mapping: Optional[FullObjectMapping] = None,
 ) -> ReportResults:
     """
     核心主对象校验：
@@ -30820,15 +31951,34 @@ def check_primary_objects(
         "visibility_skipped": [],
         "column_order_mismatched": [],
         "column_order_skipped": [],
+        "synonym_definition_mismatched": [],
+        "partition_definition_mismatched": [],
         "extraneous": extraneous_rules,
         "extra_targets": [],
     }
     column_order_mismatched: List[ColumnOrderMismatch] = results["column_order_mismatched"]
     column_order_skipped: List[Tuple[str, str]] = results["column_order_skipped"]
+    synonym_definition_mismatched: List[SynonymDefinitionDriftRow] = results[
+        "synonym_definition_mismatched"
+    ]
+    partition_definition_mismatched: List[PartitionDefinitionDriftRow] = results[
+        "partition_definition_mismatched"
+    ]
     source_db_mode = normalize_source_db_mode(
         (settings or {}).get("source_db_mode", SOURCE_DB_MODE_ORACLE)
     )
     strict_ob_compare = source_db_mode == SOURCE_DB_MODE_OCEANBASE
+    full_object_mapping = full_object_mapping or {}
+    definition_compare_source_supported = source_db_mode in SOURCE_DB_MODE_VALUES
+    synonym_definition_compare_enabled = definition_compare_source_supported and bool(
+        (settings or {}).get("synonym_definition_compare_enabled", False)
+    )
+    partition_definition_compare_enabled = definition_compare_source_supported and bool(
+        (settings or {}).get("partition_definition_compare_enabled", False)
+    )
+    synonym_definition_fixup_enabled = definition_compare_source_supported and bool(
+        (settings or {}).get("synonym_definition_fixup_enabled", False)
+    )
 
     visibility_policy = normalize_column_visibility_policy(
         (settings or {}).get("column_visibility_policy", "auto")
@@ -31526,14 +32676,30 @@ def check_primary_objects(
                             )
                         )
 
+            partition_drift = None
+            if partition_definition_compare_enabled:
+                partition_drift = compare_partition_definition(
+                    f"{src_schema_u}.{src_obj_u}",
+                    full_tgt,
+                    (getattr(oracle_meta, "partition_definitions", {}) or {}).get(
+                        (src_schema_u, src_obj_u)
+                    ),
+                    (getattr(ob_meta, "partition_definitions", {}) or {}).get(
+                        (tgt_schema_u, tgt_obj_u)
+                    ),
+                )
+                if partition_drift:
+                    partition_definition_mismatched.append(partition_drift)
+
             if (
                 not missing_in_tgt
                 and not extra_in_tgt
                 and not length_mismatches
                 and not type_mismatches
+                and partition_drift is None
             ):
                 results["ok"].append(("TABLE", full_tgt))
-            else:
+            elif missing_in_tgt or extra_in_tgt or length_mismatches or type_mismatches:
                 results["mismatched"].append(
                     (
                         "TABLE",
@@ -31548,6 +32714,22 @@ def check_primary_objects(
         elif obj_type_u in primary_existence_only_types:
             ob_set = ob_meta.objects_by_type.get(obj_type_u, set())
             if full_tgt in ob_set:
+                if obj_type_u == "SYNONYM" and synonym_definition_compare_enabled:
+                    synonym_drift = compare_synonym_definition(
+                        f"{src_schema_u}.{src_obj_u}",
+                        full_tgt,
+                        (getattr(oracle_meta, "synonym_definitions", {}) or {}).get(
+                            (src_schema_u, src_obj_u)
+                        ),
+                        (getattr(ob_meta, "synonym_definitions", {}) or {}).get(
+                            (tgt_schema_u, tgt_obj_u)
+                        ),
+                        full_object_mapping,
+                        fixup_enabled=synonym_definition_fixup_enabled,
+                    )
+                    if synonym_drift:
+                        synonym_definition_mismatched.append(synonym_drift)
+                        continue
                 results["ok"].append((obj_type_u, full_tgt))
             else:
                 results["missing"].append((obj_type_u, full_tgt, src_name))
@@ -40813,6 +41995,14 @@ TRIGGER_REF_PREFERRED_TYPES: Tuple[str, ...] = (
 TRIGGER_QUALIFIED_REF_PATTERN = re.compile(
     r'(?P<schema>"[^"]+"|[A-Z0-9_\$#]+)\s*\.\s*(?P<object>"[^"]+"|[A-Z0-9_\$#]+)', re.IGNORECASE
 )
+TRIGGER_SEQUENCE_SUFFIXES: FrozenSet[str] = frozenset({"NEXTVAL", "CURRVAL"})
+TRIGGER_SEQ_QUALIFIED_PATTERN = re.compile(
+    r'(?<![A-Z0-9_\$#".])'
+    r'(?P<schema>"?[A-Z0-9_\$#]+"?)\s*\.\s*'
+    r'(?P<name>"?[A-Z0-9_\$#]+"?)\s*\.\s*'
+    r"(?P<suffix>NEXTVAL|CURRVAL)\b",
+    re.IGNORECASE,
+)
 TRIGGER_SEQ_UNQUALIFIED_PATTERN = re.compile(
     r'(?<!\.)\b(?P<name>"?[A-Z0-9_\$#]+"?)\s*\.\s*(?P<suffix>NEXTVAL|CURRVAL)\b', re.IGNORECASE
 )
@@ -41110,6 +42300,44 @@ def remap_trigger_object_references(
             fallback_identity=True,
         )
 
+    def _resolve_sequence_target(schema: str, name: str) -> Optional[str]:
+        schema_u = (schema or "").upper()
+        name_u = (name or "").upper()
+        if not schema_u or not name_u:
+            return None
+
+        src_full = f"{schema_u}.{name_u}"
+        explicit = remap_rules_u.get(src_full)
+        tgt_full = get_mapped_target(full_object_mapping, src_full, "SEQUENCE")
+        if tgt_full and explicit and tgt_full.upper() == src_full and explicit.upper() != src_full:
+            tgt_full = explicit.upper()
+        if not tgt_full and explicit:
+            tgt_full = explicit.upper()
+
+        if not tgt_full and synonym_meta:
+            terminal_source = resolve_synonym_terminal_source(
+                schema_u, name_u, synonym_meta, full_object_mapping
+            )
+            if not terminal_source and schema_u != "PUBLIC":
+                terminal_source = resolve_synonym_terminal_source(
+                    "PUBLIC", name_u, synonym_meta, full_object_mapping
+                )
+            if terminal_source:
+                terminal_u = terminal_source.upper()
+                terminal_explicit = remap_rules_u.get(terminal_u)
+                tgt_full = get_mapped_target(full_object_mapping, terminal_u, "SEQUENCE")
+                if (
+                    tgt_full
+                    and terminal_explicit
+                    and tgt_full.upper() == terminal_u
+                    and terminal_explicit.upper() != terminal_u
+                ):
+                    tgt_full = terminal_explicit.upper()
+                if not tgt_full and terminal_explicit:
+                    tgt_full = terminal_explicit.upper()
+
+        return (tgt_full or src_full).upper()
+
     masker = SqlMasker(ddl)
     working_sql = masker.masked_sql
 
@@ -41157,6 +42385,20 @@ def remap_trigger_object_references(
         obj = _strip_quotes(match.group("object"))
         if schema in ("NEW", "OLD"):
             return match.group(0)
+        # SEQ.NEXTVAL / SCHEMA.SEQ.NEXTVAL 属于序列语法，不能按普通 A.B
+        # 对象引用重写，否则会把 NEXTVAL/CURRVAL 当对象名处理。
+        if obj in TRIGGER_SEQUENCE_SUFFIXES:
+            return match.group(0)
+        next_pos = match.end()
+        while next_pos < len(text) and text[next_pos].isspace():
+            next_pos += 1
+        if next_pos < len(text) and text[next_pos] == ".":
+            suffix_pos = next_pos + 1
+            while suffix_pos < len(text) and text[suffix_pos].isspace():
+                suffix_pos += 1
+            suffix_match = re.match(r'"?(NEXTVAL|CURRVAL)"?\b', text[suffix_pos:], re.IGNORECASE)
+            if suffix_match:
+                return match.group(0)
         resolved = _resolve_object_target(
             schema,
             obj,
@@ -41220,6 +42462,19 @@ def remap_trigger_object_references(
         working_sql = pattern.sub(_replace_dml, working_sql)
 
     # 补全序列 NEXTVAL/CURRVAL
+    def _replace_qualified_seq(match: re.Match) -> str:
+        schema_clean = _strip_quotes(match.group("schema"))
+        name_clean = _strip_quotes(match.group("name"))
+        suffix = match.group("suffix")
+        if not schema_clean or not name_clean:
+            return match.group(0)
+        if schema_clean in {"NEW", "OLD"} or name_clean in {"NEW", "OLD", "DUAL"}:
+            return match.group(0)
+        tgt_full = _resolve_sequence_target(schema_clean, name_clean)
+        return f"{ensure_quoted_qualified(tgt_full)}.{suffix}"
+
+    working_sql = TRIGGER_SEQ_QUALIFIED_PATTERN.sub(_replace_qualified_seq, working_sql)
+
     def _replace_seq(match: re.Match) -> str:
         name_raw = match.group("name")
         suffix = match.group("suffix")
@@ -41241,38 +42496,7 @@ def remap_trigger_object_references(
         if pos >= 0 and text[pos] == ".":
             return match.group(0)
 
-        src_full = f"{src_schema_u}.{name_clean}"
-        explicit = remap_rules_u.get(src_full)
-        tgt_full = get_mapped_target(full_object_mapping, src_full, "SEQUENCE")
-        if tgt_full and explicit and tgt_full.upper() == src_full and explicit.upper() != src_full:
-            tgt_full = explicit.upper()
-        if not tgt_full and explicit:
-            tgt_full = explicit.upper()
-
-        if not tgt_full and synonym_meta:
-            terminal_source = resolve_synonym_terminal_source(
-                src_schema_u, name_clean, synonym_meta, full_object_mapping
-            )
-            if not terminal_source:
-                terminal_source = resolve_synonym_terminal_source(
-                    "PUBLIC", name_clean, synonym_meta, full_object_mapping
-                )
-            if terminal_source:
-                terminal_u = terminal_source.upper()
-                tgt_full = get_mapped_target(full_object_mapping, terminal_u, "SEQUENCE")
-                if (
-                    tgt_full
-                    and remap_rules_u.get(terminal_u)
-                    and tgt_full.upper() == terminal_u
-                    and remap_rules_u[terminal_u].upper() != terminal_u
-                ):
-                    tgt_full = remap_rules_u[terminal_u].upper()
-                if not tgt_full and remap_rules_u.get(terminal_u):
-                    tgt_full = remap_rules_u[terminal_u].upper()
-
-        # 即使无 remap，也补齐源 schema，避免触发器运行时绑定到错误对象。
-        if not tgt_full:
-            tgt_full = src_full
+        tgt_full = _resolve_sequence_target(src_schema_u, name_clean)
         return f"{ensure_quoted_qualified(tgt_full)}.{suffix}"
 
     working_sql = TRIGGER_SEQ_UNQUALIFIED_PATTERN.sub(_replace_seq, working_sql)
@@ -49043,6 +50267,59 @@ def generate_fixup_scripts(
         other_jobs.append(_job)
     run_tasks(other_jobs, "OTHER_OBJECTS")
 
+    synonym_definition_generated = 0
+    synonym_definition_task_total = 0
+    synonym_definition_skip_counts: Dict[str, int] = defaultdict(int)
+    synonym_definition_rows = list(tv_results.get("synonym_definition_mismatched", []) or [])
+    if synonym_definition_rows:
+        log.info(
+            "[FIXUP] SYNONYM 定义级漂移 %d 条；仅 RUNNABLE 且 synonym_definition_fixup=true 的项会生成替换脚本。",
+            len(synonym_definition_rows),
+        )
+    for row in synonym_definition_rows:
+        if (row.fixup_status or "").upper() != "RUNNABLE" or not row.fixup_sql:
+            synonym_definition_skip_counts[(row.fixup_status or "manual_only").lower()] += 1
+            continue
+        src_schema = ""
+        tgt_schema = ""
+        parsed_src = parse_full_object_name(row.source_synonym)
+        parsed_tgt = parse_full_object_name(row.target_synonym)
+        if parsed_src:
+            src_schema = parsed_src[0]
+        if parsed_tgt:
+            tgt_schema = parsed_tgt[0]
+        if not allow_fixup("SYNONYM", tgt_schema, src_schema):
+            skip_reason = classify_fixup_skip("SYNONYM", tgt_schema, src_schema) or "filtered"
+            synonym_definition_skip_counts[skip_reason] += 1
+            continue
+        synonym_definition_task_total += 1
+        filename = build_synonym_definition_fixup_filename(row.target_synonym)
+        write_fixup_file(
+            base_dir,
+            "synonym",
+            filename,
+            row.fixup_sql,
+            f"修补 SYNONYM 定义漂移 {row.target_synonym} (源: {row.source_synonym})",
+            extra_comments=[
+                "definition_drift: true",
+                f"reason_code: {row.reason_code}",
+                f"source_target: {row.source_target}",
+                f"target_target: {row.target_target}",
+                f"action: {row.action}",
+                f"detail: {row.detail}",
+            ],
+        )
+        synonym_definition_generated += 1
+    if synonym_definition_generated:
+        log.info("[FIXUP] 已生成 SYNONYM 定义替换脚本 %d 份。", synonym_definition_generated)
+    if fixup_skip_summary is not None and synonym_definition_rows:
+        fixup_skip_summary["SYNONYM_DEFINITION"] = {
+            "missing_total": int(len(synonym_definition_rows)),
+            "task_total": int(synonym_definition_task_total),
+            "generated": int(synonym_definition_generated),
+            "skipped": dict(synonym_definition_skip_counts),
+        }
+
     if non_view_missing_unsupported:
         other_unsup_progress = build_progress_tracker(
             len(non_view_missing_unsupported), "[FIXUP] (4c/9) 不支持对象"
@@ -50963,6 +52240,10 @@ def _infer_report_index_meta(path: Path) -> Tuple[str, str]:
         return "DETAIL", "仅打印未校验对象明细"
     if name.startswith("mismatched_tables_detail_"):
         return "DETAIL", "表列不匹配明细"
+    if name.startswith("synonym_definition_mismatch_detail_"):
+        return "DETAIL", "SYNONYM 定义级差异明细"
+    if name.startswith("partition_definition_mismatch_detail_"):
+        return "DETAIL", "TABLE 分区定义级差异明细"
     if name.startswith("column_nullability_detail_"):
         return "DETAIL", "列空值语义差异明细"
     if name.startswith("column_visibility_skipped_detail_"):
@@ -51037,6 +52318,8 @@ def build_operator_handling_order(
     trigger_view_reference_count: int = 0,
     trigger_literal_alert_count: int = 0,
     extra_public_grant_count: int = 0,
+    synonym_definition_manual_count: int = 0,
+    partition_definition_manual_count: int = 0,
 ) -> List[str]:
     report_parent = Path(report_file).parent if report_file else None
     report_ts_text = (report_ts or "").strip()
@@ -51096,6 +52379,16 @@ def build_operator_handling_order(
                 steps,
                 f"若存在 PUBLIC 扩权，先审 target_extra_grants_detail_*.txt，再决定是否执行 {Path(fixup_dir_text) / 'grants_revoke'}。",
             )
+    if synonym_definition_manual_count and report_ts_text:
+        _append_unique_guide_step(
+            steps,
+            f"若存在 SYNONYM 定义漂移，再看 synonym_definition_mismatch_detail_{report_ts_text}.txt，只有 RUNNABLE 且已开启 synonym_definition_fixup 的项才会进入 synonym/。",
+        )
+    if partition_definition_manual_count and report_ts_text:
+        _append_unique_guide_step(
+            steps,
+            f"若存在分区定义漂移，再看 partition_definition_mismatch_detail_{report_ts_text}.txt；分区改造本轮固定为人工处理，不会生成可执行 repartition SQL。",
+        )
     if actionable_cnt:
         if settings and not bool(settings.get("generate_fixup", True)):
             _append_unique_guide_step(steps, "如需生成修补脚本，请先开启 generate_fixup。")
@@ -52267,6 +53560,74 @@ def export_extra_targets_detail(
     return write_pipe_report("目标端多余对象明细", header_fields, rows, output_path)
 
 
+def export_synonym_definition_mismatch_detail(
+    rows: Sequence[SynonymDefinitionDriftRow], report_dir: Path, report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not rows or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"synonym_definition_mismatch_detail_{report_timestamp}.txt"
+    header_fields = [
+        "SRC_SYNONYM",
+        "TGT_SYNONYM",
+        "SRC_TARGET",
+        "TGT_TARGET",
+        "SRC_TERMINAL",
+        "TGT_TERMINAL",
+        "REASON_CODE",
+        "FIXUP_STATUS",
+        "ACTION",
+        "DETAIL",
+    ]
+    data_rows = [
+        [
+            row.source_synonym,
+            row.target_synonym,
+            row.source_target,
+            row.target_target,
+            row.source_terminal,
+            row.target_terminal,
+            row.reason_code,
+            row.fixup_status,
+            row.action,
+            row.detail,
+        ]
+        for row in rows
+    ]
+    return write_pipe_report("SYNONYM 定义级差异明细", header_fields, data_rows, output_path)
+
+
+def export_partition_definition_mismatch_detail(
+    rows: Sequence[PartitionDefinitionDriftRow], report_dir: Path, report_timestamp: Optional[str]
+) -> Optional[Path]:
+    if not report_dir or not rows or not report_timestamp:
+        return None
+    output_path = Path(report_dir) / f"partition_definition_mismatch_detail_{report_timestamp}.txt"
+    header_fields = [
+        "SRC_TABLE",
+        "TGT_TABLE",
+        "REASON_CODE",
+        "SRC_SIGNATURE",
+        "TGT_SIGNATURE",
+        "SRC_DETAIL",
+        "TGT_DETAIL",
+        "ACTION",
+    ]
+    data_rows = [
+        [
+            row.source_table,
+            row.target_table,
+            row.reason_code,
+            row.source_signature,
+            row.target_signature,
+            row.source_detail,
+            row.target_detail,
+            row.action,
+        ]
+        for row in rows
+    ]
+    return write_pipe_report("TABLE 分区定义级差异明细", header_fields, data_rows, output_path)
+
+
 def export_skipped_objects_detail(
     skipped_items: List[Tuple[str, str, str, str]],
     report_dir: Path,
@@ -52507,6 +53868,43 @@ def build_difference_explanation_records(
                     safety_tier="review" if action == ACTION_GENERATE_FIXUP else "",
                 )
             )
+    for row in tv_results.get("synonym_definition_mismatched", []) or []:
+        action = (
+            ACTION_GENERATE_FIXUP
+            if (row.fixup_status or "").upper() == "RUNNABLE"
+            else ACTION_MANUAL_REVIEW
+        )
+        records.append(
+            build_reason_record(
+                reason_code=str(row.reason_code or "SYNONYM_DEFINITION_DRIFT").upper(),
+                rule_id="COMPARE.SYNONYM.DEFINITION.V1",
+                object_type="SYNONYM",
+                object_identity=row.target_synonym,
+                source_evidence=f"source_target={row.source_target}",
+                target_evidence=f"target_target={row.target_target}",
+                decision=DECISION_MISMATCH,
+                action=action,
+                compatibility_decision=compat_for("SYNONYM"),
+                safety_tier="review",
+                detail=row.detail,
+            )
+        )
+    for row in tv_results.get("partition_definition_mismatched", []) or []:
+        records.append(
+            build_reason_record(
+                reason_code=str(row.reason_code or "PARTITION_DEFINITION_DRIFT").upper(),
+                rule_id="COMPARE.TABLE.PARTITION_DEFINITION.V1",
+                object_type="TABLE",
+                object_identity=row.target_table,
+                source_evidence=row.source_signature,
+                target_evidence=row.target_signature,
+                decision=DECISION_MISMATCH,
+                action=ACTION_MANUAL_REVIEW,
+                compatibility_decision=compat_for("TABLE"),
+                safety_tier="manual",
+                detail=row.action,
+            )
+        )
     for item in comment_results.get("mismatched", []) or []:
         records.append(
             build_reason_record(
@@ -55618,6 +57016,9 @@ OPERATOR_ACTION_CATEGORY_LABELS = {
     "CASE_SENSITIVE_REVIEW": "大小写敏感对象",
     "CONSTRAINT_VALIDATE_LATER": "约束后置 VALIDATE",
     "DDL_SEMANTIC_REWRITE": "DDL 语义改写",
+    "SYNONYM_DEFINITION_REVIEW": "SYNONYM 定义漂移",
+    "SYNONYM_DEFINITION": "SYNONYM 定义漂移",
+    "PARTITION_DEFINITION_MANUAL": "TABLE 分区定义漂移",
     "FIXUP_NOT_GENERATED": "Fixup 未生成/需人工补位",
     "JOB_SCHEDULE_MANUAL": "JOB/SCHEDULE 人工处理",
 }
@@ -55666,6 +57067,8 @@ def build_operator_action_rows(
     context_manual_count: int = 0,
     deferred_validate_count: int = 0,
     ddl_cleanup_semantic_rows: int = 0,
+    synonym_definition_manual_count: int = 0,
+    partition_definition_manual_count: int = 0,
     fixup_skip_summary: Optional[Dict[str, Dict[str, object]]] = None,
     generated_fixup_dirs: Optional[Sequence[str]] = None,
     job_missing_count: int = 0,
@@ -55960,6 +57363,32 @@ def build_operator_action_rows(
         related_fixup_dir="",
         why="本次 fixup 中存在改变语义的兼容改写，不应当成普通格式清洗。",
         recommended_action="查看 ddl_cleanup_detail 中的 semantic_rewrite 明细，并复核对应脚本头注释。",
+    )
+    _add(
+        priority="REVIEW",
+        stage="BEFORE_DIR_EXECUTE",
+        category="SYNONYM_DEFINITION_REVIEW",
+        count=synonym_definition_manual_count,
+        default_behavior="REPORT_ONLY",
+        primary_artifact=_derive_run_artifact_path(
+            report_dir, report_timestamp, "synonym_definition_mismatch_detail"
+        ),
+        related_fixup_dir="synonym/",
+        why="同名 SYNONYM 已存在但直接目标不同，可能把对象访问路由到错误目标；含 DBLINK/PUBLIC 边界等场景默认不自动替换。",
+        recommended_action="先核对 SYNONYM 定义漂移明细。仅在 fixup_status=RUNNABLE 且业务确认后，才执行 synonym/ 中的定义替换脚本。",
+    )
+    _add(
+        priority="BLOCKER",
+        stage="BEFORE_FIXUP",
+        category="PARTITION_DEFINITION_MANUAL",
+        count=partition_definition_manual_count,
+        default_behavior="REPORT_ONLY",
+        primary_artifact=_derive_run_artifact_path(
+            report_dir, report_timestamp, "partition_definition_mismatch_detail"
+        ),
+        related_fixup_dir="",
+        why="分区方式、分区键、interval、边界或子分区定义不一致会影响数据布局和执行计划，自动重分区存在数据移动与停机风险。",
+        recommended_action="按分区定义漂移明细制定人工改造方案；本轮不会为已有表生成可执行 repartition SQL。",
     )
     skip_total = 0
     for item in (fixup_skip_summary or {}).values():
@@ -57182,6 +58611,8 @@ def _build_report_detail_rows(
         )
 
     mismatch_rows = tv_results.get("mismatched", []) or []
+    synonym_definition_rows = tv_results.get("synonym_definition_mismatched", []) or []
+    partition_definition_rows = tv_results.get("partition_definition_mismatched", []) or []
     ok_rows = tv_results.get("ok", []) or []
     skipped_rows = tv_results.get("skipped", []) or []
 
@@ -57205,6 +58636,7 @@ def _build_report_detail_rows(
         total_count += len(case_sensitive_findings or [])
     if "mismatched" in detail_modes:
         total_count += len(mismatch_rows)
+        total_count += len(synonym_definition_rows) + len(partition_definition_rows)
         total_count += len(extra_index_mismatched) + len(extra_constraint_mismatched)
         total_count += len(extra_sequence_mismatched) + len(extra_trigger_mismatched)
         total_count += len(trigger_status_rows or []) + len(constraint_status_rows or [])
@@ -57405,6 +58837,50 @@ def _build_report_detail_rows(
                         ensure_ascii=False,
                         default=str,
                     ),
+                }
+            )
+        for row in synonym_definition_rows:
+            src_schema, src_name = parse_full_object_name(row.source_synonym) or (
+                "",
+                row.source_synonym,
+            )
+            tgt_schema, tgt_name = parse_full_object_name(row.target_synonym) or (
+                "",
+                row.target_synonym,
+            )
+            _push(
+                {
+                    "report_type": "MISMATCHED",
+                    "object_type": "SYNONYM",
+                    "source_schema": src_schema,
+                    "source_name": src_name,
+                    "target_schema": tgt_schema,
+                    "target_name": tgt_name,
+                    "status": "DEFINITION_DRIFT",
+                    "reason": "SYNONYM definition drift",
+                    "detail_json": json.dumps(row._asdict(), ensure_ascii=False, default=str),
+                }
+            )
+        for row in partition_definition_rows:
+            src_schema, src_name = parse_full_object_name(row.source_table) or (
+                "",
+                row.source_table,
+            )
+            tgt_schema, tgt_name = parse_full_object_name(row.target_table) or (
+                "",
+                row.target_table,
+            )
+            _push(
+                {
+                    "report_type": "MISMATCHED",
+                    "object_type": "TABLE",
+                    "source_schema": src_schema,
+                    "source_name": src_name,
+                    "target_schema": tgt_schema,
+                    "target_name": tgt_name,
+                    "status": "DEFINITION_DRIFT",
+                    "reason": "TABLE partition definition drift",
+                    "detail_json": json.dumps(row._asdict(), ensure_ascii=False, default=str),
                 }
             )
         for row in extra_index_mismatched:
@@ -57801,6 +59277,60 @@ def _build_report_detail_item_rows(
                     "item_value": f"{issue_type}:{expected_type}",
                 }
             )
+
+    # 2.b) 定义级差异（OB->OB SYNONYM / TABLE partition）
+    for row in tv_results.get("synonym_definition_mismatched", []) or []:
+        src_schema, src_name = _split_full(row.source_synonym)
+        tgt_schema, tgt_name = _split_full(row.target_synonym)
+        base = {
+            "report_type": "MISMATCHED",
+            "object_type": "SYNONYM",
+            "source_schema": src_schema,
+            "source_name": src_name,
+            "target_schema": tgt_schema,
+            "target_name": tgt_name,
+            "status": "DEFINITION_DRIFT",
+        }
+        _push(
+            {
+                **base,
+                "item_type": "SYNONYM_TARGET",
+                "item_key": row.reason_code,
+                "src_value": row.source_target,
+                "tgt_value": row.target_target,
+                "item_value": row.detail,
+            }
+        )
+        _push(
+            {
+                **base,
+                "item_type": "FIXUP_STATUS",
+                "item_key": row.action,
+                "item_value": row.fixup_status,
+            }
+        )
+    for row in tv_results.get("partition_definition_mismatched", []) or []:
+        src_schema, src_name = _split_full(row.source_table)
+        tgt_schema, tgt_name = _split_full(row.target_table)
+        base = {
+            "report_type": "MISMATCHED",
+            "object_type": "TABLE",
+            "source_schema": src_schema,
+            "source_name": src_name,
+            "target_schema": tgt_schema,
+            "target_name": tgt_name,
+            "status": "DEFINITION_DRIFT",
+        }
+        _push(
+            {
+                **base,
+                "item_type": "PARTITION_DEFINITION",
+                "item_key": row.reason_code,
+                "src_value": row.source_signature,
+                "tgt_value": row.target_signature,
+                "item_value": row.action,
+            }
+        )
 
     # 3) INDEX 差异
     for item in extra_results.get("index_mismatched", []) or []:
@@ -58308,6 +59838,10 @@ def _infer_report_artifact_type(rel_path: str) -> str:
         return "UNSUPPORTED_DETAIL"
     if name.startswith("extra_mismatch_detail_"):
         return "MISMATCH_DETAIL"
+    if name.startswith("synonym_definition_mismatch_detail_"):
+        return "SYNONYM_DEFINITION_MISMATCH_DETAIL"
+    if name.startswith("partition_definition_mismatch_detail_"):
+        return "PARTITION_DEFINITION_MISMATCH_DETAIL"
     if name.startswith("status_drift_detail_"):
         return "MISMATCH_DETAIL"
     if name.startswith("constraint_validate_deferred_detail_"):
@@ -58434,6 +59968,8 @@ def _infer_artifact_status(
         "COLUMN_IDENTITY_OPTION_DETAIL",
         "COLUMN_DEFAULT_ON_NULL_DETAIL",
         "COLUMN_DEFAULT_DETAIL",
+        "SYNONYM_DEFINITION_MISMATCH_DETAIL",
+        "PARTITION_DEFINITION_MISMATCH_DETAIL",
         "MANAGED_TARGET_SCOPE_DETAIL",
         "OBJECTS_AFTER_CUTOFF_DETAIL",
         "CASE_SENSITIVE_IDENTIFIER_DETAIL",
@@ -60646,6 +62182,9 @@ def save_report_to_db(
 
     missing_count = len(tv_results.get("missing", []))
     mismatched_count = len(tv_results.get("mismatched", []))
+    synonym_definition_rows = list(tv_results.get("synonym_definition_mismatched", []) or [])
+    partition_definition_rows = list(tv_results.get("partition_definition_mismatched", []) or [])
+    definition_mismatch_count = len(synonym_definition_rows) + len(partition_definition_rows)
     ok_count = len(tv_results.get("ok", []))
     skipped_count = len(tv_results.get("skipped", []))
     _missing_by_type, unsupported_by_type, fixable_missing_by_type = build_missing_breakdown_counts(
@@ -60699,7 +62238,7 @@ def save_report_to_db(
         + sequence_missing_total
     )
     actionable_missing_total = missing_count + extra_missing_total
-    actionable_mismatch_total = mismatched_count + extra_mismatch_total
+    actionable_mismatch_total = mismatched_count + definition_mismatch_count + extra_mismatch_total
 
     if actionable_missing_total == 0 and actionable_mismatch_total == 0 and unsupported_count == 0:
         conclusion = "PASS"
@@ -60789,6 +62328,8 @@ def save_report_to_db(
             {
                 "missing": tv_results.get("missing", []),
                 "mismatched": tv_results.get("mismatched", []),
+                "synonym_definition_mismatched": synonym_definition_rows,
+                "partition_definition_mismatched": partition_definition_rows,
                 "ok_count": ok_count,
                 "skipped_count": skipped_count,
             },
@@ -60834,7 +62375,7 @@ INSERT INTO {schema_prefix}{REPORT_DB_TABLES["summary"]} (
     {missing_count},
     {missing_fixable_count},
     {excluded_count},
-    {mismatched_count},
+    {mismatched_count + definition_mismatch_count},
     {ok_count},
     {skipped_count},
     {unsupported_count},
@@ -61527,6 +63068,11 @@ def build_run_summary(
 
     missing_count = len(tv_results.get("missing", []))
     mismatched_count = len(tv_results.get("mismatched", []))
+    synonym_definition_rows = list(tv_results.get("synonym_definition_mismatched", []) or [])
+    partition_definition_rows = list(tv_results.get("partition_definition_mismatched", []) or [])
+    synonym_definition_mismatch_cnt = len(synonym_definition_rows)
+    partition_definition_mismatch_cnt = len(partition_definition_rows)
+    definition_mismatch_count = synonym_definition_mismatch_cnt + partition_definition_mismatch_cnt
     extra_target_cnt = len(tv_results.get("extra_targets", []))
     skipped_count = len(tv_results.get("skipped", []))
     remap_conflict_cnt = len(remap_conflicts)
@@ -61606,8 +63152,21 @@ def build_run_summary(
         if (row.fixup_behavior or "").upper() == "REWRITE_TO_NORMAL_TABLE"
     )
     findings: List[str] = [
-        f"主对象: 缺失 {missing_count}, 不匹配 {mismatched_count}, 多余 {extra_target_cnt}, 仅打印 {skipped_count}"
+        "主对象: 缺失 {missing}, 列不匹配 {mismatch}, 定义漂移 {definition}, 多余 {extra}, 仅打印 {skipped}".format(
+            missing=missing_count,
+            mismatch=mismatched_count,
+            definition=definition_mismatch_count,
+            extra=extra_target_cnt,
+            skipped=skipped_count,
+        )
     ]
+    if definition_mismatch_count:
+        findings.append(
+            "定义级差异: SYNONYM {syn}, TABLE partition {part}".format(
+                syn=synonym_definition_mismatch_cnt,
+                part=partition_definition_mismatch_cnt,
+            )
+        )
     if excluded_by_type:
         items = ", ".join(f"{k}={v}" for k, v in sorted(excluded_by_type.items()))
         findings.append(f"显式排除对象(EXCLUDED): {items}")
@@ -61716,7 +63275,7 @@ def build_run_summary(
                 f"目标端额外对象授权: {extra_object_grant_count} 条 (PUBLIC={extra_public_grant_count})"
             )
     if fixup_skip_summary:
-        for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM", "CONTEXT"):
+        for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM", "SYNONYM_DEFINITION", "CONTEXT"):
             obj_summary = fixup_skip_summary.get(obj_type) or {}
             if not obj_summary:
                 continue
@@ -61770,8 +63329,14 @@ def build_run_summary(
         )
 
     attention: List[str] = []
-    if missing_count or mismatched_count or extra_target_cnt:
+    if missing_count or mismatched_count or definition_mismatch_count or extra_target_cnt:
         attention.append("目标端结构与源端不一致，需要处理缺失/差异/多余对象。")
+    if synonym_definition_mismatch_cnt:
+        attention.append("存在 SYNONYM 定义漂移，需核对直接目标、DBLINK 与 PUBLIC/private 边界。")
+    if partition_definition_mismatch_cnt:
+        attention.append(
+            "存在 TABLE 分区定义漂移；本轮分区改造固定为人工处理，不输出可执行重分区 SQL。"
+        )
     if remap_conflict_cnt:
         attention.append("存在无法自动推导的对象，需要在 remap_rules.txt 显式配置。")
     if extraneous_count:
@@ -61863,6 +63428,7 @@ def build_run_summary(
         actionable_cnt=(
             missing_count
             + mismatched_count
+            + definition_mismatch_count
             + idx_mis_cnt
             + cons_mis_cnt
             + seq_mis_cnt
@@ -61876,6 +63442,10 @@ def build_run_summary(
         trigger_view_reference_count=trigger_view_reference_count,
         trigger_literal_alert_count=trigger_literal_alert_count,
         extra_public_grant_count=extra_public_grant_count,
+        synonym_definition_manual_count=sum(
+            1 for row in synonym_definition_rows if (row.fixup_status or "").upper() != "RUNNABLE"
+        ),
+        partition_definition_manual_count=partition_definition_mismatch_cnt,
     )
     if remap_conflict_cnt:
         _append_unique_guide_step(next_steps, "如仍存在无法推导对象，请补充 remap_rules.txt。")
@@ -61897,6 +63467,16 @@ def build_run_summary(
         _append_unique_guide_step(next_steps, "若依赖差异存在，请按依赖报告补齐编译或授权。")
     if comment_mis_cnt:
         _append_unique_guide_step(next_steps, "如业务要求注释一致，再确认 comment mismatch 明细。")
+    if synonym_definition_mismatch_cnt:
+        _append_unique_guide_step(
+            next_steps,
+            "如存在 SYNONYM 定义漂移，请先看 synonym_definition_mismatch_detail_*.txt；RUNNABLE 之外的项需人工处理。",
+        )
+    if partition_definition_mismatch_cnt:
+        _append_unique_guide_step(
+            next_steps,
+            "如存在分区定义漂移，请先看 partition_definition_mismatch_detail_*.txt；本轮不会自动重分区。",
+        )
     if (
         context_missing_cnt
         or context_mismatch_cnt
@@ -61929,7 +63509,15 @@ def build_run_summary(
             )
     if fixup_skip_summary and any(
         fixup_skip_summary.get(obj_type)
-        for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM", "CONTEXT", "SEQUENCE_RESTART")
+        for obj_type in (
+            "TABLE",
+            "INDEX",
+            "TRIGGER",
+            "SYNONYM",
+            "SYNONYM_DEFINITION",
+            "CONTEXT",
+            "SEQUENCE_RESTART",
+        )
     ):
         if report_file:
             report_parent = Path(report_file).parent
@@ -62214,6 +63802,14 @@ def print_final_report(
     ok_count = len(tv_results["ok"])
     missing_count = len(tv_results["missing"])
     mismatched_count = len(tv_results["mismatched"])
+    synonym_definition_rows = list(tv_results.get("synonym_definition_mismatched", []) or [])
+    partition_definition_rows = list(tv_results.get("partition_definition_mismatched", []) or [])
+    synonym_definition_mismatch_cnt = len(synonym_definition_rows)
+    partition_definition_mismatch_cnt = len(partition_definition_rows)
+    definition_mismatch_count = synonym_definition_mismatch_cnt + partition_definition_mismatch_cnt
+    synonym_definition_manual_count = sum(
+        1 for row in synonym_definition_rows if (row.fixup_status or "").upper() != "RUNNABLE"
+    )
     column_nullability_issue_cnt = sum(
         1
         for obj_type, _tgt_name, _missing, _extra, _length_mismatches, type_mismatches in (
@@ -62514,6 +64110,8 @@ def print_final_report(
         + context_extra_target_cnt,
         deferred_validate_count=deferred_validate_count,
         ddl_cleanup_semantic_rows=int(ddl_cleanup_summary.get("semantic_rewrite_rows", 0) or 0),
+        synonym_definition_manual_count=synonym_definition_manual_count,
+        partition_definition_manual_count=partition_definition_mismatch_cnt,
         fixup_skip_summary=fixup_skip_summary,
         generated_fixup_dirs=generated_fixup_dirs,
         job_missing_count=int(extra_missing_counts.get("JOB", 0) or 0),
@@ -62593,12 +64191,21 @@ def print_final_report(
     def build_execution_conclusion() -> Panel:
         ext_mismatch_cnt = idx_missing_cnt + cons_missing_cnt + seq_missing_cnt + trg_missing_cnt
         actionable_cnt = (
-            missing_count + mismatched_count + ext_mismatch_cnt + table_presence_risk_cnt
+            missing_count
+            + mismatched_count
+            + definition_mismatch_count
+            + ext_mismatch_cnt
+            + table_presence_risk_cnt
         )
         status = "通过" if actionable_cnt == 0 and blocked_total == 0 else "需处理"
         lines: List[str] = [
             f"状态: {status} | 总校验对象: {total_checked}",
-            f"主对象: 缺失 {missing_count}, 不匹配 {mismatched_count}, 多余 {extra_target_cnt}",
+            "主对象: 缺失 {missing}, 列不匹配 {mismatch}, 定义漂移 {definition}, 多余 {extra}".format(
+                missing=missing_count,
+                mismatch=mismatched_count,
+                definition=definition_mismatch_count,
+                extra=extra_target_cnt,
+            ),
             (
                 "扩展对象差异(缺失对象): "
                 f"索引 {idx_missing_cnt}, 约束 {cons_missing_cnt}, "
@@ -62641,6 +64248,13 @@ def print_final_report(
             lines.append(
                 f"触发器对象路径字符串提醒: {trigger_literal_alert_count} (SCHEMA.OBJECT.COLUMN 未自动改写)"
             )
+        if definition_mismatch_count:
+            lines.append(
+                "定义级差异: SYNONYM {syn}, TABLE partition {part}".format(
+                    syn=synonym_definition_mismatch_cnt,
+                    part=partition_definition_mismatch_cnt,
+                )
+            )
         if blocked_total:
             lines.append(f"不支持/阻断/待确认: {blocked_total}")
         next_steps = build_operator_handling_order(
@@ -62665,6 +64279,8 @@ def print_final_report(
             trigger_view_reference_count=trigger_view_reference_count,
             trigger_literal_alert_count=trigger_literal_alert_count,
             extra_public_grant_count=extra_public_grant_count,
+            synonym_definition_manual_count=synonym_definition_manual_count,
+            partition_definition_manual_count=partition_definition_mismatch_cnt,
         )
         if next_steps:
             lines.append("本次建议处理顺序: " + "；".join(next_steps))
@@ -62729,6 +64345,9 @@ def print_final_report(
         primary_text.append(f"{unsupported_total}\n", style="mismatch")
     primary_text.append("不匹配 (表列/长度): ", style="mismatch")
     primary_text.append(f"{mismatched_count}\n")
+    if definition_mismatch_count:
+        primary_text.append("定义级差异: ", style="mismatch")
+        primary_text.append(f"{definition_mismatch_count}\n", style="mismatch")
     primary_text.append("多余: ", style="mismatch")
     primary_text.append(f"{extra_target_cnt}\n")
     if skipped_count:
@@ -62741,6 +64360,22 @@ def print_final_report(
         primary_text.append("无法推导: ", style="mismatch")
         primary_text.append(f"{remap_conflict_cnt}")
     summary_table.add_row("[bold]主对象 (TABLE/VIEW/etc.)[/bold]", primary_text)
+
+    if definition_mismatch_count:
+        definition_text = Text()
+        definition_text.append("SYNONYM 直接目标漂移: ", style="mismatch")
+        definition_text.append(str(synonym_definition_mismatch_cnt), style="mismatch")
+        definition_text.append("\nTABLE 分区定义漂移: ", style="mismatch")
+        definition_text.append(str(partition_definition_mismatch_cnt), style="mismatch")
+        if emit_detail_files and report_ts:
+            definition_text.append("\n详见: ", style="info")
+            refs: List[str] = []
+            if synonym_definition_mismatch_cnt:
+                refs.append(f"synonym_definition_mismatch_detail_{report_ts}.txt")
+            if partition_definition_mismatch_cnt:
+                refs.append(f"partition_definition_mismatch_detail_{report_ts}.txt")
+            definition_text.append(" / ".join(refs), style="info")
+        summary_table.add_row("[bold]定义级差异[/bold]", definition_text)
 
     if settings is not None:
         gate_text = Text()
@@ -63146,6 +64781,14 @@ def print_final_report(
                     detail_hint_lines.append(
                         f"列默认值差异明细: column_default_detail_{report_ts}.txt"
                     )
+                if synonym_definition_mismatch_cnt:
+                    detail_hint_lines.append(
+                        f"SYNONYM 定义级差异明细: synonym_definition_mismatch_detail_{report_ts}.txt"
+                    )
+                if partition_definition_mismatch_cnt:
+                    detail_hint_lines.append(
+                        f"TABLE 分区定义级差异明细: partition_definition_mismatch_detail_{report_ts}.txt"
+                    )
             if column_order_mismatch_cnt and report_ts:
                 detail_hint_lines.append(
                     f"列顺序差异明细: column_order_mismatch_detail_{report_ts}.txt"
@@ -63271,13 +64914,20 @@ def print_final_report(
 
     if fixup_skip_summary and any(
         fixup_skip_summary.get(obj_type)
-        for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM", "SEQUENCE_RESTART")
+        for obj_type in (
+            "TABLE",
+            "INDEX",
+            "TRIGGER",
+            "SYNONYM",
+            "SYNONYM_DEFINITION",
+            "SEQUENCE_RESTART",
+        )
     ):
         skip_table = Table(title="[header]0.e Fixup 跳过汇总[/header]", width=section_width)
         skip_table.add_column("对象类型", style="info", width=12)
         skip_table.add_column("指标", style="info", width=28)
         skip_table.add_column("数量", justify="right")
-        for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM", "CONTEXT"):
+        for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM", "SYNONYM_DEFINITION", "CONTEXT"):
             obj_summary = fixup_skip_summary.get(obj_type) or {}
             if not obj_summary:
                 continue
@@ -63300,6 +64950,9 @@ def print_final_report(
     def summarize_actions() -> Panel:
         modify_counts = OrderedDict()
         modify_counts["TABLE (列差异修补)"] = len(tv_results.get("mismatched", []))
+        modify_counts["SYNONYM (定义替换)"] = sum(
+            1 for row in synonym_definition_rows if (row.fixup_status or "").upper() == "RUNNABLE"
+        )
 
         addition_counts: Dict[str, int] = defaultdict(int)
         for obj_type, _, _ in tv_results.get("missing", []):
@@ -63339,7 +64992,7 @@ def print_final_report(
 
         fixup_plan_lines = ["[bold]本轮 fixup 计划[/bold]"]
         plan_entries = []
-        for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM", "CONTEXT"):
+        for obj_type in ("TABLE", "INDEX", "TRIGGER", "SYNONYM", "SYNONYM_DEFINITION", "CONTEXT"):
             obj_summary = (fixup_skip_summary or {}).get(obj_type) or {}
             if not obj_summary:
                 continue
@@ -63628,6 +65281,38 @@ def print_final_report(
                                 f"    - {col}: 源={src_len} BYTE, 目标={tgt_len}, 上限允许={limit_len}\n"
                             )
             table.add_row(tgt_name, details)
+        console.print(table)
+
+    if show_detail_sections and synonym_definition_rows:
+        table = Table(
+            title=f"[header]2.a SYNONYM 定义级差异 (共 {synonym_definition_mismatch_cnt} 个)",
+            width=section_width,
+        )
+        table.add_column("同义词", style="info", width=OBJECT_COL_WIDTH)
+        table.add_column("定义差异", width=DETAIL_COL_WIDTH)
+        for row in synonym_definition_rows:
+            details = Text()
+            details.append(f"源目标: {row.source_target}\n", style="missing")
+            details.append(f"目标端: {row.target_target}\n", style="mismatch")
+            details.append(f"原因: {row.reason_code}\n", style="info")
+            details.append(f"fixup: {row.fixup_status} / {row.action}", style="info")
+            table.add_row(format_missing_mapping(row.source_synonym, row.target_synonym), details)
+        console.print(table)
+
+    if show_detail_sections and partition_definition_rows:
+        table = Table(
+            title=f"[header]2.c TABLE 分区定义级差异 (共 {partition_definition_mismatch_cnt} 个)",
+            width=section_width,
+        )
+        table.add_column("表名", style="info", width=OBJECT_COL_WIDTH)
+        table.add_column("分区差异", width=DETAIL_COL_WIDTH)
+        for row in partition_definition_rows:
+            details = Text()
+            details.append(f"原因: {row.reason_code}\n", style="mismatch")
+            details.append(f"源: {row.source_detail}\n", style="missing")
+            details.append(f"目标: {row.target_detail}\n", style="mismatch")
+            details.append(row.action, style="info")
+            table.add_row(format_missing_mapping(row.source_table, row.target_table), details)
         console.print(table)
 
     if show_detail_sections and column_order_mismatches:
@@ -64460,6 +66145,8 @@ def print_final_report(
         usability_detail_path = None
         table_presence_detail_path = None
         extra_mismatch_path = None
+        synonym_definition_mismatch_path = None
+        partition_definition_mismatch_path = None
         dependency_detail_path = None
         noise_suppressed_path = None
         explanation_jsonl_path = None
@@ -64508,6 +66195,12 @@ def print_final_report(
             )
             extra_mismatch_path = export_extra_mismatch_detail(
                 extra_results, report_path.parent, report_ts
+            )
+            synonym_definition_mismatch_path = export_synonym_definition_mismatch_detail(
+                synonym_definition_rows, report_path.parent, report_ts
+            )
+            partition_definition_mismatch_path = export_partition_definition_mismatch_detail(
+                partition_definition_rows, report_path.parent, report_ts
             )
             dependency_detail_path = export_dependency_detail(
                 dependency_report, report_path.parent, report_ts
@@ -64622,6 +66315,18 @@ def print_final_report(
             + len(extra_results.get("trigger_mismatched", []) or [])
         )
         _add_index_entry("DETAIL", extra_mismatch_path, extra_mismatch_count, "扩展对象差异明细")
+        _add_index_entry(
+            "DETAIL",
+            synonym_definition_mismatch_path,
+            synonym_definition_mismatch_cnt,
+            "SYNONYM 定义级差异明细",
+        )
+        _add_index_entry(
+            "DETAIL",
+            partition_definition_mismatch_path,
+            partition_definition_mismatch_cnt,
+            "TABLE 分区定义级差异明细",
+        )
         dep_detail_count = dep_missing_cnt + dep_unexpected_cnt + dep_skipped_cnt
         _add_index_entry("DETAIL", dependency_detail_path, dep_detail_count, "依赖关系差异明细")
         _add_index_entry(
@@ -64763,6 +66468,13 @@ def print_final_report(
                 log.info("表数据存在性风险明细已输出到: %s", table_presence_detail_path)
             if extra_mismatch_path:
                 log.info("扩展对象差异明细已输出到: %s", extra_mismatch_path)
+            if synonym_definition_mismatch_path:
+                log.info("SYNONYM 定义级差异明细已输出到: %s", synonym_definition_mismatch_path)
+            if partition_definition_mismatch_path:
+                log.info(
+                    "TABLE 分区定义级差异明细已输出到: %s",
+                    partition_definition_mismatch_path,
+                )
             if noise_suppressed_path:
                 log.info("降噪明细已输出到: %s", noise_suppressed_path)
             if dependency_detail_path:
@@ -66290,6 +68002,17 @@ def main():
             enabled_primary_types,
             enabled_extra_types,
         )
+        include_synonym_definition_metadata = (
+            bool(
+                settings.get("synonym_definition_compare_enabled")
+                or settings.get("synonym_definition_fixup_enabled")
+            )
+            and "SYNONYM" in checked_primary_types
+        )
+        include_partition_definition_metadata = (
+            bool(settings.get("partition_definition_compare_enabled"))
+            and "TABLE" in enabled_primary_types
+        )
         if load_constraint_metadata and "CONSTRAINT" not in enabled_extra_types:
             log.info(
                 "[CHECK] TABLE 主校验需要 NOT NULL 约束语义，已额外加载 Oracle/OB 约束元数据（不等同于启用约束扩展校验）。"
@@ -66309,9 +68032,13 @@ def main():
             include_sequences="SEQUENCE" in enabled_extra_types,
             include_comments=enable_comment_check,
             include_roles=enable_grant_generation,
-            target_table_pairs=target_table_pairs if enable_comment_check else set(),
+            target_table_pairs=target_table_pairs
+            if (enable_comment_check or include_partition_definition_metadata)
+            else set(),
             include_contexts=context_pipeline_enabled,
             enable_dba_synonym_fallback=source_db_mode == SOURCE_DB_MODE_OCEANBASE,
+            include_synonym_definitions=include_synonym_definition_metadata,
+            include_partition_definitions=include_partition_definition_metadata,
         )
         if ob_meta.case_sensitive_findings:
             merged_case_sensitive: Dict[
@@ -66995,6 +68722,7 @@ def main():
                 if blacklist_rehydration_state
                 else None
             ),
+            full_object_mapping=full_object_mapping,
         )
         supplement_missing_views_from_mapping(
             tv_results, full_object_mapping, ob_meta, enabled_primary_types
