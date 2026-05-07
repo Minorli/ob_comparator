@@ -37,6 +37,8 @@ For database semantics, run real Oracle and OceanBase verification. If a release
 
 Prefer a complete toolkit zip over partial file replacement.
 
+For GitHub-hosted packaging, run the `Release Package` workflow from the Actions tab. Keep `publish_release=false` for a dry run, inspect the uploaded artifacts, then rerun with `publish_release=true` only after release evidence is complete.
+
 At minimum, a customer hotfix package must keep these files together:
 
 - `schema_diff_reconciler.py`

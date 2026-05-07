@@ -1,0 +1,60 @@
+name: Feature request
+description: Propose a capability, workflow, or compatibility improvement.
+title: "[feature] "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What migration, comparison, report, or fixup problem should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: desired
+    attributes:
+      label: Desired behavior
+      description: Describe the expected behavior and user workflow.
+    validations:
+      required: true
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: New config switch
+        - label: New report or report_db behavior
+        - label: Fixup generation or execution behavior
+        - label: Object compatibility rule
+        - label: Documentation or release workflow only
+  - type: textarea
+    id: affected
+    attributes:
+      label: Affected object types and examples
+      description: List object families, source/target DB modes, and sanitized examples.
+  - type: dropdown
+    id: openspec
+    attributes:
+      label: OpenSpec likely required?
+      options:
+        - "yes"
+        - "no"
+        - unknown
+    validations:
+      required: true
+  - type: checkboxes
+    id: validation
+    attributes:
+      label: Expected validation
+      options:
+        - label: Unit/local tests only
+        - label: Real Oracle to OceanBase verification
+        - label: Real OceanBase to OceanBase verification
+        - label: Report summary/detail/report_db count consistency
+        - label: Release/package verification
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks and boundaries
+      description: What must remain unchanged or manual-only?

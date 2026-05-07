@@ -1,5 +1,8 @@
 blank_issues_enabled: true
 contact_links:
+  - name: Security report
+    url: https://github.com/Minorli/ob_comparator/security/advisories/new
+    about: Report vulnerabilities, exposed credentials, or unsafe SQL execution privately.
   - name: Latest release
     url: https://github.com/Minorli/ob_comparator/releases/latest
     about: Download the current toolkit package and review release verification notes.

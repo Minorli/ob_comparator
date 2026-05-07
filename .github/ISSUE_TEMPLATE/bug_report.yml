@@ -1,0 +1,102 @@
+name: Bug report
+description: Report a defect, regression, or unsafe generated output.
+title: "[bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste credentials, full `config.ini`, Oracle wallet files, customer data, or production SQL with sensitive values.
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - Production blocker
+        - Data correctness risk
+        - Fixup execution risk
+        - Report/noise issue
+        - Documentation or packaging issue
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Tool version or commit
+      placeholder: v0.9.9.6-hotfix5 / commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: source_mode
+    attributes:
+      label: Source database mode
+      options:
+        - oracle
+        - oceanbase
+        - unknown
+    validations:
+      required: true
+  - type: dropdown
+    id: target_mode
+    attributes:
+      label: Target database mode
+      options:
+        - oceanbase
+        - unknown
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction details
+      description: Include sanitized command lines, object names, config switches, and report/fixup paths.
+      placeholder: |
+        Compare command:
+        Fixup command:
+        Objects:
+        Config switches:
+        Report path:
+        Detail file:
+        Fixup file:
+        Error code:
+    validations:
+      required: true
+  - type: checkboxes
+    id: area
+    attributes:
+      label: Related area
+      options:
+        - label: SYNONYM
+        - label: CONSTRAINT
+        - label: VIEW
+        - label: TRIGGER
+        - label: GRANT
+        - label: report / report_db
+        - label: fixup execution
+        - label: release package / docs
+        - label: not sure
+  - type: dropdown
+    id: regression
+    attributes:
+      label: Regression?
+      options:
+        - "yes"
+        - "no"
+        - unknown
+    validations:
+      required: true

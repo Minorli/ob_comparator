@@ -28,6 +28,32 @@ jobs:
       - name: Compile tracked Python files
         run: python -m py_compile $(git ls-files '*.py')
 
+      - name: Check Python 3.7 parse compatibility
+        shell: bash
+        run: |
+          python - <<'PY'
+          import ast
+          import subprocess
+          import sys
+
+          files = subprocess.check_output(
+              ["git", "ls-files", "*.py"],
+              text=True,
+          ).splitlines()
+          failed = []
+          for path in files:
+              with open(path, "r", encoding="utf-8") as handle:
+                  source = handle.read()
+              try:
+                  ast.parse(source, filename=path, feature_version=(3, 7))
+              except SyntaxError as exc:
+                  failed.append(f"{path}:{exc.lineno}:{exc.offset}: {exc.msg}")
+          if failed:
+              print("Python 3.7-incompatible syntax detected:")
+              print("\n".join(failed))
+              sys.exit(1)
+          PY
+
       - name: Check whitespace in changed files
         shell: bash
         run: |
@@ -36,3 +62,53 @@ jobs:
           else
             git diff --check HEAD~1..HEAD
           fi
+
+  package-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Check tracked artifact hygiene
+        shell: bash
+        run: |
+          python - <<'PY'
+          import subprocess
+          import sys
+
+          forbidden = (
+              "config.ini",
+              ".env",
+              ".secrets.baseline",
+          )
+          forbidden_prefixes = (
+              "main_reports/",
+              "fixup_scripts/",
+              "dbcat_output/",
+              "logs/",
+              ".venv/",
+              "__pycache__/",
+          )
+          tracked = subprocess.check_output(["git", "ls-files"], text=True).splitlines()
+          bad = [
+              path for path in tracked
+              if path in forbidden or path.startswith(forbidden_prefixes)
+          ]
+          if bad:
+              print("Forbidden tracked local/runtime files:")
+              print("\n".join(bad))
+              sys.exit(1)
+          PY
+
+      - name: Build release package smoke
+        run: python tools/build_release_package.py --version 0.0.0-ci --output-dir dist
+
+      - name: Validate package archive
+        run: unzip -t dist/ob_comparator-0.0.0-ci-toolkit.zip
