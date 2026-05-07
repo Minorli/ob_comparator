@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Latest release
+    url: https://github.com/Minorli/ob_comparator/releases/latest
+    about: Download the current toolkit package and review release verification notes.
+  - name: Documentation index
+    url: https://github.com/Minorli/ob_comparator/blob/main/docs/README.md
+    about: Start here for architecture, deployment, release, and advanced usage documents.
