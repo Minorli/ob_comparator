@@ -1,8 +1,8 @@
 # Oracle → OceanBase 结构一致性校验与修复引擎
 ## 技术规格说明 (Technical Specification)
 
-**版本**：0.9.9.6-hotfix1
-**日期**：2026-04-29
+**版本**：0.9.9.6-hotfix5
+**日期**：2026-05-07
 **适用场景**：Oracle → OceanBase 与 OceanBase → OceanBase（Oracle mode source）结构一致性校验、对象补全、DDL 兼容性修复。
 
 ---
@@ -147,6 +147,9 @@
 - SYNONYM 对象自身的显式 remap 只影响目标对象命名，不会豁免终点对象受管性校验；若 terminal source target 不在源端受管范围，仍会判为 `SYNONYM_TARGET_OUT_OF_SCOPE`
 - PUBLIC 同义词元数据预加载会保留 `TABLE_OWNER='PUBLIC'` 的中间节点，用于解析 `PUBLIC -> PUBLIC -> ...` 链式同义词
 - PUBLIC 同义词进入 compare/fixup 前，会额外按 terminal source scope 过滤；只有终点落在受管源范围内的 `PUBLIC` 链路会被纳入，Oracle 系统 `PUBLIC` 链路不会再批量进入校验
+- 同名 SYNONYM 的定义级比对会比较直接目标 owner/name、DBLINK 与 PUBLIC/private 边界；`synonym_definition_compare=auto` 仅在 OceanBase 源自动启用，Oracle 源需显式设置 `true`。
+- `synonym_definition_fixup=true` 只会为安全分类 `RUNNABLE` 的本地同义词目标漂移生成 `fixup_scripts/synonym/*__definition.sql`；生成路径同时遵守 `synonym_fixup_scope` 与常规 fixup schema/type filter。源目标 owner 为 `PUBLIC` 时固定转为 `MANUAL_ONLY`，避免生成 `FOR "PUBLIC"."..."`。
+- 同名 TABLE 的分区定义级比对会比较分区类型、子分区类型、分区键顺序、interval、分区数量/顺序/high value 与子分区定义；分区定义漂移只进入报告和人工处理清单，不生成自动 repartition SQL。
 - target extra grant audit 以 `managed target scope` 派生的“受管 target object 集合”为准；owner 只用于目录取数，不再把同 schema 下未受管对象的授权误判为 extra grant
 - `constraint_status_sync_mode` 默认值为 `full`；现有 `FK/CHECK` 的 `VALIDATED / NOT VALIDATED` 状态漂移会默认进入状态修复逻辑，`PK/UK` 的 `VALIDATED / NOT VALIDATED` 漂移也会进入状态漂移报告，但仍不生成 `ENABLE/[NO]VALIDATE` SQL
 - 对“缺失 TABLE 首次创建”场景，若源端 `FK/CHECK` 为 `ENABLED + NOT VALIDATED`，fixup 会额外输出 `status/constraint/*.status.sql` 的后置 `ENABLE NOVALIDATE`，避免 `CREATE TABLE` 兼容清洗后把目标端默认建成 `VALIDATED`

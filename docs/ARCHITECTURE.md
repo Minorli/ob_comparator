@@ -1,6 +1,6 @@
 # 数据库对象对比工具设计文档
 
-> 当前版本：V0.9.9.6-hotfix1（截至 2026-04-30）
+> 当前版本：V0.9.9.6-hotfix5（截至 2026-05-07）
 > 核心模式：Dump-Once, Compare-Locally + 依赖分析 + 修补脚本生成
 
 ## 1. 设计原则
@@ -26,6 +26,8 @@
 
 - 默认 `source_db_mode=oracle`，保持既有 Oracle → OceanBase 主路径。
 - `source_db_mode=oceanbase` 时，源端改走 `obclient + source adapter + capability registry`，避免误复用 Oracle-only loader / cleanup / grant 逻辑。
+- 定义级差异比对作为主对象 compare 的后置层：OB → OB 在 `auto` 下启用 SYNONYM 直接目标/DBLINK/PUBLIC 边界与 TABLE 分区定义比对；Oracle → OB 需显式开启对应开关。
+- 定义级 SYNONYM fixup 只覆盖安全分类 `RUNNABLE` 的本地目标漂移，并继续复用 `synonym_fixup_scope`、schema/type filter 和 run_fixup 安全分层；分区定义漂移保持 report-only/manual。
 
 ## 4. 元数据采集
 
