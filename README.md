@@ -1,6 +1,7 @@
 # OceanBase Comparator Toolkit
 
 [![CI](https://github.com/Minorli/ob_comparator/actions/workflows/ci.yml/badge.svg)](https://github.com/Minorli/ob_comparator/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/Minorli/ob_comparator/actions/workflows/codeql.yml/badge.svg)](https://github.com/Minorli/ob_comparator/actions/workflows/codeql.yml)
 [![Latest Release](https://img.shields.io/github/v/release/Minorli/ob_comparator)](https://github.com/Minorli/ob_comparator/releases/latest)
 [![License](https://img.shields.io/github/license/Minorli/ob_comparator)](LICENSE)
 

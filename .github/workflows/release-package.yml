@@ -1,0 +1,100 @@
+name: Release Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version without leading v, for example 0.9.9.6-hotfix5
+        required: true
+        type: string
+      commitish:
+        description: Branch, tag, or commit to package
+        required: true
+        default: main
+        type: string
+      publish_release:
+        description: Create/update the GitHub release and upload assets
+        required: true
+        default: false
+        type: boolean
+      update_existing_release:
+        description: Allow replacing assets and notes on an existing release
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Build toolkit package
+        run: python tools/build_release_package.py --version "${{ inputs.version }}" --commitish "${{ inputs.commitish }}" --output-dir dist
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ob_comparator-${{ inputs.version }}-release-assets
+          path: |
+            dist/ob_comparator-${{ inputs.version }}-toolkit.zip
+            dist/ob_comparator-${{ inputs.version }}-manifest.json
+            dist/ob_comparator-${{ inputs.version }}-SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          COMMITISH: ${{ inputs.commitish }}
+          UPDATE_EXISTING_RELEASE: ${{ inputs.update_existing_release }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          notes_file="dist/${tag}-release-notes.md"
+          {
+            echo "## ${VERSION}"
+            echo
+            echo "Automated toolkit package for ${COMMITISH}."
+            echo
+            echo "### Assets"
+            echo "- ob_comparator-${VERSION}-toolkit.zip"
+            echo "- ob_comparator-${VERSION}-SHA256SUMS.txt"
+            echo "- ob_comparator-${VERSION}-manifest.json"
+            echo
+            echo "Attach real database verification evidence separately when the release changes database semantics."
+          } > "${notes_file}"
+
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            if [ "${UPDATE_EXISTING_RELEASE}" != "true" ]; then
+              echo "Release ${tag} already exists. Re-run with update_existing_release=true to replace assets and notes." >&2
+              exit 2
+            fi
+            gh release upload "${tag}" \
+              "dist/ob_comparator-${VERSION}-toolkit.zip" \
+              "dist/ob_comparator-${VERSION}-SHA256SUMS.txt" \
+              "dist/ob_comparator-${VERSION}-manifest.json" \
+              --clobber
+            gh release edit "${tag}" --notes-file "${notes_file}"
+          else
+            gh release create "${tag}" \
+              "dist/ob_comparator-${VERSION}-toolkit.zip" \
+              "dist/ob_comparator-${VERSION}-SHA256SUMS.txt" \
+              "dist/ob_comparator-${VERSION}-manifest.json" \
+              --target "${COMMITISH}" \
+              --title "${tag}" \
+              --notes-file "${notes_file}"
+          fi
