@@ -1,5 +1,9 @@
 # OceanBase Comparator Toolkit
 
+[![CI](https://github.com/Minorli/ob_comparator/actions/workflows/ci.yml/badge.svg)](https://github.com/Minorli/ob_comparator/actions/workflows/ci.yml)
+[![Latest Release](https://img.shields.io/github/v/release/Minorli/ob_comparator)](https://github.com/Minorli/ob_comparator/releases/latest)
+[![License](https://img.shields.io/github/license/Minorli/ob_comparator)](LICENSE)
+
 > 当前版本：V0.9.9.6-hotfix5
 > 面向 Oracle → OceanBase 与 OceanBase → OceanBase 的结构一致性校验与修补脚本生成工具  
 > 核心理念：一次转储、本地对比、脚本审计优先
