@@ -1,8 +1,8 @@
 # Oracle → OceanBase 结构一致性校验与修复引擎
 ## 技术规格说明 (Technical Specification)
 
-**版本**：0.9.9.6-hotfix5
-**日期**：2026-05-07
+**版本**：0.9.9.6-hotfix6
+**日期**：2026-05-08
 **适用场景**：Oracle → OceanBase 与 OceanBase → OceanBase（Oracle mode source）结构一致性校验、对象补全、DDL 兼容性修复。
 
 ---

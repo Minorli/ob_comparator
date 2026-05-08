@@ -16,7 +16,7 @@
 
 """
 
-数据库对象对比工具 (V0.9.9.6-hotfix5 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
+数据库对象对比工具 (V0.9.9.6-hotfix6 - Dump-Once, Compare-Locally + 依赖 + ALTER 修补 + 注释校验)
 ---------------------------------------------------------------------------
 功能概要：
 1. 对比 Oracle (源) 与 OceanBase (目标) 的：
@@ -33,7 +33,7 @@
    - INDEX / CONSTRAINT：校验存在性与列组合（含唯一性/约束类型）。
    - SEQUENCE / TRIGGER：校验存在性；依赖：映射后生成期望依赖并对比目标端。
 
-3. 性能架构 (V0.9.9.6-hotfix5 核心)：
+3. 性能架构 (V0.9.9.6-hotfix6 核心)：
    - OceanBase 侧采用“一次转储，本地对比”：
        使用少量 obclient 调用，分别 dump：
          DBA_OBJECTS
@@ -152,7 +152,7 @@ except ModuleNotFoundError as exc:
         raise SystemExit(2) from exc
     raise
 
-__version__ = "0.9.9.6-hotfix5"
+__version__ = "0.9.9.6-hotfix6"
 
 __author__ = "Minor Li"
 REPO_URL = "https://github.com/Minorli/ob_comparator"
@@ -4490,6 +4490,11 @@ def normalize_public_owner(owner: Optional[str]) -> Optional[str]:
     if owner_u == "__PUBLIC":
         return "PUBLIC"
     return owner_u
+
+
+OB_PUBLIC_OWNER_SQL_CONDITION = "UPPER(OWNER) IN ('PUBLIC', '__PUBLIC')"
+OB_PUBLIC_OWNER_ALIAS_SQL_CONDITION = "UPPER(s.OWNER) IN ('PUBLIC', '__PUBLIC')"
+OB_PUBLIC_TABLE_OWNER_SQL_CONDITION = "UPPER(TABLE_OWNER) IN ('PUBLIC', '__PUBLIC')"
 
 
 def normalize_ob_metadata_public_owner(meta: ObMetadata) -> ObMetadata:
@@ -17024,6 +17029,7 @@ def load_ob_source_synonym_metadata(
     ob_cfg: ObConfig,
     schemas_list: List[str],
     allowed_terminal_source_schemas: Optional[Sequence[str]] = None,
+    include_public_sequence_terminals: bool = False,
 ) -> Dict[Tuple[str, str], SynonymMeta]:
     """
     在 OceanBase 源端读取同义词元数据。
@@ -17040,7 +17046,28 @@ def load_ob_source_synonym_metadata(
     owners = sorted(set(s.upper() for s in schemas_list) | {"PUBLIC"})
     private_owners = [owner for owner in owners if owner != "PUBLIC"]
     result: Dict[Tuple[str, str], SynonymMeta] = {}
+    public_sequence_terminal_types: Dict[str, Set[str]] = {}
     skipped_public = 0
+
+    def _store_parts(parts: Sequence[str]) -> Optional[Tuple[str, str]]:
+        if len(parts) < 4:
+            return None
+        owner = normalize_public_owner(parts[0])
+        name = (parts[1] or "").strip().upper()
+        table_owner = normalize_public_owner(parts[2])
+        table_name = (parts[3] or "").strip().upper()
+        db_link = normalize_obclient_nullable_text(parts[4] if len(parts) > 4 else None, upper=True)
+        if not owner or not name or not table_name:
+            return None
+        key = (owner, name)
+        result[key] = SynonymMeta(
+            owner=owner,
+            name=name,
+            table_owner=table_owner or "",
+            table_name=table_name,
+            db_link=db_link,
+        )
+        return key
 
     sql_private_tpl = """
         SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME, DB_LINK
@@ -17054,23 +17081,7 @@ def load_ob_source_synonym_metadata(
         log.warning("读取 OceanBase 源端同义词元数据失败(私有): %s", err)
         lines = []
     for line in lines:
-        parts = line.split("\t")
-        if len(parts) < 4:
-            continue
-        owner = normalize_public_owner(parts[0])
-        name = (parts[1] or "").strip().upper()
-        table_owner = normalize_public_owner(parts[2])
-        table_name = (parts[3] or "").strip().upper()
-        db_link = normalize_obclient_nullable_text(parts[4] if len(parts) > 4 else None, upper=True)
-        if not owner or not name or not table_name:
-            continue
-        result[(owner, name)] = SynonymMeta(
-            owner=owner,
-            name=name,
-            table_owner=table_owner or "",
-            table_name=table_name,
-            db_link=db_link,
-        )
+        _store_parts(line.split("\t"))
 
     if "PUBLIC" in owners:
         if allowed_targets:
@@ -17079,40 +17090,22 @@ def load_ob_source_synonym_metadata(
                 public_sql = f"""
                     SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME, DB_LINK
                     FROM DBA_SYNONYMS
-                    WHERE UPPER(OWNER) = 'PUBLIC'
+                    WHERE {OB_PUBLIC_OWNER_SQL_CONDITION}
                       AND TABLE_OWNER IS NOT NULL
                       AND TABLE_NAME IS NOT NULL
-                      AND (UPPER(TABLE_OWNER) IN ({target_in}) OR UPPER(TABLE_OWNER) = 'PUBLIC')
+                      AND (UPPER(TABLE_OWNER) IN ({target_in}) OR {OB_PUBLIC_TABLE_OWNER_SQL_CONDITION})
                 """
                 ok, out, err = obclient_run_sql(ob_cfg, public_sql, quiet_error=True)
                 if not ok:
                     log.warning("读取 OceanBase 源端 PUBLIC 同义词失败: %s", err)
                     continue
                 for line in (out or "").splitlines():
-                    parts = line.split("\t")
-                    if len(parts) < 4:
-                        continue
-                    owner = normalize_public_owner(parts[0])
-                    name = (parts[1] or "").strip().upper()
-                    table_owner = normalize_public_owner(parts[2])
-                    table_name = (parts[3] or "").strip().upper()
-                    db_link = normalize_obclient_nullable_text(
-                        parts[4] if len(parts) > 4 else None, upper=True
-                    )
-                    if not owner or not name or not table_name:
-                        continue
-                    result[(owner, name)] = SynonymMeta(
-                        owner=owner,
-                        name=name,
-                        table_owner=table_owner or "",
-                        table_name=table_name,
-                        db_link=db_link,
-                    )
+                    _store_parts(line.split("\t"))
         else:
-            public_sql = """
+            public_sql = f"""
                 SELECT OWNER, SYNONYM_NAME, TABLE_OWNER, TABLE_NAME, DB_LINK
                 FROM DBA_SYNONYMS
-                WHERE UPPER(OWNER) = 'PUBLIC'
+                WHERE {OB_PUBLIC_OWNER_SQL_CONDITION}
                   AND TABLE_OWNER IS NOT NULL
                   AND TABLE_NAME IS NOT NULL
             """
@@ -17121,37 +17114,58 @@ def load_ob_source_synonym_metadata(
                 log.warning("读取 OceanBase 源端 PUBLIC 同义词失败: %s", err)
             else:
                 for line in (out or "").splitlines():
-                    parts = line.split("\t")
-                    if len(parts) < 4:
+                    _store_parts(line.split("\t"))
+        if include_public_sequence_terminals:
+            public_sequence_sql = f"""
+                SELECT s.OWNER, s.SYNONYM_NAME, s.TABLE_OWNER, s.TABLE_NAME, s.DB_LINK
+                FROM DBA_SYNONYMS s
+                JOIN DBA_OBJECTS o
+                  ON UPPER(o.OWNER) = UPPER(s.TABLE_OWNER)
+                 AND UPPER(o.OBJECT_NAME) = UPPER(s.TABLE_NAME)
+                 AND UPPER(o.OBJECT_TYPE) = 'SEQUENCE'
+                WHERE {OB_PUBLIC_OWNER_ALIAS_SQL_CONDITION}
+                  AND s.TABLE_OWNER IS NOT NULL
+                  AND s.TABLE_NAME IS NOT NULL
+                  AND s.DB_LINK IS NULL
+            """
+            ok, out, err = obclient_run_sql(ob_cfg, public_sequence_sql, quiet_error=True)
+            if not ok:
+                log.warning("读取 OceanBase 源端 PUBLIC sequence 同义词失败: %s", err)
+            else:
+                for line in (out or "").splitlines():
+                    key = _store_parts(line.split("\t"))
+                    if not key:
                         continue
-                    owner = normalize_public_owner(parts[0])
-                    name = (parts[1] or "").strip().upper()
-                    table_owner = normalize_public_owner(parts[2])
-                    table_name = (parts[3] or "").strip().upper()
-                    db_link = normalize_obclient_nullable_text(
-                        parts[4] if len(parts) > 4 else None, upper=True
-                    )
-                    if not owner or not name or not table_name:
+                    meta = result.get(key)
+                    if not meta or not meta.table_owner or not meta.table_name:
                         continue
-                    result[(owner, name)] = SynonymMeta(
-                        owner=owner,
-                        name=name,
-                        table_owner=table_owner or "",
-                        table_name=table_name,
-                        db_link=db_link,
-                    )
+                    public_sequence_terminal_types[
+                        f"{meta.table_owner}.{meta.table_name}".upper()
+                    ] = {"SEQUENCE"}
 
     if allowed_targets:
         relevant_public_keys, closure_public_keys = classify_public_synonym_scope(
             result,
             allowed_terminal_source_schemas=sorted(allowed_targets),
         )
+        sequence_public_keys: Set[Tuple[str, str]] = set()
+        sequence_closure_public_keys: Set[Tuple[str, str]] = set()
+        if include_public_sequence_terminals and public_sequence_terminal_types:
+            sequence_public_keys, sequence_closure_public_keys = classify_public_synonym_scope(
+                result,
+                known_source_types=public_sequence_terminal_types,
+            )
         filtered_result: Dict[Tuple[str, str], SynonymMeta] = {}
         for key, meta in result.items():
             if (key[0] or "").upper() != "PUBLIC":
                 filtered_result[key] = meta
                 continue
-            if key in closure_public_keys or key in relevant_public_keys:
+            if (
+                key in closure_public_keys
+                or key in relevant_public_keys
+                or key in sequence_closure_public_keys
+                or key in sequence_public_keys
+            ):
                 filtered_result[key] = meta
                 continue
             skipped_public += 1
@@ -17173,6 +17187,7 @@ def load_source_synonym_metadata(
     settings: Dict,
     schemas_list: List[str],
     allowed_terminal_source_schemas: Optional[Sequence[str]] = None,
+    include_public_sequence_terminals: bool = False,
 ) -> Dict[Tuple[str, str], SynonymMeta]:
     source_db_mode = normalize_source_db_mode(settings.get("source_db_mode", SOURCE_DB_MODE_ORACLE))
     if source_db_mode == SOURCE_DB_MODE_ORACLE:
@@ -17180,11 +17195,13 @@ def load_source_synonym_metadata(
             ora_cfg,
             schemas_list,
             allowed_terminal_source_schemas=allowed_terminal_source_schemas,
+            include_public_sequence_terminals=include_public_sequence_terminals,
         )
     return load_ob_source_synonym_metadata(
         settings.get("source_ob_cfg") or {},
         schemas_list,
         allowed_terminal_source_schemas=allowed_terminal_source_schemas,
+        include_public_sequence_terminals=include_public_sequence_terminals,
     )
 
 
@@ -17704,6 +17721,7 @@ def load_synonym_metadata(
     ora_cfg: OraConfig,
     schemas_list: List[str],
     allowed_terminal_source_schemas: Optional[Sequence[str]] = None,
+    include_public_sequence_terminals: bool = False,
     capabilities: Optional[Dict[str, str]] = None,
     diagnostics: Optional[List[str]] = None,
 ) -> Dict[Tuple[str, str], SynonymMeta]:
@@ -17712,6 +17730,8 @@ def load_synonym_metadata(
     返回 {(OWNER, SYNONYM_NAME): SynonymMeta}
     allowed_terminal_source_schemas: 仅保留终点落在这些源 schema 的 PUBLIC 同义词，
     用于过滤系统 PUBLIC 同义词等无关对象。
+    include_public_sequence_terminals: 额外保留 PUBLIC 同义词到外部 SEQUENCE 的链路，
+    供触发器 seq.NEXTVAL/CURRVAL 重写解析使用，不改变 source object 范围。
     """
     if not schemas_list:
         return {}
@@ -17733,7 +17753,26 @@ def load_synonym_metadata(
     """
 
     result: Dict[Tuple[str, str], SynonymMeta] = {}
+    public_sequence_terminal_types: Dict[str, Set[str]] = {}
     skipped_public = 0
+
+    def _store_synonym_row(row: Sequence[object]) -> Optional[Tuple[str, str]]:
+        owner = (row[0] or "").strip().upper()
+        name = (row[1] or "").strip().upper()
+        table_owner = (row[2] or "").strip().upper()
+        table_name = (row[3] or "").strip().upper()
+        db_link = (row[4] or "").strip().upper() if len(row) > 4 and row[4] else None
+        if not owner or not name or not table_name:
+            return None
+        key = (owner, name)
+        result[key] = SynonymMeta(
+            owner=owner,
+            name=name,
+            table_owner=table_owner,
+            table_name=table_name,
+            db_link=db_link,
+        )
+        return key
 
     try:
         with oracledb.connect(
@@ -17746,21 +17785,7 @@ def load_synonym_metadata(
                     sql = sql_tpl.format(owner_ph=owner_ph, target_filter="")
                     cursor.execute(sql, owner_chunk)
                     for row in cursor:
-                        owner = (row[0] or "").strip().upper()
-                        name = (row[1] or "").strip().upper()
-                        table_owner = (row[2] or "").strip().upper()
-                        table_name = (row[3] or "").strip().upper()
-                        db_link = (row[4] or "").strip().upper() if row[4] else None
-                        if not owner or not name or not table_name:
-                            continue
-                        key = (owner, name)
-                        result[key] = SynonymMeta(
-                            owner=owner,
-                            name=name,
-                            table_owner=table_owner,
-                            table_name=table_name,
-                            db_link=db_link,
-                        )
+                        _store_synonym_row(row)
 
                 if "PUBLIC" in owners:
                     target_chunks = (
@@ -17788,32 +17813,63 @@ def load_synonym_metadata(
                             sql = public_sql_tpl.format(target_filter="")
                             cursor.execute(sql)
                         for row in cursor:
-                            owner = (row[0] or "").strip().upper()
-                            name = (row[1] or "").strip().upper()
-                            table_owner = (row[2] or "").strip().upper()
-                            table_name = (row[3] or "").strip().upper()
-                            db_link = (row[4] or "").strip().upper() if row[4] else None
-                            if not owner or not name or not table_name:
-                                continue
-                            key = (owner, name)
-                            result[key] = SynonymMeta(
-                                owner=owner,
-                                name=name,
-                                table_owner=table_owner,
-                                table_name=table_name,
-                                db_link=db_link,
+                            _store_synonym_row(row)
+                    if include_public_sequence_terminals:
+                        sequence_sql = """
+                            SELECT s.OWNER, s.SYNONYM_NAME, s.TABLE_OWNER, s.TABLE_NAME, s.DB_LINK
+                            FROM DBA_SYNONYMS s
+                            JOIN DBA_OBJECTS o
+                              ON o.OWNER = s.TABLE_OWNER
+                             AND o.OBJECT_NAME = s.TABLE_NAME
+                             AND o.OBJECT_TYPE = 'SEQUENCE'
+                            WHERE s.OWNER = 'PUBLIC'
+                              AND s.TABLE_OWNER IS NOT NULL
+                              AND s.TABLE_NAME IS NOT NULL
+                              AND s.DB_LINK IS NULL
+                        """
+                        try:
+                            cursor.execute(sequence_sql)
+                            for row in cursor:
+                                key = _store_synonym_row(row)
+                                if not key:
+                                    continue
+                                meta = result.get(key)
+                                if not meta or not meta.table_owner or not meta.table_name:
+                                    continue
+                                public_sequence_terminal_types[
+                                    f"{meta.table_owner}.{meta.table_name}".upper()
+                                ] = {"SEQUENCE"}
+                        except oracledb.Error as exc:
+                            msg = normalize_error_text(str(exc))
+                            if diagnostics is not None:
+                                diagnostics.append(f"DBA_SYNONYMS public sequence degraded: {msg}")
+                            log.warning(
+                                "读取 PUBLIC sequence 同义词元数据失败，将保留常规同义词范围: %s",
+                                exc,
                             )
         if allowed_targets:
             relevant_public_keys, closure_public_keys = classify_public_synonym_scope(
                 result,
                 allowed_terminal_source_schemas=sorted(allowed_targets),
             )
+            sequence_public_keys: Set[Tuple[str, str]] = set()
+            sequence_closure_public_keys: Set[Tuple[str, str]] = set()
+            if include_public_sequence_terminals and public_sequence_terminal_types:
+                sequence_public_keys, sequence_closure_public_keys = classify_public_synonym_scope(
+                    result,
+                    known_source_types=public_sequence_terminal_types,
+                )
             filtered_result: Dict[Tuple[str, str], SynonymMeta] = {}
             for key, meta in result.items():
                 if (key[0] or "").upper() != "PUBLIC":
                     filtered_result[key] = meta
                     continue
-                if key in closure_public_keys or key in relevant_public_keys:
+                if (
+                    key in closure_public_keys
+                    or key in relevant_public_keys
+                    or key in sequence_closure_public_keys
+                    or key in sequence_public_keys
+                ):
                     filtered_result[key] = meta
                     continue
                 skipped_public += 1
@@ -67078,6 +67134,7 @@ def main():
                 settings,
                 settings["source_schemas_list"],
                 allowed_terminal_source_schemas=managed_source_terminal_schemas,
+                include_public_sequence_terminals=("TRIGGER" in enabled_object_types),
             )
         else:
             synonym_meta = {}

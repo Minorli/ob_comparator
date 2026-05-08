@@ -5,11 +5,13 @@
 [![Latest Release](https://img.shields.io/github/v/release/Minorli/ob_comparator)](https://github.com/Minorli/ob_comparator/releases/latest)
 [![License](https://img.shields.io/github/license/Minorli/ob_comparator)](LICENSE)
 
-> 当前版本：V0.9.9.6-hotfix5
+> 当前版本：V0.9.9.6-hotfix6
 > 面向 Oracle → OceanBase 与 OceanBase → OceanBase 的结构一致性校验与修补脚本生成工具  
 > 核心理念：一次转储、本地对比、脚本审计优先
 
-## 近期更新（0.9.9.6-hotfix5）
+## 近期更新（0.9.9.6-hotfix6）
+- Hotfix：触发器 DDL 重写会为 PUBLIC 同义词指向外部 SEQUENCE 的链路额外保留元数据，`seq_syn.NEXTVAL/CURRVAL` 不再因真实 sequence 不在受管 schema 内而回退成触发器 schema 下的同义词名。
+- Hotfix：OB -> OB 源端同义词元数据加载兼容 OceanBase 字典中 `__public` 形式的 PUBLIC owner，避免 PUBLIC synonym 在部分版本中漏入缓存。
 - Hotfix：定义级 SYNONYM 修复脚本现在继续遵守 `synonym_fixup_scope`；`public_only` 下私有同义词定义漂移只报告、不落盘执行脚本。
 - Hotfix：源同义词目标 owner 为 `PUBLIC` 时不再自动生成 `FOR "PUBLIC"."..."` 替换 SQL，改为 manual-only，避免 OceanBase 端 PUBLIC 目标引用语义不确定。
 - Hotfix：清理 definition compare 显式开关的冗余 source gate，并补齐 `run_fixup.py` 对 `OBE-` 错误码的显式分类。
@@ -87,8 +89,9 @@
 - 运行账号需具备 DBA_* 视图访问权限（Oracle 与 OB）
 - 安全说明：工具运行时不会把 OB/dbcat 密码作为明文参数暴露在 `ps` 命令中（配置文件仍按当前方式保留密码项）。
 
-## 运维提示（0.9.9.6-hotfix5）
+## 运维提示（0.9.9.6-hotfix6）
 - Oracle -> OB：默认链路不变；默认 BYTE 语义的 VARCHAR/VARCHAR2 compare/fixup 以 `DATA_LENGTH` 为准，只有 `CHAR_USED='C'` 明确字符语义时才按字符长度且不做扩容。若省略 `synonym_check_scope/synonym_fixup_scope`，仍按 `public_only` 运行。target-side `DBA_SYNONYMS` 补查不再静默扩大 Oracle 源默认范围；OB -> OB 路径会对源端和目标端同时启用补查。
+- TRIGGER：启用 TRIGGER fixup 时，源端 PUBLIC 同义词指向外部 SEQUENCE 的元数据会作为 DDL 重写辅助信息保留，但不会因此把这些外部 sequence 或 PUBLIC synonym 纳入主对象 compare/fixup 范围。
 - OB -> OB：若省略 `synonym_check_scope/synonym_fixup_scope`，运行时会提示并按 `all` 处理；OB source 的多行 `DATA_DEFAULT` 会先做控制字符清理，避免错列；默认还会按结构化元数据比对同名 SYNONYM 的直接目标/DBLINK/PUBLIC 边界，以及同名 TABLE 的分区类型、分区键、interval、分区边界和子分区定义。
 - 定义级差异：`synonym_definition_compare=auto`、`partition_definition_compare=auto` 仅在 OceanBase 源自动启用；Oracle -> OB 默认保守关闭，需显式设置为 `true` 才比对。`synonym_definition_fixup=false` 默认只报告；显式开启后，只对 `fixup_status=RUNNABLE` 且通过 `synonym_fixup_scope` 的本地同义词漂移输出 `fixup_scripts/synonym/*__definition.sql`；分区定义漂移固定进入 `partition_definition_mismatch_detail_<ts>.txt` 和人工处理清单，不生成自动重分区 SQL。
 - GTT：可继续显式使用 `rewrite_to_normal/preserve_original/blocked`；也可以用 `auto` 让程序按目标 OB 版本决策。凡是落到 `rewrite_to_normal`，都要把它视为“结构可迁、事务语义需人工确认”。
