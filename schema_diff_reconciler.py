@@ -42339,6 +42339,8 @@ def remap_trigger_object_references(
                     tgt_full = terminal_explicit.upper()
                 if not tgt_full and terminal_explicit:
                     tgt_full = terminal_explicit.upper()
+                if not tgt_full:
+                    tgt_full = terminal_u
 
         return (tgt_full or src_full).upper()
 
