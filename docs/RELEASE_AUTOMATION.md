@@ -55,7 +55,7 @@ Attach real database evidence JSON to the release when the change affects:
 The packaging step can be reproduced locally:
 
 ```bash
-python tools/build_release_package.py --version 0.9.9.6-hotfix5 --commitish main --output-dir dist
+python tools/build_release_package.py --version 0.9.9.6-hotfix6 --commitish main --output-dir dist
 cd dist
-sha256sum -c ob_comparator-0.9.9.6-hotfix5-SHA256SUMS.txt
+sha256sum -c ob_comparator-0.9.9.6-hotfix6-SHA256SUMS.txt
 ```

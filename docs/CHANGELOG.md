@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [0.9.9.6-hotfix6] - 2026-05-08
+
+### 修复
+- 触发器 DDL 序列调用重写会额外保留 `PUBLIC` 同义词指向外部 `SEQUENCE` 的元数据；当真实 sequence 不在受管 schema/mapping 内时，`seq_syn.NEXTVAL/CURRVAL` 现在回退到真实终点 owner，而不是错误生成触发器 schema 下的同义词路径。
+- OceanBase 源端 `DBA_SYNONYMS` 兼容 `OWNER='__public'` 的 PUBLIC 同义词字典口径，避免 OB -> OB 路径漏加载 PUBLIC synonym 元数据。
+- 该辅助元数据只用于触发器 DDL 引用解析，不扩大 `source_objects` 主对象范围，也不改变同义词缺失/定义漂移的 scope 过滤策略。
+
 ## [0.9.9.6-hotfix5] - 2026-05-07
 
 ### 修复

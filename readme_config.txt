@@ -1,8 +1,8 @@
 配置说明 (config.ini)
-版本：0.9.9.6-hotfix5（更新日期：2026-05-07）
+版本：0.9.9.6-hotfix6（更新日期：2026-05-08）
 本文件为完整配置说明书，覆盖所有可配置项（含最近新增功能）。
 
-本版重点增加 TRIGGER 序列调用替换边界修复，以及 OB -> OB / 显式 Oracle -> OB 的同义词与分区表定义级差异 compare；同时保留生产可靠性与诊断能力、Oracle source 默认 BYTE 语义下 VARCHAR/VARCHAR2 长度基准修复。
+本版重点补齐 TRIGGER 序列调用中 PUBLIC 同义词指向外部 SEQUENCE 的解析元数据，并保留 OB -> OB / 显式 Oracle -> OB 的同义词与分区表定义级差异 compare、生产可靠性与诊断能力、Oracle source 默认 BYTE 语义下 VARCHAR/VARCHAR2 长度基准修复。
 
 部署约束：0.9.9.6+ 需要使用完整 toolkit 目录或整仓更新。`schema_diff_reconciler.py`、`run_fixup.py`、`diagnostic_bundle.py` 都依赖同目录内的内部文件 `comparator_reliability.py`；这不是 pip 包，不需要也不能通过 `pip install comparator_reliability` 解决。`compatibility_registry.json` 建议随包保留用于审计；0.9.9.6-hotfix3+ 起默认路径漏拷时会使用内置默认 registry，不再阻断运行。
 
