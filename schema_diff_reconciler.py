@@ -7726,6 +7726,10 @@ class ConstraintCompareCache(NamedTuple):
     src_sig: ConstraintSignature
     tgt_sig: ConstraintSignature
     source_all_cols: Set[Tuple[str, ...]]
+    source_pk_cols: Set[Tuple[str, ...]]
+    source_uk_cols: Set[Tuple[str, ...]]
+    source_fk_cols: Set[Tuple[str, ...]]
+    source_incomplete_fk_cols: Set[Tuple[str, ...]]
     partition_key_set: Set[str]
 
 
@@ -33343,6 +33347,28 @@ def build_constraint_cache_for_table(
         include_deferrable=include_deferrable,
     )
     source_all_cols: Set[Tuple[str, ...]] = set(src_norm_cols.values())
+    source_pk_cols: Set[Tuple[str, ...]] = set()
+    source_uk_cols: Set[Tuple[str, ...]] = set()
+    source_fk_cols: Set[Tuple[str, ...]] = set()
+    source_incomplete_fk_cols: Set[Tuple[str, ...]] = set()
+    for name, cons in (src_cons or {}).items():
+        ctype = (cons.get("type") or "").upper()
+        cols = src_norm_cols.get(name) or normalize_column_sequence(cons.get("columns"))
+        if ctype == "P":
+            source_pk_cols.add(cols)
+        elif ctype == "U":
+            source_uk_cols.add(cols)
+        elif ctype == "R":
+            source_fk_cols.add(cols)
+            ref_owner = cons.get("ref_table_owner")
+            ref_name = cons.get("ref_table_name")
+            ref_complete = bool(
+                cons.get("ref_metadata_complete")
+                if cons.get("ref_metadata_complete") is not None
+                else True
+            )
+            if not ref_complete and not (ref_owner and ref_name):
+                source_incomplete_fk_cols.add(cols)
     partition_key_set = get_partition_key_set(oracle_meta, src_schema, src_table)
     return ConstraintCompareCache(
         src_cons=src_cons,
@@ -33352,6 +33378,10 @@ def build_constraint_cache_for_table(
         src_sig=src_sig,
         tgt_sig=tgt_sig,
         source_all_cols=source_all_cols,
+        source_pk_cols=source_pk_cols,
+        source_uk_cols=source_uk_cols,
+        source_fk_cols=source_fk_cols,
+        source_incomplete_fk_cols=source_incomplete_fk_cols,
         partition_key_set=partition_key_set,
     )
 
@@ -33966,6 +33996,7 @@ def compare_constraints_for_table(
     tgt_table: str,
     full_object_mapping: FullObjectMapping,
     cache: Optional[ConstraintCompareCache] = None,
+    strict_ob_source_compare: bool = False,
 ) -> Tuple[bool, Optional[ConstraintMismatch]]:
     include_deferrable = bool(getattr(ob_meta, "constraint_deferrable_supported", False))
     tgt_key = (tgt_schema.upper(), tgt_table.upper())
@@ -33995,9 +34026,15 @@ def compare_constraints_for_table(
         src_norm_cols = cache.src_norm_cols
         tgt_norm_cols = cache.tgt_norm_cols
         source_all_cols = cache.source_all_cols
+        source_pk_cols = set(getattr(cache, "source_pk_cols", set()) or set())
+        source_uk_cols = set(getattr(cache, "source_uk_cols", set()) or set())
+        source_fk_cols = set(getattr(cache, "source_fk_cols", set()) or set())
+        source_incomplete_fk_cols = set(getattr(cache, "source_incomplete_fk_cols", set()) or set())
         partition_key_set = cache.partition_key_set
-        if cache.src_sig == cache.tgt_sig and not _has_duplicate_notnull_cleanup_candidates(
-            src_cons
+        if (
+            cache.src_sig == cache.tgt_sig
+            and not source_incomplete_fk_cols
+            and not _has_duplicate_notnull_cleanup_candidates(src_cons)
         ):
             return True, None
     else:
@@ -34014,6 +34051,32 @@ def compare_constraints_for_table(
             name: normalize_column_sequence(cons.get("columns")) for name, cons in tgt_cons.items()
         }
         source_all_cols = set(src_norm_cols.values())
+        source_pk_cols = {
+            src_norm_cols.get(name) or normalize_column_sequence(cons.get("columns"))
+            for name, cons in (src_cons or {}).items()
+            if (cons.get("type") or "").upper() == "P"
+        }
+        source_uk_cols = {
+            src_norm_cols.get(name) or normalize_column_sequence(cons.get("columns"))
+            for name, cons in (src_cons or {}).items()
+            if (cons.get("type") or "").upper() == "U"
+        }
+        source_fk_cols = {
+            src_norm_cols.get(name) or normalize_column_sequence(cons.get("columns"))
+            for name, cons in (src_cons or {}).items()
+            if (cons.get("type") or "").upper() == "R"
+        }
+        source_incomplete_fk_cols = {
+            src_norm_cols.get(name) or normalize_column_sequence(cons.get("columns"))
+            for name, cons in (src_cons or {}).items()
+            if (cons.get("type") or "").upper() == "R"
+            and not bool(
+                cons.get("ref_metadata_complete")
+                if cons.get("ref_metadata_complete") is not None
+                else True
+            )
+            and not (cons.get("ref_table_owner") and cons.get("ref_table_name"))
+        }
         partition_key_set = get_partition_key_set(oracle_meta, src_schema, src_table)
 
     src_idx_unique_cols: Set[Tuple[str, ...]] = set()
@@ -34169,12 +34232,15 @@ def compare_constraints_for_table(
     def mark_extra_constraints(
         label: str, tgt_list: List[Tuple[Tuple[str, ...], str]], tgt_used: List[bool]
     ) -> None:
+        expected_source_cols = source_pk_cols if label == "PRIMARY KEY" else source_uk_cols
         for idx, used in enumerate(tgt_used):
             if used:
                 continue
             extra_name = tgt_list[idx][1]
             extra_cols = tgt_list[idx][0]
-            if extra_cols in source_all_cols:
+            if extra_cols in expected_source_cols:
+                continue
+            if not strict_ob_source_compare and extra_cols in source_all_cols:
                 continue
             if label == "UNIQUE KEY":
                 extra_name_u = (extra_name or "").upper()
@@ -34275,7 +34341,13 @@ def compare_constraints_for_table(
                     extra_update_rule,
                     extra_ref_complete,
                 ) = tgt_list[idx]
-                if extra_cols in source_all_cols and extra_cols not in source_incomplete_ref_cols:
+                if extra_cols in source_fk_cols and extra_cols not in source_incomplete_ref_cols:
+                    continue
+                if (
+                    not strict_ob_source_compare
+                    and extra_cols in source_all_cols
+                    and extra_cols not in source_incomplete_ref_cols
+                ):
                     continue
                 if "_OMS_ROWID" in (extra_name or ""):
                     continue
@@ -34716,6 +34788,7 @@ def _init_extra_check_worker(
     ob_meta: ObMetadata,
     full_object_mapping: FullObjectMapping,
     enabled_types: Set[str],
+    source_db_mode: str = SOURCE_DB_MODE_ORACLE,
 ) -> None:
     global _EXTRA_CHECK_CONTEXT
     _EXTRA_CHECK_CONTEXT = {
@@ -34723,6 +34796,7 @@ def _init_extra_check_worker(
         "ob_meta": ob_meta,
         "full_object_mapping": full_object_mapping,
         "enabled_types": enabled_types,
+        "source_db_mode": normalize_source_db_mode(source_db_mode),
     }
 
 
@@ -34734,6 +34808,7 @@ def _extra_check_worker(table_entry: TableEntry) -> ExtraTableResult:
         ctx["ob_meta"],
         ctx["full_object_mapping"],
         ctx["enabled_types"],
+        ctx.get("source_db_mode", SOURCE_DB_MODE_ORACLE),
     )
 
 
@@ -34743,6 +34818,7 @@ def run_extra_check_for_table(
     ob_meta: ObMetadata,
     full_object_mapping: FullObjectMapping,
     enabled_types: Set[str],
+    source_db_mode: str = SOURCE_DB_MODE_ORACLE,
 ) -> ExtraTableResult:
     src_schema, src_table, tgt_schema, tgt_table = table_entry
     tgt_name = f"{tgt_schema}.{tgt_table}"
@@ -34780,6 +34856,8 @@ def run_extra_check_for_table(
             tgt_table,
             full_object_mapping,
             cache=cons_cache,
+            strict_ob_source_compare=normalize_source_db_mode(source_db_mode)
+            == SOURCE_DB_MODE_OCEANBASE,
         )
         constraint_time = time.monotonic() - start
 
@@ -34812,6 +34890,35 @@ def run_extra_check_for_table(
         constraint_time=constraint_time,
         trigger_time=trigger_time,
     )
+
+
+def call_run_extra_check_for_table(
+    table_entry: TableEntry,
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata,
+    full_object_mapping: FullObjectMapping,
+    enabled_types: Set[str],
+    source_db_mode: str,
+) -> ExtraTableResult:
+    try:
+        return run_extra_check_for_table(
+            table_entry,
+            oracle_meta,
+            ob_meta,
+            full_object_mapping,
+            enabled_types,
+            source_db_mode,
+        )
+    except TypeError as exc:
+        if "positional argument" not in str(exc):
+            raise
+        return run_extra_check_for_table(
+            table_entry,
+            oracle_meta,
+            ob_meta,
+            full_object_mapping,
+            enabled_types,
+        )
 
 
 def run_trigger_check_for_object(
@@ -34922,6 +35029,9 @@ def check_extra_objects(
     trg_time_sum = 0.0
 
     if total_tables:
+        source_db_mode = normalize_source_db_mode(
+            settings.get("source_db_mode", SOURCE_DB_MODE_ORACLE)
+        )
         worker_count = max(1, int(settings.get("extra_check_workers", 1) or 1))
         worker_count = min(worker_count, max(1, total_tables))
         chunk_size = max(1, int(settings.get("extra_check_chunk_size", 200) or 200))
@@ -34972,7 +35082,13 @@ def check_extra_objects(
                 with ProcessPoolExecutor(
                     max_workers=worker_count,
                     initializer=_init_extra_check_worker,
-                    initargs=(oracle_meta, ob_meta, full_object_mapping, table_check_types),
+                    initargs=(
+                        oracle_meta,
+                        ob_meta,
+                        full_object_mapping,
+                        table_check_types,
+                        source_db_mode,
+                    ),
                 ) as executor:
                     future_to_entry = {
                         executor.submit(_extra_check_worker, entry): entry
@@ -34989,8 +35105,13 @@ def check_extra_objects(
                                 entry[3],
                                 exc,
                             )
-                            result = run_extra_check_for_table(
-                                entry, oracle_meta, ob_meta, full_object_mapping, table_check_types
+                            result = call_run_extra_check_for_table(
+                                entry,
+                                oracle_meta,
+                                ob_meta,
+                                full_object_mapping,
+                                table_check_types,
+                                source_db_mode,
                             )
                         done_tables += 1
                         _accumulate_result(result)
@@ -35010,12 +35131,13 @@ def check_extra_objects(
                 with ThreadPoolExecutor(max_workers=worker_count) as executor:
                     future_to_entry = {
                         executor.submit(
-                            run_extra_check_for_table,
+                            call_run_extra_check_for_table,
                             entry,
                             oracle_meta,
                             ob_meta,
                             full_object_mapping,
                             table_check_types,
+                            source_db_mode,
                         ): entry
                         for entry in table_entries
                     }
@@ -35030,8 +35152,13 @@ def check_extra_objects(
                                 entry[3],
                                 exc,
                             )
-                            result = run_extra_check_for_table(
-                                entry, oracle_meta, ob_meta, full_object_mapping, table_check_types
+                            result = call_run_extra_check_for_table(
+                                entry,
+                                oracle_meta,
+                                ob_meta,
+                                full_object_mapping,
+                                table_check_types,
+                                source_db_mode,
                             )
                         done_tables += 1
                         _accumulate_result(result)
@@ -35049,8 +35176,13 @@ def check_extra_objects(
                             last_log = now
         else:
             for entry in table_entries:
-                result = run_extra_check_for_table(
-                    entry, oracle_meta, ob_meta, full_object_mapping, table_check_types
+                result = call_run_extra_check_for_table(
+                    entry,
+                    oracle_meta,
+                    ob_meta,
+                    full_object_mapping,
+                    table_check_types,
+                    source_db_mode,
                 )
                 done_tables += 1
                 _accumulate_result(result)
