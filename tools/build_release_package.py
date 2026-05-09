@@ -33,6 +33,7 @@ EXCLUDED_PREFIXES = (
     ".codex/",
     ".agents/",
     "tools/",
+    "tests/",
     "main_reports/",
     "fixup_scripts/",
     "dbcat_output/",
