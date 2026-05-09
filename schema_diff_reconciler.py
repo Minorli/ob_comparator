@@ -1642,6 +1642,14 @@ class OracleMetadata(NamedTuple):
     identity_options: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = MappingProxyType(
         {}
     )  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: {OPTION: VALUE}}
+    enabled_notnull_check_columns: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = (
+        MappingProxyType({})
+    )  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: enabled single-column IS NOT NULL check meta}
+    enabled_notnull_check_groups: Dict[
+        Tuple[str, str], Dict[str, Tuple["NotnullCheckEntry", ...]]
+    ] = MappingProxyType(
+        {}
+    )  # (OWNER, TABLE_NAME) -> {COLUMN_NAME: (enabled single-column IS NOT NULL checks...)}
     nested_table_storage_tables: Dict[Tuple[str, str], "NestedTableStorageInfo"] = MappingProxyType(
         {}
     )  # (OWNER, STORAGE_TABLE_NAME) -> parent table/column
@@ -3403,6 +3411,10 @@ def is_ob_notnull_constraint(
     return False
 
 
+def is_obnotnull_constraint_name(name: Optional[object]) -> bool:
+    return "OBNOTNULL" in extract_constraint_name(name).upper()
+
+
 def strip_wrapping_parentheses(text: str) -> str:
     if not text or not text.startswith("(") or not text.endswith(")"):
         return text
@@ -3648,6 +3660,14 @@ def is_system_notnull_check(cons_name: Optional[str], search_condition: Optional
     return is_notnull_check_condition(search_condition)
 
 
+def is_auto_notnull_check(cons_name: Optional[str], search_condition: Optional[str]) -> bool:
+    if is_system_notnull_check(cons_name, search_condition):
+        return True
+    if not is_notnull_check_condition(search_condition):
+        return False
+    return is_ob_notnull_constraint(cons_name, search_condition)
+
+
 def should_skip_system_notnull_from_constraint_compare(
     cons_name: Optional[str],
     search_condition: Optional[str],
@@ -3660,7 +3680,7 @@ def should_skip_system_notnull_from_constraint_compare(
     对于 DISABLED 的系统命名 NOT NULL CHECK，不再视为列语义噪声，
     需要按普通缺失/额外 CHECK 参与 compare 和 fixup。
     """
-    if not is_system_notnull_check(cons_name, search_condition):
+    if not is_auto_notnull_check(cons_name, search_condition):
         return False
     return normalize_constraint_enabled_status(status) == "ENABLED"
 
@@ -3827,6 +3847,7 @@ def _notnull_check_keep_priority(
     return (
         0 if name_u in source_names else 1,
         family_rank,
+        0 if prefer_ob_auto and is_obnotnull_constraint_name(name_u) else 1,
         validated_rank,
         0 if validated_u == "VALIDATED" else 1,
         name_u,
@@ -3858,7 +3879,7 @@ def select_safe_duplicate_notnull_target_extras(
             if normalize_constraint_validated_status(entry.validated)
         }
         prefer_ob_auto = bool(source_entries) and all(
-            entry.is_system_named for entry in source_entries
+            entry.is_system_named or entry.is_ob_auto for entry in source_entries
         )
         ranked_targets = sorted(
             target_entries,
@@ -3916,6 +3937,18 @@ def select_preferred_notnull_semantic_entry(
         ),
     )
     return ranked_targets[0] if ranked_targets else None
+
+
+def get_enabled_notnull_check_groups_for_table(
+    meta: object,
+    table_key: Tuple[str, str],
+    fallback_constraints: Optional[Dict[str, Dict]] = None,
+) -> Dict[str, Tuple[NotnullCheckEntry, ...]]:
+    groups_by_table = getattr(meta, "enabled_notnull_check_groups", {}) or {}
+    groups = groups_by_table.get(table_key, {})
+    if groups:
+        return groups
+    return build_enabled_notnull_check_group_map(fallback_constraints or {})
 
 
 CHECK_SYS_CONTEXT_USERENV_RE = re.compile(
@@ -7488,6 +7521,7 @@ class ConstraintMismatch(NamedTuple):
     check_suppressed_source_dup_count: int = 0
     check_suppressed_target_dup_count: int = 0
     duplicate_notnull_extra_constraints: FrozenSet[str] = frozenset()
+    fk_source_metadata_incomplete: FrozenSet[str] = frozenset()
 
 
 class SequenceMismatch(NamedTuple):
@@ -7692,6 +7726,10 @@ class ConstraintCompareCache(NamedTuple):
     src_sig: ConstraintSignature
     tgt_sig: ConstraintSignature
     source_all_cols: Set[Tuple[str, ...]]
+    source_pk_cols: Set[Tuple[str, ...]]
+    source_uk_cols: Set[Tuple[str, ...]]
+    source_fk_cols: Set[Tuple[str, ...]]
+    source_incomplete_fk_cols: Set[Tuple[str, ...]]
     partition_key_set: Set[str]
 
 
@@ -11608,6 +11646,10 @@ def collect_constraint_status_drift_rows(
                 cons_name_u,
                 cons_meta.get("search_condition"),
             )
+            entry["is_ob_auto"] = is_ob_notnull_constraint(
+                cons_name_u,
+                cons_meta.get("search_condition"),
+            )
         elif ctype == "R":
             ref_owner = (cons_meta.get("ref_table_owner") or cons_meta.get("r_owner") or "").upper()
             ref_name = (cons_meta.get("ref_table_name") or "").upper()
@@ -11730,7 +11772,8 @@ def collect_constraint_status_drift_rows(
                 target_entries,
                 table_name=tgt_table,
                 column_name=notnull_col,
-                source_is_system_named=bool(src_entry.get("is_system_named")),
+                source_is_system_named=bool(src_entry.get("is_system_named"))
+                or bool(src_entry.get("is_ob_auto")),
             )
             if preferred is None:
                 continue
@@ -16817,6 +16860,12 @@ def adapt_ob_metadata_to_source_oracle_metadata(
         identity_modes=dict(getattr(ob_meta, "identity_modes", {}) or {}),
         default_on_null_columns=dict(getattr(ob_meta, "default_on_null_columns", {}) or {}),
         identity_options=dict(getattr(ob_meta, "identity_options", {}) or {}),
+        enabled_notnull_check_columns=dict(
+            getattr(ob_meta, "enabled_notnull_check_columns", {}) or {}
+        ),
+        enabled_notnull_check_groups=dict(
+            getattr(ob_meta, "enabled_notnull_check_groups", {}) or {}
+        ),
         nested_table_storage_tables={},
         contexts=dict(getattr(ob_meta, "contexts", {}) or {}),
     )
@@ -20439,6 +20488,14 @@ def apply_noise_suppression(
                     if normalize_identifier_name(name)
                     in {normalize_identifier_name(v) for v in new_extra}
                 ),
+                fk_source_metadata_incomplete=frozenset(
+                    normalize_identifier_name(name)
+                    for name in (
+                        getattr(item, "fk_source_metadata_incomplete", frozenset()) or frozenset()
+                    )
+                    if normalize_identifier_name(name)
+                    in {normalize_identifier_name(v) for v in new_missing}
+                ),
             )
         )
     filtered_extra["constraint_ok"] = constraint_ok
@@ -20559,6 +20616,9 @@ def normalize_extra_results_names(extra_results: ExtraCheckResults) -> ExtraChec
                 downgraded_pk_constraints=_norm_set(item.downgraded_pk_constraints),
                 duplicate_notnull_extra_constraints=frozenset(
                     _norm_set(getattr(item, "duplicate_notnull_extra_constraints", frozenset()))
+                ),
+                fk_source_metadata_incomplete=frozenset(
+                    _norm_set(getattr(item, "fk_source_metadata_incomplete", frozenset()))
                 ),
             )
         )
@@ -20726,6 +20786,14 @@ def classify_unsupported_check_constraints(
                     )
                     if normalize_identifier_name(name)
                     in {normalize_identifier_name(v) for v in new_extra}
+                ),
+                fk_source_metadata_incomplete=frozenset(
+                    normalize_identifier_name(name)
+                    for name in (
+                        getattr(item, "fk_source_metadata_incomplete", frozenset()) or frozenset()
+                    )
+                    if normalize_identifier_name(name)
+                    in {normalize_identifier_name(v) for v in new_missing}
                 ),
             )
         )
@@ -26718,6 +26786,10 @@ def dump_oracle_metadata(
     seq_owners = sorted({s.upper() for s in settings.get("source_schemas_list", [])})
     source_schema_set: Set[str] = {s.upper() for s in settings.get("source_schemas_list", []) if s}
     privilege_owners: Set[str] = set(source_schema_set)
+    enabled_notnull_check_columns: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = {}
+    enabled_notnull_check_groups: Dict[
+        Tuple[str, str], Dict[str, Tuple[NotnullCheckEntry, ...]]
+    ] = {}
 
     if not owners and not seq_owners:
         log.warning("未检测到需要加载的 Oracle schema，返回空元数据。")
@@ -28108,6 +28180,14 @@ def dump_oracle_metadata(
         ora_constraint_count,
         ora_trigger_count,
     )
+    if constraints:
+        for key, cons_map in constraints.items():
+            nn_map = build_enabled_notnull_check_column_map(cons_map)
+            if nn_map:
+                enabled_notnull_check_columns[key] = nn_map
+            nn_groups = build_enabled_notnull_check_group_map(cons_map)
+            if nn_groups:
+                enabled_notnull_check_groups[key] = nn_groups
     if non_table_triggers:
         log.warning(
             "Oracle 源端检测到 %d 个非表触发器，这些触发器不会进入普通 TABLE 触发器校验。",
@@ -28189,6 +28269,8 @@ def dump_oracle_metadata(
         identity_modes=identity_modes,
         default_on_null_columns=default_on_null_columns,
         identity_options=identity_options,
+        enabled_notnull_check_columns=enabled_notnull_check_columns,
+        enabled_notnull_check_groups=enabled_notnull_check_groups,
         nested_table_storage_tables=nested_table_storage_tables,
         contexts=contexts,
         context_inventory_error=context_inventory_error,
@@ -33265,6 +33347,28 @@ def build_constraint_cache_for_table(
         include_deferrable=include_deferrable,
     )
     source_all_cols: Set[Tuple[str, ...]] = set(src_norm_cols.values())
+    source_pk_cols: Set[Tuple[str, ...]] = set()
+    source_uk_cols: Set[Tuple[str, ...]] = set()
+    source_fk_cols: Set[Tuple[str, ...]] = set()
+    source_incomplete_fk_cols: Set[Tuple[str, ...]] = set()
+    for name, cons in (src_cons or {}).items():
+        ctype = (cons.get("type") or "").upper()
+        cols = src_norm_cols.get(name) or normalize_column_sequence(cons.get("columns"))
+        if ctype == "P":
+            source_pk_cols.add(cols)
+        elif ctype == "U":
+            source_uk_cols.add(cols)
+        elif ctype == "R":
+            source_fk_cols.add(cols)
+            ref_owner = cons.get("ref_table_owner")
+            ref_name = cons.get("ref_table_name")
+            ref_complete = bool(
+                cons.get("ref_metadata_complete")
+                if cons.get("ref_metadata_complete") is not None
+                else True
+            )
+            if not ref_complete and not (ref_owner and ref_name):
+                source_incomplete_fk_cols.add(cols)
     partition_key_set = get_partition_key_set(oracle_meta, src_schema, src_table)
     return ConstraintCompareCache(
         src_cons=src_cons,
@@ -33274,6 +33378,10 @@ def build_constraint_cache_for_table(
         src_sig=src_sig,
         tgt_sig=tgt_sig,
         source_all_cols=source_all_cols,
+        source_pk_cols=source_pk_cols,
+        source_uk_cols=source_uk_cols,
+        source_fk_cols=source_fk_cols,
+        source_incomplete_fk_cols=source_incomplete_fk_cols,
         partition_key_set=partition_key_set,
     )
 
@@ -33888,17 +33996,21 @@ def compare_constraints_for_table(
     tgt_table: str,
     full_object_mapping: FullObjectMapping,
     cache: Optional[ConstraintCompareCache] = None,
+    strict_ob_source_compare: bool = False,
 ) -> Tuple[bool, Optional[ConstraintMismatch]]:
     include_deferrable = bool(getattr(ob_meta, "constraint_deferrable_supported", False))
     tgt_key = (tgt_schema.upper(), tgt_table.upper())
 
     def _has_duplicate_notnull_cleanup_candidates(src_constraints: Dict[str, Dict]) -> bool:
-        tgt_enabled_notnull_groups_local = (
-            getattr(ob_meta, "enabled_notnull_check_groups", {}) or {}
-        ).get(tgt_key, {})
+        src_key_local = (src_schema.upper(), src_table.upper())
+        tgt_enabled_notnull_groups_local = get_enabled_notnull_check_groups_for_table(
+            ob_meta, tgt_key, (getattr(ob_meta, "constraints", {}) or {}).get(tgt_key, {})
+        )
         if not tgt_enabled_notnull_groups_local:
             return False
-        src_enabled_notnull_groups_local = build_enabled_notnull_check_group_map(src_constraints)
+        src_enabled_notnull_groups_local = get_enabled_notnull_check_groups_for_table(
+            oracle_meta, src_key_local, src_constraints
+        )
         if not src_enabled_notnull_groups_local:
             return False
         duplicate_notnull_extras_local = select_safe_duplicate_notnull_target_extras(
@@ -33914,9 +34026,15 @@ def compare_constraints_for_table(
         src_norm_cols = cache.src_norm_cols
         tgt_norm_cols = cache.tgt_norm_cols
         source_all_cols = cache.source_all_cols
+        source_pk_cols = set(getattr(cache, "source_pk_cols", set()) or set())
+        source_uk_cols = set(getattr(cache, "source_uk_cols", set()) or set())
+        source_fk_cols = set(getattr(cache, "source_fk_cols", set()) or set())
+        source_incomplete_fk_cols = set(getattr(cache, "source_incomplete_fk_cols", set()) or set())
         partition_key_set = cache.partition_key_set
-        if cache.src_sig == cache.tgt_sig and not _has_duplicate_notnull_cleanup_candidates(
-            src_cons
+        if (
+            cache.src_sig == cache.tgt_sig
+            and not source_incomplete_fk_cols
+            and not _has_duplicate_notnull_cleanup_candidates(src_cons)
         ):
             return True, None
     else:
@@ -33933,6 +34051,32 @@ def compare_constraints_for_table(
             name: normalize_column_sequence(cons.get("columns")) for name, cons in tgt_cons.items()
         }
         source_all_cols = set(src_norm_cols.values())
+        source_pk_cols = {
+            src_norm_cols.get(name) or normalize_column_sequence(cons.get("columns"))
+            for name, cons in (src_cons or {}).items()
+            if (cons.get("type") or "").upper() == "P"
+        }
+        source_uk_cols = {
+            src_norm_cols.get(name) or normalize_column_sequence(cons.get("columns"))
+            for name, cons in (src_cons or {}).items()
+            if (cons.get("type") or "").upper() == "U"
+        }
+        source_fk_cols = {
+            src_norm_cols.get(name) or normalize_column_sequence(cons.get("columns"))
+            for name, cons in (src_cons or {}).items()
+            if (cons.get("type") or "").upper() == "R"
+        }
+        source_incomplete_fk_cols = {
+            src_norm_cols.get(name) or normalize_column_sequence(cons.get("columns"))
+            for name, cons in (src_cons or {}).items()
+            if (cons.get("type") or "").upper() == "R"
+            and not bool(
+                cons.get("ref_metadata_complete")
+                if cons.get("ref_metadata_complete") is not None
+                else True
+            )
+            and not (cons.get("ref_table_owner") and cons.get("ref_table_name"))
+        }
         partition_key_set = get_partition_key_set(oracle_meta, src_schema, src_table)
 
     src_idx_unique_cols: Set[Tuple[str, ...]] = set()
@@ -33955,6 +34099,7 @@ def compare_constraints_for_table(
     duplicate_notnull_extra_constraints: Set[str] = set()
     check_suppressed_source_dup_count = 0
     check_suppressed_target_dup_count = 0
+    source_fk_metadata_incomplete: Set[str] = set()
 
     def _norm_cols(name: str, cons: Dict, *, is_source: bool) -> Tuple[str, ...]:
         if is_source:
@@ -34001,6 +34146,8 @@ def compare_constraints_for_table(
                 else:
                     # 目标端FK引用：使用原始名称（目标端已经是remapped之后的名称）
                     ref_full = ref_full_raw.upper()
+            if is_source and not ref_meta_complete and not ref_full:
+                source_fk_metadata_incomplete.add(name)
             entries.append((cols, name, ref_full, delete_rule, update_rule, ref_meta_complete))
         return entries
 
@@ -34040,9 +34187,11 @@ def compare_constraints_for_table(
     grouped_src_ck = bucket_check(src_cons, include_deferrable=include_deferrable)
     grouped_tgt_ck = bucket_check(tgt_cons, include_deferrable=include_deferrable)
     src_system_notnull_novalidate_cols = build_system_notnull_novalidate_column_map(src_cons)
-    src_enabled_notnull_groups = build_enabled_notnull_check_group_map(src_cons)
-    tgt_enabled_notnull_groups = (getattr(ob_meta, "enabled_notnull_check_groups", {}) or {}).get(
-        tgt_key, {}
+    src_enabled_notnull_groups = get_enabled_notnull_check_groups_for_table(
+        oracle_meta, (src_schema.upper(), src_table.upper()), src_cons
+    )
+    tgt_enabled_notnull_groups = get_enabled_notnull_check_groups_for_table(
+        ob_meta, tgt_key, tgt_cons
     )
 
     src_pk_list = grouped_src_pkuk.get("P", [])
@@ -34083,12 +34232,15 @@ def compare_constraints_for_table(
     def mark_extra_constraints(
         label: str, tgt_list: List[Tuple[Tuple[str, ...], str]], tgt_used: List[bool]
     ) -> None:
+        expected_source_cols = source_pk_cols if label == "PRIMARY KEY" else source_uk_cols
         for idx, used in enumerate(tgt_used):
             if used:
                 continue
             extra_name = tgt_list[idx][1]
             extra_cols = tgt_list[idx][0]
-            if extra_cols in source_all_cols:
+            if extra_cols in expected_source_cols:
+                continue
+            if not strict_ob_source_compare and extra_cols in source_all_cols:
                 continue
             if label == "UNIQUE KEY":
                 extra_name_u = (extra_name or "").upper()
@@ -34115,13 +34267,21 @@ def compare_constraints_for_table(
         tgt_used = [False] * len(tgt_list)
         tgt_by_cols: Dict[Tuple[str, ...], Set[Optional[str]]] = defaultdict(set)
         tgt_unknown_ref_cols: Set[Tuple[str, ...]] = set()
+        source_incomplete_ref_cols: Set[Tuple[str, ...]] = set()
         for cols, _name, ref, _rule, _update_rule, ref_complete in tgt_list:
             if ref:
                 tgt_by_cols[cols].add(ref)
             elif not ref_complete:
                 tgt_unknown_ref_cols.add(cols)
 
-        for cols, name, src_ref, src_rule, src_update_rule, _src_ref_complete in src_list:
+        for cols, name, src_ref, src_rule, src_update_rule, src_ref_complete in src_list:
+            if not src_ref_complete and not src_ref:
+                source_incomplete_ref_cols.add(cols)
+                missing.add(name)
+                detail_mismatch.append(
+                    f"FOREIGN KEY: 源约束 {name} (列 {list(cols)}) 源端引用表元数据未恢复，无法可靠比对。"
+                )
+                continue
             found_idx = None
             for idx, (t_cols, _t_name, t_ref, t_rule, t_update_rule, t_ref_complete) in enumerate(
                 tgt_list
@@ -34181,7 +34341,13 @@ def compare_constraints_for_table(
                     extra_update_rule,
                     extra_ref_complete,
                 ) = tgt_list[idx]
-                if extra_cols in source_all_cols:
+                if extra_cols in source_fk_cols and extra_cols not in source_incomplete_ref_cols:
+                    continue
+                if (
+                    not strict_ob_source_compare
+                    and extra_cols in source_all_cols
+                    and extra_cols not in source_incomplete_ref_cols
+                ):
                     continue
                 if "_OMS_ROWID" in (extra_name or ""):
                     continue
@@ -34330,7 +34496,7 @@ def compare_constraints_for_table(
             if normalize_constraint_validated_status(entry.validated)
         }
         prefer_ob_auto = bool(source_entries) and all(
-            entry.is_system_named for entry in source_entries
+            entry.is_system_named or entry.is_ob_auto for entry in source_entries
         )
         keep_entries = sorted(
             target_entries,
@@ -34383,6 +34549,7 @@ def compare_constraints_for_table(
             check_suppressed_source_dup_count=check_suppressed_source_dup_count,
             check_suppressed_target_dup_count=check_suppressed_target_dup_count,
             duplicate_notnull_extra_constraints=frozenset(duplicate_notnull_extra_constraints),
+            fk_source_metadata_incomplete=frozenset(source_fk_metadata_incomplete),
         )
 
 
@@ -34621,6 +34788,7 @@ def _init_extra_check_worker(
     ob_meta: ObMetadata,
     full_object_mapping: FullObjectMapping,
     enabled_types: Set[str],
+    source_db_mode: str = SOURCE_DB_MODE_ORACLE,
 ) -> None:
     global _EXTRA_CHECK_CONTEXT
     _EXTRA_CHECK_CONTEXT = {
@@ -34628,6 +34796,7 @@ def _init_extra_check_worker(
         "ob_meta": ob_meta,
         "full_object_mapping": full_object_mapping,
         "enabled_types": enabled_types,
+        "source_db_mode": normalize_source_db_mode(source_db_mode),
     }
 
 
@@ -34639,6 +34808,7 @@ def _extra_check_worker(table_entry: TableEntry) -> ExtraTableResult:
         ctx["ob_meta"],
         ctx["full_object_mapping"],
         ctx["enabled_types"],
+        ctx.get("source_db_mode", SOURCE_DB_MODE_ORACLE),
     )
 
 
@@ -34648,6 +34818,7 @@ def run_extra_check_for_table(
     ob_meta: ObMetadata,
     full_object_mapping: FullObjectMapping,
     enabled_types: Set[str],
+    source_db_mode: str = SOURCE_DB_MODE_ORACLE,
 ) -> ExtraTableResult:
     src_schema, src_table, tgt_schema, tgt_table = table_entry
     tgt_name = f"{tgt_schema}.{tgt_table}"
@@ -34685,6 +34856,8 @@ def run_extra_check_for_table(
             tgt_table,
             full_object_mapping,
             cache=cons_cache,
+            strict_ob_source_compare=normalize_source_db_mode(source_db_mode)
+            == SOURCE_DB_MODE_OCEANBASE,
         )
         constraint_time = time.monotonic() - start
 
@@ -34717,6 +34890,35 @@ def run_extra_check_for_table(
         constraint_time=constraint_time,
         trigger_time=trigger_time,
     )
+
+
+def call_run_extra_check_for_table(
+    table_entry: TableEntry,
+    oracle_meta: OracleMetadata,
+    ob_meta: ObMetadata,
+    full_object_mapping: FullObjectMapping,
+    enabled_types: Set[str],
+    source_db_mode: str,
+) -> ExtraTableResult:
+    try:
+        return run_extra_check_for_table(
+            table_entry,
+            oracle_meta,
+            ob_meta,
+            full_object_mapping,
+            enabled_types,
+            source_db_mode,
+        )
+    except TypeError as exc:
+        if "positional argument" not in str(exc):
+            raise
+        return run_extra_check_for_table(
+            table_entry,
+            oracle_meta,
+            ob_meta,
+            full_object_mapping,
+            enabled_types,
+        )
 
 
 def run_trigger_check_for_object(
@@ -34827,6 +35029,9 @@ def check_extra_objects(
     trg_time_sum = 0.0
 
     if total_tables:
+        source_db_mode = normalize_source_db_mode(
+            settings.get("source_db_mode", SOURCE_DB_MODE_ORACLE)
+        )
         worker_count = max(1, int(settings.get("extra_check_workers", 1) or 1))
         worker_count = min(worker_count, max(1, total_tables))
         chunk_size = max(1, int(settings.get("extra_check_chunk_size", 200) or 200))
@@ -34877,7 +35082,13 @@ def check_extra_objects(
                 with ProcessPoolExecutor(
                     max_workers=worker_count,
                     initializer=_init_extra_check_worker,
-                    initargs=(oracle_meta, ob_meta, full_object_mapping, table_check_types),
+                    initargs=(
+                        oracle_meta,
+                        ob_meta,
+                        full_object_mapping,
+                        table_check_types,
+                        source_db_mode,
+                    ),
                 ) as executor:
                     future_to_entry = {
                         executor.submit(_extra_check_worker, entry): entry
@@ -34894,8 +35105,13 @@ def check_extra_objects(
                                 entry[3],
                                 exc,
                             )
-                            result = run_extra_check_for_table(
-                                entry, oracle_meta, ob_meta, full_object_mapping, table_check_types
+                            result = call_run_extra_check_for_table(
+                                entry,
+                                oracle_meta,
+                                ob_meta,
+                                full_object_mapping,
+                                table_check_types,
+                                source_db_mode,
                             )
                         done_tables += 1
                         _accumulate_result(result)
@@ -34915,12 +35131,13 @@ def check_extra_objects(
                 with ThreadPoolExecutor(max_workers=worker_count) as executor:
                     future_to_entry = {
                         executor.submit(
-                            run_extra_check_for_table,
+                            call_run_extra_check_for_table,
                             entry,
                             oracle_meta,
                             ob_meta,
                             full_object_mapping,
                             table_check_types,
+                            source_db_mode,
                         ): entry
                         for entry in table_entries
                     }
@@ -34935,8 +35152,13 @@ def check_extra_objects(
                                 entry[3],
                                 exc,
                             )
-                            result = run_extra_check_for_table(
-                                entry, oracle_meta, ob_meta, full_object_mapping, table_check_types
+                            result = call_run_extra_check_for_table(
+                                entry,
+                                oracle_meta,
+                                ob_meta,
+                                full_object_mapping,
+                                table_check_types,
+                                source_db_mode,
                             )
                         done_tables += 1
                         _accumulate_result(result)
@@ -34954,8 +35176,13 @@ def check_extra_objects(
                             last_log = now
         else:
             for entry in table_entries:
-                result = run_extra_check_for_table(
-                    entry, oracle_meta, ob_meta, full_object_mapping, table_check_types
+                result = call_run_extra_check_for_table(
+                    entry,
+                    oracle_meta,
+                    ob_meta,
+                    full_object_mapping,
+                    table_check_types,
+                    source_db_mode,
                 )
                 done_tables += 1
                 _accumulate_result(result)
@@ -58997,6 +59224,12 @@ def _build_report_detail_rows(
                             "duplicate_notnull_extra_constraints": sorted(
                                 list(
                                     getattr(row, "duplicate_notnull_extra_constraints", frozenset())
+                                    or frozenset()
+                                )
+                            ),
+                            "fk_source_metadata_incomplete": sorted(
+                                list(
+                                    getattr(row, "fk_source_metadata_incomplete", frozenset())
                                     or frozenset()
                                 )
                             ),
